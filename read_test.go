@@ -715,3 +715,22 @@ func TestWriteFilePreservesPermissions(t *testing.T) {
 		t.Errorf("file mode after WriteFile: got %v, want %v", got, want)
 	}
 }
+
+// BenchmarkReadFile_Concurrent runs ReadFile in parallel goroutines to expose
+// any pool contention. Uses a minimal in-memory JPEG written to a temp file
+// to isolate pool behaviour from I/O variability.
+func BenchmarkReadFile_Concurrent(b *testing.B) {
+	tiff := minimalTIFFPayload()
+	jpeg := buildMinimalJPEG(tiff)
+	tmp := b.TempDir() + "/bench.jpg"
+	if err := os.WriteFile(tmp, jpeg, 0o644); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_, _ = ReadFile(tmp)
+		}
+	})
+}

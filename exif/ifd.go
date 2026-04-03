@@ -18,6 +18,9 @@ var visitedPool = sync.Pool{
 }
 
 // IFD represents a TIFF Image File Directory (TIFF §2).
+// Entries must remain sorted by Tag in ascending order (TIFF §7) so that
+// Get() can use binary search. Use set() to modify entries; code that
+// appends to Entries directly must call sortEntries() afterwards.
 type IFD struct {
 	Entries []IFDEntry
 	Next    *IFD // linked IFDs (e.g. IFD1 for thumbnail)
@@ -118,6 +121,10 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, error) {
 			})
 		}
 
+		// Sort entries by tag so Get() can use binary search (TIFF §7).
+		// Real cameras produce sorted IFDs, but non-compliant files may not.
+		sortEntries(ifd.Entries)
+
 		// Link into the chain.
 		if root == nil {
 			root = ifd
@@ -143,15 +150,17 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, error) {
 	return root, nil
 }
 
-// Get returns the first entry matching tag, or nil if not found.
+// Get returns the entry matching tag, or nil if not found.
+// Entries must be sorted by tag (maintained by traverse and set); Get uses
+// binary search — O(log n) with zero allocations (sort.Search).
 func (ifd *IFD) Get(tag TagID) *IFDEntry {
 	if ifd == nil {
 		return nil
 	}
-	for i := range ifd.Entries {
-		if ifd.Entries[i].Tag == tag {
-			return &ifd.Entries[i]
-		}
+	entries := ifd.Entries
+	i := sort.Search(len(entries), func(i int) bool { return entries[i].Tag >= tag })
+	if i < len(entries) && entries[i].Tag == tag {
+		return &entries[i]
 	}
 	return nil
 }
@@ -280,20 +289,23 @@ func (e *IFDEntry) Len() int {
 
 // set inserts or replaces an entry in the IFD. The byteOrder field of the
 // new entry is inherited from the existing entries in the IFD (or defaults
-// to binary.LittleEndian for an empty IFD).
+// to binary.LittleEndian for an empty IFD). Entries are kept sorted by tag
+// so that Get() can use binary search.
 func (ifd *IFD) set(tag TagID, typ DataType, count uint32, value []byte) {
 	order := binary.ByteOrder(binary.LittleEndian)
 	if len(ifd.Entries) > 0 {
 		order = ifd.Entries[0].byteOrder
 	}
 	entry := IFDEntry{Tag: tag, Type: typ, Count: count, Value: value, byteOrder: order}
-	for i := range ifd.Entries {
-		if ifd.Entries[i].Tag == tag {
-			ifd.Entries[i] = entry
-			return
-		}
+	// Replace existing entry in-place (preserves sort order).
+	i := sort.Search(len(ifd.Entries), func(i int) bool { return ifd.Entries[i].Tag >= tag })
+	if i < len(ifd.Entries) && ifd.Entries[i].Tag == tag {
+		ifd.Entries[i] = entry
+		return
 	}
+	// New tag: append and re-sort to maintain the invariant.
 	ifd.Entries = append(ifd.Entries, entry)
+	sortEntries(ifd.Entries)
 }
 
 // asciiValue encodes s as a NUL-terminated ASCII byte slice suitable for
@@ -368,9 +380,9 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 	// value area begins right after: 2 (count) + n*12 (entries) + 4 (next-IFD).
 	valueOff := startOff + uint32(2+n*12+4)
 
-	countB := make([]byte, 2)
-	order.PutUint16(countB, uint16(n))
-	out = append(out, countB...)
+	var countB [2]byte
+	order.PutUint16(countB[:], uint16(n))
+	out = append(out, countB[:]...)
 
 	entryBuf := make([]byte, n*12)
 	var valueArea []byte
@@ -397,9 +409,9 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 
 	out = append(out, entryBuf...)
 	// Write next-IFD pointer (TIFF §2).
-	nextB := make([]byte, 4)
-	order.PutUint32(nextB, nextIFDOffset)
-	out = append(out, nextB...)
+	var nextB [4]byte
+	order.PutUint32(nextB[:], nextIFDOffset)
+	out = append(out, nextB[:]...)
 	out = append(out, valueArea...)
 	return out
 }

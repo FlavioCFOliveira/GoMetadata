@@ -7,6 +7,20 @@ import (
 	"strings"
 )
 
+// xmpPadding is the pre-computed 2 KB whitespace padding block for XMP in-place
+// editing (XMP §7.3). Initialised once at package load; never mutated.
+var xmpPadding = func() [2048]byte {
+	var b [2048]byte
+	for i := range b {
+		if (i+1)%100 == 0 {
+			b[i] = '\n'
+		} else {
+			b[i] = ' '
+		}
+	}
+	return b
+}()
+
 // encode serialises x to a padded XMP packet.
 // The packet uses UTF-8 encoding and a read/write <?xpacket?> wrapper
 // with 2 KB of whitespace padding per XMP §7.3 (in-place editing support).
@@ -45,9 +59,23 @@ func encode(x *XMP) ([]byte, error) {
 
 		for _, local := range localList {
 			val := props[local]
-			values := strings.Split(val, "\x1e")
-			if len(values) > 1 {
+			// Fast path: most properties are single-valued — avoid strings.Split alloc.
+			if strings.IndexByte(val, '\x1e') < 0 {
+				// Simple property.
+				buf.WriteString("   <")
+				buf.WriteString(prefix)
+				buf.WriteByte(':')
+				buf.WriteString(local)
+				buf.WriteByte('>')
+				xml.EscapeText(&buf, []byte(val)) //nolint:errcheck
+				buf.WriteString("</")
+				buf.WriteString(prefix)
+				buf.WriteByte(':')
+				buf.WriteString(local)
+				buf.WriteString(">\n")
+			} else {
 				// Multi-valued: use the per-property collection type (ISO 16684-1 §7.5).
+				values := strings.Split(val, "\x1e")
 				ctype := collectionType(ns, local)
 				buf.WriteString("   <")
 				buf.WriteString(prefix)
@@ -82,19 +110,6 @@ func encode(x *XMP) ([]byte, error) {
 				buf.WriteByte(':')
 				buf.WriteString(local)
 				buf.WriteString(">\n")
-			} else {
-				// Simple property.
-				buf.WriteString("   <")
-				buf.WriteString(prefix)
-				buf.WriteByte(':')
-				buf.WriteString(local)
-				buf.WriteByte('>')
-				xml.EscapeText(&buf, []byte(val)) //nolint:errcheck
-				buf.WriteString("</")
-				buf.WriteString(prefix)
-				buf.WriteByte(':')
-				buf.WriteString(local)
-				buf.WriteString(">\n")
 			}
 		}
 
@@ -104,15 +119,8 @@ func encode(x *XMP) ([]byte, error) {
 	buf.WriteString(" </rdf:RDF>\n</x:xmpmeta>\n")
 
 	// 2 KB padding of spaces / newlines for in-place editing (XMP §7.3).
-	padding := make([]byte, 2048)
-	for i := range padding {
-		if (i+1)%100 == 0 {
-			padding[i] = '\n'
-		} else {
-			padding[i] = ' '
-		}
-	}
-	buf.Write(padding)
+	// Uses the pre-computed package-level array to avoid a per-call allocation.
+	buf.Write(xmpPadding[:])
 	buf.WriteString("\n<?xpacket end=\"w\"?>")
 
 	return buf.Bytes(), nil

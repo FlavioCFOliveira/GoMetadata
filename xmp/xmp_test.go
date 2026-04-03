@@ -1,6 +1,7 @@
 package xmp
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -486,4 +487,21 @@ func TestXMPNewSetters(t *testing.T) {
 		x.SetKeywords([]string{"a"})
 		x.Set(NSdc, "title", "test")
 	})
+}
+
+func BenchmarkXMPParse_RealWorld(b *testing.B) {
+	raw, err := os.ReadFile("../testdata/corpus/jpeg/exiftool/ExifTool.jpg")
+	if err != nil {
+		b.Skip("corpus file not available")
+	}
+	pkt := Scan(raw)
+	if pkt == nil {
+		b.Skip("no XMP packet found in ExifTool.jpg")
+	}
+	b.SetBytes(int64(len(pkt)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = Parse(pkt)
+	}
 }

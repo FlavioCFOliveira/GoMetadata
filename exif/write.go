@@ -36,15 +36,13 @@ func encode(e *EXIF) ([]byte, error) {
 
 	// Reserve pointer entries so ifdTotalSize accounts for them correctly.
 	// TypeLong / Count 1 → value fits inline (4 bytes); no value-area impact.
-	zeroPtr := func(tag TagID) IFDEntry {
-		v := make([]byte, 4) // placeholder; patched below
-		return IFDEntry{Tag: tag, Type: TypeLong, Count: 1, Value: v, byteOrder: order}
-	}
+	// Stack-allocated arrays avoid one heap allocation per sub-IFD pointer.
+	var exifPtrBuf, gpsPtrBuf, interopPtrBuf [4]byte // placeholders; patched below
 	if e.ExifIFD != nil {
-		ifd0Entries = append(ifd0Entries, zeroPtr(TagExifIFDPointer))
+		ifd0Entries = append(ifd0Entries, IFDEntry{Tag: TagExifIFDPointer, Type: TypeLong, Count: 1, Value: exifPtrBuf[:], byteOrder: order})
 	}
 	if e.GPSIFD != nil {
-		ifd0Entries = append(ifd0Entries, zeroPtr(TagGPSIFDPointer))
+		ifd0Entries = append(ifd0Entries, IFDEntry{Tag: TagGPSIFDPointer, Type: TypeLong, Count: 1, Value: gpsPtrBuf[:], byteOrder: order})
 	}
 	sortEntries(ifd0Entries)
 
@@ -55,7 +53,7 @@ func encode(e *EXIF) ([]byte, error) {
 	if e.ExifIFD != nil {
 		exifIFDEntries = filterEntries(e.ExifIFD, TagInteropIFDPointer)
 		if e.InteropIFD != nil {
-			exifIFDEntries = append(exifIFDEntries, zeroPtr(TagInteropIFDPointer))
+			exifIFDEntries = append(exifIFDEntries, IFDEntry{Tag: TagInteropIFDPointer, Type: TypeLong, Count: 1, Value: interopPtrBuf[:], byteOrder: order})
 		}
 		// Preserve raw MakerNote bytes verbatim when the ExifIFD no longer
 		// contains a TagMakerNote entry (e.g., it was removed during re-parse).
@@ -116,7 +114,7 @@ func encode(e *EXIF) ([]byte, error) {
 	// --- Write ---
 
 	// TIFF header (TIFF §2): byte order mark, magic 0x002A, IFD0 offset.
-	hdr := make([]byte, 8)
+	var hdr [8]byte
 	if order == binary.LittleEndian {
 		hdr[0], hdr[1] = 'I', 'I'
 	} else {
@@ -126,7 +124,7 @@ func encode(e *EXIF) ([]byte, error) {
 	order.PutUint32(hdr[4:], headerSize) // IFD0 starts right after the header
 
 	out := make([]byte, 0, headerSize+ifd0Size+exifSize+gpsSize+interopSize)
-	out = append(out, hdr...)
+	out = append(out, hdr[:]...)
 
 	// IFD0: next-IFD pointer points to IFD1 if present.
 	ifd0NextPtr := uint32(0)

@@ -92,8 +92,13 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	// Adobe XMP Specification Part 3 §1.1.4.
 	extended := make(map[string][]extChunk)
 
+	// Reusable scratch buffer: data returned by readSegment aliases this slice
+	// and is only valid until the next readSegment call. Callers that need to
+	// retain segment data must copy it (append([]byte(nil), data...)).
+	scratch := make([]byte, 4096)
+
 	for {
-		marker, data, rerr := readSegment(r)
+		marker, data, rerr := readSegment(r, &scratch)
 		if rerr != nil {
 			if rerr == io.EOF {
 				break
@@ -108,9 +113,11 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 			switch {
 			case bytes.HasPrefix(data, identExif):
 				// EXIF payload begins after the 6-byte "Exif\x00\x00" header.
-				rawEXIF = data[len(identExif):]
+				// Copy: data aliases scratch and must survive the next readSegment call.
+				rawEXIF = append([]byte(nil), data[len(identExif):]...)
 			case bytes.HasPrefix(data, identXMP):
-				rawXMP = data[len(identXMP):]
+				// Copy: same reason as rawEXIF.
+				rawXMP = append([]byte(nil), data[len(identXMP):]...)
 			case bytes.HasPrefix(data, identXMPNote):
 				// Extended XMP chunk: GUID (32 bytes) + fullLength (4 bytes) +
 				// offset (4 bytes) + chunk data. Adobe XMP Spec Part 3 §1.1.4.
@@ -120,16 +127,22 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 					fullLen := binary.BigEndian.Uint32(body[32:36])
 					offset := binary.BigEndian.Uint32(body[36:40])
 					_ = fullLen // used only for validation; assembly is offset-driven
+					// Copy chunk data: body aliases scratch and must outlive this loop.
+					chunkData := append([]byte(nil), body[40:]...)
 					extended[guid] = append(extended[guid], extChunk{
 						offset: offset,
-						data:   body[40:],
+						data:   chunkData,
 					})
 				}
 			}
 
 		case markerAPP13:
 			if bytes.HasPrefix(data, identPS) {
-				rawIPTC = parseIRB(data[len(identPS):])
+				// parseIRB returns a sub-slice of its input; copy since input aliases scratch.
+				irb := parseIRB(data[len(identPS):])
+				if irb != nil {
+					rawIPTC = append([]byte(nil), irb...)
+				}
 			}
 
 		case markerSOS, markerEOI:
@@ -220,8 +233,13 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	}
 
 	// Copy remaining segments, skipping old metadata APP segments.
+	// Use a pooled scratch buffer: data is consumed immediately within each
+	// loop iteration and never stored, so no copying is needed here.
+	injectScratch := iobuf.Get(4096)
+	defer iobuf.Put(injectScratch)
+
 	for {
-		marker, data, err := readSegment(r)
+		marker, data, err := readSegment(r, injectScratch)
 		if err != nil {
 			if err == io.EOF {
 				break
@@ -441,10 +459,14 @@ func buildIRB(iptcData []byte) []byte {
 	return buf
 }
 
-// readSegment reads one JPEG marker segment from r.
-// For standalone markers (SOI, EOI, RST*), data is nil.
+// readSegment reads one JPEG marker segment from r into *scratch, growing it
+// if necessary. For standalone markers (SOI, EOI, RST*), data is nil.
 // Returns (0, nil, io.EOF) at end of file.
-func readSegment(r io.Reader) (marker byte, data []byte, err error) {
+//
+// The returned data slice aliases *scratch and is only valid until the next
+// call to readSegment. Callers that need to retain data past the next call
+// must copy it (e.g. append([]byte(nil), data...)).
+func readSegment(r io.Reader, scratch *[]byte) (marker byte, data []byte, err error) {
 	hdr := [2]byte{}
 	if _, err = io.ReadFull(r, hdr[:]); err != nil {
 		return 0, nil, err
@@ -474,7 +496,11 @@ func readSegment(r io.Reader) (marker byte, data []byte, err error) {
 		return 0, nil, fmt.Errorf("jpeg: marker 0x%02X has invalid length %d", marker, length)
 	}
 
-	data = make([]byte, length-2)
+	need := length - 2
+	if need > len(*scratch) {
+		*scratch = make([]byte, need)
+	}
+	data = (*scratch)[:need]
 	if _, err = io.ReadFull(r, data); err != nil {
 		return 0, nil, fmt.Errorf("jpeg: truncated data for marker 0x%02X: %w", marker, err)
 	}

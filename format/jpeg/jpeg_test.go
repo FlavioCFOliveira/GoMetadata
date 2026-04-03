@@ -3,6 +3,7 @@ package jpeg
 import (
 	"bytes"
 	"encoding/binary"
+	"os"
 	"testing"
 )
 
@@ -792,5 +793,19 @@ func BenchmarkJPEGInject(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var out bytes.Buffer
 		_ = Inject(bytes.NewReader(jpeg), &out, tiffData, newIPTC, nil)
+	}
+}
+
+func BenchmarkJPEGExtract_Real(b *testing.B) {
+	data, err := os.ReadFile("../../testdata/corpus/jpeg/exiftool/ExifTool.jpg")
+	if err != nil {
+		b.Skip("corpus file not available")
+	}
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r := bytes.NewReader(data)
+		_, _, _, _ = Extract(r)
 	}
 }

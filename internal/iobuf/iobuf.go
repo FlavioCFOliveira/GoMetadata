@@ -6,7 +6,9 @@ package iobuf
 import "sync"
 
 const defaultSize = 4096
+const largeSize = 65536
 
+// pool serves buffers up to defaultSize bytes.
 var pool = sync.Pool{
 	New: func() any {
 		b := make([]byte, defaultSize)
@@ -14,9 +16,29 @@ var pool = sync.Pool{
 	},
 }
 
-// Get returns a pointer to a byte slice from the pool. The caller must call
-// Put when finished. The slice is at least n bytes long; it may be longer.
+// largePool serves buffers between defaultSize+1 and largeSize bytes.
+// Kept separate to prevent large buffers (EXIF segments, extended-XMP chunks)
+// from polluting the small-buffer pool and wasting memory.
+var largePool = sync.Pool{
+	New: func() any {
+		b := make([]byte, largeSize)
+		return &b
+	},
+}
+
+// Get returns a pointer to a byte slice from the appropriate pool tier.
+// The caller must call Put when finished. The slice is at least n bytes long;
+// it may be longer.
 func Get(n int) *[]byte {
+	if n > defaultSize {
+		p := largePool.Get().(*[]byte)
+		if cap(*p) < n {
+			b := make([]byte, n)
+			return &b
+		}
+		*p = (*p)[:n]
+		return p
+	}
 	p := pool.Get().(*[]byte)
 	if cap(*p) < n {
 		b := make([]byte, n)
@@ -26,12 +48,16 @@ func Get(n int) *[]byte {
 	return p
 }
 
-// Put returns a buffer to the pool. The caller must not use the buffer after
-// calling Put.
+// Put returns a buffer to the appropriate pool tier. The caller must not use
+// the buffer after calling Put.
 func Put(p *[]byte) {
 	if p == nil {
 		return
 	}
 	*p = (*p)[:cap(*p)]
-	pool.Put(p)
+	if cap(*p) > defaultSize {
+		largePool.Put(p)
+	} else {
+		pool.Put(p)
+	}
 }

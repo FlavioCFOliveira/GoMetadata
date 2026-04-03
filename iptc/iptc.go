@@ -29,6 +29,9 @@ type Dataset struct {
 // b must begin with (or contain) the IPTC tag marker 0x1C (IIM §1.6).
 func Parse(b []byte) (*IPTC, error) {
 	i := &IPTC{Records: make(map[uint8][]Dataset)}
+	// Pre-allocate record 2 (Application Record) — the most common record,
+	// typically containing 5–15 datasets in a production JPEG (IIM §2).
+	i.Records[2] = make([]Dataset, 0, 12)
 	utf8 := false
 
 	pos := 0
