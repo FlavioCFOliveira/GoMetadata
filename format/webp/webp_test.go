@@ -136,3 +136,13 @@ func TestInjectRoundTrip(t *testing.T) {
 	}
 	_ = exifData
 }
+
+func BenchmarkWebPExtract(b *testing.B) {
+	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00}
+	webp := buildWebP(exifData, nil, 0x08, 1920, 1080)
+	b.SetBytes(int64(len(webp)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _, _ = Extract(bytes.NewReader(webp))
+	}
+}

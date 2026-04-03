@@ -1,0 +1,113 @@
+package format
+
+import (
+	"bytes"
+	"testing"
+)
+
+func TestDetect(t *testing.T) {
+	tests := []struct {
+		name  string
+		magic []byte
+		want  FormatID
+	}{
+		// JPEG: SOI marker FF D8
+		{"JPEG", []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01}, FormatJPEG},
+
+		// PNG: 89 50 4E 47 0D 0A 1A 0A
+		{"PNG", []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D}, FormatPNG},
+
+		// WebP: RIFF????WEBP
+		{"WebP", []byte{0x52, 0x49, 0x46, 0x46, 0x12, 0x34, 0x56, 0x78, 0x57, 0x45, 0x42, 0x50}, FormatWebP},
+
+		// TIFF little-endian: "II" 0x2A 0x00
+		{"TIFF LE", []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, FormatTIFF},
+
+		// TIFF big-endian: "MM" 0x00 0x2A
+		{"TIFF BE", []byte{0x4D, 0x4D, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00}, FormatTIFF},
+
+		// CR2: TIFF LE with "CR" at bytes 8–9
+		{"CR2", []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x43, 0x52, 0x02, 0x00}, FormatCR2},
+
+		// ORF: "IIRO" little-endian Olympus marker
+		{"ORF", []byte{0x49, 0x49, 0x52, 0x4F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, FormatORF},
+
+		// RW2: "IIU\x00"
+		{"RW2", []byte{0x49, 0x49, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, FormatRW2},
+
+		// HEIF/HEIC: ftyp box with heic brand
+		{"HEIF", []byte{0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63}, FormatHEIF},
+
+		// CR3: ftyp box with crx  brand (Canon ISOBMFF RAW)
+		{"CR3", []byte{0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x63, 0x72, 0x78, 0x20}, FormatCR3},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Detect(bytes.NewReader(tc.magic))
+			if err != nil {
+				t.Fatalf("Detect() error = %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("Detect() = %v (%d), want %v (%d)", got, got, tc.want, tc.want)
+			}
+		})
+	}
+}
+
+func TestDetectUnknown(t *testing.T) {
+	unknown := [][]byte{
+		{0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+		{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+		{0x25, 0x50, 0x44, 0x46, 0x2D, 0x31, 0x2E, 0x34, 0x00, 0x00, 0x00, 0x00}, // PDF
+		{'G', 'I', 'F', '8', '9', 'a', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},       // GIF
+	}
+	for _, b := range unknown {
+		got, err := Detect(bytes.NewReader(b))
+		if err != nil {
+			t.Fatalf("Detect() unexpected error: %v", err)
+		}
+		if got != FormatUnknown {
+			t.Errorf("Detect(%x) = %v, want FormatUnknown", b, got)
+		}
+	}
+}
+
+func TestDetectTruncated(t *testing.T) {
+	cases := [][]byte{
+		{},
+		{0xFF},
+		{0xFF, 0xD8},
+	}
+	for _, b := range cases {
+		// Must not panic; result may be Unknown or JPEG (for 0xFF 0xD8).
+		_, err := Detect(bytes.NewReader(b))
+		_ = err // short reads may return an error but must not panic
+	}
+}
+
+func TestDetectSeekReset(t *testing.T) {
+	// Detect must leave the reader at position 0 after detection.
+	magic := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00, 0x01}
+	r := bytes.NewReader(magic)
+
+	if _, err := Detect(r); err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+
+	// Reader should still be at position 0 so the caller can re-read.
+	pos, _ := r.Seek(0, 1)
+	if pos != 0 {
+		t.Errorf("reader position after Detect = %d, want 0", pos)
+	}
+}
+
+func TestDetectMagic(t *testing.T) {
+	// Test detectMagic directly for edge cases.
+	if got := detectMagic([]byte{0xFF}); got != FormatUnknown {
+		t.Errorf("detectMagic(1 byte) = %v, want FormatUnknown", got)
+	}
+	if got := detectMagic(nil); got != FormatUnknown {
+		t.Errorf("detectMagic(nil) = %v, want FormatUnknown", got)
+	}
+}

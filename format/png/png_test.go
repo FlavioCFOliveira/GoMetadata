@@ -177,3 +177,14 @@ func TestInjectRoundTrip(t *testing.T) {
 		t.Errorf("XMP after inject: got %q, want %q", rawXMP, xmpData)
 	}
 }
+
+func BenchmarkPNGExtract(b *testing.B) {
+	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00}
+	xmpData := []byte("<?xpacket begin='' uid='x'?><xmpmeta xmlns:x=\"adobe:ns:meta/\"/><?xpacket end='r'?>")
+	png := buildPNG(exifData, xmpData)
+	b.SetBytes(int64(len(png)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _, _ = Extract(bytes.NewReader(png))
+	}
+}

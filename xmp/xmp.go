@@ -110,6 +110,52 @@ func (x *XMP) Caption() string {
 	return x.firstValue(NSdc, "description")
 }
 
+// DateTimeOriginal returns the exif:DateTimeOriginal property (XMP §8.4)
+// as a raw string in ISO 8601 format. Returns "" when not present.
+func (x *XMP) DateTimeOriginal() string {
+	if x == nil {
+		return ""
+	}
+	return x.get(NSexif, "DateTimeOriginal")
+}
+
+// LensModel returns the aux:Lens property (Adobe XMP Auxiliary namespace).
+func (x *XMP) LensModel() string {
+	if x == nil {
+		return ""
+	}
+	return x.get(NSaux, "Lens")
+}
+
+// Keywords returns the dc:subject values (XMP §8.3).
+// dc:subject is an unordered bag; each item is returned as a separate string.
+func (x *XMP) Keywords() []string {
+	if x == nil {
+		return nil
+	}
+	v := x.get(NSdc, "subject")
+	if v == "" {
+		return nil
+	}
+	// Multi-valued properties are joined with U+001E (record separator).
+	parts := strings.Split(v, "\x1e")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+// Creator returns the first dc:creator value (XMP §8.3).
+func (x *XMP) Creator() string {
+	if x == nil {
+		return ""
+	}
+	return x.firstValue(NSdc, "creator")
+}
+
 // get returns the property value for the given namespace URI and local name.
 func (x *XMP) get(ns, local string) string {
 	if x.Properties == nil {

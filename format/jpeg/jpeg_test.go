@@ -138,3 +138,27 @@ func TestInjectRoundTrip(t *testing.T) {
 		t.Errorf("IPTC after inject: got %q, want %q", gotIPTC, newIPTC)
 	}
 }
+
+func BenchmarkJPEGExtract(b *testing.B) {
+	tiffData := minimalTIFFBytes()
+	iptcData := []byte{0x1C, 0x02, 0x78, 0x00, 0x05, 'H', 'e', 'l', 'l', 'o'}
+	jpeg := buildJPEG(tiffData, iptcData, nil)
+	b.SetBytes(int64(len(jpeg)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _, _ = Extract(bytes.NewReader(jpeg))
+	}
+}
+
+func BenchmarkJPEGInject(b *testing.B) {
+	tiffData := minimalTIFFBytes()
+	iptcData := []byte{0x1C, 0x02, 0x78, 0x00, 0x05, 'H', 'e', 'l', 'l', 'o'}
+	jpeg := buildJPEG(tiffData, iptcData, nil)
+	newIPTC := []byte{0x1C, 0x02, 0x78, 0x00, 0x03, 'N', 'e', 'w'}
+	b.SetBytes(int64(len(jpeg)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var out bytes.Buffer
+		_ = Inject(bytes.NewReader(jpeg), &out, tiffData, newIPTC, nil)
+	}
+}

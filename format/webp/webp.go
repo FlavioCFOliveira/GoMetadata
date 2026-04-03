@@ -46,10 +46,21 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 			if _, err = io.ReadFull(r, rawEXIF); err != nil {
 				return nil, nil, nil, fmt.Errorf("webp: read EXIF chunk: %w", err)
 			}
+			// RIFF: odd-size chunks are followed by a 1-byte padding zero.
+			if chunk.Size%2 != 0 {
+				if _, err = r.Seek(1, io.SeekCurrent); err != nil && err != io.EOF {
+					return nil, nil, nil, fmt.Errorf("webp: skip EXIF padding: %w", err)
+				}
+			}
 		case "XMP ":
 			rawXMP = make([]byte, chunk.Size)
 			if _, err = io.ReadFull(r, rawXMP); err != nil {
 				return nil, nil, nil, fmt.Errorf("webp: read XMP chunk: %w", err)
+			}
+			if chunk.Size%2 != 0 {
+				if _, err = r.Seek(1, io.SeekCurrent); err != nil && err != io.EOF {
+					return nil, nil, nil, fmt.Errorf("webp: skip XMP padding: %w", err)
+				}
 			}
 		default:
 			if err = riff.SkipChunk(r, chunk); err != nil {
@@ -91,7 +102,9 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 		dataStart := pos + 8
 		dataEnd := dataStart + size
 		if dataEnd > len(original) {
-			break
+			// Chunk size exceeds available bytes (truncated or RIFF size mismatch).
+			// Clamp to available data so subsequent chunks are not silently dropped.
+			dataEnd = len(original)
 		}
 		switch id {
 		case "VP8X":

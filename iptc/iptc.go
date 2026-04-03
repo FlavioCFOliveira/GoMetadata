@@ -143,6 +143,27 @@ func (i *IPTC) Caption() string {
 	return i.firstRecord2(DS2Caption)
 }
 
+// Keywords returns all Record 2 dataset 2:25 (Keywords, IIM §2.2.17) values.
+// Keywords is a repeatable dataset; each occurrence is a separate keyword.
+func (i *IPTC) Keywords() []string {
+	if i == nil {
+		return nil
+	}
+	utf8 := i.isUTF8()
+	var result []string
+	for _, d := range i.Records[2] {
+		if d.DataSet == DS2Keywords {
+			result = append(result, decodeString(d.Value, utf8))
+		}
+	}
+	return result
+}
+
+// Creator returns the value of dataset 2:80 (By-line / author, IIM §2.2.25).
+func (i *IPTC) Creator() string {
+	return i.firstRecord2(DS2Byline)
+}
+
 // firstRecord2 returns the first string value of the given Record 2 dataset.
 func (i *IPTC) firstRecord2(ds uint8) string {
 	if i == nil {

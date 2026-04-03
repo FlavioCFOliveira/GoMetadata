@@ -199,3 +199,14 @@ func TestInjectPassThrough(t *testing.T) {
 		t.Error("pass-through inject should not modify the data")
 	}
 }
+
+func BenchmarkTIFFExtract(b *testing.B) {
+	iptc := []byte("some-iptc-payload-data-for-benchmarking")
+	xmp := []byte("<xmpmeta xmlns:x=\"adobe:ns:meta/\"/>")
+	data := buildMinimalTIFF(binary.LittleEndian, iptc, xmp)
+	b.SetBytes(int64(len(data)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _, _ = Extract(bytes.NewReader(data))
+	}
+}

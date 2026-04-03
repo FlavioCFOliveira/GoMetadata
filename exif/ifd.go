@@ -3,6 +3,7 @@ package exif
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"sort"
 )
 
@@ -175,6 +176,50 @@ func (e *IFDEntry) Rational(i int) [2]uint32 {
 		e.byteOrder.Uint32(e.Value[off:]),
 		e.byteOrder.Uint32(e.Value[off+4:]),
 	}
+}
+
+// Int16 decodes the first SSHORT value.
+func (e *IFDEntry) Int16() int16 {
+	if e.Type != TypeSShort || len(e.Value) < 2 {
+		return 0
+	}
+	return int16(e.byteOrder.Uint16(e.Value))
+}
+
+// Int32 decodes the first SLONG value.
+func (e *IFDEntry) Int32() int32 {
+	if e.Type != TypeSLong || len(e.Value) < 4 {
+		return 0
+	}
+	return int32(e.byteOrder.Uint32(e.Value))
+}
+
+// Float32 decodes the first FLOAT value (IEEE 754 single-precision).
+func (e *IFDEntry) Float32() float32 {
+	if e.Type != TypeFloat || len(e.Value) < 4 {
+		return 0
+	}
+	bits := e.byteOrder.Uint32(e.Value)
+	return math.Float32frombits(bits)
+}
+
+// Float64 decodes the first DOUBLE value (IEEE 754 double-precision).
+func (e *IFDEntry) Float64() float64 {
+	if e.Type != TypeDouble || len(e.Value) < 8 {
+		return 0
+	}
+	bits := e.byteOrder.Uint64(e.Value)
+	return math.Float64frombits(bits)
+}
+
+// Bytes returns the raw value bytes, suitable for TypeUndefined and TypeByte.
+func (e *IFDEntry) Bytes() []byte {
+	return e.Value
+}
+
+// Len returns the number of values in the entry (Count field).
+func (e *IFDEntry) Len() int {
+	return int(e.Count)
 }
 
 // --- helpers used by encode ---
