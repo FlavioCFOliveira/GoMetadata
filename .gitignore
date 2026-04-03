@@ -1,0 +1,6 @@
+# Test corpus — downloaded locally via 'make testdata', not committed
+testdata/corpus/**/*
+!testdata/corpus/**/.gitkeep
+
+# Go test artifacts
+cover.out

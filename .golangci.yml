@@ -1,0 +1,24 @@
+version: "2"
+
+linters:
+  enable:
+    - staticcheck
+    - govet
+    - errcheck
+    - revive
+    - gocritic
+    - ineffassign
+    - prealloc
+    - unparam
+
+linters-settings:
+  revive:
+    rules:
+      - name: exported
+        severity: warning
+
+issues:
+  exclude-rules:
+    # Tag and namespace registries are legitimately package-level state.
+    - linters: [gochecknoglobals]
+      text: "tagRegistry|namespaceRegistry"
