@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/flaviocfo/img-metadata/format"
@@ -272,7 +273,9 @@ func BenchmarkReadFile(b *testing.B) {
 		if err != nil || d.IsDir() || target != "" {
 			return nil
 		}
-		target = path
+		if ext := strings.ToLower(filepath.Ext(path)); ext == ".jpg" || ext == ".jpeg" {
+			target = path
+		}
 		return nil
 	})
 	if target == "" {
