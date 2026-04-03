@@ -43,6 +43,14 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 // Inject writes a modified TIFF stream to w, replacing the metadata tags.
 // When rawIPTC or rawXMP is non-nil, the TIFF is parsed and IFD0 is updated
 // with the new values before re-encoding (affects CR2, NEF, ARW, DNG via delegation).
+//
+// Round-trip fidelity: all IFD entries whose TIFF type code is defined in
+// TIFF 6.0 §2 are faithfully preserved, including private tags with known
+// types. Entries using undefined/proprietary type codes retain their 4-byte
+// IFD field but any out-of-line data they referenced is not copied (see
+// exif.Encode documentation). If exif.Parse fails (e.g. because the caller
+// passed a non-standard TIFF variant that cannot be decoded), Inject returns
+// the parse error rather than silently discarding the requested metadata.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("tiff: seek: %w", err)
@@ -67,12 +75,11 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	}
 
 	// Parse the TIFF, upsert IPTC/XMP entries in IFD0, and re-encode.
+	// If parsing fails we cannot safely inject metadata; return the error so
+	// the caller knows the update was not applied rather than silently losing it.
 	e, err := exif.Parse(base)
 	if err != nil {
-		// Parsing failed (e.g. non-standard TIFF variant); fall back to
-		// writing the base unchanged rather than losing the file.
-		_, werr := w.Write(base)
-		return werr
+		return fmt.Errorf("tiff: parse for metadata injection: %w", err)
 	}
 
 	if rawIPTC != nil {

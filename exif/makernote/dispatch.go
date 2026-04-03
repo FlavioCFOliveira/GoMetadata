@@ -4,10 +4,15 @@ package makernote
 
 import (
 	"github.com/flaviocfo/img-metadata/exif/makernote/canon"
+	"github.com/flaviocfo/img-metadata/exif/makernote/dji"
 	"github.com/flaviocfo/img-metadata/exif/makernote/fujifilm"
+	"github.com/flaviocfo/img-metadata/exif/makernote/leica"
 	"github.com/flaviocfo/img-metadata/exif/makernote/nikon"
 	"github.com/flaviocfo/img-metadata/exif/makernote/olympus"
+	"github.com/flaviocfo/img-metadata/exif/makernote/panasonic"
 	"github.com/flaviocfo/img-metadata/exif/makernote/pentax"
+	"github.com/flaviocfo/img-metadata/exif/makernote/samsung"
+	"github.com/flaviocfo/img-metadata/exif/makernote/sigma"
 	"github.com/flaviocfo/img-metadata/exif/makernote/sony"
 )
 
@@ -31,8 +36,18 @@ func Dispatch(make string) Parser {
 		return fujifilm.Parser{}
 	case "OLYMPUS IMAGING CORP.", "OLYMPUS CORPORATION", "Olympus":
 		return olympus.Parser{}
-	case "PENTAX Corporation", "Ricoh":
+	case "PENTAX Corporation", "Ricoh", "RICOH":
 		return pentax.Parser{}
+	case "Panasonic":
+		return panasonic.Parser{}
+	case "LEICA CAMERA AG", "Leica Camera AG", "LEICA", "Leica":
+		return leica.Parser{}
+	case "DJI":
+		return dji.Parser{}
+	case "SAMSUNG":
+		return samsung.Parser{}
+	case "SIGMA":
+		return sigma.Parser{}
 	}
 	return nil
 }

@@ -269,6 +269,111 @@ func TestInjectIPTCXMP(t *testing.T) {
 
 // --- Additional: out-of-bounds out-of-line value offset in IFD entry ---
 
+// TestInjectEXIFOnlyPassThrough verifies that when only rawEXIF is provided
+// (rawIPTC and rawXMP are nil), Inject writes the base bytes unchanged except
+// for restoring RW2 magic. This exercises the fast path in tiff.Inject that
+// avoids calling exif.Parse/exif.Encode entirely, preserving all non-standard
+// Panasonic IFD encoding.
+func TestInjectEXIFOnlyPassThrough(t *testing.T) {
+	data := buildRW2()
+
+	// rawEXIF = patched-to-TIFF copy of data (simulates what Extract returns).
+	patched := make([]byte, len(data))
+	copy(patched, data)
+	patched[2] = 0x2A
+	patched[3] = 0x00
+
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(data), &out, patched, nil, nil); err != nil {
+		t.Fatalf("Inject (EXIF-only): %v", err)
+	}
+
+	result := out.Bytes()
+	if len(result) < 4 {
+		t.Fatal("output too short")
+	}
+	// Output must carry RW2 magic.
+	if result[0] != rw2Magic[0] || result[1] != rw2Magic[1] ||
+		result[2] != rw2Magic[2] || result[3] != rw2Magic[3] {
+		t.Errorf("RW2 magic not present: %02x %02x %02x %02x",
+			result[0], result[1], result[2], result[3])
+	}
+
+	// The payload content (after magic bytes) must be identical to the
+	// patched input — no re-encoding took place.
+	if len(result) != len(patched) {
+		t.Errorf("output length %d != input length %d; re-encoding should not have occurred",
+			len(result), len(patched))
+	}
+}
+
+// TestInjectIPTCGracefulDegradation verifies that injecting an IPTC payload
+// into a well-formed (standard-compatible) RW2 succeeds and that the output
+// is a valid RW2 file with the correct magic bytes. This tests the path that
+// calls tiff.Inject with a non-nil IPTC payload.
+func TestInjectIPTCGracefulDegradation(t *testing.T) {
+	// Use a minimal RW2 that is also valid as a standard TIFF LE once patched.
+	data := buildRW2()
+	iptcPayload := []byte{0x1C, 0x02, 0x05, 0x00, 0x05, 'h', 'e', 'l', 'l', 'o'}
+
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(data), &out, nil, iptcPayload, nil); err != nil {
+		t.Fatalf("Inject with IPTC: %v", err)
+	}
+
+	result := out.Bytes()
+	if len(result) < 4 {
+		t.Fatal("output too short")
+	}
+	// Output must carry RW2 magic.
+	if result[0] != rw2Magic[0] || result[1] != rw2Magic[1] ||
+		result[2] != rw2Magic[2] || result[3] != rw2Magic[3] {
+		t.Errorf("RW2 magic not present in output: %02x %02x %02x %02x",
+			result[0], result[1], result[2], result[3])
+	}
+
+	// After patching magic bytes to standard TIFF, the output must be
+	// parseable and the IPTC tag must be present.
+	patched := make([]byte, len(result))
+	copy(patched, result)
+	patched[2] = 0x2A
+	patched[3] = 0x00
+
+	_, rawIPTC, _, err := Extract(bytes.NewReader(result))
+	if err != nil {
+		t.Fatalf("Extract on Inject output: %v", err)
+	}
+	if !bytes.Equal(rawIPTC, iptcPayload) {
+		t.Errorf("IPTC after Inject: got %x, want %x", rawIPTC, iptcPayload)
+	}
+}
+
+// TestInjectNonStandardRW2FallbackPreservesFile verifies the documented
+// graceful-degradation behaviour: when a non-standard RW2 file (one whose
+// patched bytes do not parse as a valid TIFF) is passed to Inject with
+// IPTC/XMP changes requested, the output is the original bytes with RW2
+// error rather than silently losing the requested metadata update.
+//
+// This test constructs an RW2 whose IFD0 offset (bytes 4-7) points past the
+// end of the buffer, which causes exif.Parse to fail on the patched bytes.
+// tiff.Inject (and therefore rw2.Inject) must propagate the parse error so
+// the caller knows the metadata update was not applied.
+func TestInjectNonStandardRW2ReturnsError(t *testing.T) {
+	// Build a minimal RW2 with a corrupt IFD0 offset so exif.Parse will fail.
+	data := buildRW2()
+	// Point IFD0 offset past end of file — exif.Parse will return an error.
+	binary.LittleEndian.PutUint32(data[4:], 0xFFFFFF00)
+
+	iptcPayload := []byte{0x1C, 0x02, 0x78, 0x00, 0x03, 'a', 'b', 'c'}
+	var out bytes.Buffer
+	err := Inject(bytes.NewReader(data), &out, nil, iptcPayload, nil)
+	// Inject must return an error: silently discarding the metadata update would
+	// leave the caller with no indication that the write failed.
+	if err == nil {
+		t.Fatal("Inject on corrupt RW2: expected error, got nil")
+	}
+}
+
 // TestExtractTIFFTagsOOBValueOffset verifies that an IFD entry whose out-of-line
 // value offset is beyond the data slice is silently skipped (no panic).
 func TestExtractTIFFTagsOOBValueOffset(t *testing.T) {

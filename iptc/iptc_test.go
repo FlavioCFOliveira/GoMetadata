@@ -456,6 +456,69 @@ func TestIPTCRecordsBeyond2(t *testing.T) {
 	}
 }
 
+// TestEncodeExtendedLengthRoundTrip verifies that a dataset whose value exceeds
+// 32767 bytes (0x8000) is correctly encoded using IIM §1.6.2 extended length
+// encoding and round-trips back through Parse without data loss.
+func TestEncodeExtendedLengthRoundTrip(t *testing.T) {
+	// Build a value that requires extended length: 40 000 bytes.
+	const valueLen = 40_000
+	large := make([]byte, valueLen)
+	for i := range large {
+		large[i] = byte(i & 0xFF)
+	}
+
+	i := &IPTC{Records: make(map[uint8][]Dataset)}
+	i.Records[2] = []Dataset{
+		{Record: 2, DataSet: DS2Caption, Value: large},
+	}
+
+	encoded, err := Encode(i)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	// Verify the extended length prefix in the encoded stream.
+	// After marker(0x1C) + record(1) + dataset(1) = 3 bytes offset:
+	//   byte 3: 0x80 (bit 15 set, upper 7 bits of byte-count = 0)
+	//   byte 4: 0x04 (lower 8 bits of byte-count = 4)
+	//   bytes 5-8: big-endian uint32 = valueLen
+	if len(encoded) < 9 {
+		t.Fatalf("encoded length %d too short to contain extended header", len(encoded))
+	}
+	if encoded[0] != 0x1C {
+		t.Errorf("encoded[0] = 0x%02X, want 0x1C (tag marker)", encoded[0])
+	}
+	if encoded[3] != 0x80 {
+		t.Errorf("encoded[3] (size high) = 0x%02X, want 0x80", encoded[3])
+	}
+	if encoded[4] != 0x04 {
+		t.Errorf("encoded[4] (size low / byte-count) = 0x%02X, want 0x04", encoded[4])
+	}
+	encodedLen := int(encoded[5])<<24 | int(encoded[6])<<16 | int(encoded[7])<<8 | int(encoded[8])
+	if encodedLen != valueLen {
+		t.Errorf("extended length field = %d, want %d", encodedLen, valueLen)
+	}
+
+	// Parse the encoded stream and verify the value survives round-trip.
+	i2, err := Parse(encoded)
+	if err != nil {
+		t.Fatalf("Parse (round-trip): %v", err)
+	}
+	datasets := i2.Records[2]
+	if len(datasets) == 0 {
+		t.Fatal("Records[2] is empty after round-trip")
+	}
+	got := datasets[0].Value
+	if len(got) != valueLen {
+		t.Fatalf("round-trip value length = %d, want %d", len(got), valueLen)
+	}
+	for j, b := range got {
+		if b != large[j] {
+			t.Fatalf("value mismatch at byte %d: got 0x%02X, want 0x%02X", j, b, large[j])
+		}
+	}
+}
+
 func BenchmarkIPTCParse(b *testing.B) {
 	raw := buildIPTC([]struct {
 		rec uint8

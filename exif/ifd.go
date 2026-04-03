@@ -5,9 +5,17 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"sync"
 
 	"github.com/flaviocfo/img-metadata/internal/metaerr"
 )
+
+// visitedPool recycles the maps used by traverse() to track visited IFD
+// offsets. Reusing these maps avoids one allocation per Parse call on the
+// hot path. The map is cleared before being returned to the pool.
+var visitedPool = sync.Pool{
+	New: func() any { return make(map[uint32]bool) },
+}
 
 // IFD represents a TIFF Image File Directory (TIFF §2).
 type IFD struct {
@@ -41,7 +49,14 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, error) {
 	}
 
 	// visited tracks offsets we have already started parsing to detect cycles.
-	visited := make(map[uint32]bool)
+	// Obtained from visitedPool to avoid a per-call allocation on the hot path.
+	visited := visitedPool.Get().(map[uint32]bool)
+	defer func() {
+		for k := range visited {
+			delete(visited, k)
+		}
+		visitedPool.Put(visited)
+	}()
 
 	var root, current *IFD
 	cur := offset

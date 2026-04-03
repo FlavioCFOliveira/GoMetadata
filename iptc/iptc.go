@@ -56,8 +56,10 @@ func Parse(b []byte) (*IPTC, error) {
 
 		var length int
 		if sizeHigh&0x80 != 0 {
-			// Extended length: (sizeHigh & 0x7F) is the byte count for length.
-			nBytes := int(sizeHigh & 0x7F)
+			// Extended length encoding (IIM §1.6.2): bit 15 of the 2-byte size
+			// field is set. The remaining 15 bits carry the byte count for the
+			// actual length value: nBytes = (sizeHigh & 0x7F) << 8 | sizeLow.
+			nBytes := int(sizeHigh&0x7F)<<8 | int(sizeLow)
 			if nBytes < 1 || nBytes > 4 || pos+nBytes > len(b) {
 				break
 			}
@@ -126,10 +128,14 @@ func Encode(i *IPTC) ([]byte, error) {
 			buf.WriteByte(ds.DataSet)
 			n := len(ds.Value)
 			if n >= 0x8000 {
-				// Extended length encoding (IIM §1.6.2): 0x80|4 signals a
-				// 4-byte length field follows.
-				buf.WriteByte(0x84)
-				buf.WriteByte(0x00) // placeholder — the 2-byte field is consumed
+				// Extended length encoding (IIM §1.6.2): the 2-byte size field
+				// has bit 15 set; the remaining 15 bits encode the byte count
+				// for the actual length. We use a 4-byte length (0x0004):
+				//   high byte = 0x80 | (4 >> 8) = 0x80
+				//   low byte  = 4 & 0xFF        = 0x04
+				// followed by the 4-byte big-endian length value.
+				buf.WriteByte(0x80) // bit 15 set; upper 7 bits of count = 0
+				buf.WriteByte(0x04) // lower 8 bits of count = 4
 				buf.WriteByte(byte(n >> 24))
 				buf.WriteByte(byte(n >> 16))
 				buf.WriteByte(byte(n >> 8))

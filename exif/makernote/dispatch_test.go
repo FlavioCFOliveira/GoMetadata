@@ -91,7 +91,7 @@ func TestDispatchOlympus(t *testing.T) {
 }
 
 func TestDispatchPentax(t *testing.T) {
-	for _, make := range []string{"PENTAX Corporation", "Ricoh"} {
+	for _, make := range []string{"PENTAX Corporation", "Ricoh", "RICOH"} {
 		p := Dispatch(make)
 		if p == nil {
 			t.Fatalf("expected non-nil parser for %q", make)
@@ -105,4 +105,67 @@ func TestDispatchPentax(t *testing.T) {
 			t.Errorf("Pentax Parse returned non-nil result for stub: %v", result)
 		}
 	}
+}
+
+func TestDispatchPanasonic(t *testing.T) {
+	p := Dispatch("Panasonic")
+	if p == nil {
+		t.Fatal("expected non-nil parser for Panasonic")
+	}
+	result, err := p.Parse([]byte("Panasonic\x00\x00\x00" + "short"))
+	if err != nil {
+		t.Errorf("Panasonic Parse returned error: %v", err)
+	}
+	// Too short to contain valid IFD.
+	_ = result
+}
+
+func TestDispatchLeica(t *testing.T) {
+	for _, make := range []string{"LEICA CAMERA AG", "Leica Camera AG", "LEICA", "Leica"} {
+		p := Dispatch(make)
+		if p == nil {
+			t.Fatalf("expected non-nil parser for %q", make)
+		}
+		result, err := p.Parse([]byte{0x00, 0x00})
+		if err != nil {
+			t.Errorf("Leica Parse returned error: %v", err)
+		}
+		_ = result
+	}
+}
+
+func TestDispatchDJI(t *testing.T) {
+	p := Dispatch("DJI")
+	if p == nil {
+		t.Fatal("expected non-nil parser for DJI")
+	}
+	result, err := p.Parse([]byte{0x00, 0x00})
+	if err != nil {
+		t.Errorf("DJI Parse returned error: %v", err)
+	}
+	_ = result
+}
+
+func TestDispatchSamsung(t *testing.T) {
+	p := Dispatch("SAMSUNG")
+	if p == nil {
+		t.Fatal("expected non-nil parser for SAMSUNG")
+	}
+	result, err := p.Parse([]byte{0x00, 0x00})
+	if err != nil {
+		t.Errorf("Samsung Parse returned error: %v", err)
+	}
+	_ = result
+}
+
+func TestDispatchSigma(t *testing.T) {
+	p := Dispatch("SIGMA")
+	if p == nil {
+		t.Fatal("expected non-nil parser for SIGMA")
+	}
+	result, err := p.Parse([]byte("SIGMA\x00\x00\x00short"))
+	if err != nil {
+		t.Errorf("Sigma Parse returned error: %v", err)
+	}
+	_ = result
 }

@@ -14,6 +14,13 @@ import "encoding/binary"
 //   - Olympus Type 2: "OLYMPUS\0" prefix, byte order at [8..9], IFD at 12
 //   - Pentax AOC: "AOC\0" prefix, big-endian IFD at offset 6
 //   - Pentax PENTAX: "PENTAX \0" prefix, byte order at [8..9], IFD at 12
+//   - Panasonic: "Panasonic\0\0\0" prefix, LE IFD at offset 12
+//   - Leica Type 0: plain IFD at offset 0, parent byte order
+//   - Leica Type 1–5: "LEICA\0" prefix, IFD at offset 8
+//   - DJI: plain IFD at offset 0, LE (drones and action cameras)
+//   - Samsung: plain IFD at offset 0, parent byte order
+//   - Sigma: "SIGMA\0\0\0" or "FOVEON\0\0" prefix, LE IFD at offset 10
+//   - Casio: plain IFD at offset 0, parent byte order
 func parseMakerNoteIFD(b []byte, make string, parentOrder binary.ByteOrder) *IFD {
 	switch make {
 	case "Canon":
@@ -26,8 +33,20 @@ func parseMakerNoteIFD(b []byte, make string, parentOrder binary.ByteOrder) *IFD
 		return parseFujifilmMakerNote(b)
 	case "OLYMPUS IMAGING CORP.", "OLYMPUS CORPORATION", "Olympus":
 		return parseOlympusMakerNote(b)
-	case "PENTAX Corporation", "Ricoh":
+	case "PENTAX Corporation", "Ricoh", "RICOH":
 		return parsePentaxMakerNote(b)
+	case "Panasonic":
+		return parsePanasonicMakerNote(b)
+	case "LEICA CAMERA AG", "Leica Camera AG", "LEICA", "Leica":
+		return parseLeicaMakerNote(b, parentOrder)
+	case "DJI":
+		return parseDJIMakerNote(b, parentOrder)
+	case "SAMSUNG":
+		return parseSamsungMakerNote(b, parentOrder)
+	case "SIGMA":
+		return parseSigmaMakerNote(b)
+	case "CASIO COMPUTER CO.,LTD.", "Casio Computer Co.,Ltd.", "CASIO":
+		return parseCasioMakerNote(b, parentOrder)
 	}
 	return nil
 }
@@ -226,4 +245,128 @@ func parsePentaxMakerNote(b []byte) *IFD {
 		return ifd
 	}
 	return nil
+}
+
+// parsePanasonicMakerNote parses a Panasonic MakerNote.
+//
+// Panasonic MakerNote layout (ExifTool Panasonic.pm):
+//
+//	[0..11]  "Panasonic\x00\x00\x00"  12-byte magic prefix
+//	[12..]   little-endian IFD; value offsets relative to b[0]
+func parsePanasonicMakerNote(b []byte) *IFD {
+	const magic = "Panasonic\x00\x00\x00"
+	if len(b) < len(magic)+2 {
+		return nil
+	}
+	if string(b[:len(magic)]) != magic {
+		return nil
+	}
+	ifd, err := traverse(b, 12, binary.LittleEndian)
+	if err != nil {
+		return nil
+	}
+	return ifd
+}
+
+// parseLeicaMakerNote parses a Leica MakerNote.
+//
+// Two sub-formats are handled (ExifTool Leica.pm):
+//
+//   - Type 0: plain IFD at offset 0, parent byte order.
+//     Used by M8, M9, X1, X2, and most rangefinder cameras.
+//
+//   - Type 1–5: "LEICA\x00" prefix (6 bytes) + 2-byte sub-type, IFD at offset 8.
+//     Used by S2, M Monochrom, and later S-series.
+func parseLeicaMakerNote(b []byte, parentOrder binary.ByteOrder) *IFD {
+	if len(b) < 2 {
+		return nil
+	}
+	// Detect "LEICA\x00" prefix.
+	if len(b) >= 8 && b[0] == 'L' && b[1] == 'E' && b[2] == 'I' &&
+		b[3] == 'C' && b[4] == 'A' && b[5] == 0x00 {
+		ifd, err := traverse(b, 8, binary.LittleEndian)
+		if err != nil {
+			return nil
+		}
+		return ifd
+	}
+	// Type 0: plain IFD at offset 0, parent byte order.
+	ifd, err := traverse(b, 0, parentOrder)
+	if err != nil {
+		return nil
+	}
+	return ifd
+}
+
+// parseDJIMakerNote parses a DJI drone MakerNote.
+//
+// DJI MakerNote is a plain TIFF IFD at offset 0, little-endian.
+// Used by Phantom, Mavic, Mini, Air, and Zenmuse series (ExifTool DJI.pm).
+func parseDJIMakerNote(b []byte, parentOrder binary.ByteOrder) *IFD {
+	if len(b) < 6 {
+		return nil
+	}
+	// DJI cameras use little-endian; fall back to parent order.
+	ifd, err := traverse(b, 0, binary.LittleEndian)
+	if err != nil {
+		ifd, err = traverse(b, 0, parentOrder)
+		if err != nil {
+			return nil
+		}
+	}
+	return ifd
+}
+
+// parseSamsungMakerNote parses a Samsung MakerNote.
+//
+// Samsung NX and Galaxy camera MakerNote is a plain TIFF IFD at offset 0,
+// parent byte order (ExifTool Samsung.pm).
+func parseSamsungMakerNote(b []byte, parentOrder binary.ByteOrder) *IFD {
+	if len(b) < 6 {
+		return nil
+	}
+	ifd, err := traverse(b, 0, parentOrder)
+	if err != nil {
+		return nil
+	}
+	return ifd
+}
+
+// parseSigmaMakerNote parses a Sigma MakerNote.
+//
+// Sigma MakerNote layout (ExifTool Sigma.pm):
+//
+//	[0..7]   "SIGMA\x00\x00\x00" or "FOVEON\x00\x00" magic
+//	[8..9]   version (2 bytes, ignored)
+//	[10..]   little-endian IFD; value offsets relative to b[0]
+func parseSigmaMakerNote(b []byte) *IFD {
+	if len(b) < 10 {
+		return nil
+	}
+	switch {
+	case string(b[:8]) == "SIGMA\x00\x00\x00":
+	case string(b[:8]) == "FOVEON\x00\x00":
+	default:
+		return nil
+	}
+	ifd, err := traverse(b, 10, binary.LittleEndian)
+	if err != nil {
+		return nil
+	}
+	return ifd
+}
+
+// parseCasioMakerNote parses a Casio MakerNote.
+//
+// Casio MakerNote is a plain TIFF IFD at offset 0, parent byte order.
+// Used by Casio Exilim and older Casio camera series (ExifTool Casio.pm).
+func parseCasioMakerNote(b []byte, parentOrder binary.ByteOrder) *IFD {
+	if len(b) < 6 {
+		return nil
+	}
+	ifd, err := traverse(b, 0, parentOrder)
+	if err != nil {
+		return nil
+	}
+	return ifd
 }
