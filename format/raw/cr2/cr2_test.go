@@ -48,3 +48,14 @@ func TestInjectRoundTrip(t *testing.T) {
 		t.Error("rawEXIF is nil after round-trip")
 	}
 }
+
+// BenchmarkCR2Extract measures the cost of extracting metadata from a minimal
+// TIFF/CR2 byte stream.
+func BenchmarkCR2Extract(b *testing.B) {
+	data := minimalTIFF()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _, _ = Extract(bytes.NewReader(data))
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // XMP holds the parsed XMP properties organised by namespace URI.
@@ -154,6 +155,53 @@ func (x *XMP) Creator() string {
 		return ""
 	}
 	return x.firstValue(NSdc, "creator")
+}
+
+// Get returns the property value for the given namespace URI and local name.
+// Returns "" when the property is absent.
+func (x *XMP) Get(ns, local string) string {
+	return x.get(ns, local)
+}
+
+// SetCaption sets dc:description to s (XMP §8.3).
+func (x *XMP) SetCaption(s string) { x.set(NSdc, "description", s) }
+
+// SetCopyright sets dc:rights to s (XMP §8.3).
+func (x *XMP) SetCopyright(s string) { x.set(NSdc, "rights", s) }
+
+// SetCreator sets dc:creator to s (XMP §8.3).
+func (x *XMP) SetCreator(s string) { x.set(NSdc, "creator", s) }
+
+// AddKeyword appends kw to dc:subject (XMP §8.3).
+// Multiple keywords are stored joined with U+001E (record separator), matching
+// the convention used by Keywords() and the RDF encoder.
+func (x *XMP) AddKeyword(kw string) {
+	existing := x.get(NSdc, "subject")
+	if existing == "" {
+		x.set(NSdc, "subject", kw)
+	} else {
+		x.set(NSdc, "subject", existing+"\x1e"+kw)
+	}
+}
+
+// SetCameraModel sets tiff:Model to s (XMP §8.4).
+func (x *XMP) SetCameraModel(s string) { x.set(NStiff, "Model", s) }
+
+// SetDateTimeOriginal sets exif:DateTimeOriginal to t formatted as RFC 3339
+// (XMP §8.4 / ISO 8601).
+func (x *XMP) SetDateTimeOriginal(t time.Time) {
+	x.set(NSexif, "DateTimeOriginal", t.Format(time.RFC3339))
+}
+
+// set writes value to Properties[ns][local], initialising inner maps as needed.
+func (x *XMP) set(ns, local, value string) {
+	if x.Properties == nil {
+		x.Properties = make(map[string]map[string]string)
+	}
+	if x.Properties[ns] == nil {
+		x.Properties[ns] = make(map[string]string)
+	}
+	x.Properties[ns][local] = value
 }
 
 // get returns the property value for the given namespace URI and local name.

@@ -43,6 +43,19 @@ func encode(e *EXIF) ([]byte, error) {
 		if e.InteropIFD != nil {
 			exifIFDEntries = append(exifIFDEntries, zeroPtr(TagInteropIFDPointer))
 		}
+		// Preserve raw MakerNote bytes verbatim when the ExifIFD no longer
+		// contains a TagMakerNote entry (e.g., it was removed during re-parse).
+		// We do NOT re-serialise MakerNoteIFD because MakerNote offsets are often
+		// relative to the parent TIFF start, making them non-portable when moved.
+		if e.MakerNote != nil && !hasEntry(exifIFDEntries, TagMakerNote) {
+			exifIFDEntries = append(exifIFDEntries, IFDEntry{
+				Tag:       TagMakerNote,
+				Type:      TypeUndefined,
+				Count:     uint32(len(e.MakerNote)),
+				Value:     e.MakerNote,
+				byteOrder: order,
+			})
+		}
 		sortEntries(exifIFDEntries)
 	}
 

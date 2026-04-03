@@ -260,6 +260,16 @@ func filterEntries(ifd *IFD, exclude ...TagID) []IFDEntry {
 	return result
 }
 
+// hasEntry reports whether entries contains an entry with the given tag.
+func hasEntry(entries []IFDEntry, tag TagID) bool {
+	for _, e := range entries {
+		if e.Tag == tag {
+			return true
+		}
+	}
+	return false
+}
+
 // sortEntries sorts entries by tag ID in ascending order (TIFF §7 requirement).
 func sortEntries(entries []IFDEntry) {
 	sort.Slice(entries, func(i, j int) bool {

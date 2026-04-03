@@ -65,11 +65,23 @@ func detectMagic(b []byte) FormatID {
 }
 
 // detectHEIFBrand maps the four-byte ftyp brand to a FormatID.
+// Recognised brands (ISO 23008-12 and CR3 spec):
+//   - CR3:  'crx '
+//   - AVIF: 'avif', 'avis', 'av01' (ISO 23008-12 §B.4)
+//   - HEIF/HEIC: all others (heic, mif1, msf1, etc.)
 func detectHEIFBrand(brand []byte) FormatID {
-	// All ISOBMFF-based RAW and still-image formats use HEIF detection.
+	if len(brand) < 4 {
+		return FormatHEIF
+	}
 	// CR3 uses the 'crx ' brand.
-	if len(brand) >= 4 && brand[0] == 0x63 && brand[1] == 0x72 && brand[2] == 0x78 {
+	if brand[0] == 0x63 && brand[1] == 0x72 && brand[2] == 0x78 {
 		return FormatCR3
+	}
+	// AVIF brands per ISO 23008-12 §B.4 — still map to FormatHEIF since the
+	// library has no separate FormatAVIF, but the detection is now explicit.
+	if brand[0] == 0x61 && brand[1] == 0x76 &&
+		(brand[2] == 0x69 || brand[2] == 0x30) { // 'avi' → avif/avis; 'av0' → av01
+		return FormatHEIF
 	}
 	return FormatHEIF
 }

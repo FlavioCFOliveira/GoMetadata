@@ -48,3 +48,14 @@ func TestInjectRoundTrip(t *testing.T) {
 		t.Error("rawEXIF is nil after round-trip")
 	}
 }
+
+// BenchmarkDNGExtract measures the cost of extracting metadata from a minimal
+// TIFF/DNG byte stream.
+func BenchmarkDNGExtract(b *testing.B) {
+	data := minimalTIFF()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _, _ = Extract(bytes.NewReader(data))
+	}
+}

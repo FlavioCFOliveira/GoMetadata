@@ -31,18 +31,27 @@ func encode(x *XMP) ([]byte, error) {
 		for local, val := range props {
 			values := strings.Split(val, "\x1e")
 			if len(values) > 1 {
-				// Multi-valued → rdf:Alt (XMP §7.5).
+				// Multi-valued: use the per-property collection type (ISO 16684-1 §7.5).
+				ctype := collectionType(ns, local)
 				buf.WriteString("   <")
 				buf.WriteString(prefix)
 				buf.WriteByte(':')
 				buf.WriteString(local)
-				buf.WriteString(">\n    <rdf:Alt>\n")
+				buf.WriteString(">\n    <rdf:")
+				buf.WriteString(ctype)
+				buf.WriteString(">\n")
 				for _, v := range values {
-					buf.WriteString("     <rdf:li xml:lang=\"x-default\">")
+					if ctype == "Alt" {
+						buf.WriteString("     <rdf:li xml:lang=\"x-default\">")
+					} else {
+						buf.WriteString("     <rdf:li>")
+					}
 					xml.EscapeText(&buf, []byte(v)) //nolint:errcheck
 					buf.WriteString("</rdf:li>\n")
 				}
-				buf.WriteString("    </rdf:Alt>\n   </")
+				buf.WriteString("    </rdf:")
+				buf.WriteString(ctype)
+				buf.WriteString(">\n   </")
 				buf.WriteString(prefix)
 				buf.WriteByte(':')
 				buf.WriteString(local)

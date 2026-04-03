@@ -3,6 +3,7 @@ package imgmetadata
 import (
 	"bytes"
 	"encoding/binary"
+	"os"
 	"testing"
 
 	"github.com/flaviocfo/img-metadata/format"
@@ -103,5 +104,129 @@ func TestUnsupportedFormat(t *testing.T) {
 	}
 	if _, ok := err.(*UnsupportedFormatError); !ok {
 		t.Errorf("expected *UnsupportedFormatError, got %T: %v", err, err)
+	}
+}
+
+func TestNewMetadata(t *testing.T) {
+	m := NewMetadata(format.FormatJPEG)
+	if m == nil {
+		t.Fatal("NewMetadata returned nil")
+	}
+	if got := m.Format(); got != format.FormatJPEG {
+		t.Errorf("Format() = %v, want FormatJPEG", got)
+	}
+	if m.EXIF != nil || m.IPTC != nil || m.XMP != nil {
+		t.Error("NewMetadata: expected nil EXIF/IPTC/XMP")
+	}
+}
+
+func TestValidate(t *testing.T) {
+	// Valid: unknown format reports error.
+	m := &Metadata{}
+	if err := m.Validate(); err == nil {
+		t.Error("Validate on FormatUnknown: expected error, got nil")
+	}
+
+	// Valid metadata with known format.
+	m2 := NewMetadata(format.FormatJPEG)
+	if err := m2.Validate(); err != nil {
+		t.Errorf("Validate on valid Metadata: unexpected error: %v", err)
+	}
+}
+
+func TestSupportsWrite(t *testing.T) {
+	writable := []format.FormatID{
+		format.FormatJPEG, format.FormatTIFF, format.FormatPNG, format.FormatHEIF,
+		format.FormatWebP, format.FormatCR2, format.FormatCR3, format.FormatNEF,
+		format.FormatARW, format.FormatDNG, format.FormatORF, format.FormatRW2,
+	}
+	for _, f := range writable {
+		if !format.SupportsWrite(f) {
+			t.Errorf("SupportsWrite(%v) = false, want true", f)
+		}
+	}
+	if format.SupportsWrite(format.FormatUnknown) {
+		t.Error("SupportsWrite(FormatUnknown) = true, want false")
+	}
+}
+
+// TestReadFileNotFound verifies that ReadFile propagates the OS "not found"
+// error unchanged so callers can use os.IsNotExist.
+func TestReadFileNotFound(t *testing.T) {
+	_, err := ReadFile("/nonexistent/definitely-does-not-exist/file.jpg")
+	if err == nil {
+		t.Fatal("expected error for non-existent path, got nil")
+	}
+	if !os.IsNotExist(err) {
+		t.Errorf("os.IsNotExist(err) = false; err = %v", err)
+	}
+}
+
+// TestReadFilePermDenied verifies that ReadFile propagates the OS "permission
+// denied" error so callers can use os.IsPermission.
+func TestReadFilePermDenied(t *testing.T) {
+	// Skip when running as root because root can read any file.
+	if os.Getuid() == 0 {
+		t.Skip("running as root: permission checks are not enforced")
+	}
+
+	f, err := os.CreateTemp("", "imgmetadata-perm-test-denied-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := f.Name()
+	f.Close()
+	defer os.Remove(path)
+
+	if err := os.Chmod(path, 0000); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = ReadFile(path)
+	if err == nil {
+		t.Fatal("expected permission error, got nil")
+	}
+	if !os.IsPermission(err) {
+		t.Errorf("os.IsPermission(err) = false; err = %v", err)
+	}
+}
+
+func TestWriteFilePreservesPermissions(t *testing.T) {
+	// Write a minimal JPEG to a temp file with mode 0644, then WriteFile it and
+	// assert the mode is preserved after the atomic rename.
+	jpeg := buildMinimalJPEG(minimalTIFFPayload())
+
+	f, err := os.CreateTemp("", "imgmetadata-perm-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := f.Name()
+	defer os.Remove(path)
+
+	if _, err := f.Write(jpeg); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+
+	want := os.FileMode(0644)
+	if err := os.Chmod(path, want); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if err := WriteFile(path, m); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode(); got != want {
+		t.Errorf("file mode after WriteFile: got %v, want %v", got, want)
 	}
 }

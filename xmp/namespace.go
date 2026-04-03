@@ -17,6 +17,21 @@ const (
 	NSx         = "adobe:ns:meta/"
 )
 
+// collectionType returns the RDF collection element name (Bag, Seq, or Alt)
+// for the given namespace URI and local property name per ISO 16684-1 §7.5.
+// Defaults to "Bag" for unrecognised properties.
+func collectionType(ns, local string) string {
+	if ns == NSdc {
+		switch local {
+		case "creator":
+			return "Seq"
+		case "rights", "description", "title":
+			return "Alt"
+		}
+	}
+	return "Bag"
+}
+
 // prefixOf returns the conventional namespace prefix for a URI.
 // Falls back to "ns" for unknown namespaces.
 func prefixOf(uri string) string {

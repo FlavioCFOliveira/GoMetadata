@@ -708,6 +708,74 @@ func TestIFDCycleDetection(t *testing.T) {
 	}
 }
 
+func TestMakerNotePreservedOnEncode(t *testing.T) {
+	// Build a minimal EXIF with a TagMakerNote entry in ExifIFD.
+	// After encode→parse, the raw MakerNote bytes must be identical.
+	makerNotePayload := []byte("FakeCanonMakerNote\x00\x01\x02\x03")
+
+	// Build ExifIFD bytes: MakerNote as TypeUndefined at offset (since > 4 bytes).
+	// We use minimalTIFFWithExifIFD helper but since it doesn't exist, we build
+	// the EXIF manually using the parse→encode path.
+	order := binary.LittleEndian
+
+	// Build raw EXIF bytes manually with ExifIFD containing TagMakerNote.
+	const (
+		hdrSize  = 8
+		exifOff  = hdrSize + 2 + 12 + 4 // IFD0: count(2) + 1 entry(12) + next(4) = 26 => exifIFD at 26
+		mnOffset = exifOff + 2 + 12 + 4  // ExifIFD: count(2) + 1 entry(12) + next(4) => MN value at 44
+	)
+
+	buf := make([]byte, mnOffset+len(makerNotePayload))
+
+	// TIFF header.
+	buf[0], buf[1] = 'I', 'I'
+	order.PutUint16(buf[2:], 0x002A)
+	order.PutUint32(buf[4:], hdrSize) // IFD0 at offset 8.
+
+	// IFD0: 1 entry = ExifIFDPointer.
+	order.PutUint16(buf[hdrSize:], 1)
+	order.PutUint16(buf[hdrSize+2:], uint16(TagExifIFDPointer))
+	order.PutUint16(buf[hdrSize+4:], uint16(TypeLong))
+	order.PutUint32(buf[hdrSize+6:], 1)
+	order.PutUint32(buf[hdrSize+10:], exifOff)
+	order.PutUint32(buf[hdrSize+14:], 0) // next IFD = 0
+
+	// ExifIFD: 1 entry = MakerNote (TypeUndefined, value at mnOffset).
+	order.PutUint16(buf[exifOff:], 1)
+	order.PutUint16(buf[exifOff+2:], uint16(TagMakerNote))
+	order.PutUint16(buf[exifOff+4:], uint16(TypeUndefined))
+	order.PutUint32(buf[exifOff+6:], uint32(len(makerNotePayload)))
+	order.PutUint32(buf[exifOff+10:], mnOffset)
+	order.PutUint32(buf[exifOff+14:], 0) // next IFD = 0
+
+	// MakerNote payload.
+	copy(buf[mnOffset:], makerNotePayload)
+
+	e, err := Parse(buf)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if e.MakerNote == nil {
+		t.Fatal("MakerNote not populated after Parse")
+	}
+
+	encoded, err := Encode(e)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	e2, err := Parse(encoded)
+	if err != nil {
+		t.Fatalf("Parse after encode: %v", err)
+	}
+	if e2.MakerNote == nil {
+		t.Fatal("MakerNote is nil after encode→parse round-trip")
+	}
+	if string(e2.MakerNote) != string(makerNotePayload) {
+		t.Errorf("MakerNote bytes mismatch after round-trip:\n  got  %x\n  want %x", e2.MakerNote, makerNotePayload)
+	}
+}
+
 func BenchmarkEXIFParse(b *testing.B) {
 	data := minimalTIFF(binary.LittleEndian, [][4]uint32{
 		{uint32(TagImageWidth), uint32(TypeLong), 1, 4000},
@@ -718,5 +786,141 @@ func BenchmarkEXIFParse(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, _ = Parse(data)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// P3-D: IFD1 thumbnail chain and SubIFD extraction
+// ---------------------------------------------------------------------------
+
+// TestIFD1ThumbnailChain builds a TIFF where IFD0 has a non-zero next-IFD
+// pointer pointing to a second IFD (IFD1 / thumbnail IFD) and verifies that
+// the parser follows the chain and exposes it via IFD0.Next.
+func TestIFD1ThumbnailChain(t *testing.T) {
+	order := binary.LittleEndian
+
+	// Layout:
+	//   offset 0–7:   TIFF header
+	//   offset 8:     IFD0  (1 entry + next ptr pointing to IFD1)
+	//   offset 26:    IFD1  (1 entry + next ptr = 0)
+	//
+	// IFD record size = 2 (count) + N*12 (entries) + 4 (next ptr)
+	// 1 entry → 2 + 12 + 4 = 18 bytes per IFD.
+
+	const ifd0Off = 8
+	const ifd1Off = ifd0Off + 2 + 12 + 4 // = 26
+
+	buf := make([]byte, ifd1Off+2+12+4)
+
+	// TIFF header.
+	buf[0], buf[1] = 'I', 'I'
+	order.PutUint16(buf[2:], 0x002A)
+	order.PutUint32(buf[4:], ifd0Off)
+
+	// IFD0: 1 entry (ImageWidth=1920), next → ifd1Off.
+	order.PutUint16(buf[ifd0Off:], 1)
+	order.PutUint16(buf[ifd0Off+2:], uint16(TagImageWidth))
+	order.PutUint16(buf[ifd0Off+4:], uint16(TypeLong))
+	order.PutUint32(buf[ifd0Off+6:], 1)
+	order.PutUint32(buf[ifd0Off+10:], 1920)
+	order.PutUint32(buf[ifd0Off+14:], ifd1Off) // non-zero next pointer
+
+	// IFD1: 1 entry (ImageWidth=160 for thumbnail), next = 0.
+	order.PutUint16(buf[ifd1Off:], 1)
+	order.PutUint16(buf[ifd1Off+2:], uint16(TagImageWidth))
+	order.PutUint16(buf[ifd1Off+4:], uint16(TypeLong))
+	order.PutUint32(buf[ifd1Off+6:], 1)
+	order.PutUint32(buf[ifd1Off+10:], 160)
+	order.PutUint32(buf[ifd1Off+14:], 0)
+
+	e, err := Parse(buf)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if e.IFD0 == nil {
+		t.Fatal("IFD0 is nil")
+	}
+	if e.IFD0.Next == nil {
+		t.Fatal("IFD0.Next is nil; expected IFD1 chain to be followed")
+	}
+	entry := e.IFD0.Next.Get(TagImageWidth)
+	if entry == nil {
+		t.Fatal("IFD1 TagImageWidth not found")
+	}
+	if entry.Uint32() != 160 {
+		t.Errorf("IFD1 ImageWidth = %d, want 160", entry.Uint32())
+	}
+}
+
+// TestSubIFDExtracted builds an EXIF block where IFD0 contains a
+// TagExifIFDPointer entry pointing to an ExifIFD that holds TagColorSpace.
+// After parsing, e.ExifIFD must be non-nil and contain the ColorSpace entry.
+func TestSubIFDExtracted(t *testing.T) {
+	order := binary.LittleEndian
+
+	// Layout:
+	//   0–7:    TIFF header
+	//   8:      IFD0 with 1 entry (ExifIFDPointer → exifIFDOff), next=0
+	//   26:     ExifIFD with 1 entry (ColorSpace=1), next=0
+
+	const ifd0Off = 8
+	const exifIFDOff = ifd0Off + 2 + 12 + 4 // = 26
+
+	buf := make([]byte, exifIFDOff+2+12+4)
+
+	// TIFF header.
+	buf[0], buf[1] = 'I', 'I'
+	order.PutUint16(buf[2:], 0x002A)
+	order.PutUint32(buf[4:], ifd0Off)
+
+	// IFD0: 1 entry = ExifIFDPointer, next = 0.
+	order.PutUint16(buf[ifd0Off:], 1)
+	order.PutUint16(buf[ifd0Off+2:], uint16(TagExifIFDPointer))
+	order.PutUint16(buf[ifd0Off+4:], uint16(TypeLong))
+	order.PutUint32(buf[ifd0Off+6:], 1)
+	order.PutUint32(buf[ifd0Off+10:], exifIFDOff)
+	order.PutUint32(buf[ifd0Off+14:], 0)
+
+	// ExifIFD: 1 entry = TagColorSpace (0xA001) = 1 (sRGB), next = 0.
+	order.PutUint16(buf[exifIFDOff:], 1)
+	order.PutUint16(buf[exifIFDOff+2:], uint16(TagColorSpace))
+	order.PutUint16(buf[exifIFDOff+4:], uint16(TypeShort))
+	order.PutUint32(buf[exifIFDOff+6:], 1)
+	order.PutUint32(buf[exifIFDOff+10:], 1) // sRGB
+	order.PutUint32(buf[exifIFDOff+14:], 0)
+
+	e, err := Parse(buf)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if e.ExifIFD == nil {
+		t.Fatal("ExifIFD is nil; expected sub-IFD to be extracted via ExifIFDPointer")
+	}
+	entry := e.ExifIFD.Get(TagColorSpace)
+	if entry == nil {
+		t.Fatal("TagColorSpace not found in ExifIFD")
+	}
+	// TagColorSpace is TypeShort; use Uint16() — Uint32() is reserved for TypeLong.
+	if entry.Uint16() != 1 {
+		t.Errorf("TagColorSpace = %d, want 1 (sRGB)", entry.Uint16())
+	}
+}
+
+// BenchmarkEXIFEncode measures the serialisation cost of a small EXIF struct
+// with three IFD0 entries and one ExifIFD pointer.
+func BenchmarkEXIFEncode(b *testing.B) {
+	data := minimalTIFF(binary.LittleEndian, [][4]uint32{
+		{uint32(TagImageWidth), uint32(TypeLong), 1, 4000},
+		{uint32(TagImageLength), uint32(TypeLong), 1, 3000},
+		{uint32(TagOrientation), uint32(TypeShort), 1, 1},
+	})
+	e, err := Parse(data)
+	if err != nil {
+		b.Fatalf("Parse: %v", err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = Encode(e)
 	}
 }

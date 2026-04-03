@@ -27,6 +27,11 @@ import (
 // result to w. Image data and unmodified metadata segments are preserved
 // byte-for-byte. r must support seeking (io.ReadSeeker).
 func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error {
+	// Guard against structurally broken metadata that would panic in encoders.
+	if m.EXIF != nil && m.EXIF.IFD0 == nil {
+		return fmt.Errorf("imgmetadata: EXIF struct has nil IFD0")
+	}
+
 	cfg := &writeConfig{preserveUnknownSegments: true}
 	for _, o := range opts {
 		o(cfg)
@@ -85,11 +90,23 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 	}
 	defer f.Close()
 
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+
 	tmp, err := os.CreateTemp("", "imgmetadata-*")
 	if err != nil {
 		return err
 	}
 	tmpName := tmp.Name()
+
+	// Preserve original file permissions before writing any data.
+	if err := tmp.Chmod(fi.Mode()); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
 
 	if err := Write(f, tmp, m, opts...); err != nil {
 		tmp.Close()

@@ -102,6 +102,33 @@ func TestDetectSeekReset(t *testing.T) {
 	}
 }
 
+func TestAVIFDetect(t *testing.T) {
+	// All AVIF brands (ISO 23008-12 §B.4) must resolve to FormatHEIF.
+	brands := []struct {
+		name  string
+		brand [4]byte
+	}{
+		{"avif", [4]byte{'a', 'v', 'i', 'f'}},
+		{"avis", [4]byte{'a', 'v', 'i', 's'}},
+		{"av01", [4]byte{'a', 'v', '0', '1'}},
+	}
+	for _, b := range brands {
+		// Build a minimal ftyp box: size(4) + "ftyp"(4) + brand(4)
+		magic := []byte{
+			0x00, 0x00, 0x00, 0x14, // box size
+			0x66, 0x74, 0x79, 0x70, // "ftyp"
+			b.brand[0], b.brand[1], b.brand[2], b.brand[3],
+		}
+		got, err := Detect(bytes.NewReader(magic))
+		if err != nil {
+			t.Fatalf("Detect(%s): %v", b.name, err)
+		}
+		if got != FormatHEIF {
+			t.Errorf("Detect(%s) = %v, want FormatHEIF", b.name, got)
+		}
+	}
+}
+
 func TestDetectMagic(t *testing.T) {
 	// Test detectMagic directly for edge cases.
 	if got := detectMagic([]byte{0xFF}); got != FormatUnknown {

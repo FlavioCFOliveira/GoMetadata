@@ -125,8 +125,19 @@ func Encode(i *IPTC) ([]byte, error) {
 			buf.WriteByte(ds.Record)
 			buf.WriteByte(ds.DataSet)
 			n := len(ds.Value)
-			buf.WriteByte(byte(n >> 8))
-			buf.WriteByte(byte(n))
+			if n >= 0x8000 {
+				// Extended length encoding (IIM §1.6.2): 0x80|4 signals a
+				// 4-byte length field follows.
+				buf.WriteByte(0x84)
+				buf.WriteByte(0x00) // placeholder — the 2-byte field is consumed
+				buf.WriteByte(byte(n >> 24))
+				buf.WriteByte(byte(n >> 16))
+				buf.WriteByte(byte(n >> 8))
+				buf.WriteByte(byte(n))
+			} else {
+				buf.WriteByte(byte(n >> 8))
+				buf.WriteByte(byte(n))
+			}
 			buf.Write(ds.Value)
 		}
 	}

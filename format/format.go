@@ -54,6 +54,17 @@ func (f FormatID) String() string {
 	return "Unknown"
 }
 
+// SupportsWrite reports whether the library can inject metadata into files of
+// the given format (i.e., Write and WriteFile will not return UnsupportedFormatError).
+func SupportsWrite(f FormatID) bool {
+	switch f {
+	case FormatJPEG, FormatTIFF, FormatPNG, FormatHEIF, FormatWebP,
+		FormatCR2, FormatCR3, FormatNEF, FormatARW, FormatDNG, FormatORF, FormatRW2:
+		return true
+	}
+	return false
+}
+
 // Container is the interface that every format-specific handler must satisfy.
 // It is the only boundary between the container layer and the dispatcher.
 //

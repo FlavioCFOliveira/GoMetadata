@@ -3,6 +3,7 @@ package xmp
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 const simpleXMP = `<?xpacket begin="" uid="W5M0MpCehiHzreSzNTczkc9d"?>
@@ -198,11 +199,122 @@ func TestRDFDepthLimit(t *testing.T) {
 	}
 }
 
+func TestXMPSetters(t *testing.T) {
+	x := &XMP{}
+
+	x.SetCaption("Hello world")
+	x.SetCopyright("(c) 2024")
+	x.SetCreator("Alice")
+	x.AddKeyword("sunset")
+	x.AddKeyword("landscape")
+	x.SetCameraModel("Canon EOS R5")
+
+	now := time.Date(2024, 6, 15, 10, 30, 0, 0, time.UTC)
+	x.SetDateTimeOriginal(now)
+
+	encoded, err := Encode(x)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	x2, err := Parse(encoded)
+	if err != nil {
+		t.Fatalf("Parse after encode: %v", err)
+	}
+
+	if got := x2.Caption(); got != "Hello world" {
+		t.Errorf("Caption: got %q", got)
+	}
+	if got := x2.Copyright(); got != "(c) 2024" {
+		t.Errorf("Copyright: got %q", got)
+	}
+	if got := x2.Creator(); got != "Alice" {
+		t.Errorf("Creator: got %q", got)
+	}
+	kws := x2.Keywords()
+	if len(kws) != 2 || kws[0] != "sunset" || kws[1] != "landscape" {
+		t.Errorf("Keywords: got %v", kws)
+	}
+	if got := x2.CameraModel(); got != "Canon EOS R5" {
+		t.Errorf("CameraModel: got %q", got)
+	}
+	dto := x2.DateTimeOriginal()
+	if dto == "" {
+		t.Error("DateTimeOriginal: empty after round-trip")
+	}
+}
+
+func TestEncodeCollectionType(t *testing.T) {
+	// dc:subject must be rdf:Bag, dc:creator must be rdf:Seq,
+	// dc:description must be rdf:Alt (ISO 16684-1 §7.5).
+	x := &XMP{Properties: map[string]map[string]string{
+		NSdc: {
+			"subject":     "alpha\x1ebeta\x1egamma",
+			"creator":     "Alice\x1eBob",
+			"description": "A caption\x1eEine Bildunterschrift",
+		},
+	}}
+
+	encoded, err := Encode(x)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	out := string(encoded)
+
+	// Verify correct collection element used for each property.
+	if !strings.Contains(out, "<rdf:Bag>") {
+		t.Error("dc:subject should use rdf:Bag")
+	}
+	if !strings.Contains(out, "<rdf:Seq>") {
+		t.Error("dc:creator should use rdf:Seq")
+	}
+	if !strings.Contains(out, "<rdf:Alt>") {
+		t.Error("dc:description should use rdf:Alt")
+	}
+	// Bag and Seq items must NOT have xml:lang.
+	if strings.Contains(out, "<rdf:Bag>") && strings.Contains(out, "xml:lang") {
+		// Only check if Bag items have xml:lang
+		bagIdx := strings.Index(out, "<rdf:Bag>")
+		endBagIdx := strings.Index(out[bagIdx:], "</rdf:Bag>")
+		if endBagIdx > 0 && strings.Contains(out[bagIdx:bagIdx+endBagIdx], "xml:lang") {
+			t.Error("rdf:Bag items should not have xml:lang attribute")
+		}
+	}
+
+	// Round-trip: keywords must survive parse→encode→parse.
+	x2, err := Parse(encoded)
+	if err != nil {
+		t.Fatalf("Parse after encode: %v", err)
+	}
+	kws := x2.Keywords()
+	if len(kws) != 3 {
+		t.Fatalf("keywords round-trip: got %v, want [alpha beta gamma]", kws)
+	}
+	if kws[0] != "alpha" || kws[1] != "beta" || kws[2] != "gamma" {
+		t.Errorf("keywords round-trip: got %v", kws)
+	}
+}
+
 func BenchmarkXMPParse(b *testing.B) {
 	data := []byte(simpleXMP)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, _ = Parse(data)
+	}
+}
+
+// BenchmarkXMPEncode measures the serialisation cost of a small XMP struct
+// with camera model, copyright, caption, and two keywords.
+func BenchmarkXMPEncode(b *testing.B) {
+	x, err := Parse([]byte(simpleXMP))
+	if err != nil {
+		b.Fatalf("Parse: %v", err)
+	}
+	x.AddKeyword("benchmark")
+	x.AddKeyword("performance")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = Encode(x)
 	}
 }

@@ -23,6 +23,45 @@ const (
 	TagWhitePoint        TagID = 0x013E
 	TagCopyright         TagID = 0x8298
 
+	// TIFF 6.0 baseline tags not in EXIF §4.6.4 but present in real files (TIFF 6.0 §8).
+	TagNewSubfileType             TagID = 0x00FE
+	TagSubfileType                TagID = 0x00FF
+	TagThresholding               TagID = 0x0107
+	TagFillOrder                  TagID = 0x010A
+	TagDocumentName               TagID = 0x010D
+	TagStripOffsets               TagID = 0x0111
+	TagSamplesPerPixel            TagID = 0x0115
+	TagRowsPerStrip               TagID = 0x0116
+	TagStripByteCounts            TagID = 0x0117
+	TagMinSampleValue             TagID = 0x0118
+	TagMaxSampleValue             TagID = 0x0119
+	TagPlanarConfiguration        TagID = 0x011C
+	TagPageName                   TagID = 0x011D
+	TagXPosition                  TagID = 0x011E
+	TagYPosition                  TagID = 0x011F
+	TagGrayResponseUnit           TagID = 0x0122
+	TagGrayResponseCurve          TagID = 0x0123
+	TagPageNumber                 TagID = 0x0129
+	TagTransferFunction           TagID = 0x012D
+	TagHostComputer               TagID = 0x013C
+	TagPredictor                  TagID = 0x013D
+	TagPrimaryChromaticities      TagID = 0x013F
+	TagColorMap                   TagID = 0x0140
+	TagHalftoneHints              TagID = 0x0141
+	TagTileWidth                  TagID = 0x0142
+	TagTileLength                 TagID = 0x0143
+	TagTileOffsets                TagID = 0x0144
+	TagTileByteCounts             TagID = 0x0145
+	TagSubIFDs                    TagID = 0x014A // TIFF-EP / DNG extension
+	TagExtraSamples               TagID = 0x0152
+	TagSampleFormat               TagID = 0x0153
+	TagJPEGInterchangeFormat      TagID = 0x0201 // Thumbnail offset in IFD1
+	TagJPEGInterchangeFormatLength TagID = 0x0202
+	TagYCbCrCoefficients          TagID = 0x0211
+	TagYCbCrSubSampling           TagID = 0x0212
+	TagYCbCrPositioning           TagID = 0x0213
+	TagReferenceBlackWhite        TagID = 0x0214
+
 	// Pointer tags (EXIF §4.6.3).
 	TagExifIFDPointer    TagID = 0x8769
 	TagGPSIFDPointer     TagID = 0x8825
@@ -34,6 +73,10 @@ const (
 
 	// EXIF IFD tags (EXIF §4.6.5 Table 4).
 	TagMakerNote TagID = 0x927C
+
+	// Interoperability IFD tags (EXIF §4.6.7, Annex A).
+	TagInteroperabilityIndex   TagID = 0x0001
+	TagInteroperabilityVersion TagID = 0x0002
 )
 
 // tagInfo holds registry metadata for a tag ID.
@@ -133,6 +176,52 @@ func init() {
 		TagInteropIFDPointer: {"InteroperabilityIFDPointer", TypeLong, 1},
 		TagIPTC:              {"IPTC-NAA", TypeLong, 0},
 		TagXMP:               {"XMP", TypeByte, 0},
+		// TIFF 6.0 baseline tags (TIFF 6.0 §8, present in real-world TIFF/RAW files).
+		TagNewSubfileType:              {"NewSubfileType", TypeLong, 1},
+		TagSubfileType:                 {"SubfileType", TypeShort, 1},
+		TagThresholding:                {"Thresholding", TypeShort, 1},
+		TagFillOrder:                   {"FillOrder", TypeShort, 1},
+		TagDocumentName:                {"DocumentName", TypeASCII, 0},
+		TagStripOffsets:                {"StripOffsets", TypeLong, 0},
+		TagSamplesPerPixel:             {"SamplesPerPixel", TypeShort, 1},
+		TagRowsPerStrip:                {"RowsPerStrip", TypeLong, 1},
+		TagStripByteCounts:             {"StripByteCounts", TypeLong, 0},
+		TagMinSampleValue:              {"MinSampleValue", TypeShort, 0},
+		TagMaxSampleValue:              {"MaxSampleValue", TypeShort, 0},
+		TagPlanarConfiguration:         {"PlanarConfiguration", TypeShort, 1},
+		TagPageName:                    {"PageName", TypeASCII, 0},
+		TagXPosition:                   {"XPosition", TypeRational, 1},
+		TagYPosition:                   {"YPosition", TypeRational, 1},
+		TagGrayResponseUnit:            {"GrayResponseUnit", TypeShort, 1},
+		TagGrayResponseCurve:           {"GrayResponseCurve", TypeShort, 0},
+		TagPageNumber:                  {"PageNumber", TypeShort, 2},
+		TagTransferFunction:            {"TransferFunction", TypeShort, 0},
+		TagHostComputer:                {"HostComputer", TypeASCII, 0},
+		TagPredictor:                   {"Predictor", TypeShort, 1},
+		TagPrimaryChromaticities:       {"PrimaryChromaticities", TypeRational, 6},
+		TagColorMap:                    {"ColorMap", TypeShort, 0},
+		TagHalftoneHints:               {"HalftoneHints", TypeShort, 2},
+		TagTileWidth:                   {"TileWidth", TypeLong, 1},
+		TagTileLength:                  {"TileLength", TypeLong, 1},
+		TagTileOffsets:                 {"TileOffsets", TypeLong, 0},
+		TagTileByteCounts:              {"TileByteCounts", TypeLong, 0},
+		TagSubIFDs:                     {"SubIFDs", TypeLong, 0},
+		TagExtraSamples:                {"ExtraSamples", TypeShort, 0},
+		TagSampleFormat:                {"SampleFormat", TypeShort, 0},
+		TagJPEGInterchangeFormat:       {"JPEGInterchangeFormat", TypeLong, 1},
+		TagJPEGInterchangeFormatLength: {"JPEGInterchangeFormatLength", TypeLong, 1},
+		TagYCbCrCoefficients:           {"YCbCrCoefficients", TypeRational, 3},
+		TagYCbCrSubSampling:            {"YCbCrSubSampling", TypeShort, 2},
+		TagYCbCrPositioning:            {"YCbCrPositioning", TypeShort, 1},
+		TagReferenceBlackWhite:         {"ReferenceBlackWhite", TypeRational, 6},
+	} {
+		tagRegistry[tag] = info
+	}
+
+	// InteropIFD tags (EXIF §4.6.7, Annex A).
+	for tag, info := range map[TagID]tagInfo{
+		TagInteroperabilityIndex:   {"InteroperabilityIndex", TypeASCII, 0},
+		TagInteroperabilityVersion: {"InteroperabilityVersion", TypeUndefined, 4},
 	} {
 		tagRegistry[tag] = info
 	}

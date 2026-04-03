@@ -348,6 +348,114 @@ func TestSettersRoundTrip(t *testing.T) {
 	}
 }
 
+func TestIPTCExtendedLengthRoundTrip(t *testing.T) {
+	// Dataset with a value that exceeds 32,767 bytes; requires extended-length
+	// encoding on write (IIM §1.6.2). Encoder previously truncated such values.
+	large := make([]byte, 40000)
+	for idx := range large {
+		large[idx] = byte(idx % 251)
+	}
+
+	i := &IPTC{Records: make(map[uint8][]Dataset)}
+	i.Records[2] = append(i.Records[2], Dataset{Record: 2, DataSet: DS2Caption, Value: large})
+
+	encoded, err := Encode(i)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	i2, err := Parse(encoded)
+	if err != nil {
+		t.Fatalf("Parse after extended-length encode: %v", err)
+	}
+	if len(i2.Records[2]) == 0 {
+		t.Fatal("no datasets in record 2 after round-trip")
+	}
+	got := i2.Records[2][0].Value
+	if len(got) != len(large) {
+		t.Fatalf("value length: got %d, want %d", len(got), len(large))
+	}
+	for idx := range large {
+		if got[idx] != large[idx] {
+			t.Fatalf("value mismatch at byte %d: got %d, want %d", idx, got[idx], large[idx])
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// P3-D: Record 1 and beyond-record-2 dataset coverage
+// ---------------------------------------------------------------------------
+
+// TestIPTCRecord1Parsing verifies that a Record 1 dataset is stored in
+// IPTC.Records[1] after parsing.
+func TestIPTCRecord1Parsing(t *testing.T) {
+	// Record 1, Dataset 20 = Supplemental Category (a valid IIM R1 dataset).
+	raw := buildIPTC([]struct {
+		rec uint8
+		ds  uint8
+		val []byte
+	}{
+		{1, 20, []byte("test")},
+	})
+
+	i, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	datasets, ok := i.Records[1]
+	if !ok || len(datasets) == 0 {
+		t.Fatalf("Records[1] is empty or missing; got records: %v", i.Records)
+	}
+
+	var found bool
+	for _, ds := range datasets {
+		if ds.Record == 1 && ds.DataSet == 20 && string(ds.Value) == "test" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("Record 1 / Dataset 20 with value \"test\" not found in Records[1]: %v", datasets)
+	}
+}
+
+// TestIPTCRecordsBeyond2 verifies that datasets for records other than 1 and 2
+// (e.g. record 3) are stored in the correct Records bucket.
+func TestIPTCRecordsBeyond2(t *testing.T) {
+	// Record 3 is the "Pre-ObjectData Descriptor" record in IIM.
+	const rec3DS uint8 = 10 // arbitrary dataset within record 3
+	raw := buildIPTC([]struct {
+		rec uint8
+		ds  uint8
+		val []byte
+	}{
+		{3, rec3DS, []byte("record3value")},
+	})
+
+	i, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	datasets, ok := i.Records[3]
+	if !ok || len(datasets) == 0 {
+		t.Fatalf("Records[3] is empty or missing; got records: %v", i.Records)
+	}
+
+	var found bool
+	for _, ds := range datasets {
+		if ds.Record == 3 && ds.DataSet == rec3DS && string(ds.Value) == "record3value" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("Record 3 / Dataset %d with value \"record3value\" not found in Records[3]: %v",
+			rec3DS, datasets)
+	}
+}
+
 func BenchmarkIPTCParse(b *testing.B) {
 	raw := buildIPTC([]struct {
 		rec uint8
@@ -361,5 +469,29 @@ func BenchmarkIPTCParse(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, _ = Parse(raw)
+	}
+}
+
+// BenchmarkIPTCEncode measures the serialisation cost of a small IPTC struct
+// with copyright, caption, and two keywords.
+func BenchmarkIPTCEncode(b *testing.B) {
+	raw := buildIPTC([]struct {
+		rec uint8
+		ds  uint8
+		val []byte
+	}{
+		{2, DS2CopyrightNotice, []byte("Test Corp")},
+		{2, DS2Caption, []byte("A test image caption for benchmarking purposes")},
+		{2, DS2Keywords, []byte("benchmark")},
+		{2, DS2Keywords, []byte("performance")},
+	})
+	i, err := Parse(raw)
+	if err != nil {
+		b.Fatalf("Parse: %v", err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		_, _ = Encode(i)
 	}
 }

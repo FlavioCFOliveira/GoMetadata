@@ -37,6 +37,10 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	patched[2] = 0x2A
 	patched[3] = 0x00
 
+	if len(patched) < 8 {
+		return patched, nil, nil, nil
+	}
+
 	order := binary.LittleEndian
 	rawEXIF = patched
 
