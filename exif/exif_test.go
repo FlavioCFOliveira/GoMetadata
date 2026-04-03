@@ -1211,3 +1211,164 @@ func BenchmarkEXIFEncode(b *testing.B) {
 		_, _ = Encode(e)
 	}
 }
+
+// TestEXIFSetters exercises every new setter added to EXIF.
+// Each sub-test calls the setter, encodes, re-parses, then asserts the getter
+// returns the expected value — proving full round-trip correctness.
+func TestEXIFSetters(t *testing.T) {
+	// newEXIF builds a minimal EXIF with IFD0 (no ExifIFD) using LE byte order.
+	newEXIF := func() *EXIF {
+		data := minimalTIFF(binary.LittleEndian, [][4]uint32{
+			{uint32(TagImageWidth), uint32(TypeLong), 1, 1},
+		})
+		e, err := Parse(data)
+		if err != nil {
+			t.Fatalf("newEXIF: Parse: %v", err)
+		}
+		return e
+	}
+
+	// roundTrip encodes e and parses the result, returning the new *EXIF.
+	roundTrip := func(t *testing.T, e *EXIF) *EXIF {
+		t.Helper()
+		b, err := Encode(e)
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		e2, err := Parse(b)
+		if err != nil {
+			t.Fatalf("Parse (round-trip): %v", err)
+		}
+		return e2
+	}
+
+	t.Run("SetMake", func(t *testing.T) {
+		e := newEXIF()
+		e.SetMake("Nikon")
+		e2 := roundTrip(t, e)
+		entry := e2.IFD0.Get(TagMake)
+		if entry == nil {
+			t.Fatal("TagMake missing after round-trip")
+		}
+		if got := entry.String(); got != "Nikon" {
+			t.Errorf("Make = %q, want %q", got, "Nikon")
+		}
+	})
+
+	t.Run("SetDateTimeOriginal", func(t *testing.T) {
+		e := newEXIF()
+		// Use a fixed time with no sub-second precision.
+		ts := time.Date(2024, 3, 15, 10, 30, 0, 0, time.UTC)
+		e.SetDateTimeOriginal(ts)
+		e2 := roundTrip(t, e)
+		got, ok := e2.DateTimeOriginal()
+		if !ok {
+			t.Fatal("DateTimeOriginal missing after round-trip")
+		}
+		if !got.Equal(ts) {
+			t.Errorf("DateTimeOriginal = %v, want %v", got, ts)
+		}
+	})
+
+	t.Run("SetExposureTime", func(t *testing.T) {
+		e := newEXIF()
+		e.SetExposureTime(1, 1000) // 1/1000 s
+		e2 := roundTrip(t, e)
+		num, den, ok := e2.ExposureTime()
+		if !ok {
+			t.Fatal("ExposureTime missing after round-trip")
+		}
+		if num != 1 || den != 1000 {
+			t.Errorf("ExposureTime = %d/%d, want 1/1000", num, den)
+		}
+	})
+
+	t.Run("SetFNumber", func(t *testing.T) {
+		e := newEXIF()
+		e.SetFNumber(2.8)
+		e2 := roundTrip(t, e)
+		f, ok := e2.FNumber()
+		if !ok {
+			t.Fatal("FNumber missing after round-trip")
+		}
+		// Encoded as rational 280/100; tolerate float rounding.
+		if math.Abs(f-2.8) > 0.001 {
+			t.Errorf("FNumber = %f, want 2.8", f)
+		}
+	})
+
+	t.Run("SetISO", func(t *testing.T) {
+		e := newEXIF()
+		e.SetISO(400)
+		e2 := roundTrip(t, e)
+		iso, ok := e2.ISO()
+		if !ok {
+			t.Fatal("ISO missing after round-trip")
+		}
+		if iso != 400 {
+			t.Errorf("ISO = %d, want 400", iso)
+		}
+	})
+
+	t.Run("SetFocalLength", func(t *testing.T) {
+		e := newEXIF()
+		e.SetFocalLength(50.0)
+		e2 := roundTrip(t, e)
+		fl, ok := e2.FocalLength()
+		if !ok {
+			t.Fatal("FocalLength missing after round-trip")
+		}
+		if math.Abs(fl-50.0) > 0.001 {
+			t.Errorf("FocalLength = %f, want 50.0", fl)
+		}
+	})
+
+	t.Run("SetLensModel", func(t *testing.T) {
+		e := newEXIF()
+		e.SetLensModel("AF-S NIKKOR 50mm f/1.8G")
+		e2 := roundTrip(t, e)
+		if got := e2.LensModel(); got != "AF-S NIKKOR 50mm f/1.8G" {
+			t.Errorf("LensModel = %q, want %q", got, "AF-S NIKKOR 50mm f/1.8G")
+		}
+	})
+
+	t.Run("SetImageSize", func(t *testing.T) {
+		e := newEXIF()
+		e.SetImageSize(3840, 2160)
+		e2 := roundTrip(t, e)
+		w, h, ok := e2.ImageSize()
+		if !ok {
+			t.Fatal("ImageSize missing after round-trip")
+		}
+		if w != 3840 || h != 2160 {
+			t.Errorf("ImageSize = %dx%d, want 3840x2160", w, h)
+		}
+	})
+
+	t.Run("NilReceiverNoPanic", func(t *testing.T) {
+		// All setters must be nil-safe.
+		var e *EXIF
+		e.SetMake("x")
+		e.SetDateTimeOriginal(time.Now())
+		e.SetExposureTime(1, 100)
+		e.SetFNumber(1.4)
+		e.SetISO(100)
+		e.SetFocalLength(35)
+		e.SetLensModel("x")
+		e.SetImageSize(100, 100)
+	})
+
+	t.Run("EnsureExifIFDCreatedOnce", func(t *testing.T) {
+		// Calling two ExifIFD setters must share the same ExifIFD (created once).
+		e := newEXIF()
+		if e.ExifIFD != nil {
+			t.Fatal("ExifIFD should be nil before any ExifIFD setter")
+		}
+		e.SetISO(100)
+		first := e.ExifIFD
+		e.SetFNumber(1.4)
+		if e.ExifIFD != first {
+			t.Error("ensureExifIFD created a second ExifIFD instead of reusing the first")
+		}
+	})
+}

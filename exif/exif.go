@@ -389,6 +389,127 @@ func (e *EXIF) SetOrientation(v uint16) {
 	e.IFD0.set(TagOrientation, TypeShort, 1, b[:])
 }
 
+// ensureExifIFD creates ExifIFD if nil and ensures IFD0 carries a placeholder
+// TagExifIFDPointer entry so that Encode() will wire the real offset.
+// It is called by all setters that target the ExifIFD.
+func (e *EXIF) ensureExifIFD() {
+	if e.ExifIFD != nil {
+		return
+	}
+	e.ExifIFD = &IFD{}
+	if e.IFD0 != nil && e.IFD0.Get(TagExifIFDPointer) == nil {
+		// Value 0 is a placeholder; encode() (write.go) overwrites it with the
+		// correct absolute offset once the ExifIFD is serialised.
+		var placeholder [4]byte
+		e.IFD0.set(TagExifIFDPointer, TypeLong, 1, placeholder[:])
+	}
+}
+
+// SetMake sets IFD0 tag 0x010F (Make, EXIF §4.6.4 Table 3).
+func (e *EXIF) SetMake(s string) {
+	if e == nil || e.IFD0 == nil {
+		return
+	}
+	v := asciiValue(s)
+	e.IFD0.set(TagMake, TypeASCII, uint32(len(v)), v)
+}
+
+// SetDateTimeOriginal sets ExifIFD tag 0x9003 (DateTimeOriginal, EXIF §4.6.5)
+// from t, using the EXIF datetime format "YYYY:MM:DD HH:MM:SS\x00" (20 bytes).
+func (e *EXIF) SetDateTimeOriginal(t time.Time) {
+	if e == nil || e.IFD0 == nil {
+		return
+	}
+	e.ensureExifIFD()
+	// EXIF §4.6.5: DateTimeOriginal is a 20-byte ASCII field including the NUL.
+	formatted := t.Format("2006:01:02 15:04:05") + "\x00"
+	v := []byte(formatted)
+	e.ExifIFD.set(TagDateTimeOriginal, TypeASCII, uint32(len(v)), v)
+}
+
+// SetExposureTime sets ExifIFD tag 0x829A (ExposureTime, EXIF §4.6.5).
+// num and den are the numerator and denominator of the rational exposure value.
+func (e *EXIF) SetExposureTime(num, den uint32) {
+	if e == nil || e.IFD0 == nil {
+		return
+	}
+	e.ensureExifIFD()
+	order := e.ifd0ByteOrder()
+	b := make([]byte, 8)
+	order.PutUint32(b[0:], num)
+	order.PutUint32(b[4:], den)
+	e.ExifIFD.set(TagExposureTime, TypeRational, 1, b)
+}
+
+// SetFNumber sets ExifIFD tag 0x829D (FNumber, EXIF §4.6.5).
+// f is encoded as a rational with denominator 100 to preserve two decimal places.
+func (e *EXIF) SetFNumber(f float64) {
+	if e == nil || e.IFD0 == nil {
+		return
+	}
+	e.ensureExifIFD()
+	order := e.ifd0ByteOrder()
+	const denom = uint32(100)
+	num := uint32(math.Round(f * float64(denom)))
+	b := make([]byte, 8)
+	order.PutUint32(b[0:], num)
+	order.PutUint32(b[4:], denom)
+	e.ExifIFD.set(TagFNumber, TypeRational, 1, b)
+}
+
+// SetISO sets ExifIFD tag 0x8827 (ISOSpeedRatings, EXIF §4.6.5).
+func (e *EXIF) SetISO(iso uint) {
+	if e == nil || e.IFD0 == nil {
+		return
+	}
+	e.ensureExifIFD()
+	order := e.ifd0ByteOrder()
+	var b [2]byte
+	order.PutUint16(b[:], uint16(iso))
+	e.ExifIFD.set(TagISOSpeedRatings, TypeShort, 1, b[:])
+}
+
+// SetFocalLength sets ExifIFD tag 0x920A (FocalLength, EXIF §4.6.5).
+// mm is encoded as a rational with denominator 100.
+func (e *EXIF) SetFocalLength(mm float64) {
+	if e == nil || e.IFD0 == nil {
+		return
+	}
+	e.ensureExifIFD()
+	order := e.ifd0ByteOrder()
+	const denom = uint32(100)
+	num := uint32(math.Round(mm * float64(denom)))
+	b := make([]byte, 8)
+	order.PutUint32(b[0:], num)
+	order.PutUint32(b[4:], denom)
+	e.ExifIFD.set(TagFocalLength, TypeRational, 1, b)
+}
+
+// SetLensModel sets ExifIFD tag 0xA434 (LensModel, EXIF §4.6.5).
+func (e *EXIF) SetLensModel(s string) {
+	if e == nil || e.IFD0 == nil {
+		return
+	}
+	e.ensureExifIFD()
+	v := asciiValue(s)
+	e.ExifIFD.set(TagLensModel, TypeASCII, uint32(len(v)), v)
+}
+
+// SetImageSize sets ExifIFD tags 0xA002 and 0xA003 (PixelXDimension /
+// PixelYDimension, EXIF §4.6.5) to the given pixel dimensions.
+func (e *EXIF) SetImageSize(width, height uint32) {
+	if e == nil || e.IFD0 == nil {
+		return
+	}
+	e.ensureExifIFD()
+	order := e.ifd0ByteOrder()
+	var bw, bh [4]byte
+	order.PutUint32(bw[:], width)
+	order.PutUint32(bh[:], height)
+	e.ExifIFD.set(TagPixelXDimension, TypeLong, 1, bw[:])
+	e.ExifIFD.set(TagPixelYDimension, TypeLong, 1, bh[:])
+}
+
 // SetGPS sets the GPS IFD from decimal-degree WGS-84 coordinates.
 // It creates GPSIFD if nil and sets the four mandatory tags:
 //

@@ -202,6 +202,28 @@ func (i *IPTC) AddKeyword(kw string) {
 	i.Records[2] = append(i.Records[2], Dataset{Record: 2, DataSet: DS2Keywords, Value: []byte(kw)})
 }
 
+// SetKeywords replaces all dataset 2:25 (Keywords, IIM §2.2.17) entries in
+// record 2 with the provided values. Existing keyword datasets are removed
+// first; then one Dataset is appended per keyword. Passing an empty slice
+// removes all keywords without adding new ones.
+func (i *IPTC) SetKeywords(kws []string) {
+	if i == nil {
+		return
+	}
+	// Remove all existing DS2Keywords entries from record 2.
+	filtered := i.Records[2][:0]
+	for _, d := range i.Records[2] {
+		if d.DataSet != DS2Keywords {
+			filtered = append(filtered, d)
+		}
+	}
+	i.Records[2] = filtered
+	// Append one Dataset per keyword (IIM §2.2.17: repeatable).
+	for _, kw := range kws {
+		i.Records[2] = append(i.Records[2], Dataset{Record: 2, DataSet: DS2Keywords, Value: []byte(kw)})
+	}
+}
+
 // setRecord2 replaces the first occurrence of ds in record 2 with value,
 // or appends a new dataset if none exists.
 func (i *IPTC) setRecord2(ds uint8, value []byte) {

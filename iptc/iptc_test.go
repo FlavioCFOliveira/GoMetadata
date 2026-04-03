@@ -558,3 +558,90 @@ func BenchmarkIPTCEncode(b *testing.B) {
 		_, _ = Encode(i)
 	}
 }
+
+// TestIPTCSetKeywords verifies that SetKeywords replaces existing keywords and
+// that a round-trip (Encode → Parse) preserves them exactly.
+func TestIPTCSetKeywords(t *testing.T) {
+	t.Run("ReplaceExisting", func(t *testing.T) {
+		raw := buildIPTC([]struct {
+			rec uint8
+			ds  uint8
+			val []byte
+		}{
+			{2, DS2Keywords, []byte("old1")},
+			{2, DS2Keywords, []byte("old2")},
+		})
+		i, err := Parse(raw)
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+
+		i.SetKeywords([]string{"nature", "landscape", "sunset"})
+
+		// Verify in-memory state before encode.
+		kws := i.Keywords()
+		if len(kws) != 3 {
+			t.Fatalf("Keywords count = %d, want 3 (before encode)", len(kws))
+		}
+
+		// Round-trip.
+		enc, err := Encode(i)
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		i2, err := Parse(enc)
+		if err != nil {
+			t.Fatalf("Parse (round-trip): %v", err)
+		}
+		kws2 := i2.Keywords()
+		if len(kws2) != 3 {
+			t.Fatalf("Keywords count after round-trip = %d, want 3", len(kws2))
+		}
+		want := map[string]bool{"nature": true, "landscape": true, "sunset": true}
+		for _, kw := range kws2 {
+			if !want[kw] {
+				t.Errorf("unexpected keyword %q after round-trip", kw)
+			}
+		}
+	})
+
+	t.Run("EmptySliceRemovesAll", func(t *testing.T) {
+		raw := buildIPTC([]struct {
+			rec uint8
+			ds  uint8
+			val []byte
+		}{
+			{2, DS2Keywords, []byte("remove-me")},
+		})
+		i, _ := Parse(raw)
+		i.SetKeywords([]string{})
+		if kws := i.Keywords(); len(kws) != 0 {
+			t.Errorf("Keywords after SetKeywords([]) = %v, want empty", kws)
+		}
+	})
+
+	t.Run("PreservesOtherDatasets", func(t *testing.T) {
+		raw := buildIPTC([]struct {
+			rec uint8
+			ds  uint8
+			val []byte
+		}{
+			{2, DS2Caption, []byte("my caption")},
+			{2, DS2Keywords, []byte("old")},
+		})
+		i, _ := Parse(raw)
+		i.SetKeywords([]string{"new"})
+		if got := i.Caption(); got != "my caption" {
+			t.Errorf("Caption changed after SetKeywords: got %q, want %q", got, "my caption")
+		}
+		kws := i.Keywords()
+		if len(kws) != 1 || kws[0] != "new" {
+			t.Errorf("Keywords = %v, want [new]", kws)
+		}
+	})
+
+	t.Run("NilReceiverNoPanic", func(t *testing.T) {
+		var i *IPTC
+		i.SetKeywords([]string{"a", "b"}) // must not panic
+	})
+}

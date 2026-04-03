@@ -403,3 +403,87 @@ func BenchmarkXMPEncode(b *testing.B) {
 		_, _ = Encode(x)
 	}
 }
+
+// TestXMPNewSetters exercises SetGPS, SetLensModel, SetKeywords, and Set.
+func TestXMPNewSetters(t *testing.T) {
+	t.Run("SetGPS_RoundTrip", func(t *testing.T) {
+		x := &XMP{Properties: make(map[string]map[string]string)}
+		x.SetGPS(37.7749, -122.4194)
+		lat, lon, ok := x.GPS()
+		if !ok {
+			t.Fatal("GPS() returned ok=false after SetGPS")
+		}
+		// Decimal-minute format preserves ~0.3 mm precision; 1e-4 deg is plenty.
+		if lat < 37.774 || lat > 37.776 {
+			t.Errorf("lat = %f, want ~37.7749", lat)
+		}
+		if lon > -122.418 || lon < -122.421 {
+			t.Errorf("lon = %f, want ~-122.4194", lon)
+		}
+	})
+
+	t.Run("SetGPS_SouthWest", func(t *testing.T) {
+		x := &XMP{Properties: make(map[string]map[string]string)}
+		x.SetGPS(-33.8688, -70.6693)
+		lat, lon, ok := x.GPS()
+		if !ok {
+			t.Fatal("GPS() returned ok=false")
+		}
+		if lat > 0 {
+			t.Errorf("southern lat should be negative, got %f", lat)
+		}
+		if lon > 0 {
+			t.Errorf("western lon should be negative, got %f", lon)
+		}
+	})
+
+	t.Run("SetLensModel", func(t *testing.T) {
+		x := &XMP{Properties: make(map[string]map[string]string)}
+		x.SetLensModel("EF 24-70mm f/2.8L II USM")
+		if got := x.LensModel(); got != "EF 24-70mm f/2.8L II USM" {
+			t.Errorf("LensModel = %q, want %q", got, "EF 24-70mm f/2.8L II USM")
+		}
+	})
+
+	t.Run("SetKeywords_Replace", func(t *testing.T) {
+		x := &XMP{Properties: make(map[string]map[string]string)}
+		x.AddKeyword("old1")
+		x.AddKeyword("old2")
+		x.SetKeywords([]string{"nature", "landscape", "sunset"})
+		kws := x.Keywords()
+		if len(kws) != 3 {
+			t.Fatalf("Keywords count = %d, want 3", len(kws))
+		}
+		want := map[string]bool{"nature": true, "landscape": true, "sunset": true}
+		for _, kw := range kws {
+			if !want[kw] {
+				t.Errorf("unexpected keyword %q", kw)
+			}
+		}
+	})
+
+	t.Run("SetKeywords_Empty_DeletesProperty", func(t *testing.T) {
+		x := &XMP{Properties: make(map[string]map[string]string)}
+		x.AddKeyword("remove-me")
+		x.SetKeywords(nil)
+		if kws := x.Keywords(); len(kws) != 0 {
+			t.Errorf("Keywords after SetKeywords(nil) = %v, want empty", kws)
+		}
+	})
+
+	t.Run("SetPublicMethod", func(t *testing.T) {
+		x := &XMP{Properties: make(map[string]map[string]string)}
+		x.Set(NSexif, "ExposureTime", "1/500")
+		if got := x.Get(NSexif, "ExposureTime"); got != "1/500" {
+			t.Errorf("Get after Set = %q, want %q", got, "1/500")
+		}
+	})
+
+	t.Run("NilReceiverNoPanic", func(t *testing.T) {
+		var x *XMP
+		x.SetGPS(0, 0)
+		x.SetLensModel("x")
+		x.SetKeywords([]string{"a"})
+		x.Set(NSdc, "title", "test")
+	})
+}

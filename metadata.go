@@ -429,3 +429,148 @@ func (m *Metadata) Creator() string {
 	}
 	return ""
 }
+
+// ---------------------------------------------------------------------------
+// Write setters — write to all non-nil component structs that support the
+// field. Components are never created; only existing ones are written.
+// ---------------------------------------------------------------------------
+
+// SetCaption writes s to all non-nil metadata components (EXIF, IPTC, XMP).
+func (m *Metadata) SetCaption(s string) {
+	if m.EXIF != nil {
+		m.EXIF.SetCaption(s)
+	}
+	if m.IPTC != nil {
+		m.IPTC.SetCaption(s)
+	}
+	if m.XMP != nil {
+		m.XMP.SetCaption(s)
+	}
+}
+
+// SetCopyright writes s to all non-nil metadata components (EXIF, IPTC, XMP).
+func (m *Metadata) SetCopyright(s string) {
+	if m.EXIF != nil {
+		m.EXIF.SetCopyright(s)
+	}
+	if m.IPTC != nil {
+		m.IPTC.SetCopyright(s)
+	}
+	if m.XMP != nil {
+		m.XMP.SetCopyright(s)
+	}
+}
+
+// SetCreator writes s to all non-nil metadata components (EXIF, IPTC, XMP).
+func (m *Metadata) SetCreator(s string) {
+	if m.EXIF != nil {
+		m.EXIF.SetCreator(s)
+	}
+	if m.IPTC != nil {
+		m.IPTC.SetCreator(s)
+	}
+	if m.XMP != nil {
+		m.XMP.SetCreator(s)
+	}
+}
+
+// SetCameraModel writes s to EXIF and XMP when those components are non-nil.
+func (m *Metadata) SetCameraModel(s string) {
+	if m.EXIF != nil {
+		m.EXIF.SetCameraModel(s)
+	}
+	if m.XMP != nil {
+		m.XMP.SetCameraModel(s)
+	}
+}
+
+// SetGPS writes the WGS-84 decimal-degree coordinates to EXIF and XMP when
+// those components are non-nil.
+func (m *Metadata) SetGPS(lat, lon float64) {
+	if m.EXIF != nil {
+		m.EXIF.SetGPS(lat, lon)
+	}
+	if m.XMP != nil {
+		m.XMP.SetGPS(lat, lon)
+	}
+}
+
+// SetKeywords writes kws to IPTC and XMP when those components are non-nil.
+func (m *Metadata) SetKeywords(kws []string) {
+	if m.IPTC != nil {
+		m.IPTC.SetKeywords(kws)
+	}
+	if m.XMP != nil {
+		m.XMP.SetKeywords(kws)
+	}
+}
+
+// SetLensModel writes s to EXIF and XMP when those components are non-nil.
+func (m *Metadata) SetLensModel(s string) {
+	if m.EXIF != nil {
+		m.EXIF.SetLensModel(s)
+	}
+	if m.XMP != nil {
+		m.XMP.SetLensModel(s)
+	}
+}
+
+// SetMake writes s to EXIF when it is non-nil.
+func (m *Metadata) SetMake(s string) {
+	if m.EXIF != nil {
+		m.EXIF.SetMake(s)
+	}
+}
+
+// SetDateTimeOriginal writes t to EXIF and XMP when those components are
+// non-nil.
+func (m *Metadata) SetDateTimeOriginal(t time.Time) {
+	if m.EXIF != nil {
+		m.EXIF.SetDateTimeOriginal(t)
+	}
+	if m.XMP != nil {
+		m.XMP.SetDateTimeOriginal(t)
+	}
+}
+
+// SetExposureTime writes the rational exposure time to EXIF when non-nil.
+func (m *Metadata) SetExposureTime(num, den uint32) {
+	if m.EXIF != nil {
+		m.EXIF.SetExposureTime(num, den)
+	}
+}
+
+// SetFNumber writes the F-number to EXIF when non-nil.
+func (m *Metadata) SetFNumber(f float64) {
+	if m.EXIF != nil {
+		m.EXIF.SetFNumber(f)
+	}
+}
+
+// SetISO writes the ISO speed rating to EXIF when non-nil.
+func (m *Metadata) SetISO(iso uint) {
+	if m.EXIF != nil {
+		m.EXIF.SetISO(iso)
+	}
+}
+
+// SetFocalLength writes the focal length in millimetres to EXIF when non-nil.
+func (m *Metadata) SetFocalLength(mm float64) {
+	if m.EXIF != nil {
+		m.EXIF.SetFocalLength(mm)
+	}
+}
+
+// SetOrientation writes the orientation tag to EXIF when non-nil.
+func (m *Metadata) SetOrientation(v uint16) {
+	if m.EXIF != nil {
+		m.EXIF.SetOrientation(v)
+	}
+}
+
+// SetImageSize writes the pixel dimensions to EXIF when non-nil.
+func (m *Metadata) SetImageSize(width, height uint32) {
+	if m.EXIF != nil {
+		m.EXIF.SetImageSize(width, height)
+	}
+}

@@ -12,6 +12,7 @@ package xmp
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -194,6 +195,66 @@ func (x *XMP) SetCameraModel(s string) { x.set(NStiff, "Model", s) }
 // (XMP §8.4 / ISO 8601).
 func (x *XMP) SetDateTimeOriginal(t time.Time) {
 	x.set(NSexif, "DateTimeOriginal", t.Format(time.RFC3339))
+}
+
+// SetGPS writes exif:GPSLatitude and exif:GPSLongitude in the XMP
+// "DDD,MM.mmmmmmR" format (XMP §8.4 / Adobe XMP Spec Part 2).
+// lat is negative for South, lon is negative for West.
+func (x *XMP) SetGPS(lat, lon float64) {
+	if x == nil {
+		return
+	}
+	formatCoord := func(coord float64, posRef, negRef string) string {
+		abs := coord
+		if abs < 0 {
+			abs = -abs
+		}
+		deg := math.Floor(abs)
+		decMin := (abs - deg) * 60
+		ref := posRef
+		if coord < 0 {
+			ref = negRef
+		}
+		return fmt.Sprintf("%.0f,%.6f%s", deg, decMin, ref)
+	}
+	x.set(NSexif, "GPSLatitude", formatCoord(lat, "N", "S"))
+	x.set(NSexif, "GPSLongitude", formatCoord(lon, "E", "W"))
+}
+
+// SetLensModel sets aux:Lens to s (Adobe XMP Auxiliary namespace).
+func (x *XMP) SetLensModel(s string) {
+	if x == nil {
+		return
+	}
+	x.set(NSaux, "Lens", s)
+}
+
+// SetKeywords replaces dc:subject entirely with kws (XMP §8.3).
+// Items are joined with the U+001E record separator, matching the convention
+// used by Keywords() and the RDF encoder. When kws is empty the property is
+// deleted so that Keywords() returns nil after a round-trip.
+func (x *XMP) SetKeywords(kws []string) {
+	if x == nil {
+		return
+	}
+	if len(kws) == 0 {
+		// Delete the property entirely so Keywords() returns nil.
+		if x.Properties != nil {
+			delete(x.Properties[NSdc], "subject")
+		}
+		return
+	}
+	x.set(NSdc, "subject", strings.Join(kws, "\x1e"))
+}
+
+// Set is the public equivalent of the private set() method.
+// It writes value to Properties[ns][local], initialising maps as needed.
+// ns is a namespace URI (use the NS* constants from this package).
+func (x *XMP) Set(ns, local, value string) {
+	if x == nil {
+		return
+	}
+	x.set(ns, local, value)
 }
 
 // set writes value to Properties[ns][local], initialising inner maps as needed.
