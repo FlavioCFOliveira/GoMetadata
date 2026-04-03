@@ -2,6 +2,7 @@ package imgmetadata
 
 import (
 	"github.com/flaviocfo/img-metadata/exif"
+	"github.com/flaviocfo/img-metadata/format"
 	"github.com/flaviocfo/img-metadata/iptc"
 	"github.com/flaviocfo/img-metadata/xmp"
 )
@@ -27,6 +28,18 @@ type Metadata struct {
 	rawIPTC  []byte
 	rawXMP   []byte
 }
+
+// Format returns the detected container format ID of the image.
+func (m *Metadata) Format() format.FormatID { return format.FormatID(m.format) }
+
+// RawEXIF returns the raw EXIF segment bytes as read from the container.
+func (m *Metadata) RawEXIF() []byte { return m.rawEXIF }
+
+// RawIPTC returns the raw IPTC IIM segment bytes as read from the container.
+func (m *Metadata) RawIPTC() []byte { return m.rawIPTC }
+
+// RawXMP returns the raw XMP packet bytes as read from the container.
+func (m *Metadata) RawXMP() []byte { return m.rawXMP }
 
 // CameraModel returns the camera model string.
 // Source priority: EXIF > XMP.

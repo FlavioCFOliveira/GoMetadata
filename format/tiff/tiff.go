@@ -7,6 +7,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	"github.com/flaviocfo/img-metadata/exif"
 )
 
 // Extract reads metadata payloads from a TIFF container.
@@ -39,22 +41,70 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 }
 
 // Inject writes a modified TIFF stream to w, replacing the metadata tags.
-// Since re-building a TIFF with updated IFD offsets is complex, this
-// implementation appends updated tag values and patches IFD0 entries in-place
-// when the original tag exists. New tags are not injected into the IFD.
+// When rawIPTC or rawXMP is non-nil, the TIFF is parsed and IFD0 is updated
+// with the new values before re-encoding (affects CR2, NEF, ARW, DNG via delegation).
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("tiff: seek: %w", err)
 	}
-	// For TIFF, the EXIF payload IS the TIFF file.
-	// rawEXIF from the caller is the serialised EXIF; write it directly.
+
+	// Determine the base TIFF data to work with.
+	var base []byte
 	if rawEXIF != nil {
-		_, err := w.Write(rawEXIF)
+		base = rawEXIF
+	} else {
+		var err error
+		base, err = io.ReadAll(r)
+		if err != nil {
+			return fmt.Errorf("tiff: read: %w", err)
+		}
+	}
+
+	// If no IPTC or XMP updates, write the base bytes directly.
+	if rawIPTC == nil && rawXMP == nil {
+		_, err := w.Write(base)
 		return err
 	}
-	// If no EXIF supplied, pass through the original unchanged.
-	_, err := io.Copy(w, r)
+
+	// Parse the TIFF, upsert IPTC/XMP entries in IFD0, and re-encode.
+	e, err := exif.Parse(base)
+	if err != nil {
+		// Parsing failed (e.g. non-standard TIFF variant); fall back to
+		// writing the base unchanged rather than losing the file.
+		_, werr := w.Write(base)
+		return werr
+	}
+
+	if rawIPTC != nil {
+		upsertIFD0Entry(e.IFD0, exif.TagIPTC, exif.TypeUndefined, rawIPTC)
+	}
+	if rawXMP != nil {
+		upsertIFD0Entry(e.IFD0, exif.TagXMP, exif.TypeUndefined, rawXMP)
+	}
+
+	updated, err := exif.Encode(e)
+	if err != nil {
+		return fmt.Errorf("tiff: encode: %w", err)
+	}
+	_, err = w.Write(updated)
 	return err
+}
+
+// upsertIFD0Entry adds or replaces an entry in ifd for the given tag.
+func upsertIFD0Entry(ifd *exif.IFD, tag exif.TagID, typ exif.DataType, value []byte) {
+	entry := exif.IFDEntry{
+		Tag:   tag,
+		Type:  typ,
+		Count: uint32(len(value)),
+		Value: value,
+	}
+	for i, e := range ifd.Entries {
+		if e.Tag == tag {
+			ifd.Entries[i] = entry
+			return
+		}
+	}
+	ifd.Entries = append(ifd.Entries, entry)
 }
 
 // byteOrder determines the TIFF byte order from the first 2 bytes.
@@ -96,11 +146,11 @@ func extractTagValues(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawI
 			v = data[e+8 : e+8+int(total)]
 		} else {
 			off := order.Uint32(data[e+8:])
-			end := uint64(off) + total
-			if end > uint64(len(data)) {
+			// Guard against integer overflow: check before computing end.
+			if uint64(off) > uint64(len(data)) || total > uint64(len(data))-uint64(off) {
 				continue
 			}
-			v = data[off:end]
+			v = data[uint64(off) : uint64(off)+total]
 		}
 
 		switch tag {

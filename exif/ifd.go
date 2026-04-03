@@ -223,8 +223,9 @@ func ifdTotalSize(entries []IFDEntry) uint32 {
 
 // writeIFD appends the serialised IFD block to out and returns the extended slice.
 // startOff is the absolute file offset at which the IFD block begins (used to
-// compute value-area offsets).
-func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff uint32) []byte {
+// compute value-area offsets). nextIFDOffset is written as the next-IFD pointer
+// (TIFF §2); pass 0 to indicate no further IFDs.
+func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, nextIFDOffset uint32) []byte {
 	n := len(entries)
 	// value area begins right after: 2 (count) + n*12 (entries) + 4 (next-IFD).
 	valueOff := startOff + uint32(2+n*12+4)
@@ -257,7 +258,10 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff u
 	}
 
 	out = append(out, entryBuf...)
-	out = append(out, 0, 0, 0, 0) // next-IFD pointer = 0
+	// Write next-IFD pointer (TIFF §2).
+	nextB := make([]byte, 4)
+	order.PutUint32(nextB, nextIFDOffset)
+	out = append(out, nextB...)
 	out = append(out, valueArea...)
 	return out
 }

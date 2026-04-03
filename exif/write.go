@@ -34,24 +34,55 @@ func encode(e *EXIF) ([]byte, error) {
 	}
 	sortEntries(ifd0Entries)
 
+	// Build ExifIFD entries: strip existing InteropIFD pointer and re-add
+	// with a freshly computed offset when InteropIFD is present (EXIF §4.6.3,
+	// tag 0xA005 lives in ExifIFD, not IFD0).
+	var exifIFDEntries []IFDEntry
+	if e.ExifIFD != nil {
+		exifIFDEntries = filterEntries(e.ExifIFD, TagInteropIFDPointer)
+		if e.InteropIFD != nil {
+			exifIFDEntries = append(exifIFDEntries, zeroPtr(TagInteropIFDPointer))
+		}
+		sortEntries(exifIFDEntries)
+	}
+
 	// Compute block sizes so we can fill pointer values before writing.
-	// Layout: [8 bytes TIFF header][IFD0 block][ExifIFD block][GPS IFD block]
+	// Layout: [8 bytes TIFF header][IFD0][ExifIFD][GPS IFD][InteropIFD][IFD1...]
 	const headerSize = uint32(8)
 	ifd0Size := ifdTotalSize(ifd0Entries)
 	exifStart := headerSize + ifd0Size
 	exifSize := uint32(0)
 	if e.ExifIFD != nil {
-		exifSize = ifdTotalSize(e.ExifIFD.Entries)
+		exifSize = ifdTotalSize(exifIFDEntries)
 	}
 	gpsStart := exifStart + exifSize
+	gpsSize := uint32(0)
+	if e.GPSIFD != nil {
+		gpsSize = ifdTotalSize(e.GPSIFD.Entries)
+	}
+	interopStart := gpsStart + gpsSize
+	interopSize := uint32(0)
+	if e.InteropIFD != nil {
+		interopSize = ifdTotalSize(e.InteropIFD.Entries)
+	}
 
-	// Patch pointer values now that their targets are known.
+	// IFD1 (thumbnail) starts after InteropIFD (TIFF §2 next-IFD pointer chain).
+	ifd1Start := interopStart + interopSize
+
+	// Patch IFD0 sub-IFD pointer values now that their targets are known.
 	for i := range ifd0Entries {
 		switch ifd0Entries[i].Tag {
 		case TagExifIFDPointer:
 			order.PutUint32(ifd0Entries[i].Value, exifStart)
 		case TagGPSIFDPointer:
 			order.PutUint32(ifd0Entries[i].Value, gpsStart)
+		}
+	}
+
+	// Patch ExifIFD InteropIFD pointer.
+	for i := range exifIFDEntries {
+		if exifIFDEntries[i].Tag == TagInteropIFDPointer {
+			order.PutUint32(exifIFDEntries[i].Value, interopStart)
 		}
 	}
 
@@ -67,14 +98,33 @@ func encode(e *EXIF) ([]byte, error) {
 	order.PutUint16(hdr[2:], 0x002A)
 	order.PutUint32(hdr[4:], headerSize) // IFD0 starts right after the header
 
-	out := make([]byte, 0, headerSize+ifd0Size+exifSize)
+	out := make([]byte, 0, headerSize+ifd0Size+exifSize+gpsSize+interopSize)
 	out = append(out, hdr...)
-	out = writeIFD(out, ifd0Entries, order, uint32(len(out)))
+
+	// IFD0: next-IFD pointer points to IFD1 if present.
+	ifd0NextPtr := uint32(0)
+	if e.IFD0 != nil && e.IFD0.Next != nil {
+		ifd0NextPtr = ifd1Start
+	}
+	out = writeIFD(out, ifd0Entries, order, uint32(len(out)), ifd0NextPtr)
+
 	if e.ExifIFD != nil {
-		out = writeIFD(out, e.ExifIFD.Entries, order, uint32(len(out)))
+		out = writeIFD(out, exifIFDEntries, order, uint32(len(out)), 0)
 	}
 	if e.GPSIFD != nil {
-		out = writeIFD(out, e.GPSIFD.Entries, order, uint32(len(out)))
+		out = writeIFD(out, e.GPSIFD.Entries, order, uint32(len(out)), 0)
+	}
+	if e.InteropIFD != nil {
+		out = writeIFD(out, e.InteropIFD.Entries, order, uint32(len(out)), 0)
+	}
+
+	// Serialise the IFD1 chain (thumbnail IFDs, TIFF §2).
+	for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
+		nextPtr := uint32(0)
+		if ifd.Next != nil {
+			nextPtr = uint32(len(out)) + ifdTotalSize(ifd.Entries)
+		}
+		out = writeIFD(out, ifd.Entries, order, uint32(len(out)), nextPtr)
 	}
 
 	return out, nil

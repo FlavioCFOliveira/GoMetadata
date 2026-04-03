@@ -78,10 +78,12 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	}
 
 	// Collect all existing chunks except EXIF, XMP, VP8X (we rebuild VP8X).
+	// Also capture the original VP8X payload to preserve canvas dimensions.
 	var chunks []struct {
 		id   string
 		data []byte
 	}
+	var origVP8XData []byte
 	pos := 12 // skip RIFF header
 	for pos+8 <= len(original) {
 		id := string(original[pos : pos+4])
@@ -91,7 +93,15 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 		if dataEnd > len(original) {
 			break
 		}
-		if id != "EXIF" && id != "XMP " && id != "VP8X" {
+		switch id {
+		case "VP8X":
+			// Capture original VP8X payload so canvas dimensions can be preserved.
+			if size >= 10 {
+				origVP8XData = original[dataStart:dataEnd]
+			}
+		case "EXIF", "XMP ":
+			// Drop: we will re-append updated versions below.
+		default:
 			chunks = append(chunks, struct {
 				id   string
 				data []byte
@@ -107,30 +117,29 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	hasEXIF := rawEXIF != nil
 	hasXMP := rawXMP != nil
 
-	// Determine if there was an original VP8X or if we need to create one.
-	// Check if original has a VP8X chunk.
-	origHasVP8X := bytes.Contains(original[:min(len(original), 64)], []byte("VP8X"))
-
 	var body bytes.Buffer
 
 	// Write VP8X if needed (EXIF or XMP present, or was already extended).
-	if hasEXIF || hasXMP || origHasVP8X {
-		flags := uint32(0)
+	if hasEXIF || hasXMP || origVP8XData != nil {
+		vp8xData := make([]byte, 10)
+		// Start with existing flags and canvas dimensions if available, so
+		// we preserve ICC, animation, alpha, and other feature bits.
+		if origVP8XData != nil {
+			copy(vp8xData, origVP8XData[:10])
+		}
+		// Update only the EXIF (bit 3) and XMP (bit 2) feature flags.
+		flags := binary.LittleEndian.Uint32(vp8xData[0:])
 		if hasXMP {
 			flags |= 0x04
+		} else {
+			flags &^= 0x04
 		}
 		if hasEXIF {
 			flags |= 0x08
+		} else {
+			flags &^= 0x08
 		}
-		vp8xData := make([]byte, 10)
 		binary.LittleEndian.PutUint32(vp8xData[0:], flags)
-		// Canvas width/height: copy from original VP8X if present, else 0.
-		if origHasVP8X {
-			vp8xOff := bytes.Index(original, []byte("VP8X"))
-			if vp8xOff >= 0 && vp8xOff+18 <= len(original) {
-				copy(vp8xData[4:], original[vp8xOff+12:vp8xOff+18])
-			}
-		}
 		writeRIFFChunk(&body, "VP8X", vp8xData)
 	}
 
@@ -171,9 +180,3 @@ func writeRIFFChunk(w *bytes.Buffer, id string, data []byte) {
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
