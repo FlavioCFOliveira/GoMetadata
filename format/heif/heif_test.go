@@ -294,6 +294,85 @@ func TestInjectRoundTrip(t *testing.T) {
 	}
 }
 
+// buildHEIFInMoov constructs a minimal HEIF stream where the meta box is
+// nested inside a moov box, exercising the ancestor-size-patching path in Inject.
+func buildHEIFInMoov(exifData, xmpData []byte) []byte {
+	inner := buildHEIF(exifData, xmpData)
+
+	// Locate the meta box inside the inner stream and wrap it in moov.
+	// inner = ftyp(16) + meta + item data
+	// We wrap everything after ftyp into a moov box.
+	ftyp := inner[:16]
+	rest := inner[16:] // meta + item data
+
+	moovBody := rest
+	moovHdr := make([]byte, 8)
+	binary.BigEndian.PutUint32(moovHdr, uint32(8+len(moovBody)))
+	copy(moovHdr[4:], "moov")
+	moov := append(moovHdr, moovBody...)
+
+	return append(ftyp, moov...)
+}
+
+func TestInjectMetaInsideMoov(t *testing.T) {
+	exif := minimalTIFFExif()
+	data := buildHEIFInMoov(exif, nil)
+
+	newExif := append(exif[:len(exif)-4], 'Y', 'Y', 'Y', 'Y')
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(data), &out, newExif, nil, nil); err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+
+	rawEXIF, _, _, err := Extract(bytes.NewReader(out.Bytes()))
+	if err != nil {
+		t.Fatalf("Extract after Inject (meta-in-moov): %v", err)
+	}
+	if !bytes.Equal(rawEXIF, newExif) {
+		t.Errorf("EXIF mismatch: got %d bytes, want %d bytes", len(rawEXIF), len(newExif))
+	}
+}
+
+func TestInjectBothEXIFAndXMP(t *testing.T) {
+	exif := minimalTIFFExif()
+	xmp := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta><?xpacket end="w"?>`)
+	data := buildHEIF(exif, xmp)
+
+	newExif := append(exif[:len(exif)-4], 'Z', 'Z', 'Z', 'Z')
+	newXMP := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"/></x:xmpmeta><?xpacket end="w"?>`)
+
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(data), &out, newExif, nil, newXMP); err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+
+	rawEXIF, _, rawXMP, err := Extract(bytes.NewReader(out.Bytes()))
+	if err != nil {
+		t.Fatalf("Extract after Inject: %v", err)
+	}
+	if !bytes.Equal(rawEXIF, newExif) {
+		t.Errorf("EXIF mismatch: got %d bytes, want %d", len(rawEXIF), len(newExif))
+	}
+	if !bytes.Equal(rawXMP, newXMP) {
+		t.Errorf("XMP mismatch: got %d bytes, want %d", len(rawXMP), len(newXMP))
+	}
+}
+
+func TestInjectPassThroughNilPayloads(t *testing.T) {
+	exif := minimalTIFFExif()
+	data := buildHEIF(exif, nil)
+	original := make([]byte, len(data))
+	copy(original, data)
+
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(data), &out, nil, nil, nil); err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), original) {
+		t.Error("pass-through: output differs from input when no payloads provided")
+	}
+}
+
 func BenchmarkHEIFExtract(b *testing.B) {
 	data := buildHEIF(minimalTIFFExif(), nil)
 	b.SetBytes(int64(len(data)))

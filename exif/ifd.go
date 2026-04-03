@@ -178,6 +178,24 @@ func (e *IFDEntry) Rational(i int) [2]uint32 {
 	}
 }
 
+// SRational decodes the i-th SRATIONAL value as [numerator, denominator].
+// Returns [0, 0] on out-of-range access.
+// Use this instead of Rational for signed tags such as ShutterSpeedValue (0x9201),
+// BrightnessValue (0x9203), and ExposureBiasValue (0x9204) (EXIF 2.x §4.6.3).
+func (e *IFDEntry) SRational(i int) [2]int32 {
+	if e.Type != TypeSRational {
+		return [2]int32{}
+	}
+	off := i * 8
+	if off+8 > len(e.Value) {
+		return [2]int32{}
+	}
+	return [2]int32{
+		int32(e.byteOrder.Uint32(e.Value[off:])),
+		int32(e.byteOrder.Uint32(e.Value[off+4:])),
+	}
+}
+
 // Int16 decodes the first SSHORT value.
 func (e *IFDEntry) Int16() int16 {
 	if e.Type != TypeSShort || len(e.Value) < 2 {

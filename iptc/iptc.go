@@ -164,6 +164,39 @@ func (i *IPTC) Creator() string {
 	return i.firstRecord2(DS2Byline)
 }
 
+// SetCaption sets dataset 2:120 (Caption/Abstract) to s, replacing any existing value.
+func (i *IPTC) SetCaption(s string) {
+	i.setRecord2(DS2Caption, []byte(s))
+}
+
+// SetCopyright sets dataset 2:116 (Copyright Notice) to s, replacing any existing value.
+func (i *IPTC) SetCopyright(s string) {
+	i.setRecord2(DS2CopyrightNotice, []byte(s))
+}
+
+// SetCreator sets dataset 2:80 (By-line) to s, replacing any existing value.
+func (i *IPTC) SetCreator(s string) {
+	i.setRecord2(DS2Byline, []byte(s))
+}
+
+// AddKeyword appends a keyword to dataset 2:25 (Keywords, IIM §2.2.17).
+// Keywords is a repeatable dataset; each call adds one additional entry.
+func (i *IPTC) AddKeyword(kw string) {
+	i.Records[2] = append(i.Records[2], Dataset{Record: 2, DataSet: DS2Keywords, Value: []byte(kw)})
+}
+
+// setRecord2 replaces the first occurrence of ds in record 2 with value,
+// or appends a new dataset if none exists.
+func (i *IPTC) setRecord2(ds uint8, value []byte) {
+	for idx := range i.Records[2] {
+		if i.Records[2][idx].DataSet == ds {
+			i.Records[2][idx].Value = value
+			return
+		}
+	}
+	i.Records[2] = append(i.Records[2], Dataset{Record: 2, DataSet: ds, Value: value})
+}
+
 // firstRecord2 returns the first string value of the given Record 2 dataset.
 func (i *IPTC) firstRecord2(ds uint8) string {
 	if i == nil {
