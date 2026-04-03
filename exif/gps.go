@@ -47,6 +47,11 @@ func parseGPS(ifd *IFD) (lat, lon float64, ok bool) {
 	lat = dmsToDecimal(latDMS, latRef)
 	lon = dmsToDecimal(lonDMS, lonRef)
 
+	// Validate WGS-84 coordinate ranges (EXIF §4.6.6).
+	if lat < -90 || lat > 90 || lon < -180 || lon > 180 {
+		return 0, 0, false
+	}
+
 	return lat, lon, true
 }
 

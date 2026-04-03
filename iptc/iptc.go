@@ -69,6 +69,11 @@ func Parse(b []byte) (*IPTC, error) {
 			length = int(sizeHigh)<<8 | int(sizeLow)
 		}
 
+		// Cap individual dataset size to 1 MiB to prevent memory exhaustion
+		// from crafted IPTC streams with large declared lengths.
+		if length > 1<<20 {
+			break
+		}
 		if length < 0 || pos+length > len(b) {
 			break
 		}
@@ -105,6 +110,14 @@ func Parse(b []byte) (*IPTC, error) {
 // Encode serialises i back to an IPTC IIM byte stream.
 func Encode(i *IPTC) ([]byte, error) {
 	var buf bytes.Buffer
+
+	// Re-emit the coded character set declaration (IIM §1.5.1) when the
+	// original stream declared UTF-8 (ESC % G = 0x1B 0x25 0x47).
+	if i.isUTF8() {
+		// Record 1, Dataset 90: coded character set = UTF-8.
+		buf.Write([]byte{0x1C, 0x01, 0x5A, 0x00, 0x03, 0x1B, 0x25, 0x47})
+	}
+
 	// Write records in order for deterministic output.
 	for record := uint8(1); record <= 9; record++ {
 		for _, ds := range i.Records[record] {

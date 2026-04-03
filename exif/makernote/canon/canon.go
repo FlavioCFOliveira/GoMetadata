@@ -5,6 +5,7 @@ package canon
 type Parser struct{}
 
 // Parse decodes a Canon MakerNote payload.
+// Not yet implemented; returns nil without error.
 func (Parser) Parse(b []byte) (map[uint16][]byte, error) {
-	panic("not implemented")
+	return nil, nil
 }

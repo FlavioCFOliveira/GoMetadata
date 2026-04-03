@@ -41,6 +41,10 @@ func parseRDF(b []byte, x *XMP) error {
 		switch t := tok.(type) {
 		case xml.StartElement:
 			depth++
+			// Guard against pathological XML with deeply nested elements.
+			if depth > 100 {
+				return fmt.Errorf("xmp: XML nesting depth exceeded 100 levels")
+			}
 
 			switch {
 			case t.Name.Space == NSrdf && t.Name.Local == "Description":

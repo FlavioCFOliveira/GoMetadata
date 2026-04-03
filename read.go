@@ -42,7 +42,7 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 		// Read first 12 bytes for the error message.
 		var magic [12]byte
 		if _, err2 := r.Seek(0, io.SeekStart); err2 == nil {
-			r.Read(magic[:]) //nolint:errcheck
+			_, _ = r.Read(magic[:]) // best-effort: populate magic for error context
 		}
 		return nil, &UnsupportedFormatError{Magic: magic}
 	}

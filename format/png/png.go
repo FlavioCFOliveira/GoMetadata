@@ -11,8 +11,10 @@ package png
 
 import (
 	"bytes"
+	"compress/zlib"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 )
 
@@ -48,7 +50,11 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		case "eXIf":
 			rawEXIF = data
 		case "iTXt":
-			if xmp := extractXMPFromITXt(data); xmp != nil {
+			xmp, xerr := extractXMPFromITXt(data)
+			if xerr != nil {
+				return nil, nil, nil, xerr
+			}
+			if xmp != nil {
 				rawXMP = xmp
 			}
 		case "IEND":
@@ -147,8 +153,7 @@ func readChunk(r io.Reader) (chunkType string, data []byte, err error) {
 	return chunkType, data, nil
 }
 
-// writeChunk writes a PNG chunk with a zeroed CRC (informational; not
-// verified by most readers when metadata-only chunks are updated).
+// writeChunk writes a PNG chunk with a correct CRC-32 checksum (PNG §5.4).
 func writeChunk(w io.Writer, chunkType string, data []byte) error {
 	hdr := make([]byte, 8)
 	binary.BigEndian.PutUint32(hdr[:4], uint32(len(data)))
@@ -161,48 +166,70 @@ func writeChunk(w io.Writer, chunkType string, data []byte) error {
 			return err
 		}
 	}
-	// Write zero CRC placeholder (4 bytes).
-	_, err := w.Write([]byte{0, 0, 0, 0})
+	// CRC covers chunk type + chunk data (PNG §5.4).
+	h := crc32.NewIEEE()
+	h.Write([]byte(chunkType))
+	h.Write(data)
+	var crcB [4]byte
+	binary.BigEndian.PutUint32(crcB[:], h.Sum32())
+	_, err := w.Write(crcB[:])
 	return err
 }
 
 // extractXMPFromITXt parses an iTXt chunk and returns the XMP text if the
 // keyword is "XML:com.adobe.xmp", or nil otherwise.
-func extractXMPFromITXt(data []byte) []byte {
+// Compressed iTXt payloads (compFlag != 0) are decompressed via zlib (PNG §11.3.4).
+func extractXMPFromITXt(data []byte) ([]byte, error) {
 	// iTXt layout: keyword\x00 compFlag(1) compMethod(1) lang\x00 transKw\x00 text
 	null := bytes.IndexByte(data, 0x00)
 	if null < 0 {
-		return nil
+		return nil, nil
 	}
 	if string(data[:null]) != xmpKeyword {
-		return nil
+		return nil, nil
 	}
 	pos := null + 1 // skip null terminator
 	if pos+2 > len(data) {
-		return nil
+		return nil, nil
 	}
 	compFlag := data[pos]
+	compMethod := data[pos+1]
 	pos += 2 // skip compFlag + compMethod
 
 	// Skip language tag (null-terminated).
 	lang := bytes.IndexByte(data[pos:], 0x00)
 	if lang < 0 {
-		return nil
+		return nil, nil
 	}
 	pos += lang + 1
 
 	// Skip translated keyword (null-terminated).
 	tk := bytes.IndexByte(data[pos:], 0x00)
 	if tk < 0 {
-		return nil
+		return nil, nil
 	}
 	pos += tk + 1
 
-	if compFlag != 0 {
-		// Compressed text is not supported in this implementation.
-		return nil
+	text := data[pos:]
+
+	if compFlag == 0 {
+		return text, nil
 	}
-	return data[pos:]
+
+	// Compressed iTXt: decompress using zlib (compMethod 0 = deflate, PNG §11.3.4).
+	if compMethod != 0 {
+		return nil, fmt.Errorf("png: compressed XMP: unsupported compression method %d", compMethod)
+	}
+	zr, err := zlib.NewReader(bytes.NewReader(text))
+	if err != nil {
+		return nil, fmt.Errorf("png: compressed XMP: %w", err)
+	}
+	defer zr.Close()
+	dec, err := io.ReadAll(zr)
+	if err != nil {
+		return nil, fmt.Errorf("png: compressed XMP: decompression failed: %w", err)
+	}
+	return dec, nil
 }
 
 // isXMPChunk reports whether an iTXt chunk contains XMP data.

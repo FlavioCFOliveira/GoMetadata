@@ -1,6 +1,10 @@
 package imgmetadata
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/flaviocfo/img-metadata/internal/metaerr"
+)
 
 // UnsupportedFormatError is returned when the magic bytes of the input do not
 // match any supported image container format.
@@ -15,23 +19,10 @@ func (e *UnsupportedFormatError) Error() string {
 
 // TruncatedFileError is returned when the input ends unexpectedly before a
 // required structure could be read.
-type TruncatedFileError struct {
-	// At describes what was being read when the truncation was detected.
-	At string
-}
-
-func (e *TruncatedFileError) Error() string {
-	return fmt.Sprintf("imgmetadata: truncated file while reading %s", e.At)
-}
+// Alias of internal/metaerr.TruncatedFileError; all sub-packages use the same type.
+type TruncatedFileError = metaerr.TruncatedFileError
 
 // CorruptMetadataError is returned when a metadata segment is structurally
 // invalid (bad offsets, impossible lengths, invalid tag types, etc.).
-// The message is specific enough for the caller to locate the problem.
-type CorruptMetadataError struct {
-	Format string // "EXIF", "IPTC", or "XMP"
-	Reason string
-}
-
-func (e *CorruptMetadataError) Error() string {
-	return fmt.Sprintf("imgmetadata: corrupt %s metadata: %s", e.Format, e.Reason)
-}
+// Alias of internal/metaerr.CorruptMetadataError; all sub-packages use the same type.
+type CorruptMetadataError = metaerr.CorruptMetadataError

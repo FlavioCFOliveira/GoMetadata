@@ -5,6 +5,7 @@ package sony
 type Parser struct{}
 
 // Parse decodes a Sony MakerNote payload.
+// Not yet implemented; returns nil without error.
 func (Parser) Parse(b []byte) (map[uint16][]byte, error) {
-	panic("not implemented")
+	return nil, nil
 }

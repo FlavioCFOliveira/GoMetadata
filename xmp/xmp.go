@@ -87,6 +87,10 @@ func (x *XMP) GPS() (lat, lon float64, ok bool) {
 	if err != nil {
 		return 0, 0, false
 	}
+	// Validate WGS-84 coordinate ranges (XMP §8.4).
+	if lat < -90 || lat > 90 || lon < -180 || lon > 180 {
+		return 0, 0, false
+	}
 	return lat, lon, true
 }
 
