@@ -142,7 +142,9 @@ const (
 	TagLensSpecification     TagID = 0xA432 // Rational 4
 	TagLensMake              TagID = 0xA433 // ASCII (EXIF 2.3+)
 	TagLensModel             TagID = 0xA434 // ASCII (EXIF 2.3+)
-	TagLensSerialNumber      TagID = 0xA435 // ASCII (EXIF 2.3+)
+	TagLensSerialNumber              TagID = 0xA435 // ASCII (EXIF 2.3+)
+	TagStandardOutputSensitivity     TagID = 0x8801 // Long 1 (EXIF 2.3+ §4.6.5)
+	TagDeviceSettingDescription      TagID = 0xA40B // Undefined (EXIF 2.x §4.6.5)
 )
 
 // tagRegistry maps TagID to tagInfo for all known tags.
@@ -285,17 +287,49 @@ func init() {
 		tagRegistry[tag] = info
 	}
 
-	// GPS IFD tags (EXIF §4.6.6 Table 15).
+	// GPS IFD tags (EXIF §4.6.6 Table 15, all 32 entries).
 	for tag, info := range map[TagID]tagInfo{
-		TagGPSVersionID:    {"GPSVersionID", TypeByte, 4},
-		TagGPSLatitudeRef:  {"GPSLatitudeRef", TypeASCII, 2},
-		TagGPSLatitude:     {"GPSLatitude", TypeRational, 3},
-		TagGPSLongitudeRef: {"GPSLongitudeRef", TypeASCII, 2},
-		TagGPSLongitude:    {"GPSLongitude", TypeRational, 3},
-		TagGPSAltitudeRef:  {"GPSAltitudeRef", TypeByte, 1},
-		TagGPSAltitude:     {"GPSAltitude", TypeRational, 1},
-		TagGPSTimeStamp:    {"GPSTimeStamp", TypeRational, 3},
-		TagGPSDateStamp:    {"GPSDateStamp", TypeASCII, 11},
+		TagGPSVersionID:        {"GPSVersionID", TypeByte, 4},
+		TagGPSLatitudeRef:      {"GPSLatitudeRef", TypeASCII, 2},
+		TagGPSLatitude:         {"GPSLatitude", TypeRational, 3},
+		TagGPSLongitudeRef:     {"GPSLongitudeRef", TypeASCII, 2},
+		TagGPSLongitude:        {"GPSLongitude", TypeRational, 3},
+		TagGPSAltitudeRef:      {"GPSAltitudeRef", TypeByte, 1},
+		TagGPSAltitude:         {"GPSAltitude", TypeRational, 1},
+		TagGPSTimeStamp:        {"GPSTimeStamp", TypeRational, 3},
+		TagGPSSatellites:       {"GPSSatellites", TypeASCII, 0},
+		TagGPSStatus:           {"GPSStatus", TypeASCII, 2},
+		TagGPSMeasureMode:      {"GPSMeasureMode", TypeASCII, 2},
+		TagGPSDOP:              {"GPSDOP", TypeRational, 1},
+		TagGPSSpeedRef:         {"GPSSpeedRef", TypeASCII, 2},
+		TagGPSSpeed:            {"GPSSpeed", TypeRational, 1},
+		TagGPSTrackRef:         {"GPSTrackRef", TypeASCII, 2},
+		TagGPSTrack:            {"GPSTrack", TypeRational, 1},
+		TagGPSImgDirectionRef:  {"GPSImgDirectionRef", TypeASCII, 2},
+		TagGPSImgDirection:     {"GPSImgDirection", TypeRational, 1},
+		TagGPSMapDatum:         {"GPSMapDatum", TypeASCII, 0},
+		TagGPSDestLatitudeRef:  {"GPSDestLatitudeRef", TypeASCII, 2},
+		TagGPSDestLatitude:     {"GPSDestLatitude", TypeRational, 3},
+		TagGPSDestLongitudeRef: {"GPSDestLongitudeRef", TypeASCII, 2},
+		TagGPSDestLongitude:    {"GPSDestLongitude", TypeRational, 3},
+		TagGPSDestBearingRef:   {"GPSDestBearingRef", TypeASCII, 2},
+		TagGPSDestBearing:      {"GPSDestBearing", TypeRational, 1},
+		TagGPSDestDistanceRef:  {"GPSDestDistanceRef", TypeASCII, 2},
+		TagGPSDestDistance:     {"GPSDestDistance", TypeRational, 1},
+		TagGPSProcessingMethod: {"GPSProcessingMethod", TypeUndefined, 0},
+		TagGPSAreaInformation:  {"GPSAreaInformation", TypeUndefined, 0},
+		TagGPSDateStamp:        {"GPSDateStamp", TypeASCII, 11},
+		TagGPSDifferential:     {"GPSDifferential", TypeShort, 1},
+		TagGPSHPositioningError: {"GPSHPositioningError", TypeRational, 1},
+	} {
+		tagRegistry[tag] = info
+	}
+
+	// Additional EXIF 2.3+ tags not in the main EXIF IFD block above
+	// (CIPA DC-008-2023 §4.6.5).
+	for tag, info := range map[TagID]tagInfo{
+		TagStandardOutputSensitivity: {"StandardOutputSensitivity", TypeLong, 1},
+		TagDeviceSettingDescription:  {"DeviceSettingDescription", TypeUndefined, 0},
 	} {
 		tagRegistry[tag] = info
 	}

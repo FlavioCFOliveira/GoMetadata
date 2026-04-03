@@ -57,6 +57,27 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 			if xmp != nil {
 				rawXMP = xmp
 			}
+		case "tEXt":
+			// Legacy uncompressed text chunk; XMP may be embedded here by older
+			// tools (e.g. Photoshop CS2, ImageMagick). Layout: keyword\x00text.
+			// Only extract if keyword is "XML:com.adobe.xmp" and rawXMP not yet set.
+			if rawXMP == nil {
+				if xmp := extractXMPFromTExt(data); xmp != nil {
+					rawXMP = xmp
+				}
+			}
+		case "zTXt":
+			// Legacy compressed text chunk; same keyword convention as tEXt.
+			// Layout: keyword\x00 compMethod(1) compressed_text. Only deflate (0).
+			if rawXMP == nil {
+				xmp, xerr := extractXMPFromZTxt(data)
+				if xerr != nil {
+					return nil, nil, nil, xerr
+				}
+				if xmp != nil {
+					rawXMP = xmp
+				}
+			}
 		case "IEND":
 			return rawEXIF, nil, rawXMP, nil
 		}
@@ -228,6 +249,54 @@ func extractXMPFromITXt(data []byte) ([]byte, error) {
 	dec, err := io.ReadAll(zr)
 	if err != nil {
 		return nil, fmt.Errorf("png: compressed XMP: decompression failed: %w", err)
+	}
+	return dec, nil
+}
+
+// extractXMPFromTExt extracts XMP from a tEXt chunk if its keyword is
+// "XML:com.adobe.xmp" (legacy uncompressed form, RFC 2083 §12.13).
+func extractXMPFromTExt(data []byte) []byte {
+	null := bytes.IndexByte(data, 0x00)
+	if null < 0 {
+		return nil
+	}
+	if string(data[:null]) != xmpKeyword {
+		return nil
+	}
+	text := data[null+1:]
+	if len(text) == 0 {
+		return nil
+	}
+	return text
+}
+
+// extractXMPFromZTxt extracts and decompresses XMP from a zTXt chunk if its
+// keyword is "XML:com.adobe.xmp" (legacy deflate-compressed form, PNG §11.3.3).
+func extractXMPFromZTxt(data []byte) ([]byte, error) {
+	null := bytes.IndexByte(data, 0x00)
+	if null < 0 {
+		return nil, nil
+	}
+	if string(data[:null]) != xmpKeyword {
+		return nil, nil
+	}
+	pos := null + 1
+	if pos >= len(data) {
+		return nil, nil
+	}
+	compMethod := data[pos]
+	pos++
+	if compMethod != 0 {
+		return nil, fmt.Errorf("png: zTXt XMP: unsupported compression method %d", compMethod)
+	}
+	zr, err := zlib.NewReader(bytes.NewReader(data[pos:]))
+	if err != nil {
+		return nil, fmt.Errorf("png: zTXt XMP: %w", err)
+	}
+	defer zr.Close()
+	dec, err := io.ReadAll(zr)
+	if err != nil {
+		return nil, fmt.Errorf("png: zTXt XMP: decompression failed: %w", err)
 	}
 	return dec, nil
 }

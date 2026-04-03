@@ -3,6 +3,7 @@ package xmp
 import (
 	"bytes"
 	"encoding/xml"
+	"sort"
 	"strings"
 )
 
@@ -17,10 +18,17 @@ func encode(x *XMP) ([]byte, error) {
 	buf.WriteString("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n")
 	buf.WriteString(" <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n")
 
+	// Sort namespace URIs for deterministic output (ISO 16684-1 §7.4).
+	nsList := make([]string, 0, len(x.Properties))
 	for ns, props := range x.Properties {
-		if len(props) == 0 {
-			continue
+		if len(props) > 0 {
+			nsList = append(nsList, ns)
 		}
+	}
+	sort.Strings(nsList)
+
+	for _, ns := range nsList {
+		props := x.Properties[ns]
 		prefix := prefixOf(ns)
 		buf.WriteString("  <rdf:Description rdf:about=\"\" xmlns:")
 		buf.WriteString(prefix)
@@ -28,7 +36,15 @@ func encode(x *XMP) ([]byte, error) {
 		buf.WriteString(ns)
 		buf.WriteString("\">\n")
 
-		for local, val := range props {
+		// Sort property names for deterministic output.
+		localList := make([]string, 0, len(props))
+		for local := range props {
+			localList = append(localList, local)
+		}
+		sort.Strings(localList)
+
+		for _, local := range localList {
+			val := props[local]
 			values := strings.Split(val, "\x1e")
 			if len(values) > 1 {
 				// Multi-valued: use the per-property collection type (ISO 16684-1 §7.5).
@@ -42,11 +58,21 @@ func encode(x *XMP) ([]byte, error) {
 				buf.WriteString(">\n")
 				for _, v := range values {
 					if ctype == "Alt" {
-						buf.WriteString("     <rdf:li xml:lang=\"x-default\">")
+						// Preserve xml:lang if stored as "lang|value" (P1-H).
+						lang, val, hasLang := strings.Cut(v, "|")
+						if hasLang {
+							buf.WriteString("     <rdf:li xml:lang=\"")
+							xml.EscapeText(&buf, []byte(lang)) //nolint:errcheck
+							buf.WriteString("\">")
+							xml.EscapeText(&buf, []byte(val)) //nolint:errcheck
+						} else {
+							buf.WriteString("     <rdf:li xml:lang=\"x-default\">")
+							xml.EscapeText(&buf, []byte(v)) //nolint:errcheck
+						}
 					} else {
 						buf.WriteString("     <rdf:li>")
+						xml.EscapeText(&buf, []byte(v)) //nolint:errcheck
 					}
-					xml.EscapeText(&buf, []byte(v)) //nolint:errcheck
 					buf.WriteString("</rdf:li>\n")
 				}
 				buf.WriteString("    </rdf:")

@@ -235,6 +235,21 @@ func (e *IFDEntry) Bytes() []byte {
 	return e.Value
 }
 
+// Byte returns the first byte of a TypeByte or TypeSByte entry.
+// Returns 0 if the entry has no bytes.
+func (e *IFDEntry) Byte() byte {
+	if len(e.Value) == 0 {
+		return 0
+	}
+	return e.Value[0]
+}
+
+// Uint8s returns all bytes of a TypeByte entry as a slice.
+// The returned slice aliases the entry's internal Value buffer; do not modify.
+func (e *IFDEntry) Uint8s() []byte {
+	return e.Value
+}
+
 // Len returns the number of values in the entry (Count field).
 func (e *IFDEntry) Len() int {
 	return int(e.Count)

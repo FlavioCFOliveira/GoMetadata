@@ -17,8 +17,9 @@ var canonUUID = []byte{
 }
 
 // Extract reads metadata from a CR3 file by navigating the ISOBMFF box tree.
-// CMT1 contains IFD0 (TIFF header + entries), CMT2 contains the Exif IFD.
-// The returned rawEXIF is the CMT1 content, which is a valid TIFF stream.
+// CMT1 contains IFD0 (TIFF header + entries); CMT2 contains the Exif IFD that
+// IFD0's ExifIFD pointer (tag 0x8769) addresses. Both are merged into rawEXIF
+// so that exif.Parse receives a contiguous buffer covering both IFDs.
 func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if _, err = r.Seek(0, io.SeekStart); err != nil {
 		return nil, nil, nil, fmt.Errorf("cr3: seek: %w", err)
@@ -35,15 +36,85 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 
 	uuidData := findUUIDBox(moovData, canonUUID)
 	if uuidData == nil {
-		// Fall back: search for CMT1 anywhere in the moov box.
-		rawEXIF = findBox(moovData, "CMT1", 0)
+		// Fall back: search for CMT1/CMT2 anywhere in the moov box.
+		cmt1 := findBox(moovData, "CMT1", 0)
+		cmt2 := findBox(moovData, "CMT2", 0)
 		rawXMP = findBox(moovData, "XMP ", 0)
-		return rawEXIF, nil, rawXMP, nil
+		return mergeCMT(cmt1, cmt2), nil, rawXMP, nil
 	}
 
-	rawEXIF = findBox(uuidData, "CMT1", 0)
+	cmt1 := findBox(uuidData, "CMT1", 0)
+	cmt2 := findBox(uuidData, "CMT2", 0)
 	rawXMP = findBox(uuidData, "XMP ", 0)
-	return rawEXIF, nil, rawXMP, nil
+	return mergeCMT(cmt1, cmt2), nil, rawXMP, nil
+}
+
+// mergeCMT combines CMT1 (IFD0 TIFF stream) with CMT2 (Exif IFD bytes) into
+// a single contiguous buffer that exif.Parse can traverse.
+//
+// In CR3 files, the ExifIFD pointer stored in CMT1's IFD0 points to a byte
+// offset relative to the start of CMT1. If that offset falls beyond CMT1's
+// length, the Exif IFD data lives in CMT2. Appending CMT2 to CMT1 makes the
+// pointer valid so the EXIF parser can follow it without modification.
+//
+// If cmt2 is nil or the ExifIFD pointer lies within CMT1, cmt1 is returned
+// unchanged (zero copy).
+func mergeCMT(cmt1, cmt2 []byte) []byte {
+	if cmt2 == nil || len(cmt1) < 8 {
+		return cmt1
+	}
+	// Parse the TIFF byte-order mark to determine endianness.
+	// TIFF 6.0 §2: "II" = little-endian, "MM" = big-endian.
+	var exifIFDOffset uint32
+	switch {
+	case cmt1[0] == 'I' && cmt1[1] == 'I': // little-endian
+		if len(cmt1) < 8 {
+			return cmt1
+		}
+		// IFD0 offset is at bytes 4–7 (TIFF header).
+		ifd0Off := binary.LittleEndian.Uint32(cmt1[4:8])
+		exifIFDOffset = findExifIFDOffset(cmt1, ifd0Off, binary.LittleEndian)
+	case cmt1[0] == 'M' && cmt1[1] == 'M': // big-endian
+		if len(cmt1) < 8 {
+			return cmt1
+		}
+		ifd0Off := binary.BigEndian.Uint32(cmt1[4:8])
+		exifIFDOffset = findExifIFDOffset(cmt1, ifd0Off, binary.BigEndian)
+	default:
+		return cmt1
+	}
+	// If the ExifIFD offset is within CMT1, no merge needed.
+	if exifIFDOffset == 0 || int(exifIFDOffset) < len(cmt1) {
+		return cmt1
+	}
+	// ExifIFD pointer extends into CMT2: concatenate.
+	merged := make([]byte, len(cmt1)+len(cmt2))
+	copy(merged, cmt1)
+	copy(merged[len(cmt1):], cmt2)
+	return merged
+}
+
+// findExifIFDOffset walks IFD0 in buf (starting at ifd0Off) looking for tag
+// 0x8769 (ExifIFD) and returns its LONG value (the offset). Returns 0 if not
+// found or if buf is too short to parse.
+func findExifIFDOffset(buf []byte, ifd0Off uint32, order binary.ByteOrder) uint32 {
+	if int(ifd0Off)+2 > len(buf) {
+		return 0
+	}
+	count := order.Uint16(buf[ifd0Off:])
+	pos := int(ifd0Off) + 2
+	for i := 0; i < int(count); i++ {
+		if pos+12 > len(buf) {
+			break
+		}
+		tag := order.Uint16(buf[pos:])
+		if tag == 0x8769 { // ExifIFD pointer
+			// type must be LONG (4), count must be 1; value is the 4-byte offset.
+			return order.Uint32(buf[pos+8:])
+		}
+		pos += 12
+	}
+	return 0
 }
 
 // Inject writes a modified CR3 stream to w by rebuilding the Canon UUID box

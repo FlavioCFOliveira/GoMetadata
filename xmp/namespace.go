@@ -15,6 +15,10 @@ const (
 	NSiptcExt   = "http://iptc.org/std/Iptc4xmpExt/2008-02-29/"
 	NSrdf       = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 	NSx         = "adobe:ns:meta/"
+	// NScc is the Creative Commons namespace (creativecommons.org/ns).
+	NScc  = "http://creativecommons.org/ns#"
+	// NSpdf is the PDF namespace (Adobe PDF 1.3 property set).
+	NSpdf = "http://ns.adobe.com/pdf/1.3/"
 )
 
 // collectionType returns the RDF collection element name (Bag, Seq, or Alt)
@@ -60,6 +64,10 @@ func prefixOf(uri string) string {
 		return "rdf"
 	case NSx:
 		return "x"
+	case NScc:
+		return "cc"
+	case NSpdf:
+		return "pdf"
 	}
 	return "ns"
 }

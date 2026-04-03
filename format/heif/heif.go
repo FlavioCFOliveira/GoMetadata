@@ -424,6 +424,9 @@ func appendUintN(b []byte, n int, v uint64) []byte {
 // ---------------------------------------------------------------------------
 
 // parseHEIFMetadata parses the box hierarchy to find EXIF and XMP items.
+// When multiple items of the same type exist, the primary item (per 'pitm' box)
+// is preferred; otherwise the item with the lowest ID is selected.
+// ISO 23008-12 §6.2 (primary item), §6.6.1 (EXIF item layout).
 func parseHEIFMetadata(data []byte) (rawEXIF, rawXMP []byte, err error) {
 	// Find the 'meta' box. It can be inside 'moov' or at top-level.
 	metaData, err := findBox(data, "meta", 0)
@@ -436,18 +439,32 @@ func parseHEIFMetadata(data []byte) (rawEXIF, rawXMP []byte, err error) {
 	itemTypes := parseIinf(metaData)
 	itemLocs := parseIloc(metaData)
 
-	for id, typ := range itemTypes {
-		loc, ok := itemLocs[id]
-		if !ok {
-			continue
-		}
-		if loc.offset+loc.length > uint64(len(data)) {
-			continue
-		}
-		itemData := data[loc.offset : loc.offset+loc.length]
+	// Determine primary item ID from pitm box; 0 means none found.
+	primaryID := parsePitm(metaData)
 
+	// Track best candidate IDs for EXIF and XMP. Prefer the primary item;
+	// among non-primary items, prefer the lowest item ID for determinism.
+	var bestEXIFID, bestXMPID uint16
+	exifFound, xmpFound := false, false
+
+	for id, typ := range itemTypes {
 		switch typ {
 		case "Exif":
+			if !exifFound || id == primaryID || (bestEXIFID != primaryID && id < bestEXIFID) {
+				bestEXIFID = id
+				exifFound = true
+			}
+		case "mime", "rdf+xml":
+			if !xmpFound || id == primaryID || (bestXMPID != primaryID && id < bestXMPID) {
+				bestXMPID = id
+				xmpFound = true
+			}
+		}
+	}
+
+	if exifFound {
+		if loc, ok := itemLocs[bestEXIFID]; ok && loc.offset+loc.length <= uint64(len(data)) {
+			itemData := data[loc.offset : loc.offset+loc.length]
 			// HEIF EXIF item begins with a 4-byte offset to the TIFF header
 			// within the item (ISO 23008-12 §6.6.1). Skip it.
 			if len(itemData) >= 4 {
@@ -456,12 +473,47 @@ func parseHEIFMetadata(data []byte) (rawEXIF, rawXMP []byte, err error) {
 					rawEXIF = itemData[skip:]
 				}
 			}
-		case "mime", "rdf+xml":
-			rawXMP = itemData
+		}
+	}
+	if xmpFound {
+		if loc, ok := itemLocs[bestXMPID]; ok && loc.offset+loc.length <= uint64(len(data)) {
+			rawXMP = data[loc.offset : loc.offset+loc.length]
 		}
 	}
 
 	return rawEXIF, rawXMP, nil
+}
+
+// parsePitm parses the 'pitm' FullBox from metaContent and returns the primary
+// item ID. Returns 0 if the box is absent or cannot be parsed.
+// ISO 14496-12 §8.11.4 (pitm box).
+func parsePitm(metaContent []byte) uint16 {
+	pitm := findInnerBox(metaContent, "pitm")
+	if pitm == nil {
+		return 0
+	}
+	// FullBox: version(1) + flags(3); then item_ID.
+	// version 0: item_ID is uint16; version 1: item_ID is uint32.
+	if len(pitm) < 1 {
+		return 0
+	}
+	version := pitm[0]
+	pos := 4 // skip version + flags
+	if version == 0 {
+		if pos+2 > len(pitm) {
+			return 0
+		}
+		return binary.BigEndian.Uint16(pitm[pos:])
+	}
+	// version 1
+	if pos+4 > len(pitm) {
+		return 0
+	}
+	id := binary.BigEndian.Uint32(pitm[pos:])
+	if id > 0xFFFF {
+		return 0
+	}
+	return uint16(id)
 }
 
 // itemLoc holds the resolved location of an ISOBMFF item.
@@ -570,6 +622,7 @@ func parseIinf(metaData []byte) map[uint16]string {
 }
 
 // parseInfe parses an 'infe' box body and returns (item_ID, item_type).
+// Handles infe versions 0, 1, 2, and 3 per ISO 14496-12 §8.11.6.
 func parseInfe(data []byte) (uint16, string) {
 	if len(data) < 4 {
 		return 0, ""
@@ -580,6 +633,39 @@ func parseInfe(data []byte) (uint16, string) {
 
 	var id uint16
 	switch version {
+	case 0, 1:
+		// infe v0/v1: item_ID(2) + item_protection_index(2) + item_name(NUL-term)
+		// + content_type(NUL-term) [+ content_encoding(NUL-term) for v1].
+		// The item type is derived from the content_type MIME string.
+		if pos+2 > len(data) {
+			return 0, ""
+		}
+		id = binary.BigEndian.Uint16(data[pos:])
+		pos += 2
+		pos += 2 // item_protection_index
+		// Skip item_name (NUL-terminated string).
+		nul := indexByte(data[pos:], 0x00)
+		if nul < 0 {
+			return id, ""
+		}
+		pos += nul + 1
+		// Read content_type (NUL-terminated MIME string).
+		nul2 := indexByte(data[pos:], 0x00)
+		var contentType string
+		if nul2 >= 0 {
+			contentType = string(data[pos : pos+nul2])
+		} else {
+			contentType = string(data[pos:])
+		}
+		// Map content type to internal type string.
+		switch contentType {
+		case "application/rdf+xml":
+			return id, "mime"
+		}
+		// Exif in v0/v1 has no formal item_type; the item_content_type is typically
+		// empty or "image/jpeg". We cannot reliably identify Exif items in v0/v1.
+		return id, ""
+
 	case 2:
 		if pos+2 > len(data) {
 			return 0, ""
@@ -592,6 +678,7 @@ func parseInfe(data []byte) (uint16, string) {
 		}
 		itemType := string(data[pos : pos+4])
 		return id, itemType
+
 	case 3:
 		if pos+4 > len(data) {
 			return 0, ""
@@ -606,6 +693,16 @@ func parseInfe(data []byte) (uint16, string) {
 		return id, itemType
 	}
 	return 0, ""
+}
+
+// indexByte returns the index of the first occurrence of b in s, or -1.
+func indexByte(s []byte, b byte) int {
+	for i, v := range s {
+		if v == b {
+			return i
+		}
+	}
+	return -1
 }
 
 // parseIloc parses an 'iloc' box body and returns a map from item ID to location.
@@ -780,6 +877,10 @@ func findInnerBox(data []byte, boxType string) []byte {
 		}
 		if size == 0 {
 			size = uint64(len(data) - pos)
+		}
+		// A box whose size is smaller than its header is malformed; stop.
+		if size < headerLen {
+			break
 		}
 		if uint64(pos)+size > uint64(len(data)) {
 			break

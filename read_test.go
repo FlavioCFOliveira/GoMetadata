@@ -3,10 +3,16 @@ package imgmetadata
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
+	"hash/crc32"
+	"io"
 	"os"
+	"sync"
 	"testing"
 
+	"github.com/flaviocfo/img-metadata/exif"
 	"github.com/flaviocfo/img-metadata/format"
+	"github.com/flaviocfo/img-metadata/iptc"
 )
 
 // buildMinimalJPEG constructs a minimal JPEG stream with an optional EXIF APP1
@@ -188,6 +194,485 @@ func TestReadFilePermDenied(t *testing.T) {
 	}
 	if !os.IsPermission(err) {
 		t.Errorf("os.IsPermission(err) = false; err = %v", err)
+	}
+}
+
+// buildMinimalPNG builds a minimal valid PNG (signature + IHDR + IEND) with
+// correct per-chunk CRC values. This is the minimum that the PNG extractor
+// will accept as a recognised container.
+func buildMinimalPNG() []byte {
+	var buf bytes.Buffer
+
+	// PNG signature (PNG §5.2).
+	buf.Write([]byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A})
+
+	writePNGChunk := func(chunkType string, data []byte) {
+		var lbuf [4]byte
+		binary.BigEndian.PutUint32(lbuf[:], uint32(len(data)))
+		buf.Write(lbuf[:])
+		buf.WriteString(chunkType)
+		buf.Write(data)
+		h := crc32.NewIEEE()
+		h.Write([]byte(chunkType))
+		h.Write(data)
+		binary.BigEndian.PutUint32(lbuf[:], h.Sum32())
+		buf.Write(lbuf[:])
+	}
+
+	// Minimal IHDR: 1×1 pixel, 8-bit RGB (PNG §11.2.2).
+	ihdr := make([]byte, 13)
+	binary.BigEndian.PutUint32(ihdr[0:], 1) // width
+	binary.BigEndian.PutUint32(ihdr[4:], 1) // height
+	ihdr[8] = 8                             // bit depth
+	ihdr[9] = 2                             // colour type: RGB
+	writePNGChunk("IHDR", ihdr)
+	writePNGChunk("IEND", nil)
+
+	return buf.Bytes()
+}
+
+// buildIPTCBytes builds a raw IPTC IIM byte stream with a single Record 2
+// caption dataset (IIM §2.2.35, dataset 2:120).
+func buildIPTCBytes(caption string) []byte {
+	val := []byte(caption)
+	var buf bytes.Buffer
+	buf.WriteByte(0x1C)
+	buf.WriteByte(2)
+	buf.WriteByte(120) // DS2Caption
+	buf.WriteByte(byte(len(val) >> 8))
+	buf.WriteByte(byte(len(val)))
+	buf.Write(val)
+	return buf.Bytes()
+}
+
+// buildJPEGWithIPTCAndXMP assembles a JPEG containing both an APP13 IPTC
+// segment and an APP1 XMP segment. The two caption values are intentionally
+// different so TestMetadata_SourcePriority can verify XMP wins.
+func buildJPEGWithIPTCAndXMP(iptcCaption, xmpCaption string) []byte {
+	var buf bytes.Buffer
+	buf.Write([]byte{0xFF, 0xD8}) // SOI
+
+	// APP13: Photoshop IRB wrapping the IPTC IIM stream (EXIF §4.5.6).
+	iptcRaw := buildIPTCBytes(iptcCaption)
+	{
+		var irb bytes.Buffer
+		irb.WriteString("Photoshop 3.0\x00")
+		irb.WriteString("8BIM")
+		irb.Write([]byte{0x04, 0x04}) // IPTC-NAA resource 0x0404
+		irb.Write([]byte{0x00, 0x00}) // Pascal string: empty name
+		var sz [4]byte
+		binary.BigEndian.PutUint32(sz[:], uint32(len(iptcRaw)))
+		irb.Write(sz[:])
+		irb.Write(iptcRaw)
+		if len(iptcRaw)%2 != 0 {
+			irb.WriteByte(0x00)
+		}
+		length := uint16(irb.Len() + 2)
+		buf.Write([]byte{0xFF, 0xED})
+		var lb [2]byte
+		binary.BigEndian.PutUint16(lb[:], length)
+		buf.Write(lb[:])
+		buf.Write(irb.Bytes())
+	}
+
+	// APP1: XMP packet (Adobe XMP Specification Part 3 §1.1.3).
+	{
+		xmpPacket := fmt.Sprintf(
+			`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>`+
+				`<x:xmpmeta xmlns:x="adobe:ns:meta/">`+
+				`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">`+
+				`<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">`+
+				`<dc:description><rdf:Alt><rdf:li xml:lang="x-default">%s</rdf:li></rdf:Alt></dc:description>`+
+				`</rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end="w"?>`,
+			xmpCaption,
+		)
+		ns := "http://ns.adobe.com/xap/1.0/\x00"
+		payload := append([]byte(ns), []byte(xmpPacket)...)
+		length := uint16(len(payload) + 2)
+		buf.Write([]byte{0xFF, 0xE1})
+		var lb [2]byte
+		binary.BigEndian.PutUint16(lb[:], length)
+		buf.Write(lb[:])
+		buf.Write(payload)
+	}
+
+	// Minimal SOS + EOI.
+	buf.Write([]byte{0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9})
+	return buf.Bytes()
+}
+
+// buildRichTIFF constructs a TIFF blob (LE) whose IFD0 contains Make, Model,
+// and Orientation, and whose ExifIFD contains ISOSpeedRatings. The ExifIFD
+// pointer (tag 0x8769) is encoded in IFD0. All entries are laid out correctly
+// with out-of-line ASCII values so exif.Parse can decode them.
+//
+// Layout:
+//
+//	[header 8B][IFD0: 4 entries + ExifIFD ptr = 5 entries][next=0][value area]
+//	[ExifIFD: 1 entry][next=0]
+func buildRichTIFF(make_, model_ string, orientation uint16, iso uint16) []byte {
+	order := binary.LittleEndian
+
+	// We build the buffer in two passes: first compute offsets, then fill values.
+	// Convenience: inline helper to write a LE uint16/uint32.
+
+	makeBytes := []byte(make_ + "\x00")
+	modelBytes := []byte(model_ + "\x00")
+
+	// IFD0 contains 5 entries (in tag-ID order): Make, Model, Orientation,
+	// ExifIFDPointer. That is 4 entries — but we need them sorted by tag:
+	//   0x010F Make  (ASCII, out-of-line)
+	//   0x0110 Model (ASCII, out-of-line)
+	//   0x0112 Orientation (SHORT, inline)
+	//   0x8769 ExifIFDPointer (LONG, inline)
+	const (
+		headerSz  = 8
+		nIFD0     = 4
+		ifd0Sz    = 2 + nIFD0*12 + 4 // count(2) + entries(N*12) + next(4)
+		nExifIFD  = 1
+		exifIFDSz = 2 + nExifIFD*12 + 4
+	)
+	// Value area begins right after IFD0.
+	valueAreaStart := uint32(headerSz + ifd0Sz)
+	// ExifIFD begins right after the value area.
+	makeOff := valueAreaStart
+	modelOff := makeOff + uint32(len(makeBytes))
+	exifIFDOff := modelOff + uint32(len(modelBytes))
+	// ExifIFD value area (ISO is SHORT → inline, no value area needed).
+
+	totalSize := int(exifIFDOff) + exifIFDSz
+	buf := make([]byte, totalSize)
+
+	// TIFF header (TIFF §2).
+	buf[0], buf[1] = 'I', 'I'
+	order.PutUint16(buf[2:], 0x002A)
+	order.PutUint32(buf[4:], headerSz) // IFD0 starts right after header
+
+	// IFD0 entry count.
+	ifd0Start := headerSz
+	order.PutUint16(buf[ifd0Start:], uint16(nIFD0))
+
+	writeEntry := func(base, i int, tag uint16, typ uint16, count uint32, val uint32) {
+		p := base + 2 + i*12
+		order.PutUint16(buf[p:], tag)
+		order.PutUint16(buf[p+2:], typ)
+		order.PutUint32(buf[p+4:], count)
+		order.PutUint32(buf[p+8:], val)
+	}
+
+	// IFD0 entries (sorted ascending by tag per TIFF §7).
+	writeEntry(ifd0Start, 0, 0x010F, uint16(exif.TypeASCII), uint32(len(makeBytes)), makeOff)   // Make
+	writeEntry(ifd0Start, 1, 0x0110, uint16(exif.TypeASCII), uint32(len(modelBytes)), modelOff) // Model
+	// Orientation: SHORT inline — value is left-justified in the 4-byte field.
+	writeEntry(ifd0Start, 2, 0x0112, uint16(exif.TypeShort), 1, uint32(orientation)) // Orientation
+	writeEntry(ifd0Start, 3, 0x8769, uint16(exif.TypeLong), 1, exifIFDOff)          // ExifIFDPointer
+
+	// next-IFD pointer = 0 (no IFD1).
+	nextPtrPos := ifd0Start + 2 + nIFD0*12
+	order.PutUint32(buf[nextPtrPos:], 0)
+
+	// Value area: Make string, then Model string.
+	copy(buf[makeOff:], makeBytes)
+	copy(buf[modelOff:], modelBytes)
+
+	// ExifIFD: 1 entry — ISOSpeedRatings (SHORT inline).
+	exifBase := int(exifIFDOff)
+	order.PutUint16(buf[exifBase:], uint16(nExifIFD))
+	writeEntry(exifBase, 0, 0x8827, uint16(exif.TypeShort), 1, uint32(iso)) // ISOSpeedRatings
+	order.PutUint32(buf[exifBase+2+nExifIFD*12:], 0)                        // next-IFD = 0
+
+	return buf
+}
+
+// TestConcurrentRead verifies that concurrent calls to Read on the same JPEG
+// bytes are safe under the race detector. Each goroutine operates on its own
+// bytes.Reader, so there is no shared mutable state; the test is primarily a
+// smoke test for the parser's goroutine safety.
+func TestConcurrentRead(t *testing.T) {
+	t.Parallel()
+
+	jpegData := buildMinimalJPEG(minimalTIFFPayload())
+
+	const goroutines = 10
+	var wg sync.WaitGroup
+	errs := make([]error, goroutines)
+	results := make([]*Metadata, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			m, err := Read(bytes.NewReader(jpegData))
+			errs[idx] = err
+			results[idx] = m
+		}(i)
+	}
+	wg.Wait()
+
+	for i := 0; i < goroutines; i++ {
+		if errs[i] != nil {
+			t.Errorf("goroutine %d: Read returned error: %v", i, errs[i])
+		}
+		if results[i] == nil {
+			t.Errorf("goroutine %d: Read returned nil Metadata", i)
+		}
+	}
+}
+
+// TestConcurrentWrite verifies that concurrent calls to Write with the same
+// Metadata struct do not race. Write reads m but does not mutate it after
+// calling exif.Encode / iptc.Encode / xmp.Encode, each of which is
+// read-only with respect to the encoded struct's fields.
+func TestConcurrentWrite(t *testing.T) {
+	t.Parallel()
+
+	jpegData := buildMinimalJPEG(minimalTIFFPayload())
+
+	m, err := Read(bytes.NewReader(jpegData))
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+
+	// Attach an IPTC block with a caption so Write has something to encode.
+	m.IPTC = &iptc.IPTC{Records: make(map[uint8][]iptc.Dataset)}
+	m.IPTC.SetCaption("concurrent test")
+
+	const goroutines = 5
+	var wg sync.WaitGroup
+	errs := make([]error, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = Write(bytes.NewReader(jpegData), io.Discard, m)
+		}(i)
+	}
+	wg.Wait()
+
+	for i := 0; i < goroutines; i++ {
+		if errs[i] != nil {
+			t.Errorf("goroutine %d: Write returned error: %v", i, errs[i])
+		}
+	}
+}
+
+// BenchmarkWrite_JPEG measures the throughput of Write for a minimal JPEG
+// with one parsed IPTC block. b.SetBytes is set to the input image size so
+// go test -bench reports MB/s.
+func BenchmarkWrite_JPEG(b *testing.B) {
+	data := buildMinimalJPEG(minimalTIFFPayload())
+
+	m, err := Read(bytes.NewReader(data))
+	if err != nil {
+		b.Fatalf("Read: %v", err)
+	}
+	m.IPTC = &iptc.IPTC{Records: make(map[uint8][]iptc.Dataset)}
+	m.IPTC.SetCaption("benchmark caption")
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(data)))
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if err := Write(bytes.NewReader(data), io.Discard, m); err != nil {
+			b.Fatalf("Write: %v", err)
+		}
+	}
+}
+
+// BenchmarkWrite_PNG measures the throughput of Write for a minimal PNG with
+// nil metadata (pass-through path: no metadata segments to re-encode).
+func BenchmarkWrite_PNG(b *testing.B) {
+	data := buildMinimalPNG()
+
+	// A Metadata with nil EXIF/IPTC/XMP exercises the pass-through path in
+	// Write: it detects the format, finds nothing to encode, and copies the
+	// PNG stream to the output unchanged.
+	m := NewMetadata(format.FormatPNG)
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(data)))
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if err := Write(bytes.NewReader(data), io.Discard, m); err != nil {
+			b.Fatalf("Write: %v", err)
+		}
+	}
+}
+
+// TestMetadata_NilMetadata verifies that every accessor on a zero-value
+// Metadata returns a safe zero/empty result without panicking.
+func TestMetadata_NilMetadata(t *testing.T) {
+	m := &Metadata{} // EXIF, IPTC, XMP all nil
+
+	// String accessors must return "".
+	if got := m.CameraModel(); got != "" {
+		t.Errorf("CameraModel() = %q, want empty", got)
+	}
+	if got := m.Copyright(); got != "" {
+		t.Errorf("Copyright() = %q, want empty", got)
+	}
+	if got := m.Caption(); got != "" {
+		t.Errorf("Caption() = %q, want empty", got)
+	}
+	if got := m.Creator(); got != "" {
+		t.Errorf("Creator() = %q, want empty", got)
+	}
+	if got := m.Make(); got != "" {
+		t.Errorf("Make() = %q, want empty", got)
+	}
+	if got := m.Software(); got != "" {
+		t.Errorf("Software() = %q, want empty", got)
+	}
+	if got := m.LensModel(); got != "" {
+		t.Errorf("LensModel() = %q, want empty", got)
+	}
+
+	// Slice/nil accessors.
+	if got := m.Keywords(); len(got) != 0 {
+		t.Errorf("Keywords() = %v, want nil/empty", got)
+	}
+
+	// Bool-return accessors must return false / zero values.
+	if _, _, ok := m.GPS(); ok {
+		t.Error("GPS() ok = true, want false")
+	}
+	if _, ok := m.DateTimeOriginal(); ok {
+		t.Error("DateTimeOriginal() ok = true, want false")
+	}
+	if _, _, ok := m.ExposureTime(); ok {
+		t.Error("ExposureTime() ok = true, want false")
+	}
+	if _, ok := m.FNumber(); ok {
+		t.Error("FNumber() ok = true, want false")
+	}
+	if _, ok := m.ISO(); ok {
+		t.Error("ISO() ok = true, want false")
+	}
+	if _, ok := m.FocalLength(); ok {
+		t.Error("FocalLength() ok = true, want false")
+	}
+	if _, ok := m.Orientation(); ok {
+		t.Error("Orientation() ok = true, want false")
+	}
+	if _, _, ok := m.ImageSize(); ok {
+		t.Error("ImageSize() ok = true, want false")
+	}
+	if _, ok := m.DateTime(); ok {
+		t.Error("DateTime() ok = true, want false")
+	}
+	if _, ok := m.Flash(); ok {
+		t.Error("Flash() ok = true, want false")
+	}
+	if _, ok := m.WhiteBalance(); ok {
+		t.Error("WhiteBalance() ok = true, want false")
+	}
+	if _, ok := m.ExposureMode(); ok {
+		t.Error("ExposureMode() ok = true, want false")
+	}
+	if _, ok := m.MeteringMode(); ok {
+		t.Error("MeteringMode() ok = true, want false")
+	}
+	if _, ok := m.ColorSpace(); ok {
+		t.Error("ColorSpace() ok = true, want false")
+	}
+	if _, ok := m.SceneType(); ok {
+		t.Error("SceneType() ok = true, want false")
+	}
+	if _, ok := m.DigitalZoomRatio(); ok {
+		t.Error("DigitalZoomRatio() ok = true, want false")
+	}
+	if _, ok := m.SubjectDistance(); ok {
+		t.Error("SubjectDistance() ok = true, want false")
+	}
+	if _, ok := m.Altitude(); ok {
+		t.Error("Altitude() ok = true, want false")
+	}
+}
+
+// TestMetadata_ExifAccessors builds a JPEG with EXIF containing Make, Model,
+// Orientation, and ISOSpeedRatings, then verifies the convenience accessors on
+// the returned Metadata decode them correctly.
+func TestMetadata_ExifAccessors(t *testing.T) {
+	const (
+		wantMake        = "TestMake"
+		wantModel       = "TestModel"
+		wantOrientation = uint16(1)
+		wantISO         = uint(400)
+	)
+
+	tiff := buildRichTIFF(wantMake, wantModel, wantOrientation, uint16(wantISO))
+	jpeg := buildMinimalJPEG(tiff)
+
+	m, err := Read(bytes.NewReader(jpeg))
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if m.EXIF == nil {
+		t.Fatal("EXIF is nil after Read; cannot test accessors")
+	}
+
+	// CameraModel() returns IFD0 tag 0x0110 (Model, EXIF §4.6.4 Table 3).
+	if got := m.CameraModel(); got != wantModel {
+		t.Errorf("CameraModel() = %q, want %q", got, wantModel)
+	}
+
+	if got := m.Make(); got != wantMake {
+		t.Errorf("Make() = %q, want %q", got, wantMake)
+	}
+
+	if got, ok := m.ISO(); !ok {
+		t.Error("ISO() ok = false, want true")
+	} else if got != wantISO {
+		t.Errorf("ISO() = %d, want %d", got, wantISO)
+	}
+
+	if got, ok := m.Orientation(); !ok {
+		t.Error("Orientation() ok = false, want true")
+	} else if got != wantOrientation {
+		t.Errorf("Orientation() = %d, want %d", got, wantOrientation)
+	}
+}
+
+// TestMetadata_SourcePriority verifies the documented resolution policy:
+// XMP caption wins over IPTC caption when both are present (metadata.go §Caption).
+// Similarly XMP copyright wins over IPTC.
+func TestMetadata_SourcePriority(t *testing.T) {
+	const (
+		iptcCaption = "IPTC caption"
+		xmpCaption  = "XMP caption"
+	)
+
+	jpegData := buildJPEGWithIPTCAndXMP(iptcCaption, xmpCaption)
+
+	m, err := Read(bytes.NewReader(jpegData))
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+
+	// Verify both sources were parsed so the test is meaningful.
+	if m.IPTC == nil {
+		t.Fatal("IPTC is nil: test cannot verify priority (IPTC segment not parsed)")
+	}
+	if m.XMP == nil {
+		t.Fatal("XMP is nil: test cannot verify priority (XMP segment not parsed)")
+	}
+
+	// Caption: XMP (dc:description) must win over IPTC (2:120).
+	if got := m.Caption(); got != xmpCaption {
+		t.Errorf("Caption() = %q, want XMP value %q", got, xmpCaption)
+	}
+
+	// Cross-check: IPTC layer alone has the IPTC caption.
+	if got := m.IPTC.Caption(); got != iptcCaption {
+		t.Errorf("IPTC.Caption() = %q, want %q", got, iptcCaption)
+	}
+
+	// Cross-check: XMP layer alone has the XMP caption.
+	if got := m.XMP.Caption(); got != xmpCaption {
+		t.Errorf("XMP.Caption() = %q, want %q", got, xmpCaption)
 	}
 }
 

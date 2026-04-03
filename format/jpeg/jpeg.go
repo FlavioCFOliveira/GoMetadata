@@ -15,6 +15,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sort"
 )
 
 // JPEG marker bytes (ISO/IEC 10918-1, Annex B).
@@ -33,8 +34,19 @@ var identExif = []byte("Exif\x00\x00")
 // Adobe XMP Specification Part 3 §1.1.3.
 var identXMP = []byte("http://ns.adobe.com/xap/1.0/\x00")
 
+// identXMPNote is the NUL-terminated namespace URI prefix for extended XMP
+// inside APP1. Adobe XMP Specification Part 3 §1.1.4.
+var identXMPNote = []byte("http://ns.adobe.com/xap/1.0/se/\x00")
+
 // identPS is the Photoshop 3.0 signature in APP13 (EXIF §4.5.6).
 var identPS = []byte("Photoshop 3.0\x00")
+
+// extChunk holds one chunk of an extended XMP segment.
+// Adobe XMP Specification Part 3 §1.1.4.
+type extChunk struct {
+	offset uint32
+	data   []byte
+}
 
 // Extract reads the JPEG marker stream from r and returns the raw payloads.
 // rawEXIF: APP1 content after the "Exif\x00\x00" identifier (nil if absent).
@@ -57,6 +69,10 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, fmt.Errorf("jpeg: not a JPEG file (SOI 0x%04X)", uint16(soi[0])<<8|uint16(soi[1]))
 	}
 
+	// extended collects chunks from extended XMP APP1 segments, keyed by GUID.
+	// Adobe XMP Specification Part 3 §1.1.4.
+	extended := make(map[string][]extChunk)
+
 	for {
 		marker, data, rerr := readSegment(r)
 		if rerr != nil {
@@ -76,6 +92,20 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 				rawEXIF = data[len(identExif):]
 			case bytes.HasPrefix(data, identXMP):
 				rawXMP = data[len(identXMP):]
+			case bytes.HasPrefix(data, identXMPNote):
+				// Extended XMP chunk: GUID (32 bytes) + fullLength (4 bytes) +
+				// offset (4 bytes) + chunk data. Adobe XMP Spec Part 3 §1.1.4.
+				body := data[len(identXMPNote):]
+				if len(body) >= 40 {
+					guid := string(body[:32])
+					fullLen := binary.BigEndian.Uint32(body[32:36])
+					offset := binary.BigEndian.Uint32(body[36:40])
+					_ = fullLen // used only for validation; assembly is offset-driven
+					extended[guid] = append(extended[guid], extChunk{
+						offset: offset,
+						data:   body[40:],
+					})
+				}
 			}
 
 		case markerAPP13:
@@ -85,10 +115,16 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 
 		case markerSOS, markerEOI:
 			// SOS/EOI: no more metadata segments follow.
+			if rawXMP != nil && len(extended) > 0 {
+				rawXMP = reassembleExtendedXMP(rawXMP, extended)
+			}
 			return rawEXIF, rawIPTC, rawXMP, nil
 		}
 	}
 
+	if rawXMP != nil && len(extended) > 0 {
+		rawXMP = reassembleExtendedXMP(rawXMP, extended)
+	}
 	return rawEXIF, rawIPTC, rawXMP, nil
 }
 
@@ -115,17 +151,32 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 
 	// Write new metadata segments before any existing ones.
 	if rawEXIF != nil {
+		// APP1 length field is 16-bit; max payload = 65535 - 2 (length field).
+		// EXIF §4.5.4, JPEG ISO/IEC 10918-1.
+		if len(identExif)+len(rawEXIF)+2 > 65535 {
+			return fmt.Errorf("jpeg: EXIF payload %d bytes exceeds APP1 segment limit; EXIF cannot be split", len(rawEXIF))
+		}
 		if err := writeSegment(w, markerAPP1, append(identExif, rawEXIF...)); err != nil {
 			return err
 		}
 	}
 	if rawXMP != nil {
+		// XMP max payload = 65535 - 2 (length field) - len(identXMP).
+		// Splitting into extended XMP requires XMP-level GUID injection which
+		// is outside the scope of the format layer. Adobe XMP Spec Part 3 §1.1.4.
+		if len(identXMP)+len(rawXMP)+2 > 65535 {
+			return fmt.Errorf("jpeg: XMP payload %d bytes exceeds APP1 segment limit (65458 bytes); split into extended XMP not supported for writing", len(rawXMP))
+		}
 		if err := writeSegment(w, markerAPP1, append(identXMP, rawXMP...)); err != nil {
 			return err
 		}
 	}
 	if rawIPTC != nil {
 		irb := buildIRB(rawIPTC)
+		// APP13 length field is 16-bit; max payload = 65535 - 2 (length field).
+		if len(identPS)+len(irb)+2 > 65535 {
+			return fmt.Errorf("jpeg: IPTC IRB payload %d bytes exceeds APP13 segment limit", len(irb))
+		}
 		if err := writeSegment(w, markerAPP13, append(identPS, irb...)); err != nil {
 			return err
 		}
@@ -142,8 +193,12 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 		}
 
 		// Skip segments we replaced (or removed when payload is nil).
+		// Also skip extended XMP segments (identXMPNote) — they belong to the
+		// old XMP data we have already replaced above.
 		if marker == markerAPP1 {
-			if bytes.HasPrefix(data, identExif) || bytes.HasPrefix(data, identXMP) {
+			if bytes.HasPrefix(data, identExif) ||
+				bytes.HasPrefix(data, identXMP) ||
+				bytes.HasPrefix(data, identXMPNote) {
 				continue
 			}
 		}
@@ -291,8 +346,13 @@ func readSegment(r io.Reader) (marker byte, data []byte, err error) {
 }
 
 // writeSegment writes a JPEG marker segment to w.
+// Returns an error if the total segment length (data + 2-byte length field)
+// would exceed the 16-bit field maximum of 65535. JPEG ISO/IEC 10918-1 §B.1.1.4.
 func writeSegment(w io.Writer, marker byte, data []byte) error {
 	length := len(data) + 2 // length field includes its own 2 bytes
+	if length > 65535 {
+		return fmt.Errorf("jpeg: segment 0x%02X payload %d bytes exceeds 65535-byte APP segment limit", marker, len(data))
+	}
 	hdr := [4]byte{0xFF, marker, byte(length >> 8), byte(length)}
 	if _, err := w.Write(hdr[:]); err != nil {
 		return err
@@ -302,6 +362,86 @@ func writeSegment(w io.Writer, marker byte, data []byte) error {
 		return err
 	}
 	return nil
+}
+
+// reassembleExtendedXMP merges extended XMP chunks into the main XMP packet
+// per Adobe XMP Specification Part 3 §1.1.4.
+//
+// The main XMP packet carries a HasExtendedXMP property whose value is the
+// 32-hex-character MD5 GUID of the corresponding extended segments. This
+// function locates that GUID, sorts the matching chunks by their byte offset,
+// concatenates their data into a complete extended XMP document, and splices
+// the inner rdf:Description elements from that document into the main packet
+// immediately before its closing </rdf:RDF> tag.
+//
+// If any step fails (missing marker, GUID not found, malformed packet) the
+// function returns main unchanged — graceful degradation is required because
+// we cannot know in advance whether all extended segments are present.
+func reassembleExtendedXMP(main []byte, extended map[string][]extChunk) []byte {
+	// Locate the HasExtendedXMP property name in the main packet.
+	const marker = "HasExtendedXMP"
+	idx := bytes.Index(main, []byte(marker))
+	if idx < 0 {
+		return main
+	}
+
+	// The GUID value follows the property name as either an attribute
+	// (HasExtendedXMP="<GUID>") or element content (HasExtendedXMP><GUID></...).
+	// In both cases we scan past up to 5 bytes for the opening quote character.
+	rest := main[idx+len(marker):]
+	qi := bytes.IndexAny(rest, `"'`)
+	if qi < 0 || qi > 5 {
+		return main
+	}
+	quote := rest[qi]
+	rest = rest[qi+1:]
+	end := bytes.IndexByte(rest, quote)
+	if end != 32 { // GUID must be exactly 32 hex characters
+		return main
+	}
+	guid := string(rest[:32])
+
+	chunks, ok := extended[guid]
+	if !ok || len(chunks) == 0 {
+		return main
+	}
+
+	// Sort chunks by offset so concatenation produces the correct byte sequence.
+	sort.Slice(chunks, func(i, j int) bool {
+		return chunks[i].offset < chunks[j].offset
+	})
+
+	// Concatenate chunk data into the complete extended XMP packet bytes.
+	var totalLen int
+	for _, c := range chunks {
+		totalLen += len(c.data)
+	}
+	extBytes := make([]byte, 0, totalLen)
+	for _, c := range chunks {
+		extBytes = append(extBytes, c.data...)
+	}
+
+	// Extract the rdf:Description elements from the extended XMP packet.
+	// The extended packet is a self-contained XMP document; we want only the
+	// RDF content between <rdf:Description and </rdf:RDF>.
+	descStart := bytes.Index(extBytes, []byte("<rdf:Description"))
+	closeRDFExt := bytes.LastIndex(extBytes, []byte("</rdf:RDF>"))
+	if descStart < 0 || closeRDFExt < 0 || descStart >= closeRDFExt {
+		return main // graceful degradation
+	}
+	extraDescs := extBytes[descStart:closeRDFExt]
+
+	// Splice extraDescs into main immediately before its </rdf:RDF> close tag.
+	mainCloseRDF := bytes.LastIndex(main, []byte("</rdf:RDF>"))
+	if mainCloseRDF < 0 {
+		return main
+	}
+
+	result := make([]byte, 0, len(main)+len(extraDescs))
+	result = append(result, main[:mainCloseRDF]...)
+	result = append(result, extraDescs...)
+	result = append(result, main[mainCloseRDF:]...)
+	return result
 }
 
 // isStandalone reports whether m is a marker that has no length / data field.
