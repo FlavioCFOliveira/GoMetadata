@@ -294,6 +294,91 @@ func TestEncodeCollectionType(t *testing.T) {
 	}
 }
 
+// TestXMPGet verifies the public Get accessor for arbitrary namespace/property
+// combinations (XMP §7.3 — property access by namespace URI and local name).
+func TestXMPGet(t *testing.T) {
+	t.Run("known property returns correct value", func(t *testing.T) {
+		x, err := Parse([]byte(simpleXMP))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		// tiff:Model is stored under NStiff / "Model".
+		if got := x.Get(NStiff, "Model"); got != "Canon EOS R5" {
+			t.Errorf("Get(NStiff, Model) = %q, want %q", got, "Canon EOS R5")
+		}
+	})
+
+	t.Run("missing property returns empty string", func(t *testing.T) {
+		x, err := Parse([]byte(simpleXMP))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if got := x.Get(NStiff, "DoesNotExist"); got != "" {
+			t.Errorf("Get for absent property = %q, want empty", got)
+		}
+	})
+
+	t.Run("missing namespace returns empty string", func(t *testing.T) {
+		x, err := Parse([]byte(simpleXMP))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if got := x.Get("http://example.com/ns/unknown/", "SomeProperty"); got != "" {
+			t.Errorf("Get for absent namespace = %q, want empty", got)
+		}
+	})
+
+	t.Run("nil Properties map returns empty string without panic", func(t *testing.T) {
+		x := &XMP{} // Properties is nil
+		if got := x.Get(NStiff, "Model"); got != "" {
+			t.Errorf("Get on nil Properties = %q, want empty", got)
+		}
+	})
+
+	t.Run("nil XMP receiver returns empty string without panic", func(t *testing.T) {
+		var x *XMP
+		// get() guards against nil receiver (see xmp.go get() implementation).
+		// Get() delegates to get(), so this must not panic.
+		if got := x.Get(NStiff, "Model"); got != "" {
+			t.Errorf("Get on nil *XMP = %q, want empty", got)
+		}
+	})
+
+	t.Run("xmp namespace CreatorTool", func(t *testing.T) {
+		// Build an XMP packet that sets xmp:CreatorTool.
+		raw := `<?xpacket begin="" uid="abc"?>` +
+			`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+			`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+			`<rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/"` +
+			` xmp:CreatorTool="Adobe Photoshop CC"/>` +
+			`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`
+		x, err := Parse([]byte(raw))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if got := x.Get(NSxmp, "CreatorTool"); got != "Adobe Photoshop CC" {
+			t.Errorf("Get(NSxmp, CreatorTool) = %q, want %q", got, "Adobe Photoshop CC")
+		}
+	})
+
+	t.Run("properties set directly survive Get round-trip", func(t *testing.T) {
+		// Populate Properties directly (public field) and verify Get retrieves them.
+		x := &XMP{Properties: map[string]map[string]string{
+			NSexif: {"Flash": "1"},
+			NSdc:   {"creator": "Jane Doe"},
+		}}
+		if got := x.Get(NSexif, "Flash"); got != "1" {
+			t.Errorf("Get(NSexif, Flash) = %q, want %q", got, "1")
+		}
+		if got := x.Get(NSdc, "creator"); got != "Jane Doe" {
+			t.Errorf("Get(NSdc, creator) = %q, want %q", got, "Jane Doe")
+		}
+		if got := x.Get(NSdc, "rights"); got != "" {
+			t.Errorf("Get(NSdc, rights) absent = %q, want empty", got)
+		}
+	})
+}
+
 func BenchmarkXMPParse(b *testing.B) {
 	data := []byte(simpleXMP)
 	b.ReportAllocs()

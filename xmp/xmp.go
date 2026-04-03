@@ -158,8 +158,11 @@ func (x *XMP) Creator() string {
 }
 
 // Get returns the property value for the given namespace URI and local name.
-// Returns "" when the property is absent.
+// Returns "" when the property is absent or when x is nil.
 func (x *XMP) Get(ns, local string) string {
+	if x == nil {
+		return ""
+	}
 	return x.get(ns, local)
 }
 

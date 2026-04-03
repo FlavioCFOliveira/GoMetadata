@@ -541,17 +541,128 @@ func TestExtractBareJPEGAllNil(t *testing.T) {
 	}
 }
 
-// --- Additional coverage: Inject with oversized XMP ---
+// --- Extended XMP write: TestInjectExtendedXMP ---
 
-// TestInjectOversizedXMPReturnsError verifies the XMP size limit error path.
-func TestInjectOversizedXMPReturnsError(t *testing.T) {
-	jpeg := buildJPEG(nil, nil, nil)
-	// identXMP is 29 bytes; 29 + N + 2 > 65535 → N > 65504
-	oversized := make([]byte, 65505)
+// TestInjectExtendedXMP verifies that Inject correctly splits an XMP packet
+// larger than maxXMPPayload (65504 bytes) across a main APP1 and one or more
+// extended APP1 segments (Adobe XMP Specification Part 3 §1.1.4), and that
+// the subsequent Extract call reassembles the full XMP content.
+func TestInjectExtendedXMP(t *testing.T) {
+	// Build a rawXMP that is larger than maxXMPPayload (65504 bytes).
+	// We use a valid XMP envelope so that Extract's reassembleExtendedXMP can
+	// splice the extended content into it correctly.
+	const extraContentSize = 66000
+
+	// Construct a payload whose inner comment field is large enough to push
+	// the whole packet over the single-segment limit. The payload is a well-
+	// formed XMP document so Extract can parse and reassemble it.
+	padding := bytes.Repeat([]byte("x"), extraContentSize)
+	rawXMP := []byte(
+		`<?xpacket begin="` + "\xef\xbb\xbf" + `" id="W5M0MpCehiHzreSzNTczkc9d"?>` +
+			`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+			`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+			`<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">` +
+			`<dc:description>` + string(padding) + `</dc:description>` +
+			`</rdf:Description>` +
+			`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`,
+	)
+	if len(rawXMP) <= maxXMPPayload {
+		t.Fatalf("test precondition failed: rawXMP (%d bytes) must exceed maxXMPPayload (%d bytes)", len(rawXMP), maxXMPPayload)
+	}
+
+	src := buildJPEG(nil, nil, nil)
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader(jpeg), &out, nil, nil, oversized)
-	if err == nil {
-		t.Error("Inject with oversized XMP: expected error, got nil")
+	if err := Inject(bytes.NewReader(src), &out, nil, nil, rawXMP); err != nil {
+		t.Fatalf("Inject with oversized XMP: %v", err)
+	}
+
+	// Extract must successfully reassemble the extended XMP.
+	_, _, got, err := Extract(bytes.NewReader(out.Bytes()))
+	if err != nil {
+		t.Fatalf("Extract after extended XMP inject: %v", err)
+	}
+	if got == nil {
+		t.Fatal("Extract returned nil rawXMP; expected reassembled extended XMP")
+	}
+
+	// The reassembled XMP must contain the large padding string.
+	if !bytes.Contains(got, padding) {
+		t.Errorf("reassembled XMP (%d bytes) does not contain the expected padding content (%d bytes of 'x')",
+			len(got), len(padding))
+	}
+}
+
+// TestInjectExtendedXMPMultiChunk verifies that an XMP packet large enough to
+// require more than one extended APP1 chunk is split and reassembled correctly.
+func TestInjectExtendedXMPMultiChunk(t *testing.T) {
+	// Each extended chunk holds maxExtChunkSize (65461) bytes.
+	// We need > 65461 bytes in rawXMP to force two extended chunks.
+	const extraContentSize = 130_000 // forces at least 2 chunks
+
+	padding := bytes.Repeat([]byte("y"), extraContentSize)
+	rawXMP := []byte(
+		`<?xpacket begin="` + "\xef\xbb\xbf" + `" id="W5M0MpCehiHzreSzNTczkc9d"?>` +
+			`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+			`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+			`<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">` +
+			`<dc:description>` + string(padding) + `</dc:description>` +
+			`</rdf:Description>` +
+			`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`,
+	)
+
+	src := buildJPEG(nil, nil, nil)
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(src), &out, nil, nil, rawXMP); err != nil {
+		t.Fatalf("Inject multi-chunk extended XMP: %v", err)
+	}
+
+	// Count the number of extended XMP APP1 segments in the output.
+	outBytes := out.Bytes()
+	extNoteIdent := []byte("http://ns.adobe.com/xap/1.0/se/\x00")
+	extCount := bytes.Count(outBytes, extNoteIdent)
+	if extCount < 2 {
+		t.Errorf("expected at least 2 extended APP1 segments, found %d", extCount)
+	}
+
+	_, _, got, err := Extract(bytes.NewReader(outBytes))
+	if err != nil {
+		t.Fatalf("Extract after multi-chunk inject: %v", err)
+	}
+	if got == nil {
+		t.Fatal("Extract returned nil rawXMP")
+	}
+	if !bytes.Contains(got, padding) {
+		t.Errorf("reassembled XMP does not contain expected padding content")
+	}
+}
+
+// TestInjectSmallXMPFastPath verifies that an XMP packet that fits within
+// maxXMPPayload is still written as a single standard APP1 (no extended split).
+func TestInjectSmallXMPFastPath(t *testing.T) {
+	xmpPayload := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta>`)
+	if len(xmpPayload) > maxXMPPayload {
+		t.Fatal("test precondition failed: payload must be small")
+	}
+
+	src := buildJPEG(nil, nil, nil)
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(src), &out, nil, nil, xmpPayload); err != nil {
+		t.Fatalf("Inject small XMP: %v", err)
+	}
+
+	outBytes := out.Bytes()
+	// Must have zero extended XMP segments.
+	extNoteIdent := []byte("http://ns.adobe.com/xap/1.0/se/\x00")
+	if bytes.Contains(outBytes, extNoteIdent) {
+		t.Error("small XMP inject produced extended APP1 segment(s); expected fast path only")
+	}
+
+	_, _, got, err := Extract(bytes.NewReader(outBytes))
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if !bytes.Equal(got, xmpPayload) {
+		t.Errorf("XMP round-trip mismatch: got %q, want %q", got, xmpPayload)
 	}
 }
 

@@ -12,7 +12,9 @@ package jpeg
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"sort"
@@ -42,6 +44,21 @@ var identXMPNote = []byte("http://ns.adobe.com/xap/1.0/se/\x00")
 
 // identPS is the Photoshop 3.0 signature in APP13 (EXIF §4.5.6).
 var identPS = []byte("Photoshop 3.0\x00")
+
+// APP1 segment capacity constants derived from the JPEG 16-bit length field.
+// JPEG ISO/IEC 10918-1 §B.1.1.4: length field is 2 bytes and includes itself,
+// so the maximum payload is 65535 − 2 = 65533 bytes.
+//
+// maxXMPPayload: max XMP packet bytes in a standard (non-extended) APP1.
+// maxExtChunkSize: max chunk data per extended XMP APP1 (Adobe XMP Spec Part 3 §1.1.4).
+//
+//   Extended APP1 layout: identXMPNote(32) + GUID(32) + fullLen(4) + offset(4) + chunk
+//   Overhead = 32 + 32 + 4 + 4 = 72 bytes → chunk data ≤ 65533 − 72 = 65461 bytes.
+const (
+	maxAPP1Payload  = 65533 // 65535 − 2 (length field)
+	maxXMPPayload   = maxAPP1Payload - 29 // − len(identXMP)
+	maxExtChunkSize = maxAPP1Payload - 72 // − len(identXMPNote)+GUID+fullLen+offset overhead
+)
 
 // extChunk holds one chunk of an extended XMP segment.
 // Adobe XMP Specification Part 3 §1.1.4.
@@ -168,19 +185,22 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 		}
 	}
 	if rawXMP != nil {
-		// XMP max payload = 65535 - 2 (length field) - len(identXMP).
-		// Splitting into extended XMP requires XMP-level GUID injection which
-		// is outside the scope of the format layer. Adobe XMP Spec Part 3 §1.1.4.
-		if len(identXMP)+len(rawXMP)+2 > 65535 {
-			return fmt.Errorf("jpeg: XMP payload %d bytes exceeds APP1 segment limit (65458 bytes); split into extended XMP not supported for writing", len(rawXMP))
-		}
-		xmpBuf := iobuf.Get(len(identXMP) + len(rawXMP))
-		copy(*xmpBuf, identXMP)
-		copy((*xmpBuf)[len(identXMP):], rawXMP)
-		writeErr := writeSegment(w, markerAPP1, *xmpBuf)
-		iobuf.Put(xmpBuf)
-		if writeErr != nil {
-			return writeErr
+		if len(rawXMP) <= maxXMPPayload {
+			// Fast path: XMP fits in a single APP1 segment.
+			xmpBuf := iobuf.Get(len(identXMP) + len(rawXMP))
+			copy(*xmpBuf, identXMP)
+			copy((*xmpBuf)[len(identXMP):], rawXMP)
+			writeErr := writeSegment(w, markerAPP1, *xmpBuf)
+			iobuf.Put(xmpBuf)
+			if writeErr != nil {
+				return writeErr
+			}
+		} else {
+			// Slow path: XMP is too large for one APP1; split into extended XMP
+			// per Adobe XMP Specification Part 3 §1.1.4.
+			if err := writeExtendedXMP(w, rawXMP); err != nil {
+				return err
+			}
 		}
 	}
 	if rawIPTC != nil {
@@ -247,6 +267,105 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 				return err
 			}
 		}
+	}
+
+	return nil
+}
+
+// writeExtendedXMP splits rawXMP across a main APP1 and one or more extended
+// APP1 segments, per Adobe XMP Specification Part 3 §1.1.4.
+//
+// Strategy:
+//  1. Generate a random 32-hex-character GUID via crypto/rand.
+//  2. Build a minimal "main" XMP document that contains only the
+//     xmpNote:HasExtendedXMP property set to the GUID. This document is
+//     guaranteed to be far smaller than the 65504-byte limit.
+//  3. Write the main XMP as a standard APP1 segment.
+//  4. Write rawXMP verbatim as the extended payload, split into chunks of at
+//     most maxExtChunkSize bytes. Each chunk becomes one extended APP1 segment.
+//
+// The xmpNote namespace URI is http://ns.adobe.com/xap/1.0/se/Note/ per the
+// Adobe XMP Specification Part 3 §1.1.4.
+func writeExtendedXMP(w io.Writer, rawXMP []byte) error {
+	// Step 1: generate GUID.
+	var guidRaw [16]byte
+	if _, err := rand.Read(guidRaw[:]); err != nil {
+		return fmt.Errorf("jpeg: extended XMP: generate GUID: %w", err)
+	}
+	guid := hex.EncodeToString(guidRaw[:]) // 32 hex characters
+
+	// Step 2: build the minimal main XMP document.
+	// The document is a self-contained, valid XMP packet that carries only the
+	// xmpNote:HasExtendedXMP attribute. Readers merge the extended payload on
+	// top of this stub. The literal template is faster and simpler than
+	// invoking the xmp package from the format layer.
+	//
+	// xmpNote namespace: http://ns.adobe.com/xap/1.0/se/Note/ (XMP Spec Part 3 §1.1.4)
+	mainXMP := []byte(
+		`<?xpacket begin="` + "\xef\xbb\xbf" + `" id="W5M0MpCehiHzreSzNTczkc9d"?>` +
+			`<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="img-metadata">` +
+			`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+			`<rdf:Description rdf:about=""` +
+			` xmlns:xmpNote="http://ns.adobe.com/xap/1.0/se/Note/"` +
+			` xmpNote:HasExtendedXMP="` + guid + `"/>` +
+			`</rdf:RDF></x:xmpmeta>` +
+			`<?xpacket end="w"?>`,
+	)
+	if len(mainXMP) > maxXMPPayload {
+		// This cannot happen in practice — the template is ~200 bytes — but
+		// guard defensively so the error is actionable rather than silent.
+		return fmt.Errorf("jpeg: extended XMP: main XMP stub (%d bytes) exceeds APP1 limit", len(mainXMP))
+	}
+
+	// Step 3: write main APP1.
+	mainBuf := iobuf.Get(len(identXMP) + len(mainXMP))
+	copy(*mainBuf, identXMP)
+	copy((*mainBuf)[len(identXMP):], mainXMP)
+	writeErr := writeSegment(w, markerAPP1, *mainBuf)
+	iobuf.Put(mainBuf)
+	if writeErr != nil {
+		return writeErr
+	}
+
+	// Step 4: split rawXMP into extended APP1 chunks.
+	// Extended APP1 layout (Adobe XMP Spec Part 3 §1.1.4):
+	//   identXMPNote (32 bytes) | GUID (32 bytes) | fullLength (4 bytes BE) |
+	//   offset (4 bytes BE) | chunk data
+	fullLen := uint32(len(rawXMP))
+	offset := uint32(0)
+	guidBytes := []byte(guid) // 32 ASCII bytes
+
+	// Pre-allocate the fixed-size extended APP1 header once.
+	// Header = identXMPNote(32) + GUID(32) + fullLen(4) + offset(4) = 72 bytes.
+	const extHdrSize = 72
+	for offset < fullLen {
+		chunkEnd := offset + uint32(maxExtChunkSize)
+		if chunkEnd > fullLen {
+			chunkEnd = fullLen
+		}
+		chunk := rawXMP[offset:chunkEnd]
+
+		extBuf := iobuf.Get(extHdrSize + len(chunk))
+		b := *extBuf
+
+		// identXMPNote
+		copy(b, identXMPNote)
+		// GUID
+		copy(b[len(identXMPNote):], guidBytes)
+		// fullLength (4 bytes BE)
+		binary.BigEndian.PutUint32(b[64:68], fullLen)
+		// offset (4 bytes BE)
+		binary.BigEndian.PutUint32(b[68:72], offset)
+		// chunk data
+		copy(b[72:], chunk)
+
+		writeErr = writeSegment(w, markerAPP1, b)
+		iobuf.Put(extBuf)
+		if writeErr != nil {
+			return writeErr
+		}
+
+		offset = chunkEnd
 	}
 
 	return nil

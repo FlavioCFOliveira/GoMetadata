@@ -178,6 +178,185 @@ func TestInjectRoundTrip(t *testing.T) {
 	}
 }
 
+// buildPNGWithChunk constructs a minimal PNG that contains one extra chunk
+// (of the given type and data) immediately after IHDR and before IEND.
+// This helper is used by tEXt and zTXt tests where buildPNG's iTXt/eXIf
+// shortcuts do not apply.
+func buildPNGWithChunk(chunkType string, data []byte) []byte {
+	var buf bytes.Buffer
+	buf.Write(pngSig[:])
+
+	ihdrData := make([]byte, 13)
+	binary.BigEndian.PutUint32(ihdrData[0:], 1) // width
+	binary.BigEndian.PutUint32(ihdrData[4:], 1) // height
+	ihdrData[8] = 8                              // bit depth
+	ihdrData[9] = 2                              // color type (RGB)
+	writeChunkTo(&buf, "IHDR", ihdrData)
+
+	writeChunkTo(&buf, chunkType, data)
+	writeChunkTo(&buf, "IEND", nil)
+
+	return buf.Bytes()
+}
+
+// TestExtractXMPFromTEXtChunk verifies that Extract recovers XMP from a legacy
+// uncompressed tEXt chunk whose keyword is "XML:com.adobe.xmp".
+// This exercises extractXMPFromTExt (png.go:257-271).
+func TestExtractXMPFromTEXtChunk(t *testing.T) {
+	xmpContent := []byte("<?xpacket begin='' uid='x'?><x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/><?xpacket end='r'?>")
+
+	// tEXt chunk payload: keyword + NUL + text (PNG §11.3.3).
+	var payload bytes.Buffer
+	payload.WriteString(xmpKeyword)
+	payload.WriteByte(0x00) // NUL separator
+	payload.Write(xmpContent)
+
+	png := buildPNGWithChunk("tEXt", payload.Bytes())
+	_, _, rawXMP, err := Extract(bytes.NewReader(png))
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if rawXMP == nil {
+		t.Fatal("rawXMP is nil; tEXt XMP chunk not extracted")
+	}
+	if !bytes.Equal(rawXMP, xmpContent) {
+		t.Errorf("rawXMP = %q, want %q", rawXMP, xmpContent)
+	}
+}
+
+// TestExtractXMPFromTEXtChunkWrongKeyword verifies that a tEXt chunk with a
+// non-XMP keyword is silently ignored and does not set rawXMP.
+func TestExtractXMPFromTEXtChunkWrongKeyword(t *testing.T) {
+	var payload bytes.Buffer
+	payload.WriteString("Comment") // not the XMP keyword
+	payload.WriteByte(0x00)
+	payload.WriteString("this is a plain PNG comment, not XMP")
+
+	png := buildPNGWithChunk("tEXt", payload.Bytes())
+	_, _, rawXMP, err := Extract(bytes.NewReader(png))
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if rawXMP != nil {
+		t.Errorf("rawXMP = %q, want nil for non-XMP tEXt keyword", rawXMP)
+	}
+}
+
+// TestExtractXMPFromTEXtChunkNoNul verifies that a tEXt chunk without a NUL
+// separator is safely skipped (extractXMPFromTExt returns nil).
+func TestExtractXMPFromTEXtChunkNoNul(t *testing.T) {
+	// Payload has no NUL byte at all — malformed but real files can have this.
+	payload := []byte("no null separator here")
+	png := buildPNGWithChunk("tEXt", payload)
+
+	_, _, rawXMP, err := Extract(bytes.NewReader(png))
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if rawXMP != nil {
+		t.Errorf("rawXMP = %q, want nil for tEXt chunk with no NUL", rawXMP)
+	}
+}
+
+// TestExtractXMPFromZTxtChunk verifies that Extract correctly decompresses
+// XMP from a legacy zTXt chunk (deflate, PNG §11.3.3).
+// This exercises extractXMPFromZTxt (png.go:273-301).
+func TestExtractXMPFromZTxtChunk(t *testing.T) {
+	xmpContent := []byte("<?xpacket begin='' uid='x'?><x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/><?xpacket end='r'?>")
+
+	// Compress xmpContent with zlib.
+	var compressed bytes.Buffer
+	zw := zlib.NewWriter(&compressed)
+	if _, err := zw.Write(xmpContent); err != nil {
+		t.Fatalf("zlib.Write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zlib.Close: %v", err)
+	}
+
+	// zTXt chunk payload: keyword + NUL + compMethod(0) + compressed_text.
+	var payload bytes.Buffer
+	payload.WriteString(xmpKeyword)
+	payload.WriteByte(0x00) // NUL separator
+	payload.WriteByte(0x00) // compression method: deflate (the only valid value)
+	payload.Write(compressed.Bytes())
+
+	png := buildPNGWithChunk("zTXt", payload.Bytes())
+	_, _, rawXMP, err := Extract(bytes.NewReader(png))
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if rawXMP == nil {
+		t.Fatal("rawXMP is nil; zTXt XMP chunk not extracted")
+	}
+	if !bytes.Equal(rawXMP, xmpContent) {
+		t.Errorf("rawXMP = %q, want %q", rawXMP, xmpContent)
+	}
+}
+
+// TestExtractXMPFromZTxtChunkWrongKeyword verifies that a zTXt chunk with a
+// non-XMP keyword is silently ignored.
+func TestExtractXMPFromZTxtChunkWrongKeyword(t *testing.T) {
+	var compressed bytes.Buffer
+	zw := zlib.NewWriter(&compressed)
+	zw.Write([]byte("some compressed text"))
+	zw.Close()
+
+	var payload bytes.Buffer
+	payload.WriteString("Description") // not the XMP keyword
+	payload.WriteByte(0x00)
+	payload.WriteByte(0x00) // compMethod
+	payload.Write(compressed.Bytes())
+
+	png := buildPNGWithChunk("zTXt", payload.Bytes())
+	_, _, rawXMP, err := Extract(bytes.NewReader(png))
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if rawXMP != nil {
+		t.Errorf("rawXMP = %q, want nil for non-XMP zTXt keyword", rawXMP)
+	}
+}
+
+// TestExtractITxtTakesPriorityOverTEXt verifies that when both an iTXt XMP
+// chunk and a tEXt XMP chunk are present, the iTXt value is used (it is read
+// first and rawXMP is set, so the tEXt branch is skipped per
+// png.go:64 `if rawXMP == nil`).
+func TestExtractITxtTakesPriorityOverTEXt(t *testing.T) {
+	iTXtContent := []byte("<?xpacket begin='' uid='x'?><iTXt/><?xpacket end='r'?>")
+	tEXtContent := []byte("<?xpacket begin='' uid='x'?><tEXt/><?xpacket end='r'?>")
+
+	var buf bytes.Buffer
+	buf.Write(pngSig[:])
+
+	ihdrData := make([]byte, 13)
+	binary.BigEndian.PutUint32(ihdrData[0:], 1)
+	binary.BigEndian.PutUint32(ihdrData[4:], 1)
+	ihdrData[8] = 8
+	ihdrData[9] = 2
+	writeChunkTo(&buf, "IHDR", ihdrData)
+
+	// iTXt XMP chunk first.
+	writeChunkTo(&buf, "iTXt", buildXMPChunk(iTXtContent))
+
+	// tEXt XMP chunk after — must be ignored.
+	var tEXtPayload bytes.Buffer
+	tEXtPayload.WriteString(xmpKeyword)
+	tEXtPayload.WriteByte(0x00)
+	tEXtPayload.Write(tEXtContent)
+	writeChunkTo(&buf, "tEXt", tEXtPayload.Bytes())
+
+	writeChunkTo(&buf, "IEND", nil)
+
+	_, _, rawXMP, err := Extract(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if !bytes.Equal(rawXMP, iTXtContent) {
+		t.Errorf("rawXMP = %q, want iTXt value %q", rawXMP, iTXtContent)
+	}
+}
+
 func BenchmarkPNGExtract(b *testing.B) {
 	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00}
 	xmpData := []byte("<?xpacket begin='' uid='x'?><xmpmeta xmlns:x=\"adobe:ns:meta/\"/><?xpacket end='r'?>")

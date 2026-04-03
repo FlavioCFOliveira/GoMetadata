@@ -19,6 +19,9 @@ const (
 	NScc  = "http://creativecommons.org/ns#"
 	// NSpdf is the PDF namespace (Adobe PDF 1.3 property set).
 	NSpdf = "http://ns.adobe.com/pdf/1.3/"
+	// NSxmpNote is the XMP namespace for extended XMP notes.
+	// Adobe XMP Specification Part 3 §1.1.4.
+	NSxmpNote = "http://ns.adobe.com/xap/1.0/se/Note/"
 )
 
 // collectionType returns the RDF collection element name (Bag, Seq, or Alt)
@@ -68,6 +71,8 @@ func prefixOf(uri string) string {
 		return "cc"
 	case NSpdf:
 		return "pdf"
+	case NSxmpNote:
+		return "xmpNote"
 	}
 	return "ns"
 }
