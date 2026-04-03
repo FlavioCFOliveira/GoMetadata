@@ -107,6 +107,9 @@ func extractByFormat(r io.ReadSeeker, fmtID format.FormatID) (rawEXIF, rawIPTC, 
 		return webp.Extract(r)
 	case format.FormatHEIF:
 		return heif.Extract(r)
+	case format.FormatAVIF:
+		// AVIF uses the same ISOBMFF container as HEIF; delegate to the HEIF handler.
+		return heif.Extract(r)
 	case format.FormatCR2:
 		return cr2.Extract(r)
 	case format.FormatCR3:

@@ -906,6 +906,293 @@ func TestSubIFDExtracted(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Tests for write setters
+// ---------------------------------------------------------------------------
+
+// TestSetCameraModel verifies SetCameraModel sets and reads back the Model tag.
+func TestSetCameraModel(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"simple ASCII", "Nikon Z9"},
+		{"with spaces", "Canon EOS R5"},
+		{"empty string", ""},
+		{"unicode-free long", "SONY ILCE-7RM5"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &EXIF{
+				ByteOrder: binary.LittleEndian,
+				IFD0:      &IFD{},
+			}
+			e.SetCameraModel(tc.input)
+			if got := e.CameraModel(); got != tc.input {
+				t.Errorf("CameraModel() = %q, want %q", got, tc.input)
+			}
+		})
+	}
+	// Nil-safety: must not panic.
+	var nilE *EXIF
+	nilE.SetCameraModel("should not panic")
+
+	// Nil IFD0: must not panic.
+	e2 := &EXIF{}
+	e2.SetCameraModel("should not panic either")
+}
+
+// TestSetCaption verifies SetCaption sets and reads back the ImageDescription tag.
+func TestSetCaption(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"typical caption", "Sunset over the Pacific"},
+		{"empty", ""},
+		{"single char", "X"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &EXIF{
+				ByteOrder: binary.LittleEndian,
+				IFD0:      &IFD{},
+			}
+			e.SetCaption(tc.input)
+			if got := e.Caption(); got != tc.input {
+				t.Errorf("Caption() = %q, want %q", got, tc.input)
+			}
+		})
+	}
+	var nilE *EXIF
+	nilE.SetCaption("should not panic")
+}
+
+// TestSetCopyright verifies SetCopyright sets and reads back the Copyright tag.
+func TestSetCopyright(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"year + owner", "2025 ACME Corp"},
+		{"empty", ""},
+		{"cc license", "CC-BY-SA 4.0"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &EXIF{
+				ByteOrder: binary.LittleEndian,
+				IFD0:      &IFD{},
+			}
+			e.SetCopyright(tc.input)
+			if got := e.Copyright(); got != tc.input {
+				t.Errorf("Copyright() = %q, want %q", got, tc.input)
+			}
+		})
+	}
+	var nilE *EXIF
+	nilE.SetCopyright("should not panic")
+}
+
+// TestSetCreator verifies SetCreator sets and reads back the Artist tag.
+func TestSetCreator(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"full name", "Jane Doe"},
+		{"empty", ""},
+		{"handle", "@photographer"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &EXIF{
+				ByteOrder: binary.LittleEndian,
+				IFD0:      &IFD{},
+			}
+			e.SetCreator(tc.input)
+			if got := e.Creator(); got != tc.input {
+				t.Errorf("Creator() = %q, want %q", got, tc.input)
+			}
+		})
+	}
+	var nilE *EXIF
+	nilE.SetCreator("should not panic")
+}
+
+// TestSetOrientation verifies SetOrientation encodes and reads back the
+// Orientation tag for both byte orders.
+func TestSetOrientation(t *testing.T) {
+	tests := []struct {
+		name      string
+		order     binary.ByteOrder
+		value     uint16
+	}{
+		{"LE normal", binary.LittleEndian, 1},
+		{"LE rotated 90 CW", binary.LittleEndian, 6},
+		{"LE rotated 180", binary.LittleEndian, 3},
+		{"BE normal", binary.BigEndian, 1},
+		{"BE rotated 90 CW", binary.BigEndian, 6},
+		{"BE mirrored+180", binary.BigEndian, 4},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Seed one entry so ifd0ByteOrder() resolves to tc.order.
+			seed := make([]byte, 2)
+			tc.order.PutUint16(seed, 0)
+			e := &EXIF{
+				ByteOrder: tc.order,
+				IFD0: &IFD{Entries: []IFDEntry{
+					{Tag: TagImageWidth, Type: TypeShort, Count: 1, Value: seed, byteOrder: tc.order},
+				}},
+			}
+			e.SetOrientation(tc.value)
+			got, ok := e.Orientation()
+			if !ok {
+				t.Fatalf("Orientation() ok=false after SetOrientation(%d)", tc.value)
+			}
+			if got != tc.value {
+				t.Errorf("Orientation() = %d, want %d", got, tc.value)
+			}
+		})
+	}
+	// Nil-safety.
+	var nilE *EXIF
+	nilE.SetOrientation(1)
+
+	e2 := &EXIF{}
+	e2.SetOrientation(1)
+}
+
+// TestSetGPS verifies SetGPS stores coordinates that GPS() can recover within
+// 0.0001 degrees of the original input.
+func TestSetGPS(t *testing.T) {
+	const tolerance = 0.0001
+
+	tests := []struct {
+		name string
+		lat  float64
+		lon  float64
+	}{
+		{"San Francisco", 37.7749, -122.4194},
+		{"Sydney", -33.8688, 151.2093},
+		{"zero island", 0.0, 0.0},
+		{"North Pole", 89.9999, 0.0},
+		{"prime meridian south", -0.5, 0.0},
+		{"antimeridian", 35.0, 179.9999},
+		{"negative lat lon", -45.0, -90.0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &EXIF{
+				ByteOrder: binary.LittleEndian,
+				IFD0:      &IFD{},
+			}
+			e.SetGPS(tc.lat, tc.lon)
+
+			if e.GPSIFD == nil {
+				t.Fatal("GPSIFD is nil after SetGPS")
+			}
+
+			// Verify the GPS pointer placeholder is present in IFD0.
+			if e.IFD0.Get(TagGPSIFDPointer) == nil {
+				t.Error("TagGPSIFDPointer not present in IFD0 after SetGPS")
+			}
+
+			gotLat, gotLon, ok := e.GPS()
+			if !ok {
+				t.Fatal("GPS() returned ok=false after SetGPS")
+			}
+			if diff := gotLat - tc.lat; diff > tolerance || diff < -tolerance {
+				t.Errorf("lat = %f, want ~%f (diff %f)", gotLat, tc.lat, diff)
+			}
+			if diff := gotLon - tc.lon; diff > tolerance || diff < -tolerance {
+				t.Errorf("lon = %f, want ~%f (diff %f)", gotLon, tc.lon, diff)
+			}
+		})
+	}
+	// Nil-safety.
+	var nilE *EXIF
+	nilE.SetGPS(37.7749, -122.4194)
+
+	e2 := &EXIF{}
+	e2.SetGPS(37.7749, -122.4194)
+}
+
+// TestEncodeRoundTripFull builds an EXIF with Make, Model, a rational (FNumber),
+// and a GPS IFD via SetGPS, then encodes and re-parses, asserting all fields survive.
+func TestEncodeRoundTripFull(t *testing.T) {
+	order := binary.LittleEndian
+
+	// Seed IFD0 with Make, Model, and FNumber in ExifIFD.
+	fnumVal := make([]byte, 8)
+	order.PutUint32(fnumVal[0:], 28)
+	order.PutUint32(fnumVal[4:], 10)
+
+	e := &EXIF{
+		ByteOrder: order,
+		IFD0: &IFD{Entries: []IFDEntry{
+			{Tag: TagMake, Type: TypeASCII, Count: 6, Value: []byte("Nikon\x00"), byteOrder: order},
+		}},
+		ExifIFD: &IFD{Entries: []IFDEntry{
+			{Tag: TagFNumber, Type: TypeRational, Count: 1, Value: fnumVal, byteOrder: order},
+		}},
+	}
+
+	// Use the setter to add Model (exercises set() replace path too).
+	e.SetCameraModel("Nikon Z9")
+	e.SetGPS(48.8566, 2.3522) // Paris
+
+	encoded, err := Encode(e)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	e2, err := Parse(encoded)
+	if err != nil {
+		t.Fatalf("Parse (round-trip): %v", err)
+	}
+
+	// Make.
+	makeEntry := e2.IFD0.Get(TagMake)
+	if makeEntry == nil {
+		t.Fatal("Make tag missing after round-trip")
+	}
+	if got := makeEntry.String(); got != "Nikon" {
+		t.Errorf("Make = %q, want \"Nikon\"", got)
+	}
+
+	// Model.
+	if got := e2.CameraModel(); got != "Nikon Z9" {
+		t.Errorf("CameraModel() = %q, want \"Nikon Z9\"", got)
+	}
+
+	// FNumber.
+	if e2.ExifIFD == nil {
+		t.Fatal("ExifIFD nil after round-trip")
+	}
+	fn, ok := e2.FNumber()
+	if !ok {
+		t.Fatal("FNumber() ok=false after round-trip")
+	}
+	if fn < 2.79 || fn > 2.81 {
+		t.Errorf("FNumber() = %f, want ~2.8", fn)
+	}
+
+	// GPS.
+	lat, lon, ok := e2.GPS()
+	if !ok {
+		t.Fatal("GPS() ok=false after round-trip")
+	}
+	const tol = 0.0001
+	if d := lat - 48.8566; d > tol || d < -tol {
+		t.Errorf("GPS lat = %f, want ~48.8566", lat)
+	}
+	if d := lon - 2.3522; d > tol || d < -tol {
+		t.Errorf("GPS lon = %f, want ~2.3522", lon)
+	}
+}
+
 // BenchmarkEXIFEncode measures the serialisation cost of a small EXIF struct
 // with three IFD0 entries and one ExifIFD pointer.
 func BenchmarkEXIFEncode(b *testing.B) {

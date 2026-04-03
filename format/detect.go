@@ -1,22 +1,42 @@
 package format
 
-import "io"
+import (
+	"encoding/binary"
+	"io"
+	"strings"
+)
 
 // magicLen is the maximum number of bytes needed to identify any supported format.
 const magicLen = 12
 
+// tiffScanSize is the number of bytes read for TIFF-variant refinement.
+// 8 (TIFF header) + 2 (IFD count) + 64×12 (IFD entries) + 256 (Make value) = 1034 bytes.
+const tiffScanSize = 1034
+
 // Detect reads up to magicLen bytes from r (without consuming them) and
-// returns the detected FormatID.
+// returns the detected FormatID. For TIFF-family files it reads additional
+// bytes to distinguish NEF, ARW, and DNG from generic TIFF.
 func Detect(r io.ReadSeeker) (FormatID, error) {
 	var buf [magicLen]byte
 	n, err := r.Read(buf[:])
 	if err != nil && n == 0 {
 		return FormatUnknown, err
 	}
+
+	fmtID := detectMagic(buf[:n])
+
+	// FormatTIFF is a superset: NEF, ARW, and DNG all share the standard TIFF
+	// magic and cannot be distinguished from the first 12 bytes alone.
+	// Read up to tiffScanSize bytes to inspect IFD0 tags for a definitive match.
+	if fmtID == FormatTIFF {
+		fmtID = refineTIFFVariant(r)
+	}
+
+	// Seek back to 0 so the caller can re-read the file from the beginning.
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return FormatUnknown, err
 	}
-	return detectMagic(buf[:n]), nil
+	return fmtID, nil
 }
 
 // detectMagic identifies the format from magic bytes alone (no I/O).
@@ -77,17 +97,19 @@ func detectHEIFBrand(brand []byte) FormatID {
 	if brand[0] == 0x63 && brand[1] == 0x72 && brand[2] == 0x78 {
 		return FormatCR3
 	}
-	// AVIF brands per ISO 23008-12 §B.4 — still map to FormatHEIF since the
-	// library has no separate FormatAVIF, but the detection is now explicit.
+	// AVIF brands per ISO 23008-12 §B.4:
+	//   'avif' → brand[0..2] = 'a','v','i', brand[3] = 'f'
+	//   'avis' → brand[0..2] = 'a','v','i', brand[3] = 's'
+	//   'av01' → brand[0..1] = 'a','v', brand[2] = '0', brand[3] = '1'
 	if brand[0] == 0x61 && brand[1] == 0x76 &&
 		(brand[2] == 0x69 || brand[2] == 0x30) { // 'avi' → avif/avis; 'av0' → av01
-		return FormatHEIF
+		return FormatAVIF
 	}
 	return FormatHEIF
 }
 
 // detectTIFFVariant distinguishes TIFF sub-formats (CR2, NEF, ARW, DNG)
-// from generic TIFF by inspecting the first few IFD entries.
+// from generic TIFF by inspecting magic bytes.
 // Falls back to FormatTIFF for unrecognised variants.
 func detectTIFFVariant(b []byte) FormatID {
 	// CR2: Canon stores a "CR" marker at bytes 8–9 of the TIFF header reserved
@@ -96,8 +118,96 @@ func detectTIFFVariant(b []byte) FormatID {
 	if len(b) >= 10 && b[8] == 0x43 && b[9] == 0x52 {
 		return FormatCR2
 	}
-	// DNG, NEF, and ARW share the standard TIFF magic and cannot be reliably
-	// distinguished from generic TIFF using only the first 12 bytes. The
-	// dispatcher may refine the format after full IFD parsing if needed.
+	// DNG, NEF, and ARW share the standard TIFF magic — refineTIFFVariant()
+	// performs IFD inspection to distinguish them.
+	return FormatTIFF
+}
+
+// refineTIFFVariant reads IFD0 from r to distinguish DNG, NEF, and ARW from
+// a generic TIFF file. r must be positioned at the start of the file.
+// Returns FormatTIFF when the variant cannot be determined.
+func refineTIFFVariant(r io.ReadSeeker) FormatID {
+	// Seek to start — Detect may have left the reader after the initial read.
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return FormatTIFF
+	}
+
+	data := make([]byte, tiffScanSize)
+	n, _ := io.ReadFull(r, data)
+	if n < 10 {
+		return FormatTIFF
+	}
+	data = data[:n]
+
+	// Parse byte order from the TIFF header (TIFF §2).
+	var order binary.ByteOrder
+	switch {
+	case data[0] == 'I' && data[1] == 'I':
+		order = binary.LittleEndian
+	case data[0] == 'M' && data[1] == 'M':
+		order = binary.BigEndian
+	default:
+		return FormatTIFF
+	}
+
+	ifd0Off := order.Uint32(data[4:])
+	if int(ifd0Off)+2 > len(data) {
+		return FormatTIFF
+	}
+
+	count := int(order.Uint16(data[ifd0Off:]))
+	if count < 0 || count > 512 {
+		return FormatTIFF
+	}
+	pos := int(ifd0Off) + 2
+
+	var makeStr string
+	for i := 0; i < count; i++ {
+		e := pos + i*12
+		if e+12 > len(data) {
+			break
+		}
+		tag := order.Uint16(data[e:])
+		typ := order.Uint16(data[e+2:])
+		cnt := order.Uint32(data[e+4:])
+
+		switch tag {
+		case 0xC612: // DNGVersion — present only in DNG files (Adobe DNG Spec §6).
+			return FormatDNG
+
+		case 0x010F: // Make — ASCII string identifying camera manufacturer (TIFF §8).
+			if typ != 2 { // TypeASCII
+				break
+			}
+			total := uint64(cnt) // ASCII: 1 byte per character
+			if total == 0 {
+				break
+			}
+			var raw []byte
+			if total <= 4 {
+				end := uint64(e+8) + total
+				if end > uint64(len(data)) {
+					break
+				}
+				raw = data[e+8 : end]
+			} else {
+				off := order.Uint32(data[e+8:])
+				end := uint64(off) + total
+				if end > uint64(len(data)) {
+					break
+				}
+				raw = data[off:end]
+			}
+			makeStr = strings.TrimRight(string(raw), "\x00 ")
+		}
+	}
+
+	// Map Make string to specific RAW format.
+	switch makeStr {
+	case "NIKON CORPORATION", "Nikon":
+		return FormatNEF
+	case "SONY":
+		return FormatARW
+	}
 	return FormatTIFF
 }

@@ -133,6 +133,9 @@ func injectByFormat(r io.ReadSeeker, w io.Writer, fmtID format.FormatID, rawEXIF
 		return webp.Inject(r, w, rawEXIF, rawIPTC, rawXMP)
 	case format.FormatHEIF:
 		return heif.Inject(r, w, rawEXIF, rawIPTC, rawXMP)
+	case format.FormatAVIF:
+		// AVIF uses the same ISOBMFF container as HEIF; delegate to the HEIF handler.
+		return heif.Inject(r, w, rawEXIF, rawIPTC, rawXMP)
 	case format.FormatCR2:
 		return cr2.Inject(r, w, rawEXIF, rawIPTC, rawXMP)
 	case format.FormatCR3:

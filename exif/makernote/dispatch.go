@@ -4,7 +4,10 @@ package makernote
 
 import (
 	"github.com/flaviocfo/img-metadata/exif/makernote/canon"
+	"github.com/flaviocfo/img-metadata/exif/makernote/fujifilm"
 	"github.com/flaviocfo/img-metadata/exif/makernote/nikon"
+	"github.com/flaviocfo/img-metadata/exif/makernote/olympus"
+	"github.com/flaviocfo/img-metadata/exif/makernote/pentax"
 	"github.com/flaviocfo/img-metadata/exif/makernote/sony"
 )
 
@@ -24,6 +27,12 @@ func Dispatch(make string) Parser {
 		return nikon.Parser{}
 	case "SONY":
 		return sony.Parser{}
+	case "FUJIFILM":
+		return fujifilm.Parser{}
+	case "OLYMPUS IMAGING CORP.", "OLYMPUS CORPORATION", "Olympus":
+		return olympus.Parser{}
+	case "PENTAX Corporation", "Ricoh":
+		return pentax.Parser{}
 	}
 	return nil
 }

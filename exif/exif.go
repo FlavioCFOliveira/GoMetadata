@@ -8,7 +8,10 @@ package exif
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"time"
+
+	"github.com/flaviocfo/img-metadata/internal/metaerr"
 )
 
 // EXIF holds the parsed contents of an EXIF block.
@@ -29,7 +32,7 @@ type EXIF struct {
 // stripped by the container layer).
 func Parse(b []byte) (*EXIF, error) {
 	if len(b) < 8 {
-		return nil, fmt.Errorf("exif: data too short (%d bytes)", len(b))
+		return nil, &metaerr.TruncatedFileError{At: "EXIF header"}
 	}
 
 	// Determine byte order from the TIFF header (TIFF §2).
@@ -40,13 +43,19 @@ func Parse(b []byte) (*EXIF, error) {
 	case b[0] == 'M' && b[1] == 'M':
 		order = binary.BigEndian
 	default:
-		return nil, fmt.Errorf("exif: invalid byte order marker %q", b[:2])
+		return nil, &metaerr.CorruptMetadataError{
+			Format: "EXIF",
+			Reason: fmt.Sprintf("invalid byte order marker %q", b[:2]),
+		}
 	}
 
 	// TIFF magic number 0x002A (TIFF §2).
 	magic := order.Uint16(b[2:])
 	if magic != 0x002A {
-		return nil, fmt.Errorf("exif: invalid TIFF magic 0x%04X", magic)
+		return nil, &metaerr.CorruptMetadataError{
+			Format: "EXIF",
+			Reason: fmt.Sprintf("invalid TIFF magic 0x%04X (expected 0x002A)", magic),
+		}
 	}
 
 	// Offset to IFD0 (TIFF §2).
@@ -315,4 +324,141 @@ func (e *EXIF) Creator() string {
 		return ""
 	}
 	return entry.String()
+}
+
+// ---------------------------------------------------------------------------
+// Write setters
+// ---------------------------------------------------------------------------
+
+// ifd0ByteOrder returns the byte order in use by IFD0, defaulting to
+// binary.LittleEndian for an empty or newly created IFD.
+func (e *EXIF) ifd0ByteOrder() binary.ByteOrder {
+	if len(e.IFD0.Entries) > 0 {
+		return e.IFD0.Entries[0].byteOrder
+	}
+	return binary.LittleEndian
+}
+
+// SetCameraModel sets IFD0 tag 0x0110 (Model, EXIF §4.6.4 Table 3).
+func (e *EXIF) SetCameraModel(s string) {
+	if e == nil || e.IFD0 == nil {
+		return
+	}
+	v := asciiValue(s)
+	e.IFD0.set(TagModel, TypeASCII, uint32(len(v)), v)
+}
+
+// SetCaption sets IFD0 tag 0x010E (ImageDescription, EXIF §4.6.4 Table 3).
+func (e *EXIF) SetCaption(s string) {
+	if e == nil || e.IFD0 == nil {
+		return
+	}
+	v := asciiValue(s)
+	e.IFD0.set(TagImageDescription, TypeASCII, uint32(len(v)), v)
+}
+
+// SetCopyright sets IFD0 tag 0x8298 (Copyright, EXIF §4.6.4 Table 3).
+func (e *EXIF) SetCopyright(s string) {
+	if e == nil || e.IFD0 == nil {
+		return
+	}
+	v := asciiValue(s)
+	e.IFD0.set(TagCopyright, TypeASCII, uint32(len(v)), v)
+}
+
+// SetCreator sets IFD0 tag 0x013B (Artist, EXIF §4.6.4 Table 3).
+func (e *EXIF) SetCreator(s string) {
+	if e == nil || e.IFD0 == nil {
+		return
+	}
+	v := asciiValue(s)
+	e.IFD0.set(TagArtist, TypeASCII, uint32(len(v)), v)
+}
+
+// SetOrientation sets IFD0 tag 0x0112 (Orientation, EXIF §4.6.4 Table 3).
+// Valid values are 1–8 per EXIF spec; the method does not validate the range.
+func (e *EXIF) SetOrientation(v uint16) {
+	if e == nil || e.IFD0 == nil {
+		return
+	}
+	// Encode using the IFD's own byte order so the inline value bytes are
+	// written correctly for both LE and BE TIFF streams.
+	order := e.ifd0ByteOrder()
+	var b [2]byte
+	order.PutUint16(b[:], v)
+	e.IFD0.set(TagOrientation, TypeShort, 1, b[:])
+}
+
+// SetGPS sets the GPS IFD from decimal-degree WGS-84 coordinates.
+// It creates GPSIFD if nil and sets the four mandatory tags:
+//
+//   - GPSLatitudeRef  (0x0001): "N\x00" or "S\x00"
+//   - GPSLatitude     (0x0002): three RATIONAL values (degrees, minutes, seconds)
+//   - GPSLongitudeRef (0x0003): "E\x00" or "W\x00"
+//   - GPSLongitude    (0x0004): three RATIONAL values
+//
+// DMS encoding per EXIF §4.6.6: degrees denominator = 1, minutes denominator = 1,
+// seconds denominator = 1,000,000 (preserves ~0.28 mm spatial precision).
+//
+// A placeholder TagGPSIFDPointer entry is also inserted into IFD0 so that
+// Encode() detects the GPS IFD and wires the offset correctly.
+func (e *EXIF) SetGPS(lat, lon float64) {
+	if e == nil || e.IFD0 == nil {
+		return
+	}
+
+	// Determine byte order from IFD0 — GPS IFD entries must match the stream.
+	order := e.ifd0ByteOrder()
+
+	// decimalToDMS converts a non-negative decimal-degree value to the three
+	// RATIONAL pairs [degrees/1, minutes/1, seconds*1e6/1e6] encoded per the
+	// EXIF GPS spec (EXIF §4.6.6).  Each rational is 8 bytes (two uint32s).
+	decimalToDMS := func(coord float64) []byte {
+		coord = math.Abs(coord)
+
+		deg := math.Floor(coord)
+		rem := (coord - deg) * 60
+		min := math.Floor(rem)
+		sec := (rem - min) * 60
+
+		// Scale seconds to integer numerator with denominator 1,000,000.
+		const secDenom = uint32(1_000_000)
+		secNum := uint32(math.Round(sec * float64(secDenom)))
+
+		b := make([]byte, 24) // 3 rationals × 8 bytes
+		order.PutUint32(b[0:], uint32(deg))
+		order.PutUint32(b[4:], 1)
+		order.PutUint32(b[8:], uint32(min))
+		order.PutUint32(b[12:], 1)
+		order.PutUint32(b[16:], secNum)
+		order.PutUint32(b[20:], secDenom)
+		return b
+	}
+
+	latRef := "N\x00"
+	if lat < 0 {
+		latRef = "S\x00"
+	}
+	lonRef := "E\x00"
+	if lon < 0 {
+		lonRef = "W\x00"
+	}
+
+	if e.GPSIFD == nil {
+		e.GPSIFD = &IFD{}
+	}
+	gps := e.GPSIFD
+
+	gps.set(TagGPSLatitudeRef, TypeASCII, 2, []byte(latRef))
+	gps.set(TagGPSLatitude, TypeRational, 3, decimalToDMS(lat))
+	gps.set(TagGPSLongitudeRef, TypeASCII, 2, []byte(lonRef))
+	gps.set(TagGPSLongitude, TypeRational, 3, decimalToDMS(lon))
+
+	// Ensure IFD0 carries a TagGPSIFDPointer entry so encode() will serialise
+	// the GPS IFD and patch the real offset.  Value 0 is a placeholder;
+	// encode() (write.go) overwrites it with the correct absolute offset.
+	if e.IFD0.Get(TagGPSIFDPointer) == nil {
+		var placeholder [4]byte
+		e.IFD0.set(TagGPSIFDPointer, TypeLong, 1, placeholder[:])
+	}
 }

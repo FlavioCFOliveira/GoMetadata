@@ -12,7 +12,7 @@ const (
 	FormatJPEG
 	FormatTIFF
 	FormatPNG
-	FormatHEIF // includes HEIC, AVIF
+	FormatHEIF // includes HEIC and other non-AVIF ISOBMFF image brands
 	FormatWebP
 	FormatCR2
 	FormatCR3
@@ -21,6 +21,7 @@ const (
 	FormatDNG
 	FormatORF
 	FormatRW2
+	FormatAVIF // AVIF (AV1 Image File Format, ISO 23008-12)
 )
 
 // String returns a human-readable name for the format.
@@ -50,6 +51,8 @@ func (f FormatID) String() string {
 		return "ORF"
 	case FormatRW2:
 		return "RW2"
+	case FormatAVIF:
+		return "AVIF"
 	}
 	return "Unknown"
 }
@@ -58,7 +61,7 @@ func (f FormatID) String() string {
 // the given format (i.e., Write and WriteFile will not return UnsupportedFormatError).
 func SupportsWrite(f FormatID) bool {
 	switch f {
-	case FormatJPEG, FormatTIFF, FormatPNG, FormatHEIF, FormatWebP,
+	case FormatJPEG, FormatTIFF, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP,
 		FormatCR2, FormatCR3, FormatNEF, FormatARW, FormatDNG, FormatORF, FormatRW2:
 		return true
 	}

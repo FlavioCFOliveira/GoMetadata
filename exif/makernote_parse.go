@@ -10,6 +10,10 @@ import "encoding/binary"
 //   - Nikon Type 3: embedded TIFF header at offset 10 within "Nikon\0" prefix
 //   - Nikon Type 1: plain IFD at offset 0, big-endian (legacy Nikon cameras)
 //   - Sony: plain IFD at offset 0, parent byte order
+//   - Fujifilm: "FUJIFILM" prefix, LE IFD at offset stored at [12..15]
+//   - Olympus Type 2: "OLYMPUS\0" prefix, byte order at [8..9], IFD at 12
+//   - Pentax AOC: "AOC\0" prefix, big-endian IFD at offset 6
+//   - Pentax PENTAX: "PENTAX \0" prefix, byte order at [8..9], IFD at 12
 func parseMakerNoteIFD(b []byte, make string, parentOrder binary.ByteOrder) *IFD {
 	switch make {
 	case "Canon":
@@ -18,6 +22,12 @@ func parseMakerNoteIFD(b []byte, make string, parentOrder binary.ByteOrder) *IFD
 		return parseNikonMakerNote(b)
 	case "SONY":
 		return parseSonyMakerNote(b, parentOrder)
+	case "FUJIFILM":
+		return parseFujifilmMakerNote(b)
+	case "OLYMPUS IMAGING CORP.", "OLYMPUS CORPORATION", "Olympus":
+		return parseOlympusMakerNote(b)
+	case "PENTAX Corporation", "Ricoh":
+		return parsePentaxMakerNote(b)
 	}
 	return nil
 }
@@ -120,4 +130,100 @@ func parseSonyMakerNote(b []byte, order binary.ByteOrder) *IFD {
 		return nil
 	}
 	return ifd
+}
+
+// parseFujifilmMakerNote parses a Fujifilm MakerNote.
+//
+// Fujifilm MakerNote layout (ExifTool Fujifilm.pm §3.1):
+//
+//	[0..7]   "FUJIFILM" magic
+//	[8..11]  version (e.g. "0100", ignored)
+//	[12..15] LE uint32 IFD offset relative to b[0]
+//
+// The IFD uses little-endian byte order. All value offsets are relative to b[0].
+func parseFujifilmMakerNote(b []byte) *IFD {
+	const minLen = 16 // 8 (magic) + 4 (version) + 4 (offset)
+	if len(b) < minLen {
+		return nil
+	}
+	if string(b[:8]) != "FUJIFILM" {
+		return nil
+	}
+	ifdOffset := binary.LittleEndian.Uint32(b[12:16])
+	ifd, err := traverse(b, ifdOffset, binary.LittleEndian)
+	if err != nil {
+		return nil
+	}
+	return ifd
+}
+
+// parseOlympusMakerNote parses an Olympus Type 2 MakerNote.
+//
+// Olympus Type 2 MakerNote layout (ExifTool Olympus.pm):
+//
+//	[0..7]   "OLYMPUS\x00" magic
+//	[8..9]   "II" (LE) or "MM" (BE) byte order
+//	[10..11] version (ignored)
+//	[12..]   IFD entries; value offsets relative to b[0]
+func parseOlympusMakerNote(b []byte) *IFD {
+	const minLen = 14 // 8 (magic) + 2 (byte order) + 2 (version) + 2 (IFD count)
+	if len(b) < minLen {
+		return nil
+	}
+	if string(b[:8]) != "OLYMPUS\x00" {
+		return nil
+	}
+	var order binary.ByteOrder
+	switch {
+	case b[8] == 'I' && b[9] == 'I':
+		order = binary.LittleEndian
+	case b[8] == 'M' && b[9] == 'M':
+		order = binary.BigEndian
+	default:
+		return nil
+	}
+	ifd, err := traverse(b, 12, order)
+	if err != nil {
+		return nil
+	}
+	return ifd
+}
+
+// parsePentaxMakerNote parses a Pentax MakerNote.
+//
+// Two sub-formats are handled (ExifTool Pentax.pm):
+//
+//   - AOC format ("AOC\x00" prefix): big-endian IFD at offset 6.
+//     Used by all modern K-series and 645-series DSLRs.
+//
+//   - PENTAX format ("PENTAX \x00" prefix): byte order at [8..9], IFD at 12.
+//     Used by older Samsung GX-series and early Pentax DSLRs.
+func parsePentaxMakerNote(b []byte) *IFD {
+	switch {
+	case len(b) >= 8 && string(b[:4]) == "AOC\x00":
+		// AOC format: big-endian, IFD at offset 6.
+		ifd, err := traverse(b, 6, binary.BigEndian)
+		if err != nil {
+			return nil
+		}
+		return ifd
+
+	case len(b) >= 14 && string(b[:8]) == "PENTAX \x00":
+		// PENTAX prefix format: byte order at [8..9], IFD at offset 12.
+		var order binary.ByteOrder
+		switch {
+		case b[8] == 'I' && b[9] == 'I':
+			order = binary.LittleEndian
+		case b[8] == 'M' && b[9] == 'M':
+			order = binary.BigEndian
+		default:
+			return nil
+		}
+		ifd, err := traverse(b, 12, order)
+		if err != nil {
+			return nil
+		}
+		return ifd
+	}
+	return nil
 }

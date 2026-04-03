@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math"
 	"sort"
+
+	"github.com/flaviocfo/img-metadata/internal/metaerr"
 )
 
 // IFD represents a TIFF Image File Directory (TIFF §2).
@@ -32,7 +34,10 @@ type IFDEntry struct {
 // prevent stack overflows on cyclic or deeply nested inputs (fuzz safety).
 func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, error) {
 	if int(offset)+2 > len(b) {
-		return nil, fmt.Errorf("exif: IFD offset %d out of bounds (buf len %d)", offset, len(b))
+		return nil, &metaerr.CorruptMetadataError{
+			Format: "EXIF",
+			Reason: fmt.Sprintf("IFD offset %d out of bounds (buf len %d)", offset, len(b)),
+		}
 	}
 
 	// visited tracks offsets we have already started parsing to detect cycles.
@@ -115,7 +120,10 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, error) {
 	}
 
 	if root == nil {
-		return nil, fmt.Errorf("exif: IFD at offset %d could not be parsed (buf len %d)", offset, len(b))
+		return nil, &metaerr.CorruptMetadataError{
+			Format: "EXIF",
+			Reason: fmt.Sprintf("IFD at offset %d could not be parsed (buf len %d)", offset, len(b)),
+		}
 	}
 	return root, nil
 }
@@ -253,6 +261,33 @@ func (e *IFDEntry) Uint8s() []byte {
 // Len returns the number of values in the entry (Count field).
 func (e *IFDEntry) Len() int {
 	return int(e.Count)
+}
+
+// set inserts or replaces an entry in the IFD. The byteOrder field of the
+// new entry is inherited from the existing entries in the IFD (or defaults
+// to binary.LittleEndian for an empty IFD).
+func (ifd *IFD) set(tag TagID, typ DataType, count uint32, value []byte) {
+	order := binary.ByteOrder(binary.LittleEndian)
+	if len(ifd.Entries) > 0 {
+		order = ifd.Entries[0].byteOrder
+	}
+	entry := IFDEntry{Tag: tag, Type: typ, Count: count, Value: value, byteOrder: order}
+	for i := range ifd.Entries {
+		if ifd.Entries[i].Tag == tag {
+			ifd.Entries[i] = entry
+			return
+		}
+	}
+	ifd.Entries = append(ifd.Entries, entry)
+}
+
+// asciiValue encodes s as a NUL-terminated ASCII byte slice suitable for
+// IFDEntry.Value (TypeASCII, TIFF §2).
+func asciiValue(s string) []byte {
+	v := make([]byte, len(s)+1)
+	copy(v, s)
+	// v[len(s)] is already 0 (NUL terminator).
+	return v
 }
 
 // --- helpers used by encode ---

@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"io"
 	"sort"
+
+	"github.com/flaviocfo/img-metadata/internal/iobuf"
 )
 
 // JPEG marker bytes (ISO/IEC 10918-1, Annex B).
@@ -156,8 +158,13 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 		if len(identExif)+len(rawEXIF)+2 > 65535 {
 			return fmt.Errorf("jpeg: EXIF payload %d bytes exceeds APP1 segment limit; EXIF cannot be split", len(rawEXIF))
 		}
-		if err := writeSegment(w, markerAPP1, append(identExif, rawEXIF...)); err != nil {
-			return err
+		exifBuf := iobuf.Get(len(identExif) + len(rawEXIF))
+		copy(*exifBuf, identExif)
+		copy((*exifBuf)[len(identExif):], rawEXIF)
+		writeErr := writeSegment(w, markerAPP1, *exifBuf)
+		iobuf.Put(exifBuf)
+		if writeErr != nil {
+			return writeErr
 		}
 	}
 	if rawXMP != nil {
@@ -167,8 +174,13 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 		if len(identXMP)+len(rawXMP)+2 > 65535 {
 			return fmt.Errorf("jpeg: XMP payload %d bytes exceeds APP1 segment limit (65458 bytes); split into extended XMP not supported for writing", len(rawXMP))
 		}
-		if err := writeSegment(w, markerAPP1, append(identXMP, rawXMP...)); err != nil {
-			return err
+		xmpBuf := iobuf.Get(len(identXMP) + len(rawXMP))
+		copy(*xmpBuf, identXMP)
+		copy((*xmpBuf)[len(identXMP):], rawXMP)
+		writeErr := writeSegment(w, markerAPP1, *xmpBuf)
+		iobuf.Put(xmpBuf)
+		if writeErr != nil {
+			return writeErr
 		}
 	}
 	if rawIPTC != nil {
@@ -177,8 +189,13 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 		if len(identPS)+len(irb)+2 > 65535 {
 			return fmt.Errorf("jpeg: IPTC IRB payload %d bytes exceeds APP13 segment limit", len(irb))
 		}
-		if err := writeSegment(w, markerAPP13, append(identPS, irb...)); err != nil {
-			return err
+		iptcBuf := iobuf.Get(len(identPS) + len(irb))
+		copy(*iptcBuf, identPS)
+		copy((*iptcBuf)[len(identPS):], irb)
+		writeErr := writeSegment(w, markerAPP13, *iptcBuf)
+		iobuf.Put(iptcBuf)
+		if writeErr != nil {
+			return writeErr
 		}
 	}
 
