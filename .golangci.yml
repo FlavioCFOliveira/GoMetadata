@@ -10,15 +10,20 @@ linters:
     - ineffassign
     - prealloc
     - unparam
+    - gochecknoglobals
+    - nilerr
+    - errorlint
+    - copyloopvar
+    - makezero
 
-linters-settings:
-  revive:
+  settings:
+    revive:
+      rules:
+        - name: exported
+          severity: warning
+
+  exclusions:
     rules:
-      - name: exported
-        severity: warning
-
-issues:
-  exclude-rules:
-    # Tag and namespace registries are legitimately package-level state.
-    - linters: [gochecknoglobals]
-      text: "tagRegistry|namespaceRegistry"
+      # Tag and namespace registries are legitimately package-level state.
+      - linters: [gochecknoglobals]
+        text: "tagRegistry|namespaceRegistry"
