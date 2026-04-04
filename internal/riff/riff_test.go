@@ -174,7 +174,12 @@ func TestMultipleChunksSequential(t *testing.T) {
 	var stream []byte
 	for i, fc := range fourccs {
 		stream = append(stream, buildChunkHeader(fc, sizes[i])...)
-		data := make([]byte, sizes[i])
+		dataCap := sizes[i]
+		if sizes[i]%2 != 0 {
+			dataCap++
+		}
+		data := make([]byte, 0, dataCap)
+		data = append(data, make([]byte, sizes[i])...)
 		if sizes[i]%2 != 0 {
 			data = append(data, 0x00) // padding
 		}

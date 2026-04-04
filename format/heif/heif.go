@@ -293,7 +293,7 @@ type ilocExtent struct {
 func parseIlocFull(metaContent []byte) (ilocBoxInfo, bool) {
 	var info ilocBoxInfo
 	ilocData := findInnerBox(metaContent, "iloc")
-	if ilocData == nil || len(ilocData) < 5 {
+	if len(ilocData) < 5 {
 		return info, false
 	}
 
@@ -431,9 +431,9 @@ func buildIlocBox(info ilocBoxInfo, items []ilocFullItem) []byte {
 		}
 	}
 
-	hdr := make([]byte, 8)
+	hdr := make([]byte, 0, 8+len(body))
+	hdr = append(hdr, 0, 0, 0, 0, 'i', 'l', 'o', 'c')
 	binary.BigEndian.PutUint32(hdr, uint32(8+len(body)))
-	copy(hdr[4:], "iloc")
 	return append(hdr, body...)
 }
 
@@ -470,9 +470,9 @@ func buildMetaBox(versionFlags, metaContent, newIloc []byte) []byte {
 	}
 	body = append(body, newIloc...)
 
-	hdr := make([]byte, 8)
+	hdr := make([]byte, 0, 8+len(body))
+	hdr = append(hdr, 0, 0, 0, 0, 'm', 'e', 't', 'a')
 	binary.BigEndian.PutUint32(hdr, uint32(8+len(body)))
-	copy(hdr[4:], "meta")
 	return append(hdr, body...)
 }
 
@@ -529,7 +529,10 @@ func appendUintN(b []byte, n int, v uint64) []byte {
 func parseHEIFMetadata(data []byte) (rawEXIF, rawXMP []byte, err error) {
 	// Find the 'meta' box. It can be inside 'moov' or at top-level.
 	metaData, err := findBox(data, "meta", 0)
-	if err != nil || metaData == nil {
+	if err != nil {
+		return nil, nil, err
+	}
+	if metaData == nil {
 		return nil, nil, nil
 	}
 
@@ -626,7 +629,7 @@ type itemLoc struct {
 // up to depth levels deep (max 32) to prevent stack exhaustion on crafted input.
 func findBox(data []byte, boxType string, depth int) ([]byte, error) {
 	if depth > 32 {
-		return nil, nil
+		return nil, fmt.Errorf("heif: findBox: exceeded maximum nesting depth")
 	}
 	pos := 0
 	for pos+8 <= len(data) {
@@ -757,12 +760,11 @@ func parseInfe(data []byte) (uint16, string) {
 			contentType = string(data[pos:])
 		}
 		// Map content type to internal type string.
-		switch contentType {
-		case "application/rdf+xml":
-			return id, "mime"
-		}
 		// Exif in v0/v1 has no formal item_type; the item_content_type is typically
 		// empty or "image/jpeg". We cannot reliably identify Exif items in v0/v1.
+		if contentType == "application/rdf+xml" {
+			return id, "mime"
+		}
 		return id, ""
 
 	case 2:

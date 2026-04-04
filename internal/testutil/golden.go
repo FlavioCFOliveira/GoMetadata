@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-var update = flag.Bool("update", false, "overwrite golden files with current output")
+var update = flag.Bool("update", false, "overwrite golden files with current output") //nolint:gochecknoglobals // test flag registered at package init
 
 // CheckGolden compares got (marshalled to JSON) against the golden file at
 // testdata/golden/<name>.json. When -update is set, it writes the current

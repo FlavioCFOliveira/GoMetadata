@@ -457,7 +457,6 @@ func TestReadBox_HeaderTruncated(t *testing.T) {
 	}
 
 	for n := 0; n < 8; n++ {
-		n := n // capture
 		t.Run("", func(t *testing.T) {
 			r := bytes.NewReader(valid[:n])
 			_, err := ReadBox(r)
@@ -525,8 +524,14 @@ func TestSkipBox_PositionAfterMultipleBoxes(t *testing.T) {
 		{[4]byte{'m', 'd', 'a', 't'}, 20},
 	}
 
-	var stream []byte
-	expectedEnd := []int64{}
+	stream := make([]byte, 0, func() int {
+		total := 0
+		for _, b := range boxes {
+			total += 8 + b.payloadSize
+		}
+		return total
+	}())
+	expectedEnd := make([]int64, 0, len(boxes))
 	var pos int64
 	for _, b := range boxes {
 		total := 8 + b.payloadSize
@@ -569,7 +574,6 @@ func TestReadBox_ExtendedSize_Offset(t *testing.T) {
 	payloads := []int{0, 1, 8, 100}
 
 	for _, plen := range payloads {
-		plen := plen
 		extSize := uint64(16 + plen)
 		raw := buildExtendedBox(extSize, typ, make([]byte, plen))
 		r := bytes.NewReader(raw)

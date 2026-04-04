@@ -16,7 +16,7 @@ const tiffScanSize = 1034
 
 // tiffScanPool recycles the scan buffer used by refineTIFFVariant so that the
 // 1 KiB allocation is amortised to zero after the first call.
-var tiffScanPool = sync.Pool{
+var tiffScanPool = sync.Pool{ //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
 	New: func() any {
 		b := make([]byte, tiffScanSize)
 		return &b

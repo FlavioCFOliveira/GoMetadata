@@ -33,9 +33,9 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 		// item_name = "" (single NUL)
 		body[12] = 0
 		size := uint32(8 + len(body))
-		hdr := make([]byte, 8)
+		hdr := make([]byte, 0, 8+len(body))
+		hdr = append(hdr, 0, 0, 0, 0, 'i', 'n', 'f', 'e')
 		binary.BigEndian.PutUint32(hdr, size)
-		copy(hdr[4:], "infe")
 		return append(hdr, body...)
 	}
 
@@ -50,9 +50,9 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 			iinfBody = append(iinfBody, infe...)
 		}
 		size := uint32(8 + len(iinfBody))
-		hdr := make([]byte, 8)
+		hdr := make([]byte, 0, 8+len(iinfBody))
+		hdr = append(hdr, 0, 0, 0, 0, 'i', 'i', 'n', 'f')
 		binary.BigEndian.PutUint32(hdr, size)
-		copy(hdr[4:], "iinf")
 		return append(hdr, iinfBody...)
 	}
 
@@ -61,7 +61,8 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 	//       base_offset_size(4bit)+reserved(4bit)+item_count(2)+items
 	// We use offset_size=4, length_size=4.
 	makeIloc := func(items []ilocTestItem) []byte {
-		ilocBody := []byte{0x00, 0x00, 0x00, 0x00} // version + flags
+		ilocBody := make([]byte, 0, 6+2+len(items)*(2+2+4+4)) // version+flags+sizes+item_count + items
+		ilocBody = append(ilocBody, 0x00, 0x00, 0x00, 0x00) // version + flags
 		ilocBody = append(ilocBody, 0x44)           // offset_size=4, length_size=4
 		ilocBody = append(ilocBody, 0x00)           // base_offset_size=0, reserved=0
 		cnt := make([]byte, 2)
@@ -82,9 +83,9 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 			ilocBody = append(ilocBody, ln...)
 		}
 		size := uint32(8 + len(ilocBody))
-		hdr := make([]byte, 8)
+		hdr := make([]byte, 0, 8+len(ilocBody))
+		hdr = append(hdr, 0, 0, 0, 0, 'i', 'l', 'o', 'c')
 		binary.BigEndian.PutUint32(hdr, size)
-		copy(hdr[4:], "iloc")
 		return append(hdr, ilocBody...)
 	}
 
@@ -136,9 +137,12 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 	copy(metaBox[4:], "meta")
 	copy(metaBox[8:], metaBody)
 
-	// Full file: ftyp + meta + item data
-	fileData := append(ftyp, metaBox...)
-	dataStart := uint32(len(fileData))
+	// Full file: ftyp + meta + item data.
+	// Keep ftyp (16 bytes) immutable; build file images as separate slices.
+	pass1 := make([]byte, 0, len(ftyp)+len(metaBox))
+	pass1 = append(pass1, ftyp...)
+	pass1 = append(pass1, metaBox...)
+	dataStart := uint32(len(pass1))
 
 	// Patch iloc offsets now that we know dataStart.
 	// Re-build iloc with correct offsets.
@@ -156,8 +160,10 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 	copy(metaBox2[8:], metaBody2)
 
 	// Recompute dataStart with the corrected meta box.
-	fileData2 := append(ftyp, metaBox2...)
-	dataStart2 := uint32(len(fileData2))
+	pass2 := make([]byte, 0, len(ftyp)+len(metaBox2))
+	pass2 = append(pass2, ftyp...)
+	pass2 = append(pass2, metaBox2...)
+	dataStart2 := uint32(len(pass2))
 	// Patch offsets again if meta size changed.
 	curOff2 := dataStart2
 	for i := range ilocItems {
@@ -172,7 +178,9 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 	copy(metaBox3[4:], "meta")
 	copy(metaBox3[8:], metaBody3)
 
-	result := append(ftyp, metaBox3...)
+	result := make([]byte, 0, len(ftyp)+len(metaBox3))
+	result = append(result, ftyp...)
+	result = append(result, metaBox3...)
 	for _, block := range itemDataBlocks {
 		result = append(result, block...)
 	}
@@ -279,7 +287,8 @@ func TestInjectRoundTrip(t *testing.T) {
 	exif := minimalTIFFExif()
 	data := buildHEIF(exif, nil)
 
-	newExif := append(exif[:len(exif)-4], 'X', 'X', 'X', 'X')
+	exif = append(exif[:len(exif)-4], 'X', 'X', 'X', 'X')
+	newExif := exif
 	var out bytes.Buffer
 	if err := Inject(bytes.NewReader(data), &out, newExif, nil, nil); err != nil {
 		t.Fatalf("Inject: %v", err)
@@ -306,19 +315,20 @@ func buildHEIFInMoov(exifData, xmpData []byte) []byte {
 	rest := inner[16:] // meta + item data
 
 	moovBody := rest
-	moovHdr := make([]byte, 8)
+	moovHdr := make([]byte, 0, 8+len(moovBody))
+	moovHdr = append(moovHdr, 0, 0, 0, 0, 'm', 'o', 'o', 'v')
 	binary.BigEndian.PutUint32(moovHdr, uint32(8+len(moovBody)))
-	copy(moovHdr[4:], "moov")
-	moov := append(moovHdr, moovBody...)
+	moovHdr = append(moovHdr, moovBody...)
 
-	return append(ftyp, moov...)
+	return append(ftyp, moovHdr...)
 }
 
 func TestInjectMetaInsideMoov(t *testing.T) {
 	exif := minimalTIFFExif()
 	data := buildHEIFInMoov(exif, nil)
 
-	newExif := append(exif[:len(exif)-4], 'Y', 'Y', 'Y', 'Y')
+	exif = append(exif[:len(exif)-4], 'Y', 'Y', 'Y', 'Y')
+	newExif := exif
 	var out bytes.Buffer
 	if err := Inject(bytes.NewReader(data), &out, newExif, nil, nil); err != nil {
 		t.Fatalf("Inject: %v", err)
@@ -338,7 +348,8 @@ func TestInjectBothEXIFAndXMP(t *testing.T) {
 	xmp := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta><?xpacket end="w"?>`)
 	data := buildHEIF(exif, xmp)
 
-	newExif := append(exif[:len(exif)-4], 'Z', 'Z', 'Z', 'Z')
+	exif = append(exif[:len(exif)-4], 'Z', 'Z', 'Z', 'Z')
+	newExif := exif
 	newXMP := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"/></x:xmpmeta><?xpacket end="w"?>`)
 
 	var out bytes.Buffer

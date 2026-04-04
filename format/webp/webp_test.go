@@ -73,6 +73,22 @@ func TestExtractEXIF(t *testing.T) {
 	}
 }
 
+func TestExtractXMP(t *testing.T) {
+	xmpData := []byte("<?xpacket begin='' uid='x'?><x:xmpmeta xmlns:x='adobe:ns:meta/'></x:xmpmeta><?xpacket end='r'?>")
+	webp := buildWebP(nil, xmpData, 0x04, 0, 0)
+
+	_, _, rawXMP, err := Extract(bytes.NewReader(webp))
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if rawXMP == nil {
+		t.Fatal("rawXMP is nil")
+	}
+	if !bytes.Equal(rawXMP, xmpData) {
+		t.Errorf("rawXMP = %v, want %v", rawXMP, xmpData)
+	}
+}
+
 func TestInjectPreservesCanvasDimensions(t *testing.T) {
 	// Build a WebP with VP8X and specific canvas dimensions.
 	const canvasW, canvasH = uint32(1024), uint32(768)

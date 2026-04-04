@@ -14,7 +14,7 @@ import (
 
 // orfMagic is the Olympus ORF byte order / magic marker (bytes 0-3).
 // Olympus replaces the standard TIFF magic (0x2A 0x00) with "RO" (0x52 0x4F).
-var orfMagic = []byte{0x49, 0x49, 0x52, 0x4F} // "IIRO"
+var orfMagic = []byte{0x49, 0x49, 0x52, 0x4F} //nolint:gochecknoglobals // package-level constant bytes
 
 // Extract reads metadata from an ORF file.
 // The ORF magic bytes are patched to standard TIFF before extraction so

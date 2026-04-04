@@ -9,7 +9,7 @@ import (
 
 // xmpPadding is the pre-computed 2 KB whitespace padding block for XMP in-place
 // editing (XMP §7.3). Initialised once at package load; never mutated.
-var xmpPadding = func() [2048]byte {
+var xmpPadding = func() [2048]byte { //nolint:gochecknoglobals // package-level constant bytes
 	var b [2048]byte
 	for i := range b {
 		if (i+1)%100 == 0 {
@@ -24,15 +24,9 @@ var xmpPadding = func() [2048]byte {
 // encBufPool recycles bytes.Buffer instances across encode calls.
 // Pre-grown buffers avoid the repeated backing-array reallocations that
 // occur when building an XMP packet from scratch.
-var encBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
-
-// nsListPool recycles the []string slice used to sort namespace URIs in encode.
-// The pool eliminates one allocation per encode call on the hot path.
-var nsListPool = sync.Pool{New: func() any { s := make([]string, 0, 8); return &s }}
-
-// localListPool recycles the []string slice used to sort property names per
-// namespace in encode. Eliminates one allocation per namespace per encode call.
-var localListPool = sync.Pool{New: func() any { s := make([]string, 0, 16); return &s }}
+var encBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}    //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
+var nsListPool = sync.Pool{New: func() any { s := make([]string, 0, 8); return &s }}  //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
+var localListPool = sync.Pool{New: func() any { s := make([]string, 0, 16); return &s }} //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
 
 // encode serialises x to a padded XMP packet.
 // The packet uses UTF-8 encoding and a read/write <?xpacket?> wrapper

@@ -88,7 +88,7 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	fi, err := f.Stat()
 	if err != nil {
@@ -103,18 +103,18 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 
 	// Preserve original file permissions before writing any data.
 	if err := tmp.Chmod(fi.Mode()); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return err
 	}
 
 	if err := Write(f, tmp, m, opts...); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return err
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return err
 	}
 	return os.Rename(tmpName, path)

@@ -126,7 +126,7 @@ func Parse(b []byte) (*IPTC, error) {
 // repeated heap allocation of the buffer's internal byte array on every call.
 // The result is always a fresh bytes.Clone of the buffer contents, so the
 // returned slice is safe to use after the buffer is returned to the pool.
-var encBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+var encBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }} //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
 
 // Encode serialises i back to an IPTC IIM byte stream.
 func Encode(i *IPTC) ([]byte, error) {

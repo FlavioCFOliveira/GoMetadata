@@ -85,8 +85,8 @@ func TestExtractXMPCompressed(t *testing.T) {
 	// Build compressed iTXt chunk manually.
 	var compressed bytes.Buffer
 	zw := zlib.NewWriter(&compressed)
-	zw.Write(xmpData)
-	zw.Close()
+	_, _ = zw.Write(xmpData)
+	_ = zw.Close()
 
 	var chunk bytes.Buffer
 	chunk.WriteString(xmpKeyword)
@@ -299,8 +299,8 @@ func TestExtractXMPFromZTxtChunk(t *testing.T) {
 func TestExtractXMPFromZTxtChunkWrongKeyword(t *testing.T) {
 	var compressed bytes.Buffer
 	zw := zlib.NewWriter(&compressed)
-	zw.Write([]byte("some compressed text"))
-	zw.Close()
+	_, _ = zw.Write([]byte("some compressed text"))
+	_ = zw.Close()
 
 	var payload bytes.Buffer
 	payload.WriteString("Description") // not the XMP keyword
@@ -375,8 +375,8 @@ func BenchmarkPNGExtractCompressedXMP(b *testing.B) {
 
 	var compressed bytes.Buffer
 	zw := zlib.NewWriter(&compressed)
-	zw.Write(xmpData)
-	zw.Close()
+	_, _ = zw.Write(xmpData)
+	_ = zw.Close()
 
 	var chunk bytes.Buffer
 	chunk.WriteString(xmpKeyword)

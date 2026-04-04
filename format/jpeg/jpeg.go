@@ -15,6 +15,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -32,18 +33,18 @@ const (
 )
 
 // identExif is the mandatory 6-byte prefix for EXIF inside APP1 (EXIF §4.5.4).
-var identExif = []byte("Exif\x00\x00")
+var identExif = []byte("Exif\x00\x00") //nolint:gochecknoglobals // package-level constant bytes
 
 // identXMP is the NUL-terminated namespace URI prefix for XMP inside APP1.
 // Adobe XMP Specification Part 3 §1.1.3.
-var identXMP = []byte("http://ns.adobe.com/xap/1.0/\x00")
+var identXMP = []byte("http://ns.adobe.com/xap/1.0/\x00") //nolint:gochecknoglobals // package-level constant bytes
 
 // identXMPNote is the NUL-terminated namespace URI prefix for extended XMP
 // inside APP1. Adobe XMP Specification Part 3 §1.1.4.
-var identXMPNote = []byte("http://ns.adobe.com/xap/1.0/se/\x00")
+var identXMPNote = []byte("http://ns.adobe.com/xap/1.0/se/\x00") //nolint:gochecknoglobals // package-level constant bytes
 
 // identPS is the Photoshop 3.0 signature in APP13 (EXIF §4.5.6).
-var identPS = []byte("Photoshop 3.0\x00")
+var identPS = []byte("Photoshop 3.0\x00") //nolint:gochecknoglobals // package-level constant bytes
 
 // APP1 segment capacity constants derived from the JPEG 16-bit length field.
 // JPEG ISO/IEC 10918-1 §B.1.1.4: length field is 2 bytes and includes itself,
@@ -103,7 +104,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	for {
 		marker, data, rerr := readSegment(r, scratchPtr)
 		if rerr != nil {
-			if rerr == io.EOF {
+			if errors.Is(rerr, io.EOF) {
 				break
 			}
 			// Non-fatal: degrade gracefully on malformed marker streams.
@@ -248,7 +249,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	for {
 		marker, data, err := readSegment(r, injectScratch)
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			return err
@@ -575,9 +576,7 @@ func reassembleExtendedXMP(main []byte, extended map[string][]extChunk) []byte {
 	if end != 32 { // GUID must be exactly 32 hex characters
 		return main
 	}
-	guid := string(rest[:32])
-
-	chunks, ok := extended[guid]
+	chunks, ok := extended[string(rest[:32])]
 	if !ok || len(chunks) == 0 {
 		return main
 	}

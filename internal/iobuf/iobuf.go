@@ -9,7 +9,7 @@ const defaultSize = 4096
 const largeSize = 65536
 
 // pool serves buffers up to defaultSize bytes.
-var pool = sync.Pool{
+var pool = sync.Pool{ //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
 	New: func() any {
 		b := make([]byte, defaultSize)
 		return &b
@@ -19,7 +19,7 @@ var pool = sync.Pool{
 // largePool serves buffers between defaultSize+1 and largeSize bytes.
 // Kept separate to prevent large buffers (EXIF segments, extended-XMP chunks)
 // from polluting the small-buffer pool and wasting memory.
-var largePool = sync.Pool{
+var largePool = sync.Pool{ //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
 	New: func() any {
 		b := make([]byte, largeSize)
 		return &b

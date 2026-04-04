@@ -26,21 +26,23 @@ func buildNikonType3() []byte {
 	//   [8..]   embedded TIFF: "II" + 0x2A00 + IFD offset(4) + count(2) + 1*12-byte entry + next(4)
 	const tiffBase = 8
 	// Embedded TIFF: header(8) + IFD at offset 8.
-	tiffHdr := []byte{'I', 'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00}
 	// IFD: count(2) + 1 entry(12) + next(4)
 	ifd := make([]byte, 2+12+4)
 	le := binary.LittleEndian
-	le.PutUint16(ifd[0:], 1)              // 1 entry
+	le.PutUint16(ifd[0:], 1)               // 1 entry
 	le.PutUint16(ifd[2:], TagShutterCount) // tag
-	le.PutUint16(ifd[4:], 4)              // LONG
-	le.PutUint32(ifd[6:], 1)              // count
-	le.PutUint32(ifd[10:], 5000)          // value: 5000 shutter actuations
+	le.PutUint16(ifd[4:], 4)               // LONG
+	le.PutUint32(ifd[6:], 1)               // count
+	le.PutUint32(ifd[10:], 5000)           // value: 5000 shutter actuations
 	// next IFD = 0
 	_ = tiffBase
 
-	embedded := append(tiffHdr, ifd...)
-	prefix := []byte{'N', 'i', 'k', 'o', 'n', 0x00, 0x02, 0x10}
-	return append(prefix, embedded...)
+	tiffHdr := make([]byte, 0, 8+len(ifd))
+	tiffHdr = append(tiffHdr, 'I', 'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00)
+	tiffHdr = append(tiffHdr, ifd...)
+	prefix := make([]byte, 0, 8+len(tiffHdr))
+	prefix = append(prefix, 'N', 'i', 'k', 'o', 'n', 0x00, 0x02, 0x10)
+	return append(prefix, tiffHdr...)
 }
 
 func TestParseType1(t *testing.T) {

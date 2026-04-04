@@ -30,10 +30,8 @@ func buildMinimalCR3(tiffData, xmpData []byte) []byte {
 	moovBox := buildBox("moov", uuidBox)
 
 	// Build ftyp box (16 bytes: size + "ftyp" + brand + minor version).
-	ftyp := make([]byte, 16)
-	binary.BigEndian.PutUint32(ftyp, 16)
-	copy(ftyp[4:], "ftyp")
-	copy(ftyp[8:], "crx ")
+	ftyp := make([]byte, 0, 16+len(moovBox))
+	ftyp = append(ftyp, 0, 0, 0, 16, 'f', 't', 'y', 'p', 'c', 'r', 'x', ' ', 0, 0, 0, 0)
 
 	return append(ftyp, moovBox...)
 }
@@ -110,7 +108,8 @@ func TestInjectEXIFRoundTrip(t *testing.T) {
 	exif := minimalTIFF()
 	data := buildMinimalCR3(exif, nil)
 
-	newExif := append(exif, 0x00, 0x01, 0x02, 0x03) // extend to differ from original
+	exif = append(exif, 0x00, 0x01, 0x02, 0x03) // extend to differ from original
+	newExif := exif
 
 	// Patch IFD offset to keep it valid for the extended slice.
 	newData := make([]byte, len(newExif))

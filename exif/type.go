@@ -3,6 +3,7 @@ package exif
 // DataType is a TIFF field type code (TIFF §2, Table 1).
 type DataType uint16
 
+// DataType constants identify the EXIF data type of a tag value (EXIF 2.3 §4.6.3).
 const (
 	TypeByte      DataType = 1  // 8-bit unsigned
 	TypeASCII     DataType = 2  // NUL-terminated string

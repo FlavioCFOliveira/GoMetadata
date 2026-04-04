@@ -10,6 +10,7 @@ package webp
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 
@@ -34,7 +35,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	for {
 		chunk, rerr := riff.ReadChunk(r)
 		if rerr != nil {
-			if rerr == io.EOF {
+			if errors.Is(rerr, io.EOF) {
 				break
 			}
 			return nil, nil, nil, fmt.Errorf("webp: read chunk: %w", rerr)
@@ -48,7 +49,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 			}
 			// RIFF: odd-size chunks are followed by a 1-byte padding zero.
 			if chunk.Size%2 != 0 {
-				if _, err = r.Seek(1, io.SeekCurrent); err != nil && err != io.EOF {
+				if _, err = r.Seek(1, io.SeekCurrent); err != nil && !errors.Is(err, io.EOF) {
 					return nil, nil, nil, fmt.Errorf("webp: skip EXIF padding: %w", err)
 				}
 			}
@@ -58,7 +59,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 				return nil, nil, nil, fmt.Errorf("webp: read XMP chunk: %w", err)
 			}
 			if chunk.Size%2 != 0 {
-				if _, err = r.Seek(1, io.SeekCurrent); err != nil && err != io.EOF {
+				if _, err = r.Seek(1, io.SeekCurrent); err != nil && !errors.Is(err, io.EOF) {
 					return nil, nil, nil, fmt.Errorf("webp: skip XMP padding: %w", err)
 				}
 			}

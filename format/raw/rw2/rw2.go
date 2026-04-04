@@ -13,7 +13,7 @@ import (
 )
 
 // rw2Magic is the Panasonic RW2 byte order marker (bytes 0-3).
-var rw2Magic = []byte{0x49, 0x49, 0x55, 0x00} // "IIU\x00"
+var rw2Magic = []byte{0x49, 0x49, 0x55, 0x00} //nolint:gochecknoglobals // package-level constant bytes
 
 // Extract reads metadata from an RW2 file.
 // The RW2 magic bytes are patched to standard TIFF LE before extraction.

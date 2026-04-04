@@ -16,7 +16,7 @@ import (
 // visitedPool recycles the maps used by traverse() to track visited IFD
 // offsets. Reusing these maps avoids one allocation per Parse call on the
 // hot path. The map is cleared before being returned to the pool.
-var visitedPool = sync.Pool{
+var visitedPool = sync.Pool{ //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
 	New: func() any { return make(map[uint32]bool) },
 }
 

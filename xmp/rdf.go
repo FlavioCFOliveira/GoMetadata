@@ -27,14 +27,14 @@ type xmpAttr struct {
 // liPool recycles the []string slice used to accumulate rdf:li values within a
 // single collection (rdf:Alt, rdf:Seq, rdf:Bag). The pool eliminates the heap
 // allocation on the hot-path after the first parse call.
-var liPool = sync.Pool{New: func() any {
+var liPool = sync.Pool{New: func() any { //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
 	s := make([]string, 0, 8)
 	return &s
 }}
 
 // builderPool recycles strings.Builder instances used by unescapeXML.
 // They are only taken from the pool when the input actually contains '&'.
-var builderPool = sync.Pool{New: func() any { return &strings.Builder{} }}
+var builderPool = sync.Pool{New: func() any { return &strings.Builder{} }} //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
 
 // parseRDF walks the RDF graph rooted at the x:xmpmeta element and populates
 // the Properties map in x. It handles rdf:Alt, rdf:Seq, and rdf:Bag
@@ -451,16 +451,17 @@ func scanAttrs(b []byte, pos int, nsTable *[32]nsEntry, nsCount int, out *[16]xm
 
 		// Classify: xmlns declaration vs. regular attribute.
 		// string(attrPrefix) == "xmlns" is a zero-alloc comparison (Go compiler).
-		if string(attrPrefix) == "xmlns" {
+		switch {
+		case string(attrPrefix) == "xmlns":
 			// xmlns:prefix="uri" — register namespace binding.
 			// attrLocal is a zero-copy slice; no string conversion needed here.
 			if nsCount < len(nsTable) {
 				nsTable[nsCount] = nsEntry{prefix: attrLocal, uri: val}
 				nsCount++
 			}
-		} else if string(attrLocal) == "xmlns" && len(attrPrefix) == 0 {
+		case string(attrLocal) == "xmlns" && len(attrPrefix) == 0:
 			// xmlns="uri" — default namespace declaration; ignore (XMP never uses it).
-		} else {
+		default:
 			// Regular attribute: resolve its namespace and store.
 			if nAttrs < len(out) {
 				resolvedNS := resolveNS(nsTable[:nsCount], attrPrefix)

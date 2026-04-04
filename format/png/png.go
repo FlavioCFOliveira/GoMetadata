@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -20,7 +21,7 @@ import (
 )
 
 // pngSig is the 8-byte PNG file signature (PNG §5.2).
-var pngSig = [8]byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}
+var pngSig = [8]byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A} //nolint:gochecknoglobals // package-level constant bytes
 
 // xmpKeyword is the iTXt keyword used by Adobe XMP (XMP Part 3 §1.1.4).
 const xmpKeyword = "XML:com.adobe.xmp"
@@ -28,7 +29,7 @@ const xmpKeyword = "XML:com.adobe.xmp"
 // zlibPool stores reusable io.ReadCloser values (zlib.NewReader return type).
 // Reusing them via zlib.Resetter avoids the ~32 KB internal decompression-state
 // allocation on every call to zlibDecompress.
-var zlibPool sync.Pool // values are io.ReadCloser
+var zlibPool sync.Pool //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
 
 // zlibDecompress decompresses a zlib-deflated payload. It gets a reader from
 // zlibPool (or allocates one) and returns it to the pool when done without
@@ -70,7 +71,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	for {
 		chunkType, data, rerr := readChunk(r)
 		if rerr != nil {
-			if rerr == io.EOF {
+			if errors.Is(rerr, io.EOF) {
 				break
 			}
 			return nil, nil, nil, rerr
@@ -137,7 +138,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	for {
 		chunkType, data, err := readChunk(r)
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			return err

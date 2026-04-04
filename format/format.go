@@ -5,8 +5,13 @@ package format
 import "io"
 
 // FormatID identifies the container format of an image file.
+//
+//nolint:revive // legacy name: renaming to ID would break the public API
 type FormatID uint8
 
+// FormatUnknown and related constants enumerate all image container formats
+// supported by the library. Format detection is by magic bytes, never by
+// file extension (CLAUDE.md §1).
 const (
 	FormatUnknown FormatID = iota
 	FormatJPEG

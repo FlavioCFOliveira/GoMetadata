@@ -41,7 +41,7 @@ func openAndRead(t *testing.T, path string) *Metadata {
 	if err != nil {
 		t.Fatalf("open %s: %v", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	m, err := Read(f)
 	if err != nil {
 		var corrupt *CorruptMetadataError
@@ -190,7 +190,6 @@ func TestCorpusProgressiveJPEG(t *testing.T) {
 	progressive := []string{"kitten-progressive.jpg", "progressive.jpg"}
 
 	for _, name := range progressive {
-		name := name
 		t.Run(name, func(t *testing.T) {
 			path := requireCorpusFile(t, filepath.Join("jpeg/progressive", name))
 			// Must parse without CorruptMetadataError. Other errors are benign.
@@ -204,7 +203,6 @@ func TestCorpusProgressiveJPEG(t *testing.T) {
 // and asserts neither produces a CorruptMetadataError.
 func TestCorpusBaselineVsProgressive(t *testing.T) {
 	for _, name := range []string{"baseline.jpg", "kitten-progressive.jpg"} {
-		name := name
 		t.Run(name, func(t *testing.T) {
 			path := requireCorpusFile(t, filepath.Join("jpeg/progressive", name))
 			openAndRead(t, path) // CorruptMetadataError → fatal; skip otherwise
@@ -277,7 +275,6 @@ func TestCorpusMakerNoteVariants(t *testing.T) {
 		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".jpg") {
 			continue
 		}
-		e := e
 		t.Run(e.Name(), func(t *testing.T) {
 			path := filepath.Join(dir, e.Name())
 			m := openAndRead(t, path)
@@ -319,7 +316,6 @@ func TestCorpusMakerNoteManufacturers(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			p := filepath.Join("testdata", "corpus", tc.file)
 			if _, err := os.Stat(p); os.IsNotExist(err) {
@@ -351,7 +347,6 @@ func TestCorpusIPTCReferenceImages(t *testing.T) {
 		"Std2017.1",
 	}
 	for _, v := range variants {
-		v := v
 		t.Run(v, func(t *testing.T) {
 			path := requireCorpusFile(t, "jpeg/iptc/IPTC-PhotometadataRef-"+v+".jpg")
 			m := openAndRead(t, path)
@@ -398,7 +393,6 @@ func TestCorpusTIFFStructuralVariants(t *testing.T) {
 		"4D-series.ome.tif",               // OME-TIFF with XML in ImageDescription
 	}
 	for _, name := range files {
-		name := name
 		t.Run(name, func(t *testing.T) {
 			path := requireCorpusFile(t, filepath.Join("tiff/exampletiffs", name))
 			// Must not CorruptMetadataError. Other errors are benign (e.g. no EXIF).
@@ -429,7 +423,6 @@ func TestCorpusBigEndianTIFF(t *testing.T) {
 		"BigTIFFMotorolaLongStrips.tif",
 	}
 	for _, name := range files {
-		name := name
 		t.Run(name, func(t *testing.T) {
 			path := requireCorpusFile(t, filepath.Join("tiff/metadata-extractor", name))
 			openAndRead(t, path)
@@ -450,7 +443,6 @@ func TestCorpusBigTIFFVariants(t *testing.T) {
 		"BigTIFFSubIFD8.tif",
 	}
 	for _, name := range files {
-		name := name
 		t.Run(name, func(t *testing.T) {
 			p := filepath.Join("testdata", "corpus", "tiff", "metadata-extractor", name)
 			if _, err := os.Stat(p); os.IsNotExist(err) {
@@ -482,7 +474,6 @@ func TestCorpusWebPVariants(t *testing.T) {
 		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".webp") {
 			continue
 		}
-		e := e
 		t.Run(e.Name(), func(t *testing.T) {
 			path := filepath.Join(dir, e.Name())
 			openAndRead(t, path)
@@ -511,7 +502,6 @@ func TestCorpusHEIFVariants(t *testing.T) {
 	}
 
 	for _, path := range heifFiles {
-		path := path
 		t.Run(filepath.Base(path), func(t *testing.T) {
 			openAndRead(t, path)
 		})
@@ -539,7 +529,6 @@ func TestCorpusRawFormatCoverage(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			dir := filepath.Join("testdata", "corpus", tc.dir)
 			if _, err := os.Stat(dir); os.IsNotExist(err) {
@@ -577,7 +566,6 @@ func TestCorpusRawGracefulUnsupported(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			p := filepath.Join("testdata", "corpus", tc.file)
 			if _, err := os.Stat(p); os.IsNotExist(err) {
@@ -587,7 +575,7 @@ func TestCorpusRawGracefulUnsupported(t *testing.T) {
 			if err != nil {
 				t.Fatalf("open: %v", err)
 			}
-			defer f.Close()
+			defer func() { _ = f.Close() }()
 			_, rerr := Read(f)
 			if rerr == nil {
 				// The format may be supported now — that's fine.
@@ -621,7 +609,6 @@ func TestCorpusPNGEdgeCases(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			p := filepath.Join("testdata", "corpus", tc.file)
 			if _, err := os.Stat(p); os.IsNotExist(err) {
@@ -673,14 +660,13 @@ func TestCorpusXMPSidecars(t *testing.T) {
 			if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".xmp") {
 				continue
 			}
-			e := e
 			t.Run(filepath.Join(d, e.Name()), func(t *testing.T) {
 				path := filepath.Join(dir, e.Name())
 				f, err := os.Open(path)
 				if err != nil {
 					t.Fatalf("open: %v", err)
 				}
-				defer f.Close()
+				defer func() { _ = f.Close() }()
 				_, rerr := Read(f)
 				if rerr == nil {
 					return // If we happen to support it, fine.

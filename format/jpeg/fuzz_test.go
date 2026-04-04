@@ -55,7 +55,7 @@ func FuzzJPEGExtract(f *testing.F) {
 		// 8 bytes before any IFD data. A zero-length slice means the APP1 existed
 		// but the TIFF payload was absent or stripped by the parser; that is
 		// allowed (the parser is lenient about truncated segments).
-		if rawEXIF != nil && len(rawEXIF) > 0 && len(rawEXIF) < 8 {
+		if len(rawEXIF) > 0 && len(rawEXIF) < 8 {
 			t.Errorf("rawEXIF too short after successful Extract: got %d bytes, want >= 8", len(rawEXIF))
 		}
 
@@ -64,7 +64,7 @@ func FuzzJPEGExtract(f *testing.F) {
 		// (XMP specification Part 1 §7.3 — the xpacket PI or xmpmeta element.)
 		// Only assert when the payload is non-empty: a zero-length slice is a
 		// degenerate-but-benign result from a corrupt or stub APP1.
-		if rawXMP != nil && len(rawXMP) > 0 {
+		if len(rawXMP) > 0 {
 			s := string(rawXMP)
 			if !strings.Contains(s, "<?xpacket") && !strings.Contains(s, "<rdf:") && !strings.Contains(s, "<x:xmpmeta") {
 				t.Errorf("rawXMP does not contain a recognised XMP marker: %q", s[:min(64, len(s))])

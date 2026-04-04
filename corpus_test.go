@@ -56,7 +56,7 @@ func TestCorpusReadAll(t *testing.T) {
 			continue
 		}
 		_, rerr := Read(f)
-		f.Close()
+		_ = f.Close()
 
 		if rerr == nil {
 			ok++
@@ -88,7 +88,7 @@ func TestCorpusGPS(t *testing.T) {
 			continue
 		}
 		m, rerr := Read(f)
-		f.Close()
+		_ = f.Close()
 		if rerr != nil || m == nil {
 			continue
 		}
@@ -270,7 +270,10 @@ func BenchmarkReadFile(b *testing.B) {
 	}
 	var target string
 	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || target != "" {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || target != "" {
 			return nil
 		}
 		if ext := strings.ToLower(filepath.Ext(path)); ext == ".jpg" || ext == ".jpeg" {

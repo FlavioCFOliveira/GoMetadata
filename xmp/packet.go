@@ -3,12 +3,12 @@ package xmp
 import "bytes"
 
 // packetHeader is the opening processing instruction of an XMP packet (XMP §7.1).
-var packetHeader = []byte("<?xpacket begin=")
+var packetHeader = []byte("<?xpacket begin=") //nolint:gochecknoglobals // package-level constant bytes
 
 // xpacketClose is the opening of the mandatory closing processing instruction
 // of an XMP packet (XMP §7.1). Searching for this string (rather than any "?>")
 // avoids false termination on processing instructions inside the XMP body.
-var xpacketClose = []byte("<?xpacket end=")
+var xpacketClose = []byte("<?xpacket end=") //nolint:gochecknoglobals // package-level constant bytes
 
 // Scan locates the XMP packet boundaries within b and returns the slice that
 // spans from the opening <?xpacket begin=…?> to the closing <?xpacket end=…?>.

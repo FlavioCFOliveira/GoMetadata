@@ -20,8 +20,6 @@ func buildMinimalTIFF(order binary.ByteOrder, iptc, xmp []byte) []byte {
 		data []byte
 	}
 
-	var entries []entry
-
 	// Calculate where extra data starts: header(8) + ifd_count(2) + entries*12 + next_ifd(4)
 	// We'll figure out exact positions below.
 
@@ -42,6 +40,7 @@ func buildMinimalTIFF(order binary.ByteOrder, iptc, xmp []byte) []byte {
 	ifdSize := 2 + len(specs)*12 + 4
 	dataOff := uint32(headerSize + ifdSize)
 
+	entries := make([]entry, 0, len(specs))
 	var valueBuf bytes.Buffer
 	for _, s := range specs {
 		typ := uint16(7)  // UNDEFINED

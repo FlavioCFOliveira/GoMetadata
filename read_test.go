@@ -3,6 +3,7 @@ package gometadata
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -108,7 +109,8 @@ func TestUnsupportedFormat(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for unsupported format, got nil")
 	}
-	if _, ok := err.(*UnsupportedFormatError); !ok {
+	var unsupported *UnsupportedFormatError
+	if !errors.As(err, &unsupported) {
 		t.Errorf("expected *UnsupportedFormatError, got %T: %v", err, err)
 	}
 }
@@ -181,8 +183,8 @@ func TestReadFilePermDenied(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := f.Name()
-	f.Close()
-	defer os.Remove(path)
+	_ = f.Close()
+	defer func() { _ = os.Remove(path) }()
 
 	if err := os.Chmod(path, 0000); err != nil {
 		t.Fatal(err)
@@ -686,13 +688,13 @@ func TestWriteFilePreservesPermissions(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := f.Name()
-	defer os.Remove(path)
+	defer func() { _ = os.Remove(path) }()
 
 	if _, err := f.Write(jpeg); err != nil {
-		f.Close()
+		_ = f.Close()
 		t.Fatal(err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	want := os.FileMode(0644)
 	if err := os.Chmod(path, want); err != nil {

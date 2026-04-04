@@ -42,7 +42,6 @@ func buildPlainIFD(order binary.ByteOrder, tags []struct {
 
 func TestLeicaParserPrefixed(t *testing.T) {
 	// Build "LEICA\x00\x01\x00" + plain LE IFD at offset 8.
-	header := []byte{'L', 'E', 'I', 'C', 'A', 0x00, 0x01, 0x00}
 	ifd := buildPlainIFD(binary.LittleEndian, []struct {
 		id  uint16
 		typ uint16
@@ -50,9 +49,11 @@ func TestLeicaParserPrefixed(t *testing.T) {
 	}{
 		{TagLensModel, 2, append([]byte("Summilux-M 35 f/1.4 ASPH"), 0)},
 	})
-	b := append(header, ifd...)
+	header := make([]byte, 0, 8+len(ifd))
+	header = append(header, 'L', 'E', 'I', 'C', 'A', 0x00, 0x01, 0x00)
+	header = append(header, ifd...)
 
-	tags, err := Parser{}.Parse(b)
+	tags, err := Parser{}.Parse(header)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}

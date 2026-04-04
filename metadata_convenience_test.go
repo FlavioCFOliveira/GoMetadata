@@ -76,8 +76,15 @@ func buildTIFFMultiIFD(ifd0Extra, exifEntries, gpsEntries []tiffEntry) []byte {
 
 	// Build the full IFD0 entry list: user entries + pointer entries.
 	// Pointer values are placeholders; they are patched below once offsets are known.
-	ifd0 := make([]tiffEntry, len(ifd0Extra))
-	copy(ifd0, ifd0Extra)
+	extraCap := len(ifd0Extra)
+	if needExif {
+		extraCap++
+	}
+	if needGPS {
+		extraCap++
+	}
+	ifd0 := make([]tiffEntry, 0, extraCap)
+	ifd0 = append(ifd0, ifd0Extra...)
 	if needExif {
 		ifd0 = append(ifd0, tiffEntry{
 			tag: exif.TagExifIFDPointer, typ: exif.TypeLong, count: 1,
