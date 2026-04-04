@@ -6,7 +6,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/FlavioCFOliveira/img-metadata/exif"
+	"github.com/FlavioCFOliveira/GoMetadata/exif"
 )
 
 // buildMinimalTIFF creates a TIFF file with optional IPTC (tag 0x83BB) and

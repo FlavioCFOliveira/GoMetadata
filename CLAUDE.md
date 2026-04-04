@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-A pure Go library for **reading and writing** EXIF, IPTC, and XMP metadata from and to **any image format** (JPEG, TIFF, PNG, HEIF/HEIC, WebP, RAW variants — CR2, CR3, NEF, ARW, DNG, ORF, RW2 — and others). The library is a universal metadata layer: regardless of container format, the caller gets a unified API.
+**GoMetadata** (`github.com/FlavioCFOliveira/GoMetadata`) — a pure Go library for **reading and writing** EXIF, IPTC, and XMP metadata from and to **any image format** (JPEG, TIFF, PNG, HEIF/HEIC, WebP, RAW variants — CR2, CR3, NEF, ARW, DNG, ORF, RW2 — and others). The library is a universal metadata layer: regardless of container format, the caller gets a unified API.
 
 ## Non-Negotiable Design Constraints
 

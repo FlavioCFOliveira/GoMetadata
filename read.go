@@ -1,26 +1,26 @@
-package imgmetadata
+package gometadata
 
 import (
 	"fmt"
 	"io"
 	"os"
 
-	"github.com/FlavioCFOliveira/img-metadata/exif"
-	"github.com/FlavioCFOliveira/img-metadata/format"
-	"github.com/FlavioCFOliveira/img-metadata/format/heif"
-	"github.com/FlavioCFOliveira/img-metadata/format/jpeg"
-	"github.com/FlavioCFOliveira/img-metadata/format/png"
-	"github.com/FlavioCFOliveira/img-metadata/format/raw/arw"
-	"github.com/FlavioCFOliveira/img-metadata/format/raw/cr2"
-	"github.com/FlavioCFOliveira/img-metadata/format/raw/cr3"
-	"github.com/FlavioCFOliveira/img-metadata/format/raw/dng"
-	"github.com/FlavioCFOliveira/img-metadata/format/raw/nef"
-	"github.com/FlavioCFOliveira/img-metadata/format/raw/orf"
-	"github.com/FlavioCFOliveira/img-metadata/format/raw/rw2"
-	"github.com/FlavioCFOliveira/img-metadata/format/tiff"
-	"github.com/FlavioCFOliveira/img-metadata/format/webp"
-	"github.com/FlavioCFOliveira/img-metadata/iptc"
-	xmppkg "github.com/FlavioCFOliveira/img-metadata/xmp"
+	"github.com/FlavioCFOliveira/GoMetadata/exif"
+	"github.com/FlavioCFOliveira/GoMetadata/format"
+	"github.com/FlavioCFOliveira/GoMetadata/format/heif"
+	"github.com/FlavioCFOliveira/GoMetadata/format/jpeg"
+	"github.com/FlavioCFOliveira/GoMetadata/format/png"
+	"github.com/FlavioCFOliveira/GoMetadata/format/raw/arw"
+	"github.com/FlavioCFOliveira/GoMetadata/format/raw/cr2"
+	"github.com/FlavioCFOliveira/GoMetadata/format/raw/cr3"
+	"github.com/FlavioCFOliveira/GoMetadata/format/raw/dng"
+	"github.com/FlavioCFOliveira/GoMetadata/format/raw/nef"
+	"github.com/FlavioCFOliveira/GoMetadata/format/raw/orf"
+	"github.com/FlavioCFOliveira/GoMetadata/format/raw/rw2"
+	"github.com/FlavioCFOliveira/GoMetadata/format/tiff"
+	"github.com/FlavioCFOliveira/GoMetadata/format/webp"
+	"github.com/FlavioCFOliveira/GoMetadata/iptc"
+	xmppkg "github.com/FlavioCFOliveira/GoMetadata/xmp"
 )
 
 // Read reads all metadata from r.
@@ -36,7 +36,7 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 	// Detect container format from magic bytes.
 	fmtID, err := format.Detect(r)
 	if err != nil {
-		return nil, fmt.Errorf("imgmetadata: format detection: %w", err)
+		return nil, fmt.Errorf("gometadata: format detection: %w", err)
 	}
 	if fmtID == format.FormatUnknown {
 		// Read first 12 bytes for the error message.

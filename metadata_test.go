@@ -1,13 +1,13 @@
-package imgmetadata
+package gometadata
 
 import (
 	"math"
 	"testing"
 	"time"
 
-	"github.com/FlavioCFOliveira/img-metadata/exif"
-	"github.com/FlavioCFOliveira/img-metadata/iptc"
-	"github.com/FlavioCFOliveira/img-metadata/xmp"
+	"github.com/FlavioCFOliveira/GoMetadata/exif"
+	"github.com/FlavioCFOliveira/GoMetadata/iptc"
+	"github.com/FlavioCFOliveira/GoMetadata/xmp"
 )
 
 // newTestMetadata builds a Metadata whose three components are all non-nil

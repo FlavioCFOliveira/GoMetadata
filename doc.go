@@ -1,4 +1,4 @@
-// Package imgmetadata provides a unified API for reading and writing
+// Package gometadata provides a unified API for reading and writing
 // EXIF, IPTC, and XMP metadata from any image format.
 //
 // Format detection is performed automatically by inspecting magic bytes;
@@ -7,10 +7,10 @@
 //
 // Basic usage:
 //
-//	m, err := imgmetadata.ReadFile("photo.jpg")
+//	m, err := gometadata.ReadFile("photo.jpg")
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
 //	fmt.Println(m.CameraModel())
 //	lat, lon, ok := m.GPS()
-package imgmetadata
+package gometadata

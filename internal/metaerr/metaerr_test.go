@@ -16,9 +16,9 @@ func TestTruncatedFileErrorMessage(t *testing.T) {
 		at   string
 		want string
 	}{
-		{"TIFF header", "imgmetadata: truncated file while reading TIFF header"},
-		{"IFD entry", "imgmetadata: truncated file while reading IFD entry"},
-		{"", "imgmetadata: truncated file while reading "},
+		{"TIFF header", "gometadata: truncated file while reading TIFF header"},
+		{"IFD entry", "gometadata: truncated file while reading IFD entry"},
+		{"", "gometadata: truncated file while reading "},
 	}
 	for _, tc := range tests {
 		e := &TruncatedFileError{At: tc.at}
@@ -38,8 +38,8 @@ func TestTruncatedFileErrorContainsAt(t *testing.T) {
 
 func TestTruncatedFileErrorIsPrefix(t *testing.T) {
 	e := &TruncatedFileError{At: "anything"}
-	if !strings.HasPrefix(e.Error(), "imgmetadata:") {
-		t.Errorf("error message missing 'imgmetadata:' prefix: %q", e.Error())
+	if !strings.HasPrefix(e.Error(), "gometadata:") {
+		t.Errorf("error message missing 'gometadata:' prefix: %q", e.Error())
 	}
 }
 
@@ -78,10 +78,10 @@ func TestCorruptMetadataErrorMessage(t *testing.T) {
 		reason string
 		want   string
 	}{
-		{"EXIF", "bad IFD offset 99999", "imgmetadata: corrupt EXIF metadata: bad IFD offset 99999"},
-		{"IPTC", "unexpected end of stream", "imgmetadata: corrupt IPTC metadata: unexpected end of stream"},
-		{"XMP", "malformed RDF", "imgmetadata: corrupt XMP metadata: malformed RDF"},
-		{"", "", "imgmetadata: corrupt  metadata: "},
+		{"EXIF", "bad IFD offset 99999", "gometadata: corrupt EXIF metadata: bad IFD offset 99999"},
+		{"IPTC", "unexpected end of stream", "gometadata: corrupt IPTC metadata: unexpected end of stream"},
+		{"XMP", "malformed RDF", "gometadata: corrupt XMP metadata: malformed RDF"},
+		{"", "", "gometadata: corrupt  metadata: "},
 	}
 	for _, tc := range tests {
 		e := &CorruptMetadataError{Format: tc.format, Reason: tc.reason}

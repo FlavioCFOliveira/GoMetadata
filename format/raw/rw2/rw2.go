@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/FlavioCFOliveira/img-metadata/format/tiff"
+	"github.com/FlavioCFOliveira/GoMetadata/format/tiff"
 )
 
 // rw2Magic is the Panasonic RW2 byte order marker (bytes 0-3).

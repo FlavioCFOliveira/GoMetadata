@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/FlavioCFOliveira/img-metadata/internal/riff"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/riff"
 )
 
 // Extract reads the RIFF/WebP chunk stream from r and returns raw metadata payloads.

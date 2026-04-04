@@ -6,7 +6,7 @@ package cr2
 import (
 	"io"
 
-	"github.com/FlavioCFOliveira/img-metadata/format/tiff"
+	"github.com/FlavioCFOliveira/GoMetadata/format/tiff"
 )
 
 // Extract reads metadata from a CR2 file. Delegates TIFF parsing to

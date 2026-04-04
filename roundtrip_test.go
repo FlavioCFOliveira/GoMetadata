@@ -1,6 +1,6 @@
 // file: roundtrip_test.go
 
-// Package imgmetadata_test contains end-to-end round-trip tests that exercise
+// Package gometadata_test contains end-to-end round-trip tests that exercise
 // the public Read → modify → Write → Read cycle for every supported container
 // format and metadata type combination.
 //
@@ -10,7 +10,7 @@
 //  3. Modifies metadata fields via the format-native setters.
 //  4. Calls Write to produce a new image.
 //  5. Calls Read again on the output and asserts the values survived.
-package imgmetadata_test
+package gometadata_test
 
 import (
 	"bytes"
@@ -18,9 +18,9 @@ import (
 	"hash/crc32"
 	"testing"
 
-	imgmetadata "github.com/FlavioCFOliveira/img-metadata"
-	"github.com/FlavioCFOliveira/img-metadata/iptc"
-	"github.com/FlavioCFOliveira/img-metadata/xmp"
+	gometadata "github.com/FlavioCFOliveira/GoMetadata"
+	"github.com/FlavioCFOliveira/GoMetadata/iptc"
+	"github.com/FlavioCFOliveira/GoMetadata/xmp"
 )
 
 // ---------------------------------------------------------------------------
@@ -203,7 +203,7 @@ func TestRoundTripIPTC_JPEG(t *testing.T) {
 	img := rtBuildJPEG(rtMinimalTIFF())
 
 	// Step 2: read — we expect no parsing error.
-	m, err := imgmetadata.Read(bytes.NewReader(img))
+	m, err := gometadata.Read(bytes.NewReader(img))
 	if err != nil {
 		t.Fatalf("Read initial: %v", err)
 	}
@@ -218,12 +218,12 @@ func TestRoundTripIPTC_JPEG(t *testing.T) {
 
 	// Step 4: write.
 	var out bytes.Buffer
-	if err := imgmetadata.Write(bytes.NewReader(img), &out, m); err != nil {
+	if err := gometadata.Write(bytes.NewReader(img), &out, m); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 
 	// Step 5: read the output back.
-	m2, err := imgmetadata.Read(bytes.NewReader(out.Bytes()))
+	m2, err := gometadata.Read(bytes.NewReader(out.Bytes()))
 	if err != nil {
 		t.Fatalf("Read after Write: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestRoundTripXMP_JPEG(t *testing.T) {
 
 	img := rtBuildJPEG(rtMinimalTIFF())
 
-	m, err := imgmetadata.Read(bytes.NewReader(img))
+	m, err := gometadata.Read(bytes.NewReader(img))
 	if err != nil {
 		t.Fatalf("Read initial: %v", err)
 	}
@@ -272,11 +272,11 @@ func TestRoundTripXMP_JPEG(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := imgmetadata.Write(bytes.NewReader(img), &out, m); err != nil {
+	if err := gometadata.Write(bytes.NewReader(img), &out, m); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 
-	m2, err := imgmetadata.Read(bytes.NewReader(out.Bytes()))
+	m2, err := gometadata.Read(bytes.NewReader(out.Bytes()))
 	if err != nil {
 		t.Fatalf("Read after Write: %v", err)
 	}
@@ -307,7 +307,7 @@ func TestRoundTripCaption_JPEG(t *testing.T) {
 	// A bare JPEG with no metadata at all.
 	img := rtBuildJPEG(nil)
 
-	m, err := imgmetadata.Read(bytes.NewReader(img))
+	m, err := gometadata.Read(bytes.NewReader(img))
 	if err != nil {
 		t.Fatalf("Read initial: %v", err)
 	}
@@ -316,11 +316,11 @@ func TestRoundTripCaption_JPEG(t *testing.T) {
 	m.IPTC.SetCaption(wantCaption)
 
 	var out bytes.Buffer
-	if err := imgmetadata.Write(bytes.NewReader(img), &out, m); err != nil {
+	if err := gometadata.Write(bytes.NewReader(img), &out, m); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 
-	m2, err := imgmetadata.Read(bytes.NewReader(out.Bytes()))
+	m2, err := gometadata.Read(bytes.NewReader(out.Bytes()))
 	if err != nil {
 		t.Fatalf("Read after Write: %v", err)
 	}
@@ -348,7 +348,7 @@ func TestRoundTripXMP_PNG(t *testing.T) {
 	}
 	img := rtBuildPNG(exifData, nil)
 
-	m, err := imgmetadata.Read(bytes.NewReader(img))
+	m, err := gometadata.Read(bytes.NewReader(img))
 	if err != nil {
 		t.Fatalf("Read initial PNG: %v", err)
 	}
@@ -358,11 +358,11 @@ func TestRoundTripXMP_PNG(t *testing.T) {
 	m.XMP.SetCopyright(wantCopyright)
 
 	var out bytes.Buffer
-	if err := imgmetadata.Write(bytes.NewReader(img), &out, m); err != nil {
+	if err := gometadata.Write(bytes.NewReader(img), &out, m); err != nil {
 		t.Fatalf("Write PNG: %v", err)
 	}
 
-	m2, err := imgmetadata.Read(bytes.NewReader(out.Bytes()))
+	m2, err := gometadata.Read(bytes.NewReader(out.Bytes()))
 	if err != nil {
 		t.Fatalf("Read after Write PNG: %v", err)
 	}
@@ -393,7 +393,7 @@ func TestRoundTripXMP_WebP(t *testing.T) {
 	}
 	img := rtBuildWebP(exifData, nil, 0x08)
 
-	m, err := imgmetadata.Read(bytes.NewReader(img))
+	m, err := gometadata.Read(bytes.NewReader(img))
 	if err != nil {
 		t.Fatalf("Read initial WebP: %v", err)
 	}
@@ -403,11 +403,11 @@ func TestRoundTripXMP_WebP(t *testing.T) {
 	m.XMP.SetCopyright(wantCopyright)
 
 	var out bytes.Buffer
-	if err := imgmetadata.Write(bytes.NewReader(img), &out, m); err != nil {
+	if err := gometadata.Write(bytes.NewReader(img), &out, m); err != nil {
 		t.Fatalf("Write WebP: %v", err)
 	}
 
-	m2, err := imgmetadata.Read(bytes.NewReader(out.Bytes()))
+	m2, err := gometadata.Read(bytes.NewReader(out.Bytes()))
 	if err != nil {
 		t.Fatalf("Read after Write WebP: %v", err)
 	}
@@ -425,19 +425,19 @@ func TestRoundTripTableDriven(t *testing.T) {
 	type testCase struct {
 		name    string
 		image   func() []byte   // build the container
-		modify  func(*imgmetadata.Metadata) // populate metadata
-		assert  func(*testing.T, *imgmetadata.Metadata) // assert values
+		modify  func(*gometadata.Metadata) // populate metadata
+		assert  func(*testing.T, *gometadata.Metadata) // assert values
 	}
 
 	cases := []testCase{
 		{
 			name:  "JPEG+IPTC+caption",
 			image: func() []byte { return rtBuildJPEG(nil) },
-			modify: func(m *imgmetadata.Metadata) {
+			modify: func(m *gometadata.Metadata) {
 				m.IPTC = new(iptc.IPTC)
 				m.IPTC.SetCaption("table-caption")
 			},
-			assert: func(t *testing.T, m *imgmetadata.Metadata) {
+			assert: func(t *testing.T, m *gometadata.Metadata) {
 				if got := m.Caption(); got != "table-caption" {
 					t.Errorf("Caption: got %q, want %q", got, "table-caption")
 				}
@@ -446,11 +446,11 @@ func TestRoundTripTableDriven(t *testing.T) {
 		{
 			name:  "JPEG+IPTC+copyright",
 			image: func() []byte { return rtBuildJPEG(nil) },
-			modify: func(m *imgmetadata.Metadata) {
+			modify: func(m *gometadata.Metadata) {
 				m.IPTC = new(iptc.IPTC)
 				m.IPTC.SetCopyright("(c) 2024")
 			},
-			assert: func(t *testing.T, m *imgmetadata.Metadata) {
+			assert: func(t *testing.T, m *gometadata.Metadata) {
 				if got := m.Copyright(); got != "(c) 2024" {
 					t.Errorf("Copyright: got %q, want %q", got, "(c) 2024")
 				}
@@ -459,12 +459,12 @@ func TestRoundTripTableDriven(t *testing.T) {
 		{
 			name:  "JPEG+IPTC+keywords",
 			image: func() []byte { return rtBuildJPEG(nil) },
-			modify: func(m *imgmetadata.Metadata) {
+			modify: func(m *gometadata.Metadata) {
 				m.IPTC = new(iptc.IPTC)
 				m.IPTC.AddKeyword("alpha")
 				m.IPTC.AddKeyword("beta")
 			},
-			assert: func(t *testing.T, m *imgmetadata.Metadata) {
+			assert: func(t *testing.T, m *gometadata.Metadata) {
 				kws := m.Keywords()
 				if len(kws) != 2 || kws[0] != "alpha" || kws[1] != "beta" {
 					t.Errorf("Keywords: got %v, want [alpha beta]", kws)
@@ -474,11 +474,11 @@ func TestRoundTripTableDriven(t *testing.T) {
 		{
 			name:  "JPEG+XMP+caption",
 			image: func() []byte { return rtBuildJPEG(nil) },
-			modify: func(m *imgmetadata.Metadata) {
+			modify: func(m *gometadata.Metadata) {
 				m.XMP = &xmp.XMP{Properties: make(map[string]map[string]string)}
 				m.XMP.SetCaption("xmp-caption")
 			},
-			assert: func(t *testing.T, m *imgmetadata.Metadata) {
+			assert: func(t *testing.T, m *gometadata.Metadata) {
 				if got := m.Caption(); got != "xmp-caption" {
 					t.Errorf("Caption: got %q, want %q", got, "xmp-caption")
 				}
@@ -487,11 +487,11 @@ func TestRoundTripTableDriven(t *testing.T) {
 		{
 			name:  "JPEG+XMP+keyword",
 			image: func() []byte { return rtBuildJPEG(nil) },
-			modify: func(m *imgmetadata.Metadata) {
+			modify: func(m *gometadata.Metadata) {
 				m.XMP = &xmp.XMP{Properties: make(map[string]map[string]string)}
 				m.XMP.AddKeyword("kw")
 			},
-			assert: func(t *testing.T, m *imgmetadata.Metadata) {
+			assert: func(t *testing.T, m *gometadata.Metadata) {
 				kws := m.Keywords()
 				if len(kws) != 1 || kws[0] != "kw" {
 					t.Errorf("Keywords: got %v, want [kw]", kws)
@@ -502,11 +502,11 @@ func TestRoundTripTableDriven(t *testing.T) {
 			// PNG does not carry IPTC — XMP only.
 			name:  "PNG+XMP+caption",
 			image: func() []byte { return rtBuildPNG(nil, nil) },
-			modify: func(m *imgmetadata.Metadata) {
+			modify: func(m *gometadata.Metadata) {
 				m.XMP = &xmp.XMP{Properties: make(map[string]map[string]string)}
 				m.XMP.SetCaption("png-xmp-caption")
 			},
-			assert: func(t *testing.T, m *imgmetadata.Metadata) {
+			assert: func(t *testing.T, m *gometadata.Metadata) {
 				if got := m.Caption(); got != "png-xmp-caption" {
 					t.Errorf("Caption: got %q, want %q", got, "png-xmp-caption")
 				}
@@ -516,11 +516,11 @@ func TestRoundTripTableDriven(t *testing.T) {
 			// WebP does not carry IPTC — XMP only.
 			name:  "WebP+XMP+copyright",
 			image: func() []byte { return rtBuildWebP(nil, nil, 0) },
-			modify: func(m *imgmetadata.Metadata) {
+			modify: func(m *gometadata.Metadata) {
 				m.XMP = &xmp.XMP{Properties: make(map[string]map[string]string)}
 				m.XMP.SetCopyright("(c) webp")
 			},
-			assert: func(t *testing.T, m *imgmetadata.Metadata) {
+			assert: func(t *testing.T, m *gometadata.Metadata) {
 				if got := m.Copyright(); got != "(c) webp" {
 					t.Errorf("Copyright: got %q, want %q", got, "(c) webp")
 				}
@@ -533,7 +533,7 @@ func TestRoundTripTableDriven(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			img := tc.image()
 
-			m, err := imgmetadata.Read(bytes.NewReader(img))
+			m, err := gometadata.Read(bytes.NewReader(img))
 			if err != nil {
 				t.Fatalf("Read initial: %v", err)
 			}
@@ -541,11 +541,11 @@ func TestRoundTripTableDriven(t *testing.T) {
 			tc.modify(m)
 
 			var out bytes.Buffer
-			if err := imgmetadata.Write(bytes.NewReader(img), &out, m); err != nil {
+			if err := gometadata.Write(bytes.NewReader(img), &out, m); err != nil {
 				t.Fatalf("Write: %v", err)
 			}
 
-			m2, err := imgmetadata.Read(bytes.NewReader(out.Bytes()))
+			m2, err := gometadata.Read(bytes.NewReader(out.Bytes()))
 			if err != nil {
 				t.Fatalf("Read after Write: %v", err)
 			}
@@ -569,7 +569,7 @@ func TestRoundTripPreservesExistingEXIF(t *testing.T) {
 	// Read without EXIF parsing so m.EXIF stays nil and Write() passes the
 	// original raw bytes through without re-encoding them. This exercises the
 	// "preserve original bytes when no struct modification was made" path.
-	m, err := imgmetadata.Read(bytes.NewReader(img), imgmetadata.WithoutEXIF())
+	m, err := gometadata.Read(bytes.NewReader(img), gometadata.WithoutEXIF())
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -584,11 +584,11 @@ func TestRoundTripPreservesExistingEXIF(t *testing.T) {
 	m.IPTC.SetCaption("preserve test")
 
 	var out bytes.Buffer
-	if err := imgmetadata.Write(bytes.NewReader(img), &out, m); err != nil {
+	if err := gometadata.Write(bytes.NewReader(img), &out, m); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 
-	m2, err := imgmetadata.Read(bytes.NewReader(out.Bytes()), imgmetadata.WithoutEXIF())
+	m2, err := gometadata.Read(bytes.NewReader(out.Bytes()), gometadata.WithoutEXIF())
 	if err != nil {
 		t.Fatalf("Read after Write: %v", err)
 	}

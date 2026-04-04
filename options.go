@@ -1,4 +1,4 @@
-package imgmetadata
+package gometadata
 
 // ReadOption configures a Read or ReadFile call.
 type ReadOption func(*readConfig)

@@ -19,7 +19,7 @@ import (
 	"io"
 	"sort"
 
-	"github.com/FlavioCFOliveira/img-metadata/internal/iobuf"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 )
 
 // JPEG marker bytes (ISO/IEC 10918-1, Annex B).
@@ -328,7 +328,7 @@ func writeExtendedXMP(w io.Writer, rawXMP []byte) error {
 	// xmpNote namespace: http://ns.adobe.com/xap/1.0/se/Note/ (XMP Spec Part 3 §1.1.4)
 	mainXMP := []byte(
 		`<?xpacket begin="` + "\xef\xbb\xbf" + `" id="W5M0MpCehiHzreSzNTczkc9d"?>` +
-			`<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="img-metadata">` +
+			`<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="GoMetadata">` +
 			`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
 			`<rdf:Description rdf:about=""` +
 			` xmlns:xmpNote="http://ns.adobe.com/xap/1.0/se/Note/"` +

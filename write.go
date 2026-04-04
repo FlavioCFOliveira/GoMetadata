@@ -1,26 +1,26 @@
-package imgmetadata
+package gometadata
 
 import (
 	"fmt"
 	"io"
 	"os"
 
-	"github.com/FlavioCFOliveira/img-metadata/exif"
-	"github.com/FlavioCFOliveira/img-metadata/format"
-	"github.com/FlavioCFOliveira/img-metadata/format/heif"
-	"github.com/FlavioCFOliveira/img-metadata/format/jpeg"
-	"github.com/FlavioCFOliveira/img-metadata/format/png"
-	"github.com/FlavioCFOliveira/img-metadata/format/raw/arw"
-	"github.com/FlavioCFOliveira/img-metadata/format/raw/cr2"
-	"github.com/FlavioCFOliveira/img-metadata/format/raw/cr3"
-	"github.com/FlavioCFOliveira/img-metadata/format/raw/dng"
-	"github.com/FlavioCFOliveira/img-metadata/format/raw/nef"
-	"github.com/FlavioCFOliveira/img-metadata/format/raw/orf"
-	"github.com/FlavioCFOliveira/img-metadata/format/raw/rw2"
-	"github.com/FlavioCFOliveira/img-metadata/format/tiff"
-	"github.com/FlavioCFOliveira/img-metadata/format/webp"
-	"github.com/FlavioCFOliveira/img-metadata/iptc"
-	xmppkg "github.com/FlavioCFOliveira/img-metadata/xmp"
+	"github.com/FlavioCFOliveira/GoMetadata/exif"
+	"github.com/FlavioCFOliveira/GoMetadata/format"
+	"github.com/FlavioCFOliveira/GoMetadata/format/heif"
+	"github.com/FlavioCFOliveira/GoMetadata/format/jpeg"
+	"github.com/FlavioCFOliveira/GoMetadata/format/png"
+	"github.com/FlavioCFOliveira/GoMetadata/format/raw/arw"
+	"github.com/FlavioCFOliveira/GoMetadata/format/raw/cr2"
+	"github.com/FlavioCFOliveira/GoMetadata/format/raw/cr3"
+	"github.com/FlavioCFOliveira/GoMetadata/format/raw/dng"
+	"github.com/FlavioCFOliveira/GoMetadata/format/raw/nef"
+	"github.com/FlavioCFOliveira/GoMetadata/format/raw/orf"
+	"github.com/FlavioCFOliveira/GoMetadata/format/raw/rw2"
+	"github.com/FlavioCFOliveira/GoMetadata/format/tiff"
+	"github.com/FlavioCFOliveira/GoMetadata/format/webp"
+	"github.com/FlavioCFOliveira/GoMetadata/iptc"
+	xmppkg "github.com/FlavioCFOliveira/GoMetadata/xmp"
 )
 
 // Write reads the image from r, applies the metadata in m, and writes the
@@ -29,7 +29,7 @@ import (
 func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error {
 	// Guard against structurally broken metadata that would panic in encoders.
 	if m.EXIF != nil && m.EXIF.IFD0 == nil {
-		return fmt.Errorf("imgmetadata: EXIF struct has nil IFD0")
+		return fmt.Errorf("gometadata: EXIF struct has nil IFD0")
 	}
 
 	cfg := &writeConfig{preserveUnknownSegments: true}
@@ -40,7 +40,7 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	// Detect container format.
 	fmtID, err := format.Detect(r)
 	if err != nil {
-		return fmt.Errorf("imgmetadata: format detection: %w", err)
+		return fmt.Errorf("gometadata: format detection: %w", err)
 	}
 	if fmtID == format.FormatUnknown {
 		return &UnsupportedFormatError{}
@@ -52,7 +52,7 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	if m.EXIF != nil {
 		rawEXIF, err = exif.Encode(m.EXIF)
 		if err != nil {
-			return fmt.Errorf("imgmetadata: encode EXIF: %w", err)
+			return fmt.Errorf("gometadata: encode EXIF: %w", err)
 		}
 	} else if m.rawEXIF != nil {
 		// No modification: pass original raw bytes through.
@@ -62,7 +62,7 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	if m.IPTC != nil {
 		rawIPTC, err = iptc.Encode(m.IPTC)
 		if err != nil {
-			return fmt.Errorf("imgmetadata: encode IPTC: %w", err)
+			return fmt.Errorf("gometadata: encode IPTC: %w", err)
 		}
 	} else if m.rawIPTC != nil {
 		rawIPTC = m.rawIPTC
@@ -71,7 +71,7 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	if m.XMP != nil {
 		rawXMP, err = xmppkg.Encode(m.XMP)
 		if err != nil {
-			return fmt.Errorf("imgmetadata: encode XMP: %w", err)
+			return fmt.Errorf("gometadata: encode XMP: %w", err)
 		}
 	} else if m.rawXMP != nil {
 		rawXMP = m.rawXMP
@@ -95,7 +95,7 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 		return err
 	}
 
-	tmp, err := os.CreateTemp("", "imgmetadata-*")
+	tmp, err := os.CreateTemp("", "gometadata-*")
 	if err != nil {
 		return err
 	}

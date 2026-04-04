@@ -1,4 +1,4 @@
-package imgmetadata
+package gometadata
 
 // Tests for Metadata convenience methods that were under-covered (P2 gaps).
 //
@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/FlavioCFOliveira/img-metadata/exif"
-	"github.com/FlavioCFOliveira/img-metadata/xmp"
+	"github.com/FlavioCFOliveira/GoMetadata/exif"
+	"github.com/FlavioCFOliveira/GoMetadata/xmp"
 )
 
 // ---------------------------------------------------------------------------

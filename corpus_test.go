@@ -1,4 +1,4 @@
-package imgmetadata
+package gometadata
 
 import (
 	"bytes"
@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/FlavioCFOliveira/img-metadata/format"
+	"github.com/FlavioCFOliveira/GoMetadata/format"
 )
 
 // corpusAllFiles returns all files from all corpus subdirectories.

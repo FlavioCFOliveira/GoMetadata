@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/FlavioCFOliveira/img-metadata/exif"
+	"github.com/FlavioCFOliveira/GoMetadata/exif"
 )
 
 // Extract reads metadata payloads from a TIFF container.

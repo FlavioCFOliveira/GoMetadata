@@ -11,7 +11,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/FlavioCFOliveira/img-metadata/internal/metaerr"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/metaerr"
 )
 
 // EXIF holds the parsed contents of an EXIF block.

@@ -1,9 +1,9 @@
-package imgmetadata
+package gometadata
 
 import (
 	"fmt"
 
-	"github.com/FlavioCFOliveira/img-metadata/internal/metaerr"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/metaerr"
 )
 
 // UnsupportedFormatError is returned when the magic bytes of the input do not
@@ -14,7 +14,7 @@ type UnsupportedFormatError struct {
 }
 
 func (e *UnsupportedFormatError) Error() string {
-	return fmt.Sprintf("imgmetadata: unsupported format (magic bytes: %x)", e.Magic[:])
+	return fmt.Sprintf("gometadata: unsupported format (magic bytes: %x)", e.Magic[:])
 }
 
 // TruncatedFileError is returned when the input ends unexpectedly before a

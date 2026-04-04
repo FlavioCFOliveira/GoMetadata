@@ -1,4 +1,4 @@
-module github.com/FlavioCFOliveira/img-metadata
+module github.com/FlavioCFOliveira/GoMetadata
 
 go 1.26
 

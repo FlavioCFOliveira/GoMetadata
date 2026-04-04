@@ -1,4 +1,4 @@
-package imgmetadata
+package gometadata
 
 // corpus_scenarios_test.go
 //

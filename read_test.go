@@ -1,4 +1,4 @@
-package imgmetadata
+package gometadata
 
 import (
 	"bytes"
@@ -10,9 +10,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/FlavioCFOliveira/img-metadata/exif"
-	"github.com/FlavioCFOliveira/img-metadata/format"
-	"github.com/FlavioCFOliveira/img-metadata/iptc"
+	"github.com/FlavioCFOliveira/GoMetadata/exif"
+	"github.com/FlavioCFOliveira/GoMetadata/format"
+	"github.com/FlavioCFOliveira/GoMetadata/iptc"
 )
 
 // buildMinimalJPEG constructs a minimal JPEG stream with an optional EXIF APP1
@@ -176,7 +176,7 @@ func TestReadFilePermDenied(t *testing.T) {
 		t.Skip("running as root: permission checks are not enforced")
 	}
 
-	f, err := os.CreateTemp("", "imgmetadata-perm-test-denied-*")
+	f, err := os.CreateTemp("", "gometadata-perm-test-denied-*")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -681,7 +681,7 @@ func TestWriteFilePreservesPermissions(t *testing.T) {
 	// assert the mode is preserved after the atomic rename.
 	jpeg := buildMinimalJPEG(minimalTIFFPayload())
 
-	f, err := os.CreateTemp("", "imgmetadata-perm-test-*")
+	f, err := os.CreateTemp("", "gometadata-perm-test-*")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,13 +1,13 @@
-package imgmetadata
+package gometadata
 
 import (
 	"fmt"
 	"time"
 
-	"github.com/FlavioCFOliveira/img-metadata/exif"
-	"github.com/FlavioCFOliveira/img-metadata/format"
-	"github.com/FlavioCFOliveira/img-metadata/iptc"
-	"github.com/FlavioCFOliveira/img-metadata/xmp"
+	"github.com/FlavioCFOliveira/GoMetadata/exif"
+	"github.com/FlavioCFOliveira/GoMetadata/format"
+	"github.com/FlavioCFOliveira/GoMetadata/iptc"
+	"github.com/FlavioCFOliveira/GoMetadata/xmp"
 )
 
 // NewMetadata returns an empty Metadata ready for writing to a file of the
@@ -60,10 +60,10 @@ func (m *Metadata) Validate() error {
 		return &UnsupportedFormatError{}
 	}
 	if m.EXIF != nil && m.EXIF.IFD0 == nil {
-		return fmt.Errorf("imgmetadata: EXIF struct has nil IFD0; use exif.Parse to construct a valid EXIF")
+		return fmt.Errorf("gometadata: EXIF struct has nil IFD0; use exif.Parse to construct a valid EXIF")
 	}
 	if m.XMP != nil && m.XMP.Properties == nil {
-		return fmt.Errorf("imgmetadata: XMP struct has nil Properties map")
+		return fmt.Errorf("gometadata: XMP struct has nil Properties map")
 	}
 	return nil
 }

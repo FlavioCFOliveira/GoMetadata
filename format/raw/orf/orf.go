@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/FlavioCFOliveira/img-metadata/format/tiff"
+	"github.com/FlavioCFOliveira/GoMetadata/format/tiff"
 )
 
 // orfMagic is the Olympus ORF byte order / magic marker (bytes 0-3).
