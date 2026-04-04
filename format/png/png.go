@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"sync"
 )
 
 // pngSig is the 8-byte PNG file signature (PNG §5.2).
@@ -23,6 +24,34 @@ var pngSig = [8]byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}
 
 // xmpKeyword is the iTXt keyword used by Adobe XMP (XMP Part 3 §1.1.4).
 const xmpKeyword = "XML:com.adobe.xmp"
+
+// zlibPool stores reusable io.ReadCloser values (zlib.NewReader return type).
+// Reusing them via zlib.Resetter avoids the ~32 KB internal decompression-state
+// allocation on every call to zlibDecompress.
+var zlibPool sync.Pool // values are io.ReadCloser
+
+// zlibDecompress decompresses a zlib-deflated payload. It gets a reader from
+// zlibPool (or allocates one) and returns it to the pool when done without
+// closing it, so the next caller can Reset it instead of allocating again.
+func zlibDecompress(data []byte) ([]byte, error) {
+	r := bytes.NewReader(data)
+	var zr io.ReadCloser
+	if v := zlibPool.Get(); v != nil {
+		zr = v.(io.ReadCloser)
+		if err := zr.(zlib.Resetter).Reset(r, nil); err != nil {
+			return nil, err
+		}
+	} else {
+		var err error
+		zr, err = zlib.NewReader(r)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// Return to pool without closing so it can be Reset on next use.
+	defer zlibPool.Put(zr)
+	return io.ReadAll(zr)
+}
 
 // Extract reads the PNG chunk stream from r and returns raw metadata payloads.
 func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
@@ -241,12 +270,7 @@ func extractXMPFromITXt(data []byte) ([]byte, error) {
 	if compMethod != 0 {
 		return nil, fmt.Errorf("png: compressed XMP: unsupported compression method %d", compMethod)
 	}
-	zr, err := zlib.NewReader(bytes.NewReader(text))
-	if err != nil {
-		return nil, fmt.Errorf("png: compressed XMP: %w", err)
-	}
-	defer zr.Close()
-	dec, err := io.ReadAll(zr)
+	dec, err := zlibDecompress(text)
 	if err != nil {
 		return nil, fmt.Errorf("png: compressed XMP: decompression failed: %w", err)
 	}
@@ -289,12 +313,7 @@ func extractXMPFromZTxt(data []byte) ([]byte, error) {
 	if compMethod != 0 {
 		return nil, fmt.Errorf("png: zTXt XMP: unsupported compression method %d", compMethod)
 	}
-	zr, err := zlib.NewReader(bytes.NewReader(data[pos:]))
-	if err != nil {
-		return nil, fmt.Errorf("png: zTXt XMP: %w", err)
-	}
-	defer zr.Close()
-	dec, err := io.ReadAll(zr)
+	dec, err := zlibDecompress(data[pos:])
 	if err != nil {
 		return nil, fmt.Errorf("png: zTXt XMP: decompression failed: %w", err)
 	}

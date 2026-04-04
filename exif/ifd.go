@@ -1,9 +1,11 @@
 package exif
 
 import (
+	"cmp"
 	"encoding/binary"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"sync"
 
@@ -348,9 +350,11 @@ func hasEntry(entries []IFDEntry, tag TagID) bool {
 }
 
 // sortEntries sorts entries by tag ID in ascending order (TIFF §7 requirement).
+// slices.SortFunc is used instead of sort.Slice because it avoids the
+// reflect-based Swapper allocation that sort.Slice incurs on every call.
 func sortEntries(entries []IFDEntry) {
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Tag < entries[j].Tag
+	slices.SortFunc(entries, func(a, b IFDEntry) int {
+		return cmp.Compare(a.Tag, b.Tag)
 	})
 }
 

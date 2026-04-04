@@ -367,3 +367,40 @@ func BenchmarkPNGExtract(b *testing.B) {
 		_, _, _, _ = Extract(bytes.NewReader(png))
 	}
 }
+
+// BenchmarkPNGExtractCompressedXMP measures the hot path that exercises the
+// zlib pool: an iTXt chunk with compression flag set.
+func BenchmarkPNGExtractCompressedXMP(b *testing.B) {
+	xmpData := []byte("<?xpacket begin='' uid='x'?><xmpmeta xmlns:x=\"adobe:ns:meta/\"/><?xpacket end='r'?>")
+
+	var compressed bytes.Buffer
+	zw := zlib.NewWriter(&compressed)
+	zw.Write(xmpData)
+	zw.Close()
+
+	var chunk bytes.Buffer
+	chunk.WriteString(xmpKeyword)
+	chunk.WriteByte(0x00) // null terminator
+	chunk.WriteByte(0x01) // compression flag = compressed
+	chunk.WriteByte(0x00) // compression method = zlib/deflate
+	chunk.WriteByte(0x00) // empty language tag
+	chunk.WriteByte(0x00) // empty translated keyword
+	chunk.Write(compressed.Bytes())
+
+	var buf bytes.Buffer
+	buf.Write(pngSig[:])
+	ihdrData := make([]byte, 13)
+	binary.BigEndian.PutUint32(ihdrData[0:], 1)
+	binary.BigEndian.PutUint32(ihdrData[4:], 1)
+	ihdrData[8], ihdrData[9] = 8, 2
+	writeChunkTo(&buf, "IHDR", ihdrData)
+	writeChunkTo(&buf, "iTXt", chunk.Bytes())
+	writeChunkTo(&buf, "IEND", nil)
+
+	pngBytes := buf.Bytes()
+	b.SetBytes(int64(len(pngBytes)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _, _ = Extract(bytes.NewReader(pngBytes))
+	}
+}

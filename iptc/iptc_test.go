@@ -559,6 +559,35 @@ func BenchmarkIPTCEncode(b *testing.B) {
 	}
 }
 
+// BenchmarkIPTCAccessors measures the cost of repeated Caption/Copyright/Keywords
+// reads on a parsed IPTC struct. The decode cache means the ISO-8859-1 → UTF-8
+// conversion is paid only on the first call; subsequent calls return the cached
+// string with zero extra allocations.
+func BenchmarkIPTCAccessors(b *testing.B) {
+	raw := buildIPTC([]struct {
+		rec uint8
+		ds  uint8
+		val []byte
+	}{
+		{2, DS2CopyrightNotice, []byte("Test Corp")},
+		{2, DS2Caption, []byte("A test image caption for benchmarking purposes")},
+		{2, DS2Keywords, []byte("nature")},
+		{2, DS2Keywords, []byte("landscape")},
+		{2, DS2Keywords, []byte("benchmark")},
+	})
+	i, err := Parse(raw)
+	if err != nil {
+		b.Fatalf("Parse: %v", err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		_ = i.Caption()
+		_ = i.Copyright()
+		_ = i.Keywords()
+	}
+}
+
 // TestIPTCSetKeywords verifies that SetKeywords replaces existing keywords and
 // that a round-trip (Encode → Parse) preserves them exactly.
 func TestIPTCSetKeywords(t *testing.T) {

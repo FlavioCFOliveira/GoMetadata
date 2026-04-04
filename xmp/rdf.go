@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"unsafe"
 )
 
 // nsEntry maps an XML namespace prefix to its URI.
 // Stored in a stack-allocated array to avoid heap allocation for the common case.
+// prefix is a zero-copy slice into the original parse buffer; uri is a string
+// because it is used as a Properties map key and must outlive the parse buffer.
 type nsEntry struct {
-	prefix string // "" means the default namespace
+	prefix []byte // slice into parse buffer — no allocation on store
 	uri    string
 }
 
@@ -172,6 +175,8 @@ func parseRDF(b []byte, x *XMP) error {
 		}
 
 		// Parse the tag name: [prefix:]local.
+		// scanName returns zero-copy byte slices; string(tagLocal) for comparisons
+		// is optimised by the Go compiler to a zero-allocation byte comparison.
 		tagPrefix, tagLocal, newPos := scanName(b, pos)
 		pos = newPos
 
@@ -212,11 +217,11 @@ func parseRDF(b []byte, x *XMP) error {
 		// ── Struct field element inside a struct node (P1-G) ──────────────
 		case inStruct && depth == structDepth+1 && structFieldDepth == 0:
 			structFieldNS = ns
-			structFieldLocal = tagLocal
+			structFieldLocal = string(tagLocal)
 			structFieldDepth = depth
 
 		// ── rdf:Description: top-level block or struct value node ─────────
-		case ns == NSrdf && tagLocal == "Description":
+		case ns == NSrdf && string(tagLocal) == "Description":
 			if propDepth > 0 && depth == propDepth+1 && !inStruct {
 				// Struct value node: nested rdf:Description inside a property
 				// element (XMP Part 1 §C.2.6). Store inline attrs as
@@ -244,14 +249,15 @@ func parseRDF(b []byte, x *XMP) error {
 		// ── Property element: direct child of top-level rdf:Description ───
 		case descDepth > 0 && depth == descDepth+1 && propDepth == 0:
 			propNS = ns
-			propLocal = tagLocal
+			propLocal = string(tagLocal) // string() here: stored as map key
 			propDepth = depth
 			// rdf:resource shorthand — already handled in the attr loop above.
 			// rdf:parseType="Resource" — already handled above.
 
 		// ── Collection container: rdf:Alt / Seq / Bag ────────────────────
 		case propDepth > 0 && depth == propDepth+1 && !inStruct:
-			if ns == NSrdf && (tagLocal == "Alt" || tagLocal == "Seq" || tagLocal == "Bag") {
+			tl := string(tagLocal) // zero-alloc compare (compiler optimisation)
+			if ns == NSrdf && (tl == "Alt" || tl == "Seq" || tl == "Bag") {
 				inColl = true
 				*liVals = (*liVals)[:0]
 			}
@@ -352,13 +358,16 @@ func parseRDF(b []byte, x *XMP) error {
 	return nil
 }
 
-// scanName parses an XML name starting at b[pos] and returns the prefix,
-// local name, and the position after the name.
+// scanName parses an XML name starting at b[pos] and returns zero-copy
+// byte slices for the prefix and local name, plus the position after the name.
 //
 // Stops at whitespace, '>', '/', or '='. For names of the form "prefix:local",
 // prefix is the part before ':' and local is the part after. For unqualified
-// names, prefix is "" and local is the whole name.
-func scanName(b []byte, pos int) (prefix, local string, end int) {
+// names, prefix is nil and local is the whole name. Callers must convert to
+// string (string(local)) only when storing; comparisons should use
+// string(local) == "literal" which the compiler optimises to a zero-alloc
+// byte comparison.
+func scanName(b []byte, pos int) (prefix, local []byte, end int) {
 	start := pos
 	colon := -1
 	for pos < len(b) {
@@ -374,10 +383,10 @@ func scanName(b []byte, pos int) (prefix, local string, end int) {
 		pos++
 	}
 	if colon >= 0 {
-		prefix = string(b[start:colon])
-		local = string(b[colon+1 : pos])
+		prefix = b[start:colon]
+		local = b[colon+1 : pos]
 	} else {
-		local = string(b[start:pos])
+		local = b[start:pos]
 	}
 	return prefix, local, pos
 }
@@ -399,7 +408,7 @@ func scanAttrs(b []byte, pos int, nsTable *[32]nsEntry, nsCount int, out *[16]xm
 			break
 		}
 
-		// Parse attribute name.
+		// Parse attribute name. scanName returns zero-copy byte slices.
 		attrPrefix, attrLocal, p := scanName(b, pos)
 		pos = p
 
@@ -441,19 +450,21 @@ func scanAttrs(b []byte, pos int, nsTable *[32]nsEntry, nsCount int, out *[16]xm
 		}
 
 		// Classify: xmlns declaration vs. regular attribute.
-		if attrPrefix == "xmlns" {
+		// string(attrPrefix) == "xmlns" is a zero-alloc comparison (Go compiler).
+		if string(attrPrefix) == "xmlns" {
 			// xmlns:prefix="uri" — register namespace binding.
+			// attrLocal is a zero-copy slice; no string conversion needed here.
 			if nsCount < len(nsTable) {
 				nsTable[nsCount] = nsEntry{prefix: attrLocal, uri: val}
 				nsCount++
 			}
-		} else if attrLocal == "xmlns" && attrPrefix == "" {
+		} else if string(attrLocal) == "xmlns" && len(attrPrefix) == 0 {
 			// xmlns="uri" — default namespace declaration; ignore (XMP never uses it).
 		} else {
 			// Regular attribute: resolve its namespace and store.
 			if nAttrs < len(out) {
 				resolvedNS := resolveNS(nsTable[:nsCount], attrPrefix)
-				out[nAttrs] = xmpAttr{ns: resolvedNS, loc: attrLocal, val: val}
+				out[nAttrs] = xmpAttr{ns: resolvedNS, loc: string(attrLocal), val: val}
 				nAttrs++
 			}
 		}
@@ -463,10 +474,11 @@ func scanAttrs(b []byte, pos int, nsTable *[32]nsEntry, nsCount int, out *[16]xm
 
 // resolveNS looks up the URI for the given prefix in the namespace table.
 // The table is scanned backward so inner (later) declarations shadow outer ones.
-// Returns "" if the prefix is not found.
-func resolveNS(table []nsEntry, prefix string) string {
+// Returns "" if the prefix is not found. prefix is a []byte slice (zero-copy
+// from the parse buffer); comparison uses bytes.Equal to avoid string allocation.
+func resolveNS(table []nsEntry, prefix []byte) string {
 	for i := len(table) - 1; i >= 0; i-- {
-		if table[i].prefix == prefix {
+		if bytes.Equal(table[i].prefix, prefix) {
 			return table[i].uri
 		}
 	}
@@ -478,7 +490,14 @@ func resolveNS(table []nsEntry, prefix string) string {
 // returns string(b) directly (one allocation, no builder overhead).
 func unescapeXML(b []byte) string {
 	if bytes.IndexByte(b, '&') < 0 {
-		return string(b) // fast path: no entities
+		// Fast path: no XML entities — create a string that borrows from b's
+		// backing array. unsafe.String is GC-safe: the string header retains a
+		// pointer into b's array, preventing it from being collected while the
+		// string is live.
+		if len(b) == 0 {
+			return ""
+		}
+		return unsafe.String(unsafe.SliceData(b), len(b))
 	}
 
 	bld := builderPool.Get().(*strings.Builder)

@@ -27,10 +27,28 @@ type EXIF struct {
 	MakerNoteIFD *IFD   // parsed MakerNote IFD; nil when parsing is unsupported for this make
 }
 
+// ParseOption configures a Parse call.
+type ParseOption func(*parseConfig)
+
+type parseConfig struct {
+	skipMakerNote bool
+}
+
+// SkipMakerNote skips parsing the manufacturer-specific MakerNote IFD.
+// The raw MakerNote bytes (EXIF.MakerNote) are still retained for round-trip
+// writes; only the decoded MakerNoteIFD is omitted. Use this when you do not
+// need manufacturer extension tags and want to minimise parse cost on camera files.
+func SkipMakerNote() ParseOption { return func(c *parseConfig) { c.skipMakerNote = true } }
+
 // Parse parses a raw EXIF block starting at the TIFF header ("II" or "MM").
 // b must be the complete EXIF payload (after the "Exif\x00\x00" prefix is
-// stripped by the container layer).
-func Parse(b []byte) (*EXIF, error) {
+// stripped by the container layer). opts are optional; existing callers that
+// pass no options continue to work without change.
+func Parse(b []byte, opts ...ParseOption) (*EXIF, error) {
+	var cfg parseConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
 	if len(b) < 8 {
 		return nil, &metaerr.TruncatedFileError{At: "EXIF header"}
 	}
@@ -74,12 +92,14 @@ func Parse(b []byte) (*EXIF, error) {
 		off := order.Uint32(ptr.Value)
 		if sub, subErr := traverse(b, off, order); subErr == nil {
 			e.ExifIFD = sub
-			// MakerNote (EXIF §4.6.5, tag 0x927C) — raw bytes; parse if make is known.
+			// MakerNote (EXIF §4.6.5, tag 0x927C) — raw bytes always retained;
+			// IFD parsing is skipped when SkipMakerNote() is requested.
 			if mn := sub.Get(TagMakerNote); mn != nil {
 				e.MakerNote = mn.Value
-				// Parse the MakerNote IFD when the make is recognised.
-				if makeEntry := ifd0.Get(TagMake); makeEntry != nil {
-					e.MakerNoteIFD = parseMakerNoteIFD(mn.Value, makeEntry.String(), order)
+				if !cfg.skipMakerNote {
+					if makeEntry := ifd0.Get(TagMake); makeEntry != nil {
+						e.MakerNoteIFD = parseMakerNoteIFD(mn.Value, makeEntry.String(), order)
+					}
 				}
 			}
 			// Interoperability IFD pointer (EXIF §4.6.3, tag 0xA005).

@@ -62,7 +62,11 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 
 	// Parse each segment unless the caller opted out.
 	if rawEXIF != nil && !cfg.lazyEXIF {
-		if e, perr := exif.Parse(rawEXIF); perr == nil {
+		var exifOpts []exif.ParseOption
+		if cfg.skipMakerNote {
+			exifOpts = []exif.ParseOption{exif.SkipMakerNote()}
+		}
+		if e, perr := exif.Parse(rawEXIF, exifOpts...); perr == nil {
 			m.EXIF = e
 		}
 		// Non-fatal: an unreadable EXIF segment is not an error.

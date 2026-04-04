@@ -79,9 +79,15 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, fmt.Errorf("jpeg: seek: %w", err)
 	}
 
-	// Read and verify SOI.
-	soi := [2]byte{}
-	if _, err = io.ReadFull(r, soi[:]); err != nil {
+	// Obtain a pooled scratch buffer first so the SOI read can reuse it,
+	// avoiding the heap escape that occurs when a stack-allocated [2]byte
+	// is passed to io.ReadFull via the io.Reader interface.
+	scratchPtr := iobuf.Get(4096)
+	defer func() { iobuf.Put(scratchPtr) }()
+
+	// Read and verify SOI using the pooled scratch buffer.
+	soi := (*scratchPtr)[:2]
+	if _, err = io.ReadFull(r, soi); err != nil {
 		return nil, nil, nil, fmt.Errorf("jpeg: read SOI: %w", err)
 	}
 	if soi[0] != 0xFF || soi[1] != markerSOI {
@@ -90,15 +96,12 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 
 	// extended collects chunks from extended XMP APP1 segments, keyed by GUID.
 	// Adobe XMP Specification Part 3 §1.1.4.
-	extended := make(map[string][]extChunk)
-
-	// Reusable scratch buffer: data returned by readSegment aliases this slice
-	// and is only valid until the next readSegment call. Callers that need to
-	// retain segment data must copy it (append([]byte(nil), data...)).
-	scratch := make([]byte, 4096)
+	// Lazily initialised: most JPEGs do not contain extended XMP, so we avoid
+	// the map allocation on the fast path.
+	var extended map[string][]extChunk
 
 	for {
-		marker, data, rerr := readSegment(r, &scratch)
+		marker, data, rerr := readSegment(r, scratchPtr)
 		if rerr != nil {
 			if rerr == io.EOF {
 				break
@@ -129,6 +132,10 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 					_ = fullLen // used only for validation; assembly is offset-driven
 					// Copy chunk data: body aliases scratch and must outlive this loop.
 					chunkData := append([]byte(nil), body[40:]...)
+					// Lazily initialise the map on first encounter.
+					if extended == nil {
+						extended = make(map[string][]extChunk)
+					}
 					extended[guid] = append(extended[guid], extChunk{
 						offset: offset,
 						data:   chunkData,
@@ -467,8 +474,15 @@ func buildIRB(iptcData []byte) []byte {
 // call to readSegment. Callers that need to retain data past the next call
 // must copy it (e.g. append([]byte(nil), data...)).
 func readSegment(r io.Reader, scratch *[]byte) (marker byte, data []byte, err error) {
-	hdr := [2]byte{}
-	if _, err = io.ReadFull(r, hdr[:]); err != nil {
+	// Ensure scratch has room for at least the 4-byte header (2-byte marker +
+	// 2-byte length). iobuf.Get guarantees at least 4096 bytes on the first
+	// call; we only reallocate when a payload exceeds the current capacity.
+	if len(*scratch) < 4 {
+		*scratch = make([]byte, 4096)
+	}
+	hdr := (*scratch)[:2]
+
+	if _, err = io.ReadFull(r, hdr); err != nil {
 		return 0, nil, err
 	}
 	if hdr[0] != 0xFF {
@@ -487,11 +501,11 @@ func readSegment(r io.Reader, scratch *[]byte) (marker byte, data []byte, err er
 		return marker, nil, nil
 	}
 
-	lenB := [2]byte{}
-	if _, err = io.ReadFull(r, lenB[:]); err != nil {
+	lenB := (*scratch)[2:4]
+	if _, err = io.ReadFull(r, lenB); err != nil {
 		return 0, nil, fmt.Errorf("jpeg: read length for marker 0x%02X: %w", marker, err)
 	}
-	length := int(binary.BigEndian.Uint16(lenB[:]))
+	length := int(binary.BigEndian.Uint16(lenB))
 	if length < 2 {
 		return 0, nil, fmt.Errorf("jpeg: marker 0x%02X has invalid length %d", marker, length)
 	}

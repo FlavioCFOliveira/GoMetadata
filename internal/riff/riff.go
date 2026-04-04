@@ -23,24 +23,24 @@ func (c *Chunk) FourCCString() string {
 }
 
 // ReadChunk reads the next RIFF chunk header from r.
-func ReadChunk(r io.ReadSeeker) (*Chunk, error) {
+func ReadChunk(r io.ReadSeeker) (Chunk, error) {
 	var hdr [8]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, err
+		return Chunk{}, err
 	}
 	var c Chunk
 	copy(c.FourCC[:], hdr[:4])
 	c.Size = binary.LittleEndian.Uint32(hdr[4:])
 	pos, err := r.Seek(0, io.SeekCurrent)
 	if err != nil {
-		return nil, err
+		return Chunk{}, err
 	}
 	c.Offset = pos
-	return &c, nil
+	return c, nil
 }
 
 // SkipChunk advances r past the data (and any padding byte) of c.
-func SkipChunk(r io.ReadSeeker, c *Chunk) error {
+func SkipChunk(r io.ReadSeeker, c Chunk) error {
 	skip := int64(c.Size)
 	if c.Size%2 != 0 {
 		skip++ // padding byte

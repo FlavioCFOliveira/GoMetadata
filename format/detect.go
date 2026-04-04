@@ -1,9 +1,10 @@
 package format
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
-	"strings"
+	"sync"
 )
 
 // magicLen is the maximum number of bytes needed to identify any supported format.
@@ -12,6 +13,15 @@ const magicLen = 12
 // tiffScanSize is the number of bytes read for TIFF-variant refinement.
 // 8 (TIFF header) + 2 (IFD count) + 64×12 (IFD entries) + 256 (Make value) = 1034 bytes.
 const tiffScanSize = 1034
+
+// tiffScanPool recycles the scan buffer used by refineTIFFVariant so that the
+// 1 KiB allocation is amortised to zero after the first call.
+var tiffScanPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, tiffScanSize)
+		return &b
+	},
+}
 
 // Detect reads up to magicLen bytes from r (without consuming them) and
 // returns the detected FormatID. For TIFF-family files it reads additional
@@ -132,9 +142,11 @@ func refineTIFFVariant(r io.ReadSeeker) FormatID {
 		return FormatTIFF
 	}
 
-	data := make([]byte, tiffScanSize)
+	bp := tiffScanPool.Get().(*[]byte)
+	data := *bp
 	n, _ := io.ReadFull(r, data)
 	if n < 10 {
+		tiffScanPool.Put(bp)
 		return FormatTIFF
 	}
 	data = data[:n]
@@ -147,21 +159,24 @@ func refineTIFFVariant(r io.ReadSeeker) FormatID {
 	case data[0] == 'M' && data[1] == 'M':
 		order = binary.BigEndian
 	default:
+		tiffScanPool.Put(bp)
 		return FormatTIFF
 	}
 
 	ifd0Off := order.Uint32(data[4:])
 	if int(ifd0Off)+2 > len(data) {
+		tiffScanPool.Put(bp)
 		return FormatTIFF
 	}
 
 	count := int(order.Uint16(data[ifd0Off:]))
 	if count < 0 || count > 512 {
+		tiffScanPool.Put(bp)
 		return FormatTIFF
 	}
 	pos := int(ifd0Off) + 2
 
-	var makeStr string
+	var makeRaw []byte
 	for i := 0; i < count; i++ {
 		e := pos + i*12
 		if e+12 > len(data) {
@@ -173,6 +188,7 @@ func refineTIFFVariant(r io.ReadSeeker) FormatID {
 
 		switch tag {
 		case 0xC612: // DNGVersion — present only in DNG files (Adobe DNG Spec §6).
+			tiffScanPool.Put(bp)
 			return FormatDNG
 
 		case 0x010F: // Make — ASCII string identifying camera manufacturer (TIFF §8).
@@ -183,31 +199,34 @@ func refineTIFFVariant(r io.ReadSeeker) FormatID {
 			if total == 0 {
 				break
 			}
-			var raw []byte
 			if total <= 4 {
 				end := uint64(e+8) + total
 				if end > uint64(len(data)) {
 					break
 				}
-				raw = data[e+8 : end]
+				makeRaw = data[e+8 : end]
 			} else {
 				off := order.Uint32(data[e+8:])
 				end := uint64(off) + total
 				if end > uint64(len(data)) {
 					break
 				}
-				raw = data[off:end]
+				makeRaw = data[off:end]
 			}
-			makeStr = strings.TrimRight(string(raw), "\x00 ")
 		}
 	}
 
-	// Map Make string to specific RAW format.
-	switch makeStr {
-	case "NIKON CORPORATION", "Nikon":
-		return FormatNEF
-	case "SONY":
-		return FormatARW
+	// Map Make bytes to specific RAW format without allocating a string.
+	make_ := bytes.TrimRight(makeRaw, "\x00 ")
+	var result FormatID
+	switch {
+	case bytes.Equal(make_, []byte("NIKON CORPORATION")), bytes.Equal(make_, []byte("Nikon")):
+		result = FormatNEF
+	case bytes.Equal(make_, []byte("SONY")):
+		result = FormatARW
+	default:
+		result = FormatTIFF
 	}
-	return FormatTIFF
+	tiffScanPool.Put(bp)
+	return result
 }

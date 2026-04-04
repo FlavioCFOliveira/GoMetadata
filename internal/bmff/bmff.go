@@ -27,10 +27,10 @@ func (b *Box) TypeString() string {
 }
 
 // ReadBox reads the next box header from r at the current position.
-func ReadBox(r io.ReadSeeker) (*Box, error) {
+func ReadBox(r io.ReadSeeker) (Box, error) {
 	var hdr [8]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, err
+		return Box{}, err
 	}
 	size := uint64(binary.BigEndian.Uint32(hdr[:4]))
 	var box Box
@@ -41,7 +41,7 @@ func ReadBox(r io.ReadSeeker) (*Box, error) {
 		// Extended size: next 8 bytes hold the actual 64-bit size.
 		var ext [8]byte
 		if _, err := io.ReadFull(r, ext[:]); err != nil {
-			return nil, err
+			return Box{}, err
 		}
 		size = binary.BigEndian.Uint64(ext[:])
 		headerLen = 16
@@ -49,7 +49,7 @@ func ReadBox(r io.ReadSeeker) (*Box, error) {
 	box.Size = size
 	pos, err := r.Seek(0, io.SeekCurrent)
 	if err != nil {
-		return nil, err
+		return Box{}, err
 	}
 	box.Offset = pos
 	if size == 0 {
@@ -57,11 +57,11 @@ func ReadBox(r io.ReadSeeker) (*Box, error) {
 	} else {
 		box.DataSize = size - headerLen
 	}
-	return &box, nil
+	return box, nil
 }
 
 // SkipBox advances r past the data portion of box.
-func SkipBox(r io.ReadSeeker, box *Box) error {
+func SkipBox(r io.ReadSeeker, box Box) error {
 	if box.Size == 0 {
 		_, err := r.Seek(0, io.SeekEnd)
 		return err

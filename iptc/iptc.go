@@ -23,6 +23,11 @@ type Dataset struct {
 	Record  uint8
 	DataSet uint8
 	Value   []byte
+	// decodedValue and decoded implement a one-shot charset decode cache so
+	// that callers that read the same field repeatedly (e.g. Keywords in a
+	// loop) pay the ISO-8859-1 → UTF-8 conversion cost only once.
+	decodedValue string
+	decoded      bool
 }
 
 // Parse parses a raw IPTC IIM byte stream.
@@ -171,9 +176,9 @@ func (i *IPTC) Keywords() []string {
 	}
 	utf8 := i.isUTF8()
 	var result []string
-	for _, d := range i.Records[2] {
-		if d.DataSet == DS2Keywords {
-			result = append(result, decodeString(d.Value, utf8))
+	for idx := range i.Records[2] {
+		if i.Records[2][idx].DataSet == DS2Keywords {
+			result = append(result, i.Records[2][idx].stringValue(utf8))
 		}
 	}
 	return result
@@ -233,6 +238,10 @@ func (i *IPTC) setRecord2(ds uint8, value []byte) {
 	for idx := range i.Records[2] {
 		if i.Records[2][idx].DataSet == ds {
 			i.Records[2][idx].Value = value
+			// Invalidate the decode cache so the new value is re-decoded on
+			// the next read (the old decoded string no longer matches Value).
+			i.Records[2][idx].decoded = false
+			i.Records[2][idx].decodedValue = ""
 			return
 		}
 	}
@@ -245,9 +254,9 @@ func (i *IPTC) firstRecord2(ds uint8) string {
 		return ""
 	}
 	utf8 := i.isUTF8()
-	for _, d := range i.Records[2] {
-		if d.DataSet == ds {
-			return decodeString(d.Value, utf8)
+	for idx := range i.Records[2] {
+		if i.Records[2][idx].DataSet == ds {
+			return i.Records[2][idx].stringValue(utf8)
 		}
 	}
 	return ""

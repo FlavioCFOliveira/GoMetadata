@@ -2,9 +2,9 @@ package xmp
 
 import (
 	"bytes"
-	"encoding/xml"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // xmpPadding is the pre-computed 2 KB whitespace padding block for XMP in-place
@@ -21,11 +21,24 @@ var xmpPadding = func() [2048]byte {
 	return b
 }()
 
+// encBufPool recycles bytes.Buffer instances across encode calls.
+// Pre-grown buffers avoid the repeated backing-array reallocations that
+// occur when building an XMP packet from scratch.
+var encBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
 // encode serialises x to a padded XMP packet.
 // The packet uses UTF-8 encoding and a read/write <?xpacket?> wrapper
 // with 2 KB of whitespace padding per XMP §7.3 (in-place editing support).
 func encode(x *XMP) ([]byte, error) {
-	var buf bytes.Buffer
+	buf := encBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+
+	// Estimate output size: fixed wrapper (~250 B) + 2 KB padding + ~100 B per property.
+	nProps := 0
+	for _, props := range x.Properties {
+		nProps += len(props)
+	}
+	buf.Grow(256 + 2048 + nProps*100)
 
 	// Opening packet wrapper with UTF-8 BOM marker (XMP §7.1).
 	buf.WriteString("<?xpacket begin=\"\xef\xbb\xbf\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n")
@@ -67,7 +80,7 @@ func encode(x *XMP) ([]byte, error) {
 				buf.WriteByte(':')
 				buf.WriteString(local)
 				buf.WriteByte('>')
-				xml.EscapeText(&buf, []byte(val)) //nolint:errcheck
+				writeXMLEscaped(buf, val)
 				buf.WriteString("</")
 				buf.WriteString(prefix)
 				buf.WriteByte(':')
@@ -87,19 +100,19 @@ func encode(x *XMP) ([]byte, error) {
 				for _, v := range values {
 					if ctype == "Alt" {
 						// Preserve xml:lang if stored as "lang|value" (P1-H).
-						lang, val, hasLang := strings.Cut(v, "|")
+						lang, altVal, hasLang := strings.Cut(v, "|")
 						if hasLang {
 							buf.WriteString("     <rdf:li xml:lang=\"")
-							xml.EscapeText(&buf, []byte(lang)) //nolint:errcheck
+							writeXMLEscaped(buf, lang)
 							buf.WriteString("\">")
-							xml.EscapeText(&buf, []byte(val)) //nolint:errcheck
+							writeXMLEscaped(buf, altVal)
 						} else {
 							buf.WriteString("     <rdf:li xml:lang=\"x-default\">")
-							xml.EscapeText(&buf, []byte(v)) //nolint:errcheck
+							writeXMLEscaped(buf, v)
 						}
 					} else {
 						buf.WriteString("     <rdf:li>")
-						xml.EscapeText(&buf, []byte(v)) //nolint:errcheck
+						writeXMLEscaped(buf, v)
 					}
 					buf.WriteString("</rdf:li>\n")
 				}
@@ -123,5 +136,40 @@ func encode(x *XMP) ([]byte, error) {
 	buf.Write(xmpPadding[:])
 	buf.WriteString("\n<?xpacket end=\"w\"?>")
 
-	return buf.Bytes(), nil
+	// Copy the result before returning the buffer to the pool so callers own
+	// their slice independently of the pooled backing array.
+	result := bytes.Clone(buf.Bytes())
+	encBufPool.Put(buf)
+	return result, nil
+}
+
+// writeXMLEscaped writes s to buf with XML character escaping, operating
+// directly on the string to avoid the []byte(s) conversion that
+// encoding/xml.EscapeText requires.  Handles the five predefined XML
+// entities plus the CR character (XML 1.0 §2.2 and §4.6).
+func writeXMLEscaped(buf *bytes.Buffer, s string) {
+	last := 0
+	for i := 0; i < len(s); i++ {
+		var esc string
+		switch s[i] {
+		case '&':
+			esc = "&amp;"
+		case '<':
+			esc = "&lt;"
+		case '>':
+			esc = "&gt;"
+		case '"':
+			esc = "&#34;"
+		case '\'':
+			esc = "&#39;"
+		case '\r':
+			esc = "&#xD;"
+		default:
+			continue
+		}
+		buf.WriteString(s[last:i])
+		buf.WriteString(esc)
+		last = i + 1
+	}
+	buf.WriteString(s[last:])
 }

@@ -10,6 +10,8 @@ type readConfig struct {
 	lazyIPTC bool
 	// lazyEXIF skips EXIF parsing.
 	lazyEXIF bool
+	// skipMakerNote skips MakerNote IFD parsing inside EXIF.
+	skipMakerNote bool
 }
 
 // WithoutXMP skips XMP parsing, reducing allocations when XMP is not needed.
@@ -20,6 +22,12 @@ func WithoutIPTC() ReadOption { return func(c *readConfig) { c.lazyIPTC = true }
 
 // WithoutEXIF skips EXIF parsing.
 func WithoutEXIF() ReadOption { return func(c *readConfig) { c.lazyEXIF = true } }
+
+// WithoutMakerNote skips manufacturer-specific MakerNote IFD parsing.
+// The raw MakerNote bytes are still retained for round-trip writes; only the
+// decoded EXIF.MakerNoteIFD field is omitted. Use this when extension tags
+// are not needed and you want to minimise parse latency on camera RAW files.
+func WithoutMakerNote() ReadOption { return func(c *readConfig) { c.skipMakerNote = true } }
 
 // WriteOption configures a Write or WriteFile call.
 type WriteOption func(*writeConfig)
