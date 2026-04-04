@@ -8,14 +8,19 @@
 // is the responsibility of the container layer (format/jpeg).
 package iptc
 
-import "bytes"
+import (
+	"bytes"
+	"sync"
+)
 
 // IPTC holds the parsed IPTC datasets grouped by record number.
 type IPTC struct {
-	// Records maps record number to a slice of datasets in that record.
-	// IIM defines records 1–9; record 2 is the most common (envelope and
-	// application records per IIM §2).
-	Records map[uint8][]Dataset
+	// Records holds datasets indexed by record number (0–9).
+	// IIM defines records 1–9; index 0 is a pseudo-record used internally
+	// to store the UTF-8 flag (see isUTF8). Using a fixed-size array instead
+	// of a map eliminates the map allocation entirely — one fewer heap object
+	// per Parse call — and allows O(1) index access without hashing.
+	Records [10][]Dataset
 }
 
 // Dataset is a single IPTC record:dataset value (IIM §1.6).
@@ -33,7 +38,7 @@ type Dataset struct {
 // Parse parses a raw IPTC IIM byte stream.
 // b must begin with (or contain) the IPTC tag marker 0x1C (IIM §1.6).
 func Parse(b []byte) (*IPTC, error) {
-	i := &IPTC{Records: make(map[uint8][]Dataset)}
+	i := new(IPTC)
 	// Pre-allocate record 2 (Application Record) — the most common record,
 	// typically containing 5–15 datasets in a production JPEG (IIM §2).
 	i.Records[2] = make([]Dataset, 0, 12)
@@ -117,9 +122,16 @@ func Parse(b []byte) (*IPTC, error) {
 	return i, nil
 }
 
+// encBufPool reuses bytes.Buffer allocations across Encode calls. This avoids
+// repeated heap allocation of the buffer's internal byte array on every call.
+// The result is always a fresh bytes.Clone of the buffer contents, so the
+// returned slice is safe to use after the buffer is returned to the pool.
+var encBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
 // Encode serialises i back to an IPTC IIM byte stream.
 func Encode(i *IPTC) ([]byte, error) {
-	var buf bytes.Buffer
+	buf := encBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
 
 	// Re-emit the coded character set declaration (IIM §1.5.1) when the
 	// original stream declared UTF-8 (ESC % G = 0x1B 0x25 0x47).
@@ -155,7 +167,9 @@ func Encode(i *IPTC) ([]byte, error) {
 			buf.Write(ds.Value)
 		}
 	}
-	return buf.Bytes(), nil
+	result := bytes.Clone(buf.Bytes())
+	encBufPool.Put(buf)
+	return result, nil
 }
 
 // Copyright returns the value of dataset 2:116 (Copyright Notice, IIM §2.2.28).
@@ -265,6 +279,6 @@ func (i *IPTC) firstRecord2(ds uint8) string {
 // isUTF8 reports whether the stream declared UTF-8 encoding via the
 // coded character set dataset (IIM §1.5.1).
 func (i *IPTC) isUTF8() bool {
-	recs, ok := i.Records[0]
-	return ok && len(recs) > 0 && len(recs[0].Value) > 0 && recs[0].Value[0] == 1
+	recs := i.Records[0]
+	return len(recs) > 0 && len(recs[0].Value) > 0 && recs[0].Value[0] == 1
 }

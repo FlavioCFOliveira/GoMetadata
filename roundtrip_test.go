@@ -209,7 +209,7 @@ func TestRoundTripIPTC_JPEG(t *testing.T) {
 	}
 
 	// Step 3: attach and populate an IPTC struct.
-	m.IPTC = &iptc.IPTC{Records: make(map[uint8][]iptc.Dataset)}
+	m.IPTC = new(iptc.IPTC)
 	m.IPTC.SetCaption(wantCaption)
 	m.IPTC.SetCopyright(wantCopyright)
 	for _, kw := range wantKeywords {
@@ -312,7 +312,7 @@ func TestRoundTripCaption_JPEG(t *testing.T) {
 		t.Fatalf("Read initial: %v", err)
 	}
 
-	m.IPTC = &iptc.IPTC{Records: make(map[uint8][]iptc.Dataset)}
+	m.IPTC = new(iptc.IPTC)
 	m.IPTC.SetCaption(wantCaption)
 
 	var out bytes.Buffer
@@ -434,7 +434,7 @@ func TestRoundTripTableDriven(t *testing.T) {
 			name:  "JPEG+IPTC+caption",
 			image: func() []byte { return rtBuildJPEG(nil) },
 			modify: func(m *imgmetadata.Metadata) {
-				m.IPTC = &iptc.IPTC{Records: make(map[uint8][]iptc.Dataset)}
+				m.IPTC = new(iptc.IPTC)
 				m.IPTC.SetCaption("table-caption")
 			},
 			assert: func(t *testing.T, m *imgmetadata.Metadata) {
@@ -447,7 +447,7 @@ func TestRoundTripTableDriven(t *testing.T) {
 			name:  "JPEG+IPTC+copyright",
 			image: func() []byte { return rtBuildJPEG(nil) },
 			modify: func(m *imgmetadata.Metadata) {
-				m.IPTC = &iptc.IPTC{Records: make(map[uint8][]iptc.Dataset)}
+				m.IPTC = new(iptc.IPTC)
 				m.IPTC.SetCopyright("(c) 2024")
 			},
 			assert: func(t *testing.T, m *imgmetadata.Metadata) {
@@ -460,7 +460,7 @@ func TestRoundTripTableDriven(t *testing.T) {
 			name:  "JPEG+IPTC+keywords",
 			image: func() []byte { return rtBuildJPEG(nil) },
 			modify: func(m *imgmetadata.Metadata) {
-				m.IPTC = &iptc.IPTC{Records: make(map[uint8][]iptc.Dataset)}
+				m.IPTC = new(iptc.IPTC)
 				m.IPTC.AddKeyword("alpha")
 				m.IPTC.AddKeyword("beta")
 			},
@@ -580,7 +580,7 @@ func TestRoundTripPreservesExistingEXIF(t *testing.T) {
 	}
 
 	// Modify only IPTC; leave m.EXIF = nil so Write() passes rawEXIF through.
-	m.IPTC = &iptc.IPTC{Records: make(map[uint8][]iptc.Dataset)}
+	m.IPTC = new(iptc.IPTC)
 	m.IPTC.SetCaption("preserve test")
 
 	var out bytes.Buffer

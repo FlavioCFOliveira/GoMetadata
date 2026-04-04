@@ -434,7 +434,7 @@ func TestConcurrentWrite(t *testing.T) {
 	}
 
 	// Attach an IPTC block with a caption so Write has something to encode.
-	m.IPTC = &iptc.IPTC{Records: make(map[uint8][]iptc.Dataset)}
+	m.IPTC = new(iptc.IPTC)
 	m.IPTC.SetCaption("concurrent test")
 
 	const goroutines = 5
@@ -467,7 +467,7 @@ func BenchmarkWrite_JPEG(b *testing.B) {
 	if err != nil {
 		b.Fatalf("Read: %v", err)
 	}
-	m.IPTC = &iptc.IPTC{Records: make(map[uint8][]iptc.Dataset)}
+	m.IPTC = new(iptc.IPTC)
 	m.IPTC.SetCaption("benchmark caption")
 
 	b.ReportAllocs()

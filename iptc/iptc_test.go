@@ -275,7 +275,7 @@ func TestISO8859_1VsUTF8(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestSetCaption(t *testing.T) {
-	i := &IPTC{Records: make(map[uint8][]Dataset)}
+	i := new(IPTC)
 	i.SetCaption("First caption")
 	if got := i.Caption(); got != "First caption" {
 		t.Errorf("SetCaption: got %q, want %q", got, "First caption")
@@ -288,7 +288,7 @@ func TestSetCaption(t *testing.T) {
 }
 
 func TestSetCopyright(t *testing.T) {
-	i := &IPTC{Records: make(map[uint8][]Dataset)}
+	i := new(IPTC)
 	i.SetCopyright("(c) 2024 Test Corp")
 	if got := i.Copyright(); got != "(c) 2024 Test Corp" {
 		t.Errorf("SetCopyright: got %q, want %q", got, "(c) 2024 Test Corp")
@@ -296,7 +296,7 @@ func TestSetCopyright(t *testing.T) {
 }
 
 func TestSetCreator(t *testing.T) {
-	i := &IPTC{Records: make(map[uint8][]Dataset)}
+	i := new(IPTC)
 	i.SetCreator("Photographer X")
 	if got := i.Creator(); got != "Photographer X" {
 		t.Errorf("SetCreator: got %q, want %q", got, "Photographer X")
@@ -304,7 +304,7 @@ func TestSetCreator(t *testing.T) {
 }
 
 func TestAddKeyword(t *testing.T) {
-	i := &IPTC{Records: make(map[uint8][]Dataset)}
+	i := new(IPTC)
 	i.AddKeyword("alpha")
 	i.AddKeyword("beta")
 	i.AddKeyword("gamma")
@@ -318,7 +318,7 @@ func TestAddKeyword(t *testing.T) {
 }
 
 func TestSettersRoundTrip(t *testing.T) {
-	i := &IPTC{Records: make(map[uint8][]Dataset)}
+	i := new(IPTC)
 	i.SetCaption("A test caption")
 	i.SetCopyright("(c) Test Corp")
 	i.SetCreator("Author Name")
@@ -356,7 +356,7 @@ func TestIPTCExtendedLengthRoundTrip(t *testing.T) {
 		large[idx] = byte(idx % 251)
 	}
 
-	i := &IPTC{Records: make(map[uint8][]Dataset)}
+	i := new(IPTC)
 	i.Records[2] = append(i.Records[2], Dataset{Record: 2, DataSet: DS2Caption, Value: large})
 
 	encoded, err := Encode(i)
@@ -403,8 +403,8 @@ func TestIPTCRecord1Parsing(t *testing.T) {
 		t.Fatalf("Parse: %v", err)
 	}
 
-	datasets, ok := i.Records[1]
-	if !ok || len(datasets) == 0 {
+	datasets := i.Records[1]
+	if len(datasets) == 0 {
 		t.Fatalf("Records[1] is empty or missing; got records: %v", i.Records)
 	}
 
@@ -438,8 +438,8 @@ func TestIPTCRecordsBeyond2(t *testing.T) {
 		t.Fatalf("Parse: %v", err)
 	}
 
-	datasets, ok := i.Records[3]
-	if !ok || len(datasets) == 0 {
+	datasets := i.Records[3]
+	if len(datasets) == 0 {
 		t.Fatalf("Records[3] is empty or missing; got records: %v", i.Records)
 	}
 
@@ -467,7 +467,7 @@ func TestEncodeExtendedLengthRoundTrip(t *testing.T) {
 		large[i] = byte(i & 0xFF)
 	}
 
-	i := &IPTC{Records: make(map[uint8][]Dataset)}
+	i := new(IPTC)
 	i.Records[2] = []Dataset{
 		{Record: 2, DataSet: DS2Caption, Value: large},
 	}

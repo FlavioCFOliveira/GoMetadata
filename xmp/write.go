@@ -2,7 +2,7 @@ package xmp
 
 import (
 	"bytes"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -26,6 +26,14 @@ var xmpPadding = func() [2048]byte {
 // occur when building an XMP packet from scratch.
 var encBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
+// nsListPool recycles the []string slice used to sort namespace URIs in encode.
+// The pool eliminates one allocation per encode call on the hot path.
+var nsListPool = sync.Pool{New: func() any { s := make([]string, 0, 8); return &s }}
+
+// localListPool recycles the []string slice used to sort property names per
+// namespace in encode. Eliminates one allocation per namespace per encode call.
+var localListPool = sync.Pool{New: func() any { s := make([]string, 0, 16); return &s }}
+
 // encode serialises x to a padded XMP packet.
 // The packet uses UTF-8 encoding and a read/write <?xpacket?> wrapper
 // with 2 KB of whitespace padding per XMP §7.3 (in-place editing support).
@@ -46,13 +54,18 @@ func encode(x *XMP) ([]byte, error) {
 	buf.WriteString(" <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n")
 
 	// Sort namespace URIs for deterministic output (ISO 16684-1 §7.4).
-	nsList := make([]string, 0, len(x.Properties))
+	nsListPtr := nsListPool.Get().(*[]string)
+	nsList := (*nsListPtr)[:0]
 	for ns, props := range x.Properties {
 		if len(props) > 0 {
 			nsList = append(nsList, ns)
 		}
 	}
-	sort.Strings(nsList)
+	slices.Sort(nsList)
+	// Write-back: if append grew the slice, update the pointer so the pool
+	// gets the larger backing array next time.
+	*nsListPtr = nsList
+	defer nsListPool.Put(nsListPtr)
 
 	for _, ns := range nsList {
 		props := x.Properties[ns]
@@ -64,11 +77,13 @@ func encode(x *XMP) ([]byte, error) {
 		buf.WriteString("\">\n")
 
 		// Sort property names for deterministic output.
-		localList := make([]string, 0, len(props))
+		localListPtr := localListPool.Get().(*[]string)
+		localList := (*localListPtr)[:0]
 		for local := range props {
 			localList = append(localList, local)
 		}
-		sort.Strings(localList)
+		slices.Sort(localList)
+		*localListPtr = localList
 
 		for _, local := range localList {
 			val := props[local]
@@ -126,6 +141,7 @@ func encode(x *XMP) ([]byte, error) {
 			}
 		}
 
+		localListPool.Put(localListPtr)
 		buf.WriteString("  </rdf:Description>\n")
 	}
 

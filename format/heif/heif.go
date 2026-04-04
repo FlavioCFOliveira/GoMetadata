@@ -11,22 +11,121 @@ import (
 	"fmt"
 	"io"
 	"math"
+
+	"github.com/flaviocfo/img-metadata/internal/iobuf"
 )
 
 // Extract navigates the ISOBMFF box hierarchy of r and extracts raw payloads.
 // rawEXIF has the 4-byte TIFF-header offset prefix stripped before return.
+//
+// Fast path: reads only the first 64 KB to locate the meta box (iinf+iloc+pitm),
+// then seeks directly to each item payload — no full-file allocation needed.
+// Slow path fallback (meta box beyond 64 KB header window): reads the full file.
 func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if _, err = r.Seek(0, io.SeekStart); err != nil {
 		return nil, nil, nil, fmt.Errorf("heif: seek: %w", err)
 	}
 
+	// Read the first 64 KB: sufficient to contain the meta box in all typical
+	// HEIF/HEIC files (iinf + iloc + pitm are compact; < 4 KB in practice).
+	// largePool always provides a cap-65536 buffer so Get never allocates fresh.
+	const headerWindow = 65536
+	hdrPtr := iobuf.Get(headerWindow)
+	hdr := *hdrPtr
+	n, rerr := io.ReadFull(r, hdr[:headerWindow])
+	if rerr != nil && rerr != io.ErrUnexpectedEOF {
+		iobuf.Put(hdrPtr)
+		return nil, nil, nil, fmt.Errorf("heif: read: %w", rerr)
+	}
+	hdr = hdr[:n]
+
+	// Find the meta box within the header window.
+	metaData, _ := findBox(hdr, "meta", 0)
+	if metaData != nil {
+		// Fast path: meta box fully within header window.
+		// Read item payloads by seeking rather than slicing a full in-memory copy.
+		iobuf.Put(hdrPtr)
+		rawEXIF, rawXMP, err = extractFromMetaData(r, metaData)
+		return rawEXIF, nil, rawXMP, err
+	}
+
+	// Slow path fallback: meta box not found in first 64 KB (extremely rare —
+	// HEIF spec places meta at the file head). Read the full file.
+	iobuf.Put(hdrPtr)
+	if _, err = r.Seek(0, io.SeekStart); err != nil {
+		return nil, nil, nil, fmt.Errorf("heif: seek: %w", err)
+	}
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("heif: read: %w", err)
 	}
-
 	rawEXIF, rawXMP, err = parseHEIFMetadata(data)
 	return rawEXIF, nil, rawXMP, err
+}
+
+// readItemPayload seeks r to loc.offset and reads loc.length bytes.
+// The returned slice is owned by the caller; r is left at an unspecified position.
+func readItemPayload(r io.ReadSeeker, loc itemLoc) ([]byte, error) {
+	if loc.length == 0 {
+		return nil, nil
+	}
+	if _, err := r.Seek(int64(loc.offset), io.SeekStart); err != nil {
+		return nil, err
+	}
+	payload := make([]byte, loc.length)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+// extractFromMetaData parses the meta box content and seeks r to read EXIF/XMP
+// item payloads directly, avoiding a full file read.
+// metaData must be the content of the meta box with the 4-byte FullBox
+// version+flags already stripped (as returned by findBox).
+// ISO 23008-12 §6.2 (primary item), §6.6.1 (EXIF item layout).
+func extractFromMetaData(r io.ReadSeeker, metaData []byte) (rawEXIF, rawXMP []byte, err error) {
+	itemTypes := parseIinf(metaData)
+	itemLocs := parseIloc(metaData)
+	primaryID := parsePitm(metaData)
+
+	var bestEXIFID, bestXMPID uint16
+	exifFound, xmpFound := false, false
+
+	for id, typ := range itemTypes {
+		switch typ {
+		case "Exif":
+			if !exifFound || id == primaryID || (bestEXIFID != primaryID && id < bestEXIFID) {
+				bestEXIFID = id
+				exifFound = true
+			}
+		case "mime", "rdf+xml":
+			if !xmpFound || id == primaryID || (bestXMPID != primaryID && id < bestXMPID) {
+				bestXMPID = id
+				xmpFound = true
+			}
+		}
+	}
+
+	if exifFound {
+		if loc, ok := itemLocs[bestEXIFID]; ok && loc.length > 0 {
+			payload, e := readItemPayload(r, loc)
+			if e == nil && len(payload) >= 4 {
+				// HEIF EXIF item begins with a 4-byte offset to the TIFF header
+				// within the item (ISO 23008-12 §6.6.1). Skip it.
+				skip := int(binary.BigEndian.Uint32(payload[:4])) + 4
+				if skip <= len(payload) {
+					rawEXIF = payload[skip:]
+				}
+			}
+		}
+	}
+	if xmpFound {
+		if loc, ok := itemLocs[bestXMPID]; ok && loc.length > 0 {
+			rawXMP, err = readItemPayload(r, loc)
+		}
+	}
+	return rawEXIF, rawXMP, err
 }
 
 // Inject writes a modified HEIF stream to w with updated metadata items.

@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## MANDATORY: Code Authorship Rule
+
+> **ALL code creation and modification — including new files, edits, refactors, bug fixes, and test additions — MUST be performed EXCLUSIVELY by the `go-performance-architect` specialist agent via the `Agent` tool.**
+>
+> The assistant (Claude Code) must NEVER use the `Edit`, `Write`, or equivalent tools to modify or create source files directly. When any code change is required, the assistant must spawn the `go-performance-architect` agent with full context and delegate the change to it. This rule has no exceptions.
+
 ## Project
 
 A pure Go library for **reading and writing** EXIF, IPTC, and XMP metadata from and to **any image format** (JPEG, TIFF, PNG, HEIF/HEIC, WebP, RAW variants — CR2, CR3, NEF, ARW, DNG, ORF, RW2 — and others). The library is a universal metadata layer: regardless of container format, the caller gets a unified API.

@@ -62,9 +62,6 @@ func (m *Metadata) Validate() error {
 	if m.EXIF != nil && m.EXIF.IFD0 == nil {
 		return fmt.Errorf("imgmetadata: EXIF struct has nil IFD0; use exif.Parse to construct a valid EXIF")
 	}
-	if m.IPTC != nil && m.IPTC.Records == nil {
-		return fmt.Errorf("imgmetadata: IPTC struct has nil Records map")
-	}
 	if m.XMP != nil && m.XMP.Properties == nil {
 		return fmt.Errorf("imgmetadata: XMP struct has nil Properties map")
 	}

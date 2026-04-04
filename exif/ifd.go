@@ -9,6 +9,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/flaviocfo/img-metadata/internal/iobuf"
 	"github.com/flaviocfo/img-metadata/internal/metaerr"
 )
 
@@ -322,17 +323,22 @@ func asciiValue(s string) []byte {
 // --- helpers used by encode ---
 
 // filterEntries returns a copy of ifd.Entries with the given tags removed.
+// All callers pass at most 3 tags, so a linear scan over the exclude slice
+// is cheaper than a map allocation (no heap escape, no hashing overhead).
 func filterEntries(ifd *IFD, exclude ...TagID) []IFDEntry {
 	if ifd == nil {
 		return nil
 	}
-	excl := make(map[TagID]bool, len(exclude))
-	for _, t := range exclude {
-		excl[t] = true
-	}
 	result := make([]IFDEntry, 0, len(ifd.Entries))
 	for _, entry := range ifd.Entries {
-		if !excl[entry.Tag] {
+		excluded := false
+		for _, t := range exclude {
+			if entry.Tag == t {
+				excluded = true
+				break
+			}
+		}
+		if !excluded {
 			result = append(result, entry)
 		}
 	}
@@ -388,7 +394,9 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 	order.PutUint16(countB[:], uint16(n))
 	out = append(out, countB[:]...)
 
-	entryBuf := make([]byte, n*12)
+	scratchPtr := iobuf.Get(n * 12)
+	entryBuf := (*scratchPtr)[:n*12]
+	defer iobuf.Put(scratchPtr)
 	var valueArea []byte
 	curOff := valueOff
 

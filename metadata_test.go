@@ -37,7 +37,7 @@ func newTestMetadata(t *testing.T) *Metadata {
 		t.Fatalf("newTestMetadata: exif.Parse: %v", err)
 	}
 
-	i := &iptc.IPTC{Records: make(map[uint8][]iptc.Dataset)}
+	i := new(iptc.IPTC)
 	x := &xmp.XMP{Properties: make(map[string]map[string]string)}
 
 	return &Metadata{EXIF: e, IPTC: i, XMP: x}
