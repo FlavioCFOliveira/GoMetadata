@@ -79,7 +79,7 @@ linters:
     gocritic:
       # Activate the performance tag to surface cache-friendly and
       # allocation-reducing suggestions in hot parsing paths.
-      enabledTags:
+      enabled-tags:
         - performance
 
     exhaustive:
