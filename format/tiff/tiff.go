@@ -5,6 +5,7 @@ package tiff
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 
@@ -24,7 +25,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, fmt.Errorf("tiff: read: %w", err)
 	}
 	if len(data) < 8 {
-		return nil, nil, nil, fmt.Errorf("tiff: file too short")
+		return nil, nil, nil, errors.New("tiff: file too short")
 	}
 
 	order, err := byteOrder(data)
@@ -71,7 +72,10 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	// If no IPTC or XMP updates, write the base bytes directly.
 	if rawIPTC == nil && rawXMP == nil {
 		_, err := w.Write(base)
-		return err
+		if err != nil {
+			return fmt.Errorf("tiff: write: %w", err)
+		}
+		return nil
 	}
 
 	// Parse the TIFF, upsert IPTC/XMP entries in IFD0, and re-encode.
@@ -94,7 +98,10 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 		return fmt.Errorf("tiff: encode: %w", err)
 	}
 	_, err = w.Write(updated)
-	return err
+	if err != nil {
+		return fmt.Errorf("tiff: write updated: %w", err)
+	}
+	return nil
 }
 
 // upsertIFD0Entry adds or replaces an entry in ifd for the given tag.
@@ -102,7 +109,7 @@ func upsertIFD0Entry(ifd *exif.IFD, tag exif.TagID, typ exif.DataType, value []b
 	entry := exif.IFDEntry{
 		Tag:   tag,
 		Type:  typ,
-		Count: uint32(len(value)),
+		Count: uint32(len(value)), //nolint:gosec // G115: IFD value length bounded by input
 		Value: value,
 	}
 	for i, e := range ifd.Entries {

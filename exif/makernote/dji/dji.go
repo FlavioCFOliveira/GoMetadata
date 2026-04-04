@@ -41,7 +41,7 @@ type Parser struct{}
 // DJI MakerNote is a standard TIFF IFD at offset 0 (little-endian).
 func (Parser) Parse(b []byte) (map[uint16][]byte, error) {
 	if len(b) < 2 {
-		return nil, nil
+		return nil, nil //nolint:nilnil // (nil, nil) signals "unrecognized format"; Parser interface contract
 	}
 	// Try LE (DJI cameras use LE); fall back to BE.
 	if result := parseAt(b, binary.LittleEndian); result != nil {

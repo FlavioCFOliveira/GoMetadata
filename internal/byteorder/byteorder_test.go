@@ -112,7 +112,7 @@ func TestUint16LEBESymmetry(t *testing.T) {
 	le := Uint16LE(buf, 0)
 	be := Uint16BE(buf, 0)
 	// swap le bytes and compare with be
-	swapped := uint16(le>>8) | uint16(le<<8)
+	swapped := le>>8 | le<<8
 	if swapped != be {
 		t.Errorf("byte-swap symmetry failed: LE=0x%04X, BE=0x%04X, swap(LE)=0x%04X", le, be, swapped)
 	}

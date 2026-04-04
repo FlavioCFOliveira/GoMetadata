@@ -25,14 +25,14 @@ func buildPanasonicMakerNote(tags []struct {
 	n := len(tags)
 	buf := make([]byte, 12+2+n*12+outOfLineSize)
 	copy(buf[:12], magic)
-	binary.LittleEndian.PutUint16(buf[12:], uint16(n))
+	binary.LittleEndian.PutUint16(buf[12:], uint16(n)) //nolint:gosec // G115: test helper, intentional type cast
 
-	valueOff := uint32(12 + 2 + n*12)
+	valueOff := uint32(12 + 2 + n*12) //nolint:gosec // G115: test helper, intentional type cast
 	for i, t := range tags {
 		pos := 12 + 2 + i*12
 		binary.LittleEndian.PutUint16(buf[pos:], t.id)
 		binary.LittleEndian.PutUint16(buf[pos+2:], t.typ)
-		cnt := uint32(len(t.val)) / typeSize(t.typ)
+		cnt := uint32(len(t.val)) / typeSize(t.typ) //nolint:gosec // G115: test helper, intentional type cast
 		binary.LittleEndian.PutUint32(buf[pos+4:], cnt)
 		total := uint64(typeSize(t.typ)) * uint64(cnt)
 		if total <= 4 {
@@ -40,7 +40,7 @@ func buildPanasonicMakerNote(tags []struct {
 		} else {
 			binary.LittleEndian.PutUint32(buf[pos+8:], valueOff)
 			copy(buf[valueOff:], t.val)
-			valueOff += uint32(len(t.val))
+			valueOff += uint32(len(t.val)) //nolint:gosec // G115: test helper, intentional type cast
 		}
 	}
 	return buf

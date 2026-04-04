@@ -8,6 +8,7 @@ package heif
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -69,12 +70,12 @@ func readItemPayload(r io.ReadSeeker, loc itemLoc) ([]byte, error) {
 	if loc.length == 0 {
 		return nil, nil
 	}
-	if _, err := r.Seek(int64(loc.offset), io.SeekStart); err != nil {
-		return nil, err
+	if _, err := r.Seek(int64(loc.offset), io.SeekStart); err != nil { //nolint:gosec // G115: offset fits int64 for any realistic file
+		return nil, fmt.Errorf("heif: seek to item: %w", err)
 	}
 	payload := make([]byte, loc.length)
 	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("heif: read item payload: %w", err)
 	}
 	return payload, nil
 }
@@ -146,14 +147,20 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	// Pass through if nothing to update.
 	if rawEXIF == nil && rawXMP == nil {
 		_, err = w.Write(data)
-		return err
+		if err != nil {
+			return fmt.Errorf("heif: write: %w", err)
+		}
+		return nil
 	}
 
 	// Locate the meta box (absolute positions in the file).
 	metaAbsStart, metaAbsEnd, metaContentOff, found := findMetaBoxAbs(data)
 	if !found || metaAbsEnd > len(data) {
 		_, err = w.Write(data)
-		return err
+		if err != nil {
+			return fmt.Errorf("heif: write: %w", err)
+		}
+		return nil
 	}
 	metaContent := data[metaContentOff:metaAbsEnd]
 
@@ -163,7 +170,10 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	if !ilocOK || ilocInfo.offsetSize == 0 {
 		// Cannot encode new item offsets without an offset field.
 		_, err = w.Write(data)
-		return err
+		if err != nil {
+			return fmt.Errorf("heif: write: %w", err)
+		}
+		return nil
 	}
 
 	// Map item IDs to their new payloads.
@@ -185,7 +195,10 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	}
 	if len(pendingByID) == 0 {
 		_, err = w.Write(data)
-		return err
+		if err != nil {
+			return fmt.Errorf("heif: write: %w", err)
+		}
+		return nil
 	}
 
 	// Build updated iloc items. For each item we are replacing, collapse its
@@ -241,18 +254,18 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 
 	// Write: outputPrefix + finalMeta + suffix + new item payloads.
 	if _, err := w.Write(outputPrefix); err != nil {
-		return err
+		return fmt.Errorf("heif: write prefix: %w", err)
 	}
 	if _, err := w.Write(finalMetaBox); err != nil {
-		return err
+		return fmt.Errorf("heif: write meta: %w", err)
 	}
 	if _, err := w.Write(suffix); err != nil {
-		return err
+		return fmt.Errorf("heif: write suffix: %w", err)
 	}
 	for _, item := range updatedItems {
 		if payload, ok := pendingByID[item.id]; ok {
 			if _, err := w.Write(payload); err != nil {
-				return err
+				return fmt.Errorf("heif: write item payload: %w", err)
 			}
 		}
 	}
@@ -336,7 +349,11 @@ func parseIlocFull(metaContent []byte) (ilocBoxInfo, bool) {
 			if pos+4 > len(ilocData) {
 				break
 			}
-			item.id = uint16(binary.BigEndian.Uint32(ilocData[pos:]))
+			rawID := binary.BigEndian.Uint32(ilocData[pos:])
+			if rawID > math.MaxUint16 {
+				break // item ID exceeds uint16 range; malformed iloc box
+			}
+			item.id = uint16(rawID) //nolint:gosec // G115: range guard above ensures no overflow
 			pos += 4
 		}
 		if info.version == 1 || info.version == 2 {
@@ -395,9 +412,9 @@ func buildIlocBox(info ilocBoxInfo, items []ilocFullItem) []byte {
 	// FullBox: version(1) + flags(3)
 	body = append(body, info.version, 0, 0, 0)
 	// offset_size (high nibble) | length_size (low nibble)
-	body = append(body, byte(info.offsetSize<<4|info.lengthSize))
+	body = append(body, byte(info.offsetSize<<4|info.lengthSize)) //nolint:gosec // G115: nibble-packed field, values are 0–8
 	// base_offset_size (high nibble) | index_size (low nibble)
-	body = append(body, byte(info.baseOffsetSize<<4|info.indexSize))
+	body = append(body, byte(info.baseOffsetSize<<4|info.indexSize)) //nolint:gosec // G115: nibble-packed field, values are 0–8
 
 	if info.version < 2 {
 		body = appendUintN(body, 2, uint64(len(items)))
@@ -433,7 +450,7 @@ func buildIlocBox(info ilocBoxInfo, items []ilocFullItem) []byte {
 
 	hdr := make([]byte, 0, 8+len(body))
 	hdr = append(hdr, 0, 0, 0, 0, 'i', 'l', 'o', 'c')
-	binary.BigEndian.PutUint32(hdr, uint32(8+len(body)))
+	binary.BigEndian.PutUint32(hdr, uint32(8+len(body))) //nolint:gosec // G115: ISOBMFF box size bounded by body length
 	return append(hdr, body...)
 }
 
@@ -463,16 +480,16 @@ func buildMetaBox(versionFlags, metaContent, newIloc []byte) []byte {
 		}
 		typ := string(metaContent[pos+4 : pos+8])
 		if typ != "iloc" {
-			body = append(body, metaContent[pos:pos+int(size)]...)
+			body = append(body, metaContent[pos:pos+int(size)]...) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 		}
 		_ = headerLen
-		pos += int(size)
+		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 	}
 	body = append(body, newIloc...)
 
 	hdr := make([]byte, 0, 8+len(body))
 	hdr = append(hdr, 0, 0, 0, 0, 'm', 'e', 't', 'a')
-	binary.BigEndian.PutUint32(hdr, uint32(8+len(body)))
+	binary.BigEndian.PutUint32(hdr, uint32(8+len(body))) //nolint:gosec // G115: ISOBMFF box size bounded by body length
 	return append(hdr, body...)
 }
 
@@ -495,16 +512,16 @@ func patchAncestorSize(data []byte, metaAbsStart, delta int) {
 		if uint64(pos)+size > uint64(len(data)) {
 			break
 		}
-		boxEnd := pos + int(size)
+		boxEnd := pos + int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 		if pos < metaAbsStart && metaAbsStart < boxEnd {
 			// This box wraps the meta box — update its size.
-			newSize := int(size) + delta
+			newSize := int(size) + delta //nolint:gosec // G115: ISOBMFF box size bounded by file size
 			if newSize > 0 {
-				binary.BigEndian.PutUint32(data[pos:], uint32(newSize))
+				binary.BigEndian.PutUint32(data[pos:], uint32(newSize)) //nolint:gosec // G115: newSize > 0 checked above
 			}
 			break
 		}
-		pos += int(size)
+		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 	}
 }
 
@@ -629,7 +646,7 @@ type itemLoc struct {
 // up to depth levels deep (max 32) to prevent stack exhaustion on crafted input.
 func findBox(data []byte, boxType string, depth int) ([]byte, error) {
 	if depth > 32 {
-		return nil, fmt.Errorf("heif: findBox: exceeded maximum nesting depth")
+		return nil, errors.New("heif: findBox: exceeded maximum nesting depth")
 	}
 	pos := 0
 	for pos+8 <= len(data) {
@@ -651,7 +668,7 @@ func findBox(data []byte, boxType string, depth int) ([]byte, error) {
 			break
 		}
 
-		boxData := data[pos+int(headerLen) : pos+int(size)]
+		boxData := data[pos+int(headerLen) : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by file size
 
 		if typ == boxType {
 			// Skip the 4-byte version/flags for full boxes.
@@ -669,7 +686,7 @@ func findBox(data []byte, boxType string, depth int) ([]byte, error) {
 			}
 		}
 
-		pos += int(size)
+		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 	}
 	return nil, nil
 }
@@ -712,13 +729,13 @@ func parseIinf(metaData []byte) map[uint16]string {
 			break
 		}
 		if typ == "infe" {
-			infeData := iinfData[pos+8 : pos+int(size)]
+			infeData := iinfData[pos+8 : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by file size
 			id, itemType := parseInfe(infeData)
 			if itemType != "" {
 				result[id] = itemType
 			}
 		}
-		pos += int(size)
+		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 	}
 	return result
 }
@@ -784,7 +801,11 @@ func parseInfe(data []byte) (uint16, string) {
 		if pos+4 > len(data) {
 			return 0, ""
 		}
-		id = uint16(binary.BigEndian.Uint32(data[pos:]))
+		rawID := binary.BigEndian.Uint32(data[pos:])
+		if rawID > math.MaxUint16 {
+			return 0, "" // item ID exceeds uint16 range; malformed infe box
+		}
+		id = uint16(rawID) //nolint:gosec // G115: range guard above ensures no overflow
 		pos += 4
 		pos += 2 // item_protection_index
 		if pos+4 > len(data) {
@@ -857,7 +878,11 @@ func parseIloc(metaData []byte) map[uint16]itemLoc {
 			if pos+4 > len(ilocData) {
 				break
 			}
-			id = uint16(binary.BigEndian.Uint32(ilocData[pos:]))
+			rawID2 := binary.BigEndian.Uint32(ilocData[pos:])
+			if rawID2 > math.MaxUint16 {
+				break // item ID exceeds uint16 range; malformed iloc box
+			}
+			id = uint16(rawID2) //nolint:gosec // G115: range guard above ensures no overflow
 			pos += 4
 		}
 
@@ -954,10 +979,10 @@ func flatBoxRangeInFile(data []byte, boxType string) (start, end int, found bool
 			break
 		}
 		if typ == boxType {
-			return pos, pos + int(size), true
+			return pos, pos + int(size), true //nolint:gosec // G115: ISOBMFF box size bounded by file size
 		}
 		_ = headerLen
-		pos += int(size)
+		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 	}
 	return 0, 0, false
 }
@@ -987,10 +1012,10 @@ func findInnerBox(data []byte, boxType string) []byte {
 			break
 		}
 		if typ == boxType {
-			boxData := data[pos+int(headerLen) : pos+int(size)]
+			boxData := data[pos+int(headerLen) : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by file size
 			return boxData
 		}
-		pos += int(size)
+		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 	}
 	return nil
 }

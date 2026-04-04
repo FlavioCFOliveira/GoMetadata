@@ -29,7 +29,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, fmt.Errorf("webp: read header: %w", err)
 	}
 	if string(hdr[:4]) != "RIFF" || string(hdr[8:12]) != "WEBP" {
-		return nil, nil, nil, fmt.Errorf("webp: not a WebP file")
+		return nil, nil, nil, errors.New("webp: not a WebP file")
 	}
 
 	for {
@@ -86,7 +86,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 		return fmt.Errorf("webp: read: %w", err)
 	}
 	if len(original) < 12 {
-		return fmt.Errorf("webp: file too short")
+		return errors.New("webp: file too short")
 	}
 
 	// Collect all existing chunks except EXIF, XMP, VP8X (we rebuild VP8X).
@@ -174,19 +174,22 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	totalSize := 4 + body.Len() // "WEBP" + chunks
 	riffHdr := make([]byte, 12)
 	copy(riffHdr[:4], "RIFF")
-	binary.LittleEndian.PutUint32(riffHdr[4:], uint32(totalSize))
+	binary.LittleEndian.PutUint32(riffHdr[4:], uint32(totalSize)) //nolint:gosec // G115: RIFF size bounded by body size
 	copy(riffHdr[8:], "WEBP")
 	if _, err := w.Write(riffHdr); err != nil {
-		return err
+		return fmt.Errorf("webp: write header: %w", err)
 	}
 	_, err = w.Write(body.Bytes())
-	return err
+	if err != nil {
+		return fmt.Errorf("webp: write body: %w", err)
+	}
+	return nil
 }
 
 func writeRIFFChunk(w *bytes.Buffer, id string, data []byte) {
 	w.WriteString(id)
 	sz := make([]byte, 4)
-	binary.LittleEndian.PutUint32(sz, uint32(len(data)))
+	binary.LittleEndian.PutUint32(sz, uint32(len(data))) //nolint:gosec // G115: RIFF chunk size bounded by buffer size
 	w.Write(sz)
 	w.Write(data)
 	if len(data)%2 != 0 {

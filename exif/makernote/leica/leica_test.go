@@ -20,13 +20,13 @@ func buildPlainIFD(order binary.ByteOrder, tags []struct {
 		}
 	}
 	buf := make([]byte, 2+n*12+outSize)
-	order.PutUint16(buf[0:], uint16(n))
-	valueOff := uint32(2 + n*12)
+	order.PutUint16(buf[0:], uint16(n)) //nolint:gosec // G115: test helper, intentional type cast
+	valueOff := uint32(2 + n*12) //nolint:gosec // G115: test helper, intentional type cast
 	for i, t := range tags {
 		pos := 2 + i*12
 		order.PutUint16(buf[pos:], t.id)
 		order.PutUint16(buf[pos+2:], t.typ)
-		cnt := uint32(len(t.val)) / typeSize(t.typ)
+		cnt := uint32(len(t.val)) / typeSize(t.typ) //nolint:gosec // G115: test helper, intentional type cast
 		order.PutUint32(buf[pos+4:], cnt)
 		total := uint64(typeSize(t.typ)) * uint64(cnt)
 		if total <= 4 {
@@ -34,7 +34,7 @@ func buildPlainIFD(order binary.ByteOrder, tags []struct {
 		} else {
 			order.PutUint32(buf[pos+8:], valueOff)
 			copy(buf[valueOff:], t.val)
-			valueOff += uint32(len(t.val))
+			valueOff += uint32(len(t.val)) //nolint:gosec // G115: test helper, intentional type cast
 		}
 	}
 	return buf

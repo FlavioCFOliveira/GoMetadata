@@ -130,7 +130,7 @@ var encBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }} //nolin
 
 // Encode serialises i back to an IPTC IIM byte stream.
 func Encode(i *IPTC) ([]byte, error) {
-	buf := encBufPool.Get().(*bytes.Buffer)
+	buf := encBufPool.Get().(*bytes.Buffer) //nolint:forcetypeassert // encBufPool.New always stores *bytes.Buffer; pool invariant
 	buf.Reset()
 
 	// Re-emit the coded character set declaration (IIM §1.5.1) when the
@@ -156,13 +156,13 @@ func Encode(i *IPTC) ([]byte, error) {
 				// followed by the 4-byte big-endian length value.
 				buf.WriteByte(0x80) // bit 15 set; upper 7 bits of count = 0
 				buf.WriteByte(0x04) // lower 8 bits of count = 4
-				buf.WriteByte(byte(n >> 24))
-				buf.WriteByte(byte(n >> 16))
-				buf.WriteByte(byte(n >> 8))
-				buf.WriteByte(byte(n))
+				buf.WriteByte(byte(n >> 24)) //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding
+				buf.WriteByte(byte(n >> 16)) //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding
+				buf.WriteByte(byte(n >> 8)) //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding
+				buf.WriteByte(byte(n))      //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding
 			} else {
-				buf.WriteByte(byte(n >> 8))
-				buf.WriteByte(byte(n))
+				buf.WriteByte(byte(n >> 8)) //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding
+				buf.WriteByte(byte(n))      //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding
 			}
 			buf.Write(ds.Value)
 		}

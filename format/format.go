@@ -32,6 +32,8 @@ const (
 // String returns a human-readable name for the format.
 func (f FormatID) String() string {
 	switch f {
+	case FormatUnknown:
+		return "Unknown"
 	case FormatJPEG:
 		return "JPEG"
 	case FormatTIFF:
@@ -69,6 +71,8 @@ func SupportsWrite(f FormatID) bool {
 	case FormatJPEG, FormatTIFF, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP,
 		FormatCR2, FormatCR3, FormatNEF, FormatARW, FormatDNG, FormatORF, FormatRW2:
 		return true
+	case FormatUnknown:
+		return false
 	}
 	return false
 }

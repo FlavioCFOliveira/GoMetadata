@@ -183,10 +183,10 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 		return fmt.Errorf("jpeg: read SOI: %w", err)
 	}
 	if soi[0] != 0xFF || soi[1] != markerSOI {
-		return fmt.Errorf("jpeg: not a JPEG file")
+		return errors.New("jpeg: not a JPEG file")
 	}
 	if _, err := w.Write(soi[:]); err != nil {
-		return err
+		return fmt.Errorf("jpeg: write segment: %w", err)
 	}
 
 	// Write new metadata segments before any existing ones.
@@ -274,19 +274,24 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 			if err := writeSegment(w, markerSOS, data); err != nil {
 				return err
 			}
-			_, err = io.Copy(w, r)
-			return err
+			if _, err = io.Copy(w, r); err != nil {
+				return fmt.Errorf("jpeg: copy image data: %w", err)
+			}
+			return nil
 		}
 
 		if marker == markerEOI {
 			_, err = w.Write([]byte{0xFF, markerEOI})
-			return err
+			if err != nil {
+				return fmt.Errorf("jpeg: write image data: %w", err)
+			}
+			return nil
 		}
 
 		if data == nil {
 			// Standalone marker (no data).
 			if _, err := w.Write([]byte{0xFF, marker}); err != nil {
-				return err
+				return fmt.Errorf("jpeg: write segment data: %w", err)
 			}
 		} else {
 			if err := writeSegment(w, marker, data); err != nil {
@@ -357,7 +362,7 @@ func writeExtendedXMP(w io.Writer, rawXMP []byte) error {
 	// Extended APP1 layout (Adobe XMP Spec Part 3 §1.1.4):
 	//   identXMPNote (32 bytes) | GUID (32 bytes) | fullLength (4 bytes BE) |
 	//   offset (4 bytes BE) | chunk data
-	fullLen := uint32(len(rawXMP))
+	fullLen := uint32(len(rawXMP)) //nolint:gosec // G115: XMP payload size bounded by input
 	offset := uint32(0)
 	guidBytes := []byte(guid) // 32 ASCII bytes
 
@@ -459,7 +464,7 @@ func buildIRB(iptcData []byte) []byte {
 	buf = append(buf, 0x04, 0x04) // resource ID 0x0404
 	buf = append(buf, 0x00, 0x00) // empty pascal name (length 0 + padding byte)
 	buf = append(buf,
-		byte(size>>24), byte(size>>16), byte(size>>8), byte(size))
+		byte(size>>24), byte(size>>16), byte(size>>8), byte(size)) //nolint:gosec // G115: byte extraction from int size value, each byte individually masked by shift
 	buf = append(buf, iptcData...)
 	if size%2 != 0 {
 		buf = append(buf, 0x00) // pad data to even boundary
@@ -484,7 +489,7 @@ func readSegment(r io.Reader, scratch *[]byte) (marker byte, data []byte, err er
 	hdr := (*scratch)[:2]
 
 	if _, err = io.ReadFull(r, hdr); err != nil {
-		return 0, nil, err
+		return 0, nil, fmt.Errorf("jpeg: read segment header: %w", err)
 	}
 	if hdr[0] != 0xFF {
 		return 0, nil, fmt.Errorf("jpeg: expected marker prefix 0xFF, got 0x%02X", hdr[0])
@@ -492,7 +497,7 @@ func readSegment(r io.Reader, scratch *[]byte) (marker byte, data []byte, err er
 	// Skip fill bytes (consecutive 0xFF).
 	for hdr[1] == 0xFF {
 		if _, err = io.ReadFull(r, hdr[1:]); err != nil {
-			return 0, nil, err
+			return 0, nil, fmt.Errorf("jpeg: read fill byte: %w", err)
 		}
 	}
 	marker = hdr[1]
@@ -530,13 +535,14 @@ func writeSegment(w io.Writer, marker byte, data []byte) error {
 	if length > 65535 {
 		return fmt.Errorf("jpeg: segment 0x%02X payload %d bytes exceeds 65535-byte APP segment limit", marker, len(data))
 	}
-	hdr := [4]byte{0xFF, marker, byte(length >> 8), byte(length)}
+	hdr := [4]byte{0xFF, marker, byte(length >> 8), byte(length)} //nolint:gosec // G115: JPEG segment length ≤ 65535 per format spec
 	if _, err := w.Write(hdr[:]); err != nil {
-		return err
+		return fmt.Errorf("jpeg: write segment header: %w", err)
 	}
 	if len(data) > 0 {
-		_, err := w.Write(data)
-		return err
+		if _, err := w.Write(data); err != nil {
+			return fmt.Errorf("jpeg: write segment body: %w", err)
+		}
 	}
 	return nil
 }

@@ -36,7 +36,7 @@ type Parser struct{}
 // Handles both the prefixed and non-prefixed formats.
 func (Parser) Parse(b []byte) (map[uint16][]byte, error) {
 	if len(b) < 2 {
-		return nil, nil
+		return nil, nil //nolint:nilnil // (nil, nil) signals "unrecognized format"; Parser interface contract
 	}
 	// Type 1–5: "LEICA\x00" prefix (6 bytes) + 2-byte sub-type + IFD at 8.
 	if len(b) >= 8 && b[0] == 'L' && b[1] == 'E' && b[2] == 'I' &&

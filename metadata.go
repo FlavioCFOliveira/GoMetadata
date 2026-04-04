@@ -1,7 +1,7 @@
 package gometadata
 
 import (
-	"fmt"
+	"errors"
 	"time"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
@@ -60,10 +60,10 @@ func (m *Metadata) Validate() error {
 		return &UnsupportedFormatError{}
 	}
 	if m.EXIF != nil && m.EXIF.IFD0 == nil {
-		return fmt.Errorf("gometadata: EXIF struct has nil IFD0; use exif.Parse to construct a valid EXIF")
+		return errors.New("gometadata: EXIF struct has nil IFD0; use exif.Parse to construct a valid EXIF")
 	}
 	if m.XMP != nil && m.XMP.Properties == nil {
-		return fmt.Errorf("gometadata: XMP struct has nil Properties map")
+		return errors.New("gometadata: XMP struct has nil Properties map")
 	}
 	return nil
 }

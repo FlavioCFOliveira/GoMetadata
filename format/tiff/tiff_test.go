@@ -38,14 +38,14 @@ func buildMinimalTIFF(order binary.ByteOrder, iptc, xmp []byte) []byte {
 	// Header = 8, ifd = 2 + len(specs)*12 + 4
 	headerSize := 8
 	ifdSize := 2 + len(specs)*12 + 4
-	dataOff := uint32(headerSize + ifdSize)
+	dataOff := uint32(headerSize + ifdSize) //nolint:gosec // G115: test helper, intentional type cast
 
 	entries := make([]entry, 0, len(specs))
 	var valueBuf bytes.Buffer
 	for _, s := range specs {
 		typ := uint16(7)  // UNDEFINED
-		cnt := uint32(len(s.payload))
-		off := dataOff + uint32(valueBuf.Len())
+		cnt := uint32(len(s.payload)) //nolint:gosec // G115: test helper, intentional type cast
+		off := dataOff + uint32(valueBuf.Len()) //nolint:gosec // G115: test helper, intentional type cast
 		entries = append(entries, entry{s.tag, typ, cnt, off, s.payload})
 		valueBuf.Write(s.payload)
 	}
@@ -63,7 +63,7 @@ func buildMinimalTIFF(order binary.ByteOrder, iptc, xmp []byte) []byte {
 
 	// IFD.
 	ifdStart := 8
-	order.PutUint16(buf[ifdStart:], uint16(len(entries)))
+	order.PutUint16(buf[ifdStart:], uint16(len(entries))) //nolint:gosec // G115: test helper, intentional type cast
 	for i, e := range entries {
 		p := ifdStart + 2 + i*12
 		order.PutUint16(buf[p:], e.tag)
@@ -250,7 +250,7 @@ func buildTIFFWithPrivateTag(tag uint16, typ uint16, value []byte) []byte {
 	e := ifd0Off + 2
 	order.PutUint16(buf[e:], tag)
 	order.PutUint16(buf[e+2:], typ)
-	order.PutUint32(buf[e+4:], uint32(total))
+	order.PutUint32(buf[e+4:], uint32(total)) //nolint:gosec // G115: test helper, intentional type cast
 	if total <= 4 {
 		copy(buf[e+8:], value)
 	} else {

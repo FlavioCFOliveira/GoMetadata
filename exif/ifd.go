@@ -56,7 +56,7 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, error) {
 
 	// visited tracks offsets we have already started parsing to detect cycles.
 	// Obtained from visitedPool to avoid a per-call allocation on the hot path.
-	visited := visitedPool.Get().(map[uint32]bool)
+	visited := visitedPool.Get().(map[uint32]bool) //nolint:forcetypeassert // visitedPool.New always stores map[uint32]bool; pool invariant
 	defer func() {
 		for k := range visited {
 			delete(visited, k)
@@ -226,8 +226,8 @@ func (e *IFDEntry) SRational(i int) [2]int32 {
 		return [2]int32{}
 	}
 	return [2]int32{
-		int32(e.byteOrder.Uint32(e.Value[off:])),
-		int32(e.byteOrder.Uint32(e.Value[off+4:])),
+		int32(e.byteOrder.Uint32(e.Value[off:])),   //nolint:gosec // G115: intentional bit-reinterpretation of uint32 as signed int32 per EXIF TypeSRational
+		int32(e.byteOrder.Uint32(e.Value[off+4:])), //nolint:gosec // G115: intentional bit-reinterpretation of uint32 as signed int32 per EXIF TypeSRational
 	}
 }
 
@@ -236,7 +236,7 @@ func (e *IFDEntry) Int16() int16 {
 	if e.Type != TypeSShort || len(e.Value) < 2 {
 		return 0
 	}
-	return int16(e.byteOrder.Uint16(e.Value))
+	return int16(e.byteOrder.Uint16(e.Value)) //nolint:gosec // G115: intentional bit-reinterpretation per EXIF TypeSShort
 }
 
 // Int32 decodes the first SLONG value.
@@ -244,7 +244,7 @@ func (e *IFDEntry) Int32() int32 {
 	if e.Type != TypeSLong || len(e.Value) < 4 {
 		return 0
 	}
-	return int32(e.byteOrder.Uint32(e.Value))
+	return int32(e.byteOrder.Uint32(e.Value)) //nolint:gosec // G115: intentional bit-reinterpretation per EXIF TypeSLong
 }
 
 // Float32 decodes the first FLOAT value (IEEE 754 single-precision).
@@ -367,7 +367,7 @@ func sortEntries(entries []IFDEntry) {
 // ifdTotalSize returns the total bytes occupied by the serialised IFD block:
 // 2 (entry count) + len(entries)*12 (entry list) + 4 (next-IFD pointer) + value area.
 func ifdTotalSize(entries []IFDEntry) uint32 {
-	sz := uint32(2 + len(entries)*12 + 4)
+	sz := uint32(2 + len(entries)*12 + 4) //nolint:gosec // G115: IFD size bounded by validated entry count
 	for _, e := range entries {
 		ts := typeSize(e.Type)
 		if ts == 0 {
@@ -375,7 +375,7 @@ func ifdTotalSize(entries []IFDEntry) uint32 {
 		}
 		total := uint64(ts) * uint64(e.Count)
 		if total > 4 {
-			sz += uint32(total)
+			sz += uint32(total) //nolint:gosec // G115: total is bounded by IFD size constraints
 		}
 	}
 	return sz
@@ -388,10 +388,10 @@ func ifdTotalSize(entries []IFDEntry) uint32 {
 func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, nextIFDOffset uint32) []byte {
 	n := len(entries)
 	// value area begins right after: 2 (count) + n*12 (entries) + 4 (next-IFD).
-	valueOff := startOff + uint32(2+n*12+4)
+	valueOff := startOff + uint32(2+n*12+4) //nolint:gosec // G115: IFD size bounded by validated entry count
 
 	var countB [2]byte
-	order.PutUint16(countB[:], uint16(n))
+	order.PutUint16(countB[:], uint16(n)) //nolint:gosec // G115: IFD entry count bounded by parser-validated input
 	out = append(out, countB[:]...)
 
 	scratchPtr := iobuf.Get(n * 12)
@@ -415,7 +415,7 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 		} else {
 			order.PutUint32(entryBuf[p+8:], curOff)
 			valueArea = append(valueArea, e.Value...)
-			curOff += uint32(len(e.Value))
+			curOff += uint32(len(e.Value)) //nolint:gosec // G115: value length bounded by input
 		}
 	}
 

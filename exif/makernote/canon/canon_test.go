@@ -12,7 +12,7 @@ func buildCanonIFD(entries []struct{ tag, typ uint16; val uint32 }) []byte {
 	// IFD: count(2) + n*12 bytes entries (no next-IFD pointer in MakerNote)
 	buf := make([]byte, 2+n*12)
 	le := binary.LittleEndian
-	le.PutUint16(buf[0:], uint16(n))
+	le.PutUint16(buf[0:], uint16(n)) //nolint:gosec // G115: test helper, intentional type cast
 	for i, e := range entries {
 		p := 2 + i*12
 		le.PutUint16(buf[p:], e.tag)

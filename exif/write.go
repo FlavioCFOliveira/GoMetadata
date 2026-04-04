@@ -2,7 +2,7 @@ package exif
 
 import (
 	"encoding/binary"
-	"fmt"
+	"errors"
 )
 
 // encode serialises e to a raw EXIF byte stream beginning with the TIFF
@@ -24,7 +24,7 @@ import (
 //     type codes must re-inject that data after calling Encode.
 func encode(e *EXIF) ([]byte, error) {
 	if e == nil {
-		return nil, fmt.Errorf("exif: cannot encode nil EXIF")
+		return nil, errors.New("exif: cannot encode nil EXIF")
 	}
 
 	order := e.ByteOrder
@@ -63,7 +63,7 @@ func encode(e *EXIF) ([]byte, error) {
 			exifIFDEntries = append(exifIFDEntries, IFDEntry{
 				Tag:       TagMakerNote,
 				Type:      TypeUndefined,
-				Count:     uint32(len(e.MakerNote)),
+				Count:     uint32(len(e.MakerNote)), //nolint:gosec // G115: MakerNote length bounded by input
 				Value:     e.MakerNote,
 				byteOrder: order,
 			})
@@ -131,25 +131,25 @@ func encode(e *EXIF) ([]byte, error) {
 	if e.IFD0 != nil && e.IFD0.Next != nil {
 		ifd0NextPtr = ifd1Start
 	}
-	out = writeIFD(out, ifd0Entries, order, uint32(len(out)), ifd0NextPtr)
+	out = writeIFD(out, ifd0Entries, order, uint32(len(out)), ifd0NextPtr) //nolint:gosec // G115: output offset bounded by buffer size
 
 	if e.ExifIFD != nil {
-		out = writeIFD(out, exifIFDEntries, order, uint32(len(out)), 0)
+		out = writeIFD(out, exifIFDEntries, order, uint32(len(out)), 0) //nolint:gosec // G115: output offset bounded by buffer size
 	}
 	if e.GPSIFD != nil {
-		out = writeIFD(out, e.GPSIFD.Entries, order, uint32(len(out)), 0)
+		out = writeIFD(out, e.GPSIFD.Entries, order, uint32(len(out)), 0) //nolint:gosec // G115: output offset bounded by buffer size
 	}
 	if e.InteropIFD != nil {
-		out = writeIFD(out, e.InteropIFD.Entries, order, uint32(len(out)), 0)
+		out = writeIFD(out, e.InteropIFD.Entries, order, uint32(len(out)), 0) //nolint:gosec // G115: output offset bounded by buffer size
 	}
 
 	// Serialise the IFD1 chain (thumbnail IFDs, TIFF §2).
 	for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
 		nextPtr := uint32(0)
 		if ifd.Next != nil {
-			nextPtr = uint32(len(out)) + ifdTotalSize(ifd.Entries)
+			nextPtr = uint32(len(out)) + ifdTotalSize(ifd.Entries) //nolint:gosec // G115: output offset bounded by buffer size
 		}
-		out = writeIFD(out, ifd.Entries, order, uint32(len(out)), nextPtr)
+		out = writeIFD(out, ifd.Entries, order, uint32(len(out)), nextPtr) //nolint:gosec // G115: output offset bounded by buffer size
 	}
 
 	return out, nil

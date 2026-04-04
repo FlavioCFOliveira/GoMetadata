@@ -60,14 +60,14 @@ type Parser struct{}
 // Handles both "SIGMA\x00\x00\x00" and "FOVEON\x00\x00" prefixes.
 func (Parser) Parse(b []byte) (map[uint16][]byte, error) {
 	if len(b) < 10 {
-		return nil, nil
+		return nil, nil //nolint:nilnil // (nil, nil) signals "unrecognized format"; Parser interface contract
 	}
 	// Validate known prefixes.
 	switch {
 	case len(b) >= 8 && string(b[:8]) == "SIGMA\x00\x00\x00":
 	case len(b) >= 8 && string(b[:8]) == "FOVEON\x00\x00":
 	default:
-		return nil, nil
+		return nil, nil //nolint:nilnil // (nil, nil) signals "unrecognized format"; Parser interface contract
 	}
 	// IFD starts at offset 10, little-endian.
 	return parseAt(b, 10), nil

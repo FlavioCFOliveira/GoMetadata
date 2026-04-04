@@ -17,7 +17,7 @@ func buildJPEG(exifData, iptcData, xmpData []byte) []byte {
 	if exifData != nil {
 		// APP1 with Exif header
 		payload := append([]byte("Exif\x00\x00"), exifData...)
-		length := uint16(len(payload) + 2)
+		length := uint16(len(payload) + 2) //nolint:gosec // G115: test helper, intentional type cast
 		buf.Write([]byte{0xFF, 0xE1})
 		var lbuf [2]byte
 		binary.BigEndian.PutUint16(lbuf[:], length)
@@ -29,7 +29,7 @@ func buildJPEG(exifData, iptcData, xmpData []byte) []byte {
 		// APP1 with XMP namespace
 		ns := "http://ns.adobe.com/xap/1.0/\x00"
 		payload := append([]byte(ns), xmpData...)
-		length := uint16(len(payload) + 2)
+		length := uint16(len(payload) + 2) //nolint:gosec // G115: test helper, intentional type cast
 		buf.Write([]byte{0xFF, 0xE1})
 		var lbuf [2]byte
 		binary.BigEndian.PutUint16(lbuf[:], length)
@@ -47,14 +47,14 @@ func buildJPEG(exifData, iptcData, xmpData []byte) []byte {
 		irb.Write([]byte{0x00, 0x00}) // pascal string (empty name)
 		// Resource data size (4 bytes BE)
 		var sz [4]byte
-		binary.BigEndian.PutUint32(sz[:], uint32(len(iptcData)))
+		binary.BigEndian.PutUint32(sz[:], uint32(len(iptcData))) //nolint:gosec // G115: test helper, intentional type cast
 		irb.Write(sz[:])
 		irb.Write(iptcData)
 		if len(iptcData)%2 != 0 {
 			irb.WriteByte(0x00)
 		}
 
-		length := uint16(irb.Len() + 2)
+		length := uint16(irb.Len() + 2) //nolint:gosec // G115: test helper, intentional type cast
 		buf.Write([]byte{0xFF, 0xED})
 		var lbuf [2]byte
 		binary.BigEndian.PutUint16(lbuf[:], length)
@@ -148,7 +148,7 @@ func buildJPEGWithAPP2(exifData []byte, app2Payload []byte) []byte {
 
 	// APP2 segment
 	if app2Payload != nil {
-		length := uint16(len(app2Payload) + 2)
+		length := uint16(len(app2Payload) + 2) //nolint:gosec // G115: test helper, intentional type cast
 		buf.Write([]byte{0xFF, 0xE2})
 		var lbuf [2]byte
 		binary.BigEndian.PutUint16(lbuf[:], length)
@@ -158,7 +158,7 @@ func buildJPEGWithAPP2(exifData []byte, app2Payload []byte) []byte {
 
 	if exifData != nil {
 		payload := append([]byte("Exif\x00\x00"), exifData...)
-		length := uint16(len(payload) + 2)
+		length := uint16(len(payload) + 2) //nolint:gosec // G115: test helper, intentional type cast
 		buf.Write([]byte{0xFF, 0xE1})
 		var lbuf [2]byte
 		binary.BigEndian.PutUint16(lbuf[:], length)
@@ -182,7 +182,7 @@ func buildExtendedXMPJPEG(mainXMP []byte, guid string, extContent []byte) []byte
 
 	// Main XMP APP1
 	mainPayload := append([]byte("http://ns.adobe.com/xap/1.0/\x00"), mainXMP...)
-	mainLen := uint16(len(mainPayload) + 2)
+	mainLen := uint16(len(mainPayload) + 2) //nolint:gosec // G115: test helper, intentional type cast
 	buf.Write([]byte{0xFF, 0xE1})
 	var lbuf [2]byte
 	binary.BigEndian.PutUint16(lbuf[:], mainLen)
@@ -195,7 +195,7 @@ func buildExtendedXMPJPEG(mainXMP []byte, guid string, extContent []byte) []byte
 	extBody.WriteString("http://ns.adobe.com/xap/1.0/se/\x00")
 	extBody.WriteString(guid) // 32 bytes
 	var fullLenBuf [4]byte
-	binary.BigEndian.PutUint32(fullLenBuf[:], uint32(len(extContent)))
+	binary.BigEndian.PutUint32(fullLenBuf[:], uint32(len(extContent))) //nolint:gosec // G115: test helper, intentional type cast
 	extBody.Write(fullLenBuf[:])
 	var offsetBuf [4]byte
 	binary.BigEndian.PutUint32(offsetBuf[:], 0) // first chunk starts at offset 0
@@ -203,7 +203,7 @@ func buildExtendedXMPJPEG(mainXMP []byte, guid string, extContent []byte) []byte
 	extBody.Write(extContent)
 
 	extPayload := extBody.Bytes()
-	extLen := uint16(len(extPayload) + 2)
+	extLen := uint16(len(extPayload) + 2) //nolint:gosec // G115: test helper, intentional type cast
 	buf.Write([]byte{0xFF, 0xE1})
 	binary.BigEndian.PutUint16(lbuf[:], extLen)
 	buf.Write(lbuf[:])
@@ -222,7 +222,7 @@ func buildJPEGWithFillByte(exifData []byte) []byte {
 
 	// 0xFF fill byte before APP1 marker — readSegment must skip it.
 	payload := append([]byte("Exif\x00\x00"), exifData...)
-	length := uint16(len(payload) + 2)
+	length := uint16(len(payload) + 2) //nolint:gosec // G115: test helper, intentional type cast
 	buf.Write([]byte{0xFF, 0xFF, 0xE1})
 	var lbuf [2]byte
 	binary.BigEndian.PutUint16(lbuf[:], length)
@@ -241,10 +241,10 @@ func buildAPP13MultiBlock(rid1 uint16, data1, iptcData []byte) []byte {
 
 	// First block: rid1
 	irb.WriteString("8BIM")
-	irb.Write([]byte{byte(rid1 >> 8), byte(rid1)})
+	irb.Write([]byte{byte(rid1 >> 8), byte(rid1)}) //nolint:gosec // G115: test helper, intentional type cast
 	irb.Write([]byte{0x00, 0x00}) // empty pascal name
 	var sz [4]byte
-	binary.BigEndian.PutUint32(sz[:], uint32(len(data1)))
+	binary.BigEndian.PutUint32(sz[:], uint32(len(data1))) //nolint:gosec // G115: test helper, intentional type cast
 	irb.Write(sz[:])
 	irb.Write(data1)
 	if len(data1)%2 != 0 {
@@ -255,7 +255,7 @@ func buildAPP13MultiBlock(rid1 uint16, data1, iptcData []byte) []byte {
 	irb.WriteString("8BIM")
 	irb.Write([]byte{0x04, 0x04})
 	irb.Write([]byte{0x00, 0x00})
-	binary.BigEndian.PutUint32(sz[:], uint32(len(iptcData)))
+	binary.BigEndian.PutUint32(sz[:], uint32(len(iptcData))) //nolint:gosec // G115: test helper, intentional type cast
 	irb.Write(sz[:])
 	irb.Write(iptcData)
 	if len(iptcData)%2 != 0 {
@@ -265,7 +265,7 @@ func buildAPP13MultiBlock(rid1 uint16, data1, iptcData []byte) []byte {
 	irbBytes := irb.Bytes()
 	var out bytes.Buffer
 	out.Write([]byte{0xFF, 0xD8})
-	totalLen := uint16(len(irbBytes) + 2)
+	totalLen := uint16(len(irbBytes) + 2) //nolint:gosec // G115: test helper, intentional type cast
 	out.Write([]byte{0xFF, 0xED})
 	var lbuf [2]byte
 	binary.BigEndian.PutUint16(lbuf[:], totalLen)
@@ -289,7 +289,7 @@ func TestExtractRSTMarkerNoPanic(t *testing.T) {
 	// APP1 with EXIF
 	payload := append([]byte("Exif\x00\x00"), tiffData...)
 	var lbuf [2]byte
-	binary.BigEndian.PutUint16(lbuf[:], uint16(len(payload)+2))
+	binary.BigEndian.PutUint16(lbuf[:], uint16(len(payload)+2)) //nolint:gosec // G115: test helper, intentional type cast
 	buf.Write([]byte{0xFF, 0xE1})
 	buf.Write(lbuf[:])
 	buf.Write(payload)

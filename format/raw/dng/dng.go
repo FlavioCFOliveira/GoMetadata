@@ -4,6 +4,7 @@
 package dng
 
 import (
+	"fmt"
 	"io"
 
 	"github.com/FlavioCFOliveira/GoMetadata/format/tiff"
@@ -11,10 +12,17 @@ import (
 
 // Extract reads metadata from a DNG file.
 func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
-	return tiff.Extract(r)
+	rawEXIF, rawIPTC, rawXMP, err = tiff.Extract(r)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("dng: %w", err)
+	}
+	return rawEXIF, rawIPTC, rawXMP, nil
 }
 
 // Inject writes a modified DNG stream to w.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
-	return tiff.Inject(r, w, rawEXIF, rawIPTC, rawXMP)
+	if err := tiff.Inject(r, w, rawEXIF, rawIPTC, rawXMP); err != nil {
+		return fmt.Errorf("dng: %w", err)
+	}
+	return nil
 }

@@ -77,7 +77,7 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) {
 	}
 
 	// Offset to IFD0 (TIFF §2).
-	ifd0Off := order.Uint32(b[4:])
+	ifd0Off := order.Uint32(b[4:]) //nolint:gosec // G602: len(b) >= 8 is asserted earlier in this function; false positive
 
 	e := &EXIF{ByteOrder: order}
 
@@ -211,7 +211,7 @@ func (e *EXIF) DateTimeOriginal() (time.Time, bool) {
 func parseExifTZ(s string) (*time.Location, error) {
 	t, err := time.Parse("-07:00", s)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("exif: parse date/time: %w", err)
 	}
 	_, offset := t.Zone()
 	return time.FixedZone(s, offset), nil
@@ -365,7 +365,7 @@ func (e *EXIF) SetCameraModel(s string) {
 		return
 	}
 	v := asciiValue(s)
-	e.IFD0.set(TagModel, TypeASCII, uint32(len(v)), v)
+	e.IFD0.set(TagModel, TypeASCII, uint32(len(v)), v) //nolint:gosec // G115: string length bounded by input
 }
 
 // SetCaption sets IFD0 tag 0x010E (ImageDescription, EXIF §4.6.4 Table 3).
@@ -374,7 +374,7 @@ func (e *EXIF) SetCaption(s string) {
 		return
 	}
 	v := asciiValue(s)
-	e.IFD0.set(TagImageDescription, TypeASCII, uint32(len(v)), v)
+	e.IFD0.set(TagImageDescription, TypeASCII, uint32(len(v)), v) //nolint:gosec // G115: string length bounded by input
 }
 
 // SetCopyright sets IFD0 tag 0x8298 (Copyright, EXIF §4.6.4 Table 3).
@@ -383,7 +383,7 @@ func (e *EXIF) SetCopyright(s string) {
 		return
 	}
 	v := asciiValue(s)
-	e.IFD0.set(TagCopyright, TypeASCII, uint32(len(v)), v)
+	e.IFD0.set(TagCopyright, TypeASCII, uint32(len(v)), v) //nolint:gosec // G115: string length bounded by input
 }
 
 // SetCreator sets IFD0 tag 0x013B (Artist, EXIF §4.6.4 Table 3).
@@ -392,7 +392,7 @@ func (e *EXIF) SetCreator(s string) {
 		return
 	}
 	v := asciiValue(s)
-	e.IFD0.set(TagArtist, TypeASCII, uint32(len(v)), v)
+	e.IFD0.set(TagArtist, TypeASCII, uint32(len(v)), v) //nolint:gosec // G115: string length bounded by input
 }
 
 // SetOrientation sets IFD0 tag 0x0112 (Orientation, EXIF §4.6.4 Table 3).
@@ -431,7 +431,7 @@ func (e *EXIF) SetMake(s string) {
 		return
 	}
 	v := asciiValue(s)
-	e.IFD0.set(TagMake, TypeASCII, uint32(len(v)), v)
+	e.IFD0.set(TagMake, TypeASCII, uint32(len(v)), v) //nolint:gosec // G115: string length bounded by input
 }
 
 // SetDateTimeOriginal sets ExifIFD tag 0x9003 (DateTimeOriginal, EXIF §4.6.5)
@@ -444,7 +444,7 @@ func (e *EXIF) SetDateTimeOriginal(t time.Time) {
 	// EXIF §4.6.5: DateTimeOriginal is a 20-byte ASCII field including the NUL.
 	formatted := t.Format("2006:01:02 15:04:05") + "\x00"
 	v := []byte(formatted)
-	e.ExifIFD.set(TagDateTimeOriginal, TypeASCII, uint32(len(v)), v)
+	e.ExifIFD.set(TagDateTimeOriginal, TypeASCII, uint32(len(v)), v) //nolint:gosec // G115: string length bounded by input
 }
 
 // SetExposureTime sets ExifIFD tag 0x829A (ExposureTime, EXIF §4.6.5).
@@ -485,7 +485,10 @@ func (e *EXIF) SetISO(iso uint) {
 	e.ensureExifIFD()
 	order := e.ifd0ByteOrder()
 	var b [2]byte
-	order.PutUint16(b[:], uint16(iso))
+	if iso > 65535 {
+		iso = 65535
+	}
+	order.PutUint16(b[:], uint16(iso)) //nolint:gosec // G115: clamped to uint16 range above
 	e.ExifIFD.set(TagISOSpeedRatings, TypeShort, 1, b[:])
 }
 
@@ -512,7 +515,7 @@ func (e *EXIF) SetLensModel(s string) {
 	}
 	e.ensureExifIFD()
 	v := asciiValue(s)
-	e.ExifIFD.set(TagLensModel, TypeASCII, uint32(len(v)), v)
+	e.ExifIFD.set(TagLensModel, TypeASCII, uint32(len(v)), v) //nolint:gosec // G115: string length bounded by input
 }
 
 // SetImageSize sets ExifIFD tags 0xA002 and 0xA003 (PixelXDimension /

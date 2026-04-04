@@ -92,7 +92,7 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 func ReadFile(path string, opts ...ReadOption) (*Metadata, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("gometadata: open file: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 	return Read(f, opts...)
@@ -102,33 +102,41 @@ func ReadFile(path string, opts ...ReadOption) (*Metadata, error) {
 func extractByFormat(r io.ReadSeeker, fmtID format.FormatID) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	switch fmtID {
 	case format.FormatJPEG:
-		return jpeg.Extract(r)
+		return wrapExtract(jpeg.Extract(r))
 	case format.FormatTIFF:
-		return tiff.Extract(r)
+		return wrapExtract(tiff.Extract(r))
 	case format.FormatPNG:
-		return png.Extract(r)
+		return wrapExtract(png.Extract(r))
 	case format.FormatWebP:
-		return webp.Extract(r)
+		return wrapExtract(webp.Extract(r))
 	case format.FormatHEIF:
-		return heif.Extract(r)
+		return wrapExtract(heif.Extract(r))
 	case format.FormatAVIF:
 		// AVIF uses the same ISOBMFF container as HEIF; delegate to the HEIF handler.
-		return heif.Extract(r)
+		return wrapExtract(heif.Extract(r))
 	case format.FormatCR2:
-		return cr2.Extract(r)
+		return wrapExtract(cr2.Extract(r))
 	case format.FormatCR3:
-		return cr3.Extract(r)
+		return wrapExtract(cr3.Extract(r))
 	case format.FormatNEF:
-		return nef.Extract(r)
+		return wrapExtract(nef.Extract(r))
 	case format.FormatARW:
-		return arw.Extract(r)
+		return wrapExtract(arw.Extract(r))
 	case format.FormatDNG:
-		return dng.Extract(r)
+		return wrapExtract(dng.Extract(r))
 	case format.FormatORF:
-		return orf.Extract(r)
+		return wrapExtract(orf.Extract(r))
 	case format.FormatRW2:
-		return rw2.Extract(r)
+		return wrapExtract(rw2.Extract(r))
 	default:
 		return nil, nil, nil, &UnsupportedFormatError{}
 	}
+}
+
+// wrapExtract wraps errors from format-specific Extract calls with the library prefix.
+func wrapExtract(rawEXIF, rawIPTC, rawXMP []byte, err error) ([]byte, []byte, []byte, error) {
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("gometadata: %w", err)
+	}
+	return rawEXIF, rawIPTC, rawXMP, nil
 }

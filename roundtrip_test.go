@@ -40,7 +40,7 @@ func rtBuildJPEG(exifData []byte) []byte {
 	if exifData != nil {
 		// APP1 with Exif header (JEITA CP-3451 §4.5.4).
 		payload := append([]byte("Exif\x00\x00"), exifData...)
-		length := uint16(len(payload) + 2)
+		length := uint16(len(payload) + 2) //nolint:gosec // G115: test helper, intentional type cast
 		buf.Write([]byte{0xFF, 0xE1})
 		var lb [2]byte
 		binary.BigEndian.PutUint16(lb[:], length)
@@ -85,13 +85,13 @@ func rtMinimalTIFF() []byte {
 // rtPNGWriteChunk appends a PNG chunk with correct CRC to buf.
 func rtPNGWriteChunk(buf *bytes.Buffer, chunkType string, data []byte) {
 	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(data)))
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(data))) //nolint:gosec // G115: test helper, intentional type cast
 	buf.Write(hdr[:])
 	buf.WriteString(chunkType)
 	buf.Write(data)
 	h := crc32.NewIEEE()
-	h.Write([]byte(chunkType))
-	h.Write(data)
+	_, _ = h.Write([]byte(chunkType)) //nolint:gosec // G104: hash.Hash.Write never returns an error
+	_, _ = h.Write(data)               //nolint:gosec // G104: hash.Hash.Write never returns an error
 	binary.BigEndian.PutUint32(hdr[:], h.Sum32())
 	buf.Write(hdr[:])
 }
@@ -161,7 +161,7 @@ func rtBuildWebP(exifData, xmpData []byte, vp8xFlags uint32) []byte {
 	}
 
 	// RIFF header: "RIFF" + 4-byte body size (body includes "WEBP") + "WEBP".
-	totalBodySize := uint32(4 + body.Len())
+	totalBodySize := uint32(4 + body.Len()) //nolint:gosec // G115: test helper, intentional type cast
 	var out bytes.Buffer
 	out.WriteString("RIFF")
 	var sz [4]byte
@@ -177,7 +177,7 @@ func rtBuildWebP(exifData, xmpData []byte, vp8xFlags uint32) []byte {
 func rtWriteWebPChunk(buf *bytes.Buffer, fourCC string, data []byte) {
 	buf.WriteString(fourCC)
 	var sz [4]byte
-	binary.LittleEndian.PutUint32(sz[:], uint32(len(data)))
+	binary.LittleEndian.PutUint32(sz[:], uint32(len(data))) //nolint:gosec // G115: test helper, intentional type cast
 	buf.Write(sz[:])
 	buf.Write(data)
 	if len(data)%2 != 0 {

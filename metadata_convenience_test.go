@@ -114,7 +114,7 @@ func buildTIFFMultiIFD(ifd0Extra, exifEntries, gpsEntries []tiffEntry) []byte {
 
 	// Absolute offsets within the TIFF blob.
 	ifd0Off := uint32(headerSz)
-	exifOff := ifd0Off + uint32(ifd0Sz)
+	exifOff := ifd0Off + uint32(ifd0Sz) //nolint:gosec // G115: test helper, intentional type cast
 	gpsOff := exifOff + uint32(exifSz)
 	valueAreaStart := gpsOff + uint32(gpsSz)
 
@@ -142,10 +142,10 @@ func buildTIFFMultiIFD(ifd0Extra, exifEntries, gpsEntries []tiffEntry) []byte {
 	placeEntries := func(entries []tiffEntry, ifdIdx int) {
 		for i := range entries {
 			e := &entries[i]
-			totalSize := uint32(typeSize(e.typ)) * e.count
+			totalSize := uint32(typeSize(e.typ)) * e.count //nolint:gosec // G115: test helper, intentional type cast
 			if totalSize > 4 && len(e.outOfLine) > 0 {
 				placements = append(placements, valPlacement{ifdIdx, i, cursor})
-				cursor += uint32(len(e.outOfLine))
+				cursor += uint32(len(e.outOfLine)) //nolint:gosec // G115: test helper, intentional type cast
 			}
 		}
 	}
@@ -168,14 +168,14 @@ func buildTIFFMultiIFD(ifd0Extra, exifEntries, gpsEntries []tiffEntry) []byte {
 	// ifdIdx is used to match entries against their valPlacement records.
 	writeIFD := func(base uint32, entries []tiffEntry, ifdIdx int, nextOff uint32) {
 		off := int(base)
-		order.PutUint16(buf[off:], uint16(len(entries)))
+		order.PutUint16(buf[off:], uint16(len(entries))) //nolint:gosec // G115: test helper, intentional type cast
 		off += 2
 		for i, e := range entries {
 			order.PutUint16(buf[off:], uint16(e.tag))
 			order.PutUint16(buf[off+2:], uint16(e.typ))
 			order.PutUint32(buf[off+4:], e.count)
 
-			totalSize := uint32(typeSize(e.typ)) * e.count
+			totalSize := uint32(typeSize(e.typ)) * e.count //nolint:gosec // G115: test helper, intentional type cast
 			placed := false
 			if totalSize > 4 && len(e.outOfLine) > 0 {
 				for _, p := range placements {
@@ -227,7 +227,7 @@ func makeShortEntry(tag exif.TagID, val uint16) tiffEntry {
 // (including NUL) are stored inline; longer strings are placed out-of-line.
 func makeASCIIEntry(tag exif.TagID, s string) tiffEntry {
 	val := []byte(s + "\x00")
-	e := tiffEntry{tag: tag, typ: exif.TypeASCII, count: uint32(len(val))}
+	e := tiffEntry{tag: tag, typ: exif.TypeASCII, count: uint32(len(val))} //nolint:gosec // G115: test helper, intentional type cast
 	if len(val) <= 4 {
 		copy(e.inline[:], val)
 	} else {
@@ -248,7 +248,7 @@ func makeRationalEntry(tag exif.TagID, num, den uint32) tiffEntry {
 // makeUndefinedEntry builds a tiffEntry for an UNDEFINED-type tag. Values ≤ 4
 // bytes are stored inline; longer values are placed out-of-line.
 func makeUndefinedEntry(tag exif.TagID, data []byte) tiffEntry {
-	e := tiffEntry{tag: tag, typ: exif.TypeUndefined, count: uint32(len(data))}
+	e := tiffEntry{tag: tag, typ: exif.TypeUndefined, count: uint32(len(data))} //nolint:gosec // G115: test helper, intentional type cast
 	if len(data) <= 4 {
 		copy(e.inline[:], data)
 	} else {

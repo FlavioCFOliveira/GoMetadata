@@ -6,6 +6,7 @@ package cr3
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -31,7 +32,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 
 	moovData := findBox(data, "moov", 0)
 	if moovData == nil {
-		return nil, nil, nil, fmt.Errorf("cr3: no moov box found")
+		return nil, nil, nil, errors.New("cr3: no moov box found")
 	}
 
 	uuidData := findUUIDBox(moovData, canonUUID)
@@ -133,7 +134,10 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	moovStart, moovEnd, found := flatBoxRange(data, "moov")
 	if !found {
 		_, err = w.Write(data)
-		return err
+		if err != nil {
+			return fmt.Errorf("cr3: write chunk: %w", err)
+		}
+		return nil
 	}
 	moovContent := data[moovStart+8 : moovEnd]
 
@@ -141,7 +145,10 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	uuidStart, uuidEnd, found := flatUUIDBoxRange(moovContent, canonUUID)
 	if !found {
 		_, err = w.Write(data)
-		return err
+		if err != nil {
+			return fmt.Errorf("cr3: write chunk data: %w", err)
+		}
+		return nil
 	}
 	// uuidContent is the payload after the 8-byte box header + 16-byte UUID.
 	uuidContent := moovContent[uuidStart+8+16 : uuidEnd]
@@ -167,27 +174,27 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 		if uint64(pos)+size > uint64(len(uuidContent)) {
 			break
 		}
-		boxPayload := uuidContent[pos+int(headerLen) : pos+int(size)]
+		boxPayload := uuidContent[pos+int(headerLen) : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by file size
 
 		switch typ {
 		case "CMT1":
 			if rawEXIF != nil {
 				newUUIDContent.Write(buildBox("CMT1", rawEXIF))
 			} else {
-				newUUIDContent.Write(uuidContent[pos : pos+int(size)])
+				newUUIDContent.Write(uuidContent[pos : pos+int(size)]) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 			}
 		case "XMP ":
 			hadXMP = true
 			if rawXMP != nil {
 				newUUIDContent.Write(buildBox("XMP ", rawXMP))
 			} else {
-				newUUIDContent.Write(uuidContent[pos : pos+int(size)])
+				newUUIDContent.Write(uuidContent[pos : pos+int(size)]) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 			}
 		default:
 			_ = boxPayload
-			newUUIDContent.Write(uuidContent[pos : pos+int(size)])
+			newUUIDContent.Write(uuidContent[pos : pos+int(size)]) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 		}
-		pos += int(size)
+		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 	}
 
 	// If the UUID box didn't have an XMP  sub-box but we have rawXMP, append it.
@@ -213,14 +220,17 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	out.Write(newMoovBox)
 	out.Write(data[moovEnd:])
 	_, err = w.Write(out.Bytes())
-	return err
+	if err != nil {
+		return fmt.Errorf("cr3: write box: %w", err)
+	}
+	return nil
 }
 
 // buildBox constructs an ISOBMFF box: [4-byte size][4-byte type][content].
 func buildBox(boxType string, content []byte) []byte {
 	size := 8 + len(content)
 	box := make([]byte, size)
-	binary.BigEndian.PutUint32(box[0:], uint32(size))
+	binary.BigEndian.PutUint32(box[0:], uint32(size)) //nolint:gosec // G115: ISOBMFF box size bounded by content length
 	copy(box[4:8], boxType)
 	copy(box[8:], content)
 	return box
@@ -230,7 +240,7 @@ func buildBox(boxType string, content []byte) []byte {
 func buildUUIDBox(uuid []byte, content []byte) []byte {
 	size := 8 + 16 + len(content)
 	box := make([]byte, size)
-	binary.BigEndian.PutUint32(box[0:], uint32(size))
+	binary.BigEndian.PutUint32(box[0:], uint32(size)) //nolint:gosec // G115: ISOBMFF box size bounded by content length
 	copy(box[4:8], "uuid")
 	copy(box[8:24], uuid)
 	copy(box[24:], content)
@@ -259,10 +269,10 @@ func flatBoxRange(data []byte, boxType string) (start, end int, found bool) {
 			break
 		}
 		if typ == boxType {
-			return pos, pos + int(size), true
+			return pos, pos + int(size), true //nolint:gosec // G115: ISOBMFF box size bounded by file size
 		}
 		_ = headerLen
-		pos += int(size)
+		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 	}
 	return 0, 0, false
 }
@@ -290,10 +300,10 @@ func flatUUIDBoxRange(data []byte, uuid []byte) (start, end int, found bool) {
 		}
 		if typ == "uuid" && pos+int(headerLen)+16 <= len(data) {
 			if matchesUUID(data[pos+int(headerLen):], uuid) {
-				return pos, pos + int(size), true
+				return pos, pos + int(size), true //nolint:gosec // G115: ISOBMFF box size bounded by file size
 			}
 		}
-		pos += int(size)
+		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 	}
 	return 0, 0, false
 }
@@ -323,7 +333,7 @@ func findBox(data []byte, boxType string, depth int) []byte {
 		if uint64(pos)+size > uint64(len(data)) {
 			break
 		}
-		boxData := data[pos+int(headerLen) : pos+int(size)]
+		boxData := data[pos+int(headerLen) : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by file size
 		if typ == boxType {
 			return boxData
 		}
@@ -333,7 +343,7 @@ func findBox(data []byte, boxType string, depth int) []byte {
 				return inner
 			}
 		}
-		pos += int(size)
+		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 	}
 	return nil
 }
@@ -360,10 +370,10 @@ func findUUIDBox(data []byte, uuid []byte) []byte {
 		}
 		if typ == "uuid" && pos+int(headerLen)+16 <= len(data) {
 			if matchesUUID(data[pos+int(headerLen):], uuid) {
-				return data[pos+int(headerLen)+16 : pos+int(size)]
+				return data[pos+int(headerLen)+16 : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by file size
 			}
 		}
-		pos += int(size)
+		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 	}
 	return nil
 }

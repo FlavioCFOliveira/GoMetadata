@@ -125,7 +125,7 @@ func buildRW2WithTag(tag uint16, typ uint16, value []byte) []byte {
 	e := ifd0Off + 2
 	binary.LittleEndian.PutUint16(buf[e:], tag)
 	binary.LittleEndian.PutUint16(buf[e+2:], typ)
-	binary.LittleEndian.PutUint32(buf[e+4:], uint32(len(value)))
+	binary.LittleEndian.PutUint32(buf[e+4:], uint32(len(value))) //nolint:gosec // G115: test helper, intentional type cast
 	if len(value) <= 4 {
 		copy(buf[e+8:], value)
 	} else {

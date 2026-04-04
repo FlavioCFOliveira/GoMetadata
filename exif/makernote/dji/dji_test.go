@@ -23,8 +23,8 @@ func buildDJIMakerNote(tags []struct {
 		}
 	}
 	buf := make([]byte, 2+n*12+outSize)
-	binary.LittleEndian.PutUint16(buf[0:], uint16(n))
-	valueOff := uint32(2 + n*12)
+	binary.LittleEndian.PutUint16(buf[0:], uint16(n)) //nolint:gosec // G115: test helper, intentional type cast
+	valueOff := uint32(2 + n*12) //nolint:gosec // G115: test helper, intentional type cast
 	for i, t := range tags {
 		pos := 2 + i*12
 		binary.LittleEndian.PutUint16(buf[pos:], t.id)
@@ -33,7 +33,7 @@ func buildDJIMakerNote(tags []struct {
 		if sz == 0 {
 			sz = 1
 		}
-		cnt := uint32(len(t.val)) / sz
+		cnt := uint32(len(t.val)) / sz //nolint:gosec // G115: test helper, intentional type cast
 		binary.LittleEndian.PutUint32(buf[pos+4:], cnt)
 		total := uint64(sz) * uint64(cnt)
 		if total <= 4 {
@@ -41,7 +41,7 @@ func buildDJIMakerNote(tags []struct {
 		} else {
 			binary.LittleEndian.PutUint32(buf[pos+8:], valueOff)
 			copy(buf[valueOff:], t.val)
-			valueOff += uint32(len(t.val))
+			valueOff += uint32(len(t.val)) //nolint:gosec // G115: test helper, intentional type cast
 		}
 	}
 	return buf

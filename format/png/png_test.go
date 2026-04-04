@@ -35,13 +35,13 @@ func buildPNG(exifData, xmpData []byte) []byte {
 // writeChunkTo writes a PNG chunk with correct CRC to buf.
 func writeChunkTo(buf *bytes.Buffer, chunkType string, data []byte) {
 	var lbuf [4]byte
-	binary.BigEndian.PutUint32(lbuf[:], uint32(len(data)))
+	binary.BigEndian.PutUint32(lbuf[:], uint32(len(data))) //nolint:gosec // G115: test helper, intentional type cast
 	buf.Write(lbuf[:])
 	buf.WriteString(chunkType)
 	buf.Write(data)
 	h := crc32.NewIEEE()
-	h.Write([]byte(chunkType))
-	h.Write(data)
+	_, _ = h.Write([]byte(chunkType)) //nolint:gosec // G104: hash.Hash.Write never returns an error
+	_, _ = h.Write(data)              //nolint:gosec // G104: hash.Hash.Write never returns an error
 	binary.BigEndian.PutUint32(lbuf[:], h.Sum32())
 	buf.Write(lbuf[:])
 }
@@ -142,8 +142,8 @@ func TestInjectCRCCorrect(t *testing.T) {
 		storedCRC := binary.BigEndian.Uint32(result[dataEnd:])
 
 		h := crc32.NewIEEE()
-		h.Write([]byte(chunkType))
-		h.Write(data)
+		_, _ = h.Write([]byte(chunkType)) //nolint:gosec // G104: hash.Hash.Write never returns an error
+		_, _ = h.Write(data)              //nolint:gosec // G104: hash.Hash.Write never returns an error
 		computed := h.Sum32()
 
 		if storedCRC != computed {

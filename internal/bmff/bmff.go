@@ -66,6 +66,6 @@ func SkipBox(r io.ReadSeeker, box Box) error {
 		_, err := r.Seek(0, io.SeekEnd)
 		return err
 	}
-	_, err := r.Seek(box.Offset+int64(box.DataSize), io.SeekStart)
+	_, err := r.Seek(box.Offset+int64(box.DataSize), io.SeekStart) //nolint:gosec // G115: DataSize fits int64 for valid ISOBMFF files
 	return err
 }

@@ -6,6 +6,7 @@ package orf
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 
@@ -28,7 +29,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, fmt.Errorf("orf: read: %w", err)
 	}
 	if !bytes.HasPrefix(data, orfMagic) {
-		return nil, nil, nil, fmt.Errorf("orf: invalid magic bytes")
+		return nil, nil, nil, errors.New("orf: invalid magic bytes")
 	}
 
 	// Patch bytes 2-3 to standard TIFF LE magic so the TIFF parser works.
@@ -61,7 +62,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 		return fmt.Errorf("orf: read: %w", err)
 	}
 	if !bytes.HasPrefix(data, orfMagic) {
-		return fmt.Errorf("orf: invalid magic bytes")
+		return errors.New("orf: invalid magic bytes")
 	}
 
 	// Patch bytes 2-3 to standard TIFF LE magic so tiff.Inject works.
@@ -78,14 +79,17 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 
 	out := buf.Bytes()
 	if len(out) < 4 {
-		return fmt.Errorf("orf: output too short")
+		return errors.New("orf: output too short")
 	}
 	// Restore ORF magic ("IIRO") in the output.
 	out[2] = orfMagic[2]
 	out[3] = orfMagic[3]
 
 	_, err = w.Write(out)
-	return err
+	if err != nil {
+		return fmt.Errorf("orf: write: %w", err)
+	}
+	return nil
 }
 
 func extractTIFFTags(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawIPTC, rawXMP []byte) {

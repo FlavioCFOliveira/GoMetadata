@@ -1,6 +1,7 @@
 package gometadata
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,7 +30,7 @@ import (
 func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error {
 	// Guard against structurally broken metadata that would panic in encoders.
 	if m.EXIF != nil && m.EXIF.IFD0 == nil {
-		return fmt.Errorf("gometadata: EXIF struct has nil IFD0")
+		return errors.New("gometadata: EXIF struct has nil IFD0")
 	}
 
 	cfg := &writeConfig{preserveUnknownSegments: true}
@@ -86,18 +87,18 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return fmt.Errorf("gometadata: open file: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 
 	fi, err := f.Stat()
 	if err != nil {
-		return err
+		return fmt.Errorf("gometadata: stat file: %w", err)
 	}
 
 	tmp, err := os.CreateTemp("", "gometadata-*")
 	if err != nil {
-		return err
+		return fmt.Errorf("gometadata: create temp file: %w", err)
 	}
 	tmpName := tmp.Name()
 
@@ -105,7 +106,7 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 	if err := tmp.Chmod(fi.Mode()); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
-		return err
+		return fmt.Errorf("gometadata: chmod temp file: %w", err)
 	}
 
 	if err := Write(f, tmp, m, opts...); err != nil {
@@ -115,42 +116,53 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpName)
-		return err
+		return fmt.Errorf("gometadata: close temp file: %w", err)
 	}
-	return os.Rename(tmpName, path)
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("gometadata: rename temp file: %w", err)
+	}
+	return nil
 }
 
 // injectByFormat dispatches to the correct container handler for segment injection.
 func injectByFormat(r io.ReadSeeker, w io.Writer, fmtID format.FormatID, rawEXIF, rawIPTC, rawXMP []byte) error {
 	switch fmtID {
 	case format.FormatJPEG:
-		return jpeg.Inject(r, w, rawEXIF, rawIPTC, rawXMP)
+		return wrapInject(jpeg.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
 	case format.FormatTIFF:
-		return tiff.Inject(r, w, rawEXIF, rawIPTC, rawXMP)
+		return wrapInject(tiff.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
 	case format.FormatPNG:
-		return png.Inject(r, w, rawEXIF, rawIPTC, rawXMP)
+		return wrapInject(png.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
 	case format.FormatWebP:
-		return webp.Inject(r, w, rawEXIF, rawIPTC, rawXMP)
+		return wrapInject(webp.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
 	case format.FormatHEIF:
-		return heif.Inject(r, w, rawEXIF, rawIPTC, rawXMP)
+		return wrapInject(heif.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
 	case format.FormatAVIF:
 		// AVIF uses the same ISOBMFF container as HEIF; delegate to the HEIF handler.
-		return heif.Inject(r, w, rawEXIF, rawIPTC, rawXMP)
+		return wrapInject(heif.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
 	case format.FormatCR2:
-		return cr2.Inject(r, w, rawEXIF, rawIPTC, rawXMP)
+		return wrapInject(cr2.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
 	case format.FormatCR3:
-		return cr3.Inject(r, w, rawEXIF, rawIPTC, rawXMP)
+		return wrapInject(cr3.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
 	case format.FormatNEF:
-		return nef.Inject(r, w, rawEXIF, rawIPTC, rawXMP)
+		return wrapInject(nef.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
 	case format.FormatARW:
-		return arw.Inject(r, w, rawEXIF, rawIPTC, rawXMP)
+		return wrapInject(arw.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
 	case format.FormatDNG:
-		return dng.Inject(r, w, rawEXIF, rawIPTC, rawXMP)
+		return wrapInject(dng.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
 	case format.FormatORF:
-		return orf.Inject(r, w, rawEXIF, rawIPTC, rawXMP)
+		return wrapInject(orf.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
 	case format.FormatRW2:
-		return rw2.Inject(r, w, rawEXIF, rawIPTC, rawXMP)
+		return wrapInject(rw2.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
 	default:
 		return &UnsupportedFormatError{}
 	}
+}
+
+// wrapInject wraps errors from format-specific Inject calls with the library prefix.
+func wrapInject(err error) error {
+	if err != nil {
+		return fmt.Errorf("gometadata: %w", err)
+	}
+	return nil
 }

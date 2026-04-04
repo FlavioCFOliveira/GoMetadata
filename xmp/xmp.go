@@ -11,6 +11,7 @@
 package xmp
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -31,7 +32,7 @@ type XMP struct {
 // treated as the xmpmeta/RDF body directly.
 func Parse(b []byte) (*XMP, error) {
 	if len(b) == 0 {
-		return nil, fmt.Errorf("xmp: empty input")
+		return nil, errors.New("xmp: empty input")
 	}
 
 	x := &XMP{Properties: make(map[string]map[string]string)}

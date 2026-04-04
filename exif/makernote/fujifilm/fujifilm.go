@@ -156,7 +156,7 @@ func parseIFDAt(b []byte, offset int, bigEndian bool) map[uint16][]byte {
 		} else {
 			// Value is at the offset stored in the value/offset field.
 			off := int(readU32(b[pos+8:], bigEndian))
-			valEnd := off + int(total)
+			valEnd := off + int(total) //nolint:gosec // G115: total is a uint64 value offset bounded by file size
 			if off < 0 || valEnd > len(b) {
 				continue
 			}

@@ -195,11 +195,11 @@ func (Parser) Parse(b []byte) (map[uint16][]byte, error) {
 		case b[8] == 'M' && b[9] == 'M':
 			bigEndian = true
 		default:
-			return nil, nil
+			return nil, nil //nolint:nilnil // (nil, nil) signals "unrecognized format"; Parser interface contract
 		}
 		return parseIFDAt(b, 12, bigEndian), nil
 	}
-	return nil, nil
+	return nil, nil //nolint:nilnil // (nil, nil) signals "unrecognized format"; Parser interface contract
 }
 
 // parseIFDAt walks a TIFF IFD starting at offset within b.
@@ -236,7 +236,7 @@ func parseIFDAt(b []byte, offset int, bigEndian bool) map[uint16][]byte {
 			value = b[pos+8 : pos+8+int(total)]
 		} else {
 			off := int(readU32(b[pos+8:], bigEndian))
-			valEnd := off + int(total)
+			valEnd := off + int(total) //nolint:gosec // G115: total is a uint64 value offset bounded by file size
 			if off < 0 || valEnd > len(b) {
 				continue
 			}

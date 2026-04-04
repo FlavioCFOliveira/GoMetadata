@@ -31,7 +31,7 @@ var largePool = sync.Pool{ //nolint:gochecknoglobals // sync.Pool: reuse reduces
 // it may be longer.
 func Get(n int) *[]byte {
 	if n > defaultSize {
-		p := largePool.Get().(*[]byte)
+		p := largePool.Get().(*[]byte) //nolint:forcetypeassert // largePool.New always stores *[]byte; pool invariant
 		if cap(*p) < n {
 			b := make([]byte, n)
 			return &b
@@ -39,7 +39,7 @@ func Get(n int) *[]byte {
 		*p = (*p)[:n]
 		return p
 	}
-	p := pool.Get().(*[]byte)
+	p := pool.Get().(*[]byte) //nolint:forcetypeassert // pool.New always stores *[]byte; pool invariant
 	if cap(*p) < n {
 		b := make([]byte, n)
 		return &b

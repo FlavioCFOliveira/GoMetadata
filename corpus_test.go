@@ -207,7 +207,7 @@ func TestWriteModifyRoundTrip(t *testing.T) {
 		if e.Tag == 0x010E { // TagImageDescription
 			v := []byte(newCaption + "\x00")
 			m.EXIF.IFD0.Entries[i].Value = v
-			m.EXIF.IFD0.Entries[i].Count = uint32(len(v))
+			m.EXIF.IFD0.Entries[i].Count = uint32(len(v)) //nolint:gosec // G115: test helper, intentional type cast
 			break
 		}
 	}
@@ -229,7 +229,7 @@ func TestWriteModifyRoundTrip(t *testing.T) {
 // buildJPEGWithCaption builds a minimal JPEG with an EXIF ImageDescription tag.
 func buildJPEGWithCaption(caption string) []byte {
 	captionBytes := []byte(caption + "\x00")
-	captionLen := uint32(len(captionBytes))
+	captionLen := uint32(len(captionBytes)) //nolint:gosec // G115: test helper, intentional type cast
 
 	// Layout: TIFF header(8) + IFD count(2) + 1 entry(12) + next-IFD(4) + value area
 	valueOffset := uint32(8 + 2 + 1*12 + 4)

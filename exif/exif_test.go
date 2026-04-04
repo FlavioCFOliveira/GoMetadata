@@ -23,11 +23,11 @@ func minimalTIFF(order binary.ByteOrder, entries [][4]uint32) []byte {
 	}
 	order.PutUint16(buf[2:], 0x002A)
 	order.PutUint32(buf[4:], ifdOff)
-	order.PutUint16(buf[8:], uint16(n))
+	order.PutUint16(buf[8:], uint16(n)) //nolint:gosec // G115: test helper, intentional type cast
 	for i, e := range entries {
 		p := 10 + i*12
-		order.PutUint16(buf[p:], uint16(e[0]))   // tag
-		order.PutUint16(buf[p+2:], uint16(e[1])) // type
+		order.PutUint16(buf[p:], uint16(e[0]))   //nolint:gosec // G115: test helper, intentional type cast
+		order.PutUint16(buf[p+2:], uint16(e[1])) //nolint:gosec // G115: test helper, intentional type cast
 		order.PutUint32(buf[p+4:], e[2])          // count
 		order.PutUint32(buf[p+8:], e[3])          // value/offset
 	}
@@ -583,7 +583,7 @@ func TestIFDEntryInt32(t *testing.T) {
 	order := binary.LittleEndian
 	var neg1M int32 = -1_000_000
 	val := make([]byte, 4)
-	order.PutUint32(val, uint32(neg1M))
+	order.PutUint32(val, uint32(neg1M)) //nolint:gosec // G115: test helper, intentional type cast
 	e := IFDEntry{Type: TypeSLong, Count: 1, Value: val, byteOrder: order}
 	if got := e.Int32(); got != neg1M {
 		t.Errorf("Int32() = %d, want %d", got, neg1M)
@@ -648,10 +648,10 @@ func TestIFDEntrySRational(t *testing.T) {
 	// Encode two SRational values: -1/2 and 3/4.
 	val := make([]byte, 16)
 	var negOne, posTwo, posThree, posFour int32 = -1, 2, 3, 4
-	order.PutUint32(val[0:], uint32(negOne))
-	order.PutUint32(val[4:], uint32(posTwo))
-	order.PutUint32(val[8:], uint32(posThree))
-	order.PutUint32(val[12:], uint32(posFour))
+	order.PutUint32(val[0:], uint32(negOne))   //nolint:gosec // G115: test helper, intentional type cast
+	order.PutUint32(val[4:], uint32(posTwo))   //nolint:gosec // G115: test helper, intentional type cast
+	order.PutUint32(val[8:], uint32(posThree)) //nolint:gosec // G115: test helper, intentional type cast
+	order.PutUint32(val[12:], uint32(posFour)) //nolint:gosec // G115: test helper, intentional type cast
 
 	e := IFDEntry{Type: TypeSRational, Count: 2, Value: val, byteOrder: order}
 
@@ -744,7 +744,7 @@ func TestMakerNotePreservedOnEncode(t *testing.T) {
 	order.PutUint16(buf[exifOff:], 1)
 	order.PutUint16(buf[exifOff+2:], uint16(TagMakerNote))
 	order.PutUint16(buf[exifOff+4:], uint16(TypeUndefined))
-	order.PutUint32(buf[exifOff+6:], uint32(len(makerNotePayload)))
+	order.PutUint32(buf[exifOff+6:], uint32(len(makerNotePayload))) //nolint:gosec // G115: test helper, intentional type cast
 	order.PutUint32(buf[exifOff+10:], mnOffset)
 	order.PutUint32(buf[exifOff+14:], 0) // next IFD = 0
 
@@ -1262,7 +1262,7 @@ func buildCameraEXIF() []byte {
 	// Fix ascii counts.
 	for i := range ifd0Entries {
 		if ifd0Entries[i].blob != nil && ifd0Entries[i].count == 0 {
-			ifd0Entries[i].count = uint32(len(ifd0Entries[i].blob))
+			ifd0Entries[i].count = uint32(len(ifd0Entries[i].blob)) //nolint:gosec // G115: test helper, intentional type cast
 		}
 	}
 
@@ -1290,7 +1290,7 @@ func buildCameraEXIF() []byte {
 	}
 	for i := range exifEntries {
 		if exifEntries[i].blob != nil && exifEntries[i].count == 0 {
-			exifEntries[i].count = uint32(len(exifEntries[i].blob))
+			exifEntries[i].count = uint32(len(exifEntries[i].blob)) //nolint:gosec // G115: test helper, intentional type cast
 		}
 	}
 
@@ -1306,16 +1306,16 @@ func buildCameraEXIF() []byte {
 	}
 	for i := range gpsEntries {
 		if gpsEntries[i].blob != nil && gpsEntries[i].count == 0 {
-			gpsEntries[i].count = uint32(len(gpsEntries[i].blob))
+			gpsEntries[i].count = uint32(len(gpsEntries[i].blob)) //nolint:gosec // G115: test helper, intentional type cast
 		}
 	}
 
 	// Compute sizes so we can set offsets.
 	ifdSize := func(es []entry) uint32 {
-		sz := uint32(2 + len(es)*12 + 4)
+		sz := uint32(2 + len(es)*12 + 4) //nolint:gosec // G115: test helper, intentional type cast
 		for _, e := range es {
 			if e.blob != nil {
-				sz += uint32(len(e.blob))
+				sz += uint32(len(e.blob)) //nolint:gosec // G115: test helper, intentional type cast
 			}
 		}
 		return sz
@@ -1341,10 +1341,10 @@ func buildCameraEXIF() []byte {
 	encodeIFD := func(buf []byte, es []entry, startOff, nextOff uint32) []byte {
 		n := len(es)
 		// Compute out-of-line value start offset.
-		valOff := startOff + uint32(2+n*12+4)
+		valOff := startOff + uint32(2+n*12+4) //nolint:gosec // G115: test helper, intentional type cast
 
 		var cnt [2]byte
-		order.PutUint16(cnt[:], uint16(n))
+		order.PutUint16(cnt[:], uint16(n)) //nolint:gosec // G115: test helper, intentional type cast
 		buf = append(buf, cnt[:]...)
 
 		var entries [12]byte
@@ -1357,7 +1357,7 @@ func buildCameraEXIF() []byte {
 			if e.blob != nil {
 				order.PutUint32(entries[8:], curOff)
 				blobs = append(blobs, e.blob...)
-				curOff += uint32(len(e.blob))
+				curOff += uint32(len(e.blob)) //nolint:gosec // G115: test helper, intentional type cast
 			} else {
 				order.PutUint32(entries[8:], e.inline4)
 			}

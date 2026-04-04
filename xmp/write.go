@@ -32,7 +32,7 @@ var localListPool = sync.Pool{New: func() any { s := make([]string, 0, 16); retu
 // The packet uses UTF-8 encoding and a read/write <?xpacket?> wrapper
 // with 2 KB of whitespace padding per XMP §7.3 (in-place editing support).
 func encode(x *XMP) ([]byte, error) {
-	buf := encBufPool.Get().(*bytes.Buffer)
+	buf := encBufPool.Get().(*bytes.Buffer) //nolint:forcetypeassert // encBufPool.New always stores *bytes.Buffer; pool invariant
 	buf.Reset()
 
 	// Estimate output size: fixed wrapper (~250 B) + 2 KB padding + ~100 B per property.
@@ -48,7 +48,7 @@ func encode(x *XMP) ([]byte, error) {
 	buf.WriteString(" <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n")
 
 	// Sort namespace URIs for deterministic output (ISO 16684-1 §7.4).
-	nsListPtr := nsListPool.Get().(*[]string)
+	nsListPtr := nsListPool.Get().(*[]string) //nolint:forcetypeassert // nsListPool.New always stores *[]string; pool invariant
 	nsList := (*nsListPtr)[:0]
 	for ns, props := range x.Properties {
 		if len(props) > 0 {
@@ -71,7 +71,7 @@ func encode(x *XMP) ([]byte, error) {
 		buf.WriteString("\">\n")
 
 		// Sort property names for deterministic output.
-		localListPtr := localListPool.Get().(*[]string)
+		localListPtr := localListPool.Get().(*[]string) //nolint:forcetypeassert // localListPool.New always stores *[]string; pool invariant
 		localList := (*localListPtr)[:0]
 		for local := range props {
 			localList = append(localList, local)

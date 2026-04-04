@@ -101,7 +101,7 @@ type Parser struct{}
 // trying little-endian first (Sony cameras are almost always LE).
 func (Parser) Parse(b []byte) (map[uint16][]byte, error) {
 	if len(b) < 2 {
-		return nil, nil
+		return nil, nil //nolint:nilnil // (nil, nil) signals "unrecognized format"; Parser interface contract
 	}
 	return parseSonyIFD(b), nil
 }
@@ -142,7 +142,7 @@ func parseRawIFD(b []byte, bigEndian bool) map[uint16][]byte {
 			value = b[pos+8 : pos+8+int(total)]
 		} else {
 			off := int(readU32(b[pos+8:], bigEndian))
-			end := off + int(total)
+			end := off + int(total) //nolint:gosec // G115: total is a uint64 value offset bounded by file size
 			if off < 0 || end > len(b) {
 				continue
 			}

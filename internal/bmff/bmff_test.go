@@ -103,7 +103,7 @@ func TestReadBox_Standard(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			raw := buildStandardBox(uint32(tc.wantSize), tc.typ, tc.payload)
+			raw := buildStandardBox(uint32(tc.wantSize), tc.typ, tc.payload) //nolint:gosec // G115: test helper, intentional type cast
 			r := bytes.NewReader(raw)
 
 			box, err := ReadBox(r)
@@ -345,7 +345,7 @@ func TestSkipBox(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			totalSize := 8 + tc.payloadSize
-			raw := buildStandardBox(uint32(totalSize), tc.typ, make([]byte, tc.payloadSize))
+			raw := buildStandardBox(uint32(totalSize), tc.typ, make([]byte, tc.payloadSize)) //nolint:gosec // G115: test helper, intentional type cast
 			r := bytes.NewReader(raw)
 
 			box, err := ReadBox(r)
@@ -535,7 +535,7 @@ func TestSkipBox_PositionAfterMultipleBoxes(t *testing.T) {
 	var pos int64
 	for _, b := range boxes {
 		total := 8 + b.payloadSize
-		stream = append(stream, buildStandardBox(uint32(total), b.typ, make([]byte, b.payloadSize))...)
+		stream = append(stream, buildStandardBox(uint32(total), b.typ, make([]byte, b.payloadSize))...) //nolint:gosec // G115: test helper, intentional type cast
 		pos += int64(total)
 		expectedEnd = append(expectedEnd, pos)
 	}
@@ -574,7 +574,7 @@ func TestReadBox_ExtendedSize_Offset(t *testing.T) {
 	payloads := []int{0, 1, 8, 100}
 
 	for _, plen := range payloads {
-		extSize := uint64(16 + plen)
+		extSize := uint64(16 + plen) //nolint:gosec // G115: test helper, intentional type cast
 		raw := buildExtendedBox(extSize, typ, make([]byte, plen))
 		r := bytes.NewReader(raw)
 
@@ -585,7 +585,7 @@ func TestReadBox_ExtendedSize_Offset(t *testing.T) {
 		if box.Offset != 16 {
 			t.Errorf("payload %d: Offset = %d, want 16", plen, box.Offset)
 		}
-		if box.DataSize != uint64(plen) {
+		if box.DataSize != uint64(plen) { //nolint:gosec // G115: test helper, intentional type cast
 			t.Errorf("payload %d: DataSize = %d, want %d", plen, box.DataSize, plen)
 		}
 	}

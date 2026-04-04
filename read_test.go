@@ -24,7 +24,7 @@ func buildMinimalJPEG(exifData []byte) []byte {
 
 	if exifData != nil {
 		payload := append([]byte("Exif\x00\x00"), exifData...)
-		length := uint16(len(payload) + 2)
+		length := uint16(len(payload) + 2) //nolint:gosec // G115: test helper, intentional type cast
 		buf.Write([]byte{0xFF, 0xE1})
 		var lb [2]byte
 		binary.BigEndian.PutUint16(lb[:], length)
@@ -158,20 +158,20 @@ func TestSupportsWrite(t *testing.T) {
 	}
 }
 
-// TestReadFileNotFound verifies that ReadFile propagates the OS "not found"
-// error unchanged so callers can use os.IsNotExist.
+// TestReadFileNotFound verifies that ReadFile wraps the OS "not found" error
+// so callers can inspect it with errors.Is(err, fs.ErrNotExist).
 func TestReadFileNotFound(t *testing.T) {
 	_, err := ReadFile("/nonexistent/definitely-does-not-exist/file.jpg")
 	if err == nil {
 		t.Fatal("expected error for non-existent path, got nil")
 	}
-	if !os.IsNotExist(err) {
-		t.Errorf("os.IsNotExist(err) = false; err = %v", err)
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("errors.Is(err, os.ErrNotExist) = false; err = %v", err)
 	}
 }
 
-// TestReadFilePermDenied verifies that ReadFile propagates the OS "permission
-// denied" error so callers can use os.IsPermission.
+// TestReadFilePermDenied verifies that ReadFile wraps the OS "permission
+// denied" error so callers can inspect it with errors.Is(err, fs.ErrPermission).
 func TestReadFilePermDenied(t *testing.T) {
 	// Skip when running as root because root can read any file.
 	if os.Getuid() == 0 {
@@ -194,8 +194,8 @@ func TestReadFilePermDenied(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected permission error, got nil")
 	}
-	if !os.IsPermission(err) {
-		t.Errorf("os.IsPermission(err) = false; err = %v", err)
+	if !errors.Is(err, os.ErrPermission) {
+		t.Errorf("errors.Is(err, os.ErrPermission) = false; err = %v", err)
 	}
 }
 
@@ -210,13 +210,13 @@ func buildMinimalPNG() []byte {
 
 	writePNGChunk := func(chunkType string, data []byte) {
 		var lbuf [4]byte
-		binary.BigEndian.PutUint32(lbuf[:], uint32(len(data)))
+		binary.BigEndian.PutUint32(lbuf[:], uint32(len(data))) //nolint:gosec // G115: test helper, intentional type cast
 		buf.Write(lbuf[:])
 		buf.WriteString(chunkType)
 		buf.Write(data)
 		h := crc32.NewIEEE()
-		h.Write([]byte(chunkType))
-		h.Write(data)
+		_, _ = h.Write([]byte(chunkType)) //nolint:gosec // G104: hash.Hash.Write never returns an error
+		_, _ = h.Write(data)               //nolint:gosec // G104: hash.Hash.Write never returns an error
 		binary.BigEndian.PutUint32(lbuf[:], h.Sum32())
 		buf.Write(lbuf[:])
 	}
@@ -241,8 +241,8 @@ func buildIPTCBytes(caption string) []byte {
 	buf.WriteByte(0x1C)
 	buf.WriteByte(2)
 	buf.WriteByte(120) // DS2Caption
-	buf.WriteByte(byte(len(val) >> 8))
-	buf.WriteByte(byte(len(val)))
+	buf.WriteByte(byte(len(val) >> 8)) //nolint:gosec // G115: test helper, intentional type cast
+	buf.WriteByte(byte(len(val)))      //nolint:gosec // G115: test helper, intentional type cast
 	buf.Write(val)
 	return buf.Bytes()
 }
@@ -263,13 +263,13 @@ func buildJPEGWithIPTCAndXMP(iptcCaption, xmpCaption string) []byte {
 		irb.Write([]byte{0x04, 0x04}) // IPTC-NAA resource 0x0404
 		irb.Write([]byte{0x00, 0x00}) // Pascal string: empty name
 		var sz [4]byte
-		binary.BigEndian.PutUint32(sz[:], uint32(len(iptcRaw)))
+		binary.BigEndian.PutUint32(sz[:], uint32(len(iptcRaw))) //nolint:gosec // G115: test helper, intentional type cast
 		irb.Write(sz[:])
 		irb.Write(iptcRaw)
 		if len(iptcRaw)%2 != 0 {
 			irb.WriteByte(0x00)
 		}
-		length := uint16(irb.Len() + 2)
+		length := uint16(irb.Len() + 2) //nolint:gosec // G115: test helper, intentional type cast
 		buf.Write([]byte{0xFF, 0xED})
 		var lb [2]byte
 		binary.BigEndian.PutUint16(lb[:], length)
@@ -290,7 +290,7 @@ func buildJPEGWithIPTCAndXMP(iptcCaption, xmpCaption string) []byte {
 		)
 		ns := "http://ns.adobe.com/xap/1.0/\x00"
 		payload := append([]byte(ns), []byte(xmpPacket)...)
-		length := uint16(len(payload) + 2)
+		length := uint16(len(payload) + 2) //nolint:gosec // G115: test helper, intentional type cast
 		buf.Write([]byte{0xFF, 0xE1})
 		var lb [2]byte
 		binary.BigEndian.PutUint16(lb[:], length)
@@ -312,14 +312,14 @@ func buildJPEGWithIPTCAndXMP(iptcCaption, xmpCaption string) []byte {
 //
 //	[header 8B][IFD0: 4 entries + ExifIFD ptr = 5 entries][next=0][value area]
 //	[ExifIFD: 1 entry][next=0]
-func buildRichTIFF(make_, model_ string, orientation uint16, iso uint16) []byte {
+func buildRichTIFF(makeStr, modelStr string, orientation uint16, iso uint16) []byte {
 	order := binary.LittleEndian
 
 	// We build the buffer in two passes: first compute offsets, then fill values.
 	// Convenience: inline helper to write a LE uint16/uint32.
 
-	makeBytes := []byte(make_ + "\x00")
-	modelBytes := []byte(model_ + "\x00")
+	makeBytes := []byte(makeStr + "\x00")
+	modelBytes := []byte(modelStr + "\x00")
 
 	// IFD0 contains 5 entries (in tag-ID order): Make, Model, Orientation,
 	// ExifIFDPointer. That is 4 entries — but we need them sorted by tag:
@@ -338,8 +338,8 @@ func buildRichTIFF(make_, model_ string, orientation uint16, iso uint16) []byte 
 	valueAreaStart := uint32(headerSz + ifd0Sz)
 	// ExifIFD begins right after the value area.
 	makeOff := valueAreaStart
-	modelOff := makeOff + uint32(len(makeBytes))
-	exifIFDOff := modelOff + uint32(len(modelBytes))
+	modelOff := makeOff + uint32(len(makeBytes))         //nolint:gosec // G115: test helper, intentional type cast
+	exifIFDOff := modelOff + uint32(len(modelBytes))     //nolint:gosec // G115: test helper, intentional type cast
 	// ExifIFD value area (ISO is SHORT → inline, no value area needed).
 
 	totalSize := int(exifIFDOff) + exifIFDSz
@@ -363,8 +363,8 @@ func buildRichTIFF(make_, model_ string, orientation uint16, iso uint16) []byte 
 	}
 
 	// IFD0 entries (sorted ascending by tag per TIFF §7).
-	writeEntry(ifd0Start, 0, 0x010F, uint16(exif.TypeASCII), uint32(len(makeBytes)), makeOff)   // Make
-	writeEntry(ifd0Start, 1, 0x0110, uint16(exif.TypeASCII), uint32(len(modelBytes)), modelOff) // Model
+	writeEntry(ifd0Start, 0, 0x010F, uint16(exif.TypeASCII), uint32(len(makeBytes)), makeOff) //nolint:gosec // G115: test helper, intentional type cast
+	writeEntry(ifd0Start, 1, 0x0110, uint16(exif.TypeASCII), uint32(len(modelBytes)), modelOff) //nolint:gosec // G115: test helper, intentional type cast
 	// Orientation: SHORT inline — value is left-justified in the 4-byte field.
 	writeEntry(ifd0Start, 2, 0x0112, uint16(exif.TypeShort), 1, uint32(orientation)) // Orientation
 	writeEntry(ifd0Start, 3, 0x8769, uint16(exif.TypeLong), 1, exifIFDOff)          // ExifIFDPointer
@@ -725,7 +725,7 @@ func BenchmarkReadFile_Concurrent(b *testing.B) {
 	tiff := minimalTIFFPayload()
 	jpeg := buildMinimalJPEG(tiff)
 	tmp := b.TempDir() + "/bench.jpg"
-	if err := os.WriteFile(tmp, jpeg, 0o644); err != nil {
+	if err := os.WriteFile(tmp, jpeg, 0o600); err != nil {
 		b.Fatal(err)
 	}
 	b.ReportAllocs()

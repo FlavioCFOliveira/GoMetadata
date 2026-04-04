@@ -21,10 +21,10 @@ func CheckGolden(t *testing.T, name string, got any) {
 		t.Fatalf("marshal golden: %v", err)
 	}
 	if *update {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 			t.Fatalf("mkdir golden: %v", err)
 		}
-		if err := os.WriteFile(path, data, 0o644); err != nil {
+		if err := os.WriteFile(path, data, 0o600); err != nil {
 			t.Fatalf("write golden: %v", err)
 		}
 		return

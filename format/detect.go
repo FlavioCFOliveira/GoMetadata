@@ -3,6 +3,7 @@ package format
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"sync"
 )
@@ -30,7 +31,7 @@ func Detect(r io.ReadSeeker) (FormatID, error) {
 	var buf [magicLen]byte
 	n, err := r.Read(buf[:])
 	if err != nil && n == 0 {
-		return FormatUnknown, err
+		return FormatUnknown, fmt.Errorf("format: read magic bytes: %w", err)
 	}
 
 	fmtID := detectMagic(buf[:n])
@@ -44,7 +45,7 @@ func Detect(r io.ReadSeeker) (FormatID, error) {
 
 	// Seek back to 0 so the caller can re-read the file from the beginning.
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
-		return FormatUnknown, err
+		return FormatUnknown, fmt.Errorf("format: seek reset: %w", err)
 	}
 	return fmtID, nil
 }
@@ -142,7 +143,7 @@ func refineTIFFVariant(r io.ReadSeeker) FormatID {
 		return FormatTIFF
 	}
 
-	bp := tiffScanPool.Get().(*[]byte)
+	bp := tiffScanPool.Get().(*[]byte) //nolint:forcetypeassert // tiffScanPool.New always stores *[]byte; pool invariant
 	data := *bp
 	n, _ := io.ReadFull(r, data)
 	if n < 10 {
@@ -217,12 +218,12 @@ func refineTIFFVariant(r io.ReadSeeker) FormatID {
 	}
 
 	// Map Make bytes to specific RAW format without allocating a string.
-	make_ := bytes.TrimRight(makeRaw, "\x00 ")
+	makeBytes := bytes.TrimRight(makeRaw, "\x00 ")
 	var result FormatID
 	switch {
-	case bytes.Equal(make_, []byte("NIKON CORPORATION")), bytes.Equal(make_, []byte("Nikon")):
+	case bytes.Equal(makeBytes, []byte("NIKON CORPORATION")), bytes.Equal(makeBytes, []byte("Nikon")):
 		result = FormatNEF
-	case bytes.Equal(make_, []byte("SONY")):
+	case bytes.Equal(makeBytes, []byte("SONY")):
 		result = FormatARW
 	default:
 		result = FormatTIFF

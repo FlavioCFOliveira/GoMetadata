@@ -52,7 +52,7 @@ type Parser struct{}
 // Samsung MakerNote is a standard TIFF IFD at offset 0; tries little-endian first.
 func (Parser) Parse(b []byte) (map[uint16][]byte, error) {
 	if len(b) < 2 {
-		return nil, nil
+		return nil, nil //nolint:nilnil // (nil, nil) signals "unrecognized format"; Parser interface contract
 	}
 	if result := parseAt(b, binary.LittleEndian); result != nil {
 		return result, nil

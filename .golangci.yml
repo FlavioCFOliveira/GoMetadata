@@ -2,28 +2,116 @@ version: "2"
 
 linters:
   enable:
+    # --- Correctness and safety ---
+    # Core static analysis: catches misuse of sync primitives, shadowing,
+    # incorrect printf verbs, and unreachable code.
     - staticcheck
     - govet
+    # Ensures all returned errors are checked.
     - errcheck
-    - revive
-    - gocritic
+    # Detects assignments whose result is never used.
     - ineffassign
-    - prealloc
-    - unparam
-    - gochecknoglobals
+    # Catches `err != nil` being returned as the non-error value (e.g. return err, nil).
     - nilerr
+    # Catches `(nil, nil)` returns that silently discard information.
+    - nilnil
+    # Detects incorrect error wrapping patterns (e.g. %v instead of %w).
     - errorlint
-    - copyloopvar
+    # Prevents panics from unchecked type assertions (x.(T) without ok).
+    - forcetypeassert
+    # Security: this library parses untrusted bytes from arbitrary image files.
+    - gosec
+
+    # --- API quality ---
+    # Configurable opinionated linter for exported symbols, naming, and code style.
+    - revive
+    # Requires errors from external packages to be wrapped so callers can inspect them.
+    - wrapcheck
+    # Ensures spelling is correct in a public library's exported identifiers and comments.
+    - misspell
+
+    # --- Performance ---
+    # Suggests pre-allocation for slices and maps when the size is known.
+    - prealloc
+    # Detects unnecessary type conversions, common in byte-manipulation parsing code.
+    - unconvert
+    # Flags fmt.Sprintf usage that can be replaced with zero-allocation alternatives.
+    - perfsprint
+    # Catches make([]T, n)[i] = v patterns that allocate and then overwrite.
     - makezero
+    # Detects unused function parameters, which often indicate dead code paths.
+    - unparam
+    # Extended code checks including performance-oriented suggestions (see settings below).
+    - gocritic
+
+    # --- Enum safety ---
+    # Enforces exhaustive switches over iota enums. This library uses iota for
+    # field types, image formats, and RDF collection kinds.
+    - exhaustive
+
+    # --- Package structure ---
+    # Prevents package-level var declarations that carry hidden mutable state.
+    # Exclusions below permit the tag registry and sync.Pool globals that are
+    # intentional and already documented.
+    - gochecknoglobals
+    # Prevents init() functions; the one legitimate use (tag registry population
+    # in exif/tag.go) is excluded below.
+    - gochecknoinits
+    # Ensures loop variable capture is handled correctly (Go 1.22+ semantics).
+    - copyloopvar
 
   settings:
     revive:
       rules:
+        # Exported symbols must have godoc comments — mandatory for a public library.
         - name: exported
           severity: warning
+        # Exported functions must not return unexported types.
+        - name: unexported-return
+          severity: warning
+        # Error return values must be last in the return list.
+        - name: error-return
+          severity: warning
+        # Variable names must follow Go naming conventions.
+        - name: var-naming
+          severity: warning
+
+    gocritic:
+      # Activate the performance tag to surface cache-friendly and
+      # allocation-reducing suggestions in hot parsing paths.
+      enabledTags:
+        - performance
+
+    exhaustive:
+      # Only flag switches that are missing cases; default: does not require
+      # a default branch, which is correct for exhaustive enum coverage.
+      default-signifies-exhaustive: true
+      # TagID has ~130 hex constants and switches over it are intentionally
+      # partial (e.g. patching only pointer tags). Exclude it from exhaustive
+      # checking — FormatID (iota enum) is the primary target here.
+      ignore-enum-types: "exif.TagID"
+
+    gosec:
+      excludes:
+        # G304 (file inclusion via variable) is expected: this library opens
+        # caller-supplied image file paths by design.
+        - G304
 
   exclusions:
     rules:
-      # Tag and namespace registries are legitimately package-level state.
-      - linters: [gochecknoglobals]
-        text: "tagRegistry|namespaceRegistry"
+      # exif/tag.go contains the tag registry — a deliberately global, read-only
+      # map populated once at init time. Both the var and the init() are
+      # intentional design decisions documented in the file.
+      - linters: [gochecknoglobals, gochecknoinits]
+        path: "exif/tag\\.go"
+
+      # internal/metaerr defines the library's own error types. Wrapping errors
+      # with wrapcheck inside the error-construction package itself is circular.
+      - linters: [wrapcheck]
+        path: "internal/.*"
+
+      # Test files: exhaustive switches over enums in table-driven tests or
+      # switch-based helpers do not need to be exhaustive — the test author
+      # picks the cases under test deliberately.
+      - linters: [exhaustive]
+        path: "_test\\.go$"

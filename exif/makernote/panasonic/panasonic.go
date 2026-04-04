@@ -79,10 +79,10 @@ type Parser struct{}
 // followed by a little-endian TIFF IFD.
 func (Parser) Parse(b []byte) (map[uint16][]byte, error) {
 	if len(b) < len(magic)+2 {
-		return nil, nil
+		return nil, nil //nolint:nilnil // (nil, nil) signals "unrecognized format"; Parser interface contract
 	}
 	if string(b[:len(magic)]) != magic {
-		return nil, nil
+		return nil, nil //nolint:nilnil // (nil, nil) signals "unrecognized format"; Parser interface contract
 	}
 	return parseLE(b), nil
 }

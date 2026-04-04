@@ -32,7 +32,7 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 		copy(body[8:], itemType)
 		// item_name = "" (single NUL)
 		body[12] = 0
-		size := uint32(8 + len(body))
+		size := uint32(8 + len(body)) //nolint:gosec // G115: test helper, intentional type cast
 		hdr := make([]byte, 0, 8+len(body))
 		hdr = append(hdr, 0, 0, 0, 0, 'i', 'n', 'f', 'e')
 		binary.BigEndian.PutUint32(hdr, size)
@@ -44,12 +44,12 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 		var iinfBody []byte
 		iinfBody = append(iinfBody, 0, 0, 0, 0) // version 0 + flags
 		cnt := make([]byte, 2)
-		binary.BigEndian.PutUint16(cnt, uint16(len(infes)))
+		binary.BigEndian.PutUint16(cnt, uint16(len(infes))) //nolint:gosec // G115: test helper, intentional type cast
 		iinfBody = append(iinfBody, cnt...)
 		for _, infe := range infes {
 			iinfBody = append(iinfBody, infe...)
 		}
-		size := uint32(8 + len(iinfBody))
+		size := uint32(8 + len(iinfBody)) //nolint:gosec // G115: test helper, intentional type cast
 		hdr := make([]byte, 0, 8+len(iinfBody))
 		hdr = append(hdr, 0, 0, 0, 0, 'i', 'i', 'n', 'f')
 		binary.BigEndian.PutUint32(hdr, size)
@@ -66,7 +66,7 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 		ilocBody = append(ilocBody, 0x44)           // offset_size=4, length_size=4
 		ilocBody = append(ilocBody, 0x00)           // base_offset_size=0, reserved=0
 		cnt := make([]byte, 2)
-		binary.BigEndian.PutUint16(cnt, uint16(len(items)))
+		binary.BigEndian.PutUint16(cnt, uint16(len(items))) //nolint:gosec // G115: test helper, intentional type cast
 		ilocBody = append(ilocBody, cnt...)
 		for _, item := range items {
 			id := make([]byte, 2)
@@ -82,7 +82,7 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 			binary.BigEndian.PutUint32(ln, item.length)
 			ilocBody = append(ilocBody, ln...)
 		}
-		size := uint32(8 + len(ilocBody))
+		size := uint32(8 + len(ilocBody)) //nolint:gosec // G115: test helper, intentional type cast
 		hdr := make([]byte, 0, 8+len(ilocBody))
 		hdr = append(hdr, 0, 0, 0, 0, 'i', 'l', 'o', 'c')
 		binary.BigEndian.PutUint32(hdr, size)
@@ -116,12 +116,12 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 		// HEIF EXIF item starts with 4-byte header offset (= 0 here).
 		exifBlock := append([]byte{0, 0, 0, 0}, exifData...)
 		itemDataBlocks = append(itemDataBlocks, exifBlock)
-		ilocItems = append(ilocItems, ilocTestItem{id: exifItemID, offset: 0, length: uint32(len(exifBlock))})
+		ilocItems = append(ilocItems, ilocTestItem{id: exifItemID, offset: 0, length: uint32(len(exifBlock))}) //nolint:gosec // G115: test helper, intentional type cast
 	}
 	if xmpData != nil {
 		infes = append(infes, makeInfe(xmpItemID, "mime"))
 		itemDataBlocks = append(itemDataBlocks, xmpData)
-		ilocItems = append(ilocItems, ilocTestItem{id: xmpItemID, offset: 0, length: uint32(len(xmpData))})
+		ilocItems = append(ilocItems, ilocTestItem{id: xmpItemID, offset: 0, length: uint32(len(xmpData))}) //nolint:gosec // G115: test helper, intentional type cast
 	}
 
 	iinfBox := makeIinf(infes...)
@@ -133,7 +133,7 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 	metaBody := append([]byte{0, 0, 0, 0}, iinfBox...)
 	metaBody = append(metaBody, ilocBox...)
 	metaBox := make([]byte, 8+len(metaBody))
-	binary.BigEndian.PutUint32(metaBox, uint32(len(metaBox)))
+	binary.BigEndian.PutUint32(metaBox, uint32(len(metaBox))) //nolint:gosec // G115: test helper, intentional type cast
 	copy(metaBox[4:], "meta")
 	copy(metaBox[8:], metaBody)
 
@@ -142,7 +142,7 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 	pass1 := make([]byte, 0, len(ftyp)+len(metaBox))
 	pass1 = append(pass1, ftyp...)
 	pass1 = append(pass1, metaBox...)
-	dataStart := uint32(len(pass1))
+	dataStart := uint32(len(pass1)) //nolint:gosec // G115: test helper, intentional type cast
 
 	// Patch iloc offsets now that we know dataStart.
 	// Re-build iloc with correct offsets.
@@ -155,7 +155,7 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 	metaBody2 := append([]byte{0, 0, 0, 0}, iinfBox...)
 	metaBody2 = append(metaBody2, ilocBox...)
 	metaBox2 := make([]byte, 8+len(metaBody2))
-	binary.BigEndian.PutUint32(metaBox2, uint32(len(metaBox2)))
+	binary.BigEndian.PutUint32(metaBox2, uint32(len(metaBox2))) //nolint:gosec // G115: test helper, intentional type cast
 	copy(metaBox2[4:], "meta")
 	copy(metaBox2[8:], metaBody2)
 
@@ -163,7 +163,7 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 	pass2 := make([]byte, 0, len(ftyp)+len(metaBox2))
 	pass2 = append(pass2, ftyp...)
 	pass2 = append(pass2, metaBox2...)
-	dataStart2 := uint32(len(pass2))
+	dataStart2 := uint32(len(pass2)) //nolint:gosec // G115: test helper, intentional type cast
 	// Patch offsets again if meta size changed.
 	curOff2 := dataStart2
 	for i := range ilocItems {
@@ -174,7 +174,7 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 	metaBody3 := append([]byte{0, 0, 0, 0}, iinfBox...)
 	metaBody3 = append(metaBody3, ilocBox2...)
 	metaBox3 := make([]byte, 8+len(metaBody3))
-	binary.BigEndian.PutUint32(metaBox3, uint32(len(metaBox3)))
+	binary.BigEndian.PutUint32(metaBox3, uint32(len(metaBox3))) //nolint:gosec // G115: test helper, intentional type cast
 	copy(metaBox3[4:], "meta")
 	copy(metaBox3[8:], metaBody3)
 
@@ -317,7 +317,7 @@ func buildHEIFInMoov(exifData, xmpData []byte) []byte {
 	moovBody := rest
 	moovHdr := make([]byte, 0, 8+len(moovBody))
 	moovHdr = append(moovHdr, 0, 0, 0, 0, 'm', 'o', 'o', 'v')
-	binary.BigEndian.PutUint32(moovHdr, uint32(8+len(moovBody)))
+	binary.BigEndian.PutUint32(moovHdr, uint32(8+len(moovBody))) //nolint:gosec // G115: test helper, intentional type cast
 	moovHdr = append(moovHdr, moovBody...)
 
 	return append(ftyp, moovHdr...)

@@ -38,20 +38,24 @@ func zlibDecompress(data []byte) ([]byte, error) {
 	r := bytes.NewReader(data)
 	var zr io.ReadCloser
 	if v := zlibPool.Get(); v != nil {
-		zr = v.(io.ReadCloser)
-		if err := zr.(zlib.Resetter).Reset(r, nil); err != nil {
-			return nil, err
+		zr = v.(io.ReadCloser) //nolint:forcetypeassert // zlibPool.New always stores io.ReadCloser; pool invariant
+		if err := zr.(zlib.Resetter).Reset(r, nil); err != nil { //nolint:forcetypeassert // zlib.NewReader always implements zlib.Resetter; Go stdlib guarantee
+			return nil, fmt.Errorf("png: zlib reset: %w", err)
 		}
 	} else {
 		var err error
 		zr, err = zlib.NewReader(r)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("png: zlib open: %w", err)
 		}
 	}
 	// Return to pool without closing so it can be Reset on next use.
 	defer zlibPool.Put(zr)
-	return io.ReadAll(zr)
+	data, err := io.ReadAll(zr)
+	if err != nil {
+		return nil, fmt.Errorf("png: zlib decompress: %w", err)
+	}
+	return data, nil
 }
 
 // Extract reads the PNG chunk stream from r and returns raw metadata payloads.
@@ -65,7 +69,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, fmt.Errorf("png: read signature: %w", err)
 	}
 	if sig != pngSig {
-		return nil, nil, nil, fmt.Errorf("png: invalid signature")
+		return nil, nil, nil, errors.New("png: invalid signature")
 	}
 
 	for {
@@ -125,7 +129,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 
 	// Write PNG signature.
 	if _, err := w.Write(pngSig[:]); err != nil {
-		return err
+		return fmt.Errorf("png: write signature: %w", err)
 	}
 	// Skip signature in r.
 	if _, err := io.ReadFull(r, make([]byte, 8)); err != nil {
@@ -185,7 +189,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 func readChunk(r io.Reader) (chunkType string, data []byte, err error) {
 	var hdr [8]byte
 	if _, err = io.ReadFull(r, hdr[:]); err != nil {
-		return "", nil, err
+		return "", nil, fmt.Errorf("png: read chunk data: %w", err)
 	}
 	length := int(binary.BigEndian.Uint32(hdr[:4]))
 	chunkType = string(hdr[4:8])
@@ -207,24 +211,26 @@ func readChunk(r io.Reader) (chunkType string, data []byte, err error) {
 // writeChunk writes a PNG chunk with a correct CRC-32 checksum (PNG §5.4).
 func writeChunk(w io.Writer, chunkType string, data []byte) error {
 	hdr := make([]byte, 8)
-	binary.BigEndian.PutUint32(hdr[:4], uint32(len(data)))
+	binary.BigEndian.PutUint32(hdr[:4], uint32(len(data))) //nolint:gosec // G115: chunk data length bounded by input
 	copy(hdr[4:8], chunkType)
 	if _, err := w.Write(hdr); err != nil {
-		return err
+		return fmt.Errorf("png: write chunk header: %w", err)
 	}
 	if len(data) > 0 {
 		if _, err := w.Write(data); err != nil {
-			return err
+			return fmt.Errorf("png: write chunk data: %w", err)
 		}
 	}
 	// CRC covers chunk type + chunk data (PNG §5.4).
 	h := crc32.NewIEEE()
-	h.Write([]byte(chunkType))
-	h.Write(data)
+	_, _ = h.Write([]byte(chunkType)) //nolint:gosec // G104: hash.Hash.Write never returns an error
+	_, _ = h.Write(data)               //nolint:gosec // G104: hash.Hash.Write never returns an error
 	var crcB [4]byte
 	binary.BigEndian.PutUint32(crcB[:], h.Sum32())
-	_, err := w.Write(crcB[:])
-	return err
+	if _, err := w.Write(crcB[:]); err != nil {
+		return fmt.Errorf("png: write chunk CRC: %w", err)
+	}
+	return nil
 }
 
 // extractXMPFromITXt parses an iTXt chunk and returns the XMP text if the

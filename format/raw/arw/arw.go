@@ -3,6 +3,7 @@
 package arw
 
 import (
+	"fmt"
 	"io"
 
 	"github.com/FlavioCFOliveira/GoMetadata/format/tiff"
@@ -10,10 +11,17 @@ import (
 
 // Extract reads metadata from an ARW file.
 func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
-	return tiff.Extract(r)
+	rawEXIF, rawIPTC, rawXMP, err = tiff.Extract(r)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("arw: %w", err)
+	}
+	return rawEXIF, rawIPTC, rawXMP, nil
 }
 
 // Inject writes a modified ARW stream to w.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
-	return tiff.Inject(r, w, rawEXIF, rawIPTC, rawXMP)
+	if err := tiff.Inject(r, w, rawEXIF, rawIPTC, rawXMP); err != nil {
+		return fmt.Errorf("arw: %w", err)
+	}
+	return nil
 }

@@ -2,7 +2,7 @@ package xmp
 
 import (
 	"bytes"
-	"fmt"
+	"errors"
 	"strings"
 	"sync"
 	"unsafe"
@@ -81,7 +81,7 @@ func parseRDF(b []byte, x *XMP) error {
 	var attrBuf [16]xmpAttr
 
 	// Pooled list accumulator for rdf:li values.
-	liVals := liPool.Get().(*[]string)
+	liVals := liPool.Get().(*[]string) //nolint:forcetypeassert // liPool.New always stores *[]string; pool invariant
 	*liVals = (*liVals)[:0]
 	defer liPool.Put(liVals)
 
@@ -171,7 +171,7 @@ func parseRDF(b []byte, x *XMP) error {
 		// ── Start tag or self-closing tag ────────────────────────────────────
 		depth++
 		if depth > 100 {
-			return fmt.Errorf("xmp: XML nesting depth exceeded 100 levels")
+			return errors.New("xmp: XML nesting depth exceeded 100 levels")
 		}
 
 		// Parse the tag name: [prefix:]local.
@@ -498,10 +498,10 @@ func unescapeXML(b []byte) string {
 		if len(b) == 0 {
 			return ""
 		}
-		return unsafe.String(unsafe.SliceData(b), len(b))
+		return unsafe.String(unsafe.SliceData(b), len(b)) //nolint:gosec // G103: unsafe.String is safe here; b is kept alive by the caller via the parent slice
 	}
 
-	bld := builderPool.Get().(*strings.Builder)
+	bld := builderPool.Get().(*strings.Builder) //nolint:forcetypeassert // builderPool.New always stores *strings.Builder; pool invariant
 	bld.Reset()
 	bld.Grow(len(b))
 

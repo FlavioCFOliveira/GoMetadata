@@ -77,7 +77,7 @@ type Parser struct{}
 // IFD methods for typed access; this function provides a low-level raw-byte view.
 func (Parser) Parse(b []byte) (map[uint16][]byte, error) {
 	if len(b) < 2 {
-		return nil, nil
+		return nil, nil //nolint:nilnil // (nil, nil) signals "unrecognized format"; Parser interface contract
 	}
 	return parseCanonIFD(b), nil
 }

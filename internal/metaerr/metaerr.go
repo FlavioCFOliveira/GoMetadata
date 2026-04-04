@@ -13,7 +13,7 @@ type TruncatedFileError struct {
 }
 
 func (e *TruncatedFileError) Error() string {
-	return fmt.Sprintf("gometadata: truncated file while reading %s", e.At)
+	return "gometadata: truncated file while reading " + e.At
 }
 
 // CorruptMetadataError is returned when a metadata segment is structurally

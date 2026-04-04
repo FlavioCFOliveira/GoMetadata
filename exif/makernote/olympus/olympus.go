@@ -148,10 +148,10 @@ type Parser struct{}
 // Returns nil, nil for unrecognised or too-short input (non-fatal for dispatch callers).
 func (Parser) Parse(b []byte) (map[uint16][]byte, error) {
 	if len(b) < minLengthType2 {
-		return nil, nil
+		return nil, nil //nolint:nilnil // (nil, nil) signals "unrecognized format"; Parser interface contract
 	}
 	if string(b[:8]) != magicType2 {
-		return nil, nil
+		return nil, nil //nolint:nilnil // (nil, nil) signals "unrecognized format"; Parser interface contract
 	}
 
 	// Byte order at [8..9].
@@ -163,7 +163,7 @@ func (Parser) Parse(b []byte) (map[uint16][]byte, error) {
 		bigEndian = true
 	default:
 		// Unrecognised byte order: degrade gracefully.
-		return nil, nil
+		return nil, nil //nolint:nilnil // (nil, nil) signals "unrecognized format"; Parser interface contract
 	}
 
 	// IFD starts at offset 12.
@@ -204,7 +204,7 @@ func parseIFDAt(b []byte, offset int, bigEndian bool) map[uint16][]byte {
 			value = b[pos+8 : pos+8+int(total)]
 		} else {
 			off := int(readU32(b[pos+8:], bigEndian))
-			valEnd := off + int(total)
+			valEnd := off + int(total) //nolint:gosec // G115: total is a uint64 value offset bounded by file size
 			if off < 0 || valEnd > len(b) {
 				continue
 			}
