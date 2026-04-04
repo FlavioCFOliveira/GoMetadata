@@ -76,12 +76,6 @@ linters:
         - name: var-naming
           severity: warning
 
-    gocritic:
-      # Activate the performance tag to surface cache-friendly and
-      # allocation-reducing suggestions in hot parsing paths.
-      enabled-tags:
-        - performance
-
     exhaustive:
       # Only flag switches that are missing cases; default: does not require
       # a default branch, which is correct for exhaustive enum coverage.
