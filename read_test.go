@@ -10,9 +10,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/flaviocfo/img-metadata/exif"
-	"github.com/flaviocfo/img-metadata/format"
-	"github.com/flaviocfo/img-metadata/iptc"
+	"github.com/FlavioCFOliveira/img-metadata/exif"
+	"github.com/FlavioCFOliveira/img-metadata/format"
+	"github.com/FlavioCFOliveira/img-metadata/iptc"
 )
 
 // buildMinimalJPEG constructs a minimal JPEG stream with an optional EXIF APP1

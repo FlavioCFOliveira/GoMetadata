@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/flaviocfo/img-metadata/exif"
-	"github.com/flaviocfo/img-metadata/format"
-	"github.com/flaviocfo/img-metadata/iptc"
-	"github.com/flaviocfo/img-metadata/xmp"
+	"github.com/FlavioCFOliveira/img-metadata/exif"
+	"github.com/FlavioCFOliveira/img-metadata/format"
+	"github.com/FlavioCFOliveira/img-metadata/iptc"
+	"github.com/FlavioCFOliveira/img-metadata/xmp"
 )
 
 // NewMetadata returns an empty Metadata ready for writing to a file of the

@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/flaviocfo/img-metadata/exif"
-	"github.com/flaviocfo/img-metadata/xmp"
+	"github.com/FlavioCFOliveira/img-metadata/exif"
+	"github.com/FlavioCFOliveira/img-metadata/xmp"
 )
 
 // ---------------------------------------------------------------------------

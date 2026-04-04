@@ -12,7 +12,7 @@ import (
 	"io"
 	"math"
 
-	"github.com/flaviocfo/img-metadata/internal/iobuf"
+	"github.com/FlavioCFOliveira/img-metadata/internal/iobuf"
 )
 
 // Extract navigates the ISOBMFF box hierarchy of r and extracts raw payloads.

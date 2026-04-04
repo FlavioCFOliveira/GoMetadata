@@ -9,8 +9,8 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/flaviocfo/img-metadata/internal/iobuf"
-	"github.com/flaviocfo/img-metadata/internal/metaerr"
+	"github.com/FlavioCFOliveira/img-metadata/internal/iobuf"
+	"github.com/FlavioCFOliveira/img-metadata/internal/metaerr"
 )
 
 // visitedPool recycles the maps used by traverse() to track visited IFD

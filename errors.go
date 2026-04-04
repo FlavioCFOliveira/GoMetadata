@@ -3,7 +3,7 @@ package imgmetadata
 import (
 	"fmt"
 
-	"github.com/flaviocfo/img-metadata/internal/metaerr"
+	"github.com/FlavioCFOliveira/img-metadata/internal/metaerr"
 )
 
 // UnsupportedFormatError is returned when the magic bytes of the input do not

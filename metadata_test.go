@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/flaviocfo/img-metadata/exif"
-	"github.com/flaviocfo/img-metadata/iptc"
-	"github.com/flaviocfo/img-metadata/xmp"
+	"github.com/FlavioCFOliveira/img-metadata/exif"
+	"github.com/FlavioCFOliveira/img-metadata/iptc"
+	"github.com/FlavioCFOliveira/img-metadata/xmp"
 )
 
 // newTestMetadata builds a Metadata whose three components are all non-nil

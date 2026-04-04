@@ -3,17 +3,17 @@
 package makernote
 
 import (
-	"github.com/flaviocfo/img-metadata/exif/makernote/canon"
-	"github.com/flaviocfo/img-metadata/exif/makernote/dji"
-	"github.com/flaviocfo/img-metadata/exif/makernote/fujifilm"
-	"github.com/flaviocfo/img-metadata/exif/makernote/leica"
-	"github.com/flaviocfo/img-metadata/exif/makernote/nikon"
-	"github.com/flaviocfo/img-metadata/exif/makernote/olympus"
-	"github.com/flaviocfo/img-metadata/exif/makernote/panasonic"
-	"github.com/flaviocfo/img-metadata/exif/makernote/pentax"
-	"github.com/flaviocfo/img-metadata/exif/makernote/samsung"
-	"github.com/flaviocfo/img-metadata/exif/makernote/sigma"
-	"github.com/flaviocfo/img-metadata/exif/makernote/sony"
+	"github.com/FlavioCFOliveira/img-metadata/exif/makernote/canon"
+	"github.com/FlavioCFOliveira/img-metadata/exif/makernote/dji"
+	"github.com/FlavioCFOliveira/img-metadata/exif/makernote/fujifilm"
+	"github.com/FlavioCFOliveira/img-metadata/exif/makernote/leica"
+	"github.com/FlavioCFOliveira/img-metadata/exif/makernote/nikon"
+	"github.com/FlavioCFOliveira/img-metadata/exif/makernote/olympus"
+	"github.com/FlavioCFOliveira/img-metadata/exif/makernote/panasonic"
+	"github.com/FlavioCFOliveira/img-metadata/exif/makernote/pentax"
+	"github.com/FlavioCFOliveira/img-metadata/exif/makernote/samsung"
+	"github.com/FlavioCFOliveira/img-metadata/exif/makernote/sigma"
+	"github.com/FlavioCFOliveira/img-metadata/exif/makernote/sony"
 )
 
 // Parser is implemented by each manufacturer-specific package.

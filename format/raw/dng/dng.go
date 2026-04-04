@@ -6,7 +6,7 @@ package dng
 import (
 	"io"
 
-	"github.com/flaviocfo/img-metadata/format/tiff"
+	"github.com/FlavioCFOliveira/img-metadata/format/tiff"
 )
 
 // Extract reads metadata from a DNG file.

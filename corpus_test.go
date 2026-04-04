@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/flaviocfo/img-metadata/format"
+	"github.com/FlavioCFOliveira/img-metadata/format"
 )
 
 // corpusAllFiles returns all files from all corpus subdirectories.

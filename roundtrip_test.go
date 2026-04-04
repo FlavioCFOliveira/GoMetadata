@@ -18,9 +18,9 @@ import (
 	"hash/crc32"
 	"testing"
 
-	imgmetadata "github.com/flaviocfo/img-metadata"
-	"github.com/flaviocfo/img-metadata/iptc"
-	"github.com/flaviocfo/img-metadata/xmp"
+	imgmetadata "github.com/FlavioCFOliveira/img-metadata"
+	"github.com/FlavioCFOliveira/img-metadata/iptc"
+	"github.com/FlavioCFOliveira/img-metadata/xmp"
 )
 
 // ---------------------------------------------------------------------------

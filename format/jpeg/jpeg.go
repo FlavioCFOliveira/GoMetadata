@@ -19,7 +19,7 @@ import (
 	"io"
 	"sort"
 
-	"github.com/flaviocfo/img-metadata/internal/iobuf"
+	"github.com/FlavioCFOliveira/img-metadata/internal/iobuf"
 )
 
 // JPEG marker bytes (ISO/IEC 10918-1, Annex B).
