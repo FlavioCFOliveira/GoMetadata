@@ -106,5 +106,8 @@ func copyFile(src, dst string) error {
 	if _, err := io.Copy(out, in); err != nil {
 		return fmt.Errorf("copy data: %w", err)
 	}
-	return out.Close()
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("close destination: %w", err)
+	}
+	return nil
 }

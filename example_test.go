@@ -272,7 +272,6 @@ func ExampleMetadata_Keywords() {
 	fmt.Printf("existing keywords: %d\n", len(existing))
 
 	// Append a new keyword to the existing set and update the Metadata.
-	updated := append(existing, "gometadata-example")
-	m.SetKeywords(updated)
+	m.SetKeywords(append(existing, "gometadata-example"))
 	fmt.Printf("updated keywords: %d\n", len(m.Keywords()))
 }

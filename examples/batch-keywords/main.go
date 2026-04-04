@@ -24,18 +24,18 @@ import (
 	gometadata "github.com/FlavioCFOliveira/GoMetadata"
 )
 
-// supportedExtensions is the set of file suffixes (lower-case) that this
-// tool will process. Format detection inside the library uses magic bytes,
-// but the extension pre-filter avoids unnecessary I/O on non-image files.
-var supportedExtensions = map[string]bool{
-	".jpg":  true,
-	".jpeg": true,
-	".png":  true,
-	".tiff": true,
-	".tif":  true,
-}
-
 func main() {
+	// supportedExtensions is the set of file suffixes (lower-case) that this
+	// tool will process. Format detection inside the library uses magic bytes,
+	// but the extension pre-filter avoids unnecessary I/O on non-image files.
+	supportedExtensions := map[string]bool{
+		".jpg":  true,
+		".jpeg": true,
+		".png":  true,
+		".tiff": true,
+		".tif":  true,
+	}
+
 	dryRun := flag.Bool("dry-run", false, "print changes without writing")
 	flag.Parse()
 
@@ -89,7 +89,7 @@ func main() {
 			}
 		}
 
-		updated := append(existing, keyword)
+		existing = append(existing, keyword)
 
 		if *dryRun {
 			fmt.Printf("would add %q to: %s\n", keyword, path)
@@ -97,7 +97,7 @@ func main() {
 			return nil
 		}
 
-		m.SetKeywords(updated)
+		m.SetKeywords(existing)
 		if err := gometadata.WriteFile(path, m); err != nil {
 			fmt.Fprintf(os.Stderr, "skip (write error): %s: %v\n", path, err)
 			skipped++
