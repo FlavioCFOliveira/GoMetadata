@@ -17,6 +17,44 @@ var canonUUID = []byte{ //nolint:gochecknoglobals // package-level constant byte
 	0x81, 0x11, 0xF4, 0xCE, 0x46, 0x2B, 0x6A, 0x48,
 }
 
+// parseCR3BoxHeader reads an ISOBMFF box header at data[pos:] and returns the
+// resolved box size, 4-byte type string, header length in bytes, and whether
+// the parse succeeded.
+//
+// ISOBMFF (ISO 14496-12) §4.2:
+//   - Normal box:   4-byte size + 4-byte type          → headerLen = 8
+//   - Extended box: size==1, followed by 8-byte largesize → headerLen = 16
+//   - size==0 means the box extends to end-of-container → size = len(data)-pos
+func parseCR3BoxHeader(data []byte, pos int) (size uint64, typ string, headerLen uint64, ok bool) {
+	if pos+8 > len(data) {
+		return 0, "", 0, false
+	}
+	size = uint64(binary.BigEndian.Uint32(data[pos:]))
+	typ = string(data[pos+4 : pos+8])
+	headerLen = 8
+
+	if size == 1 {
+		// Extended 64-bit size immediately follows the 8-byte base header.
+		if pos+16 > len(data) {
+			return 0, "", 0, false
+		}
+		size = binary.BigEndian.Uint64(data[pos+8:])
+		headerLen = 16
+	}
+
+	if size == 0 {
+		// size==0 means box extends to end of container.
+		size = uint64(len(data)) - uint64(pos)
+	}
+
+	// Bounds check: box must not extend beyond the containing slice.
+	if uint64(pos)+size > uint64(len(data)) {
+		return 0, "", 0, false
+	}
+
+	return size, typ, headerLen, true
+}
+
 // Extract reads metadata from a CR3 file by navigating the ISOBMFF box tree.
 // CMT1 contains IFD0 (TIFF header + entries); CMT2 contains the Exif IFD that
 // IFD0's ExifIFD pointer (tag 0x8769) addresses. Both are merged into rawEXIF
@@ -50,6 +88,28 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	return mergeCMT(cmt1, cmt2), nil, rawXMP, nil
 }
 
+// getExifIFDOffset detects byte order from cmt1's TIFF header and returns the
+// value of the ExifIFD pointer tag (0x8769) in IFD0. Returns 0 if cmt1 is
+// too short, the byte-order mark is unrecognised, or the tag is absent.
+//
+// TIFF 6.0 §2: "II" = little-endian, "MM" = big-endian.
+func getExifIFDOffset(cmt1 []byte) uint32 {
+	if len(cmt1) < 8 {
+		return 0
+	}
+	var order binary.ByteOrder
+	switch {
+	case cmt1[0] == 'I' && cmt1[1] == 'I':
+		order = binary.LittleEndian
+	case cmt1[0] == 'M' && cmt1[1] == 'M':
+		order = binary.BigEndian
+	default:
+		return 0
+	}
+	ifd0Off := order.Uint32(cmt1[4:8])
+	return findExifIFDOffset(cmt1, ifd0Off, order)
+}
+
 // mergeCMT combines CMT1 (IFD0 TIFF stream) with CMT2 (Exif IFD bytes) into
 // a single contiguous buffer that exif.Parse can traverse.
 //
@@ -64,26 +124,7 @@ func mergeCMT(cmt1, cmt2 []byte) []byte {
 	if cmt2 == nil || len(cmt1) < 8 {
 		return cmt1
 	}
-	// Parse the TIFF byte-order mark to determine endianness.
-	// TIFF 6.0 §2: "II" = little-endian, "MM" = big-endian.
-	var exifIFDOffset uint32
-	switch {
-	case cmt1[0] == 'I' && cmt1[1] == 'I': // little-endian
-		if len(cmt1) < 8 {
-			return cmt1
-		}
-		// IFD0 offset is at bytes 4–7 (TIFF header).
-		ifd0Off := binary.LittleEndian.Uint32(cmt1[4:8])
-		exifIFDOffset = findExifIFDOffset(cmt1, ifd0Off, binary.LittleEndian)
-	case cmt1[0] == 'M' && cmt1[1] == 'M': // big-endian
-		if len(cmt1) < 8 {
-			return cmt1
-		}
-		ifd0Off := binary.BigEndian.Uint32(cmt1[4:8])
-		exifIFDOffset = findExifIFDOffset(cmt1, ifd0Off, binary.BigEndian)
-	default:
-		return cmt1
-	}
+	exifIFDOffset := getExifIFDOffset(cmt1)
 	// If the ExifIFD offset is within CMT1, no merge needed.
 	if exifIFDOffset == 0 || int(exifIFDOffset) < len(cmt1) {
 		return cmt1
@@ -116,6 +157,40 @@ func findExifIFDOffset(buf []byte, ifd0Off uint32, order binary.ByteOrder) uint3
 		pos += 12
 	}
 	return 0
+}
+
+// rebuildUUIDContent iterates the sub-boxes of the Canon UUID box payload and
+// reconstructs the content with CMT1 replaced by rawEXIF (if non-nil) and
+// "XMP " replaced by rawXMP (if non-nil). Other sub-boxes are copied unchanged.
+// hadXMP reports whether an "XMP " sub-box was present in the original content.
+func rebuildUUIDContent(uuidContent, rawEXIF, rawXMP []byte) (newContent []byte, hadXMP bool) {
+	var buf bytes.Buffer
+	pos := 0
+	for pos+8 <= len(uuidContent) {
+		size, typ, _, ok := parseCR3BoxHeader(uuidContent, pos)
+		if !ok {
+			break
+		}
+		switch typ {
+		case "CMT1":
+			if rawEXIF != nil {
+				buf.Write(buildBox("CMT1", rawEXIF))
+			} else {
+				buf.Write(uuidContent[pos : pos+int(size)]) //nolint:gosec // G115: ISOBMFF box size bounded by file size
+			}
+		case "XMP ":
+			hadXMP = true
+			if rawXMP != nil {
+				buf.Write(buildBox("XMP ", rawXMP))
+			} else {
+				buf.Write(uuidContent[pos : pos+int(size)]) //nolint:gosec // G115: ISOBMFF box size bounded by file size
+			}
+		default:
+			buf.Write(uuidContent[pos : pos+int(size)]) //nolint:gosec // G115: ISOBMFF box size bounded by file size
+		}
+		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
+	}
+	return buf.Bytes(), hadXMP
 }
 
 // Inject writes a modified CR3 stream to w by rebuilding the Canon UUID box
@@ -153,57 +228,16 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	// uuidContent is the payload after the 8-byte box header + 16-byte UUID.
 	uuidContent := moovContent[uuidStart+8+16 : uuidEnd]
 
-	// Rebuild the UUID content: iterate sub-boxes and replace CMT1/XMP  as needed.
-	var newUUIDContent bytes.Buffer
-	hadXMP := false
-	pos := 0
-	for pos+8 <= len(uuidContent) {
-		size := uint64(binary.BigEndian.Uint32(uuidContent[pos:]))
-		typ := string(uuidContent[pos+4 : pos+8])
-		headerLen := uint64(8)
-		if size == 1 {
-			if pos+16 > len(uuidContent) {
-				break
-			}
-			size = binary.BigEndian.Uint64(uuidContent[pos+8:])
-			headerLen = 16
-		}
-		if size == 0 {
-			size = uint64(len(uuidContent) - pos)
-		}
-		if uint64(pos)+size > uint64(len(uuidContent)) {
-			break
-		}
-		boxPayload := uuidContent[pos+int(headerLen) : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by file size
-
-		switch typ {
-		case "CMT1":
-			if rawEXIF != nil {
-				newUUIDContent.Write(buildBox("CMT1", rawEXIF))
-			} else {
-				newUUIDContent.Write(uuidContent[pos : pos+int(size)]) //nolint:gosec // G115: ISOBMFF box size bounded by file size
-			}
-		case "XMP ":
-			hadXMP = true
-			if rawXMP != nil {
-				newUUIDContent.Write(buildBox("XMP ", rawXMP))
-			} else {
-				newUUIDContent.Write(uuidContent[pos : pos+int(size)]) //nolint:gosec // G115: ISOBMFF box size bounded by file size
-			}
-		default:
-			_ = boxPayload
-			newUUIDContent.Write(uuidContent[pos : pos+int(size)]) //nolint:gosec // G115: ISOBMFF box size bounded by file size
-		}
-		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
-	}
+	// Rebuild UUID content: replace CMT1/XMP  sub-boxes as needed.
+	newUUIDContentBytes, hadXMP := rebuildUUIDContent(uuidContent, rawEXIF, rawXMP)
 
 	// If the UUID box didn't have an XMP  sub-box but we have rawXMP, append it.
 	if !hadXMP && rawXMP != nil {
-		newUUIDContent.Write(buildBox("XMP ", rawXMP))
+		newUUIDContentBytes = append(newUUIDContentBytes, buildBox("XMP ", rawXMP)...)
 	}
 
 	// Build the new UUID box: 8-byte header + 16-byte Canon UUID + new content.
-	newUUIDBox := buildUUIDBox(canonUUID, newUUIDContent.Bytes())
+	newUUIDBox := buildUUIDBox(canonUUID, newUUIDContentBytes)
 
 	// Splice: replace the old UUID box in moov content with the new one.
 	newMoovContent := make([]byte, 0, len(moovContent)-uuidEnd+len(newUUIDBox)+uuidStart)
@@ -252,26 +286,13 @@ func buildUUIDBox(uuid []byte, content []byte) []byte {
 func flatBoxRange(data []byte, boxType string) (start, end int, found bool) {
 	pos := 0
 	for pos+8 <= len(data) {
-		size := uint64(binary.BigEndian.Uint32(data[pos:]))
-		typ := string(data[pos+4 : pos+8])
-		headerLen := uint64(8)
-		if size == 1 {
-			if pos+16 > len(data) {
-				break
-			}
-			size = binary.BigEndian.Uint64(data[pos+8:])
-			headerLen = 16
-		}
-		if size == 0 {
-			size = uint64(len(data) - pos)
-		}
-		if uint64(pos)+size > uint64(len(data)) {
+		size, typ, _, ok := parseCR3BoxHeader(data, pos)
+		if !ok {
 			break
 		}
 		if typ == boxType {
 			return pos, pos + int(size), true //nolint:gosec // G115: ISOBMFF box size bounded by file size
 		}
-		_ = headerLen
 		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 	}
 	return 0, 0, false
@@ -282,24 +303,12 @@ func flatBoxRange(data []byte, boxType string) (start, end int, found bool) {
 func flatUUIDBoxRange(data []byte, uuid []byte) (start, end int, found bool) {
 	pos := 0
 	for pos+8 <= len(data) {
-		size := uint64(binary.BigEndian.Uint32(data[pos:]))
-		typ := string(data[pos+4 : pos+8])
-		headerLen := uint64(8)
-		if size == 1 {
-			if pos+16 > len(data) {
-				break
-			}
-			size = binary.BigEndian.Uint64(data[pos+8:])
-			headerLen = 16
-		}
-		if size == 0 {
-			size = uint64(len(data) - pos)
-		}
-		if uint64(pos)+size > uint64(len(data)) {
+		size, typ, headerLen, ok := parseCR3BoxHeader(data, pos)
+		if !ok {
 			break
 		}
-		if typ == "uuid" && pos+int(headerLen)+16 <= len(data) {
-			if matchesUUID(data[pos+int(headerLen):], uuid) {
+		if typ == "uuid" && pos+int(headerLen)+16 <= len(data) { //nolint:gosec // G115: headerLen is 8 or 16
+			if matchesUUID(data[pos+int(headerLen):], uuid) { //nolint:gosec // G115: headerLen is 8 or 16
 				return pos, pos + int(size), true //nolint:gosec // G115: ISOBMFF box size bounded by file size
 			}
 		}
@@ -317,20 +326,8 @@ func findBox(data []byte, boxType string, depth int) []byte {
 	}
 	pos := 0
 	for pos+8 <= len(data) {
-		size := uint64(binary.BigEndian.Uint32(data[pos:]))
-		typ := string(data[pos+4 : pos+8])
-		headerLen := uint64(8)
-		if size == 1 {
-			if pos+16 > len(data) {
-				break
-			}
-			size = binary.BigEndian.Uint64(data[pos+8:])
-			headerLen = 16
-		}
-		if size == 0 {
-			size = uint64(len(data) - pos)
-		}
-		if uint64(pos)+size > uint64(len(data)) {
+		size, typ, headerLen, ok := parseCR3BoxHeader(data, pos)
+		if !ok {
 			break
 		}
 		boxData := data[pos+int(headerLen) : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by file size
@@ -352,24 +349,12 @@ func findBox(data []byte, boxType string, depth int) []byte {
 func findUUIDBox(data []byte, uuid []byte) []byte {
 	pos := 0
 	for pos+8 <= len(data) {
-		size := uint64(binary.BigEndian.Uint32(data[pos:]))
-		typ := string(data[pos+4 : pos+8])
-		headerLen := uint64(8)
-		if size == 1 {
-			if pos+16 > len(data) {
-				break
-			}
-			size = binary.BigEndian.Uint64(data[pos+8:])
-			headerLen = 16
-		}
-		if size == 0 {
-			size = uint64(len(data) - pos)
-		}
-		if uint64(pos)+size > uint64(len(data)) {
+		size, typ, headerLen, ok := parseCR3BoxHeader(data, pos)
+		if !ok {
 			break
 		}
-		if typ == "uuid" && pos+int(headerLen)+16 <= len(data) {
-			if matchesUUID(data[pos+int(headerLen):], uuid) {
+		if typ == "uuid" && pos+int(headerLen)+16 <= len(data) { //nolint:gosec // G115: headerLen is 8 or 16
+			if matchesUUID(data[pos+int(headerLen):], uuid) { //nolint:gosec // G115: headerLen is 8 or 16
 				return data[pos+int(headerLen)+16 : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by file size
 			}
 		}

@@ -25,10 +25,10 @@ import (
 
 // JPEG marker bytes (ISO/IEC 10918-1, Annex B).
 const (
-	markerSOI  byte = 0xD8
-	markerEOI  byte = 0xD9
-	markerSOS  byte = 0xDA
-	markerAPP1 byte = 0xE1
+	markerSOI   byte = 0xD8
+	markerEOI   byte = 0xD9
+	markerSOS   byte = 0xDA
+	markerAPP1  byte = 0xE1
 	markerAPP13 byte = 0xED
 )
 
@@ -53,10 +53,10 @@ var identPS = []byte("Photoshop 3.0\x00") //nolint:gochecknoglobals // package-l
 // maxXMPPayload: max XMP packet bytes in a standard (non-extended) APP1.
 // maxExtChunkSize: max chunk data per extended XMP APP1 (Adobe XMP Spec Part 3 §1.1.4).
 //
-//   Extended APP1 layout: identXMPNote(32) + GUID(32) + fullLen(4) + offset(4) + chunk
-//   Overhead = 32 + 32 + 4 + 4 = 72 bytes → chunk data ≤ 65533 − 72 = 65461 bytes.
+//	Extended APP1 layout: identXMPNote(32) + GUID(32) + fullLen(4) + offset(4) + chunk
+//	Overhead = 32 + 32 + 4 + 4 = 72 bytes → chunk data ≤ 65533 − 72 = 65461 bytes.
 const (
-	maxAPP1Payload  = 65533 // 65535 − 2 (length field)
+	maxAPP1Payload  = 65533             // 65535 − 2 (length field)
 	maxXMPPayload   = maxAPP1Payload - 29 // − len(identXMP)
 	maxExtChunkSize = maxAPP1Payload - 72 // − len(identXMPNote)+GUID+fullLen+offset overhead
 )
@@ -66,6 +66,115 @@ const (
 type extChunk struct {
 	offset uint32
 	data   []byte
+}
+
+// processAPP1Segment dispatches an APP1 segment payload to the appropriate
+// metadata bucket (EXIF, standard XMP, or extended XMP).
+// It returns updated values for rawEXIF, rawXMP, and the extended map;
+// pass-through values are returned unchanged when not applicable.
+func processAPP1Segment(data, rawEXIF, rawXMP []byte, extended map[string][]extChunk) ([]byte, []byte, map[string][]extChunk) {
+	switch {
+	case bytes.HasPrefix(data, identExif):
+		// EXIF payload begins after the 6-byte "Exif\x00\x00" header.
+		// Copy: data aliases scratch and must survive the next readSegment call.
+		rawEXIF = append([]byte(nil), data[len(identExif):]...)
+
+	case bytes.HasPrefix(data, identXMP):
+		// Copy: same reason as rawEXIF.
+		rawXMP = append([]byte(nil), data[len(identXMP):]...)
+
+	case bytes.HasPrefix(data, identXMPNote):
+		// Extended XMP chunk: GUID (32 bytes) + fullLength (4 bytes) +
+		// offset (4 bytes) + chunk data. Adobe XMP Spec Part 3 §1.1.4.
+		body := data[len(identXMPNote):]
+		if len(body) >= 40 {
+			guid := string(body[:32])
+			fullLen := binary.BigEndian.Uint32(body[32:36])
+			offset := binary.BigEndian.Uint32(body[36:40])
+			_ = fullLen // used only for validation; assembly is offset-driven
+			// Copy chunk data: body aliases scratch and must outlive this loop.
+			chunkData := append([]byte(nil), body[40:]...)
+			// Lazily initialise the map on first encounter.
+			if extended == nil {
+				extended = make(map[string][]extChunk)
+			}
+			extended[guid] = append(extended[guid], extChunk{
+				offset: offset,
+				data:   chunkData,
+			})
+		}
+	}
+
+	return rawEXIF, rawXMP, extended
+}
+
+// processAPP13Segment checks a segment payload for the Photoshop IRB prefix and,
+// if present, calls parseIRB to extract the IPTC IIM stream.
+// Returns nil when the segment carries no recognisable IPTC data.
+func processAPP13Segment(data []byte) []byte {
+	if !bytes.HasPrefix(data, identPS) {
+		return nil
+	}
+	// parseIRB returns a sub-slice of its input; copy since input aliases scratch.
+	irb := parseIRB(data[len(identPS):])
+	if irb == nil {
+		return nil
+	}
+	return append([]byte(nil), irb...)
+}
+
+// maybeReassembleXMP returns the reassembled XMP when extended chunks are
+// present, or rawXMP unchanged when there is nothing to merge.
+// Centralising this condition removes the duplicated &&-branch that would
+// otherwise appear at every early-return point in Extract.
+func maybeReassembleXMP(rawXMP []byte, extended map[string][]extChunk) []byte {
+	if rawXMP != nil && len(extended) > 0 {
+		return reassembleExtendedXMP(rawXMP, extended)
+	}
+	return rawXMP
+}
+
+// readSOI reads and validates the 2-byte JPEG SOI marker from soi.
+// Returns an error if the bytes are not 0xFF 0xD8.
+// JPEG ISO/IEC 10918-1 §B.1.1.3.
+func readSOI(soi []byte) error {
+	if soi[0] != 0xFF || soi[1] != markerSOI {
+		return fmt.Errorf("jpeg: not a JPEG file (SOI 0x%04X)", uint16(soi[0])<<8|uint16(soi[1]))
+	}
+	return nil
+}
+
+// scanMetadataSegments reads the JPEG marker stream from r until SOS/EOI or
+// read failure, collecting EXIF, IPTC, XMP, and extended-XMP payloads.
+func scanMetadataSegments(r io.Reader, scratchPtr *[]byte) (rawEXIF, rawIPTC, rawXMP []byte) {
+	// extended collects chunks from extended XMP APP1 segments, keyed by GUID.
+	// Adobe XMP Specification Part 3 §1.1.4.
+	// Lazily initialised: most JPEGs do not contain extended XMP, so we avoid
+	// the map allocation on the fast path.
+	var extended map[string][]extChunk
+
+	for {
+		marker, data, rerr := readSegment(r, scratchPtr)
+		if rerr != nil {
+			// Both EOF and malformed-stream errors: degrade gracefully and
+			// return whatever metadata has been collected so far.
+			break
+		}
+
+		switch marker {
+		case markerAPP1:
+			rawEXIF, rawXMP, extended = processAPP1Segment(data, rawEXIF, rawXMP, extended)
+		case markerAPP13:
+			if iptc := processAPP13Segment(data); iptc != nil {
+				rawIPTC = iptc
+			}
+		case markerSOS, markerEOI:
+			// SOS/EOI: no more metadata segments follow.
+			return rawEXIF, rawIPTC, maybeReassembleXMP(rawXMP, extended)
+		}
+	}
+
+	return rawEXIF, rawIPTC, maybeReassembleXMP(rawXMP, extended)
 }
 
 // Extract reads the JPEG marker stream from r and returns the raw payloads.
@@ -91,81 +200,156 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if _, err = io.ReadFull(r, soi); err != nil {
 		return nil, nil, nil, fmt.Errorf("jpeg: read SOI: %w", err)
 	}
-	if soi[0] != 0xFF || soi[1] != markerSOI {
-		return nil, nil, nil, fmt.Errorf("jpeg: not a JPEG file (SOI 0x%04X)", uint16(soi[0])<<8|uint16(soi[1]))
+	if err = readSOI(soi); err != nil {
+		return nil, nil, nil, err
 	}
 
-	// extended collects chunks from extended XMP APP1 segments, keyed by GUID.
-	// Adobe XMP Specification Part 3 §1.1.4.
-	// Lazily initialised: most JPEGs do not contain extended XMP, so we avoid
-	// the map allocation on the fast path.
-	var extended map[string][]extChunk
+	rawEXIF, rawIPTC, rawXMP = scanMetadataSegments(r, scratchPtr)
+	return rawEXIF, rawIPTC, rawXMP, nil
+}
 
+// writeEXIFSegment writes the EXIF APP1 segment to w.
+// APP1 length field is 16-bit; JPEG ISO/IEC 10918-1 and EXIF §4.5.4.
+func writeEXIFSegment(w io.Writer, rawEXIF []byte) error {
+	if len(identExif)+len(rawEXIF)+2 > 65535 {
+		return fmt.Errorf("jpeg: EXIF payload %d bytes exceeds APP1 segment limit; EXIF cannot be split", len(rawEXIF))
+	}
+	exifBuf := iobuf.Get(len(identExif) + len(rawEXIF))
+	copy(*exifBuf, identExif)
+	copy((*exifBuf)[len(identExif):], rawEXIF)
+	writeErr := writeSegment(w, markerAPP1, *exifBuf)
+	iobuf.Put(exifBuf)
+	return writeErr
+}
+
+// writeXMPSegments writes a standard XMP APP1 when the payload fits within
+// maxXMPPayload, or falls back to the multi-segment extended-XMP path.
+// Adobe XMP Specification Part 3 §1.1.4.
+func writeXMPSegments(w io.Writer, rawXMP []byte) error {
+	if len(rawXMP) <= maxXMPPayload {
+		// Fast path: XMP fits in a single APP1 segment.
+		xmpBuf := iobuf.Get(len(identXMP) + len(rawXMP))
+		copy(*xmpBuf, identXMP)
+		copy((*xmpBuf)[len(identXMP):], rawXMP)
+		writeErr := writeSegment(w, markerAPP1, *xmpBuf)
+		iobuf.Put(xmpBuf)
+		return writeErr
+	}
+	// Slow path: split into extended XMP segments.
+	return writeExtendedXMP(w, rawXMP)
+}
+
+// writeIPTCSegment wraps the IPTC IIM stream in a Photoshop IRB block and
+// writes it as an APP13 segment. APP13 length field is 16-bit; EXIF §4.5.6.
+func writeIPTCSegment(w io.Writer, rawIPTC []byte) error {
+	irb := buildIRB(rawIPTC)
+	if len(identPS)+len(irb)+2 > 65535 {
+		return fmt.Errorf("jpeg: IPTC IRB payload %d bytes exceeds APP13 segment limit", len(irb))
+	}
+	iptcBuf := iobuf.Get(len(identPS) + len(irb))
+	copy(*iptcBuf, identPS)
+	copy((*iptcBuf)[len(identPS):], irb)
+	writeErr := writeSegment(w, markerAPP13, *iptcBuf)
+	iobuf.Put(iptcBuf)
+	return writeErr
+}
+
+// writeNewMetadataSegments writes EXIF APP1, XMP APP1 (with extended-XMP
+// splitting when the payload exceeds the single-segment limit), and IPTC
+// APP13 segments to w. Returns the first error encountered.
+func writeNewMetadataSegments(w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
+	if rawEXIF != nil {
+		if err := writeEXIFSegment(w, rawEXIF); err != nil {
+			return err
+		}
+	}
+	if rawXMP != nil {
+		if err := writeXMPSegments(w, rawXMP); err != nil {
+			return err
+		}
+	}
+	if rawIPTC != nil {
+		if err := writeIPTCSegment(w, rawIPTC); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// isOldMetadataSegment reports whether a marker+data pair is a metadata
+// segment that Inject should strip (EXIF APP1, standard XMP APP1, extended
+// XMP APP1, or Photoshop APP13). It is a pure predicate with no side effects.
+func isOldMetadataSegment(marker byte, data []byte) bool {
+	if marker == markerAPP1 {
+		return bytes.HasPrefix(data, identExif) ||
+			bytes.HasPrefix(data, identXMP) ||
+			bytes.HasPrefix(data, identXMPNote)
+	}
+	if marker == markerAPP13 {
+		return bytes.HasPrefix(data, identPS)
+	}
+	return false
+}
+
+// writeMarker writes a standalone JPEG marker (FF <marker>) to w.
+func writeMarker(w io.Writer, marker byte) error {
+	if _, err := w.Write([]byte{0xFF, marker}); err != nil {
+		return fmt.Errorf("jpeg: write marker: %w", err)
+	}
+	return nil
+}
+
+// writePassThroughSegment writes a single non-metadata segment to w.
+// Standalone markers (nil data) are written as FF <marker>; segments with
+// data are written with the standard length-prefixed format.
+func writePassThroughSegment(w io.Writer, marker byte, data []byte) error {
+	if data == nil {
+		return writeMarker(w, marker)
+	}
+	return writeSegment(w, marker, data)
+}
+
+// writeSOS writes the SOS segment and then copies the remaining compressed
+// image data from r to w verbatim.
+func writeSOS(r io.Reader, w io.Writer, data []byte) error {
+	if err := writeSegment(w, markerSOS, data); err != nil {
+		return err
+	}
+	if _, err := io.Copy(w, r); err != nil {
+		return fmt.Errorf("jpeg: copy image data: %w", err)
+	}
+	return nil
+}
+
+// copyNonMetadataSegments reads segments from r, skips old metadata APP
+// segments, and passes the rest through to w. It terminates on SOS (copying
+// the compressed stream verbatim) or EOI.
+func copyNonMetadataSegments(r io.Reader, w io.Writer, scratch *[]byte) error {
 	for {
-		marker, data, rerr := readSegment(r, scratchPtr)
-		if rerr != nil {
-			if errors.Is(rerr, io.EOF) {
-				break
+		marker, data, err := readSegment(r, scratch)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
 			}
-			// Non-fatal: degrade gracefully on malformed marker streams.
-			// Return whatever metadata we have collected so far.
-			break
+			return err
+		}
+
+		// Skip segments we replaced (or removed when payload is nil).
+		if isOldMetadataSegment(marker, data) {
+			continue
 		}
 
 		switch marker {
-		case markerAPP1:
-			switch {
-			case bytes.HasPrefix(data, identExif):
-				// EXIF payload begins after the 6-byte "Exif\x00\x00" header.
-				// Copy: data aliases scratch and must survive the next readSegment call.
-				rawEXIF = append([]byte(nil), data[len(identExif):]...)
-			case bytes.HasPrefix(data, identXMP):
-				// Copy: same reason as rawEXIF.
-				rawXMP = append([]byte(nil), data[len(identXMP):]...)
-			case bytes.HasPrefix(data, identXMPNote):
-				// Extended XMP chunk: GUID (32 bytes) + fullLength (4 bytes) +
-				// offset (4 bytes) + chunk data. Adobe XMP Spec Part 3 §1.1.4.
-				body := data[len(identXMPNote):]
-				if len(body) >= 40 {
-					guid := string(body[:32])
-					fullLen := binary.BigEndian.Uint32(body[32:36])
-					offset := binary.BigEndian.Uint32(body[36:40])
-					_ = fullLen // used only for validation; assembly is offset-driven
-					// Copy chunk data: body aliases scratch and must outlive this loop.
-					chunkData := append([]byte(nil), body[40:]...)
-					// Lazily initialise the map on first encounter.
-					if extended == nil {
-						extended = make(map[string][]extChunk)
-					}
-					extended[guid] = append(extended[guid], extChunk{
-						offset: offset,
-						data:   chunkData,
-					})
-				}
+		case markerSOS:
+			return writeSOS(r, w, data)
+		case markerEOI:
+			return writeMarker(w, markerEOI)
+		default:
+			if err := writePassThroughSegment(w, marker, data); err != nil {
+				return err
 			}
-
-		case markerAPP13:
-			if bytes.HasPrefix(data, identPS) {
-				// parseIRB returns a sub-slice of its input; copy since input aliases scratch.
-				irb := parseIRB(data[len(identPS):])
-				if irb != nil {
-					rawIPTC = append([]byte(nil), irb...)
-				}
-			}
-
-		case markerSOS, markerEOI:
-			// SOS/EOI: no more metadata segments follow.
-			if rawXMP != nil && len(extended) > 0 {
-				rawXMP = reassembleExtendedXMP(rawXMP, extended)
-			}
-			return rawEXIF, rawIPTC, rawXMP, nil
 		}
 	}
-
-	if rawXMP != nil && len(extended) > 0 {
-		rawXMP = reassembleExtendedXMP(rawXMP, extended)
-	}
-	return rawEXIF, rawIPTC, rawXMP, nil
 }
 
 // Inject reads the JPEG marker stream from r, replaces the relevant APP
@@ -190,54 +374,8 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	}
 
 	// Write new metadata segments before any existing ones.
-	if rawEXIF != nil {
-		// APP1 length field is 16-bit; max payload = 65535 - 2 (length field).
-		// EXIF §4.5.4, JPEG ISO/IEC 10918-1.
-		if len(identExif)+len(rawEXIF)+2 > 65535 {
-			return fmt.Errorf("jpeg: EXIF payload %d bytes exceeds APP1 segment limit; EXIF cannot be split", len(rawEXIF))
-		}
-		exifBuf := iobuf.Get(len(identExif) + len(rawEXIF))
-		copy(*exifBuf, identExif)
-		copy((*exifBuf)[len(identExif):], rawEXIF)
-		writeErr := writeSegment(w, markerAPP1, *exifBuf)
-		iobuf.Put(exifBuf)
-		if writeErr != nil {
-			return writeErr
-		}
-	}
-	if rawXMP != nil {
-		if len(rawXMP) <= maxXMPPayload {
-			// Fast path: XMP fits in a single APP1 segment.
-			xmpBuf := iobuf.Get(len(identXMP) + len(rawXMP))
-			copy(*xmpBuf, identXMP)
-			copy((*xmpBuf)[len(identXMP):], rawXMP)
-			writeErr := writeSegment(w, markerAPP1, *xmpBuf)
-			iobuf.Put(xmpBuf)
-			if writeErr != nil {
-				return writeErr
-			}
-		} else {
-			// Slow path: XMP is too large for one APP1; split into extended XMP
-			// per Adobe XMP Specification Part 3 §1.1.4.
-			if err := writeExtendedXMP(w, rawXMP); err != nil {
-				return err
-			}
-		}
-	}
-	if rawIPTC != nil {
-		irb := buildIRB(rawIPTC)
-		// APP13 length field is 16-bit; max payload = 65535 - 2 (length field).
-		if len(identPS)+len(irb)+2 > 65535 {
-			return fmt.Errorf("jpeg: IPTC IRB payload %d bytes exceeds APP13 segment limit", len(irb))
-		}
-		iptcBuf := iobuf.Get(len(identPS) + len(irb))
-		copy(*iptcBuf, identPS)
-		copy((*iptcBuf)[len(identPS):], irb)
-		writeErr := writeSegment(w, markerAPP13, *iptcBuf)
-		iobuf.Put(iptcBuf)
-		if writeErr != nil {
-			return writeErr
-		}
+	if err := writeNewMetadataSegments(w, rawEXIF, rawIPTC, rawXMP); err != nil {
+		return err
 	}
 
 	// Copy remaining segments, skipping old metadata APP segments.
@@ -246,61 +384,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	injectScratch := iobuf.Get(4096)
 	defer iobuf.Put(injectScratch)
 
-	for {
-		marker, data, err := readSegment(r, injectScratch)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return err
-		}
-
-		// Skip segments we replaced (or removed when payload is nil).
-		// Also skip extended XMP segments (identXMPNote) — they belong to the
-		// old XMP data we have already replaced above.
-		if marker == markerAPP1 {
-			if bytes.HasPrefix(data, identExif) ||
-				bytes.HasPrefix(data, identXMP) ||
-				bytes.HasPrefix(data, identXMPNote) {
-				continue
-			}
-		}
-		if marker == markerAPP13 && bytes.HasPrefix(data, identPS) {
-			continue
-		}
-
-		if marker == markerSOS {
-			// Write SOS and then pass through the rest of the file verbatim.
-			if err := writeSegment(w, markerSOS, data); err != nil {
-				return err
-			}
-			if _, err = io.Copy(w, r); err != nil {
-				return fmt.Errorf("jpeg: copy image data: %w", err)
-			}
-			return nil
-		}
-
-		if marker == markerEOI {
-			_, err = w.Write([]byte{0xFF, markerEOI})
-			if err != nil {
-				return fmt.Errorf("jpeg: write image data: %w", err)
-			}
-			return nil
-		}
-
-		if data == nil {
-			// Standalone marker (no data).
-			if _, err := w.Write([]byte{0xFF, marker}); err != nil {
-				return fmt.Errorf("jpeg: write segment data: %w", err)
-			}
-		} else {
-			if err := writeSegment(w, marker, data); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
+	return copyNonMetadataSegments(r, w, injectScratch)
 }
 
 // writeExtendedXMP splits rawXMP across a main APP1 and one or more extended
@@ -402,53 +486,99 @@ func writeExtendedXMP(w io.Writer, rawXMP []byte) error {
 	return nil
 }
 
+// skipPascalString advances pos past a Pascal-string name field in a
+// Photoshop IRB entry. The field is 1-byte length + length bytes of name,
+// padded to an even total. Returns (newPos, true) on success or (pos+1, false)
+// when the buffer is too short. EXIF §4.5.6.
+func skipPascalString(b []byte, pos int) (int, bool) {
+	if pos >= len(b) {
+		return pos + 1, false
+	}
+	nameLen := int(b[pos])
+	pos++ // consume length byte
+	pos += nameLen
+	if (nameLen+1)%2 != 0 {
+		pos++ // even-padding byte
+	}
+	return pos, true
+}
+
+// parseIRBEntry validates the "8BIM" signature at b[pos], reads the resource
+// ID, Pascal-string name, and data block, and returns the resource ID, data
+// slice, new position, and a success flag.
+//
+// Two distinct failure modes:
+//   - signature mismatch: returns (0, nil, pos, false) — newPos == pos signals
+//     this; the caller may advance by 1 to scan forward.
+//   - structural failure (truncated data, bad size): returns with newPos > pos;
+//     the caller treats this as terminal.
+//
+// IRB format: "8BIM" + 2-byte resource ID + Pascal string name + 4-byte size + data.
+// EXIF §4.5.6.
+func parseIRBEntry(b []byte, pos int) (resourceID uint16, data []byte, newPos int, ok bool) {
+	if pos+4 > len(b) {
+		return 0, nil, pos + 1, false // terminal: not enough bytes even for signature
+	}
+
+	// Check "8BIM" signature; return pos unchanged on mismatch so the caller
+	// can distinguish a scan-forward miss from a structural error.
+	if b[pos] != '8' || b[pos+1] != 'B' || b[pos+2] != 'I' || b[pos+3] != 'M' {
+		return 0, nil, pos, false // signature mismatch — caller advances by 1
+	}
+	pos += 4
+
+	if pos+2 > len(b) {
+		return 0, nil, pos + 1, false
+	}
+	resourceID = binary.BigEndian.Uint16(b[pos:])
+	pos += 2
+
+	// Skip the Pascal-string name field (1-byte length + name + even padding).
+	pos, ok = skipPascalString(b, pos)
+	if !ok {
+		return 0, nil, pos, false
+	}
+
+	if pos+4 > len(b) {
+		return 0, nil, pos + 1, false
+	}
+	// binary.BigEndian.Uint32 returns uint32; on 64-bit platforms the int cast
+	// is always non-negative. The subsequent bounds check catches truncation.
+	dataSize := int(binary.BigEndian.Uint32(b[pos:])) //nolint:gosec // G115: cast uint32→int; non-negative on 64-bit; truncation caught by next check
+	pos += 4
+
+	if pos+dataSize > len(b) {
+		return 0, nil, pos + 1, false
+	}
+
+	return resourceID, b[pos : pos+dataSize], pos + dataSize, true
+}
+
 // parseIRB extracts the IPTC IIM stream from a Photoshop IRB block.
 // IRB format: "8BIM" + 2-byte resource ID + Pascal string name + 4-byte size + data.
 // Resource ID 0x0404 is the IPTC-NAA resource (EXIF §4.5.6.2).
 func parseIRB(b []byte) []byte {
 	pos := 0
-	for pos+12 <= len(b) {
-		// Locate the "8BIM" signature.
-		if b[pos] != '8' || b[pos+1] != 'B' || b[pos+2] != 'I' || b[pos+3] != 'M' {
-			pos++
-			continue
-		}
-		pos += 4
-
-		if pos+2 > len(b) {
-			break
-		}
-		resourceID := binary.BigEndian.Uint16(b[pos:])
-		pos += 2
-
-		// Pascal string name: 1-byte length + n bytes, padded to even total.
-		if pos >= len(b) {
-			break
-		}
-		nameLen := int(b[pos])
-		pos++
-		pos += nameLen
-		if (nameLen+1)%2 != 0 {
-			pos++ // padding byte
-		}
-
-		if pos+4 > len(b) {
-			break
-		}
-		dataSize := int(binary.BigEndian.Uint32(b[pos:]))
-		pos += 4
-
-		if dataSize < 0 || pos+dataSize > len(b) {
+	for pos < len(b) {
+		resourceID, data, newPos, ok := parseIRBEntry(b, pos)
+		if !ok {
+			if newPos == pos {
+				// Signature mismatch: advance one byte to scan forward.
+				pos++
+				continue
+			}
+			// Structural failure (truncated data, bad bounds): terminal.
 			break
 		}
 
 		if resourceID == 0x0404 {
-			return b[pos : pos+dataSize]
+			return data
 		}
 
-		pos += dataSize
-		if dataSize%2 != 0 {
-			pos++ // pad data to even boundary
+		pos = newPos
+		// Apply even-padding to data block (EXIF §4.5.6).
+		if len(data)%2 != 0 {
+			pos++
 		}
 	}
 	return nil
@@ -470,6 +600,18 @@ func buildIRB(iptcData []byte) []byte {
 		buf = append(buf, 0x00) // pad data to even boundary
 	}
 	return buf
+}
+
+// skipFillBytes reads consecutive 0xFF fill bytes from r into hdr[1], advancing
+// past padding bytes until hdr[1] holds a non-0xFF marker byte.
+// JPEG ISO/IEC 10918-1 §B.1.1.2: fill bytes are allowed before any marker.
+func skipFillBytes(r io.Reader, hdr []byte) error {
+	for hdr[1] == 0xFF {
+		if _, err := io.ReadFull(r, hdr[1:]); err != nil {
+			return fmt.Errorf("jpeg: read fill byte: %w", err)
+		}
+	}
+	return nil
 }
 
 // readSegment reads one JPEG marker segment from r into *scratch, growing it
@@ -495,10 +637,8 @@ func readSegment(r io.Reader, scratch *[]byte) (marker byte, data []byte, err er
 		return 0, nil, fmt.Errorf("jpeg: expected marker prefix 0xFF, got 0x%02X", hdr[0])
 	}
 	// Skip fill bytes (consecutive 0xFF).
-	for hdr[1] == 0xFF {
-		if _, err = io.ReadFull(r, hdr[1:]); err != nil {
-			return 0, nil, fmt.Errorf("jpeg: read fill byte: %w", err)
-		}
+	if err = skipFillBytes(r, hdr); err != nil {
+		return 0, nil, err
 	}
 	marker = hdr[1]
 
@@ -547,6 +687,51 @@ func writeSegment(w io.Writer, marker byte, data []byte) error {
 	return nil
 }
 
+// extractGUIDFromMain locates the HasExtendedXMP attribute in the main XMP
+// packet and returns the 32-hex-character GUID value.
+// Returns ("", false) if the attribute is absent or malformed.
+func extractGUIDFromMain(main []byte) (guid string, ok bool) {
+	const marker = "HasExtendedXMP"
+	idx := bytes.Index(main, []byte(marker))
+	if idx < 0 {
+		return "", false
+	}
+
+	// The GUID value follows the property name as either an attribute
+	// (HasExtendedXMP="<GUID>") or element content (HasExtendedXMP><GUID></...).
+	// In both cases we scan past up to 5 bytes for the opening quote character.
+	rest := main[idx+len(marker):]
+	qi := bytes.IndexAny(rest, `"'`)
+	if qi < 0 || qi > 5 {
+		return "", false
+	}
+	quote := rest[qi]
+	rest = rest[qi+1:]
+	end := bytes.IndexByte(rest, quote)
+	if end != 32 { // GUID must be exactly 32 hex characters
+		return "", false
+	}
+	return string(rest[:32]), true
+}
+
+// mergeExtendedChunks sorts chunks by their byte offset and concatenates their
+// data fields into a single contiguous extended XMP byte slice.
+func mergeExtendedChunks(chunks []extChunk) []byte {
+	sort.Slice(chunks, func(i, j int) bool {
+		return chunks[i].offset < chunks[j].offset
+	})
+
+	var totalLen int
+	for _, c := range chunks {
+		totalLen += len(c.data)
+	}
+	extBytes := make([]byte, 0, totalLen)
+	for _, c := range chunks {
+		extBytes = append(extBytes, c.data...)
+	}
+	return extBytes
+}
+
 // reassembleExtendedXMP merges extended XMP chunks into the main XMP packet
 // per Adobe XMP Specification Part 3 §1.1.4.
 //
@@ -561,46 +746,17 @@ func writeSegment(w io.Writer, marker byte, data []byte) error {
 // function returns main unchanged — graceful degradation is required because
 // we cannot know in advance whether all extended segments are present.
 func reassembleExtendedXMP(main []byte, extended map[string][]extChunk) []byte {
-	// Locate the HasExtendedXMP property name in the main packet.
-	const marker = "HasExtendedXMP"
-	idx := bytes.Index(main, []byte(marker))
-	if idx < 0 {
+	guid, ok := extractGUIDFromMain(main)
+	if !ok {
 		return main
 	}
 
-	// The GUID value follows the property name as either an attribute
-	// (HasExtendedXMP="<GUID>") or element content (HasExtendedXMP><GUID></...).
-	// In both cases we scan past up to 5 bytes for the opening quote character.
-	rest := main[idx+len(marker):]
-	qi := bytes.IndexAny(rest, `"'`)
-	if qi < 0 || qi > 5 {
-		return main
-	}
-	quote := rest[qi]
-	rest = rest[qi+1:]
-	end := bytes.IndexByte(rest, quote)
-	if end != 32 { // GUID must be exactly 32 hex characters
-		return main
-	}
-	chunks, ok := extended[string(rest[:32])]
+	chunks, ok := extended[guid]
 	if !ok || len(chunks) == 0 {
 		return main
 	}
 
-	// Sort chunks by offset so concatenation produces the correct byte sequence.
-	sort.Slice(chunks, func(i, j int) bool {
-		return chunks[i].offset < chunks[j].offset
-	})
-
-	// Concatenate chunk data into the complete extended XMP packet bytes.
-	var totalLen int
-	for _, c := range chunks {
-		totalLen += len(c.data)
-	}
-	extBytes := make([]byte, 0, totalLen)
-	for _, c := range chunks {
-		extBytes = append(extBytes, c.data...)
-	}
+	extBytes := mergeExtendedChunks(chunks)
 
 	// Extract the rdf:Description elements from the extended XMP packet.
 	// The extended packet is a self-contained XMP document; we want only the

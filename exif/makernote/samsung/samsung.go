@@ -70,25 +70,9 @@ func parseAt(b []byte, order binary.ByteOrder) map[uint16][]byte {
 	}
 	result := make(map[uint16][]byte, count)
 	for i := 0; i < count; i++ {
-		pos := 2 + i*12
-		tag := order.Uint16(b[pos:])
-		typ := order.Uint16(b[pos+2:])
-		cnt := order.Uint32(b[pos+4:])
-		sz := typeSize(typ)
-		if sz == 0 {
+		tag, value, ok := parseSamsungIFDEntry(b, 2+i*12, order)
+		if !ok {
 			continue
-		}
-		total := uint64(sz) * uint64(cnt)
-		var value []byte
-		if total <= 4 {
-			value = b[pos+8 : pos+8+int(total)]
-		} else {
-			off := order.Uint32(b[pos+8:])
-			end := uint64(off) + total
-			if end > uint64(len(b)) {
-				continue
-			}
-			value = b[off:end]
 		}
 		result[tag] = value
 	}
@@ -96,6 +80,32 @@ func parseAt(b []byte, order binary.ByteOrder) map[uint16][]byte {
 		return nil
 	}
 	return result
+}
+
+// parseSamsungIFDEntry decodes a single 12-byte IFD entry at pos within b.
+// Returns (tag, value slice, true) on success, or (0, nil, false) on any
+// invalid or out-of-bounds data. The value slice aliases b directly (no copy).
+func parseSamsungIFDEntry(b []byte, pos int, order binary.ByteOrder) (tag uint16, value []byte, ok bool) {
+	if pos < 0 || pos+12 > len(b) {
+		return 0, nil, false
+	}
+	tag = order.Uint16(b[pos:])
+	typ := order.Uint16(b[pos+2:])
+	cnt := order.Uint32(b[pos+4:])
+	sz := typeSize(typ)
+	if sz == 0 {
+		return 0, nil, false
+	}
+	total := uint64(sz) * uint64(cnt)
+	if total <= 4 {
+		return tag, b[pos+8 : pos+8+int(total)], true
+	}
+	off := order.Uint32(b[pos+8:])
+	end := uint64(off) + total
+	if end > uint64(len(b)) {
+		return 0, nil, false
+	}
+	return tag, b[off:end], true
 }
 
 func typeSize(t uint16) uint32 {

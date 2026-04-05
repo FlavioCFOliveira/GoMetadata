@@ -58,6 +58,25 @@ func zlibDecompress(data []byte) ([]byte, error) {
 	return data, nil
 }
 
+// processExtractChunk dispatches a single PNG chunk during Extract, updating
+// rawEXIF and rawXMP as appropriate. It returns (rawEXIF, rawXMP, done, err)
+// where done is true when IEND signals the end of the chunk stream.
+func processExtractChunk(chunkType string, data, rawEXIF, rawXMP []byte) ([]byte, []byte, bool, error) {
+	switch chunkType {
+	case "eXIf":
+		return data, rawXMP, false, nil
+	case "iTXt", "tEXt", "zTXt":
+		xmp, err := handleXMPChunk(chunkType, data, rawXMP)
+		if err != nil {
+			return rawEXIF, rawXMP, false, err
+		}
+		return rawEXIF, xmp, false, nil
+	case "IEND":
+		return rawEXIF, rawXMP, true, nil
+	}
+	return rawEXIF, rawXMP, false, nil
+}
+
 // Extract reads the PNG chunk stream from r and returns raw metadata payloads.
 func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if _, err = r.Seek(0, io.SeekStart); err != nil {
@@ -80,43 +99,85 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 			}
 			return nil, nil, nil, rerr
 		}
-		switch chunkType {
-		case "eXIf":
-			rawEXIF = data
-		case "iTXt":
-			xmp, xerr := extractXMPFromITXt(data)
-			if xerr != nil {
-				return nil, nil, nil, xerr
-			}
-			if xmp != nil {
-				rawXMP = xmp
-			}
-		case "tEXt":
-			// Legacy uncompressed text chunk; XMP may be embedded here by older
-			// tools (e.g. Photoshop CS2, ImageMagick). Layout: keyword\x00text.
-			// Only extract if keyword is "XML:com.adobe.xmp" and rawXMP not yet set.
-			if rawXMP == nil {
-				if xmp := extractXMPFromTExt(data); xmp != nil {
-					rawXMP = xmp
-				}
-			}
-		case "zTXt":
-			// Legacy compressed text chunk; same keyword convention as tEXt.
-			// Layout: keyword\x00 compMethod(1) compressed_text. Only deflate (0).
-			if rawXMP == nil {
-				xmp, xerr := extractXMPFromZTxt(data)
-				if xerr != nil {
-					return nil, nil, nil, xerr
-				}
-				if xmp != nil {
-					rawXMP = xmp
-				}
-			}
-		case "IEND":
+		var done bool
+		rawEXIF, rawXMP, done, err = processExtractChunk(chunkType, data, rawEXIF, rawXMP)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if done {
 			return rawEXIF, nil, rawXMP, nil
 		}
 	}
 	return rawEXIF, nil, rawXMP, nil
+}
+
+// handleITXtXMP extracts XMP from an iTXt chunk. Returns (xmp, nil) on
+// success, (nil, nil) when the chunk is not an XMP iTXt, or (nil, err).
+func handleITXtXMP(data []byte) ([]byte, error) {
+	return extractXMPFromITXt(data)
+}
+
+// handleLegacyXMP extracts XMP from a tEXt or zTXt chunk only when existing
+// is nil (legacy chunks do not override a higher-priority iTXt source).
+func handleLegacyXMP(chunkType string, data []byte) ([]byte, error) {
+	if chunkType == "zTXt" {
+		return extractXMPFromZTxt(data)
+	}
+	return extractXMPFromTExt(data), nil
+}
+
+// handleXMPChunk dispatches iTXt, tEXt, and zTXt chunks to the appropriate
+// XMP extractor. It returns existing unchanged if the chunk does not contain
+// XMP, or if existing is already set and the chunk type does not override it.
+func handleXMPChunk(chunkType string, data []byte, existing []byte) ([]byte, error) {
+	switch chunkType {
+	case "iTXt":
+		xmp, err := handleITXtXMP(data)
+		if err != nil {
+			return nil, err
+		}
+		if xmp != nil {
+			return xmp, nil
+		}
+	case "tEXt", "zTXt":
+		// Legacy text chunks are only used when no higher-priority XMP was found.
+		if existing == nil {
+			xmp, err := handleLegacyXMP(chunkType, data)
+			if err != nil {
+				return nil, err
+			}
+			if xmp != nil {
+				return xmp, nil
+			}
+		}
+	}
+	return existing, nil
+}
+
+// shouldDropChunk reports whether the chunk should be dropped during Inject
+// because it is being replaced by a new metadata chunk. eXIf is always
+// dropped; iTXt is dropped only when it carries an XMP payload.
+func shouldDropChunk(chunkType string, data []byte) bool {
+	if chunkType == "eXIf" {
+		return true
+	}
+	return chunkType == "iTXt" && isXMPChunk(data)
+}
+
+// writeInjectChunk writes chunkType/data to w and, if chunkType is "IHDR",
+// immediately writes the new metadata chunks. It returns (done=true) when
+// chunkType is "IEND". This helper extracts the per-chunk logic from Inject,
+// reducing that function's cyclomatic complexity.
+func writeInjectChunk(w io.Writer, chunkType string, data, rawEXIF, rawXMP []byte) (done bool, err error) {
+	if err = writeChunk(w, chunkType, data); err != nil {
+		return false, err
+	}
+	if chunkType == "IHDR" {
+		if err = writeMetadataAfterIHDR(w, rawEXIF, rawXMP); err != nil {
+			return false, err
+		}
+	}
+	return chunkType == "IEND", nil
 }
 
 // Inject reads the PNG chunk stream from r, replaces or inserts the eXIf and
@@ -136,9 +197,6 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 		return fmt.Errorf("png: read signature: %w", err)
 	}
 
-	// Write new metadata chunks right after IHDR.
-	ihdrWritten := false
-
 	for {
 		chunkType, data, err := readChunk(r)
 		if err != nil {
@@ -149,36 +207,34 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 		}
 
 		// Skip chunks we are replacing.
-		if chunkType == "eXIf" {
-			continue
-		}
-		if chunkType == "iTXt" && isXMPChunk(data) {
+		if shouldDropChunk(chunkType, data) {
 			continue
 		}
 
-		// Write this chunk.
-		if err := writeChunk(w, chunkType, data); err != nil {
+		done, err := writeInjectChunk(w, chunkType, data, rawEXIF, rawXMP)
+		if err != nil {
 			return err
 		}
-
-		// After writing IHDR, insert our metadata chunks.
-		if chunkType == "IHDR" && !ihdrWritten {
-			ihdrWritten = true
-			if rawEXIF != nil {
-				if err := writeChunk(w, "eXIf", rawEXIF); err != nil {
-					return err
-				}
-			}
-			if rawXMP != nil {
-				xmpChunk := buildXMPChunk(rawXMP)
-				if err := writeChunk(w, "iTXt", xmpChunk); err != nil {
-					return err
-				}
-			}
-		}
-
-		if chunkType == "IEND" {
+		if done {
 			break
+		}
+	}
+	return nil
+}
+
+// writeMetadataAfterIHDR writes the eXIf chunk (if rawEXIF is non-nil) and
+// the iTXt XMP chunk (if rawXMP is non-nil) to w. Both chunks are placed
+// immediately after IHDR per the PNG metadata extension specification.
+func writeMetadataAfterIHDR(w io.Writer, rawEXIF, rawXMP []byte) error {
+	if rawEXIF != nil {
+		if err := writeChunk(w, "eXIf", rawEXIF); err != nil {
+			return err
+		}
+	}
+	if rawXMP != nil {
+		xmpChunk := buildXMPChunk(rawXMP)
+		if err := writeChunk(w, "iTXt", xmpChunk); err != nil {
+			return err
 		}
 	}
 	return nil

@@ -23,6 +23,24 @@ import (
 	xmppkg "github.com/FlavioCFOliveira/GoMetadata/xmp"
 )
 
+// extractors maps each FormatID to its Extract function.
+var extractors = map[format.FormatID]func(io.ReadSeeker) ([]byte, []byte, []byte, error){ //nolint:gochecknoglobals
+	format.FormatJPEG: jpeg.Extract,
+	format.FormatTIFF: tiff.Extract,
+	format.FormatPNG:  png.Extract,
+	format.FormatWebP: webp.Extract,
+	format.FormatHEIF: heif.Extract,
+	// AVIF uses the same ISOBMFF container as HEIF; delegate to the HEIF handler.
+	format.FormatAVIF: heif.Extract,
+	format.FormatCR2:  cr2.Extract,
+	format.FormatCR3:  cr3.Extract,
+	format.FormatNEF:  nef.Extract,
+	format.FormatARW:  arw.Extract,
+	format.FormatDNG:  dng.Extract,
+	format.FormatORF:  orf.Extract,
+	format.FormatRW2:  rw2.Extract,
+}
+
 // Read reads all metadata from r.
 // The format is detected automatically from magic bytes; r must support
 // seeking (io.ReadSeeker). A nil error means at least one metadata type
@@ -60,31 +78,46 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 		rawXMP:  rawXMP,
 	}
 
-	// Parse each segment unless the caller opted out.
-	if rawEXIF != nil && !cfg.lazyEXIF {
+	parseParsedMetadata(m, rawEXIF, rawIPTC, rawXMP, cfg)
+
+	return m, nil
+}
+
+// parseIfPresent calls parse(raw) when raw is non-nil and lazy is false.
+// Parse failures are non-fatal and silently ignored so callers still receive
+// whatever segments were readable.
+func parseIfPresent(raw []byte, lazy bool, parse func([]byte)) {
+	if raw != nil && !lazy {
+		parse(raw)
+	}
+}
+
+// parseParsedMetadata parses each raw metadata segment into m unless the
+// caller opted out via cfg. Parse failures are non-fatal: an unreadable
+// segment is silently skipped so the caller still gets whatever was readable.
+func parseParsedMetadata(m *Metadata, rawEXIF, rawIPTC, rawXMP []byte, cfg *readConfig) {
+	parseIfPresent(rawEXIF, cfg.lazyEXIF, func(raw []byte) {
 		var exifOpts []exif.ParseOption
 		if cfg.skipMakerNote {
 			exifOpts = []exif.ParseOption{exif.SkipMakerNote()}
 		}
-		if e, perr := exif.Parse(rawEXIF, exifOpts...); perr == nil {
+		if e, perr := exif.Parse(raw, exifOpts...); perr == nil {
 			m.EXIF = e
 		}
 		// Non-fatal: an unreadable EXIF segment is not an error.
-	}
+	})
 
-	if rawIPTC != nil && !cfg.lazyIPTC {
-		if i, perr := iptc.Parse(rawIPTC); perr == nil {
+	parseIfPresent(rawIPTC, cfg.lazyIPTC, func(raw []byte) {
+		if i, perr := iptc.Parse(raw); perr == nil {
 			m.IPTC = i
 		}
-	}
+	})
 
-	if rawXMP != nil && !cfg.lazyXMP {
-		if x, perr := xmppkg.Parse(rawXMP); perr == nil {
+	parseIfPresent(rawXMP, cfg.lazyXMP, func(raw []byte) {
+		if x, perr := xmppkg.Parse(raw); perr == nil {
 			m.XMP = x
 		}
-	}
-
-	return m, nil
+	})
 }
 
 // ReadFile opens the file at path and reads all metadata from it.
@@ -100,37 +133,11 @@ func ReadFile(path string, opts ...ReadOption) (*Metadata, error) {
 
 // extractByFormat dispatches to the correct container handler for raw segment extraction.
 func extractByFormat(r io.ReadSeeker, fmtID format.FormatID) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
-	switch fmtID {
-	case format.FormatJPEG:
-		return wrapExtract(jpeg.Extract(r))
-	case format.FormatTIFF:
-		return wrapExtract(tiff.Extract(r))
-	case format.FormatPNG:
-		return wrapExtract(png.Extract(r))
-	case format.FormatWebP:
-		return wrapExtract(webp.Extract(r))
-	case format.FormatHEIF:
-		return wrapExtract(heif.Extract(r))
-	case format.FormatAVIF:
-		// AVIF uses the same ISOBMFF container as HEIF; delegate to the HEIF handler.
-		return wrapExtract(heif.Extract(r))
-	case format.FormatCR2:
-		return wrapExtract(cr2.Extract(r))
-	case format.FormatCR3:
-		return wrapExtract(cr3.Extract(r))
-	case format.FormatNEF:
-		return wrapExtract(nef.Extract(r))
-	case format.FormatARW:
-		return wrapExtract(arw.Extract(r))
-	case format.FormatDNG:
-		return wrapExtract(dng.Extract(r))
-	case format.FormatORF:
-		return wrapExtract(orf.Extract(r))
-	case format.FormatRW2:
-		return wrapExtract(rw2.Extract(r))
-	default:
+	fn, ok := extractors[fmtID]
+	if !ok {
 		return nil, nil, nil, &UnsupportedFormatError{}
 	}
+	return wrapExtract(fn(r))
 }
 
 // wrapExtract wraps errors from format-specific Extract calls with the library prefix.

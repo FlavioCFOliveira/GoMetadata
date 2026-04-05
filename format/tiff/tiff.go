@@ -71,19 +71,30 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 
 	// If no IPTC or XMP updates, write the base bytes directly.
 	if rawIPTC == nil && rawXMP == nil {
-		_, err := w.Write(base)
-		if err != nil {
+		if _, err := w.Write(base); err != nil {
 			return fmt.Errorf("tiff: write: %w", err)
 		}
 		return nil
 	}
 
-	// Parse the TIFF, upsert IPTC/XMP entries in IFD0, and re-encode.
-	// If parsing fails we cannot safely inject metadata; return the error so
-	// the caller knows the update was not applied rather than silently losing it.
+	updated, err := buildUpdatedTIFF(base, rawIPTC, rawXMP)
+	if err != nil {
+		return err
+	}
+	if _, err = w.Write(updated); err != nil {
+		return fmt.Errorf("tiff: write updated: %w", err)
+	}
+	return nil
+}
+
+// buildUpdatedTIFF parses base as a TIFF stream, upserts IPTC and XMP entries
+// in IFD0 for any non-nil payload, and re-encodes the result.
+// If parsing fails we cannot safely inject metadata; the error is returned so
+// the caller knows the update was not applied rather than silently losing it.
+func buildUpdatedTIFF(base []byte, rawIPTC, rawXMP []byte) ([]byte, error) {
 	e, err := exif.Parse(base)
 	if err != nil {
-		return fmt.Errorf("tiff: parse for metadata injection: %w", err)
+		return nil, fmt.Errorf("tiff: parse for metadata injection: %w", err)
 	}
 
 	if rawIPTC != nil {
@@ -95,13 +106,9 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 
 	updated, err := exif.Encode(e)
 	if err != nil {
-		return fmt.Errorf("tiff: encode: %w", err)
+		return nil, fmt.Errorf("tiff: encode: %w", err)
 	}
-	_, err = w.Write(updated)
-	if err != nil {
-		return fmt.Errorf("tiff: write updated: %w", err)
-	}
-	return nil
+	return updated, nil
 }
 
 // upsertIFD0Entry adds or replaces an entry in ifd for the given tag.

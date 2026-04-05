@@ -29,39 +29,31 @@ const (
 	FormatAVIF // AVIF (AV1 Image File Format, ISO 23008-12)
 )
 
+// formatNames maps FormatID iota values to their human-readable names.
+// Array indices must stay in sync with the iota block above.
+var formatNames = [...]string{ //nolint:gochecknoglobals
+	FormatUnknown: "Unknown",
+	FormatJPEG:    "JPEG",
+	FormatTIFF:    "TIFF",
+	FormatPNG:     "PNG",
+	FormatHEIF:    "HEIF",
+	FormatWebP:    "WebP",
+	FormatCR2:     "CR2",
+	FormatCR3:     "CR3",
+	FormatNEF:     "NEF",
+	FormatARW:     "ARW",
+	FormatDNG:     "DNG",
+	FormatORF:     "ORF",
+	FormatRW2:     "RW2",
+	FormatAVIF:    "AVIF",
+}
+
 // String returns a human-readable name for the format.
 func (f FormatID) String() string {
-	switch f {
-	case FormatUnknown:
+	if int(f) >= len(formatNames) || formatNames[f] == "" {
 		return "Unknown"
-	case FormatJPEG:
-		return "JPEG"
-	case FormatTIFF:
-		return "TIFF"
-	case FormatPNG:
-		return "PNG"
-	case FormatHEIF:
-		return "HEIF"
-	case FormatWebP:
-		return "WebP"
-	case FormatCR2:
-		return "CR2"
-	case FormatCR3:
-		return "CR3"
-	case FormatNEF:
-		return "NEF"
-	case FormatARW:
-		return "ARW"
-	case FormatDNG:
-		return "DNG"
-	case FormatORF:
-		return "ORF"
-	case FormatRW2:
-		return "RW2"
-	case FormatAVIF:
-		return "AVIF"
 	}
-	return "Unknown"
+	return formatNames[f]
 }
 
 // SupportsWrite reports whether the library can inject metadata into files of

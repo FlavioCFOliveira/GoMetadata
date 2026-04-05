@@ -29,91 +29,35 @@ func encode(e *EXIF) ([]byte, error) {
 
 	order := e.ByteOrder
 
-	// Build IFD0 entries: strip existing sub-IFD pointers (we will re-add
-	// them with freshly computed offsets).
-	ifd0Entries := filterEntries(e.IFD0,
-		TagExifIFDPointer, TagGPSIFDPointer, TagInteropIFDPointer)
-
-	// Reserve pointer entries so ifdTotalSize accounts for them correctly.
-	// TypeLong / Count 1 → value fits inline (4 bytes); no value-area impact.
 	// Stack-allocated arrays avoid one heap allocation per sub-IFD pointer.
-	var exifPtrBuf, gpsPtrBuf, interopPtrBuf [4]byte // placeholders; patched below
-	if e.ExifIFD != nil {
-		ifd0Entries = append(ifd0Entries, IFDEntry{Tag: TagExifIFDPointer, Type: TypeLong, Count: 1, Value: exifPtrBuf[:], byteOrder: order})
-	}
-	if e.GPSIFD != nil {
-		ifd0Entries = append(ifd0Entries, IFDEntry{Tag: TagGPSIFDPointer, Type: TypeLong, Count: 1, Value: gpsPtrBuf[:], byteOrder: order})
-	}
-	sortEntries(ifd0Entries)
+	var exifPtrBuf, gpsPtrBuf, interopPtrBuf [4]byte
 
-	// Build ExifIFD entries: strip existing InteropIFD pointer and re-add
-	// with a freshly computed offset when InteropIFD is present (EXIF §4.6.3,
-	// tag 0xA005 lives in ExifIFD, not IFD0).
-	var exifIFDEntries []IFDEntry
-	if e.ExifIFD != nil {
-		exifIFDEntries = filterEntries(e.ExifIFD, TagInteropIFDPointer)
-		if e.InteropIFD != nil {
-			exifIFDEntries = append(exifIFDEntries, IFDEntry{Tag: TagInteropIFDPointer, Type: TypeLong, Count: 1, Value: interopPtrBuf[:], byteOrder: order})
-		}
-		// Preserve raw MakerNote bytes verbatim when the ExifIFD no longer
-		// contains a TagMakerNote entry (e.g., it was removed during re-parse).
-		// We do NOT re-serialise MakerNoteIFD because MakerNote offsets are often
-		// relative to the parent TIFF start, making them non-portable when moved.
-		if e.MakerNote != nil && !hasEntry(exifIFDEntries, TagMakerNote) {
-			exifIFDEntries = append(exifIFDEntries, IFDEntry{
-				Tag:       TagMakerNote,
-				Type:      TypeUndefined,
-				Count:     uint32(len(e.MakerNote)), //nolint:gosec // G115: MakerNote length bounded by input
-				Value:     e.MakerNote,
-				byteOrder: order,
-			})
-		}
-		sortEntries(exifIFDEntries)
-	}
+	ifd0Entries := buildIFD0Entries(e, order, &exifPtrBuf, &gpsPtrBuf)
+	exifIFDEntries := buildExifIFDEntries(e, order, &interopPtrBuf)
 
-	// Compute block sizes so we can fill pointer values before writing.
-	// Layout: [8 bytes TIFF header][IFD0][ExifIFD][GPS IFD][InteropIFD][IFD1...]
+	exifStart, gpsStart, interopStart, ifd1Start := computeIFDOffsets(e, ifd0Entries, exifIFDEntries)
+
+	patchPointers(ifd0Entries, exifIFDEntries, order, exifStart, gpsStart, interopStart)
+
+	out := writeTIFFHeader(e, order, ifd0Entries, exifIFDEntries)
+
+	// IFD0: next-IFD pointer points to IFD1 if present.
+	ifd0NextPtr := uint32(0)
+	if e.IFD0 != nil && e.IFD0.Next != nil {
+		ifd0NextPtr = ifd1Start
+	}
+	out = writeIFD(out, ifd0Entries, order, uint32(len(out)), ifd0NextPtr) //nolint:gosec // G115: output offset bounded by buffer size
+
+	out = writeSubIFDs(out, e, exifIFDEntries, order)
+
+	return out, nil
+}
+
+// writeTIFFHeader builds the initial output buffer containing the TIFF header
+// (TIFF §2): byte order mark, magic 0x002A, and the IFD0 offset. It also
+// pre-allocates capacity for the IFD0, ExifIFD, GPS IFD, and InteropIFD blocks.
+func writeTIFFHeader(e *EXIF, order binary.ByteOrder, ifd0Entries, exifIFDEntries []IFDEntry) []byte {
 	const headerSize = uint32(8)
-	ifd0Size := ifdTotalSize(ifd0Entries)
-	exifStart := headerSize + ifd0Size
-	exifSize := uint32(0)
-	if e.ExifIFD != nil {
-		exifSize = ifdTotalSize(exifIFDEntries)
-	}
-	gpsStart := exifStart + exifSize
-	gpsSize := uint32(0)
-	if e.GPSIFD != nil {
-		gpsSize = ifdTotalSize(e.GPSIFD.Entries)
-	}
-	interopStart := gpsStart + gpsSize
-	interopSize := uint32(0)
-	if e.InteropIFD != nil {
-		interopSize = ifdTotalSize(e.InteropIFD.Entries)
-	}
-
-	// IFD1 (thumbnail) starts after InteropIFD (TIFF §2 next-IFD pointer chain).
-	ifd1Start := interopStart + interopSize
-
-	// Patch IFD0 sub-IFD pointer values now that their targets are known.
-	for i := range ifd0Entries {
-		switch ifd0Entries[i].Tag {
-		case TagExifIFDPointer:
-			order.PutUint32(ifd0Entries[i].Value, exifStart)
-		case TagGPSIFDPointer:
-			order.PutUint32(ifd0Entries[i].Value, gpsStart)
-		}
-	}
-
-	// Patch ExifIFD InteropIFD pointer.
-	for i := range exifIFDEntries {
-		if exifIFDEntries[i].Tag == TagInteropIFDPointer {
-			order.PutUint32(exifIFDEntries[i].Value, interopStart)
-		}
-	}
-
-	// --- Write ---
-
-	// TIFF header (TIFF §2): byte order mark, magic 0x002A, IFD0 offset.
 	var hdr [8]byte
 	if order == binary.LittleEndian {
 		hdr[0], hdr[1] = 'I', 'I'
@@ -123,16 +67,29 @@ func encode(e *EXIF) ([]byte, error) {
 	order.PutUint16(hdr[2:], 0x002A)
 	order.PutUint32(hdr[4:], headerSize) // IFD0 starts right after the header
 
+	ifd0Size := ifdTotalSize(ifd0Entries)
+	exifSize := uint32(0)
+	if e.ExifIFD != nil {
+		exifSize = ifdTotalSize(exifIFDEntries)
+	}
+	gpsSize := uint32(0)
+	if e.GPSIFD != nil {
+		gpsSize = ifdTotalSize(e.GPSIFD.Entries)
+	}
+	interopSize := uint32(0)
+	if e.InteropIFD != nil {
+		interopSize = ifdTotalSize(e.InteropIFD.Entries)
+	}
+
 	out := make([]byte, 0, headerSize+ifd0Size+exifSize+gpsSize+interopSize)
 	out = append(out, hdr[:]...)
+	return out
+}
 
-	// IFD0: next-IFD pointer points to IFD1 if present.
-	ifd0NextPtr := uint32(0)
-	if e.IFD0 != nil && e.IFD0.Next != nil {
-		ifd0NextPtr = ifd1Start
-	}
-	out = writeIFD(out, ifd0Entries, order, uint32(len(out)), ifd0NextPtr) //nolint:gosec // G115: output offset bounded by buffer size
-
+// writeSubIFDs appends the ExifIFD, GPS IFD, InteropIFD, and IFD1 chain blocks
+// to out in the order mandated by the TIFF layout (TIFF §2 / EXIF §4.5.4).
+// Returns the extended slice.
+func writeSubIFDs(out []byte, e *EXIF, exifIFDEntries []IFDEntry, order binary.ByteOrder) []byte {
 	if e.ExifIFD != nil {
 		out = writeIFD(out, exifIFDEntries, order, uint32(len(out)), 0) //nolint:gosec // G115: output offset bounded by buffer size
 	}
@@ -151,6 +108,117 @@ func encode(e *EXIF) ([]byte, error) {
 		}
 		out = writeIFD(out, ifd.Entries, order, uint32(len(out)), nextPtr) //nolint:gosec // G115: output offset bounded by buffer size
 	}
+	return out
+}
 
-	return out, nil
+// buildIFD0Entries assembles the IFD0 entry slice for encoding.
+// It strips existing sub-IFD pointer tags, conditionally appends placeholder
+// entries for ExifIFD and GPS IFD (using the caller-supplied stack buffers),
+// and returns a sorted slice. The placeholder values are patched later by
+// patchPointers once the target offsets are known.
+func buildIFD0Entries(e *EXIF, order binary.ByteOrder, exifPtrBuf, gpsPtrBuf *[4]byte) []IFDEntry {
+	entries := filterEntries(e.IFD0,
+		TagExifIFDPointer, TagGPSIFDPointer, TagInteropIFDPointer)
+
+	// Reserve pointer entries so ifdTotalSize accounts for them correctly.
+	// TypeLong / Count 1 → value fits inline (4 bytes); no value-area impact.
+	if e.ExifIFD != nil {
+		entries = append(entries, IFDEntry{Tag: TagExifIFDPointer, Type: TypeLong, Count: 1, Value: exifPtrBuf[:], byteOrder: order})
+	}
+	if e.GPSIFD != nil {
+		entries = append(entries, IFDEntry{Tag: TagGPSIFDPointer, Type: TypeLong, Count: 1, Value: gpsPtrBuf[:], byteOrder: order})
+	}
+	sortEntries(entries)
+	return entries
+}
+
+// buildExifIFDEntries assembles the ExifIFD entry slice for encoding.
+// Returns nil when e.ExifIFD is nil. It strips the existing InteropIFD pointer,
+// re-adds a placeholder (using interopPtrBuf) when InteropIFD is present,
+// preserves raw MakerNote bytes if they are not already present in the entries,
+// and returns a sorted slice. Placeholder values are patched later by patchPointers.
+//
+// MakerNote bytes are preserved verbatim rather than re-serialising MakerNoteIFD
+// because MakerNote offsets are often relative to the parent TIFF start, making
+// them non-portable when moved. EXIF §4.6.3 / MakerNote interoperability notes.
+func buildExifIFDEntries(e *EXIF, order binary.ByteOrder, interopPtrBuf *[4]byte) []IFDEntry {
+	if e.ExifIFD == nil {
+		return nil
+	}
+
+	// Strip existing InteropIFD pointer; we will re-add it with a freshly
+	// computed offset when InteropIFD is present (EXIF §4.6.3, tag 0xA005
+	// lives in ExifIFD, not IFD0).
+	entries := filterEntries(e.ExifIFD, TagInteropIFDPointer)
+	if e.InteropIFD != nil {
+		entries = append(entries, IFDEntry{Tag: TagInteropIFDPointer, Type: TypeLong, Count: 1, Value: interopPtrBuf[:], byteOrder: order})
+	}
+	if e.MakerNote != nil && !hasEntry(entries, TagMakerNote) {
+		entries = append(entries, IFDEntry{
+			Tag:       TagMakerNote,
+			Type:      TypeUndefined,
+			Count:     uint32(len(e.MakerNote)), //nolint:gosec // G115: MakerNote length bounded by input
+			Value:     e.MakerNote,
+			byteOrder: order,
+		})
+	}
+	sortEntries(entries)
+	return entries
+}
+
+// computeIFDOffsets derives the byte offset at which each sub-IFD block begins
+// within the final encoded output.
+//
+// Layout (TIFF §2 / EXIF §4.5.4):
+//
+//	[8-byte TIFF header][IFD0 block][ExifIFD block][GPS IFD block][InteropIFD block][IFD1 chain…]
+//
+// Returns exifStart, gpsStart, interopStart, ifd1Start (all absolute offsets
+// from the beginning of the TIFF data, i.e. from byte 0 of the encoded output).
+func computeIFDOffsets(e *EXIF, ifd0Entries, exifIFDEntries []IFDEntry) (exifStart, gpsStart, interopStart, ifd1Start uint32) {
+	const headerSize = uint32(8)
+
+	ifd0Size := ifdTotalSize(ifd0Entries)
+	exifStart = headerSize + ifd0Size
+
+	exifSize := uint32(0)
+	if e.ExifIFD != nil {
+		exifSize = ifdTotalSize(exifIFDEntries)
+	}
+	gpsStart = exifStart + exifSize
+
+	gpsSize := uint32(0)
+	if e.GPSIFD != nil {
+		gpsSize = ifdTotalSize(e.GPSIFD.Entries)
+	}
+	interopStart = gpsStart + gpsSize
+
+	interopSize := uint32(0)
+	if e.InteropIFD != nil {
+		interopSize = ifdTotalSize(e.InteropIFD.Entries)
+	}
+	ifd1Start = interopStart + interopSize
+
+	return exifStart, gpsStart, interopStart, ifd1Start
+}
+
+// patchPointers writes the now-known target offsets into the placeholder
+// IFDEntry.Value slices that were reserved by buildIFD0Entries and
+// buildExifIFDEntries. Because Value slices point into the stack-allocated
+// [4]byte arrays passed to the build helpers, this is a direct in-place
+// write with no allocation.
+func patchPointers(ifd0Entries, exifIFDEntries []IFDEntry, order binary.ByteOrder, exifStart, gpsStart, interopStart uint32) {
+	for i := range ifd0Entries {
+		switch ifd0Entries[i].Tag {
+		case TagExifIFDPointer:
+			order.PutUint32(ifd0Entries[i].Value, exifStart)
+		case TagGPSIFDPointer:
+			order.PutUint32(ifd0Entries[i].Value, gpsStart)
+		}
+	}
+	for i := range exifIFDEntries {
+		if exifIFDEntries[i].Tag == TagInteropIFDPointer {
+			order.PutUint32(exifIFDEntries[i].Value, interopStart)
+		}
+	}
 }

@@ -50,46 +50,94 @@ func Detect(r io.ReadSeeker) (FormatID, error) {
 	return fmtID, nil
 }
 
-// detectMagic identifies the format from magic bytes alone (no I/O).
+// --------------------------------------------------------------------------
+// Magic-byte predicates — one per format family.
+// --------------------------------------------------------------------------
+
+// isJPEG reports whether b begins with the JPEG SOI marker FF D8.
+func isJPEG(b []byte) bool {
+	return len(b) >= 2 && b[0] == 0xFF && b[1] == 0xD8
+}
+
+// isPNG reports whether b begins with the 8-byte PNG signature.
+func isPNG(b []byte) bool {
+	return len(b) >= 8 &&
+		b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47 &&
+		b[4] == 0x0D && b[5] == 0x0A && b[6] == 0x1A && b[7] == 0x0A
+}
+
+// isWebP reports whether b carries a RIFF header with the "WEBP" brand.
+// Layout: "RIFF" (4 bytes) + file-size (4 bytes) + "WEBP" (4 bytes).
+func isWebP(b []byte) bool {
+	return len(b) >= 12 &&
+		b[0] == 0x52 && b[1] == 0x49 && b[2] == 0x46 && b[3] == 0x46 &&
+		b[8] == 0x57 && b[9] == 0x45 && b[10] == 0x42 && b[11] == 0x50
+}
+
+// isHEIFFamily reports whether b contains an ISO Base Media File Format ftyp
+// box at offset 4, which is the common marker for HEIF/HEIC/AVIF/CR3.
+func isHEIFFamily(b []byte) bool {
+	return len(b) >= 12 &&
+		b[4] == 0x66 && b[5] == 0x74 && b[6] == 0x79 && b[7] == 0x70
+}
+
+// isTIFFLittleEndian reports whether b begins with the TIFF little-endian
+// byte-order mark "II" followed by magic value 0x002A.
+func isTIFFLittleEndian(b []byte) bool {
+	return len(b) >= 4 &&
+		b[0] == 0x49 && b[1] == 0x49 && b[2] == 0x2A && b[3] == 0x00
+}
+
+// isTIFFBigEndian reports whether b begins with the TIFF big-endian
+// byte-order mark "MM" followed by magic value 0x002A.
+func isTIFFBigEndian(b []byte) bool {
+	return len(b) >= 4 &&
+		b[0] == 0x4D && b[1] == 0x4D && b[2] == 0x00 && b[3] == 0x2A
+}
+
+// isORF reports whether b begins with the Olympus ORF marker "IIRO".
+func isORF(b []byte) bool {
+	return len(b) >= 4 &&
+		b[0] == 0x49 && b[1] == 0x49 && b[2] == 0x52 && b[3] == 0x4F
+}
+
+// isRW2 reports whether b begins with the Panasonic RW2 marker "IIU\x00".
+func isRW2(b []byte) bool {
+	return len(b) >= 4 &&
+		b[0] == 0x49 && b[1] == 0x49 && b[2] == 0x55 && b[3] == 0x00
+}
+
+// --------------------------------------------------------------------------
+// detectMagic — format identification from magic bytes alone (no I/O).
+// --------------------------------------------------------------------------
+
+// detectMagic identifies the format from magic bytes alone.
 func detectMagic(b []byte) FormatID {
 	if len(b) < 2 {
 		return FormatUnknown
 	}
-	switch {
-	// JPEG: SOI marker FF D8
-	case b[0] == 0xFF && b[1] == 0xD8:
+	if isJPEG(b) {
 		return FormatJPEG
-
-	// PNG: 89 50 4E 47 0D 0A 1A 0A
-	case len(b) >= 8 &&
-		b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47 &&
-		b[4] == 0x0D && b[5] == 0x0A && b[6] == 0x1A && b[7] == 0x0A:
+	}
+	if isPNG(b) {
 		return FormatPNG
-
-	// RIFF-based (WebP): "RIFF????WEBP"
-	case len(b) >= 12 &&
-		b[0] == 0x52 && b[1] == 0x49 && b[2] == 0x46 && b[3] == 0x46 &&
-		b[8] == 0x57 && b[9] == 0x45 && b[10] == 0x42 && b[11] == 0x50:
+	}
+	if isWebP(b) {
 		return FormatWebP
-
-	// HEIF/HEIC: ftyp box — check brand at offset 8
-	case len(b) >= 12 && b[4] == 0x66 && b[5] == 0x74 && b[6] == 0x79 && b[7] == 0x70:
+	}
+	// HEIF family: ftyp box brand at offset 8 determines the exact sub-format.
+	if isHEIFFamily(b) {
 		return detectHEIFBrand(b[8:12])
-
-	// TIFF little-endian: "II" 0x2A 0x00
-	case b[0] == 0x49 && b[1] == 0x49 && len(b) >= 4 && b[2] == 0x2A && b[3] == 0x00:
+	}
+	// Standard TIFF magic (LE or BE). CR2 is distinguished inside detectTIFFVariant;
+	// NEF/ARW/DNG require IFD inspection via refineTIFFVariant.
+	if isTIFFLittleEndian(b) || isTIFFBigEndian(b) {
 		return detectTIFFVariant(b)
-
-	// TIFF big-endian: "MM" 0x00 0x2A
-	case b[0] == 0x4D && b[1] == 0x4D && len(b) >= 4 && b[2] == 0x00 && b[3] == 0x2A:
-		return detectTIFFVariant(b)
-
-	// Olympus ORF: "IIRO" (little-endian Olympus marker)
-	case b[0] == 0x49 && b[1] == 0x49 && len(b) >= 4 && b[2] == 0x52 && b[3] == 0x4F:
+	}
+	if isORF(b) {
 		return FormatORF
-
-	// Panasonic RW2: "IIU\x00"
-	case b[0] == 0x49 && b[1] == 0x49 && len(b) >= 4 && b[2] == 0x55 && b[3] == 0x00:
+	}
+	if isRW2(b) {
 		return FormatRW2
 	}
 	return FormatUnknown
@@ -134,50 +182,19 @@ func detectTIFFVariant(b []byte) FormatID {
 	return FormatTIFF
 }
 
-// refineTIFFVariant reads IFD0 from r to distinguish DNG, NEF, and ARW from
-// a generic TIFF file. r must be positioned at the start of the file.
-// Returns FormatTIFF when the variant cannot be determined.
-func refineTIFFVariant(r io.ReadSeeker) FormatID {
-	// Seek to start — Detect may have left the reader after the initial read.
-	if _, err := r.Seek(0, io.SeekStart); err != nil {
-		return FormatTIFF
-	}
+// --------------------------------------------------------------------------
+// IFD helpers for TIFF-variant refinement.
+// --------------------------------------------------------------------------
 
-	bp := tiffScanPool.Get().(*[]byte) //nolint:forcetypeassert // tiffScanPool.New always stores *[]byte; pool invariant
-	data := *bp
-	n, _ := io.ReadFull(r, data)
-	if n < 10 {
-		tiffScanPool.Put(bp)
-		return FormatTIFF
-	}
-	data = data[:n]
-
-	// Parse byte order from the TIFF header (TIFF §2).
-	var order binary.ByteOrder
-	switch {
-	case data[0] == 'I' && data[1] == 'I':
-		order = binary.LittleEndian
-	case data[0] == 'M' && data[1] == 'M':
-		order = binary.BigEndian
-	default:
-		tiffScanPool.Put(bp)
-		return FormatTIFF
-	}
-
-	ifd0Off := order.Uint32(data[4:])
-	if int(ifd0Off)+2 > len(data) {
-		tiffScanPool.Put(bp)
-		return FormatTIFF
-	}
-
-	count := int(order.Uint16(data[ifd0Off:]))
-	if count < 0 || count > 512 {
-		tiffScanPool.Put(bp)
-		return FormatTIFF
-	}
-	pos := int(ifd0Off) + 2
-
-	var makeRaw []byte
+// findMakeTagInIFD iterates over count IFD0 entries starting at pos in data,
+// looking for TagDNGVersion (0xC612) and TagMake (0x010F).
+//
+// If TagDNGVersion is found the file is definitely DNG (Adobe DNG Spec §6):
+// isDNG is set to true and makeRaw is nil.
+//
+// Otherwise makeRaw carries the raw ASCII bytes of the Make tag value (may be
+// nil when the tag is absent or unreadable), and isDNG is false.
+func findMakeTagInIFD(data []byte, order binary.ByteOrder, count, pos int) (makeRaw []byte, isDNG bool) {
 	for i := 0; i < count; i++ {
 		e := pos + i*12
 		if e+12 > len(data) {
@@ -188,11 +205,10 @@ func refineTIFFVariant(r io.ReadSeeker) FormatID {
 		cnt := order.Uint32(data[e+4:])
 
 		switch tag {
-		case 0xC612: // DNGVersion — present only in DNG files (Adobe DNG Spec §6).
-			tiffScanPool.Put(bp)
-			return FormatDNG
+		case 0xC612: // TagDNGVersion — present only in DNG files (Adobe DNG Spec §6).
+			return nil, true
 
-		case 0x010F: // Make — ASCII string identifying camera manufacturer (TIFF §8).
+		case 0x010F: // TagMake — ASCII string identifying camera manufacturer (TIFF §8).
 			if typ != 2 { // TypeASCII
 				break
 			}
@@ -216,18 +232,89 @@ func refineTIFFVariant(r io.ReadSeeker) FormatID {
 			}
 		}
 	}
+	return makeRaw, false
+}
 
-	// Map Make bytes to specific RAW format without allocating a string.
-	makeBytes := bytes.TrimRight(makeRaw, "\x00 ")
-	var result FormatID
+// mapMakeToFormat maps trimmed Make bytes to the appropriate RAW FormatID.
+// Returns FormatNEF for Nikon, FormatARW for Sony, and FormatTIFF for all
+// other values (including nil/empty, which means no Make tag was found).
+func mapMakeToFormat(makeBytes []byte) FormatID {
+	trimmed := bytes.TrimRight(makeBytes, "\x00 ")
 	switch {
-	case bytes.Equal(makeBytes, []byte("NIKON CORPORATION")), bytes.Equal(makeBytes, []byte("Nikon")):
-		result = FormatNEF
-	case bytes.Equal(makeBytes, []byte("SONY")):
-		result = FormatARW
+	case bytes.Equal(trimmed, []byte("NIKON CORPORATION")), bytes.Equal(trimmed, []byte("Nikon")):
+		return FormatNEF
+	case bytes.Equal(trimmed, []byte("SONY")):
+		return FormatARW
 	default:
-		result = FormatTIFF
+		return FormatTIFF
 	}
+}
+
+// --------------------------------------------------------------------------
+// refineTIFFVariant — IFD0 inspection to distinguish DNG, NEF, ARW from TIFF.
+// --------------------------------------------------------------------------
+
+// parseTIFFScanHeader reads up to tiffScanSize bytes from r (which must be
+// positioned at file offset 0) and returns the byte order, the IFD0 entry
+// count, the byte position of the first IFD0 entry, the raw data slice, the
+// pool pointer (caller must return it via tiffScanPool.Put), and whether
+// parsing succeeded. On failure the pool buffer is returned automatically and
+// the returned bp is nil.
+func parseTIFFScanHeader(r io.ReadSeeker) (order binary.ByteOrder, count, pos int, data []byte, bp *[]byte, ok bool) {
+	bp = tiffScanPool.Get().(*[]byte) //nolint:forcetypeassert // tiffScanPool.New always stores *[]byte; pool invariant
+	data = *bp
+	n, _ := io.ReadFull(r, data)
+	if n < 10 {
+		tiffScanPool.Put(bp)
+		return nil, 0, 0, nil, nil, false
+	}
+	data = data[:n]
+
+	// Parse byte order from the TIFF header (TIFF §2).
+	switch {
+	case data[0] == 'I' && data[1] == 'I':
+		order = binary.LittleEndian
+	case data[0] == 'M' && data[1] == 'M':
+		order = binary.BigEndian
+	default:
+		tiffScanPool.Put(bp)
+		return nil, 0, 0, nil, nil, false
+	}
+
+	ifd0Off := order.Uint32(data[4:])
+	if int(ifd0Off)+2 > len(data) {
+		tiffScanPool.Put(bp)
+		return nil, 0, 0, nil, nil, false
+	}
+
+	count = int(order.Uint16(data[ifd0Off:]))
+	if count > 512 {
+		tiffScanPool.Put(bp)
+		return nil, 0, 0, nil, nil, false
+	}
+	pos = int(ifd0Off) + 2
+	return order, count, pos, data, bp, true
+}
+
+// refineTIFFVariant reads IFD0 from r to distinguish DNG, NEF, and ARW from
+// a generic TIFF file. r must be positioned at the start of the file.
+// Returns FormatTIFF when the variant cannot be determined.
+func refineTIFFVariant(r io.ReadSeeker) FormatID {
+	// Seek to start — Detect may have left the reader after the initial read.
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return FormatTIFF
+	}
+
+	order, count, pos, data, bp, ok := parseTIFFScanHeader(r)
+	if !ok {
+		return FormatTIFF
+	}
+
+	makeRaw, isDNG := findMakeTagInIFD(data, order, count, pos)
 	tiffScanPool.Put(bp)
-	return result
+
+	if isDNG {
+		return FormatDNG
+	}
+	return mapMakeToFormat(makeRaw)
 }

@@ -40,6 +40,86 @@ type parseConfig struct {
 // need manufacturer extension tags and want to minimise parse cost on camera files.
 func SkipMakerNote() ParseOption { return func(c *parseConfig) { c.skipMakerNote = true } }
 
+// parseByteOrder reads the two-byte byte-order marker at b[0:2] and returns
+// the corresponding binary.ByteOrder. Returns a CorruptMetadataError for any
+// marker other than "II" (little-endian) or "MM" (big-endian).
+// Caller must ensure len(b) >= 2.
+//
+// TIFF §2: "The byte order field contains the value 49 49h (II) for
+// little-endian (Intel) byte order, or 4D 4Dh (MM) for big-endian (Motorola)."
+func parseByteOrder(b []byte) (binary.ByteOrder, error) {
+	switch {
+	case b[0] == 'I' && b[1] == 'I':
+		return binary.LittleEndian, nil
+	case b[0] == 'M' && b[1] == 'M':
+		return binary.BigEndian, nil
+	default:
+		return nil, &metaerr.CorruptMetadataError{
+			Format: "EXIF",
+			Reason: fmt.Sprintf("invalid byte order marker %q", b[:2]),
+		}
+	}
+}
+
+// parseExifSubIFDs traverses the ExifIFD sub-tree rooted at the
+// TagExifIFDPointer entry in ifd0.  It returns the ExifIFD, the raw MakerNote
+// bytes (always retained for round-trip writes), the parsed MakerNoteIFD
+// (nil when cfg.skipMakerNote is set or the make is unrecognised), and the
+// InteropIFD.  All fields are nil/empty when the corresponding pointer tag is
+// absent or the sub-IFD cannot be traversed — errors are silently discarded to
+// match the original Parse behaviour (corrupt sub-IFDs must not abort the whole
+// parse).
+//
+// EXIF §4.6.3: ExifIFD pointer is tag 0x8769; InteropIFD pointer is tag 0xA005.
+// EXIF §4.6.5: MakerNote is tag 0x927C.
+func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseConfig) (exifIFD *IFD, makerNote []byte, makerNoteIFD *IFD, interopIFD *IFD) {
+	ptr := ifd0.Get(TagExifIFDPointer)
+	if ptr == nil || len(ptr.Value) < 4 {
+		return
+	}
+	sub, err := traverse(b, order.Uint32(ptr.Value), order)
+	if err != nil {
+		return
+	}
+	exifIFD = sub
+
+	// MakerNote (EXIF §4.6.5, tag 0x927C) — raw bytes always retained;
+	// IFD parsing is skipped when SkipMakerNote() is requested.
+	if mn := sub.Get(TagMakerNote); mn != nil {
+		makerNote = mn.Value
+		if !cfg.skipMakerNote {
+			if makeEntry := ifd0.Get(TagMake); makeEntry != nil {
+				makerNoteIFD = parseMakerNoteIFD(mn.Value, makeEntry.String(), order)
+			}
+		}
+	}
+
+	// Interoperability IFD pointer (EXIF §4.6.3, tag 0xA005).
+	if iptr := sub.Get(TagInteropIFDPointer); iptr != nil && len(iptr.Value) >= 4 {
+		if isub, ierr := traverse(b, order.Uint32(iptr.Value), order); ierr == nil {
+			interopIFD = isub
+		}
+	}
+	return
+}
+
+// parseGPSSubIFD traverses the GPS IFD rooted at the TagGPSIFDPointer entry
+// in ifd0.  Returns nil when the pointer tag is absent or the IFD cannot be
+// traversed.
+//
+// EXIF §4.6.3: GPS IFD pointer is tag 0x8825.
+func parseGPSSubIFD(b []byte, ifd0 *IFD, order binary.ByteOrder) *IFD {
+	ptr := ifd0.Get(TagGPSIFDPointer)
+	if ptr == nil || len(ptr.Value) < 4 {
+		return nil
+	}
+	sub, err := traverse(b, order.Uint32(ptr.Value), order)
+	if err != nil {
+		return nil
+	}
+	return sub
+}
+
 // Parse parses a raw EXIF block starting at the TIFF header ("II" or "MM").
 // b must be the complete EXIF payload (after the "Exif\x00\x00" prefix is
 // stripped by the container layer). opts are optional; existing callers that
@@ -54,17 +134,9 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) {
 	}
 
 	// Determine byte order from the TIFF header (TIFF §2).
-	var order binary.ByteOrder
-	switch {
-	case b[0] == 'I' && b[1] == 'I':
-		order = binary.LittleEndian
-	case b[0] == 'M' && b[1] == 'M':
-		order = binary.BigEndian
-	default:
-		return nil, &metaerr.CorruptMetadataError{
-			Format: "EXIF",
-			Reason: fmt.Sprintf("invalid byte order marker %q", b[:2]),
-		}
+	order, err := parseByteOrder(b)
+	if err != nil {
+		return nil, err
 	}
 
 	// TIFF magic number 0x002A (TIFF §2).
@@ -87,38 +159,8 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) {
 	}
 	e.IFD0 = ifd0
 
-	// ExifIFD sub-IFD pointer (EXIF §4.6.3, tag 0x8769).
-	if ptr := ifd0.Get(TagExifIFDPointer); ptr != nil && len(ptr.Value) >= 4 {
-		off := order.Uint32(ptr.Value)
-		if sub, subErr := traverse(b, off, order); subErr == nil {
-			e.ExifIFD = sub
-			// MakerNote (EXIF §4.6.5, tag 0x927C) — raw bytes always retained;
-			// IFD parsing is skipped when SkipMakerNote() is requested.
-			if mn := sub.Get(TagMakerNote); mn != nil {
-				e.MakerNote = mn.Value
-				if !cfg.skipMakerNote {
-					if makeEntry := ifd0.Get(TagMake); makeEntry != nil {
-						e.MakerNoteIFD = parseMakerNoteIFD(mn.Value, makeEntry.String(), order)
-					}
-				}
-			}
-			// Interoperability IFD pointer (EXIF §4.6.3, tag 0xA005).
-			if iptr := sub.Get(TagInteropIFDPointer); iptr != nil && len(iptr.Value) >= 4 {
-				ioff := order.Uint32(iptr.Value)
-				if isub, ierr := traverse(b, ioff, order); ierr == nil {
-					e.InteropIFD = isub
-				}
-			}
-		}
-	}
-
-	// GPS IFD pointer (EXIF §4.6.3, tag 0x8825).
-	if ptr := ifd0.Get(TagGPSIFDPointer); ptr != nil && len(ptr.Value) >= 4 {
-		off := order.Uint32(ptr.Value)
-		if sub, subErr := traverse(b, off, order); subErr == nil {
-			e.GPSIFD = sub
-		}
-	}
+	e.ExifIFD, e.MakerNote, e.MakerNoteIFD, e.InteropIFD = parseExifSubIFDs(b, ifd0, order, &cfg)
+	e.GPSIFD = parseGPSSubIFD(b, ifd0, order)
 
 	return e, nil
 }

@@ -83,55 +83,9 @@ func encode(x *XMP) ([]byte, error) {
 			val := props[local]
 			// Fast path: most properties are single-valued — avoid strings.Split alloc.
 			if strings.IndexByte(val, '\x1e') < 0 {
-				// Simple property.
-				buf.WriteString("   <")
-				buf.WriteString(prefix)
-				buf.WriteByte(':')
-				buf.WriteString(local)
-				buf.WriteByte('>')
-				writeXMLEscaped(buf, val)
-				buf.WriteString("</")
-				buf.WriteString(prefix)
-				buf.WriteByte(':')
-				buf.WriteString(local)
-				buf.WriteString(">\n")
+				writeSimpleProperty(buf, prefix, local, val)
 			} else {
-				// Multi-valued: use the per-property collection type (ISO 16684-1 §7.5).
-				values := strings.Split(val, "\x1e")
-				ctype := collectionType(ns, local)
-				buf.WriteString("   <")
-				buf.WriteString(prefix)
-				buf.WriteByte(':')
-				buf.WriteString(local)
-				buf.WriteString(">\n    <rdf:")
-				buf.WriteString(ctype)
-				buf.WriteString(">\n")
-				for _, v := range values {
-					if ctype == "Alt" {
-						// Preserve xml:lang if stored as "lang|value" (P1-H).
-						lang, altVal, hasLang := strings.Cut(v, "|")
-						if hasLang {
-							buf.WriteString("     <rdf:li xml:lang=\"")
-							writeXMLEscaped(buf, lang)
-							buf.WriteString("\">")
-							writeXMLEscaped(buf, altVal)
-						} else {
-							buf.WriteString("     <rdf:li xml:lang=\"x-default\">")
-							writeXMLEscaped(buf, v)
-						}
-					} else {
-						buf.WriteString("     <rdf:li>")
-						writeXMLEscaped(buf, v)
-					}
-					buf.WriteString("</rdf:li>\n")
-				}
-				buf.WriteString("    </rdf:")
-				buf.WriteString(ctype)
-				buf.WriteString(">\n   </")
-				buf.WriteString(prefix)
-				buf.WriteByte(':')
-				buf.WriteString(local)
-				buf.WriteString(">\n")
+				writeMultiValuedProperty(buf, prefix, ns, local, val)
 			}
 		}
 
@@ -151,6 +105,64 @@ func encode(x *XMP) ([]byte, error) {
 	result := bytes.Clone(buf.Bytes())
 	encBufPool.Put(buf)
 	return result, nil
+}
+
+// writeSimpleProperty writes a single-valued XMP property element to buf.
+// Produces: <prefix:local>val</prefix:local>\n with XML escaping applied to val.
+func writeSimpleProperty(buf *bytes.Buffer, prefix, local, val string) {
+	buf.WriteString("   <")
+	buf.WriteString(prefix)
+	buf.WriteByte(':')
+	buf.WriteString(local)
+	buf.WriteByte('>')
+	writeXMLEscaped(buf, val)
+	buf.WriteString("</")
+	buf.WriteString(prefix)
+	buf.WriteByte(':')
+	buf.WriteString(local)
+	buf.WriteString(">\n")
+}
+
+// writeMultiValuedProperty writes a multi-valued XMP property element to buf.
+// val is a '\x1e'-delimited list of values. The RDF collection type (Alt, Seq,
+// or Bag) is determined by collectionType(ns, local) per ISO 16684-1 §7.5.
+// For Alt collections, items may carry an xml:lang prefix encoded as "lang|value".
+func writeMultiValuedProperty(buf *bytes.Buffer, prefix, ns, local, val string) {
+	values := strings.Split(val, "\x1e")
+	ctype := collectionType(ns, local)
+	buf.WriteString("   <")
+	buf.WriteString(prefix)
+	buf.WriteByte(':')
+	buf.WriteString(local)
+	buf.WriteString(">\n    <rdf:")
+	buf.WriteString(ctype)
+	buf.WriteString(">\n")
+	for _, v := range values {
+		if ctype == "Alt" {
+			// Preserve xml:lang if stored as "lang|value" (P1-H).
+			lang, altVal, hasLang := strings.Cut(v, "|")
+			if hasLang {
+				buf.WriteString("     <rdf:li xml:lang=\"")
+				writeXMLEscaped(buf, lang)
+				buf.WriteString("\">")
+				writeXMLEscaped(buf, altVal)
+			} else {
+				buf.WriteString("     <rdf:li xml:lang=\"x-default\">")
+				writeXMLEscaped(buf, v)
+			}
+		} else {
+			buf.WriteString("     <rdf:li>")
+			writeXMLEscaped(buf, v)
+		}
+		buf.WriteString("</rdf:li>\n")
+	}
+	buf.WriteString("    </rdf:")
+	buf.WriteString(ctype)
+	buf.WriteString(">\n   </")
+	buf.WriteString(prefix)
+	buf.WriteByte(':')
+	buf.WriteString(local)
+	buf.WriteString(">\n")
 }
 
 // writeXMLEscaped writes s to buf with XML character escaping, operating

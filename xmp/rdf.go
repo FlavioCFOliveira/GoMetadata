@@ -36,6 +36,439 @@ var liPool = sync.Pool{New: func() any { //nolint:gochecknoglobals // sync.Pool:
 // They are only taken from the pool when the input actually contains '&'.
 var builderPool = sync.Pool{New: func() any { return &strings.Builder{} }} //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
 
+// rdfParser holds all mutable state for a single parseRDF invocation.
+// Bundling state into a struct allows the three dispatch methods (onStartElement,
+// onEndElement, onCharData) to be extracted cleanly, reducing cyclomatic
+// complexity of parseRDF from ~97 to ≤ 10.
+type rdfParser struct {
+	x *XMP
+
+	// Depth tracking (absolute element nesting level, 1-based).
+	depth int
+	// Depth at which the current top-level rdf:Description was opened.
+	descDepth int
+	// Depth at which the current property element was opened.
+	propDepth int
+	// Namespace and local name of the current property element.
+	propNS    string
+	propLocal string
+	// True when inside an rdf:Alt / rdf:Seq / rdf:Bag.
+	inColl bool
+	// True when inside a struct value node (nested rdf:Description inside a property).
+	inStruct bool
+	// Depth of the struct's rdf:Description element.
+	structDepth int
+	// Field element currently being parsed inside a struct.
+	structFieldNS    string
+	structFieldLocal string
+	structFieldDepth int
+	// xml:lang of the current rdf:li element (P1-H, used for rdf:Alt).
+	liLang string
+
+	// Stack-allocated namespace table. The scanner pushes entries as it
+	// encounters xmlns:prefix="uri" declarations; resolveNS scans backward so
+	// inner declarations shadow outer ones correctly.
+	nsTable [32]nsEntry
+	nsCount int
+
+	// Stack-allocated attribute buffer. 16 attributes per element is sufficient
+	// for all real XMP properties; excess attributes are silently dropped.
+	attrBuf [16]xmpAttr
+
+	// Pooled list accumulator for rdf:li values.
+	liVals *[]string
+}
+
+// closeStructField resets the struct field tracking fields when the parser
+// leaves a struct field element at the current depth.
+func (p *rdfParser) closeStructField() {
+	p.structFieldNS, p.structFieldLocal = "", ""
+	p.structFieldDepth = 0
+}
+
+// closeStruct resets the struct tracking fields when the parser leaves a
+// struct value node at the current depth.
+func (p *rdfParser) closeStruct() {
+	p.inStruct = false
+	p.structDepth = 0
+}
+
+// closeProp finalises a property element, flushing any accumulated rdf:li
+// values for collection properties before resetting all property tracking fields.
+func (p *rdfParser) closeProp() {
+	if p.inColl && len(*p.liVals) > 0 {
+		storeProperty(p.x, p.propNS, p.propLocal, strings.Join(*p.liVals, "\x1e"))
+		*p.liVals = (*p.liVals)[:0]
+	}
+	p.inColl = false
+	p.inStruct = false
+	p.propNS, p.propLocal = "", ""
+	p.propDepth = 0
+}
+
+// onEndElement handles the closing-tag dispatch logic.
+// It is called both from the explicit end-tag path and from self-closing tags,
+// eliminating the duplication that previously existed between those two branches.
+func (p *rdfParser) onEndElement() {
+	switch {
+	case p.inStruct && p.structFieldDepth > 0 && p.depth == p.structFieldDepth:
+		// Closing a struct field element.
+		p.closeStructField()
+
+	case p.inStruct && p.depth == p.structDepth:
+		// Closing the struct value node.
+		p.closeStruct()
+
+	case p.depth == p.propDepth && p.propDepth > 0:
+		// Closing the current property element.
+		p.closeProp()
+
+	case p.depth == p.descDepth:
+		p.descDepth = 0
+	}
+	p.depth--
+}
+
+// onStartStructField handles an element that opens a new struct field inside
+// the current struct value node.
+// Compliance: XMP Part 1 §C.2.6 (struct field elements).
+func (p *rdfParser) onStartStructField(ns string, tagLocal []byte) {
+	p.structFieldNS = ns
+	p.structFieldLocal = string(tagLocal)
+	p.structFieldDepth = p.depth
+}
+
+// onStartProperty handles a direct child element of a top-level rdf:Description
+// that begins a new property.
+// Compliance: XMP Part 1 §C.2.4.
+func (p *rdfParser) onStartProperty(ns string, tagLocal []byte) {
+	p.propNS = ns
+	p.propLocal = string(tagLocal) // string() here: stored as map key
+	p.propDepth = p.depth
+	// rdf:resource shorthand and rdf:parseType="Resource" already handled in onStartElement.
+}
+
+// onStartCollection handles rdf:Alt, rdf:Seq, and rdf:Bag container elements
+// immediately inside a property element.
+// Compliance: XMP Part 1 §C.2.5.
+func (p *rdfParser) onStartCollection(ns string, tagLocal []byte) {
+	tl := string(tagLocal) // zero-alloc compare (compiler optimisation)
+	if ns == NSrdf && (tl == "Alt" || tl == "Seq" || tl == "Bag") {
+		p.inColl = true
+		*p.liVals = (*p.liVals)[:0]
+	}
+}
+
+// onStartListItem handles rdf:li elements inside a collection, capturing any
+// xml:lang attribute for rdf:Alt items.
+// Compliance: XMP Part 1 §C.2.5 and P1-H.
+func (p *rdfParser) onStartListItem(attrs []xmpAttr) {
+	p.liLang = ""
+	for _, a := range attrs {
+		if a.loc == "lang" {
+			p.liLang = a.val
+			break
+		}
+	}
+}
+
+// applyAttrShorthands scans attrs for rdf:parseType="Resource" and
+// rdf:resource shorthand attributes and applies their effects immediately.
+// Must be called before the element-kind dispatch so that parseType and
+// resource are visible in the switch cases below.
+// Compliance: XMP Part 1 §C.2.5 / §C.2.6.
+func (p *rdfParser) applyAttrShorthands(attrs []xmpAttr) {
+	for _, a := range attrs {
+		if a.ns == NSrdf && a.loc == "parseType" && a.val == "Resource" {
+			p.inStruct = true
+			p.structDepth = p.depth
+		}
+		if a.ns == NSrdf && a.loc == "resource" && p.propDepth > 0 && p.depth == p.propDepth {
+			storeProperty(p.x, p.propNS, p.propLocal, a.val)
+		}
+	}
+}
+
+// atStructField reports whether the current element is a struct field:
+// we are inside a struct, at exactly one level below the struct node,
+// and no field is currently open.
+func (p *rdfParser) atStructField() bool {
+	return p.inStruct && p.depth == p.structDepth+1 && p.structFieldDepth == 0
+}
+
+// atProperty reports whether the current element is a property element:
+// a direct child of the current top-level rdf:Description, and no property
+// is already open.
+func (p *rdfParser) atProperty() bool {
+	return p.descDepth > 0 && p.depth == p.descDepth+1 && p.propDepth == 0
+}
+
+// atCollection reports whether the current element is a collection container
+// (rdf:Alt/Seq/Bag): directly inside the current property and not a struct.
+func (p *rdfParser) atCollection() bool {
+	return p.propDepth > 0 && p.depth == p.propDepth+1 && !p.inStruct
+}
+
+// atListItem reports whether the current element is an rdf:li inside the
+// current collection.
+func (p *rdfParser) atListItem() bool {
+	return p.inColl && p.depth == p.propDepth+2
+}
+
+// onStartElement handles the start-element dispatch for a single element.
+// ns is the resolved namespace URI for the element; tagLocal is the zero-copy
+// local name slice; attrs is the resolved attribute slice for the element.
+//
+// Compliance: ISO 16684-1:2019 §7, Adobe XMP Specification Part 1 §C.
+func (p *rdfParser) onStartElement(ns string, tagLocal []byte, attrs []xmpAttr) {
+	// First pass over attrs: handle rdf:parseType="Resource" and
+	// rdf:resource shorthand (XMP Part 1 §C.2.5 / §C.2.6).
+	p.applyAttrShorthands(attrs)
+
+	switch {
+	// ── Struct field element inside a struct node (P1-G) ──────────────
+	case p.atStructField():
+		p.onStartStructField(ns, tagLocal)
+
+	// ── rdf:Description: top-level block or struct value node ─────────
+	case ns == NSrdf && string(tagLocal) == "Description":
+		p.onStartDescription(attrs)
+
+	// ── Property element: direct child of top-level rdf:Description ───
+	case p.atProperty():
+		p.onStartProperty(ns, tagLocal)
+
+	// ── Collection container: rdf:Alt / Seq / Bag ────────────────────
+	case p.atCollection():
+		p.onStartCollection(ns, tagLocal)
+
+	// ── rdf:li inside a collection ────────────────────────────────────
+	case p.atListItem():
+		// Capture xml:lang attribute for rdf:Alt items (P1-H).
+		p.onStartListItem(attrs)
+	}
+}
+
+// onStartStructValueNode handles a nested rdf:Description that introduces a
+// struct value node inside a property element.
+// Compliance: XMP Part 1 §C.2.6.
+func (p *rdfParser) onStartStructValueNode(attrs []xmpAttr) {
+	p.inStruct = true
+	p.structDepth = p.depth
+	for _, a := range attrs {
+		if a.ns == "" || a.ns == NSrdf || a.ns == NSx {
+			continue
+		}
+		storeProperty(p.x, p.propNS, p.propLocal+"."+a.loc, a.val)
+	}
+}
+
+// onStartTopLevelDesc handles a top-level rdf:Description element, registering
+// shorthand (inline) properties from its attributes.
+// Compliance: XMP Part 1 §C.2.4.
+func (p *rdfParser) onStartTopLevelDesc(attrs []xmpAttr) {
+	p.descDepth = p.depth
+	for _, a := range attrs {
+		if a.ns == "" || a.ns == NSrdf || a.ns == NSx {
+			continue
+		}
+		storeProperty(p.x, a.ns, a.loc, a.val)
+	}
+}
+
+// onStartDescription handles rdf:Description elements, which can be either
+// a top-level property block or a struct value node nested inside a property.
+// Extracted from onStartElement to reduce its cyclomatic complexity.
+//
+// Compliance: XMP Part 1 §C.2.4 (shorthand properties) and §C.2.6 (struct value nodes).
+func (p *rdfParser) onStartDescription(attrs []xmpAttr) {
+	if p.propDepth > 0 && p.depth == p.propDepth+1 && !p.inStruct {
+		// Struct value node: nested rdf:Description inside a property element
+		// (XMP Part 1 §C.2.6). Store inline attrs as "propLocal.fieldLocal"
+		// keys in the parent property's namespace.
+		p.onStartStructValueNode(attrs)
+	} else if p.descDepth == 0 {
+		// Top-level rdf:Description — begin a new property block.
+		// Shorthand properties are inline attributes (XMP Part 1 §C.2.4).
+		p.onStartTopLevelDesc(attrs)
+	}
+}
+
+// onCharDataStructField stores the text content of a struct field element.
+// Compliance: XMP Part 1 §C.2.6 (P1-G).
+func (p *rdfParser) onCharDataStructField(s string) {
+	fieldNS := p.structFieldNS
+	if fieldNS == "" {
+		fieldNS = p.propNS
+	}
+	key := p.propLocal + "." + p.structFieldLocal
+	if p.x.Properties[fieldNS] == nil {
+		p.x.Properties[fieldNS] = make(map[string]string)
+	}
+	if p.x.Properties[fieldNS][key] == "" {
+		p.x.Properties[fieldNS][key] = s
+	}
+}
+
+// onCharDataListItem appends text content inside an rdf:li element to the
+// current collection accumulator, preserving xml:lang prefix for rdf:Alt items.
+// Compliance: XMP Part 1 §C.2.5 (P1-H).
+func (p *rdfParser) onCharDataListItem(s string) {
+	if p.liLang != "" && p.liLang != "x-default" {
+		*p.liVals = append(*p.liVals, p.liLang+"|"+s)
+	} else {
+		*p.liVals = append(*p.liVals, s)
+	}
+}
+
+// onCharDataSimple stores the text content of a simple (scalar) property element.
+// Compliance: XMP Part 1 §C.2.3.
+func (p *rdfParser) onCharDataSimple(s string) {
+	if p.x.Properties[p.propNS] == nil {
+		p.x.Properties[p.propNS] = make(map[string]string)
+	}
+	// Only store if not already set (e.g. by rdf:resource attribute).
+	if p.x.Properties[p.propNS][p.propLocal] == "" {
+		p.x.Properties[p.propNS][p.propLocal] = s
+	}
+}
+
+// onCharData handles text content between tags.
+// s is the already-unescaped text content of the current element.
+//
+// Compliance: ISO 16684-1:2019 §7, XMP Part 1 §C.2.3 and §C.2.6.
+func (p *rdfParser) onCharData(s string) {
+	switch {
+	case p.inStruct && p.structFieldDepth > 0 && p.depth == p.structFieldDepth:
+		// Text content of a struct field element (P1-G).
+		// Store as "propLocal.fieldLocal" in the parent property namespace.
+		// If the field is in a different namespace, use that namespace.
+		p.onCharDataStructField(s)
+
+	case p.inColl && p.depth == p.propDepth+2:
+		// Inside rdf:li (propDepth+1 = collection, propDepth+2 = li).
+		// For rdf:Alt items, preserve non-default xml:lang as "lang|value" (P1-H).
+		p.onCharDataListItem(s)
+
+	case p.propDepth > 0 && !p.inStruct && p.depth == p.propDepth:
+		// Direct text content of a simple property (XMP Part 1 §C.2.3).
+		p.onCharDataSimple(s)
+	}
+}
+
+// skipComment advances pos past an XML comment construct <!-- ... -->.
+// b[pos] must be '!' at entry. Returns the updated position.
+func skipComment(b []byte, pos int) int {
+	end := bytes.Index(b[pos:], []byte("-->"))
+	if end < 0 {
+		return len(b) // unterminated — skip to end
+	}
+	return pos + end + 3
+}
+
+// skipPI advances pos past an XML processing instruction <? ... ?>.
+// b[pos] must be '?' at entry. Returns the updated position.
+func skipPI(b []byte, pos int) int {
+	end := bytes.Index(b[pos:], []byte("?>"))
+	if end < 0 {
+		return len(b)
+	}
+	return pos + end + 2
+}
+
+// skipBang advances pos past an XML <! ... > construct (CDATA, DOCTYPE, etc.)
+// b[pos] must be '!' at entry. Returns the updated position.
+func skipBang(b []byte, pos int) int {
+	end := bytes.IndexByte(b[pos:], '>')
+	if end < 0 {
+		return len(b)
+	}
+	return pos + end + 1
+}
+
+// isComment reports whether b[pos:] begins an XML comment (<!--).
+func isComment(b []byte, pos int) bool {
+	return pos+2 < len(b) && b[pos] == '!' && b[pos+1] == '-' && b[pos+2] == '-'
+}
+
+// skipSpecialTag advances pos past a comment (<!-- ... -->), processing
+// instruction (<? ... ?>), or CDATA/DOCTYPE (<! ... >) construct.
+// Returns the updated position and true if a special tag was consumed;
+// returns the original position and false otherwise.
+func skipSpecialTag(b []byte, pos int) (newPos int, skipped bool) {
+	if pos >= len(b) {
+		return pos, false
+	}
+	switch {
+	case isComment(b, pos):
+		return skipComment(b, pos), true
+	case b[pos] == '?':
+		return skipPI(b, pos), true
+	case b[pos] == '!':
+		return skipBang(b, pos), true
+	}
+	return pos, false
+}
+
+// parseStartTag parses a start (or self-closing) tag beginning at b[pos] (the
+// byte immediately after '<'). It updates p.depth, dispatches onStartElement,
+// and handles both the self-closing case and the text content that follows.
+// Returns the updated position, or -1 to signal a fatal parse error.
+func parseStartTag(b []byte, pos int, p *rdfParser) (newPos int, err error) {
+	p.depth++
+	if p.depth > 100 {
+		return 0, errors.New("xmp: XML nesting depth exceeded 100 levels")
+	}
+
+	// Parse the tag name: [prefix:]local.
+	tagPrefix, tagLocal, newPos2 := scanName(b, pos)
+	pos = newPos2
+
+	// Resolve the element's namespace URI.
+	ns := resolveNS(p.nsTable[:p.nsCount], tagPrefix)
+
+	// Parse attributes. xmlns declarations are registered into nsTable;
+	// regular attributes land in attrBuf.
+	var nAttrs int
+	p.nsCount, nAttrs, pos = scanAttrs(b, pos, &p.nsTable, p.nsCount, &p.attrBuf)
+	attrs := p.attrBuf[:nAttrs]
+
+	// Detect self-closing '/>' — consume '/' and '>'.
+	selfClose := false
+	if pos < len(b) && b[pos] == '/' {
+		selfClose = true
+		pos++
+	}
+	if pos < len(b) && b[pos] == '>' {
+		pos++
+	}
+
+	p.onStartElement(ns, tagLocal, attrs)
+
+	if selfClose {
+		// Self-closing element: immediately apply EndElement logic.
+		p.onEndElement()
+		return pos, nil
+	}
+
+	// ── Text content between this tag and the next '<' ────────────────
+	textEnd := bytes.IndexByte(b[pos:], '<')
+	var text []byte
+	if textEnd >= 0 {
+		text = trimSpace(b[pos : pos+textEnd])
+		// Do NOT advance pos here; the outer loop will find this '<'.
+	} else {
+		text = trimSpace(b[pos:])
+		pos = len(b)
+	}
+
+	if len(text) > 0 {
+		p.onCharData(unescapeXML(text))
+	}
+
+	return pos, nil
+}
+
 // parseRDF walks the RDF graph rooted at the x:xmpmeta element and populates
 // the Properties map in x. It handles rdf:Alt, rdf:Seq, and rdf:Bag
 // collections by joining their rdf:li values with U+001E (record separator).
@@ -50,40 +483,12 @@ var builderPool = sync.Pool{New: func() any { return &strings.Builder{} }} //nol
 //
 // Compliance: ISO 16684-1:2019 §7, Adobe XMP Specification Part 1 §C.
 func parseRDF(b []byte, x *XMP) error {
-	// Depth tracking (absolute element nesting level, 1-based).
-	var depth int
-	// Depth at which the current top-level rdf:Description was opened.
-	var descDepth int
-	// Depth at which the current property element was opened.
-	var propDepth int
-	// Namespace and local name of the current property element.
-	var propNS, propLocal string
-	// True when inside an rdf:Alt / rdf:Seq / rdf:Bag.
-	var inColl bool
-	// True when inside a struct value node (nested rdf:Description inside a property).
-	var inStruct bool
-	// Depth of the struct's rdf:Description element.
-	var structDepth int
-	// Field element currently being parsed inside a struct.
-	var structFieldNS, structFieldLocal string
-	var structFieldDepth int
-	// xml:lang of the current rdf:li element (P1-H, used for rdf:Alt).
-	var liLang string
-
-	// Stack-allocated namespace table. The scanner pushes entries as it
-	// encounters xmlns:prefix="uri" declarations; resolveNS scans backward so
-	// inner declarations shadow outer ones correctly.
-	var nsTable [32]nsEntry
-	nsCount := 0
-
-	// Stack-allocated attribute buffer. 16 attributes per element is sufficient
-	// for all real XMP properties; excess attributes are silently dropped.
-	var attrBuf [16]xmpAttr
+	p := rdfParser{x: x}
 
 	// Pooled list accumulator for rdf:li values.
-	liVals := liPool.Get().(*[]string) //nolint:forcetypeassert // liPool.New always stores *[]string; pool invariant
-	*liVals = (*liVals)[:0]
-	defer liPool.Put(liVals)
+	p.liVals = liPool.Get().(*[]string) //nolint:forcetypeassert // liPool.New always stores *[]string; pool invariant
+	*p.liVals = (*p.liVals)[:0]
+	defer liPool.Put(p.liVals)
 
 	pos := 0
 
@@ -99,33 +504,12 @@ func parseRDF(b []byte, x *XMP) error {
 			break
 		}
 
-		// ── Comment: <!-- ... --> ────────────────────────────────────────────
-		if pos+2 < len(b) && b[pos] == '!' && b[pos+1] == '-' && b[pos+2] == '-' {
-			end := bytes.Index(b[pos:], []byte("-->"))
-			if end < 0 {
+		// ── Comment, PI, CDATA, DOCTYPE ─────────────────────────────────────
+		if newPos, skipped := skipSpecialTag(b, pos); skipped {
+			if newPos >= len(b) {
 				break
 			}
-			pos += end + 3
-			continue
-		}
-
-		// ── Processing instruction: <? ... ?> ────────────────────────────────
-		if b[pos] == '?' {
-			end := bytes.Index(b[pos:], []byte("?>"))
-			if end < 0 {
-				break
-			}
-			pos += end + 2
-			continue
-		}
-
-		// ── CDATA / DOCTYPE — skip gracefully ────────────────────────────────
-		if b[pos] == '!' {
-			end := bytes.IndexByte(b[pos:], '>')
-			if end < 0 {
-				break
-			}
-			pos += end + 1
+			pos = newPos
 			continue
 		}
 
@@ -137,221 +521,15 @@ func parseRDF(b []byte, x *XMP) error {
 				break
 			}
 			pos += end + 1
-
-			// EndElement dispatch — mirrors rdf.go:144-173.
-			switch {
-			case inStruct && structFieldDepth > 0 && depth == structFieldDepth:
-				// Closing a struct field element.
-				structFieldNS, structFieldLocal = "", ""
-				structFieldDepth = 0
-
-			case inStruct && depth == structDepth:
-				// Closing the struct value node.
-				inStruct = false
-				structDepth = 0
-
-			case depth == propDepth && propDepth > 0:
-				// Closing the current property element.
-				if inColl && len(*liVals) > 0 {
-					storeProperty(x, propNS, propLocal, strings.Join(*liVals, "\x1e"))
-					*liVals = (*liVals)[:0]
-				}
-				inColl = false
-				inStruct = false
-				propNS, propLocal = "", ""
-				propDepth = 0
-
-			case depth == descDepth:
-				descDepth = 0
-			}
-			depth--
+			p.onEndElement()
 			continue
 		}
 
 		// ── Start tag or self-closing tag ────────────────────────────────────
-		depth++
-		if depth > 100 {
-			return errors.New("xmp: XML nesting depth exceeded 100 levels")
-		}
-
-		// Parse the tag name: [prefix:]local.
-		// scanName returns zero-copy byte slices; string(tagLocal) for comparisons
-		// is optimised by the Go compiler to a zero-allocation byte comparison.
-		tagPrefix, tagLocal, newPos := scanName(b, pos)
-		pos = newPos
-
-		// Resolve the element's namespace URI.
-		ns := resolveNS(nsTable[:nsCount], tagPrefix)
-
-		// Parse attributes. xmlns declarations are registered into nsTable;
-		// regular attributes land in attrBuf.
-		var nAttrs int
-		nsCount, nAttrs, pos = scanAttrs(b, pos, &nsTable, nsCount, &attrBuf)
-		attrs := attrBuf[:nAttrs]
-
-		// Detect self-closing '/>' — consume '/' and '>'.
-		selfClose := false
-		if pos < len(b) && b[pos] == '/' {
-			selfClose = true
-			pos++
-		}
-		if pos < len(b) && b[pos] == '>' {
-			pos++
-		}
-
-		// ── StartElement dispatch — mirrors rdf.go:61-141 ────────────────────
-
-		// First pass over attrs: handle rdf:parseType="Resource" and
-		// rdf:resource shorthand (XMP Part 1 §C.2.5 / §C.2.6).
-		for _, a := range attrs {
-			if a.ns == NSrdf && a.loc == "parseType" && a.val == "Resource" {
-				inStruct = true
-				structDepth = depth
-			}
-			if a.ns == NSrdf && a.loc == "resource" && propDepth > 0 && depth == propDepth {
-				storeProperty(x, propNS, propLocal, a.val)
-			}
-		}
-
-		switch {
-		// ── Struct field element inside a struct node (P1-G) ──────────────
-		case inStruct && depth == structDepth+1 && structFieldDepth == 0:
-			structFieldNS = ns
-			structFieldLocal = string(tagLocal)
-			structFieldDepth = depth
-
-		// ── rdf:Description: top-level block or struct value node ─────────
-		case ns == NSrdf && string(tagLocal) == "Description":
-			if propDepth > 0 && depth == propDepth+1 && !inStruct {
-				// Struct value node: nested rdf:Description inside a property
-				// element (XMP Part 1 §C.2.6). Store inline attrs as
-				// "propLocal.fieldLocal" keys in the parent property's namespace.
-				inStruct = true
-				structDepth = depth
-				for _, a := range attrs {
-					if a.ns == "" || a.ns == NSrdf || a.ns == NSx {
-						continue
-					}
-					storeProperty(x, propNS, propLocal+"."+a.loc, a.val)
-				}
-			} else if descDepth == 0 {
-				// Top-level rdf:Description — begin a new property block.
-				// Shorthand properties are inline attributes (XMP Part 1 §C.2.4).
-				descDepth = depth
-				for _, a := range attrs {
-					if a.ns == "" || a.ns == NSrdf || a.ns == NSx {
-						continue
-					}
-					storeProperty(x, a.ns, a.loc, a.val)
-				}
-			}
-
-		// ── Property element: direct child of top-level rdf:Description ───
-		case descDepth > 0 && depth == descDepth+1 && propDepth == 0:
-			propNS = ns
-			propLocal = string(tagLocal) // string() here: stored as map key
-			propDepth = depth
-			// rdf:resource shorthand — already handled in the attr loop above.
-			// rdf:parseType="Resource" — already handled above.
-
-		// ── Collection container: rdf:Alt / Seq / Bag ────────────────────
-		case propDepth > 0 && depth == propDepth+1 && !inStruct:
-			tl := string(tagLocal) // zero-alloc compare (compiler optimisation)
-			if ns == NSrdf && (tl == "Alt" || tl == "Seq" || tl == "Bag") {
-				inColl = true
-				*liVals = (*liVals)[:0]
-			}
-
-		// ── rdf:li inside a collection ────────────────────────────────────
-		case inColl && depth == propDepth+2:
-			// Capture xml:lang attribute for rdf:Alt items (P1-H).
-			liLang = ""
-			for _, a := range attrs {
-				if a.loc == "lang" {
-					liLang = a.val
-					break
-				}
-			}
-		}
-
-		if selfClose {
-			// Self-closing element: immediately apply EndElement logic.
-			switch {
-			case inStruct && structFieldDepth > 0 && depth == structFieldDepth:
-				structFieldNS, structFieldLocal = "", ""
-				structFieldDepth = 0
-			case inStruct && depth == structDepth:
-				inStruct = false
-				structDepth = 0
-			case depth == propDepth && propDepth > 0:
-				if inColl && len(*liVals) > 0 {
-					storeProperty(x, propNS, propLocal, strings.Join(*liVals, "\x1e"))
-					*liVals = (*liVals)[:0]
-				}
-				inColl = false
-				inStruct = false
-				propNS, propLocal = "", ""
-				propDepth = 0
-			case depth == descDepth:
-				descDepth = 0
-			}
-			depth--
-			continue
-		}
-
-		// ── Text content between this tag and the next '<' ────────────────
-		textEnd := bytes.IndexByte(b[pos:], '<')
-		var text []byte
-		if textEnd >= 0 {
-			text = trimSpace(b[pos : pos+textEnd])
-			// Do NOT advance pos here; the outer loop will find this '<'.
-		} else {
-			text = trimSpace(b[pos:])
-			pos = len(b)
-		}
-
-		if len(text) == 0 {
-			continue
-		}
-
-		s := unescapeXML(text)
-
-		// ── CharData dispatch — mirrors rdf.go:176-218 ────────────────────
-		switch {
-		case inStruct && structFieldDepth > 0 && depth == structFieldDepth:
-			// Text content of a struct field element (P1-G).
-			// Store as "propLocal.fieldLocal" in the parent property namespace.
-			// If the field is in a different namespace, use that namespace.
-			fieldNS := structFieldNS
-			if fieldNS == "" {
-				fieldNS = propNS
-			}
-			key := propLocal + "." + structFieldLocal
-			if x.Properties[fieldNS] == nil {
-				x.Properties[fieldNS] = make(map[string]string)
-			}
-			if x.Properties[fieldNS][key] == "" {
-				x.Properties[fieldNS][key] = s
-			}
-
-		case inColl && depth == propDepth+2:
-			// Inside rdf:li (propDepth+1 = collection, propDepth+2 = li).
-			// For rdf:Alt items, preserve non-default xml:lang as "lang|value" (P1-H).
-			if liLang != "" && liLang != "x-default" {
-				*liVals = append(*liVals, liLang+"|"+s)
-			} else {
-				*liVals = append(*liVals, s)
-			}
-
-		case propDepth > 0 && !inStruct && depth == propDepth:
-			// Direct text content of a simple property (XMP Part 1 §C.2.3).
-			if x.Properties[propNS] == nil {
-				x.Properties[propNS] = make(map[string]string)
-			}
-			// Only store if not already set (e.g. by rdf:resource attribute).
-			if x.Properties[propNS][propLocal] == "" {
-				x.Properties[propNS][propLocal] = s
-			}
+		var err error
+		pos, err = parseStartTag(b, pos, &p)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -373,8 +551,7 @@ func scanName(b []byte, pos int) (prefix, local []byte, end int) {
 	for pos < len(b) {
 		c := b[pos]
 		// Stop at XML attribute/tag terminators.
-		if c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
-			c == '>' || c == '/' || c == '=' {
+		if isNameTerminator(c) {
 			break
 		}
 		if c == ':' && colon < 0 {
@@ -391,6 +568,42 @@ func scanName(b []byte, pos int) (prefix, local []byte, end int) {
 	return prefix, local, pos
 }
 
+// isNameTerminator reports whether c is a byte that terminates an XML name
+// token in the context of attribute/tag parsing.
+func isNameTerminator(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+		c == '>' || c == '/' || c == '='
+}
+
+// advancePastEquals skips optional whitespace at b[pos], then expects '=' and
+// advances past it. Returns the updated position and true on success; returns
+// the position after the whitespace and false if '=' is not present (malformed).
+func advancePastEquals(b []byte, pos int) (newPos int, ok bool) {
+	for pos < len(b) && isASCIISpace(b[pos]) {
+		pos++
+	}
+	if pos >= len(b) || b[pos] != '=' {
+		return pos, false
+	}
+	return pos + 1, true // skip '='
+}
+
+// parseSingleAttr parses one XML attribute starting at b[pos].
+// Returns the attribute prefix, local name, value, the updated position,
+// and whether the attribute was well-formed.
+func parseSingleAttr(b []byte, pos int) (attrPrefix, attrLocal []byte, val string, newPos int, ok bool) {
+	attrPrefix, attrLocal, pos = scanName(b, pos)
+
+	// Require '=' (with optional surrounding whitespace).
+	pos, ok = advancePastEquals(b, pos)
+	if !ok {
+		return nil, nil, "", pos, false
+	}
+
+	val, pos, ok = parseAttributeValue(b, pos)
+	return attrPrefix, attrLocal, val, pos, ok
+}
+
 // scanAttrs parses XML attributes starting at b[pos] until '>' or '/' is
 // reached. xmlns:prefix="uri" declarations are added to nsTable; all other
 // attributes are appended to out (up to cap(out)).
@@ -401,76 +614,95 @@ func scanAttrs(b []byte, pos int, nsTable *[32]nsEntry, nsCount int, out *[16]xm
 	nAttrs = 0
 	for pos < len(b) && b[pos] != '>' && b[pos] != '/' {
 		// Skip whitespace between attributes.
-		for pos < len(b) && (b[pos] == ' ' || b[pos] == '\t' || b[pos] == '\n' || b[pos] == '\r') {
+		for pos < len(b) && isASCIISpace(b[pos]) {
 			pos++
 		}
 		if pos >= len(b) || b[pos] == '>' || b[pos] == '/' {
 			break
 		}
 
-		// Parse attribute name. scanName returns zero-copy byte slices.
-		attrPrefix, attrLocal, p := scanName(b, pos)
-		pos = p
-
-		// Skip optional whitespace around '='.
-		for pos < len(b) && (b[pos] == ' ' || b[pos] == '\t' || b[pos] == '\n' || b[pos] == '\r') {
-			pos++
-		}
-		if pos >= len(b) || b[pos] != '=' {
-			// Malformed: attribute without value — skip.
+		attrPrefix, attrLocal, val, newPos2, ok := parseSingleAttr(b, pos)
+		pos = newPos2
+		if !ok {
 			continue
 		}
-		pos++ // skip '='
 
-		// Skip optional whitespace before the quote.
-		for pos < len(b) && (b[pos] == ' ' || b[pos] == '\t' || b[pos] == '\n' || b[pos] == '\r') {
-			pos++
-		}
-		if pos >= len(b) {
-			break
-		}
-
-		// Parse quoted attribute value.
-		quote := b[pos]
-		if quote != '"' && quote != '\'' {
-			// Malformed: unquoted attribute value — skip to next whitespace.
-			for pos < len(b) && b[pos] != ' ' && b[pos] != '\t' && b[pos] != '>' && b[pos] != '/' {
-				pos++
-			}
-			continue
-		}
-		pos++ // skip opening quote
-		valStart := pos
-		for pos < len(b) && b[pos] != quote {
-			pos++
-		}
-		val := unescapeXML(b[valStart:pos])
-		if pos < len(b) {
-			pos++ // skip closing quote
-		}
-
-		// Classify: xmlns declaration vs. regular attribute.
-		// string(attrPrefix) == "xmlns" is a zero-alloc comparison (Go compiler).
-		switch {
-		case string(attrPrefix) == "xmlns":
-			// xmlns:prefix="uri" — register namespace binding.
-			// attrLocal is a zero-copy slice; no string conversion needed here.
-			if nsCount < len(nsTable) {
-				nsTable[nsCount] = nsEntry{prefix: attrLocal, uri: val}
-				nsCount++
-			}
-		case string(attrLocal) == "xmlns" && len(attrPrefix) == 0:
-			// xmlns="uri" — default namespace declaration; ignore (XMP never uses it).
-		default:
-			// Regular attribute: resolve its namespace and store.
-			if nAttrs < len(out) {
-				resolvedNS := resolveNS(nsTable[:nsCount], attrPrefix)
-				out[nAttrs] = xmpAttr{ns: resolvedNS, loc: string(attrLocal), val: val}
-				nAttrs++
-			}
-		}
+		nsCount, nAttrs = classifyAndStoreAttr(attrPrefix, attrLocal, val, nsTable, nsCount, out, nAttrs)
 	}
 	return nsCount, nAttrs, pos
+}
+
+// skipUnquotedAttr advances pos past an unquoted attribute token, stopping at
+// whitespace, '>', or '/'. Returns the updated position.
+func skipUnquotedAttr(b []byte, pos int) int {
+	for pos < len(b) && b[pos] != ' ' && b[pos] != '\t' && b[pos] != '>' && b[pos] != '/' {
+		pos++
+	}
+	return pos
+}
+
+// readQuotedValue reads the attribute value enclosed by quote (either '"' or
+// "'") starting at b[pos] (the byte after the opening quote character).
+// Returns the unescaped value string and the position after the closing quote.
+func readQuotedValue(b []byte, pos int, quote byte) (val string, newPos int) {
+	valStart := pos
+	for pos < len(b) && b[pos] != quote {
+		pos++
+	}
+	val = unescapeXML(b[valStart:pos])
+	if pos < len(b) {
+		pos++ // skip closing quote
+	}
+	return val, pos
+}
+
+// parseAttributeValue skips optional whitespace, reads a quoted attribute
+// value (single or double quotes), unescapes entities, and returns the decoded
+// string plus the updated position. ok is false if the input is malformed.
+func parseAttributeValue(b []byte, pos int) (val string, newPos int, ok bool) {
+	// Skip optional whitespace before the quote.
+	for pos < len(b) && isASCIISpace(b[pos]) {
+		pos++
+	}
+	if pos >= len(b) {
+		return "", pos, false
+	}
+
+	quote := b[pos]
+	if quote != '"' && quote != '\'' {
+		// Malformed: unquoted attribute value — skip to next whitespace.
+		return "", skipUnquotedAttr(b, pos), false
+	}
+	pos++ // skip opening quote
+
+	val, pos = readQuotedValue(b, pos, quote)
+	return val, pos, true
+}
+
+// classifyAndStoreAttr classifies a parsed attribute as either an xmlns
+// declaration or a regular attribute, updating the namespace table or the
+// attribute output buffer accordingly. Returns updated nsCount and nAttrs.
+func classifyAndStoreAttr(attrPrefix, attrLocal []byte, val string, nsTable *[32]nsEntry, nsCount int, out *[16]xmpAttr, nAttrs int) (int, int) {
+	// string(attrPrefix) == "xmlns" is a zero-alloc comparison (Go compiler).
+	switch {
+	case string(attrPrefix) == "xmlns":
+		// xmlns:prefix="uri" — register namespace binding.
+		// attrLocal is a zero-copy slice; no string conversion needed here.
+		if nsCount < len(nsTable) {
+			nsTable[nsCount] = nsEntry{prefix: attrLocal, uri: val}
+			nsCount++
+		}
+	case string(attrLocal) == "xmlns" && len(attrPrefix) == 0:
+		// xmlns="uri" — default namespace declaration; ignore (XMP never uses it).
+	default:
+		// Regular attribute: resolve its namespace and store.
+		if nAttrs < len(out) {
+			resolvedNS := resolveNS(nsTable[:nsCount], attrPrefix)
+			out[nAttrs] = xmpAttr{ns: resolvedNS, loc: string(attrLocal), val: val}
+			nAttrs++
+		}
+	}
+	return nsCount, nAttrs
 }
 
 // resolveNS looks up the URI for the given prefix in the namespace table.
@@ -520,42 +752,60 @@ func unescapeXML(b []byte) string {
 		}
 		ref := b[i+1 : i+semi] // the content between '&' and ';'
 		i += semi + 1
-
-		switch {
-		case bytes.Equal(ref, []byte("amp")):
-			bld.WriteByte('&')
-		case bytes.Equal(ref, []byte("lt")):
-			bld.WriteByte('<')
-		case bytes.Equal(ref, []byte("gt")):
-			bld.WriteByte('>')
-		case bytes.Equal(ref, []byte("quot")):
-			bld.WriteByte('"')
-		case bytes.Equal(ref, []byte("apos")):
-			bld.WriteByte('\'')
-		case len(ref) > 1 && ref[0] == '#':
-			// Numeric character reference: &#N; or &#xHH;
-			var r rune
-			var ok bool
-			if len(ref) > 2 && (ref[1] == 'x' || ref[1] == 'X') {
-				r, ok = parseHex(ref[2:])
-			} else {
-				r, ok = parseDec(ref[1:])
-			}
-			if ok {
-				bld.WriteRune(r)
-			}
-		default:
-			// Unknown entity — emit the original reference.
-			bld.WriteByte('&')
-			bld.Write(ref)
-			bld.WriteByte(';')
-		}
+		decodeEntity(ref, bld)
 	}
 
 	s := bld.String()
 	bld.Reset()
 	builderPool.Put(bld)
 	return s
+}
+
+// decodeCharRef decodes a numeric XML character reference (&#N; or &#xHH;).
+// ref is the content after '#' (e.g., []byte("65") or []byte("x41")).
+// Returns true and writes the rune if the reference is valid.
+func decodeCharRef(ref []byte, bld *strings.Builder) bool {
+	if len(ref) == 0 {
+		return false
+	}
+	var r rune
+	var ok bool
+	if ref[0] == 'x' || ref[0] == 'X' {
+		r, ok = parseHex(ref[1:])
+	} else {
+		r, ok = parseDec(ref)
+	}
+	if ok {
+		bld.WriteRune(r)
+	}
+	return ok
+}
+
+// decodeEntity writes the character(s) for the XML entity reference ref into
+// bld. ref is the content between '&' and ';' (e.g., []byte("amp") or
+// []byte("#65")). Handles the five predefined entities, decimal and hex numeric
+// character references, and unknown entities (emitted literally as &ref;).
+func decodeEntity(ref []byte, bld *strings.Builder) {
+	switch {
+	case bytes.Equal(ref, []byte("amp")):
+		bld.WriteByte('&')
+	case bytes.Equal(ref, []byte("lt")):
+		bld.WriteByte('<')
+	case bytes.Equal(ref, []byte("gt")):
+		bld.WriteByte('>')
+	case bytes.Equal(ref, []byte("quot")):
+		bld.WriteByte('"')
+	case bytes.Equal(ref, []byte("apos")):
+		bld.WriteByte('\'')
+	case len(ref) > 1 && ref[0] == '#':
+		// Numeric character reference: &#N; or &#xHH;
+		decodeCharRef(ref[1:], bld)
+	default:
+		// Unknown entity — emit the original reference.
+		bld.WriteByte('&')
+		bld.Write(ref)
+		bld.WriteByte(';')
+	}
 }
 
 // parseHex parses a hexadecimal rune reference (without the leading "x").
@@ -593,14 +843,19 @@ func parseDec(b []byte) (rune, bool) {
 // removed. It operates on []byte to avoid an intermediate string allocation.
 func trimSpace(b []byte) []byte {
 	start := 0
-	for start < len(b) && (b[start] == ' ' || b[start] == '\t' || b[start] == '\n' || b[start] == '\r') {
+	for start < len(b) && isASCIISpace(b[start]) {
 		start++
 	}
 	end := len(b)
-	for end > start && (b[end-1] == ' ' || b[end-1] == '\t' || b[end-1] == '\n' || b[end-1] == '\r') {
+	for end > start && isASCIISpace(b[end-1]) {
 		end--
 	}
 	return b[start:end]
+}
+
+// isASCIISpace reports whether b is an ASCII whitespace character.
+func isASCIISpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
 }
 
 // storeProperty writes val to x.Properties[ns][local], initialising inner maps

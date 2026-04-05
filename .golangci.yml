@@ -43,6 +43,9 @@ linters:
     - unparam
     # Extended code checks including performance-oriented suggestions (see settings below).
     - gocritic
+    # Enforces cyclomatic complexity ≤ 10 per function. Prevents untestable
+    # branching growth; functions exceeding the threshold must be decomposed.
+    - gocyclo
 
     # --- Enum safety ---
     # Enforces exhaustive switches over iota enums. This library uses iota for
@@ -85,6 +88,9 @@ linters:
       # checking — FormatID (iota enum) is the primary target here.
       ignore-enum-types: "exif.TagID"
 
+    gocyclo:
+      min-complexity: 10
+
     gosec:
       excludes:
         # G304 (file inclusion via variable) is expected: this library opens
@@ -109,3 +115,12 @@ linters:
       # picks the cases under test deliberately.
       - linters: [exhaustive]
         path: "_test\\.go$"
+
+      # Test functions use complex table-driven setup and multi-step assertion
+      # chains that read clearly at CC > 10 — gocyclo does not apply here.
+      - linters: [gocyclo]
+        path: "_test\\.go$"
+
+      # Example main functions are intentionally procedural and sequential.
+      - linters: [gocyclo]
+        path: "^examples/"

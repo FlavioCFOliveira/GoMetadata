@@ -24,6 +24,26 @@ import (
 	xmppkg "github.com/FlavioCFOliveira/GoMetadata/xmp"
 )
 
+// injectors maps each FormatID to its Inject function.
+//
+//nolint:gochecknoglobals
+var injectors = map[format.FormatID]func(io.ReadSeeker, io.Writer, []byte, []byte, []byte) error{
+	format.FormatJPEG: jpeg.Inject,
+	format.FormatTIFF: tiff.Inject,
+	format.FormatPNG:  png.Inject,
+	format.FormatWebP: webp.Inject,
+	// AVIF uses the same ISOBMFF container as HEIF; delegate to the HEIF handler.
+	format.FormatHEIF: heif.Inject,
+	format.FormatAVIF: heif.Inject,
+	format.FormatCR2:  cr2.Inject,
+	format.FormatCR3:  cr3.Inject,
+	format.FormatNEF:  nef.Inject,
+	format.FormatARW:  arw.Inject,
+	format.FormatDNG:  dng.Inject,
+	format.FormatORF:  orf.Inject,
+	format.FormatRW2:  rw2.Inject,
+}
+
 // Write reads the image from r, applies the metadata in m, and writes the
 // result to w. Image data and unmodified metadata segments are preserved
 // byte-for-byte. r must support seeking (io.ReadSeeker).
@@ -47,35 +67,9 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 		return &UnsupportedFormatError{}
 	}
 
-	// Serialise modified metadata segments.
-	var rawEXIF, rawIPTC, rawXMP []byte
-
-	if m.EXIF != nil {
-		rawEXIF, err = exif.Encode(m.EXIF)
-		if err != nil {
-			return fmt.Errorf("gometadata: encode EXIF: %w", err)
-		}
-	} else if m.rawEXIF != nil {
-		// No modification: pass original raw bytes through.
-		rawEXIF = m.rawEXIF
-	}
-
-	if m.IPTC != nil {
-		rawIPTC, err = iptc.Encode(m.IPTC)
-		if err != nil {
-			return fmt.Errorf("gometadata: encode IPTC: %w", err)
-		}
-	} else if m.rawIPTC != nil {
-		rawIPTC = m.rawIPTC
-	}
-
-	if m.XMP != nil {
-		rawXMP, err = xmppkg.Encode(m.XMP)
-		if err != nil {
-			return fmt.Errorf("gometadata: encode XMP: %w", err)
-		}
-	} else if m.rawXMP != nil {
-		rawXMP = m.rawXMP
+	rawEXIF, rawIPTC, rawXMP, err := encodeMetadata(m)
+	if err != nil {
+		return err
 	}
 
 	return injectByFormat(r, w, fmtID, rawEXIF, rawIPTC, rawXMP)
@@ -124,39 +118,47 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 	return nil
 }
 
+// encodeMetadata serialises each modified metadata segment. If a segment was
+// not modified (m.EXIF/IPTC/XMP is nil) the original raw bytes are passed
+// through unchanged. Returns the first encoding error encountered.
+func encodeMetadata(m *Metadata) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+	if m.EXIF != nil {
+		rawEXIF, err = exif.Encode(m.EXIF)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("gometadata: encode EXIF: %w", err)
+		}
+	} else if m.rawEXIF != nil {
+		rawEXIF = m.rawEXIF
+	}
+
+	if m.IPTC != nil {
+		rawIPTC, err = iptc.Encode(m.IPTC)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("gometadata: encode IPTC: %w", err)
+		}
+	} else if m.rawIPTC != nil {
+		rawIPTC = m.rawIPTC
+	}
+
+	if m.XMP != nil {
+		rawXMP, err = xmppkg.Encode(m.XMP)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("gometadata: encode XMP: %w", err)
+		}
+	} else if m.rawXMP != nil {
+		rawXMP = m.rawXMP
+	}
+
+	return rawEXIF, rawIPTC, rawXMP, nil
+}
+
 // injectByFormat dispatches to the correct container handler for segment injection.
 func injectByFormat(r io.ReadSeeker, w io.Writer, fmtID format.FormatID, rawEXIF, rawIPTC, rawXMP []byte) error {
-	switch fmtID {
-	case format.FormatJPEG:
-		return wrapInject(jpeg.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
-	case format.FormatTIFF:
-		return wrapInject(tiff.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
-	case format.FormatPNG:
-		return wrapInject(png.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
-	case format.FormatWebP:
-		return wrapInject(webp.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
-	case format.FormatHEIF:
-		return wrapInject(heif.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
-	case format.FormatAVIF:
-		// AVIF uses the same ISOBMFF container as HEIF; delegate to the HEIF handler.
-		return wrapInject(heif.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
-	case format.FormatCR2:
-		return wrapInject(cr2.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
-	case format.FormatCR3:
-		return wrapInject(cr3.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
-	case format.FormatNEF:
-		return wrapInject(nef.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
-	case format.FormatARW:
-		return wrapInject(arw.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
-	case format.FormatDNG:
-		return wrapInject(dng.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
-	case format.FormatORF:
-		return wrapInject(orf.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
-	case format.FormatRW2:
-		return wrapInject(rw2.Inject(r, w, rawEXIF, rawIPTC, rawXMP))
-	default:
+	fn, ok := injectors[fmtID]
+	if !ok {
 		return &UnsupportedFormatError{}
 	}
+	return wrapInject(fn(r, w, rawEXIF, rawIPTC, rawXMP))
 }
 
 // wrapInject wraps errors from format-specific Inject calls with the library prefix.

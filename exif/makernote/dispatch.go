@@ -22,32 +22,35 @@ type Parser interface {
 	Parse(b []byte) (map[uint16][]byte, error)
 }
 
+// parsers maps Make tag strings to the corresponding Parser implementation.
+// Multiple Make string variants that share the same parser are each listed as
+// separate keys so that Dispatch remains a single map lookup (CC = 1).
+//
+//nolint:gochecknoglobals
+var parsers = map[string]Parser{
+	"Canon":                canon.Parser{},
+	"NIKON CORPORATION":    nikon.Parser{},
+	"Nikon":                nikon.Parser{},
+	"SONY":                 sony.Parser{},
+	"FUJIFILM":             fujifilm.Parser{},
+	"OLYMPUS IMAGING CORP.": olympus.Parser{},
+	"OLYMPUS CORPORATION":  olympus.Parser{},
+	"Olympus":              olympus.Parser{},
+	"PENTAX Corporation":   pentax.Parser{},
+	"Ricoh":                pentax.Parser{},
+	"RICOH":                pentax.Parser{},
+	"Panasonic":            panasonic.Parser{},
+	"LEICA CAMERA AG":      leica.Parser{},
+	"Leica Camera AG":      leica.Parser{},
+	"LEICA":                leica.Parser{},
+	"Leica":                leica.Parser{},
+	"DJI":                  dji.Parser{},
+	"SAMSUNG":              samsung.Parser{},
+	"SIGMA":                sigma.Parser{},
+}
+
 // Dispatch selects the correct Parser for the given make string.
 // Returns nil when the make is unknown or unsupported.
 func Dispatch(make string) Parser {
-	switch make {
-	case "Canon":
-		return canon.Parser{}
-	case "NIKON CORPORATION", "Nikon":
-		return nikon.Parser{}
-	case "SONY":
-		return sony.Parser{}
-	case "FUJIFILM":
-		return fujifilm.Parser{}
-	case "OLYMPUS IMAGING CORP.", "OLYMPUS CORPORATION", "Olympus":
-		return olympus.Parser{}
-	case "PENTAX Corporation", "Ricoh", "RICOH":
-		return pentax.Parser{}
-	case "Panasonic":
-		return panasonic.Parser{}
-	case "LEICA CAMERA AG", "Leica Camera AG", "LEICA", "Leica":
-		return leica.Parser{}
-	case "DJI":
-		return dji.Parser{}
-	case "SAMSUNG":
-		return samsung.Parser{}
-	case "SIGMA":
-		return sigma.Parser{}
-	}
-	return nil
+	return parsers[make]
 }

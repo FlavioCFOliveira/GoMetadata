@@ -2,6 +2,36 @@ package exif
 
 import "encoding/binary"
 
+// makerNoteParsers maps EXIF Make strings to their MakerNote IFD parser.
+// Each value is a function that takes the raw MakerNote bytes and the parent
+// byte order and returns the parsed IFD, or nil on failure.
+//
+//nolint:gochecknoglobals
+var makerNoteParsers = map[string]func([]byte, binary.ByteOrder) *IFD{
+	"Canon":                    parseCanonMakerNote,
+	"NIKON CORPORATION":        func(b []byte, _ binary.ByteOrder) *IFD { return parseNikonMakerNote(b) },
+	"Nikon":                    func(b []byte, _ binary.ByteOrder) *IFD { return parseNikonMakerNote(b) },
+	"SONY":                     parseSonyMakerNote,
+	"FUJIFILM":                 func(b []byte, _ binary.ByteOrder) *IFD { return parseFujifilmMakerNote(b) },
+	"OLYMPUS IMAGING CORP.":    func(b []byte, _ binary.ByteOrder) *IFD { return parseOlympusMakerNote(b) },
+	"OLYMPUS CORPORATION":      func(b []byte, _ binary.ByteOrder) *IFD { return parseOlympusMakerNote(b) },
+	"Olympus":                  func(b []byte, _ binary.ByteOrder) *IFD { return parseOlympusMakerNote(b) },
+	"PENTAX Corporation":       func(b []byte, _ binary.ByteOrder) *IFD { return parsePentaxMakerNote(b) },
+	"Ricoh":                    func(b []byte, _ binary.ByteOrder) *IFD { return parsePentaxMakerNote(b) },
+	"RICOH":                    func(b []byte, _ binary.ByteOrder) *IFD { return parsePentaxMakerNote(b) },
+	"Panasonic":                func(b []byte, _ binary.ByteOrder) *IFD { return parsePanasonicMakerNote(b) },
+	"LEICA CAMERA AG":          parseLeicaMakerNote,
+	"Leica Camera AG":          parseLeicaMakerNote,
+	"LEICA":                    parseLeicaMakerNote,
+	"Leica":                    parseLeicaMakerNote,
+	"DJI":                      parseDJIMakerNote,
+	"SAMSUNG":                  parseSamsungMakerNote,
+	"SIGMA":                    func(b []byte, _ binary.ByteOrder) *IFD { return parseSigmaMakerNote(b) },
+	"CASIO COMPUTER CO.,LTD.":  parseCasioMakerNote,
+	"Casio Computer Co.,Ltd.":  parseCasioMakerNote,
+	"CASIO":                    parseCasioMakerNote,
+}
+
 // parseMakerNoteIFD attempts to parse the raw MakerNote bytes into an IFD.
 // Returns nil when the format is unrecognised or parsing fails.
 //
@@ -22,31 +52,8 @@ import "encoding/binary"
 //   - Sigma: "SIGMA\0\0\0" or "FOVEON\0\0" prefix, LE IFD at offset 10
 //   - Casio: plain IFD at offset 0, parent byte order
 func parseMakerNoteIFD(b []byte, make string, parentOrder binary.ByteOrder) *IFD {
-	switch make {
-	case "Canon":
-		return parseCanonMakerNote(b, parentOrder)
-	case "NIKON CORPORATION", "Nikon":
-		return parseNikonMakerNote(b)
-	case "SONY":
-		return parseSonyMakerNote(b, parentOrder)
-	case "FUJIFILM":
-		return parseFujifilmMakerNote(b)
-	case "OLYMPUS IMAGING CORP.", "OLYMPUS CORPORATION", "Olympus":
-		return parseOlympusMakerNote(b)
-	case "PENTAX Corporation", "Ricoh", "RICOH":
-		return parsePentaxMakerNote(b)
-	case "Panasonic":
-		return parsePanasonicMakerNote(b)
-	case "LEICA CAMERA AG", "Leica Camera AG", "LEICA", "Leica":
-		return parseLeicaMakerNote(b, parentOrder)
-	case "DJI":
-		return parseDJIMakerNote(b, parentOrder)
-	case "SAMSUNG":
-		return parseSamsungMakerNote(b, parentOrder)
-	case "SIGMA":
-		return parseSigmaMakerNote(b)
-	case "CASIO COMPUTER CO.,LTD.", "Casio Computer Co.,Ltd.", "CASIO":
-		return parseCasioMakerNote(b, parentOrder)
+	if fn, ok := makerNoteParsers[make]; ok {
+		return fn(b, parentOrder)
 	}
 	return nil
 }
@@ -67,6 +74,77 @@ func parseCanonMakerNote(b []byte, order binary.ByteOrder) *IFD {
 	return ifd
 }
 
+// isNikonType3 reports whether b starts with the Nikon Type-3 magic prefix.
+// Type-3 MakerNotes begin with the 6-byte sequence "Nikon\x00".
+func isNikonType3(b []byte) bool {
+	return len(b) >= 18 &&
+		b[0] == 'N' && b[1] == 'i' && b[2] == 'k' &&
+		b[3] == 'o' && b[4] == 'n' && b[5] == 0x00
+}
+
+// parseNikonType3 parses a Nikon Type-3 MakerNote (modern DSLRs and Coolpix).
+//
+// Layout (ExifTool Nikon.pm):
+//
+//	[0..5]   "Nikon\0"    magic
+//	[6..7]   version      2 bytes (e.g. 0x02 0x10)
+//	[8..9]   byte order   "II" or "MM"
+//	[10..11] TIFF magic   0x002A (LE) or 0x2A00 (BE)
+//	[12..15] IFD offset   relative to the embedded TIFF base at b[8]
+//
+// All value offsets within the embedded IFD are relative to b[8].
+func parseNikonType3(b []byte, _ binary.ByteOrder) *IFD {
+	// The embedded TIFF header starts at offset 8.
+	const tiffStart = 8
+	tiff := b[tiffStart:]
+
+	if len(tiff) < 8 {
+		return nil
+	}
+
+	var order binary.ByteOrder
+	switch {
+	case tiff[0] == 'I' && tiff[1] == 'I':
+		order = binary.LittleEndian
+	case tiff[0] == 'M' && tiff[1] == 'M':
+		order = binary.BigEndian
+	default:
+		return nil
+	}
+
+	magic := order.Uint16(tiff[2:])
+	if magic != 0x002A {
+		return nil
+	}
+
+	ifdOffset := order.Uint32(tiff[4:])
+	ifd, err := traverse(tiff, ifdOffset, order)
+	if err != nil {
+		return nil
+	}
+	return ifd
+}
+
+// parseNikonType1 parses a Nikon Type-1 MakerNote (legacy D1 / early Coolpix).
+//
+// Type-1 MakerNotes are plain IFDs at offset 0, big-endian, with no magic
+// prefix. A heuristic check (entry count > 0 and < 256) guards against
+// false positives on non-Nikon data (ExifTool Nikon.pm).
+func parseNikonType1(b []byte, _ binary.ByteOrder) *IFD {
+	if len(b) < 2 {
+		return nil
+	}
+	count := binary.BigEndian.Uint16(b)
+	if count == 0 || count >= 256 {
+		return nil
+	}
+	ifd, err := traverse(b, 0, binary.BigEndian)
+	if err != nil {
+		return nil
+	}
+	return ifd
+}
+
 // parseNikonMakerNote parses a Nikon MakerNote.
 //
 // Nikon uses two distinct MakerNote formats (ExifTool Nikon.pm):
@@ -76,63 +154,18 @@ func parseCanonMakerNote(b []byte, order binary.ByteOrder) *IFD {
 //
 //   - Type 3 (all modern Nikon DSLRs and Coolpix): embedded TIFF header.
 //     Layout:
-//       [0..5]  "Nikon\0"     magic (6 bytes)
-//       [6..7]  version       2 bytes (e.g. 0x02 0x10)
-//       [8..9]  byte order    "II" or "MM"
-//       [10..11] TIFF magic   0x002A (LE) or 0x2A00 (BE)
-//       [12..15] IFD offset   relative to start of the embedded TIFF (offset 8)
+//     [0..5]  "Nikon\0"     magic (6 bytes)
+//     [6..7]  version       2 bytes (e.g. 0x02 0x10)
+//     [8..9]  byte order    "II" or "MM"
+//     [10..11] TIFF magic   0x002A (LE) or 0x2A00 (BE)
+//     [12..15] IFD offset   relative to start of the embedded TIFF (offset 8)
 //
 // Offsets within the embedded TIFF are relative to byte 8 of the MakerNote payload.
 func parseNikonMakerNote(b []byte) *IFD {
-	// Type 3: detect "Nikon\0" prefix.
-	if len(b) >= 18 &&
-		b[0] == 'N' && b[1] == 'i' && b[2] == 'k' &&
-		b[3] == 'o' && b[4] == 'n' && b[5] == 0x00 {
-
-		// The embedded TIFF header starts at offset 8.
-		tiffStart := 8
-		tiff := b[tiffStart:]
-
-		if len(tiff) < 8 {
-			return nil
-		}
-
-		var order binary.ByteOrder
-		switch {
-		case tiff[0] == 'I' && tiff[1] == 'I':
-			order = binary.LittleEndian
-		case tiff[0] == 'M' && tiff[1] == 'M':
-			order = binary.BigEndian
-		default:
-			return nil
-		}
-
-		magic := order.Uint16(tiff[2:])
-		if magic != 0x002A {
-			return nil
-		}
-
-		ifdOffset := order.Uint32(tiff[4:])
-		ifd, err := traverse(tiff, ifdOffset, order)
-		if err != nil {
-			return nil
-		}
-		return ifd
+	if isNikonType3(b) {
+		return parseNikonType3(b, binary.BigEndian)
 	}
-
-	// Type 1: plain IFD at offset 0, big-endian.
-	// Only attempt if the payload looks like an IFD (entry count < 256 is a heuristic).
-	if len(b) >= 2 {
-		count := binary.BigEndian.Uint16(b)
-		if count > 0 && count < 256 {
-			ifd, err := traverse(b, 0, binary.BigEndian)
-			if err != nil {
-				return nil
-			}
-			return ifd
-		}
-	}
-	return nil
+	return parseNikonType1(b, binary.BigEndian)
 }
 
 // parseSonyMakerNote parses a Sony MakerNote.
@@ -208,6 +241,39 @@ func parseOlympusMakerNote(b []byte) *IFD {
 	return ifd
 }
 
+// parsePentaxAOC parses a Pentax AOC-format MakerNote.
+//
+// AOC format ("AOC\x00" prefix): big-endian IFD at offset 6.
+// Used by all modern K-series and 645-series DSLRs (ExifTool Pentax.pm).
+func parsePentaxAOC(b []byte) *IFD {
+	ifd, err := traverse(b, 6, binary.BigEndian)
+	if err != nil {
+		return nil
+	}
+	return ifd
+}
+
+// parsePentaxPENTAX parses a Pentax PENTAX-format MakerNote.
+//
+// PENTAX format ("PENTAX \x00" prefix): byte order at [8..9], IFD at offset 12.
+// Used by older Samsung GX-series and early Pentax DSLRs (ExifTool Pentax.pm).
+func parsePentaxPENTAX(b []byte) *IFD {
+	var order binary.ByteOrder
+	switch {
+	case b[8] == 'I' && b[9] == 'I':
+		order = binary.LittleEndian
+	case b[8] == 'M' && b[9] == 'M':
+		order = binary.BigEndian
+	default:
+		return nil
+	}
+	ifd, err := traverse(b, 12, order)
+	if err != nil {
+		return nil
+	}
+	return ifd
+}
+
 // parsePentaxMakerNote parses a Pentax MakerNote.
 //
 // Two sub-formats are handled (ExifTool Pentax.pm):
@@ -220,29 +286,9 @@ func parseOlympusMakerNote(b []byte) *IFD {
 func parsePentaxMakerNote(b []byte) *IFD {
 	switch {
 	case len(b) >= 8 && string(b[:4]) == "AOC\x00":
-		// AOC format: big-endian, IFD at offset 6.
-		ifd, err := traverse(b, 6, binary.BigEndian)
-		if err != nil {
-			return nil
-		}
-		return ifd
-
+		return parsePentaxAOC(b)
 	case len(b) >= 14 && string(b[:8]) == "PENTAX \x00":
-		// PENTAX prefix format: byte order at [8..9], IFD at offset 12.
-		var order binary.ByteOrder
-		switch {
-		case b[8] == 'I' && b[9] == 'I':
-			order = binary.LittleEndian
-		case b[8] == 'M' && b[9] == 'M':
-			order = binary.BigEndian
-		default:
-			return nil
-		}
-		ifd, err := traverse(b, 12, order)
-		if err != nil {
-			return nil
-		}
-		return ifd
+		return parsePentaxPENTAX(b)
 	}
 	return nil
 }
@@ -268,6 +314,19 @@ func parsePanasonicMakerNote(b []byte) *IFD {
 	return ifd
 }
 
+// parseLeicaWithPrefix parses a Leica MakerNote that carries the "LEICA\x00" prefix.
+//
+// Type 1–5 layout (ExifTool Leica.pm): "LEICA\x00" (6 bytes) + 2-byte sub-type,
+// followed by a little-endian IFD at offset 8. Used by S2, M Monochrom, and
+// later S-series cameras.
+func parseLeicaWithPrefix(b []byte) *IFD {
+	ifd, err := traverse(b, 8, binary.LittleEndian)
+	if err != nil {
+		return nil
+	}
+	return ifd
+}
+
 // parseLeicaMakerNote parses a Leica MakerNote.
 //
 // Two sub-formats are handled (ExifTool Leica.pm):
@@ -284,11 +343,7 @@ func parseLeicaMakerNote(b []byte, parentOrder binary.ByteOrder) *IFD {
 	// Detect "LEICA\x00" prefix.
 	if len(b) >= 8 && b[0] == 'L' && b[1] == 'E' && b[2] == 'I' &&
 		b[3] == 'C' && b[4] == 'A' && b[5] == 0x00 {
-		ifd, err := traverse(b, 8, binary.LittleEndian)
-		if err != nil {
-			return nil
-		}
-		return ifd
+		return parseLeicaWithPrefix(b)
 	}
 	// Type 0: plain IFD at offset 0, parent byte order.
 	ifd, err := traverse(b, 0, parentOrder)

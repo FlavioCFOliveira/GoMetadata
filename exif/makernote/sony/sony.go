@@ -126,27 +126,9 @@ func parseRawIFD(b []byte, bigEndian bool) map[uint16][]byte {
 	}
 	result := make(map[uint16][]byte, count)
 	for i := 0; i < count; i++ {
-		pos := 2 + i*12
-		tag := readU16(b[pos:], bigEndian)
-		typ := readU16(b[pos+2:], bigEndian)
-		cnt := readU32(b[pos+4:], bigEndian)
-
-		sz := typeSize16(typ)
-		if sz == 0 {
+		tag, value, ok := parseSonyIFDEntry(b, 2+i*12, bigEndian)
+		if !ok {
 			continue
-		}
-		total := uint64(sz) * uint64(cnt)
-
-		var value []byte
-		if total <= 4 {
-			value = b[pos+8 : pos+8+int(total)]
-		} else {
-			off := int(readU32(b[pos+8:], bigEndian))
-			end := off + int(total) //nolint:gosec // G115: total is a uint64 value offset bounded by file size
-			if off < 0 || end > len(b) {
-				continue
-			}
-			value = b[off:end]
 		}
 		result[tag] = value
 	}
@@ -154,6 +136,33 @@ func parseRawIFD(b []byte, bigEndian bool) map[uint16][]byte {
 		return nil
 	}
 	return result
+}
+
+// parseSonyIFDEntry decodes a single 12-byte IFD entry at pos within b.
+// Returns (tag, value slice, true) on success, or (0, nil, false) on any
+// invalid or out-of-bounds data. The value slice aliases b directly (no copy).
+func parseSonyIFDEntry(b []byte, pos int, bigEndian bool) (tag uint16, value []byte, ok bool) {
+	if pos < 0 || pos+12 > len(b) {
+		return 0, nil, false
+	}
+	tag = readU16(b[pos:], bigEndian)
+	typ := readU16(b[pos+2:], bigEndian)
+	cnt := readU32(b[pos+4:], bigEndian)
+
+	sz := typeSize16(typ)
+	if sz == 0 {
+		return 0, nil, false
+	}
+	total := uint64(sz) * uint64(cnt)
+	if total <= 4 {
+		return tag, b[pos+8 : pos+8+int(total)], true
+	}
+	off := int(readU32(b[pos+8:], bigEndian))
+	end := off + int(total) //nolint:gosec // G115: total is a uint64 value offset bounded by file size
+	if off < 0 || end > len(b) {
+		return 0, nil, false
+	}
+	return tag, b[off:end], true
 }
 
 func readU16(b []byte, bigEndian bool) uint16 {

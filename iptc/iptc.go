@@ -35,6 +35,56 @@ type Dataset struct {
 	decoded      bool
 }
 
+// decodeDatasetLength decodes the 2-byte size field starting at b[pos+3..pos+4]
+// (IIM §1.6.2). If bit 15 of the size field is set, the length is encoded in
+// the next (sizeHigh & 0x7F) bytes (extended form); otherwise the two bytes
+// themselves are the length (standard form). pos must already point to the
+// tag marker (0x1C); the caller is expected to have verified pos+5 ≤ len(b).
+// Returns (length, newPos, true) on success or (0, pos, false) on bounds
+// violation inside the extended block.
+func decodeDatasetLength(b []byte, pos int) (length, newPos int, ok bool) {
+	sizeHigh := b[pos+3]
+	sizeLow := b[pos+4]
+	newPos = pos + 5
+
+	if sizeHigh&0x80 != 0 {
+		// Extended length encoding (IIM §1.6.2): bit 15 set; lower 15 bits
+		// carry the byte count for the actual length value.
+		nBytes := int(sizeHigh&0x7F)<<8 | int(sizeLow)
+		if nBytes < 1 || nBytes > 4 || newPos+nBytes > len(b) {
+			return 0, pos, false
+		}
+		for j := 0; j < nBytes; j++ {
+			length = length<<8 | int(b[newPos+j])
+		}
+		newPos += nBytes
+	} else {
+		// Standard length encoding (IIM §1.6.2): the two size bytes are the length.
+		length = int(sizeHigh)<<8 | int(sizeLow)
+	}
+
+	return length, newPos, true
+}
+
+// storeDataset handles the UTF-8 marker detection (record 1, dataset 90;
+// IIM §1.5.1) and appends the dataset to i.Records[record] for all other
+// datasets. The utf8 pointer is updated in-place when the marker is found.
+func storeDataset(i *IPTC, record, dataset uint8, value []byte, utf8 *bool) {
+	// Record 1, dataset 90 (1:90) carries the coded character set declaration
+	// (IIM §1.5.1). ESC % G signals UTF-8.
+	if record == 1 && dataset == 90 {
+		*utf8 = isUTF8Declaration(value)
+		return
+	}
+	// We store datasets as raw bytes; charset decoding happens on access
+	// (see firstRecord2 / stringValue).
+	i.Records[record] = append(i.Records[record], Dataset{
+		Record:  record,
+		DataSet: dataset,
+		Value:   value,
+	})
+}
+
 // Parse parses a raw IPTC IIM byte stream.
 // b must begin with (or contain) the IPTC tag marker 0x1C (IIM §1.6).
 func Parse(b []byte) (*IPTC, error) {
@@ -60,57 +110,22 @@ func Parse(b []byte) (*IPTC, error) {
 		record := b[pos+1]
 		dataset := b[pos+2]
 
-		// Data length field (IIM §1.6.2).
-		// If bit 15 of the 2-byte size field is set, the following n bytes
-		// (n = lower 15 bits) carry the actual length.
-		sizeHigh := b[pos+3]
-		sizeLow := b[pos+4]
-		pos += 5
-
-		var length int
-		if sizeHigh&0x80 != 0 {
-			// Extended length encoding (IIM §1.6.2): bit 15 of the 2-byte size
-			// field is set. The remaining 15 bits carry the byte count for the
-			// actual length value: nBytes = (sizeHigh & 0x7F) << 8 | sizeLow.
-			nBytes := int(sizeHigh&0x7F)<<8 | int(sizeLow)
-			if nBytes < 1 || nBytes > 4 || pos+nBytes > len(b) {
-				break
-			}
-			for j := 0; j < nBytes; j++ {
-				length = length<<8 | int(b[pos+j])
-			}
-			pos += nBytes
-		} else {
-			length = int(sizeHigh)<<8 | int(sizeLow)
+		length, newPos, ok := decodeDatasetLength(b, pos)
+		if !ok {
+			break
 		}
+		pos = newPos
 
 		// Cap individual dataset size to 1 MiB to prevent memory exhaustion
 		// from crafted IPTC streams with large declared lengths.
-		if length > 1<<20 {
-			break
-		}
-		if length < 0 || pos+length > len(b) {
+		if length > 1<<20 || length < 0 || pos+length > len(b) {
 			break
 		}
 
 		value := b[pos : pos+length]
 		pos += length
 
-		// Record 1, dataset 90 (1:90) carries the coded character set declaration
-		// (IIM §1.5.1). ESC % G signals UTF-8.
-		if record == 1 && dataset == 90 {
-			utf8 = isUTF8Declaration(value)
-			continue
-		}
-
-		// Record 1, dataset 90 constant is also named DS2_CodedCharacterSet but
-		// shares numeric value 90 with DS2_City — dataset.go comment explains this.
-		// We store datasets as raw bytes; decoding on access (see firstRecord2).
-		i.Records[record] = append(i.Records[record], Dataset{
-			Record:  record,
-			DataSet: dataset,
-			Value:   value,
-		})
+		storeDataset(i, record, dataset, value, &utf8)
 	}
 
 	// Store the UTF-8 flag as a pseudo-dataset in record 0 so convenience

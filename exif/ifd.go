@@ -41,6 +41,99 @@ type IFDEntry struct {
 	byteOrder binary.ByteOrder
 }
 
+// parseIFDEntry decodes a single 12-byte IFD entry starting at byte offset e
+// within b, using the given byte order.
+//
+// Tag layout (TIFF §2, EXIF 2.32 CIPA DC-008-2019 §4.6.2):
+//
+//	bytes 0-1  tag ID (uint16)
+//	bytes 2-3  data type (uint16)
+//	bytes 4-7  value count (uint32)
+//	bytes 8-11 value or offset: inline when totalSize ≤ 4, otherwise a uint32
+//	           file offset pointing to the value data
+//
+// For unknown types (sz == 0) the raw 4-byte field is stored verbatim.
+// Returns (zero, false) on any out-of-bounds condition.
+func parseIFDEntry(b []byte, e int, order binary.ByteOrder) (IFDEntry, bool) {
+	// Each entry is exactly 12 bytes; verify the slice is long enough.
+	if e+12 > len(b) {
+		return IFDEntry{}, false
+	}
+
+	tag := TagID(order.Uint16(b[e:]))
+	typ := DataType(order.Uint16(b[e+2:]))
+	cnt := order.Uint32(b[e+4:])
+
+	sz := typeSize(typ)
+	totalSize := uint64(sz) * uint64(cnt)
+
+	var value []byte
+	switch {
+	case sz == 0:
+		// Unknown type: store the raw 4-byte offset/value field verbatim.
+		value = b[e+8 : e+12]
+	case totalSize > 4:
+		// Value is out-of-line; bytes 8-11 are the file offset (TIFF §2).
+		valOff := order.Uint32(b[e+8:])
+		end := uint64(valOff) + totalSize
+		if end > uint64(len(b)) {
+			// Out-of-bounds offset: skip this entry gracefully.
+			return IFDEntry{}, false
+		}
+		value = b[valOff:end]
+	default:
+		// Value is inline, left-justified in the 4-byte field (TIFF §2).
+		value = b[e+8 : e+8+int(totalSize)]
+	}
+
+	return IFDEntry{
+		Tag:       tag,
+		Type:      typ,
+		Count:     cnt,
+		Value:     value,
+		byteOrder: order,
+	}, true
+}
+
+// parseSingleIFD parses all entries at a single IFD offset within b and
+// returns the parsed IFD, the next-IFD offset (0 if absent or unreadable),
+// and whether parsing succeeded. It does not follow the next-IFD chain.
+//
+// Callers are responsible for cycle detection before calling this function.
+func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint32, bool) {
+	if int(offset)+2 > len(b) {
+		return nil, 0, false
+	}
+
+	count := order.Uint16(b[offset:])
+	pos := int(offset) + 2
+
+	if pos+int(count)*12 > len(b) {
+		// Truncated entry list — treat as unreadable.
+		return nil, 0, false
+	}
+
+	ifd := &IFD{Entries: make([]IFDEntry, 0, count)}
+	for i := 0; i < int(count); i++ {
+		entry, ok := parseIFDEntry(b, pos+i*12, order)
+		if !ok {
+			continue
+		}
+		ifd.Entries = append(ifd.Entries, entry)
+	}
+
+	// Sort entries by tag so Get() can use binary search (TIFF §7).
+	// Real cameras produce sorted IFDs, but non-compliant files may not.
+	sortEntries(ifd.Entries)
+
+	// Read the next-IFD pointer (4 bytes after the last entry, TIFF §2).
+	nextPtrPos := pos + int(count)*12
+	if nextPtrPos+4 > len(b) {
+		return ifd, 0, true
+	}
+	return ifd, order.Uint32(b[nextPtrPos:]), true
+}
+
 // traverse walks the IFD chain starting at offset within b, using the given
 // byte order. It returns the root IFD.
 //
@@ -73,60 +166,10 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, error) {
 		}
 		visited[cur] = true
 
-		if int(cur)+2 > len(b) {
+		ifd, next, ok := parseSingleIFD(b, cur, order)
+		if !ok {
 			break
 		}
-
-		count := order.Uint16(b[cur:])
-		pos := int(cur) + 2
-
-		if pos+int(count)*12 > len(b) {
-			// Truncated entry list — stop but return what we have.
-			break
-		}
-
-		ifd := &IFD{Entries: make([]IFDEntry, 0, count)}
-
-		for i := 0; i < int(count); i++ {
-			e := pos + i*12
-			tag := TagID(order.Uint16(b[e:]))
-			typ := DataType(order.Uint16(b[e+2:]))
-			cnt := order.Uint32(b[e+4:])
-
-			sz := typeSize(typ)
-			totalSize := uint64(sz) * uint64(cnt)
-
-			var value []byte
-			if sz == 0 || totalSize > 4 {
-				if sz == 0 {
-					// Unknown type: store the raw 4-byte offset/value field.
-					value = b[e+8 : e+12]
-				} else {
-					valOff := order.Uint32(b[e+8:])
-					end := uint64(valOff) + totalSize
-					if end > uint64(len(b)) {
-						// Out-of-bounds offset: skip this entry gracefully.
-						continue
-					}
-					value = b[valOff:end]
-				}
-			} else {
-				// Value is inline, left-justified in the 4-byte field (TIFF §2).
-				value = b[e+8 : e+8+int(totalSize)]
-			}
-
-			ifd.Entries = append(ifd.Entries, IFDEntry{
-				Tag:       tag,
-				Type:      typ,
-				Count:     cnt,
-				Value:     value,
-				byteOrder: order,
-			})
-		}
-
-		// Sort entries by tag so Get() can use binary search (TIFF §7).
-		// Real cameras produce sorted IFDs, but non-compliant files may not.
-		sortEntries(ifd.Entries)
 
 		// Link into the chain.
 		if root == nil {
@@ -135,13 +178,7 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, error) {
 			current.Next = ifd
 		}
 		current = ifd
-
-		// Read the next-IFD pointer (4 bytes after the last entry, TIFF §2).
-		nextPtrPos := pos + int(count)*12
-		if nextPtrPos+4 > len(b) {
-			break
-		}
-		cur = order.Uint32(b[nextPtrPos:])
+		cur = next
 	}
 
 	if root == nil {

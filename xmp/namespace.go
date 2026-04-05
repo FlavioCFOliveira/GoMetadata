@@ -39,40 +39,31 @@ func collectionType(ns, local string) string {
 	return "Bag"
 }
 
+// prefixMap maps well-known XMP namespace URIs to their canonical prefix strings.
+// XMP Part 1 §B, Adobe XMP Specification Appendix A.
+var prefixMap = map[string]string{ //nolint:gochecknoglobals
+	NSxmp:       "xmp",
+	NSxmpRights: "xmpRights",
+	NSxmpMM:     "xmpMM",
+	NSdc:        "dc",
+	NSphotoshop: "photoshop",
+	NSexif:      "exif",
+	NStiff:      "tiff",
+	NSaux:       "aux",
+	NSiptcCore:  "Iptc4xmpCore",
+	NSiptcExt:   "Iptc4xmpExt",
+	NSrdf:       "rdf",
+	NSx:         "x",
+	NScc:        "cc",
+	NSpdf:       "pdf",
+	NSxmpNote:   "xmpNote",
+}
+
 // prefixOf returns the conventional namespace prefix for a URI.
 // Falls back to "ns" for unknown namespaces.
 func prefixOf(uri string) string {
-	switch uri {
-	case NSxmp:
-		return "xmp"
-	case NSxmpRights:
-		return "xmpRights"
-	case NSxmpMM:
-		return "xmpMM"
-	case NSdc:
-		return "dc"
-	case NSphotoshop:
-		return "photoshop"
-	case NSexif:
-		return "exif"
-	case NStiff:
-		return "tiff"
-	case NSaux:
-		return "aux"
-	case NSiptcCore:
-		return "Iptc4xmpCore"
-	case NSiptcExt:
-		return "Iptc4xmpExt"
-	case NSrdf:
-		return "rdf"
-	case NSx:
-		return "x"
-	case NScc:
-		return "cc"
-	case NSpdf:
-		return "pdf"
-	case NSxmpNote:
-		return "xmpNote"
+	if p, ok := prefixMap[uri]; ok {
+		return p
 	}
 	return "ns"
 }

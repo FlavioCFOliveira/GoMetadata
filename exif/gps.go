@@ -36,39 +36,39 @@ const (
 	TagGPSHPositioningError  TagID = 0x001F // Rational 1    — horizontal positioning error (EXIF 2.31+)
 )
 
+// decodeCoordinate extracts a DMS (degrees/minutes/seconds) triplet from an
+// IFDEntry that must carry exactly 3 RATIONAL values (EXIF §4.6.6).
+// Returns (zero, false) when entry is nil, Count != 3, or any Rational call
+// returns an out-of-bounds result.
+func decodeCoordinate(entry *IFDEntry) ([3][2]uint32, bool) {
+	if entry == nil || entry.Count != 3 {
+		return [3][2]uint32{}, false
+	}
+	var dms [3][2]uint32
+	for i := 0; i < 3; i++ {
+		dms[i] = entry.Rational(i)
+	}
+	return dms, true
+}
+
 // parseGPS extracts decimal-degree coordinates from a GPS IFD.
 // DMS (degrees/minutes/seconds) values are converted per the EXIF spec
 // (EXIF §4.6.6, GPS tags 0x0002/0x0004).
 func parseGPS(ifd *IFD) (lat, lon float64, ok bool) {
-	latEntry := ifd.Get(TagGPSLatitude)
 	latRefEntry := ifd.Get(TagGPSLatitudeRef)
-	lonEntry := ifd.Get(TagGPSLongitude)
 	lonRefEntry := ifd.Get(TagGPSLongitudeRef)
-
-	if latEntry == nil || latRefEntry == nil || lonEntry == nil || lonRefEntry == nil {
+	if latRefEntry == nil || lonRefEntry == nil {
 		return 0, 0, false
 	}
 
-	// Each coordinate is 3 RATIONAL values: degrees, minutes, seconds (EXIF §4.6.6).
-	if latEntry.Count != 3 || lonEntry.Count != 3 {
+	latDMS, latOK := decodeCoordinate(ifd.Get(TagGPSLatitude))
+	lonDMS, lonOK := decodeCoordinate(ifd.Get(TagGPSLongitude))
+	if !latOK || !lonOK {
 		return 0, 0, false
 	}
 
-	var latDMS [3][2]uint32
-	for i := 0; i < 3; i++ {
-		latDMS[i] = latEntry.Rational(i)
-	}
-
-	var lonDMS [3][2]uint32
-	for i := 0; i < 3; i++ {
-		lonDMS[i] = lonEntry.Rational(i)
-	}
-
-	latRef := latRefEntry.String()
-	lonRef := lonRefEntry.String()
-
-	lat = dmsToDecimal(latDMS, latRef)
-	lon = dmsToDecimal(lonDMS, lonRef)
+	lat = dmsToDecimal(latDMS, latRefEntry.String())
+	lon = dmsToDecimal(lonDMS, lonRefEntry.String())
 
 	// Validate WGS-84 coordinate ranges (EXIF §4.6.6).
 	if lat < -90 || lat > 90 || lon < -180 || lon > 180 {

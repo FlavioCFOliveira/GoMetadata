@@ -99,29 +99,40 @@ func parseLE(b []byte) map[uint16][]byte {
 	}
 	result := make(map[uint16][]byte, count)
 	for i := 0; i < count; i++ {
-		pos := ifdOffset + 2 + i*12
-		tag := binary.LittleEndian.Uint16(b[pos:])
-		typ := binary.LittleEndian.Uint16(b[pos+2:])
-		cnt := binary.LittleEndian.Uint32(b[pos+4:])
-		sz := typeSize(typ)
-		if sz == 0 {
+		tag, value, ok := parsePanasonicIFDEntry(b, ifdOffset+2+i*12)
+		if !ok {
 			continue
-		}
-		total := uint64(sz) * uint64(cnt)
-		var value []byte
-		if total <= 4 {
-			value = b[pos+8 : pos+8+int(total)]
-		} else {
-			off := binary.LittleEndian.Uint32(b[pos+8:])
-			end := uint64(off) + total
-			if end > uint64(len(b)) {
-				continue
-			}
-			value = b[off:end]
 		}
 		result[tag] = value
 	}
 	return result
+}
+
+// parsePanasonicIFDEntry decodes a single 12-byte IFD entry at pos within b
+// using little-endian byte order (Panasonic MakerNote is always LE).
+// Returns (tag, value slice, true) on success, or (0, nil, false) on any
+// invalid or out-of-bounds data. The value slice aliases b directly (no copy).
+func parsePanasonicIFDEntry(b []byte, pos int) (tag uint16, value []byte, ok bool) {
+	if pos < 0 || pos+12 > len(b) {
+		return 0, nil, false
+	}
+	tag = binary.LittleEndian.Uint16(b[pos:])
+	typ := binary.LittleEndian.Uint16(b[pos+2:])
+	cnt := binary.LittleEndian.Uint32(b[pos+4:])
+	sz := typeSize(typ)
+	if sz == 0 {
+		return 0, nil, false
+	}
+	total := uint64(sz) * uint64(cnt)
+	if total <= 4 {
+		return tag, b[pos+8 : pos+8+int(total)], true
+	}
+	off := binary.LittleEndian.Uint32(b[pos+8:])
+	end := uint64(off) + total
+	if end > uint64(len(b)) {
+		return 0, nil, false
+	}
+	return tag, b[off:end], true
 }
 
 func typeSize(t uint16) uint32 {

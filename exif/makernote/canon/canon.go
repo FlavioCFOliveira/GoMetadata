@@ -100,48 +100,16 @@ func tryParseIFD(b []byte, bigEndian bool) map[uint16][]byte {
 		return nil
 	}
 
-	read16 := func(p []byte) uint16 {
-		if bigEndian {
-			return uint16(p[0])<<8 | uint16(p[1])
-		}
-		return uint16(p[1])<<8 | uint16(p[0])
-	}
-	read32 := func(p []byte) uint32 {
-		if bigEndian {
-			return uint32(p[0])<<24 | uint32(p[1])<<16 | uint32(p[2])<<8 | uint32(p[3])
-		}
-		return uint32(p[3])<<24 | uint32(p[2])<<16 | uint32(p[1])<<8 | uint32(p[0])
-	}
-
-	count := int(read16(b[0:]))
+	count := int(canonRead16(b[0:], bigEndian))
 	if count <= 0 || count > 512 || 2+count*12 > len(b) {
 		return nil
 	}
 
 	result := make(map[uint16][]byte, count)
 	for i := 0; i < count; i++ {
-		pos := 2 + i*12
-		tag := read16(b[pos:])
-		typ := read16(b[pos+2:])
-		cnt := read32(b[pos+4:])
-
-		// typeSize mirrors the exif package logic.
-		sz := typeSize16(typ)
-		if sz == 0 {
+		tag, value, ok := parseCanonIFDEntry(b, 2+i*12, bigEndian)
+		if !ok {
 			continue
-		}
-		total := uint64(sz) * uint64(cnt)
-
-		var value []byte
-		if total <= 4 {
-			value = b[pos+8 : pos+8+int(total)]
-		} else {
-			off := read32(b[pos+8:])
-			end := uint64(off) + total
-			if end > uint64(len(b)) {
-				continue
-			}
-			value = b[off:end]
 		}
 		result[tag] = value
 	}
@@ -151,6 +119,47 @@ func tryParseIFD(b []byte, bigEndian bool) map[uint16][]byte {
 		return nil
 	}
 	return result
+}
+
+// parseCanonIFDEntry decodes a single 12-byte IFD entry at pos within b.
+// Returns (tag, value slice, true) on success, or (0, nil, false) on any
+// invalid or out-of-bounds data. The value slice aliases b directly (no copy).
+func parseCanonIFDEntry(b []byte, pos int, bigEndian bool) (tag uint16, value []byte, ok bool) {
+	if pos < 0 || pos+12 > len(b) {
+		return 0, nil, false
+	}
+	tag = canonRead16(b[pos:], bigEndian)
+	typ := canonRead16(b[pos+2:], bigEndian)
+	cnt := canonRead32(b[pos+4:], bigEndian)
+
+	sz := typeSize16(typ)
+	if sz == 0 {
+		return 0, nil, false
+	}
+	total := uint64(sz) * uint64(cnt)
+	if total <= 4 {
+		return tag, b[pos+8 : pos+8+int(total)], true
+	}
+	off := uint64(canonRead32(b[pos+8:], bigEndian))
+	end := off + total
+	if end > uint64(len(b)) {
+		return 0, nil, false
+	}
+	return tag, b[off:end], true
+}
+
+func canonRead16(p []byte, bigEndian bool) uint16 {
+	if bigEndian {
+		return uint16(p[0])<<8 | uint16(p[1])
+	}
+	return uint16(p[1])<<8 | uint16(p[0])
+}
+
+func canonRead32(p []byte, bigEndian bool) uint32 {
+	if bigEndian {
+		return uint32(p[0])<<24 | uint32(p[1])<<16 | uint32(p[2])<<8 | uint32(p[3])
+	}
+	return uint32(p[3])<<24 | uint32(p[2])<<16 | uint32(p[1])<<8 | uint32(p[0])
 }
 
 // typeSize16 returns the byte size of a TIFF data type by numeric code.
