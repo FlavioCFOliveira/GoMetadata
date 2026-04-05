@@ -56,7 +56,7 @@ var identPS = []byte("Photoshop 3.0\x00") //nolint:gochecknoglobals // package-l
 //	Extended APP1 layout: identXMPNote(32) + GUID(32) + fullLen(4) + offset(4) + chunk
 //	Overhead = 32 + 32 + 4 + 4 = 72 bytes → chunk data ≤ 65533 − 72 = 65461 bytes.
 const (
-	maxAPP1Payload  = 65533             // 65535 − 2 (length field)
+	maxAPP1Payload  = 65533               // 65535 − 2 (length field)
 	maxXMPPayload   = maxAPP1Payload - 29 // − len(identXMP)
 	maxExtChunkSize = maxAPP1Payload - 72 // − len(identXMPNote)+GUID+fullLen+offset overhead
 )

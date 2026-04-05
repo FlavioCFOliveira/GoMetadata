@@ -7,7 +7,10 @@ import (
 
 // buildCanonIFD creates a minimal Canon MakerNote IFD with n entries.
 // The IFD has no pointer-based (offset) values — all values fit inline.
-func buildCanonIFD(entries []struct{ tag, typ uint16; val uint32 }) []byte {
+func buildCanonIFD(entries []struct {
+	tag, typ uint16
+	val      uint32
+}) []byte {
 	n := len(entries)
 	// IFD: count(2) + n*12 bytes entries (no next-IFD pointer in MakerNote)
 	buf := make([]byte, 2+n*12)
@@ -25,7 +28,10 @@ func buildCanonIFD(entries []struct{ tag, typ uint16; val uint32 }) []byte {
 
 func TestParseValidIFD(t *testing.T) {
 	// Build a Canon MakerNote with 3 entries (minimum for tryParseIFD to succeed).
-	entries := []struct{ tag, typ uint16; val uint32 }{
+	entries := []struct {
+		tag, typ uint16
+		val      uint32
+	}{
 		{TagCameraSettings, 3, 0x0001}, // SHORT
 		{TagModelID, 4, 0x80000010},    // LONG
 		{TagColorSpace, 3, 0x0001},     // SHORT

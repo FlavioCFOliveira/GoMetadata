@@ -38,7 +38,7 @@ func zlibDecompress(data []byte) ([]byte, error) {
 	r := bytes.NewReader(data)
 	var zr io.ReadCloser
 	if v := zlibPool.Get(); v != nil {
-		zr = v.(io.ReadCloser) //nolint:forcetypeassert // zlibPool.New always stores io.ReadCloser; pool invariant
+		zr = v.(io.ReadCloser)                                   //nolint:forcetypeassert // zlibPool.New always stores io.ReadCloser; pool invariant
 		if err := zr.(zlib.Resetter).Reset(r, nil); err != nil { //nolint:forcetypeassert // zlib.NewReader always implements zlib.Resetter; Go stdlib guarantee
 			return nil, fmt.Errorf("png: zlib reset: %w", err)
 		}
@@ -280,7 +280,7 @@ func writeChunk(w io.Writer, chunkType string, data []byte) error {
 	// CRC covers chunk type + chunk data (PNG §5.4).
 	h := crc32.NewIEEE()
 	_, _ = h.Write([]byte(chunkType)) //nolint:gosec // G104: hash.Hash.Write never returns an error
-	_, _ = h.Write(data)               //nolint:gosec // G104: hash.Hash.Write never returns an error
+	_, _ = h.Write(data)              //nolint:gosec // G104: hash.Hash.Write never returns an error
 	var crcB [4]byte
 	binary.BigEndian.PutUint32(crcB[:], h.Sum32())
 	if _, err := w.Write(crcB[:]); err != nil {

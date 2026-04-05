@@ -33,10 +33,10 @@ type Metadata struct {
 
 	// unexported: detected container format and original raw segments
 	// retained so round-trip writes can reconstruct the file correctly.
-	format   uint8
-	rawEXIF  []byte
-	rawIPTC  []byte
-	rawXMP   []byte
+	format  uint8
+	rawEXIF []byte
+	rawIPTC []byte
+	rawXMP  []byte
 }
 
 // Format returns the detected container format ID of the image.

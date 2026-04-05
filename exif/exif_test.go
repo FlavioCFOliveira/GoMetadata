@@ -28,8 +28,8 @@ func minimalTIFF(order binary.ByteOrder, entries [][4]uint32) []byte {
 		p := 10 + i*12
 		order.PutUint16(buf[p:], uint16(e[0]))   //nolint:gosec // G115: test helper, intentional type cast
 		order.PutUint16(buf[p+2:], uint16(e[1])) //nolint:gosec // G115: test helper, intentional type cast
-		order.PutUint32(buf[p+4:], e[2])          // count
-		order.PutUint32(buf[p+8:], e[3])          // value/offset
+		order.PutUint32(buf[p+4:], e[2])         // count
+		order.PutUint32(buf[p+8:], e[3])         // value/offset
 	}
 	return buf
 }
@@ -694,8 +694,8 @@ func TestIFDCycleDetection(t *testing.T) {
 	buf := make([]byte, 8+2+4)
 	buf[0], buf[1] = 'I', 'I'
 	order.PutUint16(buf[2:], 0x002A)
-	order.PutUint32(buf[4:], 8) // IFD0 at offset 8
-	order.PutUint16(buf[8:], 0) // 0 entries
+	order.PutUint32(buf[4:], 8)  // IFD0 at offset 8
+	order.PutUint16(buf[8:], 0)  // 0 entries
 	order.PutUint32(buf[10:], 8) // next IFD = 8 → cycle back to IFD0
 
 	// Must not hang or panic.
@@ -722,7 +722,7 @@ func TestMakerNotePreservedOnEncode(t *testing.T) {
 	const (
 		hdrSize  = 8
 		exifOff  = hdrSize + 2 + 12 + 4 // IFD0: count(2) + 1 entry(12) + next(4) = 26 => exifIFD at 26
-		mnOffset = exifOff + 2 + 12 + 4  // ExifIFD: count(2) + 1 entry(12) + next(4) => MN value at 44
+		mnOffset = exifOff + 2 + 12 + 4 // ExifIFD: count(2) + 1 entry(12) + next(4) => MN value at 44
 	)
 
 	buf := make([]byte, mnOffset+len(makerNotePayload))
@@ -1024,9 +1024,9 @@ func TestSetCreator(t *testing.T) {
 // Orientation tag for both byte orders.
 func TestSetOrientation(t *testing.T) {
 	tests := []struct {
-		name      string
-		order     binary.ByteOrder
-		value     uint16
+		name  string
+		order binary.ByteOrder
+		value uint16
 	}{
 		{"LE normal", binary.LittleEndian, 1},
 		{"LE rotated 90 CW", binary.LittleEndian, 6},
@@ -1252,12 +1252,12 @@ func buildCameraEXIF() []byte {
 		{uint16(TagXResolution), uint16(TypeRational), 1, 0, rational(72, 1)},
 		{uint16(TagYResolution), uint16(TypeRational), 1, 0, rational(72, 1)},
 		{uint16(TagResolutionUnit), uint16(TypeShort), 1, 2, nil},
-		{0x010f, uint16(TypeASCII), 0, 0, asciiBlob("Canon")},      // Make
-		{0x0110, uint16(TypeASCII), 0, 0, asciiBlob("Canon EOS R5")}, // Model
+		{0x010f, uint16(TypeASCII), 0, 0, asciiBlob("Canon")},          // Make
+		{0x0110, uint16(TypeASCII), 0, 0, asciiBlob("Canon EOS R5")},   // Model
 		{0x0131, uint16(TypeASCII), 0, 0, asciiBlob("Firmware 1.8.2")}, // Software
-		{0x013b, uint16(TypeASCII), 0, 0, asciiBlob("Test Author")},  // Artist
-		{uint16(TagExifIFDPointer), uint16(TypeLong), 1, 0, nil},    // patched below
-		{uint16(TagGPSIFDPointer), uint16(TypeLong), 1, 0, nil},     // patched below
+		{0x013b, uint16(TypeASCII), 0, 0, asciiBlob("Test Author")},    // Artist
+		{uint16(TagExifIFDPointer), uint16(TypeLong), 1, 0, nil},       // patched below
+		{uint16(TagGPSIFDPointer), uint16(TypeLong), 1, 0, nil},        // patched below
 	}
 	// Fix ascii counts.
 	for i := range ifd0Entries {
@@ -1267,26 +1267,26 @@ func buildCameraEXIF() []byte {
 	}
 
 	exifEntries := []entry{
-		{0x829a, uint16(TypeRational), 1, 0, rational(1, 200)},   // ExposureTime
-		{0x829d, uint16(TypeRational), 1, 0, rational(8, 10)},    // FNumber (f/8)
-		{0x8822, uint16(TypeShort), 1, 0, nil},                    // ExposureProgram=Manual
-		{0x8827, uint16(TypeShort), 1, 400, nil},                  // ISO 400
+		{0x829a, uint16(TypeRational), 1, 0, rational(1, 200)},              // ExposureTime
+		{0x829d, uint16(TypeRational), 1, 0, rational(8, 10)},               // FNumber (f/8)
+		{0x8822, uint16(TypeShort), 1, 0, nil},                              // ExposureProgram=Manual
+		{0x8827, uint16(TypeShort), 1, 400, nil},                            // ISO 400
 		{0x9003, uint16(TypeASCII), 0, 0, asciiBlob("2024:03:15 10:30:00")}, // DateTimeOriginal
 		{0x9004, uint16(TypeASCII), 0, 0, asciiBlob("2024:03:15 10:30:00")}, // DateTimeDigitized
-		{0x9201, uint16(TypeSRational), 1, 0, rational(8, 1)},    // ShutterSpeedValue
-		{0x9202, uint16(TypeRational), 1, 0, rational(3, 1)},     // ApertureValue
-		{0x9204, uint16(TypeSRational), 1, 0, rational(0, 1)},    // ExposureBiasValue
-		{0x9205, uint16(TypeRational), 1, 0, rational(4, 1)},     // MaxApertureValue
-		{0x9207, uint16(TypeShort), 1, 5, nil},                    // MeteringMode=Pattern
-		{0x9209, uint16(TypeShort), 1, 0, nil},                    // Flash=no
-		{0x920a, uint16(TypeRational), 1, 0, rational(50, 1)},    // FocalLength 50mm
-		{0xa001, uint16(TypeShort), 1, 1, nil},                    // ColorSpace=sRGB
-		{0xa002, uint16(TypeLong), 1, 6000, nil},                  // PixelXDimension
-		{0xa003, uint16(TypeLong), 1, 4000, nil},                  // PixelYDimension
-		{0xa20e, uint16(TypeRational), 1, 0, rational(300, 1)},   // FocalPlaneXResolution
-		{0xa20f, uint16(TypeRational), 1, 0, rational(300, 1)},   // FocalPlaneYResolution
-		{0xa210, uint16(TypeShort), 1, 3, nil},                    // FocalPlaneResolutionUnit
-		{0xa405, uint16(TypeShort), 1, 50, nil},                   // FocalLengthIn35mmFilm
+		{0x9201, uint16(TypeSRational), 1, 0, rational(8, 1)},               // ShutterSpeedValue
+		{0x9202, uint16(TypeRational), 1, 0, rational(3, 1)},                // ApertureValue
+		{0x9204, uint16(TypeSRational), 1, 0, rational(0, 1)},               // ExposureBiasValue
+		{0x9205, uint16(TypeRational), 1, 0, rational(4, 1)},                // MaxApertureValue
+		{0x9207, uint16(TypeShort), 1, 5, nil},                              // MeteringMode=Pattern
+		{0x9209, uint16(TypeShort), 1, 0, nil},                              // Flash=no
+		{0x920a, uint16(TypeRational), 1, 0, rational(50, 1)},               // FocalLength 50mm
+		{0xa001, uint16(TypeShort), 1, 1, nil},                              // ColorSpace=sRGB
+		{0xa002, uint16(TypeLong), 1, 6000, nil},                            // PixelXDimension
+		{0xa003, uint16(TypeLong), 1, 4000, nil},                            // PixelYDimension
+		{0xa20e, uint16(TypeRational), 1, 0, rational(300, 1)},              // FocalPlaneXResolution
+		{0xa20f, uint16(TypeRational), 1, 0, rational(300, 1)},              // FocalPlaneYResolution
+		{0xa210, uint16(TypeShort), 1, 3, nil},                              // FocalPlaneResolutionUnit
+		{0xa405, uint16(TypeShort), 1, 50, nil},                             // FocalLengthIn35mmFilm
 	}
 	for i := range exifEntries {
 		if exifEntries[i].blob != nil && exifEntries[i].count == 0 {
@@ -1295,14 +1295,14 @@ func buildCameraEXIF() []byte {
 	}
 
 	gpsEntries := []entry{
-		{0x0001, uint16(TypeASCII), 2, 0, []byte("N\x00")},       // GPSLatitudeRef
+		{0x0001, uint16(TypeASCII), 2, 0, []byte("N\x00")},                                                   // GPSLatitudeRef
 		{0x0002, uint16(TypeRational), 3, 0, rationals([2]uint32{38, 1}, [2]uint32{43, 1}, [2]uint32{0, 1})}, // GPSLatitude
-		{0x0003, uint16(TypeASCII), 2, 0, []byte("W\x00")},       // GPSLongitudeRef
+		{0x0003, uint16(TypeASCII), 2, 0, []byte("W\x00")},                                                   // GPSLongitudeRef
 		{0x0004, uint16(TypeRational), 3, 0, rationals([2]uint32{9, 1}, [2]uint32{8, 1}, [2]uint32{0, 1})},   // GPSLongitude
-		{0x0005, uint16(TypeByte), 1, 0, nil},                     // GPSAltitudeRef=above sea
-		{0x0006, uint16(TypeRational), 1, 0, rational(150, 1)},   // GPSAltitude 150m
+		{0x0005, uint16(TypeByte), 1, 0, nil},                                                                // GPSAltitudeRef=above sea
+		{0x0006, uint16(TypeRational), 1, 0, rational(150, 1)},                                               // GPSAltitude 150m
 		{0x0007, uint16(TypeRational), 3, 0, rationals([2]uint32{10, 1}, [2]uint32{30, 1}, [2]uint32{0, 1})}, // GPSTimeStamp
-		{0x001d, uint16(TypeASCII), 0, 0, asciiBlob("2024:03:15")}, // GPSDateStamp
+		{0x001d, uint16(TypeASCII), 0, 0, asciiBlob("2024:03:15")},                                           // GPSDateStamp
 	}
 	for i := range gpsEntries {
 		if gpsEntries[i].blob != nil && gpsEntries[i].count == 0 {

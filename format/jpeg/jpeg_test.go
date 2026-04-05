@@ -242,7 +242,7 @@ func buildAPP13MultiBlock(rid1 uint16, data1, iptcData []byte) []byte {
 	// First block: rid1
 	irb.WriteString("8BIM")
 	irb.Write([]byte{byte(rid1 >> 8), byte(rid1)}) //nolint:gosec // G115: test helper, intentional type cast
-	irb.Write([]byte{0x00, 0x00}) // empty pascal name
+	irb.Write([]byte{0x00, 0x00})                  // empty pascal name
 	var sz [4]byte
 	binary.BigEndian.PutUint32(sz[:], uint32(len(data1))) //nolint:gosec // G115: test helper, intentional type cast
 	irb.Write(sz[:])

@@ -34,7 +34,7 @@ func buildFujifilmMakerNote() []byte {
 	binary.LittleEndian.PutUint16(buf[18:20], TagVersion) // tag
 	binary.LittleEndian.PutUint16(buf[20:22], 7)          // type UNDEFINED
 	binary.LittleEndian.PutUint32(buf[22:26], 4)          // count
-	copy(buf[26:30], "0100")                               // inline value (4 bytes fit in value field)
+	copy(buf[26:30], "0100")                              // inline value (4 bytes fit in value field)
 
 	return buf
 }
@@ -54,8 +54,8 @@ func buildFujifilmMakerNoteWithOffset() []byte {
 
 	// Entry: TagWhiteBalance (0x1001), type RATIONAL (5), count 1 → 8 bytes → offset-based.
 	binary.LittleEndian.PutUint16(buf[18:20], TagWhiteBalance)
-	binary.LittleEndian.PutUint16(buf[20:22], 5)          // RATIONAL
-	binary.LittleEndian.PutUint32(buf[22:26], 1)          // count 1
+	binary.LittleEndian.PutUint16(buf[20:22], 5)           // RATIONAL
+	binary.LittleEndian.PutUint32(buf[22:26], 1)           // count 1
 	binary.LittleEndian.PutUint32(buf[26:30], valueOffset) // offset to value
 
 	// RATIONAL value: numerator=1, denominator=1.

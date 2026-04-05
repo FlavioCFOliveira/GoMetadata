@@ -28,7 +28,7 @@ func buildSigmaMakerNote(tags []struct {
 	buf[8] = 0x01
 	buf[9] = 0x00
 	binary.LittleEndian.PutUint16(buf[10:], uint16(n)) //nolint:gosec // G115: test helper, intentional type cast
-	valueOff := uint32(10 + 2 + n*12) //nolint:gosec // G115: test helper, intentional type cast
+	valueOff := uint32(10 + 2 + n*12)                  //nolint:gosec // G115: test helper, intentional type cast
 	for i, t := range tags {
 		pos := 10 + 2 + i*12
 		binary.LittleEndian.PutUint16(buf[pos:], t.id)

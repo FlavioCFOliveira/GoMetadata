@@ -24,43 +24,43 @@ const (
 	TagCopyright         TagID = 0x8298
 
 	// TIFF 6.0 baseline tags not in EXIF §4.6.4 but present in real files (TIFF 6.0 §8).
-	TagNewSubfileType             TagID = 0x00FE
-	TagSubfileType                TagID = 0x00FF
-	TagThresholding               TagID = 0x0107
-	TagFillOrder                  TagID = 0x010A
-	TagDocumentName               TagID = 0x010D
-	TagStripOffsets               TagID = 0x0111
-	TagSamplesPerPixel            TagID = 0x0115
-	TagRowsPerStrip               TagID = 0x0116
-	TagStripByteCounts            TagID = 0x0117
-	TagMinSampleValue             TagID = 0x0118
-	TagMaxSampleValue             TagID = 0x0119
-	TagPlanarConfiguration        TagID = 0x011C
-	TagPageName                   TagID = 0x011D
-	TagXPosition                  TagID = 0x011E
-	TagYPosition                  TagID = 0x011F
-	TagGrayResponseUnit           TagID = 0x0122
-	TagGrayResponseCurve          TagID = 0x0123
-	TagPageNumber                 TagID = 0x0129
-	TagTransferFunction           TagID = 0x012D
-	TagHostComputer               TagID = 0x013C
-	TagPredictor                  TagID = 0x013D
-	TagPrimaryChromaticities      TagID = 0x013F
-	TagColorMap                   TagID = 0x0140
-	TagHalftoneHints              TagID = 0x0141
-	TagTileWidth                  TagID = 0x0142
-	TagTileLength                 TagID = 0x0143
-	TagTileOffsets                TagID = 0x0144
-	TagTileByteCounts             TagID = 0x0145
-	TagSubIFDs                    TagID = 0x014A // TIFF-EP / DNG extension
-	TagExtraSamples               TagID = 0x0152
-	TagSampleFormat               TagID = 0x0153
-	TagJPEGInterchangeFormat      TagID = 0x0201 // Thumbnail offset in IFD1
+	TagNewSubfileType              TagID = 0x00FE
+	TagSubfileType                 TagID = 0x00FF
+	TagThresholding                TagID = 0x0107
+	TagFillOrder                   TagID = 0x010A
+	TagDocumentName                TagID = 0x010D
+	TagStripOffsets                TagID = 0x0111
+	TagSamplesPerPixel             TagID = 0x0115
+	TagRowsPerStrip                TagID = 0x0116
+	TagStripByteCounts             TagID = 0x0117
+	TagMinSampleValue              TagID = 0x0118
+	TagMaxSampleValue              TagID = 0x0119
+	TagPlanarConfiguration         TagID = 0x011C
+	TagPageName                    TagID = 0x011D
+	TagXPosition                   TagID = 0x011E
+	TagYPosition                   TagID = 0x011F
+	TagGrayResponseUnit            TagID = 0x0122
+	TagGrayResponseCurve           TagID = 0x0123
+	TagPageNumber                  TagID = 0x0129
+	TagTransferFunction            TagID = 0x012D
+	TagHostComputer                TagID = 0x013C
+	TagPredictor                   TagID = 0x013D
+	TagPrimaryChromaticities       TagID = 0x013F
+	TagColorMap                    TagID = 0x0140
+	TagHalftoneHints               TagID = 0x0141
+	TagTileWidth                   TagID = 0x0142
+	TagTileLength                  TagID = 0x0143
+	TagTileOffsets                 TagID = 0x0144
+	TagTileByteCounts              TagID = 0x0145
+	TagSubIFDs                     TagID = 0x014A // TIFF-EP / DNG extension
+	TagExtraSamples                TagID = 0x0152
+	TagSampleFormat                TagID = 0x0153
+	TagJPEGInterchangeFormat       TagID = 0x0201 // Thumbnail offset in IFD1
 	TagJPEGInterchangeFormatLength TagID = 0x0202
-	TagYCbCrCoefficients          TagID = 0x0211
-	TagYCbCrSubSampling           TagID = 0x0212
-	TagYCbCrPositioning           TagID = 0x0213
-	TagReferenceBlackWhite        TagID = 0x0214
+	TagYCbCrCoefficients           TagID = 0x0211
+	TagYCbCrSubSampling            TagID = 0x0212
+	TagYCbCrPositioning            TagID = 0x0213
+	TagReferenceBlackWhite         TagID = 0x0214
 
 	// Pointer tags (EXIF §4.6.3).
 	TagExifIFDPointer    TagID = 0x8769
@@ -88,63 +88,63 @@ type tagInfo struct {
 
 // Standard EXIF IFD tags (EXIF §4.6.5 Table 4).
 const (
-	TagExposureTime          TagID = 0x829A // Rational (seconds)
-	TagFNumber               TagID = 0x829D // Rational (f/N)
-	TagExposureProgram       TagID = 0x8822 // Short
-	TagISOSpeedRatings       TagID = 0x8827 // Short (ISO 12232)
-	TagSensitivityType       TagID = 0x8830 // Short (EXIF 2.3+)
-	TagRecommendedExposureIndex TagID = 0x8832 // Long  (EXIF 2.3+)
-	TagDateTimeOriginal      TagID = 0x9003 // ASCII 20 ("YYYY:MM:DD HH:MM:SS\0")
-	TagDateTimeDigitized     TagID = 0x9004 // ASCII 20
-	TagOffsetTime            TagID = 0x9010 // ASCII (EXIF 2.31+)
-	TagOffsetTimeOriginal    TagID = 0x9011 // ASCII (EXIF 2.31+)
-	TagOffsetTimeDigitized   TagID = 0x9012 // ASCII (EXIF 2.31+)
-	TagShutterSpeedValue     TagID = 0x9201 // SRational (APEX)
-	TagApertureValue         TagID = 0x9202 // Rational  (APEX)
-	TagBrightnessValue       TagID = 0x9203 // SRational (APEX)
-	TagExposureBiasValue     TagID = 0x9204 // SRational (APEX)
-	TagMaxApertureValue      TagID = 0x9205 // Rational  (APEX)
-	TagSubjectDistance       TagID = 0x9206 // Rational  (metres)
-	TagMeteringMode          TagID = 0x9207 // Short
-	TagLightSource           TagID = 0x9208 // Short
-	TagFlash                 TagID = 0x9209 // Short
-	TagFocalLength           TagID = 0x920A // Rational  (mm)
-	TagSubSecTime            TagID = 0x9290 // ASCII
-	TagSubSecTimeOriginal    TagID = 0x9291 // ASCII
-	TagSubSecTimeDigitized   TagID = 0x9292 // ASCII
-	TagFlashpixVersion       TagID = 0xA000 // Undefined 4
-	TagColorSpace            TagID = 0xA001 // Short
-	TagPixelXDimension       TagID = 0xA002 // Short or Long
-	TagPixelYDimension       TagID = 0xA003 // Short or Long
-	TagRelatedSoundFile      TagID = 0xA004 // ASCII 13
-	TagFlashEnergy           TagID = 0xA20B // Rational
-	TagFocalPlaneXResolution TagID = 0xA20E // Rational
-	TagFocalPlaneYResolution TagID = 0xA20F // Rational
-	TagFocalPlaneResolutionUnit TagID = 0xA210 // Short
-	TagExposureIndex         TagID = 0xA215 // Rational
-	TagSensingMethod         TagID = 0xA217 // Short
-	TagFileSource            TagID = 0xA300 // Undefined 1
-	TagSceneType             TagID = 0xA301 // Undefined 1
-	TagCustomRendered        TagID = 0xA401 // Short
-	TagExposureMode          TagID = 0xA402 // Short
-	TagWhiteBalance          TagID = 0xA403 // Short
-	TagDigitalZoomRatio      TagID = 0xA404 // Rational
-	TagFocalLengthIn35mmFilm TagID = 0xA405 // Short
-	TagSceneCaptureType      TagID = 0xA406 // Short
-	TagGainControl           TagID = 0xA407 // Rational
-	TagContrast              TagID = 0xA408 // Short
-	TagSaturation            TagID = 0xA409 // Short
-	TagSharpness             TagID = 0xA40A // Short
-	TagSubjectDistanceRange  TagID = 0xA40C // Short
-	TagImageUniqueID         TagID = 0xA420 // ASCII 33
-	TagCameraOwnerName       TagID = 0xA430 // ASCII (EXIF 2.3+)
-	TagBodySerialNumber      TagID = 0xA431 // ASCII (EXIF 2.3+)
-	TagLensSpecification     TagID = 0xA432 // Rational 4
-	TagLensMake              TagID = 0xA433 // ASCII (EXIF 2.3+)
-	TagLensModel             TagID = 0xA434 // ASCII (EXIF 2.3+)
-	TagLensSerialNumber              TagID = 0xA435 // ASCII (EXIF 2.3+)
-	TagStandardOutputSensitivity     TagID = 0x8801 // Long 1 (EXIF 2.3+ §4.6.5)
-	TagDeviceSettingDescription      TagID = 0xA40B // Undefined (EXIF 2.x §4.6.5)
+	TagExposureTime              TagID = 0x829A // Rational (seconds)
+	TagFNumber                   TagID = 0x829D // Rational (f/N)
+	TagExposureProgram           TagID = 0x8822 // Short
+	TagISOSpeedRatings           TagID = 0x8827 // Short (ISO 12232)
+	TagSensitivityType           TagID = 0x8830 // Short (EXIF 2.3+)
+	TagRecommendedExposureIndex  TagID = 0x8832 // Long  (EXIF 2.3+)
+	TagDateTimeOriginal          TagID = 0x9003 // ASCII 20 ("YYYY:MM:DD HH:MM:SS\0")
+	TagDateTimeDigitized         TagID = 0x9004 // ASCII 20
+	TagOffsetTime                TagID = 0x9010 // ASCII (EXIF 2.31+)
+	TagOffsetTimeOriginal        TagID = 0x9011 // ASCII (EXIF 2.31+)
+	TagOffsetTimeDigitized       TagID = 0x9012 // ASCII (EXIF 2.31+)
+	TagShutterSpeedValue         TagID = 0x9201 // SRational (APEX)
+	TagApertureValue             TagID = 0x9202 // Rational  (APEX)
+	TagBrightnessValue           TagID = 0x9203 // SRational (APEX)
+	TagExposureBiasValue         TagID = 0x9204 // SRational (APEX)
+	TagMaxApertureValue          TagID = 0x9205 // Rational  (APEX)
+	TagSubjectDistance           TagID = 0x9206 // Rational  (metres)
+	TagMeteringMode              TagID = 0x9207 // Short
+	TagLightSource               TagID = 0x9208 // Short
+	TagFlash                     TagID = 0x9209 // Short
+	TagFocalLength               TagID = 0x920A // Rational  (mm)
+	TagSubSecTime                TagID = 0x9290 // ASCII
+	TagSubSecTimeOriginal        TagID = 0x9291 // ASCII
+	TagSubSecTimeDigitized       TagID = 0x9292 // ASCII
+	TagFlashpixVersion           TagID = 0xA000 // Undefined 4
+	TagColorSpace                TagID = 0xA001 // Short
+	TagPixelXDimension           TagID = 0xA002 // Short or Long
+	TagPixelYDimension           TagID = 0xA003 // Short or Long
+	TagRelatedSoundFile          TagID = 0xA004 // ASCII 13
+	TagFlashEnergy               TagID = 0xA20B // Rational
+	TagFocalPlaneXResolution     TagID = 0xA20E // Rational
+	TagFocalPlaneYResolution     TagID = 0xA20F // Rational
+	TagFocalPlaneResolutionUnit  TagID = 0xA210 // Short
+	TagExposureIndex             TagID = 0xA215 // Rational
+	TagSensingMethod             TagID = 0xA217 // Short
+	TagFileSource                TagID = 0xA300 // Undefined 1
+	TagSceneType                 TagID = 0xA301 // Undefined 1
+	TagCustomRendered            TagID = 0xA401 // Short
+	TagExposureMode              TagID = 0xA402 // Short
+	TagWhiteBalance              TagID = 0xA403 // Short
+	TagDigitalZoomRatio          TagID = 0xA404 // Rational
+	TagFocalLengthIn35mmFilm     TagID = 0xA405 // Short
+	TagSceneCaptureType          TagID = 0xA406 // Short
+	TagGainControl               TagID = 0xA407 // Rational
+	TagContrast                  TagID = 0xA408 // Short
+	TagSaturation                TagID = 0xA409 // Short
+	TagSharpness                 TagID = 0xA40A // Short
+	TagSubjectDistanceRange      TagID = 0xA40C // Short
+	TagImageUniqueID             TagID = 0xA420 // ASCII 33
+	TagCameraOwnerName           TagID = 0xA430 // ASCII (EXIF 2.3+)
+	TagBodySerialNumber          TagID = 0xA431 // ASCII (EXIF 2.3+)
+	TagLensSpecification         TagID = 0xA432 // Rational 4
+	TagLensMake                  TagID = 0xA433 // ASCII (EXIF 2.3+)
+	TagLensModel                 TagID = 0xA434 // ASCII (EXIF 2.3+)
+	TagLensSerialNumber          TagID = 0xA435 // ASCII (EXIF 2.3+)
+	TagStandardOutputSensitivity TagID = 0x8801 // Long 1 (EXIF 2.3+ §4.6.5)
+	TagDeviceSettingDescription  TagID = 0xA40B // Undefined (EXIF 2.x §4.6.5)
 )
 
 // tagRegistry maps TagID to tagInfo for all known tags.
@@ -289,37 +289,37 @@ func init() {
 
 	// GPS IFD tags (EXIF §4.6.6 Table 15, all 32 entries).
 	for tag, info := range map[TagID]tagInfo{
-		TagGPSVersionID:        {"GPSVersionID", TypeByte, 4},
-		TagGPSLatitudeRef:      {"GPSLatitudeRef", TypeASCII, 2},
-		TagGPSLatitude:         {"GPSLatitude", TypeRational, 3},
-		TagGPSLongitudeRef:     {"GPSLongitudeRef", TypeASCII, 2},
-		TagGPSLongitude:        {"GPSLongitude", TypeRational, 3},
-		TagGPSAltitudeRef:      {"GPSAltitudeRef", TypeByte, 1},
-		TagGPSAltitude:         {"GPSAltitude", TypeRational, 1},
-		TagGPSTimeStamp:        {"GPSTimeStamp", TypeRational, 3},
-		TagGPSSatellites:       {"GPSSatellites", TypeASCII, 0},
-		TagGPSStatus:           {"GPSStatus", TypeASCII, 2},
-		TagGPSMeasureMode:      {"GPSMeasureMode", TypeASCII, 2},
-		TagGPSDOP:              {"GPSDOP", TypeRational, 1},
-		TagGPSSpeedRef:         {"GPSSpeedRef", TypeASCII, 2},
-		TagGPSSpeed:            {"GPSSpeed", TypeRational, 1},
-		TagGPSTrackRef:         {"GPSTrackRef", TypeASCII, 2},
-		TagGPSTrack:            {"GPSTrack", TypeRational, 1},
-		TagGPSImgDirectionRef:  {"GPSImgDirectionRef", TypeASCII, 2},
-		TagGPSImgDirection:     {"GPSImgDirection", TypeRational, 1},
-		TagGPSMapDatum:         {"GPSMapDatum", TypeASCII, 0},
-		TagGPSDestLatitudeRef:  {"GPSDestLatitudeRef", TypeASCII, 2},
-		TagGPSDestLatitude:     {"GPSDestLatitude", TypeRational, 3},
-		TagGPSDestLongitudeRef: {"GPSDestLongitudeRef", TypeASCII, 2},
-		TagGPSDestLongitude:    {"GPSDestLongitude", TypeRational, 3},
-		TagGPSDestBearingRef:   {"GPSDestBearingRef", TypeASCII, 2},
-		TagGPSDestBearing:      {"GPSDestBearing", TypeRational, 1},
-		TagGPSDestDistanceRef:  {"GPSDestDistanceRef", TypeASCII, 2},
-		TagGPSDestDistance:     {"GPSDestDistance", TypeRational, 1},
-		TagGPSProcessingMethod: {"GPSProcessingMethod", TypeUndefined, 0},
-		TagGPSAreaInformation:  {"GPSAreaInformation", TypeUndefined, 0},
-		TagGPSDateStamp:        {"GPSDateStamp", TypeASCII, 11},
-		TagGPSDifferential:     {"GPSDifferential", TypeShort, 1},
+		TagGPSVersionID:         {"GPSVersionID", TypeByte, 4},
+		TagGPSLatitudeRef:       {"GPSLatitudeRef", TypeASCII, 2},
+		TagGPSLatitude:          {"GPSLatitude", TypeRational, 3},
+		TagGPSLongitudeRef:      {"GPSLongitudeRef", TypeASCII, 2},
+		TagGPSLongitude:         {"GPSLongitude", TypeRational, 3},
+		TagGPSAltitudeRef:       {"GPSAltitudeRef", TypeByte, 1},
+		TagGPSAltitude:          {"GPSAltitude", TypeRational, 1},
+		TagGPSTimeStamp:         {"GPSTimeStamp", TypeRational, 3},
+		TagGPSSatellites:        {"GPSSatellites", TypeASCII, 0},
+		TagGPSStatus:            {"GPSStatus", TypeASCII, 2},
+		TagGPSMeasureMode:       {"GPSMeasureMode", TypeASCII, 2},
+		TagGPSDOP:               {"GPSDOP", TypeRational, 1},
+		TagGPSSpeedRef:          {"GPSSpeedRef", TypeASCII, 2},
+		TagGPSSpeed:             {"GPSSpeed", TypeRational, 1},
+		TagGPSTrackRef:          {"GPSTrackRef", TypeASCII, 2},
+		TagGPSTrack:             {"GPSTrack", TypeRational, 1},
+		TagGPSImgDirectionRef:   {"GPSImgDirectionRef", TypeASCII, 2},
+		TagGPSImgDirection:      {"GPSImgDirection", TypeRational, 1},
+		TagGPSMapDatum:          {"GPSMapDatum", TypeASCII, 0},
+		TagGPSDestLatitudeRef:   {"GPSDestLatitudeRef", TypeASCII, 2},
+		TagGPSDestLatitude:      {"GPSDestLatitude", TypeRational, 3},
+		TagGPSDestLongitudeRef:  {"GPSDestLongitudeRef", TypeASCII, 2},
+		TagGPSDestLongitude:     {"GPSDestLongitude", TypeRational, 3},
+		TagGPSDestBearingRef:    {"GPSDestBearingRef", TypeASCII, 2},
+		TagGPSDestBearing:       {"GPSDestBearing", TypeRational, 1},
+		TagGPSDestDistanceRef:   {"GPSDestDistanceRef", TypeASCII, 2},
+		TagGPSDestDistance:      {"GPSDestDistance", TypeRational, 1},
+		TagGPSProcessingMethod:  {"GPSProcessingMethod", TypeUndefined, 0},
+		TagGPSAreaInformation:   {"GPSAreaInformation", TypeUndefined, 0},
+		TagGPSDateStamp:         {"GPSDateStamp", TypeASCII, 11},
+		TagGPSDifferential:      {"GPSDifferential", TypeShort, 1},
 		TagGPSHPositioningError: {"GPSHPositioningError", TypeRational, 1},
 	} {
 		tagRegistry[tag] = info

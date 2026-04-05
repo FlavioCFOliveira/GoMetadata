@@ -169,12 +169,12 @@ func Encode(i *IPTC) ([]byte, error) {
 				//   high byte = 0x80 | (4 >> 8) = 0x80
 				//   low byte  = 4 & 0xFF        = 0x04
 				// followed by the 4-byte big-endian length value.
-				buf.WriteByte(0x80) // bit 15 set; upper 7 bits of count = 0
-				buf.WriteByte(0x04) // lower 8 bits of count = 4
+				buf.WriteByte(0x80)          // bit 15 set; upper 7 bits of count = 0
+				buf.WriteByte(0x04)          // lower 8 bits of count = 4
 				buf.WriteByte(byte(n >> 24)) //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding
 				buf.WriteByte(byte(n >> 16)) //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding
-				buf.WriteByte(byte(n >> 8)) //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding
-				buf.WriteByte(byte(n))      //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding
+				buf.WriteByte(byte(n >> 8))  //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding
+				buf.WriteByte(byte(n))       //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding
 			} else {
 				buf.WriteByte(byte(n >> 8)) //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding
 				buf.WriteByte(byte(n))      //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding

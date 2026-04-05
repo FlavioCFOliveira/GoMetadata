@@ -43,8 +43,8 @@ func buildMinimalTIFF(order binary.ByteOrder, iptc, xmp []byte) []byte {
 	entries := make([]entry, 0, len(specs))
 	var valueBuf bytes.Buffer
 	for _, s := range specs {
-		typ := uint16(7)  // UNDEFINED
-		cnt := uint32(len(s.payload)) //nolint:gosec // G115: test helper, intentional type cast
+		typ := uint16(7)                        // UNDEFINED
+		cnt := uint32(len(s.payload))           //nolint:gosec // G115: test helper, intentional type cast
 		off := dataOff + uint32(valueBuf.Len()) //nolint:gosec // G115: test helper, intentional type cast
 		entries = append(entries, entry{s.tag, typ, cnt, off, s.payload})
 		valueBuf.Write(s.payload)

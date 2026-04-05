@@ -16,7 +16,7 @@ const (
 	NSrdf       = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 	NSx         = "adobe:ns:meta/"
 	// NScc is the Creative Commons namespace (creativecommons.org/ns).
-	NScc  = "http://creativecommons.org/ns#"
+	NScc = "http://creativecommons.org/ns#"
 	// NSpdf is the PDF namespace (Adobe PDF 1.3 property set).
 	NSpdf = "http://ns.adobe.com/pdf/1.3/"
 	// NSxmpNote is the XMP namespace for extended XMP notes.

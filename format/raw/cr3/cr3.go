@@ -43,12 +43,12 @@ func parseCR3BoxHeader(data []byte, pos int) (size uint64, typ string, headerLen
 	}
 
 	if size == 0 {
-		// size==0 means box extends to end of container.
-		size = uint64(len(data)) - uint64(pos)
+		// len(data)-pos is non-negative: guarded by pos+8 ≤ len(data) check above.
+		size = uint64(len(data) - pos) //nolint:gosec // G115: len(data)-pos is non-negative (guarded above)
 	}
 
 	// Bounds check: box must not extend beyond the containing slice.
-	if uint64(pos)+size > uint64(len(data)) {
+	if size > uint64(len(data)-pos) { //nolint:gosec // G115: len(data)-pos is non-negative (guarded above)
 		return 0, "", 0, false
 	}
 

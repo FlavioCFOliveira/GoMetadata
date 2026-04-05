@@ -60,12 +60,12 @@ func TestReadBox_Standard(t *testing.T) {
 	free := [4]byte{'f', 'r', 'e', 'e'}
 
 	tests := []struct {
-		name        string
-		typ         [4]byte
-		payload     []byte
-		wantSize    uint64
-		wantOffset  int64
-		wantData    uint64
+		name       string
+		typ        [4]byte
+		payload    []byte
+		wantSize   uint64
+		wantOffset int64
+		wantData   uint64
 	}{
 		{
 			name:       "ftyp with 4-byte payload",
@@ -249,8 +249,8 @@ func TestReadBox_Truncated(t *testing.T) {
 	fullHeader := buildStandardBox(12, typ, []byte{0x00, 0x00, 0x00, 0x00})
 
 	tests := []struct {
-		name   string
-		data   []byte
+		name string
+		data []byte
 	}{
 		{
 			name: "completely empty",
@@ -371,9 +371,9 @@ func TestSkipBox(t *testing.T) {
 // leaving the reader at the end of the stream.
 func TestSkipBox_SizeZero(t *testing.T) {
 	tests := []struct {
-		name        string
-		typ         [4]byte
-		payload     []byte
+		name    string
+		typ     [4]byte
+		payload []byte
 	}{
 		{
 			name:    "zero-size box, no trailing data",

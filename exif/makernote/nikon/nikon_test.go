@@ -9,11 +9,11 @@ import (
 func buildNikonType1IFD() []byte {
 	// 1 entry: TagISO (0x0002), type SHORT (3), count 1, value 400.
 	buf := make([]byte, 2+1*12)
-	binary.BigEndian.PutUint16(buf[0:], 1)         // entry count = 1
-	binary.BigEndian.PutUint16(buf[2:], TagISO)    // tag
-	binary.BigEndian.PutUint16(buf[4:], 3)         // type SHORT
-	binary.BigEndian.PutUint32(buf[6:], 1)         // count
-	binary.BigEndian.PutUint32(buf[10:], 400)      // value 400
+	binary.BigEndian.PutUint16(buf[0:], 1)      // entry count = 1
+	binary.BigEndian.PutUint16(buf[2:], TagISO) // tag
+	binary.BigEndian.PutUint16(buf[4:], 3)      // type SHORT
+	binary.BigEndian.PutUint32(buf[6:], 1)      // count
+	binary.BigEndian.PutUint32(buf[10:], 400)   // value 400
 	return buf
 }
 

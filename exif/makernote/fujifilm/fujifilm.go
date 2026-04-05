@@ -64,26 +64,26 @@ import (
 // Tag IDs for Fujifilm MakerNote IFD entries.
 // These are Fujifilm-proprietary tags (not EXIF-standard).
 const (
-	TagVersion                  uint16 = 0x0000
-	TagInternalSerialNumber     uint16 = 0x0010
-	TagQuality                  uint16 = 0x0011
-	TagWhiteBalance             uint16 = 0x1001
-	TagSaturation               uint16 = 0x1002
-	TagSharpness                uint16 = 0x1003
-	TagFujiFlashMode            uint16 = 0x1004
-	TagFlashExposureComp        uint16 = 0x1005
-	TagMacro                    uint16 = 0x1006
-	TagFocusMode                uint16 = 0x1007
-	TagBlurWarning              uint16 = 0x100E
-	TagFocusWarning             uint16 = 0x100F
-	TagAutoExposureWarning      uint16 = 0x1010
-	TagDynamicRange             uint16 = 0x1020
-	TagFilmMode                 uint16 = 0x1021
-	TagDynamicRangeSetting      uint16 = 0x1022
-	TagImageStabilization       uint16 = 0x102D
-	TagAutoBracketingCount      uint16 = 0x1100
-	TagFileSource               uint16 = 0x8000
-	TagFrameNumber              uint16 = 0x8003
+	TagVersion              uint16 = 0x0000
+	TagInternalSerialNumber uint16 = 0x0010
+	TagQuality              uint16 = 0x0011
+	TagWhiteBalance         uint16 = 0x1001
+	TagSaturation           uint16 = 0x1002
+	TagSharpness            uint16 = 0x1003
+	TagFujiFlashMode        uint16 = 0x1004
+	TagFlashExposureComp    uint16 = 0x1005
+	TagMacro                uint16 = 0x1006
+	TagFocusMode            uint16 = 0x1007
+	TagBlurWarning          uint16 = 0x100E
+	TagFocusWarning         uint16 = 0x100F
+	TagAutoExposureWarning  uint16 = 0x1010
+	TagDynamicRange         uint16 = 0x1020
+	TagFilmMode             uint16 = 0x1021
+	TagDynamicRangeSetting  uint16 = 0x1022
+	TagImageStabilization   uint16 = 0x102D
+	TagAutoBracketingCount  uint16 = 0x1100
+	TagFileSource           uint16 = 0x8000
+	TagFrameNumber          uint16 = 0x8003
 )
 
 // magic is the required 8-byte prefix for all Fujifilm MakerNotes.

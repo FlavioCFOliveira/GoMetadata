@@ -247,10 +247,10 @@ func buildJPEGWithCaption(caption string) []byte {
 
 	// Entry: tag 0x010E ImageDescription, type ASCII, count captionLen, offset
 	e := tiff[10:]
-	order.PutUint16(e[0:], 0x010E)       // tag
-	order.PutUint16(e[2:], 0x0002)       // TypeASCII
-	order.PutUint32(e[4:], captionLen)   // count
-	order.PutUint32(e[8:], valueOffset)  // value offset
+	order.PutUint16(e[0:], 0x010E)      // tag
+	order.PutUint16(e[2:], 0x0002)      // TypeASCII
+	order.PutUint32(e[4:], captionLen)  // count
+	order.PutUint32(e[8:], valueOffset) // value offset
 
 	// Next-IFD pointer = 0
 	order.PutUint32(tiff[10+12:], 0)

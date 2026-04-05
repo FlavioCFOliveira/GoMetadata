@@ -48,23 +48,23 @@ import "encoding/binary"
 
 // Tag IDs for Panasonic MakerNote IFD entries.
 const (
-	TagImageQuality         uint16 = 0x0001
-	TagFirmwareVersion      uint16 = 0x0002
-	TagWhiteBalance         uint16 = 0x0003
-	TagFocusMode            uint16 = 0x0007
-	TagAFAreaMode           uint16 = 0x000F
-	TagImageStabilization   uint16 = 0x001A
-	TagMacroMode            uint16 = 0x001C
-	TagShootingMode         uint16 = 0x001F
-	TagWhiteBalanceBias     uint16 = 0x0025
-	TagFlashBias            uint16 = 0x0026
-	TagColorEffect          uint16 = 0x0034
-	TagContrast             uint16 = 0x003C
-	TagNoiseReduction       uint16 = 0x003D
-	TagColorSpace           uint16 = 0x004C
-	TagLensType             uint16 = 0x0051
-	TagLensSerialNumber     uint16 = 0x0052
-	TagIntelligentExposure  uint16 = 0x0059
+	TagImageQuality          uint16 = 0x0001
+	TagFirmwareVersion       uint16 = 0x0002
+	TagWhiteBalance          uint16 = 0x0003
+	TagFocusMode             uint16 = 0x0007
+	TagAFAreaMode            uint16 = 0x000F
+	TagImageStabilization    uint16 = 0x001A
+	TagMacroMode             uint16 = 0x001C
+	TagShootingMode          uint16 = 0x001F
+	TagWhiteBalanceBias      uint16 = 0x0025
+	TagFlashBias             uint16 = 0x0026
+	TagColorEffect           uint16 = 0x0034
+	TagContrast              uint16 = 0x003C
+	TagNoiseReduction        uint16 = 0x003D
+	TagColorSpace            uint16 = 0x004C
+	TagLensType              uint16 = 0x0051
+	TagLensSerialNumber      uint16 = 0x0052
+	TagIntelligentExposure   uint16 = 0x0059
 	TagIntelligentResolution uint16 = 0x0070
 )
 

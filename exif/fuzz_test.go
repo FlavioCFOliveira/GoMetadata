@@ -20,9 +20,9 @@ func FuzzParseEXIF(f *testing.F) {
 		order := binary.LittleEndian
 		buf[0], buf[1] = 'I', 'I'
 		order.PutUint16(buf[2:], 0x002A)
-		order.PutUint32(buf[4:], 8)   // IFD0 at offset 8
-		order.PutUint16(buf[8:], 0)   // 0 entries
-		order.PutUint32(buf[10:], 0)  // next IFD = 0
+		order.PutUint32(buf[4:], 8)  // IFD0 at offset 8
+		order.PutUint16(buf[8:], 0)  // 0 entries
+		order.PutUint32(buf[10:], 0) // next IFD = 0
 		f.Add(buf)
 	}
 
@@ -46,13 +46,13 @@ func FuzzParseEXIF(f *testing.F) {
 		buf[0], buf[1] = 'I', 'I'
 		order.PutUint16(buf[2:], 0x002A)
 		order.PutUint32(buf[4:], 8)
-		order.PutUint16(buf[8:], 1)       // 1 entry
+		order.PutUint16(buf[8:], 1) // 1 entry
 		p := buf[10:]
-		order.PutUint16(p[0:], 0x0100)   // ImageWidth
-		order.PutUint16(p[2:], 3)         // TypeSHORT
-		order.PutUint32(p[4:], 1)         // count = 1
-		order.PutUint16(p[8:], 800)       // inline value
-		order.PutUint32(buf[10+12:], 0)  // next IFD = 0
+		order.PutUint16(p[0:], 0x0100)  // ImageWidth
+		order.PutUint16(p[2:], 3)       // TypeSHORT
+		order.PutUint32(p[4:], 1)       // count = 1
+		order.PutUint16(p[8:], 800)     // inline value
+		order.PutUint32(buf[10+12:], 0) // next IFD = 0
 		f.Add(buf)
 	}
 

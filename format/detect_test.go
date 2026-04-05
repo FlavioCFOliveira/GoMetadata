@@ -156,7 +156,7 @@ func TestDetectMagic(t *testing.T) {
 // is a complete, structurally valid TIFF byte slice.
 func buildTIFFWithMakeTag(makeStr string) []byte {
 	makeBytes := []byte(makeStr + "\x00") // NUL-terminated ASCII
-	makeLen := uint32(len(makeBytes)) //nolint:gosec // G115: test helper, intentional type cast
+	makeLen := uint32(len(makeBytes))     //nolint:gosec // G115: test helper, intentional type cast
 
 	// Layout: header(8) + IFD_count(2) + 1_entry(12) + next_IFD(4) + value_area
 	valueOffset := uint32(8 + 2 + 12 + 4)
@@ -174,7 +174,7 @@ func buildTIFFWithMakeTag(makeStr string) []byte {
 	// Entry: tag=0x010F (Make), type=2 (ASCII), count=makeLen, offset=valueOffset.
 	buf[10], buf[11] = 0x0F, 0x01 // tag 0x010F LE
 	buf[12], buf[13] = 0x02, 0x00 // TypeASCII
-	buf[14] = byte(makeLen) //nolint:gosec // G115: test helper, intentional type cast
+	buf[14] = byte(makeLen)       //nolint:gosec // G115: test helper, intentional type cast
 	buf[18] = byte(valueOffset)   // value offset (LE, fits in 1 byte)
 
 	// next-IFD pointer = 0.
@@ -198,7 +198,7 @@ func buildTIFFWithDNGTag() []byte {
 	// Entry: tag=0xC612 (DNGVersion), type=1 (BYTE), count=4, inline value.
 	buf[10], buf[11] = 0x12, 0xC6 // tag 0xC612 LE
 	buf[12], buf[13] = 0x01, 0x00 // TypeByte
-	buf[14] = 0x04                 // count = 4
+	buf[14] = 0x04                // count = 4
 	// value [18..21] = 0x01,0x04,0x00,0x00 (DNG 1.4)
 	buf[18] = 0x01
 	buf[19] = 0x04

@@ -62,9 +62,9 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 	// We use offset_size=4, length_size=4.
 	makeIloc := func(items []ilocTestItem) []byte {
 		ilocBody := make([]byte, 0, 6+2+len(items)*(2+2+4+4)) // version+flags+sizes+item_count + items
-		ilocBody = append(ilocBody, 0x00, 0x00, 0x00, 0x00) // version + flags
-		ilocBody = append(ilocBody, 0x44)           // offset_size=4, length_size=4
-		ilocBody = append(ilocBody, 0x00)           // base_offset_size=0, reserved=0
+		ilocBody = append(ilocBody, 0x00, 0x00, 0x00, 0x00)   // version + flags
+		ilocBody = append(ilocBody, 0x44)                     // offset_size=4, length_size=4
+		ilocBody = append(ilocBody, 0x00)                     // base_offset_size=0, reserved=0
 		cnt := make([]byte, 2)
 		binary.BigEndian.PutUint16(cnt, uint16(len(items))) //nolint:gosec // G115: test helper, intentional type cast
 		ilocBody = append(ilocBody, cnt...)

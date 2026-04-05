@@ -77,11 +77,11 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 func readPaddedChunk(r io.ReadSeeker, chunk riff.Chunk) ([]byte, error) {
 	data := make([]byte, chunk.Size)
 	if _, err := io.ReadFull(r, data); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("webp: read chunk data: %w", err)
 	}
 	if chunk.Size%2 != 0 {
 		if _, err := r.Seek(1, io.SeekCurrent); err != nil && !errors.Is(err, io.EOF) {
-			return nil, err
+			return nil, fmt.Errorf("webp: seek past odd-size padding byte: %w", err)
 		}
 	}
 	return data, nil

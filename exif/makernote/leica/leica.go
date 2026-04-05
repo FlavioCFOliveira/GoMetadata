@@ -22,11 +22,11 @@ import "encoding/binary"
 
 // Tag IDs for Leica MakerNote IFD entries.
 const (
-	TagLensType            uint16 = 0x0001
-	TagOriginalFileName    uint16 = 0x0300
-	TagLensModel           uint16 = 0x0303
+	TagLensType             uint16 = 0x0001
+	TagOriginalFileName     uint16 = 0x0300
+	TagLensModel            uint16 = 0x0303
 	TagInternalSerialNumber uint16 = 0x0500
-	TagSensorHeightWidth   uint16 = 0x3000
+	TagSensorHeightWidth    uint16 = 0x3000
 )
 
 // Parser implements makernote.Parser for Leica cameras.

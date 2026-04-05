@@ -71,10 +71,10 @@ func rtMinimalTIFF() []byte {
 
 	// Tag 0x010E ImageDescription (EXIF §4.6.3), TypeASCII.
 	p := buf[10:]
-	order.PutUint16(p[0:], 0x010E)          // tag
-	order.PutUint16(p[2:], 0x0002)          // TypeASCII
+	order.PutUint16(p[0:], 0x010E)            // tag
+	order.PutUint16(p[2:], 0x0002)            // TypeASCII
 	order.PutUint32(p[4:], uint32(len(desc))) // count
-	order.PutUint32(p[8:], valueOff)        // value offset
+	order.PutUint32(p[8:], valueOff)          // value offset
 
 	order.PutUint32(buf[10+12:], 0) // next IFD = 0
 
@@ -91,7 +91,7 @@ func rtPNGWriteChunk(buf *bytes.Buffer, chunkType string, data []byte) {
 	buf.Write(data)
 	h := crc32.NewIEEE()
 	_, _ = h.Write([]byte(chunkType)) //nolint:gosec // G104: hash.Hash.Write never returns an error
-	_, _ = h.Write(data)               //nolint:gosec // G104: hash.Hash.Write never returns an error
+	_, _ = h.Write(data)              //nolint:gosec // G104: hash.Hash.Write never returns an error
 	binary.BigEndian.PutUint32(hdr[:], h.Sum32())
 	buf.Write(hdr[:])
 }
@@ -423,10 +423,10 @@ func TestRoundTripXMP_WebP(t *testing.T) {
 // most important format+metadata-type combinations in a compact form.
 func TestRoundTripTableDriven(t *testing.T) {
 	type testCase struct {
-		name    string
-		image   func() []byte   // build the container
-		modify  func(*gometadata.Metadata) // populate metadata
-		assert  func(*testing.T, *gometadata.Metadata) // assert values
+		name   string
+		image  func() []byte                          // build the container
+		modify func(*gometadata.Metadata)             // populate metadata
+		assert func(*testing.T, *gometadata.Metadata) // assert values
 	}
 
 	cases := []testCase{

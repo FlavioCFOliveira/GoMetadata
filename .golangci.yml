@@ -124,3 +124,11 @@ linters:
       # Example main functions are intentionally procedural and sequential.
       - linters: [gocyclo]
         path: "^examples/"
+
+formatters:
+  enable:
+    # Enforces canonical Go formatting and applies simplifications (gofmt -s).
+    - gofmt
+  settings:
+    gofmt:
+      simplify: true

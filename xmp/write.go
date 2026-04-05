@@ -24,8 +24,8 @@ var xmpPadding = func() [2048]byte { //nolint:gochecknoglobals // package-level 
 // encBufPool recycles bytes.Buffer instances across encode calls.
 // Pre-grown buffers avoid the repeated backing-array reallocations that
 // occur when building an XMP packet from scratch.
-var encBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}    //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
-var nsListPool = sync.Pool{New: func() any { s := make([]string, 0, 8); return &s }}  //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
+var encBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}                 //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
+var nsListPool = sync.Pool{New: func() any { s := make([]string, 0, 8); return &s }}     //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
 var localListPool = sync.Pool{New: func() any { s := make([]string, 0, 16); return &s }} //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
 
 // encode serialises x to a padded XMP packet.

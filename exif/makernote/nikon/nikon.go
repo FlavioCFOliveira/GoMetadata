@@ -6,11 +6,11 @@
 //
 //   - Type 3 (all modern Nikon DSLRs / Coolpix / Z-series): embedded TIFF header
 //     prefixed by "Nikon\0" + 2-byte version. Layout:
-//       [0..5]   "Nikon\0"   magic
-//       [6..7]   version     (e.g. 0x02 0x10)
-//       [8..9]   byte order  "II" or "MM"
-//       [10..11] TIFF magic  0x002A
-//       [12..15] IFD offset  (relative to byte 8)
+//     [0..5]   "Nikon\0"   magic
+//     [6..7]   version     (e.g. 0x02 0x10)
+//     [8..9]   byte order  "II" or "MM"
+//     [10..11] TIFF magic  0x002A
+//     [12..15] IFD offset  (relative to byte 8)
 //
 // Selected Nikon MakerNote tag IDs:
 //

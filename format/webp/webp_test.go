@@ -18,15 +18,15 @@ func buildWebP(exifData, xmpData []byte, vp8xFlags uint32, canvasW, canvasH uint
 		// Canvas: (width-1) in 3 bytes LE, (height-1) in 3 bytes LE
 		if canvasW > 0 {
 			w := canvasW - 1
-			vp8xPayload[4] = byte(w)        //nolint:gosec // G115: test helper, intentional type cast
-			vp8xPayload[5] = byte(w >> 8)   //nolint:gosec // G115: test helper, intentional type cast
-			vp8xPayload[6] = byte(w >> 16)  //nolint:gosec // G115: test helper, intentional type cast
+			vp8xPayload[4] = byte(w)       //nolint:gosec // G115: test helper, intentional type cast
+			vp8xPayload[5] = byte(w >> 8)  //nolint:gosec // G115: test helper, intentional type cast
+			vp8xPayload[6] = byte(w >> 16) //nolint:gosec // G115: test helper, intentional type cast
 		}
 		if canvasH > 0 {
 			h := canvasH - 1
-			vp8xPayload[7] = byte(h)        //nolint:gosec // G115: test helper, intentional type cast
-			vp8xPayload[8] = byte(h >> 8)   //nolint:gosec // G115: test helper, intentional type cast
-			vp8xPayload[9] = byte(h >> 16)  //nolint:gosec // G115: test helper, intentional type cast
+			vp8xPayload[7] = byte(h)       //nolint:gosec // G115: test helper, intentional type cast
+			vp8xPayload[8] = byte(h >> 8)  //nolint:gosec // G115: test helper, intentional type cast
+			vp8xPayload[9] = byte(h >> 16) //nolint:gosec // G115: test helper, intentional type cast
 		}
 		writeRIFFChunk(&body, "VP8X", vp8xPayload)
 	}

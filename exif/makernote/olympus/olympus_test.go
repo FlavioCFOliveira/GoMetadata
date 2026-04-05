@@ -70,9 +70,9 @@ func buildOlympusMakerNoteWithOffset() []byte {
 
 	// Entry: TagApertureValue, RATIONAL (5), count 1 → 8 bytes → offset-based.
 	binary.LittleEndian.PutUint16(buf[14:16], TagApertureValue)
-	binary.LittleEndian.PutUint16(buf[16:18], 5)            // RATIONAL
-	binary.LittleEndian.PutUint32(buf[18:22], 1)            // count 1
-	binary.LittleEndian.PutUint32(buf[22:26], valueOffset)  // offset
+	binary.LittleEndian.PutUint16(buf[16:18], 5)           // RATIONAL
+	binary.LittleEndian.PutUint32(buf[18:22], 1)           // count 1
+	binary.LittleEndian.PutUint32(buf[22:26], valueOffset) // offset
 
 	// Value: numerator=14, denominator=10 → f/1.4
 	binary.LittleEndian.PutUint32(buf[valueOffset:valueOffset+4], 14)

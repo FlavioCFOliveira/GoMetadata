@@ -77,20 +77,20 @@ package sony
 
 // Tag IDs for Sony MakerNote IFD entries.
 const (
-	TagQuality             uint16 = 0x0102
-	TagFlashExposureComp   uint16 = 0x0104
-	TagCameraSettings      uint16 = 0x0114
-	TagWhiteBalance        uint16 = 0x0115
-	TagFocalLength         uint16 = 0x0201
-	TagSonyModelID         uint16 = 0x7001
-	TagSceneMode           uint16 = 0xB023
-	TagLensType            uint16 = 0xB027
-	TagColorMode           uint16 = 0xB029
-	TagFullImageSize       uint16 = 0xB02B
-	TagImageStabilization  uint16 = 0xB026
-	TagDynamicRangeOpt     uint16 = 0xB025
-	TagAntiBlur            uint16 = 0xB047
-	TagLongExpNR           uint16 = 0xB04E
+	TagQuality            uint16 = 0x0102
+	TagFlashExposureComp  uint16 = 0x0104
+	TagCameraSettings     uint16 = 0x0114
+	TagWhiteBalance       uint16 = 0x0115
+	TagFocalLength        uint16 = 0x0201
+	TagSonyModelID        uint16 = 0x7001
+	TagSceneMode          uint16 = 0xB023
+	TagLensType           uint16 = 0xB027
+	TagColorMode          uint16 = 0xB029
+	TagFullImageSize      uint16 = 0xB02B
+	TagImageStabilization uint16 = 0xB026
+	TagDynamicRangeOpt    uint16 = 0xB025
+	TagAntiBlur           uint16 = 0xB047
+	TagLongExpNR          uint16 = 0xB04E
 )
 
 // Parser implements makernote.Parser for Sony cameras.

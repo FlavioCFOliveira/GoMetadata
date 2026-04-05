@@ -21,7 +21,7 @@ func buildPlainIFD(order binary.ByteOrder, tags []struct {
 	}
 	buf := make([]byte, 2+n*12+outSize)
 	order.PutUint16(buf[0:], uint16(n)) //nolint:gosec // G115: test helper, intentional type cast
-	valueOff := uint32(2 + n*12) //nolint:gosec // G115: test helper, intentional type cast
+	valueOff := uint32(2 + n*12)        //nolint:gosec // G115: test helper, intentional type cast
 	for i, t := range tags {
 		pos := 2 + i*12
 		order.PutUint16(buf[pos:], t.id)

@@ -14,10 +14,10 @@ func buildPNG(exifData, xmpData []byte) []byte {
 	buf.Write(pngSig[:])
 	// Minimal IHDR chunk: width=1, height=1, bitdepth=8, colortype=2, rest zeros.
 	ihdrData := make([]byte, 13)
-	binary.BigEndian.PutUint32(ihdrData[0:], 1)  // width
-	binary.BigEndian.PutUint32(ihdrData[4:], 1)  // height
-	ihdrData[8] = 8                               // bit depth
-	ihdrData[9] = 2                               // color type (RGB)
+	binary.BigEndian.PutUint32(ihdrData[0:], 1) // width
+	binary.BigEndian.PutUint32(ihdrData[4:], 1) // height
+	ihdrData[8] = 8                             // bit depth
+	ihdrData[9] = 2                             // color type (RGB)
 	writeChunkTo(&buf, "IHDR", ihdrData)
 
 	if exifData != nil {
@@ -189,8 +189,8 @@ func buildPNGWithChunk(chunkType string, data []byte) []byte {
 	ihdrData := make([]byte, 13)
 	binary.BigEndian.PutUint32(ihdrData[0:], 1) // width
 	binary.BigEndian.PutUint32(ihdrData[4:], 1) // height
-	ihdrData[8] = 8                              // bit depth
-	ihdrData[9] = 2                              // color type (RGB)
+	ihdrData[8] = 8                             // bit depth
+	ihdrData[9] = 2                             // color type (RGB)
 	writeChunkTo(&buf, "IHDR", ihdrData)
 
 	writeChunkTo(&buf, chunkType, data)

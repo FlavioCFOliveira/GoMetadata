@@ -46,12 +46,12 @@ func minimalTIFFPayload() []byte {
 	order.PutUint16(buf[2:], 0x002A)
 	order.PutUint32(buf[4:], 8) // IFD0 at offset 8
 
-	order.PutUint16(buf[8:], 1)           // 1 entry
-	order.PutUint16(buf[10:], 0x010E)     // ImageDescription tag
-	order.PutUint16(buf[12:], 2)          // ASCII
-	order.PutUint32(buf[14:], 4)          // count = 4
-	copy(buf[18:], []byte("test"))        // inline value
-	order.PutUint32(buf[22:], 0)          // next IFD = 0
+	order.PutUint16(buf[8:], 1)       // 1 entry
+	order.PutUint16(buf[10:], 0x010E) // ImageDescription tag
+	order.PutUint16(buf[12:], 2)      // ASCII
+	order.PutUint32(buf[14:], 4)      // count = 4
+	copy(buf[18:], []byte("test"))    // inline value
+	order.PutUint32(buf[22:], 0)      // next IFD = 0
 	return buf
 }
 
@@ -216,7 +216,7 @@ func buildMinimalPNG() []byte {
 		buf.Write(data)
 		h := crc32.NewIEEE()
 		_, _ = h.Write([]byte(chunkType)) //nolint:gosec // G104: hash.Hash.Write never returns an error
-		_, _ = h.Write(data)               //nolint:gosec // G104: hash.Hash.Write never returns an error
+		_, _ = h.Write(data)              //nolint:gosec // G104: hash.Hash.Write never returns an error
 		binary.BigEndian.PutUint32(lbuf[:], h.Sum32())
 		buf.Write(lbuf[:])
 	}
@@ -240,7 +240,7 @@ func buildIPTCBytes(caption string) []byte {
 	var buf bytes.Buffer
 	buf.WriteByte(0x1C)
 	buf.WriteByte(2)
-	buf.WriteByte(120) // DS2Caption
+	buf.WriteByte(120)                 // DS2Caption
 	buf.WriteByte(byte(len(val) >> 8)) //nolint:gosec // G115: test helper, intentional type cast
 	buf.WriteByte(byte(len(val)))      //nolint:gosec // G115: test helper, intentional type cast
 	buf.Write(val)
@@ -338,8 +338,8 @@ func buildRichTIFF(makeStr, modelStr string, orientation uint16, iso uint16) []b
 	valueAreaStart := uint32(headerSz + ifd0Sz)
 	// ExifIFD begins right after the value area.
 	makeOff := valueAreaStart
-	modelOff := makeOff + uint32(len(makeBytes))         //nolint:gosec // G115: test helper, intentional type cast
-	exifIFDOff := modelOff + uint32(len(modelBytes))     //nolint:gosec // G115: test helper, intentional type cast
+	modelOff := makeOff + uint32(len(makeBytes))     //nolint:gosec // G115: test helper, intentional type cast
+	exifIFDOff := modelOff + uint32(len(modelBytes)) //nolint:gosec // G115: test helper, intentional type cast
 	// ExifIFD value area (ISO is SHORT → inline, no value area needed).
 
 	totalSize := int(exifIFDOff) + exifIFDSz
@@ -363,11 +363,11 @@ func buildRichTIFF(makeStr, modelStr string, orientation uint16, iso uint16) []b
 	}
 
 	// IFD0 entries (sorted ascending by tag per TIFF §7).
-	writeEntry(ifd0Start, 0, 0x010F, uint16(exif.TypeASCII), uint32(len(makeBytes)), makeOff) //nolint:gosec // G115: test helper, intentional type cast
+	writeEntry(ifd0Start, 0, 0x010F, uint16(exif.TypeASCII), uint32(len(makeBytes)), makeOff)   //nolint:gosec // G115: test helper, intentional type cast
 	writeEntry(ifd0Start, 1, 0x0110, uint16(exif.TypeASCII), uint32(len(modelBytes)), modelOff) //nolint:gosec // G115: test helper, intentional type cast
 	// Orientation: SHORT inline — value is left-justified in the 4-byte field.
 	writeEntry(ifd0Start, 2, 0x0112, uint16(exif.TypeShort), 1, uint32(orientation)) // Orientation
-	writeEntry(ifd0Start, 3, 0x8769, uint16(exif.TypeLong), 1, exifIFDOff)          // ExifIFDPointer
+	writeEntry(ifd0Start, 3, 0x8769, uint16(exif.TypeLong), 1, exifIFDOff)           // ExifIFDPointer
 
 	// next-IFD pointer = 0 (no IFD1).
 	nextPtrPos := ifd0Start + 2 + nIFD0*12

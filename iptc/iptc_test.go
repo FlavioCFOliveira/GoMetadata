@@ -256,7 +256,7 @@ func TestISO8859_1VsUTF8(t *testing.T) {
 	buf.WriteByte(0x1C)
 	buf.WriteByte(0x02)
 	buf.WriteByte(DS2Caption)
-	payload := []byte("caf\xC3\xA9") // "café" in UTF-8
+	payload := []byte("caf\xC3\xA9")       // "café" in UTF-8
 	buf.WriteByte(byte(len(payload) >> 8)) //nolint:gosec // G115: test helper, intentional type cast
 	buf.WriteByte(byte(len(payload)))      //nolint:gosec // G115: test helper, intentional type cast
 	buf.Write(payload)

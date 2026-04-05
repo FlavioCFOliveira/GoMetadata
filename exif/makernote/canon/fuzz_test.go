@@ -4,7 +4,10 @@ import "testing"
 
 func FuzzCanonParse(f *testing.F) {
 	// Seed: minimal valid Canon MakerNote IFD (3 entries).
-	f.Add(buildCanonIFD([]struct{ tag, typ uint16; val uint32 }{
+	f.Add(buildCanonIFD([]struct {
+		tag, typ uint16
+		val      uint32
+	}{
 		{TagCameraSettings, 3, 0x0001},
 		{TagModelID, 4, 0x80000010},
 		{TagColorSpace, 3, 0x0001},

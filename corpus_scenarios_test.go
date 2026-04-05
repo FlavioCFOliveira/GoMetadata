@@ -381,16 +381,16 @@ func TestCorpusIPTCReferenceImages(t *testing.T) {
 // Source: tlnagy/exampletiffs.
 func TestCorpusTIFFStructuralVariants(t *testing.T) {
 	files := []string{
-		"mri.tif",                         // multi-page (MRI slices)
-		"shapes_tiled_multi.tif",          // tiled, multi-page
-		"shapes_lzw.tif",                  // LZW compression
-		"shapes_deflate.tif",              // deflate compression
-		"shapes_uncompressed.tif",         // no compression
-		"shapes_lzw_planar.tif",           // planar (non-chunky) storage
-		"shapes_lzw_tiled.tif",            // LZW + tiled
-		"shapes_lzw_palette.tif",          // palette/indexed
+		"mri.tif",                              // multi-page (MRI slices)
+		"shapes_tiled_multi.tif",               // tiled, multi-page
+		"shapes_lzw.tif",                       // LZW compression
+		"shapes_deflate.tif",                   // deflate compression
+		"shapes_uncompressed.tif",              // no compression
+		"shapes_lzw_planar.tif",                // planar (non-chunky) storage
+		"shapes_lzw_tiled.tif",                 // LZW + tiled
+		"shapes_lzw_palette.tif",               // palette/indexed
 		"shapes_uncompressed_tiled_planar.tif", // uncompressed + tiled + planar
-		"4D-series.ome.tif",               // OME-TIFF with XML in ImageDescription
+		"4D-series.ome.tif",                    // OME-TIFF with XML in ImageDescription
 	}
 	for _, name := range files {
 		t.Run(name, func(t *testing.T) {
@@ -599,8 +599,8 @@ func TestCorpusRawGracefulUnsupported(t *testing.T) {
 // Source: Exiv2/exiv2 test/data.
 func TestCorpusPNGEdgeCases(t *testing.T) {
 	cases := []struct {
-		name   string
-		file   string
+		name     string
+		file     string
 		wantExif bool
 	}{
 		{"exif-chunk", "png/exiv2/1343_exif.png", true},

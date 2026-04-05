@@ -119,11 +119,11 @@ func writePassThrough(w io.Writer, data []byte) error {
 
 // injectComponents holds the output sections produced by buildInjectComponents.
 type injectComponents struct {
-	outputPrefix  []byte
-	finalMetaBox  []byte
-	suffix        []byte
-	updatedItems  []ilocFullItem
-	pendingByID   map[uint16][]byte
+	outputPrefix []byte
+	finalMetaBox []byte
+	suffix       []byte
+	updatedItems []ilocFullItem
+	pendingByID  map[uint16][]byte
 }
 
 // buildInjectComponents parses the existing meta box, maps pending items, computes
@@ -257,9 +257,11 @@ func parseHEIFBoxHeader(data []byte, pos int) (size uint64, typ string, headerLe
 		headerLen = 16
 	}
 	if size == 0 {
-		size = uint64(len(data)) - uint64(pos)
+		// len(data)-pos is non-negative: guarded by pos+8 ≤ len(data) check above.
+		size = uint64(len(data) - pos) //nolint:gosec // G115: len(data)-pos is non-negative (guarded above)
 	}
-	if uint64(pos)+size > uint64(len(data)) {
+	// Bounds check without casting pos: size must not exceed remaining bytes.
+	if size > uint64(len(data)-pos) { //nolint:gosec // G115: len(data)-pos is non-negative (guarded above)
 		return 0, "", 0, false
 	}
 	return size, typ, headerLen, true

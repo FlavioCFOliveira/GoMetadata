@@ -24,9 +24,9 @@ func buildAOCMakerNote() []byte {
 
 	// Entry: TagPentaxVersion (0x0000), type UNDEFINED (7), count 4, inline "0100".
 	binary.BigEndian.PutUint16(buf[8:10], TagPentaxVersion)
-	binary.BigEndian.PutUint16(buf[10:12], 7)  // UNDEFINED
-	binary.BigEndian.PutUint32(buf[12:16], 4)  // count
-	copy(buf[16:20], "0100")                   // inline value
+	binary.BigEndian.PutUint16(buf[10:12], 7) // UNDEFINED
+	binary.BigEndian.PutUint32(buf[12:16], 4) // count
+	copy(buf[16:20], "0100")                  // inline value
 
 	return buf
 }

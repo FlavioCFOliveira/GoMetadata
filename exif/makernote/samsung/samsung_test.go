@@ -24,7 +24,7 @@ func buildSamsungMakerNote(tags []struct {
 	}
 	buf := make([]byte, 2+n*12+outSize)
 	binary.LittleEndian.PutUint16(buf[0:], uint16(n)) //nolint:gosec // G115: test helper, intentional type cast
-	valueOff := uint32(2 + n*12)                       //nolint:gosec // G115: test helper, intentional type cast
+	valueOff := uint32(2 + n*12)                      //nolint:gosec // G115: test helper, intentional type cast
 	for i, t := range tags {
 		pos := 2 + i*12
 		binary.LittleEndian.PutUint16(buf[pos:], t.id)
@@ -53,7 +53,7 @@ func TestSamsungParserBasic(t *testing.T) {
 		typ uint16
 		val []byte
 	}{
-		{TagMeteringMode, 3, []byte{0x02, 0x00}},      // SHORT = 2
+		{TagMeteringMode, 3, []byte{0x02, 0x00}},                 // SHORT = 2
 		{TagColorTemperature, 4, []byte{0xD8, 0x13, 0x00, 0x00}}, // LONG = 5080
 	})
 

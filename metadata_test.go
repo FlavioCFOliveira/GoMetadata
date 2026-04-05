@@ -25,8 +25,8 @@ func newTestMetadata(t *testing.T) *Metadata {
 	// 1 entry
 	buf[8], buf[9] = 0x01, 0x00
 	// entry: tag=0x0100 (ImageWidth), type=4 (Long), count=1, value=1
-	buf[10], buf[11] = 0x00, 0x01 // tag LE
-	buf[12], buf[13] = 0x04, 0x00 // type LE
+	buf[10], buf[11] = 0x00, 0x01                               // tag LE
+	buf[12], buf[13] = 0x04, 0x00                               // type LE
 	buf[14], buf[15], buf[16], buf[17] = 0x01, 0x00, 0x00, 0x00 // count LE
 	buf[18], buf[19], buf[20], buf[21] = 0x01, 0x00, 0x00, 0x00 // value LE
 	// next IFD offset = 0

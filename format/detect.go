@@ -217,8 +217,10 @@ func findMakeTagInIFD(data []byte, order binary.ByteOrder, count, pos int) (make
 				break
 			}
 			if total <= 4 {
-				end := uint64(e+8) + total
-				if end > uint64(len(data)) {
+				// e+8 is non-negative: loop guard ensures e+12 ≤ len(data).
+				// total ≤ 4 here, so (e+8)+int(total) cannot overflow int.
+				end := e + 8 + int(total)
+				if end > len(data) {
 					break
 				}
 				makeRaw = data[e+8 : end]
