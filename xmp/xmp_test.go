@@ -61,7 +61,7 @@ func TestParseMultiValue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	v := x.get(NSdc, "subject")
+	v := x.getProp(NSdc, "subject")
 	parts := strings.Split(v, "\x1e")
 	if len(parts) != 3 {
 		t.Errorf("expected 3 subject values, got %d: %v", len(parts), parts)
@@ -186,10 +186,10 @@ func TestRDFDepthLimit(t *testing.T) {
 	var sb strings.Builder
 	sb.WriteString(`<?xpacket begin="" uid="abc"?>`)
 	sb.WriteString(`<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">`)
-	for i := 0; i < 110; i++ {
+	for range 110 {
 		sb.WriteString(`<a>`)
 	}
-	for i := 0; i < 110; i++ {
+	for range 110 {
 		sb.WriteString(`</a>`)
 	}
 	sb.WriteString(`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`)
@@ -384,7 +384,7 @@ func BenchmarkXMPParse(b *testing.B) {
 	data := []byte(simpleXMP)
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_, _ = Parse(data)
 	}
 }
@@ -400,7 +400,7 @@ func BenchmarkXMPEncode(b *testing.B) {
 	x.AddKeyword("performance")
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_, _ = Encode(x)
 	}
 }
@@ -501,7 +501,7 @@ func BenchmarkXMPParse_RealWorld(b *testing.B) {
 	b.SetBytes(int64(len(pkt)))
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_, _ = Parse(pkt)
 	}
 }

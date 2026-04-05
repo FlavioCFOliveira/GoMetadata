@@ -40,8 +40,8 @@ func writeChunkTo(buf *bytes.Buffer, chunkType string, data []byte) {
 	buf.WriteString(chunkType)
 	buf.Write(data)
 	h := crc32.NewIEEE()
-	_, _ = h.Write([]byte(chunkType)) //nolint:gosec // G104: hash.Hash.Write never returns an error
-	_, _ = h.Write(data)              //nolint:gosec // G104: hash.Hash.Write never returns an error
+	_, _ = h.Write([]byte(chunkType))
+	_, _ = h.Write(data)
 	binary.BigEndian.PutUint32(lbuf[:], h.Sum32())
 	buf.Write(lbuf[:])
 }
@@ -142,8 +142,8 @@ func TestInjectCRCCorrect(t *testing.T) {
 		storedCRC := binary.BigEndian.Uint32(result[dataEnd:])
 
 		h := crc32.NewIEEE()
-		_, _ = h.Write([]byte(chunkType)) //nolint:gosec // G104: hash.Hash.Write never returns an error
-		_, _ = h.Write(data)              //nolint:gosec // G104: hash.Hash.Write never returns an error
+		_, _ = h.Write([]byte(chunkType))
+		_, _ = h.Write(data)
 		computed := h.Sum32()
 
 		if storedCRC != computed {
@@ -363,7 +363,7 @@ func BenchmarkPNGExtract(b *testing.B) {
 	png := buildPNG(exifData, xmpData)
 	b.SetBytes(int64(len(png)))
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_, _, _, _ = Extract(bytes.NewReader(png))
 	}
 }
@@ -400,7 +400,7 @@ func BenchmarkPNGExtractCompressedXMP(b *testing.B) {
 	pngBytes := buf.Bytes()
 	b.SetBytes(int64(len(pngBytes)))
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_, _, _, _ = Extract(bytes.NewReader(pngBytes))
 	}
 }

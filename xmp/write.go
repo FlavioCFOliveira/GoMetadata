@@ -28,11 +28,11 @@ var encBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}        
 var nsListPool = sync.Pool{New: func() any { s := make([]string, 0, 8); return &s }}     //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
 var localListPool = sync.Pool{New: func() any { s := make([]string, 0, 16); return &s }} //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
 
-// encode serialises x to a padded XMP packet.
+// serialise encodes x to a padded XMP packet.
 // The packet uses UTF-8 encoding and a read/write <?xpacket?> wrapper
 // with 2 KB of whitespace padding per XMP §7.3 (in-place editing support).
-func encode(x *XMP) ([]byte, error) {
-	buf := encBufPool.Get().(*bytes.Buffer) //nolint:forcetypeassert // encBufPool.New always stores *bytes.Buffer; pool invariant
+func serialise(x *XMP) ([]byte, error) {
+	buf := encBufPool.Get().(*bytes.Buffer) //nolint:forcetypeassert,revive // encBufPool.New always stores *bytes.Buffer; pool invariant
 	buf.Reset()
 
 	// Estimate output size: fixed wrapper (~250 B) + 2 KB padding + ~100 B per property.
@@ -48,7 +48,7 @@ func encode(x *XMP) ([]byte, error) {
 	buf.WriteString(" <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n")
 
 	// Sort namespace URIs for deterministic output (ISO 16684-1 §7.4).
-	nsListPtr := nsListPool.Get().(*[]string) //nolint:forcetypeassert // nsListPool.New always stores *[]string; pool invariant
+	nsListPtr := nsListPool.Get().(*[]string) //nolint:forcetypeassert,revive // nsListPool.New always stores *[]string; pool invariant
 	nsList := (*nsListPtr)[:0]
 	for ns, props := range x.Properties {
 		if len(props) > 0 {
@@ -71,7 +71,7 @@ func encode(x *XMP) ([]byte, error) {
 		buf.WriteString("\">\n")
 
 		// Sort property names for deterministic output.
-		localListPtr := localListPool.Get().(*[]string) //nolint:forcetypeassert // localListPool.New always stores *[]string; pool invariant
+		localListPtr := localListPool.Get().(*[]string) //nolint:forcetypeassert,revive // localListPool.New always stores *[]string; pool invariant
 		localList := (*localListPtr)[:0]
 		for local := range props {
 			localList = append(localList, local)
@@ -171,7 +171,7 @@ func writeMultiValuedProperty(buf *bytes.Buffer, prefix, ns, local, val string) 
 // entities plus the CR character (XML 1.0 §2.2 and §4.6).
 func writeXMLEscaped(buf *bytes.Buffer, s string) {
 	last := 0
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		var esc string
 		switch s[i] {
 		case '&':

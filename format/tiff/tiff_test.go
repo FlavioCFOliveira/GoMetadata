@@ -207,7 +207,7 @@ func BenchmarkTIFFExtract(b *testing.B) {
 	data := buildMinimalTIFF(binary.LittleEndian, iptc, xmp)
 	b.SetBytes(int64(len(data)))
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_, _, _, _ = Extract(bytes.NewReader(data))
 	}
 }

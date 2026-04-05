@@ -54,7 +54,7 @@ func decodeDatasetLength(b []byte, pos int) (length, newPos int, ok bool) {
 		if nBytes < 1 || nBytes > 4 || newPos+nBytes > len(b) {
 			return 0, pos, false
 		}
-		for j := 0; j < nBytes; j++ {
+		for j := range nBytes {
 			length = length<<8 | int(b[newPos+j])
 		}
 		newPos += nBytes
@@ -145,7 +145,7 @@ var encBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }} //nolin
 
 // Encode serialises i back to an IPTC IIM byte stream.
 func Encode(i *IPTC) ([]byte, error) {
-	buf := encBufPool.Get().(*bytes.Buffer) //nolint:forcetypeassert // encBufPool.New always stores *bytes.Buffer; pool invariant
+	buf := encBufPool.Get().(*bytes.Buffer) //nolint:forcetypeassert,revive // encBufPool.New always stores *bytes.Buffer; pool invariant
 	buf.Reset()
 
 	// Re-emit the coded character set declaration (IIM §1.5.1) when the
@@ -171,13 +171,13 @@ func Encode(i *IPTC) ([]byte, error) {
 				// followed by the 4-byte big-endian length value.
 				buf.WriteByte(0x80)          // bit 15 set; upper 7 bits of count = 0
 				buf.WriteByte(0x04)          // lower 8 bits of count = 4
-				buf.WriteByte(byte(n >> 24)) //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding
-				buf.WriteByte(byte(n >> 16)) //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding
-				buf.WriteByte(byte(n >> 8))  //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding
-				buf.WriteByte(byte(n))       //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding
+				buf.WriteByte(byte(n >> 24)) //nolint:gosec // G115: intentional byte extraction per IPTC IIM §1.6.2 extended length encoding
+				buf.WriteByte(byte(n >> 16)) //nolint:gosec // G115: intentional byte extraction per IPTC IIM §1.6.2 extended length encoding
+				buf.WriteByte(byte(n >> 8))  //nolint:gosec // G115: intentional byte extraction per IPTC IIM §1.6.2 extended length encoding
+				buf.WriteByte(byte(n))       //nolint:gosec // G115: intentional byte extraction per IPTC IIM §1.6.2 extended length encoding
 			} else {
-				buf.WriteByte(byte(n >> 8)) //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding
-				buf.WriteByte(byte(n))      //nolint:gosec // G115: byte extraction from int, intentional per IPTC IIM encoding
+				buf.WriteByte(byte(n >> 8)) // intentional byte extraction per IPTC IIM §1.6.2 standard length encoding
+				buf.WriteByte(byte(n))      //nolint:gosec // G115: intentional byte extraction per IPTC IIM §1.6.2 standard length encoding
 			}
 			buf.Write(ds.Value)
 		}

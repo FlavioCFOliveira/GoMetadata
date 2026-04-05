@@ -75,11 +75,11 @@ func parseByteOrder(b []byte) (binary.ByteOrder, error) {
 func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseConfig) (exifIFD *IFD, makerNote []byte, makerNoteIFD *IFD, interopIFD *IFD) {
 	ptr := ifd0.Get(TagExifIFDPointer)
 	if ptr == nil || len(ptr.Value) < 4 {
-		return
+		return nil, nil, nil, nil
 	}
 	sub, err := traverse(b, order.Uint32(ptr.Value), order)
 	if err != nil {
-		return
+		return nil, nil, nil, nil
 	}
 	exifIFD = sub
 
@@ -100,7 +100,7 @@ func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseCon
 			interopIFD = isub
 		}
 	}
-	return
+	return exifIFD, makerNote, makerNoteIFD, interopIFD
 }
 
 // parseGPSSubIFD traverses the GPS IFD rooted at the TagGPSIFDPointer entry
@@ -149,7 +149,7 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) {
 	}
 
 	// Offset to IFD0 (TIFF §2).
-	ifd0Off := order.Uint32(b[4:]) //nolint:gosec // G602: len(b) >= 8 is asserted earlier in this function; false positive
+	ifd0Off := order.Uint32(b[4:])
 
 	e := &EXIF{ByteOrder: order}
 
@@ -167,7 +167,7 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) {
 
 // Encode serialises e back to a raw EXIF byte stream (TIFF header + IFDs).
 func Encode(e *EXIF) ([]byte, error) {
-	return encode(e)
+	return serialise(e)
 }
 
 // CameraModel returns the value of IFD0 tag 0x0110 (Model, EXIF §4.6.4 Table 3).
@@ -530,7 +530,7 @@ func (e *EXIF) SetISO(iso uint) {
 	if iso > 65535 {
 		iso = 65535
 	}
-	order.PutUint16(b[:], uint16(iso)) //nolint:gosec // G115: clamped to uint16 range above
+	order.PutUint16(b[:], uint16(iso))
 	e.ExifIFD.set(TagISOSpeedRatings, TypeShort, 1, b[:])
 }
 
@@ -604,8 +604,8 @@ func (e *EXIF) SetGPS(lat, lon float64) {
 
 		deg := math.Floor(coord)
 		rem := (coord - deg) * 60
-		min := math.Floor(rem)
-		sec := (rem - min) * 60
+		mins := math.Floor(rem)
+		sec := (rem - mins) * 60
 
 		// Scale seconds to integer numerator with denominator 1,000,000.
 		const secDenom = uint32(1_000_000)
@@ -614,7 +614,7 @@ func (e *EXIF) SetGPS(lat, lon float64) {
 		b := make([]byte, 24) // 3 rationals × 8 bytes
 		order.PutUint32(b[0:], uint32(deg))
 		order.PutUint32(b[4:], 1)
-		order.PutUint32(b[8:], uint32(min))
+		order.PutUint32(b[8:], uint32(mins))
 		order.PutUint32(b[12:], 1)
 		order.PutUint32(b[16:], secNum)
 		order.PutUint32(b[20:], secDenom)

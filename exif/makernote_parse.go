@@ -6,7 +6,7 @@ import "encoding/binary"
 // Each value is a function that takes the raw MakerNote bytes and the parent
 // byte order and returns the parsed IFD, or nil on failure.
 //
-//nolint:gochecknoglobals
+//nolint:gochecknoglobals // dispatch table: package-level read-only map populated at init and never mutated
 var makerNoteParsers = map[string]func([]byte, binary.ByteOrder) *IFD{
 	"Canon":                   parseCanonMakerNote,
 	"NIKON CORPORATION":       func(b []byte, _ binary.ByteOrder) *IFD { return parseNikonMakerNote(b) },
@@ -51,8 +51,8 @@ var makerNoteParsers = map[string]func([]byte, binary.ByteOrder) *IFD{
 //   - Samsung: plain IFD at offset 0, parent byte order
 //   - Sigma: "SIGMA\0\0\0" or "FOVEON\0\0" prefix, LE IFD at offset 10
 //   - Casio: plain IFD at offset 0, parent byte order
-func parseMakerNoteIFD(b []byte, make string, parentOrder binary.ByteOrder) *IFD {
-	if fn, ok := makerNoteParsers[make]; ok {
+func parseMakerNoteIFD(b []byte, cameraMake string, parentOrder binary.ByteOrder) *IFD {
+	if fn, ok := makerNoteParsers[cameraMake]; ok {
 		return fn(b, parentOrder)
 	}
 	return nil

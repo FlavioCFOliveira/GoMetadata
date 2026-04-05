@@ -778,7 +778,7 @@ func BenchmarkJPEGExtract(b *testing.B) {
 	jpeg := buildJPEG(tiffData, iptcData, nil)
 	b.SetBytes(int64(len(jpeg)))
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_, _, _, _ = Extract(bytes.NewReader(jpeg))
 	}
 }
@@ -790,7 +790,7 @@ func BenchmarkJPEGInject(b *testing.B) {
 	newIPTC := []byte{0x1C, 0x02, 0x78, 0x00, 0x03, 'N', 'e', 'w'}
 	b.SetBytes(int64(len(jpeg)))
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		var out bytes.Buffer
 		_ = Inject(bytes.NewReader(jpeg), &out, tiffData, newIPTC, nil)
 	}
@@ -804,7 +804,7 @@ func BenchmarkJPEGExtract_Real(b *testing.B) {
 	b.SetBytes(int64(len(data)))
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		r := bytes.NewReader(data)
 		_, _, _, _ = Extract(r)
 	}

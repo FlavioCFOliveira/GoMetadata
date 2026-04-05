@@ -1,5 +1,7 @@
 package exif
 
+import "maps"
+
 // TagID is a TIFF/EXIF tag number (EXIF §4.6, TIFF §8).
 type TagID uint16
 
@@ -155,7 +157,7 @@ func init() {
 	tagRegistry = make(map[TagID]tagInfo, 256)
 
 	// IFD0 / TIFF baseline tags (TIFF 6.0 §8).
-	for tag, info := range map[TagID]tagInfo{
+	maps.Copy(tagRegistry, map[TagID]tagInfo{
 		TagImageWidth:        {"ImageWidth", TypeShort, 1},
 		TagImageLength:       {"ImageLength", TypeShort, 1},
 		TagBitsPerSample:     {"BitsPerSample", TypeShort, 0},
@@ -216,20 +218,16 @@ func init() {
 		TagYCbCrSubSampling:            {"YCbCrSubSampling", TypeShort, 2},
 		TagYCbCrPositioning:            {"YCbCrPositioning", TypeShort, 1},
 		TagReferenceBlackWhite:         {"ReferenceBlackWhite", TypeRational, 6},
-	} {
-		tagRegistry[tag] = info
-	}
+	})
 
 	// InteropIFD tags (EXIF §4.6.7, Annex A).
-	for tag, info := range map[TagID]tagInfo{
+	maps.Copy(tagRegistry, map[TagID]tagInfo{
 		TagInteroperabilityIndex:   {"InteroperabilityIndex", TypeASCII, 0},
 		TagInteroperabilityVersion: {"InteroperabilityVersion", TypeUndefined, 4},
-	} {
-		tagRegistry[tag] = info
-	}
+	})
 
 	// EXIF IFD tags (EXIF §4.6.5 Table 4).
-	for tag, info := range map[TagID]tagInfo{
+	maps.Copy(tagRegistry, map[TagID]tagInfo{
 		TagExposureTime:             {"ExposureTime", TypeRational, 1},
 		TagFNumber:                  {"FNumber", TypeRational, 1},
 		TagExposureProgram:          {"ExposureProgram", TypeShort, 1},
@@ -283,12 +281,10 @@ func init() {
 		TagLensModel:                {"LensModel", TypeASCII, 0},
 		TagLensSerialNumber:         {"LensSerialNumber", TypeASCII, 0},
 		TagMakerNote:                {"MakerNote", TypeUndefined, 0},
-	} {
-		tagRegistry[tag] = info
-	}
+	})
 
 	// GPS IFD tags (EXIF §4.6.6 Table 15, all 32 entries).
-	for tag, info := range map[TagID]tagInfo{
+	maps.Copy(tagRegistry, map[TagID]tagInfo{
 		TagGPSVersionID:         {"GPSVersionID", TypeByte, 4},
 		TagGPSLatitudeRef:       {"GPSLatitudeRef", TypeASCII, 2},
 		TagGPSLatitude:          {"GPSLatitude", TypeRational, 3},
@@ -321,16 +317,12 @@ func init() {
 		TagGPSDateStamp:         {"GPSDateStamp", TypeASCII, 11},
 		TagGPSDifferential:      {"GPSDifferential", TypeShort, 1},
 		TagGPSHPositioningError: {"GPSHPositioningError", TypeRational, 1},
-	} {
-		tagRegistry[tag] = info
-	}
+	})
 
 	// Additional EXIF 2.3+ tags not in the main EXIF IFD block above
 	// (CIPA DC-008-2023 §4.6.5).
-	for tag, info := range map[TagID]tagInfo{
+	maps.Copy(tagRegistry, map[TagID]tagInfo{
 		TagStandardOutputSensitivity: {"StandardOutputSensitivity", TypeLong, 1},
 		TagDeviceSettingDescription:  {"DeviceSettingDescription", TypeUndefined, 0},
-	} {
-		tagRegistry[tag] = info
-	}
+	})
 }

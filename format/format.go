@@ -31,7 +31,7 @@ const (
 
 // formatNames maps FormatID iota values to their human-readable names.
 // Array indices must stay in sync with the iota block above.
-var formatNames = [...]string{ //nolint:gochecknoglobals
+var formatNames = [...]string{ //nolint:gochecknoglobals // read-only lookup table indexed by FormatID iota; never mutated
 	FormatUnknown: "Unknown",
 	FormatJPEG:    "JPEG",
 	FormatTIFF:    "TIFF",

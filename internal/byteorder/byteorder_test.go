@@ -178,7 +178,7 @@ func BenchmarkUint16LE(b *testing.B) {
 	buf := []byte{0x34, 0x12}
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_ = Uint16LE(buf, 0)
 	}
 }
@@ -188,7 +188,7 @@ func BenchmarkUint32LE(b *testing.B) {
 	buf := []byte{0x78, 0x56, 0x34, 0x12}
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_ = Uint32LE(buf, 0)
 	}
 }

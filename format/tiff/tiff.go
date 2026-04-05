@@ -148,7 +148,7 @@ func extractTagValues(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawI
 	count := int(order.Uint16(data[ifd0Off:]))
 	pos := int(ifd0Off) + 2
 
-	for i := 0; i < count; i++ {
+	for i := 0; i < count; i++ { //nolint:intrange,modernize // binary parser: loop variable is a byte-slice offset multiplier
 		e := pos + i*12
 		if e+12 > len(data) {
 			break

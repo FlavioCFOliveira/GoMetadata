@@ -111,8 +111,8 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	copy(riffHdr[:4], "RIFF")
 	binary.LittleEndian.PutUint32(riffHdr[4:], uint32(totalSize)) //nolint:gosec // G115: RIFF size bounded by body size
 	copy(riffHdr[8:], "WEBP")
-	if _, err := w.Write(riffHdr); err != nil {
-		return fmt.Errorf("webp: write header: %w", err)
+	if _, writeErr := w.Write(riffHdr); writeErr != nil {
+		return fmt.Errorf("webp: write header: %w", writeErr)
 	}
 	_, err = w.Write(body.Bytes())
 	if err != nil {
@@ -169,12 +169,9 @@ func collectOriginalChunks(original []byte) (chunks []struct {
 		id := string(original[pos : pos+4])
 		size := int(binary.LittleEndian.Uint32(original[pos+4:]))
 		dataStart := pos + 8
-		dataEnd := dataStart + size
-		if dataEnd > len(original) {
-			// Chunk size exceeds available bytes (truncated or RIFF size mismatch).
-			// Clamp to available data so subsequent chunks are not silently dropped.
-			dataEnd = len(original)
-		}
+		// Clamp to available data so subsequent chunks are not silently dropped
+		// when chunk size exceeds remaining bytes (truncated or RIFF size mismatch).
+		dataEnd := min(dataStart+size, len(original))
 		switch id {
 		case "VP8X":
 			// Capture original VP8X payload so canvas dimensions can be preserved.

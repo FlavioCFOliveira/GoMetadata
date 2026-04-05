@@ -90,8 +90,8 @@ func rtPNGWriteChunk(buf *bytes.Buffer, chunkType string, data []byte) {
 	buf.WriteString(chunkType)
 	buf.Write(data)
 	h := crc32.NewIEEE()
-	_, _ = h.Write([]byte(chunkType)) //nolint:gosec // G104: hash.Hash.Write never returns an error
-	_, _ = h.Write(data)              //nolint:gosec // G104: hash.Hash.Write never returns an error
+	_, _ = h.Write([]byte(chunkType))
+	_, _ = h.Write(data)
 	binary.BigEndian.PutUint32(hdr[:], h.Sum32())
 	buf.Write(hdr[:])
 }
@@ -438,6 +438,7 @@ func TestRoundTripTableDriven(t *testing.T) {
 				m.IPTC.SetCaption("table-caption")
 			},
 			assert: func(t *testing.T, m *gometadata.Metadata) {
+				t.Helper()
 				if got := m.Caption(); got != "table-caption" {
 					t.Errorf("Caption: got %q, want %q", got, "table-caption")
 				}
@@ -451,6 +452,7 @@ func TestRoundTripTableDriven(t *testing.T) {
 				m.IPTC.SetCopyright("(c) 2024")
 			},
 			assert: func(t *testing.T, m *gometadata.Metadata) {
+				t.Helper()
 				if got := m.Copyright(); got != "(c) 2024" {
 					t.Errorf("Copyright: got %q, want %q", got, "(c) 2024")
 				}
@@ -465,6 +467,7 @@ func TestRoundTripTableDriven(t *testing.T) {
 				m.IPTC.AddKeyword("beta")
 			},
 			assert: func(t *testing.T, m *gometadata.Metadata) {
+				t.Helper()
 				kws := m.Keywords()
 				if len(kws) != 2 || kws[0] != "alpha" || kws[1] != "beta" {
 					t.Errorf("Keywords: got %v, want [alpha beta]", kws)
@@ -479,6 +482,7 @@ func TestRoundTripTableDriven(t *testing.T) {
 				m.XMP.SetCaption("xmp-caption")
 			},
 			assert: func(t *testing.T, m *gometadata.Metadata) {
+				t.Helper()
 				if got := m.Caption(); got != "xmp-caption" {
 					t.Errorf("Caption: got %q, want %q", got, "xmp-caption")
 				}
@@ -492,6 +496,7 @@ func TestRoundTripTableDriven(t *testing.T) {
 				m.XMP.AddKeyword("kw")
 			},
 			assert: func(t *testing.T, m *gometadata.Metadata) {
+				t.Helper()
 				kws := m.Keywords()
 				if len(kws) != 1 || kws[0] != "kw" {
 					t.Errorf("Keywords: got %v, want [kw]", kws)
@@ -507,6 +512,7 @@ func TestRoundTripTableDriven(t *testing.T) {
 				m.XMP.SetCaption("png-xmp-caption")
 			},
 			assert: func(t *testing.T, m *gometadata.Metadata) {
+				t.Helper()
 				if got := m.Caption(); got != "png-xmp-caption" {
 					t.Errorf("Caption: got %q, want %q", got, "png-xmp-caption")
 				}
@@ -521,6 +527,7 @@ func TestRoundTripTableDriven(t *testing.T) {
 				m.XMP.SetCopyright("(c) webp")
 			},
 			assert: func(t *testing.T, m *gometadata.Metadata) {
+				t.Helper()
 				if got := m.Copyright(); got != "(c) webp" {
 					t.Errorf("Copyright: got %q, want %q", got, "(c) webp")
 				}

@@ -85,10 +85,10 @@ func (m *Metadata) CameraModel() string {
 // GPS returns the GPS coordinates in decimal degrees (WGS-84).
 // ok is false when no GPS data is present.
 // Source priority: EXIF > XMP.
-func (m *Metadata) GPS() (lat, lon float64, ok bool) {
+func (m *Metadata) GPS() (float64, float64, bool) {
 	if m.EXIF != nil {
-		if lat, lon, ok = m.EXIF.GPS(); ok {
-			return
+		if lat, lon, ok := m.EXIF.GPS(); ok {
+			return lat, lon, true
 		}
 	}
 	if m.XMP != nil {

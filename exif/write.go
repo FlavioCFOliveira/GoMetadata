@@ -5,7 +5,7 @@ import (
 	"errors"
 )
 
-// encode serialises e to a raw EXIF byte stream beginning with the TIFF
+// serialise encodes e to a raw EXIF byte stream beginning with the TIFF
 // header. The caller is responsible for prepending the "Exif\x00\x00"
 // identifier required by JPEG APP1 (EXIF §4.5.4).
 //
@@ -22,7 +22,7 @@ import (
 //     an inherent constraint: without knowing the type size we cannot locate or
 //     copy the pointed-to data. Callers that embed private data using unknown
 //     type codes must re-inject that data after calling Encode.
-func encode(e *EXIF) ([]byte, error) {
+func serialise(e *EXIF) ([]byte, error) {
 	if e == nil {
 		return nil, errors.New("exif: cannot encode nil EXIF")
 	}

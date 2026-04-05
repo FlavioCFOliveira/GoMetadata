@@ -114,7 +114,7 @@ func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint
 	}
 
 	ifd := &IFD{Entries: make([]IFDEntry, 0, count)}
-	for i := 0; i < int(count); i++ {
+	for i := 0; i < int(count); i++ { //nolint:intrange // binary parser: loop variable is a byte-slice offset multiplier
 		entry, ok := parseIFDEntry(b, pos+i*12, order)
 		if !ok {
 			continue
@@ -149,7 +149,7 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, error) {
 
 	// visited tracks offsets we have already started parsing to detect cycles.
 	// Obtained from visitedPool to avoid a per-call allocation on the hot path.
-	visited := visitedPool.Get().(map[uint32]bool) //nolint:forcetypeassert // visitedPool.New always stores map[uint32]bool; pool invariant
+	visited := visitedPool.Get().(map[uint32]bool) //nolint:forcetypeassert,revive // visitedPool.New always stores map[uint32]bool; pool invariant
 	defer func() {
 		for k := range visited {
 			delete(visited, k)
@@ -368,14 +368,7 @@ func filterEntries(ifd *IFD, exclude ...TagID) []IFDEntry {
 	}
 	result := make([]IFDEntry, 0, len(ifd.Entries))
 	for _, entry := range ifd.Entries {
-		excluded := false
-		for _, t := range exclude {
-			if entry.Tag == t {
-				excluded = true
-				break
-			}
-		}
-		if !excluded {
+		if !slices.Contains(exclude, entry.Tag) {
 			result = append(result, entry)
 		}
 	}

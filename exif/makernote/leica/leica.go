@@ -60,7 +60,7 @@ func parseIFDAt(b []byte, offset int, order binary.ByteOrder) map[uint16][]byte 
 		return nil
 	}
 	result := make(map[uint16][]byte, count)
-	for i := 0; i < count; i++ {
+	for i := 0; i < count; i++ { //nolint:intrange,modernize // binary parser: loop variable is a byte-slice offset multiplier
 		tag, value, ok := parseLeicaIFDEntry(b, offset+2+i*12, order)
 		if !ok {
 			continue

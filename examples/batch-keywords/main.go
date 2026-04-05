@@ -19,6 +19,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	gometadata "github.com/FlavioCFOliveira/GoMetadata"
@@ -82,11 +83,9 @@ func main() {
 
 		// Check whether the keyword is already present to avoid duplicates.
 		existing := m.Keywords()
-		for _, kw := range existing {
-			if kw == keyword {
-				fmt.Printf("already has keyword: %s\n", path)
-				return nil
-			}
+		if slices.Contains(existing, keyword) {
+			fmt.Printf("already has keyword: %s\n", path)
+			return nil
 		}
 
 		existing = append(existing, keyword)

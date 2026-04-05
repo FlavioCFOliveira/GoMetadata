@@ -125,7 +125,7 @@ func parseRawIFD(b []byte, bigEndian bool) map[uint16][]byte {
 		return nil
 	}
 	result := make(map[uint16][]byte, count)
-	for i := 0; i < count; i++ {
+	for i := 0; i < count; i++ { //nolint:intrange,modernize // binary parser: loop variable is a byte-slice offset multiplier
 		tag, value, ok := parseSonyIFDEntry(b, 2+i*12, bigEndian)
 		if !ok {
 			continue

@@ -83,10 +83,10 @@ func TestGetPutRace(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
 
-	for g := 0; g < goroutines; g++ {
+	for range goroutines {
 		go func() {
 			defer wg.Done()
-			for i := 0; i < iterations; i++ {
+			for i := range iterations {
 				size := (i % 4) * 1024 // 0, 1024, 2048, 3072
 				p := Get(size)
 				if p == nil {
@@ -109,7 +109,7 @@ func TestGetPutRace(t *testing.T) {
 func BenchmarkGetPut(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		p := Get(defaultSize)
 		Put(p)
 	}
@@ -120,7 +120,7 @@ func BenchmarkGetPut(b *testing.B) {
 func BenchmarkGetLarge(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		p := Get(65536)
 		Put(p)
 	}

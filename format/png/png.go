@@ -38,7 +38,7 @@ func zlibDecompress(data []byte) ([]byte, error) {
 	r := bytes.NewReader(data)
 	var zr io.ReadCloser
 	if v := zlibPool.Get(); v != nil {
-		zr = v.(io.ReadCloser)                                   //nolint:forcetypeassert // zlibPool.New always stores io.ReadCloser; pool invariant
+		zr = v.(io.ReadCloser)                                   //nolint:forcetypeassert,revive // zlibPool.New always stores io.ReadCloser; pool invariant
 		if err := zr.(zlib.Resetter).Reset(r, nil); err != nil { //nolint:forcetypeassert // zlib.NewReader always implements zlib.Resetter; Go stdlib guarantee
 			return nil, fmt.Errorf("png: zlib reset: %w", err)
 		}
@@ -168,12 +168,12 @@ func shouldDropChunk(chunkType string, data []byte) bool {
 // immediately writes the new metadata chunks. It returns (done=true) when
 // chunkType is "IEND". This helper extracts the per-chunk logic from Inject,
 // reducing that function's cyclomatic complexity.
-func writeInjectChunk(w io.Writer, chunkType string, data, rawEXIF, rawXMP []byte) (done bool, err error) {
-	if err = writeChunk(w, chunkType, data); err != nil {
+func writeInjectChunk(w io.Writer, chunkType string, data, rawEXIF, rawXMP []byte) (bool, error) {
+	if err := writeChunk(w, chunkType, data); err != nil {
 		return false, err
 	}
 	if chunkType == "IHDR" {
-		if err = writeMetadataAfterIHDR(w, rawEXIF, rawXMP); err != nil {
+		if err := writeMetadataAfterIHDR(w, rawEXIF, rawXMP); err != nil {
 			return false, err
 		}
 	}
@@ -279,8 +279,8 @@ func writeChunk(w io.Writer, chunkType string, data []byte) error {
 	}
 	// CRC covers chunk type + chunk data (PNG §5.4).
 	h := crc32.NewIEEE()
-	_, _ = h.Write([]byte(chunkType)) //nolint:gosec // G104: hash.Hash.Write never returns an error
-	_, _ = h.Write(data)              //nolint:gosec // G104: hash.Hash.Write never returns an error
+	_, _ = h.Write([]byte(chunkType))
+	_, _ = h.Write(data)
 	var crcB [4]byte
 	binary.BigEndian.PutUint32(crcB[:], h.Sum32())
 	if _, err := w.Write(crcB[:]); err != nil {
@@ -343,14 +343,13 @@ func extractXMPFromITXt(data []byte) ([]byte, error) {
 // extractXMPFromTExt extracts XMP from a tEXt chunk if its keyword is
 // "XML:com.adobe.xmp" (legacy uncompressed form, RFC 2083 §12.13).
 func extractXMPFromTExt(data []byte) []byte {
-	null := bytes.IndexByte(data, 0x00)
-	if null < 0 {
+	keyword, text, found := bytes.Cut(data, []byte{0x00})
+	if !found {
 		return nil
 	}
-	if string(data[:null]) != xmpKeyword {
+	if string(keyword) != xmpKeyword {
 		return nil
 	}
-	text := data[null+1:]
 	if len(text) == 0 {
 		return nil
 	}

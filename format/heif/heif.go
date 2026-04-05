@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 )
@@ -294,7 +295,7 @@ func parseIlocFull(metaContent []byte) (ilocBoxInfo, bool) {
 	}
 	pos = newPos
 
-	for i := 0; i < itemCount; i++ {
+	for range itemCount {
 		item, updatedPos, itemOK := parseIlocFullItem(ilocData, pos, info)
 		if !itemOK {
 			break
@@ -322,7 +323,7 @@ func readIlocItemID(ilocData []byte, pos int, version uint8) (id uint16, newPos 
 	if rawID > math.MaxUint16 {
 		return 0, pos, false // item ID exceeds uint16 range; malformed iloc box
 	}
-	return uint16(rawID), pos + 4, true //nolint:gosec // G115: range guard above ensures no overflow
+	return uint16(rawID), pos + 4, true
 }
 
 // readIlocFullExtents reads extentCount extents from ilocData at pos using the
@@ -330,7 +331,7 @@ func readIlocItemID(ilocData []byte, pos int, version uint8) (id uint16, newPos 
 // whether all extents were read without truncation.
 // ISO 14496-12 §8.11.3.
 func readIlocFullExtents(ilocData []byte, pos, extentCount int, info ilocBoxInfo) (extents []ilocExtent, newPos int, ok bool) {
-	for j := 0; j < extentCount; j++ {
+	for range extentCount {
 		var ext ilocExtent
 		if info.indexSize > 0 {
 			if pos+info.indexSize > len(ilocData) {
@@ -405,13 +406,13 @@ func parseIlocFullItem(ilocData []byte, pos int, info ilocBoxInfo) (ilocFullItem
 // buildIlocBox serialises the iloc FullBox from info (field sizes) and the
 // given items (which may differ from info.items — e.g. with updated extents).
 func buildIlocBox(info ilocBoxInfo, items []ilocFullItem) []byte {
-	var body []byte
-	// FullBox: version(1) + flags(3)
-	body = append(body, info.version, 0, 0, 0)
-	// offset_size (high nibble) | length_size (low nibble)
-	body = append(body, byte(info.offsetSize<<4|info.lengthSize)) //nolint:gosec // G115: nibble-packed field, values are 0–8
-	// base_offset_size (high nibble) | index_size (low nibble)
-	body = append(body, byte(info.baseOffsetSize<<4|info.indexSize)) //nolint:gosec // G115: nibble-packed field, values are 0–8
+	// FullBox: version(1) + flags(3), then field-size nibble-pair bytes.
+	// G115: nibble-packed fields; values are 0–8 so byte cast is safe.
+	body := []byte{
+		info.version, 0, 0, 0,
+		byte(info.offsetSize<<4 | info.lengthSize),    //nolint:gosec // G115: nibble-packed field, values are 0–8
+		byte(info.baseOffsetSize<<4 | info.indexSize), //nolint:gosec // G115: nibble-packed field, values are 0–8
+	}
 
 	if info.version < 2 {
 		body = appendUintN(body, 2, uint64(len(items)))
@@ -579,17 +580,8 @@ func parseHEIFMetadata(data []byte) (rawEXIF, rawXMP []byte, err error) {
 // lowest ID is chosen for determinism.
 // ISO 23008-12 §6.2 (primary item selection).
 func selectBestItem(itemTypes map[uint16]string, primaryID uint16, targetTypes ...string) (bestID uint16, found bool) {
-	matchesTarget := func(typ string) bool {
-		for _, t := range targetTypes {
-			if typ == t {
-				return true
-			}
-		}
-		return false
-	}
-
 	for id, typ := range itemTypes {
-		if !matchesTarget(typ) {
+		if !slices.Contains(targetTypes, typ) {
 			continue
 		}
 		if !found || id == primaryID || (bestID != primaryID && id < bestID) {
@@ -832,7 +824,7 @@ func parseInfeV2V3(data []byte, pos int, version byte) (uint16, string) {
 		if rawID > math.MaxUint16 {
 			return 0, "" // item ID exceeds uint16 range; malformed infe box
 		}
-		id = uint16(rawID) //nolint:gosec // G115: range guard above ensures no overflow
+		id = uint16(rawID)
 		pos += 4
 	}
 	pos += 2 // item_protection_index
@@ -882,7 +874,7 @@ func parseIloc(metaData []byte) map[uint16]itemLoc {
 		return result
 	}
 
-	for i := 0; i < itemCount; i++ {
+	for range itemCount {
 		id, loc, newPos, itemOK := parseIlocItemSimple(ilocData, pos, version, offsetSize, lengthSize, baseOffsetSize, indexSize)
 		if !itemOK {
 			break
@@ -901,7 +893,7 @@ func parseIloc(metaData []byte) map[uint16]itemLoc {
 // ISO 14496-12 §8.11.3: extents accumulate; only the last extent's values are
 // retained here (matching the original implementation's behaviour).
 func readIlocSimpleExtents(ilocData []byte, pos, extentCount int, baseOffset uint64, offsetSize, lengthSize, indexSize int) (offset, length uint64, newPos int, ok bool) {
-	for j := 0; j < extentCount; j++ {
+	for range extentCount {
 		if indexSize > 0 {
 			pos += indexSize
 		}

@@ -45,7 +45,7 @@ func decodeCoordinate(entry *IFDEntry) ([3][2]uint32, bool) {
 		return [3][2]uint32{}, false
 	}
 	var dms [3][2]uint32
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		dms[i] = entry.Rational(i)
 	}
 	return dms, true
@@ -87,10 +87,10 @@ func dmsToDecimal(dms [3][2]uint32, ref string) float64 {
 	}
 
 	deg := float64(dms[0][0]) / float64(dms[0][1])
-	min := float64(dms[1][0]) / float64(dms[1][1])
+	mins := float64(dms[1][0]) / float64(dms[1][1])
 	sec := float64(dms[2][0]) / float64(dms[2][1])
 
-	decimal := deg + min/60 + sec/3600
+	decimal := deg + mins/60 + sec/3600
 
 	if ref == "S" || ref == "W" {
 		decimal = -decimal

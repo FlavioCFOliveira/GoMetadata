@@ -182,7 +182,7 @@ func parseIFDAt(b []byte, offset int, bigEndian bool) map[uint16][]byte {
 		return nil
 	}
 	result := make(map[uint16][]byte, count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		tag, value, ok := parseNikonIFDEntry(b, offset+2+i*12, bigEndian)
 		if !ok {
 			continue

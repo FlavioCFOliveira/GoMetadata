@@ -24,7 +24,7 @@ import (
 )
 
 // extractors maps each FormatID to its Extract function.
-var extractors = map[format.FormatID]func(io.ReadSeeker) ([]byte, []byte, []byte, error){ //nolint:gochecknoglobals
+var extractors = map[format.FormatID]func(io.ReadSeeker) ([]byte, []byte, []byte, error){ //nolint:gochecknoglobals // dispatch table: read-only after init, never mutated
 	format.FormatJPEG: jpeg.Extract,
 	format.FormatTIFF: tiff.Extract,
 	format.FormatPNG:  png.Extract,

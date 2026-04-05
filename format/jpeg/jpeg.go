@@ -200,7 +200,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if _, err = io.ReadFull(r, soi); err != nil {
 		return nil, nil, nil, fmt.Errorf("jpeg: read SOI: %w", err)
 	}
-	if err = readSOI(soi); err != nil {
+	if err := readSOI(soi); err != nil {
 		return nil, nil, nil, err
 	}
 
@@ -454,7 +454,7 @@ func writeExtendedXMP(w io.Writer, rawXMP []byte) error {
 	// Header = identXMPNote(32) + GUID(32) + fullLen(4) + offset(4) = 72 bytes.
 	const extHdrSize = 72
 	for offset < fullLen {
-		chunkEnd := offset + uint32(maxExtChunkSize)
+		chunkEnd := offset + uint32(maxExtChunkSize) // min builtin shadowed by test-only helper in fuzz_test.go; cannot use min here
 		if chunkEnd > fullLen {
 			chunkEnd = fullLen
 		}
@@ -544,7 +544,7 @@ func parseIRBEntry(b []byte, pos int) (resourceID uint16, data []byte, newPos in
 	}
 	// binary.BigEndian.Uint32 returns uint32; on 64-bit platforms the int cast
 	// is always non-negative. The subsequent bounds check catches truncation.
-	dataSize := int(binary.BigEndian.Uint32(b[pos:])) //nolint:gosec // G115: cast uint32→int; non-negative on 64-bit; truncation caught by next check
+	dataSize := int(binary.BigEndian.Uint32(b[pos:]))
 	pos += 4
 
 	if pos+dataSize > len(b) {
@@ -590,11 +590,15 @@ func buildIRB(iptcData []byte) []byte {
 	size := len(iptcData)
 	// 4 (8BIM) + 2 (ID) + 2 (empty pascal name) + 4 (data size) + data [+ padding]
 	buf := make([]byte, 0, 12+size+(size%2))
-	buf = append(buf, '8', 'B', 'I', 'M')
-	buf = append(buf, 0x04, 0x04) // resource ID 0x0404
-	buf = append(buf, 0x00, 0x00) // empty pascal name (length 0 + padding byte)
+	// Photoshop IRB header: 8BIM marker, resource ID 0x0404, empty pascal name,
+	// then 4-byte big-endian data length. G115: byte shifts are safe bit extractions.
+	//nolint:gosec // G115: byte extraction from int size value; shifts are safe bit extractions
 	buf = append(buf,
-		byte(size>>24), byte(size>>16), byte(size>>8), byte(size)) //nolint:gosec // G115: byte extraction from int size value, each byte individually masked by shift
+		'8', 'B', 'I', 'M', // 8BIM marker
+		0x04, 0x04, // resource ID 0x0404
+		0x00, 0x00, // empty pascal name (length 0 + padding byte)
+		byte(size>>24), byte(size>>16), byte(size>>8), byte(size), // data length
+	)
 	buf = append(buf, iptcData...)
 	if size%2 != 0 {
 		buf = append(buf, 0x00) // pad data to even boundary
@@ -637,8 +641,8 @@ func readSegment(r io.Reader, scratch *[]byte) (marker byte, data []byte, err er
 		return 0, nil, fmt.Errorf("jpeg: expected marker prefix 0xFF, got 0x%02X", hdr[0])
 	}
 	// Skip fill bytes (consecutive 0xFF).
-	if err = skipFillBytes(r, hdr); err != nil {
-		return 0, nil, err
+	if skipErr := skipFillBytes(r, hdr); skipErr != nil {
+		return 0, nil, skipErr
 	}
 	marker = hdr[1]
 
@@ -692,15 +696,13 @@ func writeSegment(w io.Writer, marker byte, data []byte) error {
 // Returns ("", false) if the attribute is absent or malformed.
 func extractGUIDFromMain(main []byte) (guid string, ok bool) {
 	const marker = "HasExtendedXMP"
-	idx := bytes.Index(main, []byte(marker))
-	if idx < 0 {
-		return "", false
-	}
-
 	// The GUID value follows the property name as either an attribute
 	// (HasExtendedXMP="<GUID>") or element content (HasExtendedXMP><GUID></...).
 	// In both cases we scan past up to 5 bytes for the opening quote character.
-	rest := main[idx+len(marker):]
+	_, rest, found := bytes.Cut(main, []byte(marker))
+	if !found {
+		return "", false
+	}
 	qi := bytes.IndexAny(rest, `"'`)
 	if qi < 0 || qi > 5 {
 		return "", false

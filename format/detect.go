@@ -195,7 +195,7 @@ func detectTIFFVariant(b []byte) FormatID {
 // Otherwise makeRaw carries the raw ASCII bytes of the Make tag value (may be
 // nil when the tag is absent or unreadable), and isDNG is false.
 func findMakeTagInIFD(data []byte, order binary.ByteOrder, count, pos int) (makeRaw []byte, isDNG bool) {
-	for i := 0; i < count; i++ {
+	for i := 0; i < count; i++ { //nolint:intrange,modernize // binary parser: loop variable is a byte-slice offset multiplier
 		e := pos + i*12
 		if e+12 > len(data) {
 			break
@@ -263,7 +263,7 @@ func mapMakeToFormat(makeBytes []byte) FormatID {
 // parsing succeeded. On failure the pool buffer is returned automatically and
 // the returned bp is nil.
 func parseTIFFScanHeader(r io.ReadSeeker) (order binary.ByteOrder, count, pos int, data []byte, bp *[]byte, ok bool) {
-	bp = tiffScanPool.Get().(*[]byte) //nolint:forcetypeassert // tiffScanPool.New always stores *[]byte; pool invariant
+	bp = tiffScanPool.Get().(*[]byte) //nolint:forcetypeassert,revive // tiffScanPool.New always stores *[]byte; pool invariant
 	data = *bp
 	n, _ := io.ReadFull(r, data)
 	if n < 10 {

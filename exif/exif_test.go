@@ -1,6 +1,7 @@
 package exif
 
 import (
+	"bytes"
 	"encoding/binary"
 	"math"
 	"testing"
@@ -627,7 +628,7 @@ func TestIFDEntryFloat64(t *testing.T) {
 func TestIFDEntryBytes(t *testing.T) {
 	payload := []byte{0xDE, 0xAD, 0xBE, 0xEF}
 	e := IFDEntry{Type: TypeUndefined, Count: 4, Value: payload, byteOrder: binary.LittleEndian}
-	if got := e.Bytes(); string(got) != string(payload) {
+	if got := e.Bytes(); !bytes.Equal(got, payload) {
 		t.Errorf("Bytes() = %v, want %v", got, payload)
 	}
 }
@@ -648,10 +649,10 @@ func TestIFDEntrySRational(t *testing.T) {
 	// Encode two SRational values: -1/2 and 3/4.
 	val := make([]byte, 16)
 	var negOne, posTwo, posThree, posFour int32 = -1, 2, 3, 4
-	order.PutUint32(val[0:], uint32(negOne))   //nolint:gosec // G115: test helper, intentional type cast
-	order.PutUint32(val[4:], uint32(posTwo))   //nolint:gosec // G115: test helper, intentional type cast
-	order.PutUint32(val[8:], uint32(posThree)) //nolint:gosec // G115: test helper, intentional type cast
-	order.PutUint32(val[12:], uint32(posFour)) //nolint:gosec // G115: test helper, intentional type cast
+	order.PutUint32(val[0:], uint32(negOne)) //nolint:gosec // G115: intentional signed-to-unsigned reinterpretation for SRational test
+	order.PutUint32(val[4:], uint32(posTwo))
+	order.PutUint32(val[8:], uint32(posThree))
+	order.PutUint32(val[12:], uint32(posFour))
 
 	e := IFDEntry{Type: TypeSRational, Count: 2, Value: val, byteOrder: order}
 
@@ -771,7 +772,7 @@ func TestMakerNotePreservedOnEncode(t *testing.T) {
 	if e2.MakerNote == nil {
 		t.Fatal("MakerNote is nil after encode→parse round-trip")
 	}
-	if string(e2.MakerNote) != string(makerNotePayload) {
+	if !bytes.Equal(e2.MakerNote, makerNotePayload) {
 		t.Errorf("MakerNote bytes mismatch after round-trip:\n  got  %x\n  want %x", e2.MakerNote, makerNotePayload)
 	}
 }
@@ -784,7 +785,7 @@ func BenchmarkEXIFParse(b *testing.B) {
 	})
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_, _ = Parse(data)
 	}
 }
@@ -1386,7 +1387,7 @@ func BenchmarkEXIFParse_Camera(b *testing.B) {
 	data := buildCameraEXIF()
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_, _ = Parse(data)
 	}
 }
@@ -1400,7 +1401,7 @@ func BenchmarkIFDGet_Large(b *testing.B) {
 	target := TagID(100) // mid-range tag — exercises log(100) ≈ 7 comparisons
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_ = ifd.Get(target)
 	}
 }
@@ -1417,7 +1418,7 @@ func BenchmarkEXIFEncode(b *testing.B) {
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_, _ = Encode(e)
 	}
 }

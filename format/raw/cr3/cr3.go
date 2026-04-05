@@ -145,7 +145,7 @@ func findExifIFDOffset(buf []byte, ifd0Off uint32, order binary.ByteOrder) uint3
 	}
 	count := order.Uint16(buf[ifd0Off:])
 	pos := int(ifd0Off) + 2
-	for i := 0; i < int(count); i++ {
+	for range int(count) {
 		if pos+12 > len(buf) {
 			break
 		}
@@ -367,7 +367,7 @@ func matchesUUID(data, uuid []byte) bool {
 	if len(data) < 16 || len(uuid) < 16 {
 		return false
 	}
-	for i := 0; i < 16; i++ {
+	for i := range 16 {
 		if data[i] != uuid[i] {
 			return false
 		}

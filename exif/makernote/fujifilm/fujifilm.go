@@ -136,7 +136,7 @@ func parseIFDAt(b []byte, offset int, bigEndian bool) map[uint16][]byte {
 		return nil
 	}
 	result := make(map[uint16][]byte, count)
-	for i := 0; i < count; i++ {
+	for i := 0; i < count; i++ { //nolint:intrange,modernize // binary parser: loop variable is a byte-slice offset multiplier
 		tag, value, ok := parseFujifilmIFDEntry(b, offset+2+i*12, bigEndian)
 		if !ok {
 			// Unknown type or out-of-bounds: skip entry, do not abort the whole IFD.

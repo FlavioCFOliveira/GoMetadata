@@ -26,7 +26,7 @@ import (
 
 // injectors maps each FormatID to its Inject function.
 //
-//nolint:gochecknoglobals
+//nolint:gochecknoglobals // dispatch table: read-only after init, never mutated
 var injectors = map[format.FormatID]func(io.ReadSeeker, io.Writer, []byte, []byte, []byte) error{
 	format.FormatJPEG: jpeg.Inject,
 	format.FormatTIFF: tiff.Inject,

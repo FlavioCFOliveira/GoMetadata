@@ -1,6 +1,7 @@
 package testutil
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"os"
@@ -21,11 +22,11 @@ func CheckGolden(t *testing.T, name string, got any) {
 		t.Fatalf("marshal golden: %v", err)
 	}
 	if *update {
-		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-			t.Fatalf("mkdir golden: %v", err)
+		if mkdirErr := os.MkdirAll(filepath.Dir(path), 0o750); mkdirErr != nil {
+			t.Fatalf("mkdir golden: %v", mkdirErr)
 		}
-		if err := os.WriteFile(path, data, 0o600); err != nil {
-			t.Fatalf("write golden: %v", err)
+		if writeErr := os.WriteFile(path, data, 0o600); writeErr != nil {
+			t.Fatalf("write golden: %v", writeErr)
 		}
 		return
 	}
@@ -36,7 +37,7 @@ func CheckGolden(t *testing.T, name string, got any) {
 	if err != nil {
 		t.Fatalf("read golden: %v", err)
 	}
-	if string(want) != string(data) {
+	if !bytes.Equal(want, data) {
 		t.Errorf("golden mismatch for %s\ngot:\n%s\nwant:\n%s", name, data, want)
 	}
 }

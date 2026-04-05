@@ -41,7 +41,7 @@ func collectionType(ns, local string) string {
 
 // prefixMap maps well-known XMP namespace URIs to their canonical prefix strings.
 // XMP Part 1 §B, Adobe XMP Specification Appendix A.
-var prefixMap = map[string]string{ //nolint:gochecknoglobals
+var prefixMap = map[string]string{ //nolint:gochecknoglobals // read-only namespace→prefix lookup table per XMP Part 1 §B; never mutated
 	NSxmp:       "xmp",
 	NSxmpRights: "xmpRights",
 	NSxmpMM:     "xmpMM",

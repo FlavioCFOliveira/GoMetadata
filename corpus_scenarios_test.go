@@ -191,7 +191,7 @@ func TestCorpusProgressiveJPEG(t *testing.T) {
 
 	for _, name := range progressive {
 		t.Run(name, func(t *testing.T) {
-			path := requireCorpusFile(t, filepath.Join("jpeg/progressive", name))
+			path := requireCorpusFile(t, filepath.Join("jpeg", "progressive", name))
 			// Must parse without CorruptMetadataError. Other errors are benign.
 			openAndRead(t, path)
 		})
@@ -204,7 +204,7 @@ func TestCorpusProgressiveJPEG(t *testing.T) {
 func TestCorpusBaselineVsProgressive(t *testing.T) {
 	for _, name := range []string{"baseline.jpg", "kitten-progressive.jpg"} {
 		t.Run(name, func(t *testing.T) {
-			path := requireCorpusFile(t, filepath.Join("jpeg/progressive", name))
+			path := requireCorpusFile(t, filepath.Join("jpeg", "progressive", name))
 			openAndRead(t, path) // CorruptMetadataError → fatal; skip otherwise
 		})
 	}
@@ -394,7 +394,7 @@ func TestCorpusTIFFStructuralVariants(t *testing.T) {
 	}
 	for _, name := range files {
 		t.Run(name, func(t *testing.T) {
-			path := requireCorpusFile(t, filepath.Join("tiff/exampletiffs", name))
+			path := requireCorpusFile(t, filepath.Join("tiff", "exampletiffs", name))
 			// Must not CorruptMetadataError. Other errors are benign (e.g. no EXIF).
 			openAndRead(t, path)
 		})
@@ -424,7 +424,7 @@ func TestCorpusBigEndianTIFF(t *testing.T) {
 	}
 	for _, name := range files {
 		t.Run(name, func(t *testing.T) {
-			path := requireCorpusFile(t, filepath.Join("tiff/metadata-extractor", name))
+			path := requireCorpusFile(t, filepath.Join("tiff", "metadata-extractor", name))
 			openAndRead(t, path)
 		})
 	}
@@ -688,7 +688,7 @@ func TestCorpusXMPSidecars(t *testing.T) {
 // BenchmarkReadProgressiveJPEG measures Read() performance on a progressive
 // JPEG, allowing comparison against baseline JPEG performance.
 func BenchmarkReadProgressiveJPEG(b *testing.B) {
-	path := filepath.Join("testdata", "corpus", "jpeg/progressive/kitten-progressive.jpg")
+	path := filepath.Join("testdata", "corpus", "jpeg", "progressive", "kitten-progressive.jpg")
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		b.Skip("progressive JPEG corpus absent")
 	}
@@ -698,7 +698,7 @@ func BenchmarkReadProgressiveJPEG(b *testing.B) {
 	}
 	b.ResetTimer()
 	b.SetBytes(int64(len(data)))
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		if _, err := Read(bytes.NewReader(data)); err != nil {
 			b.Fatal(err)
 		}
@@ -708,7 +708,7 @@ func BenchmarkReadProgressiveJPEG(b *testing.B) {
 // BenchmarkReadCombinedMetadataJPEG measures Read() on a JPEG with all three
 // metadata types (EXIF + IPTC + XMP), the heaviest realistic parse path.
 func BenchmarkReadCombinedMetadataJPEG(b *testing.B) {
-	path := filepath.Join("testdata", "corpus", "jpeg/exiftool/ExifTool.jpg")
+	path := filepath.Join("testdata", "corpus", "jpeg", "exiftool", "ExifTool.jpg")
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		b.Skip("ExifTool.jpg corpus absent")
 	}
@@ -718,7 +718,7 @@ func BenchmarkReadCombinedMetadataJPEG(b *testing.B) {
 	}
 	b.ResetTimer()
 	b.SetBytes(int64(len(data)))
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		if _, err := Read(bytes.NewReader(data)); err != nil {
 			b.Fatal(err)
 		}

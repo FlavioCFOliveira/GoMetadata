@@ -158,7 +158,7 @@ func BenchmarkWebPExtract(b *testing.B) {
 	webp := buildWebP(exifData, nil, 0x08, 1920, 1080)
 	b.SetBytes(int64(len(webp)))
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_, _, _, _ = Extract(bytes.NewReader(webp))
 	}
 }

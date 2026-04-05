@@ -486,7 +486,7 @@ func parseRDF(b []byte, x *XMP) error {
 	p := rdfParser{x: x}
 
 	// Pooled list accumulator for rdf:li values.
-	p.liVals = liPool.Get().(*[]string) //nolint:forcetypeassert // liPool.New always stores *[]string; pool invariant
+	p.liVals = liPool.Get().(*[]string) //nolint:forcetypeassert,revive // liPool.New always stores *[]string; pool invariant
 	*p.liVals = (*p.liVals)[:0]
 	defer liPool.Put(p.liVals)
 
@@ -733,7 +733,7 @@ func unescapeXML(b []byte) string {
 		return unsafe.String(unsafe.SliceData(b), len(b)) //nolint:gosec // G103: unsafe.String is safe here; b is kept alive by the caller via the parent slice
 	}
 
-	bld := builderPool.Get().(*strings.Builder) //nolint:forcetypeassert // builderPool.New always stores *strings.Builder; pool invariant
+	bld := builderPool.Get().(*strings.Builder) //nolint:forcetypeassert,revive // builderPool.New always stores *strings.Builder; pool invariant
 	bld.Reset()
 	bld.Grow(len(b))
 

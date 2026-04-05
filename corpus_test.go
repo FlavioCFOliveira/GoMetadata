@@ -292,7 +292,7 @@ func BenchmarkReadFile(b *testing.B) {
 
 	b.ResetTimer()
 	b.SetBytes(int64(len(data)))
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		if _, err := Read(bytes.NewReader(data)); err != nil {
 			b.Fatal(err)
 		}

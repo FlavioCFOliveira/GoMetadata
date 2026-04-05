@@ -50,7 +50,7 @@ func minimalTIFFPayload() []byte {
 	order.PutUint16(buf[10:], 0x010E) // ImageDescription tag
 	order.PutUint16(buf[12:], 2)      // ASCII
 	order.PutUint32(buf[14:], 4)      // count = 4
-	copy(buf[18:], []byte("test"))    // inline value
+	copy(buf[18:], "test")            // inline value
 	order.PutUint32(buf[22:], 0)      // next IFD = 0
 	return buf
 }
@@ -215,8 +215,8 @@ func buildMinimalPNG() []byte {
 		buf.WriteString(chunkType)
 		buf.Write(data)
 		h := crc32.NewIEEE()
-		_, _ = h.Write([]byte(chunkType)) //nolint:gosec // G104: hash.Hash.Write never returns an error
-		_, _ = h.Write(data)              //nolint:gosec // G104: hash.Hash.Write never returns an error
+		_, _ = h.Write([]byte(chunkType))
+		_, _ = h.Write(data)
 		binary.BigEndian.PutUint32(lbuf[:], h.Sum32())
 		buf.Write(lbuf[:])
 	}
@@ -400,7 +400,7 @@ func TestConcurrentRead(t *testing.T) {
 	errs := make([]error, goroutines)
 	results := make([]*Metadata, goroutines)
 
-	for i := 0; i < goroutines; i++ {
+	for i := range goroutines {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -411,7 +411,7 @@ func TestConcurrentRead(t *testing.T) {
 	}
 	wg.Wait()
 
-	for i := 0; i < goroutines; i++ {
+	for i := range goroutines {
 		if errs[i] != nil {
 			t.Errorf("goroutine %d: Read returned error: %v", i, errs[i])
 		}
@@ -443,7 +443,7 @@ func TestConcurrentWrite(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make([]error, goroutines)
 
-	for i := 0; i < goroutines; i++ {
+	for i := range goroutines {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -452,7 +452,7 @@ func TestConcurrentWrite(t *testing.T) {
 	}
 	wg.Wait()
 
-	for i := 0; i < goroutines; i++ {
+	for i := range goroutines {
 		if errs[i] != nil {
 			t.Errorf("goroutine %d: Write returned error: %v", i, errs[i])
 		}
@@ -476,7 +476,7 @@ func BenchmarkWrite_JPEG(b *testing.B) {
 	b.SetBytes(int64(len(data)))
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		if err := Write(bytes.NewReader(data), io.Discard, m); err != nil {
 			b.Fatalf("Write: %v", err)
 		}
@@ -497,7 +497,7 @@ func BenchmarkWrite_PNG(b *testing.B) {
 	b.SetBytes(int64(len(data)))
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		if err := Write(bytes.NewReader(data), io.Discard, m); err != nil {
 			b.Fatalf("Write: %v", err)
 		}

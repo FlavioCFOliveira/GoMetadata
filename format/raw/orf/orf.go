@@ -73,8 +73,8 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 
 	// Buffer the TIFF output so we can restore the ORF magic bytes.
 	var buf bytes.Buffer
-	if err := tiff.Inject(bytes.NewReader(patched), &buf, rawEXIF, rawIPTC, rawXMP); err != nil {
-		return fmt.Errorf("orf: inject: %w", err)
+	if injectErr := tiff.Inject(bytes.NewReader(patched), &buf, rawEXIF, rawIPTC, rawXMP); injectErr != nil {
+		return fmt.Errorf("orf: inject: %w", injectErr)
 	}
 
 	out := buf.Bytes()
@@ -98,7 +98,7 @@ func extractTIFFTags(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawIP
 	}
 	count := int(order.Uint16(data[ifd0Off:]))
 	pos := int(ifd0Off) + 2
-	for i := 0; i < count; i++ {
+	for i := 0; i < count; i++ { //nolint:intrange,modernize // binary parser: loop variable is a byte-slice offset multiplier
 		e := pos + i*12
 		if e+12 > len(data) {
 			break

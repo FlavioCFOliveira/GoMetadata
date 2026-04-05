@@ -26,7 +26,7 @@ type Parser interface {
 // Multiple Make string variants that share the same parser are each listed as
 // separate keys so that Dispatch remains a single map lookup (CC = 1).
 //
-//nolint:gochecknoglobals
+//nolint:gochecknoglobals // dispatch table: package-level read-only map populated at init and never mutated
 var parsers = map[string]Parser{
 	"Canon":                 canon.Parser{},
 	"NIKON CORPORATION":     nikon.Parser{},
@@ -51,6 +51,6 @@ var parsers = map[string]Parser{
 
 // Dispatch selects the correct Parser for the given make string.
 // Returns nil when the make is unknown or unsupported.
-func Dispatch(make string) Parser {
-	return parsers[make]
+func Dispatch(cameraMake string) Parser {
+	return parsers[cameraMake]
 }

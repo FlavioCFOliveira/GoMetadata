@@ -55,7 +55,7 @@ func Parse(b []byte) (*XMP, error) {
 // container segment. The packet is UTF-8 encoded with a read/write
 // <?xpacket?> wrapper per XMP §7.
 func Encode(x *XMP) ([]byte, error) {
-	return encode(x)
+	return serialise(x)
 }
 
 // CameraModel returns the tiff:Model or xmp:CreatorTool property.
@@ -64,10 +64,10 @@ func (x *XMP) CameraModel() string {
 	if x == nil {
 		return ""
 	}
-	if v := x.get(NStiff, "Model"); v != "" {
+	if v := x.getProp(NStiff, "Model"); v != "" {
 		return v
 	}
-	return x.get(NSxmp, "CreatorTool")
+	return x.getProp(NSxmp, "CreatorTool")
 }
 
 // GPS returns GPS coordinates from the exif:GPSLatitude / exif:GPSLongitude
@@ -76,8 +76,8 @@ func (x *XMP) GPS() (lat, lon float64, ok bool) {
 	if x == nil {
 		return 0, 0, false
 	}
-	latStr := x.get(NSexif, "GPSLatitude")
-	lonStr := x.get(NSexif, "GPSLongitude")
+	latStr := x.getProp(NSexif, "GPSLatitude")
+	lonStr := x.getProp(NSexif, "GPSLongitude")
 	if latStr == "" || lonStr == "" {
 		return 0, 0, false
 	}
@@ -119,7 +119,7 @@ func (x *XMP) DateTimeOriginal() string {
 	if x == nil {
 		return ""
 	}
-	return x.get(NSexif, "DateTimeOriginal")
+	return x.getProp(NSexif, "DateTimeOriginal")
 }
 
 // LensModel returns the aux:Lens property (Adobe XMP Auxiliary namespace).
@@ -127,7 +127,7 @@ func (x *XMP) LensModel() string {
 	if x == nil {
 		return ""
 	}
-	return x.get(NSaux, "Lens")
+	return x.getProp(NSaux, "Lens")
 }
 
 // Keywords returns the dc:subject values (XMP §8.3).
@@ -136,7 +136,7 @@ func (x *XMP) Keywords() []string {
 	if x == nil {
 		return nil
 	}
-	v := x.get(NSdc, "subject")
+	v := x.getProp(NSdc, "subject")
 	if v == "" {
 		return nil
 	}
@@ -165,37 +165,37 @@ func (x *XMP) Get(ns, local string) string {
 	if x == nil {
 		return ""
 	}
-	return x.get(ns, local)
+	return x.getProp(ns, local)
 }
 
 // SetCaption sets dc:description to s (XMP §8.3).
-func (x *XMP) SetCaption(s string) { x.set(NSdc, "description", s) }
+func (x *XMP) SetCaption(s string) { x.putProp(NSdc, "description", s) }
 
 // SetCopyright sets dc:rights to s (XMP §8.3).
-func (x *XMP) SetCopyright(s string) { x.set(NSdc, "rights", s) }
+func (x *XMP) SetCopyright(s string) { x.putProp(NSdc, "rights", s) }
 
 // SetCreator sets dc:creator to s (XMP §8.3).
-func (x *XMP) SetCreator(s string) { x.set(NSdc, "creator", s) }
+func (x *XMP) SetCreator(s string) { x.putProp(NSdc, "creator", s) }
 
 // AddKeyword appends kw to dc:subject (XMP §8.3).
 // Multiple keywords are stored joined with U+001E (record separator), matching
 // the convention used by Keywords() and the RDF encoder.
 func (x *XMP) AddKeyword(kw string) {
-	existing := x.get(NSdc, "subject")
+	existing := x.getProp(NSdc, "subject")
 	if existing == "" {
-		x.set(NSdc, "subject", kw)
+		x.putProp(NSdc, "subject", kw)
 	} else {
-		x.set(NSdc, "subject", existing+"\x1e"+kw)
+		x.putProp(NSdc, "subject", existing+"\x1e"+kw)
 	}
 }
 
 // SetCameraModel sets tiff:Model to s (XMP §8.4).
-func (x *XMP) SetCameraModel(s string) { x.set(NStiff, "Model", s) }
+func (x *XMP) SetCameraModel(s string) { x.putProp(NStiff, "Model", s) }
 
 // SetDateTimeOriginal sets exif:DateTimeOriginal to t formatted as RFC 3339
 // (XMP §8.4 / ISO 8601).
 func (x *XMP) SetDateTimeOriginal(t time.Time) {
-	x.set(NSexif, "DateTimeOriginal", t.Format(time.RFC3339))
+	x.putProp(NSexif, "DateTimeOriginal", t.Format(time.RFC3339))
 }
 
 // SetGPS writes exif:GPSLatitude and exif:GPSLongitude in the XMP
@@ -218,8 +218,8 @@ func (x *XMP) SetGPS(lat, lon float64) {
 		}
 		return fmt.Sprintf("%.0f,%.6f%s", deg, decMin, ref)
 	}
-	x.set(NSexif, "GPSLatitude", formatCoord(lat, "N", "S"))
-	x.set(NSexif, "GPSLongitude", formatCoord(lon, "E", "W"))
+	x.putProp(NSexif, "GPSLatitude", formatCoord(lat, "N", "S"))
+	x.putProp(NSexif, "GPSLongitude", formatCoord(lon, "E", "W"))
 }
 
 // SetLensModel sets aux:Lens to s (Adobe XMP Auxiliary namespace).
@@ -227,7 +227,7 @@ func (x *XMP) SetLensModel(s string) {
 	if x == nil {
 		return
 	}
-	x.set(NSaux, "Lens", s)
+	x.putProp(NSaux, "Lens", s)
 }
 
 // SetKeywords replaces dc:subject entirely with kws (XMP §8.3).
@@ -245,7 +245,7 @@ func (x *XMP) SetKeywords(kws []string) {
 		}
 		return
 	}
-	x.set(NSdc, "subject", strings.Join(kws, "\x1e"))
+	x.putProp(NSdc, "subject", strings.Join(kws, "\x1e"))
 }
 
 // Set is the public equivalent of the private set() method.
@@ -255,11 +255,11 @@ func (x *XMP) Set(ns, local, value string) {
 	if x == nil {
 		return
 	}
-	x.set(ns, local, value)
+	x.putProp(ns, local, value)
 }
 
-// set writes value to Properties[ns][local], initialising inner maps as needed.
-func (x *XMP) set(ns, local, value string) {
+// putProp writes value to Properties[ns][local], initialising inner maps as needed.
+func (x *XMP) putProp(ns, local, value string) {
 	if x.Properties == nil {
 		x.Properties = make(map[string]map[string]string)
 	}
@@ -269,8 +269,8 @@ func (x *XMP) set(ns, local, value string) {
 	x.Properties[ns][local] = value
 }
 
-// get returns the property value for the given namespace URI and local name.
-func (x *XMP) get(ns, local string) string {
+// getProp returns the property value for the given namespace URI and local name.
+func (x *XMP) getProp(ns, local string) string {
 	if x.Properties == nil {
 		return ""
 	}
@@ -285,12 +285,12 @@ func (x *XMP) get(ns, local string) string {
 // Multi-valued properties are joined with U+001E; we return the substring
 // before the first separator.
 func (x *XMP) firstValue(ns, local string) string {
-	v := x.get(ns, local)
+	v := x.getProp(ns, local)
 	if v == "" {
 		return ""
 	}
-	if i := strings.IndexByte(v, '\x1e'); i >= 0 {
-		return v[:i]
+	if first, _, found := strings.Cut(v, "\x1e"); found {
+		return first
 	}
 	return v
 }
@@ -321,21 +321,21 @@ func parseXMPGPS(s string) (float64, error) {
 
 	var result float64
 	if len(parts) == 2 {
-		min, err := strconv.ParseFloat(parts[1], 64)
-		if err != nil {
-			return 0, fmt.Errorf("xmp: GPS minutes: %w", err)
+		mins, minsErr := strconv.ParseFloat(parts[1], 64)
+		if minsErr != nil {
+			return 0, fmt.Errorf("xmp: GPS minutes: %w", minsErr)
 		}
-		result = deg + min/60
+		result = deg + mins/60
 	} else {
-		min, err := strconv.ParseFloat(parts[1], 64)
-		if err != nil {
-			return 0, fmt.Errorf("xmp: GPS minutes: %w", err)
+		mins, minsErr := strconv.ParseFloat(parts[1], 64)
+		if minsErr != nil {
+			return 0, fmt.Errorf("xmp: GPS minutes: %w", minsErr)
 		}
-		sec, err := strconv.ParseFloat(parts[2], 64)
-		if err != nil {
-			return 0, fmt.Errorf("xmp: GPS seconds: %w", err)
+		sec, secErr := strconv.ParseFloat(parts[2], 64)
+		if secErr != nil {
+			return 0, fmt.Errorf("xmp: GPS seconds: %w", secErr)
 		}
-		result = deg + min/60 + sec/3600
+		result = deg + mins/60 + sec/3600
 	}
 
 	if ref == "S" || ref == "W" {

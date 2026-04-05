@@ -530,7 +530,7 @@ func BenchmarkIPTCParse(b *testing.B) {
 	})
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_, _ = Parse(raw)
 	}
 }
@@ -554,7 +554,7 @@ func BenchmarkIPTCEncode(b *testing.B) {
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
-	for n := 0; n < b.N; n++ {
+	for range b.N {
 		_, _ = Encode(i)
 	}
 }
@@ -581,7 +581,7 @@ func BenchmarkIPTCAccessors(b *testing.B) {
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
-	for n := 0; n < b.N; n++ {
+	for range b.N {
 		_ = i.Caption()
 		_ = i.Copyright()
 		_ = i.Keywords()

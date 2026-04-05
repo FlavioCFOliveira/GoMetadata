@@ -24,8 +24,22 @@ func ExampleReadFile() {
 	fmt.Println("Format:  ", m.Format())
 	fmt.Println("Make:    ", m.Make())
 	fmt.Println("Model:   ", m.CameraModel())
-	fmt.Println("Lens:    ", m.LensModel())
-	fmt.Println("Software:", m.Software())
+	if lens := m.LensModel(); lens != "" {
+		fmt.Println("Lens:    ", lens)
+	} else {
+		fmt.Println("Lens:")
+	}
+	if sw := m.Software(); sw != "" {
+		fmt.Println("Software:", sw)
+	} else {
+		fmt.Println("Software:")
+	}
+	// Output:
+	// Format:   JPEG
+	// Make:     Canon
+	// Model:    Canon DIGITAL IXUS 40
+	// Lens:
+	// Software:
 }
 
 // ExampleReadFile_gps demonstrates extracting GPS coordinates.
@@ -43,6 +57,8 @@ func ExampleReadFile_gps() {
 		return
 	}
 	fmt.Printf("lat=%.6f lon=%.6f\n", lat, lon)
+	// Output:
+	// no GPS data
 }
 
 // ExampleReadFile_exposureData demonstrates reading shooting parameters.
@@ -78,6 +94,11 @@ func ExampleReadFile_exposureData() {
 	if t, ok := m.DateTimeOriginal(); ok {
 		fmt.Printf("Captured:     %s\n", t.Format(time.RFC3339))
 	}
+	// Output:
+	// ExposureTime: 1/500 s
+	// FNumber:      f/2.8
+	// FocalLength:  5.8 mm
+	// Captured:     2007-09-03T16:03:45Z
 }
 
 // ExampleReadFile_options demonstrates selective parsing for performance.
@@ -100,6 +121,9 @@ func ExampleReadFile_options() {
 	// XMP is nil because we skipped it; EXIF and IPTC are available.
 	fmt.Println("XMP skipped:", m.XMP == nil)
 	fmt.Println("Model:      ", m.CameraModel())
+	// Output:
+	// XMP skipped: true
+	// Model:       Canon DIGITAL IXUS 40
 }
 
 // ExampleWriteFile demonstrates setting metadata on an image and writing it
@@ -159,6 +183,10 @@ func ExampleWriteFile() {
 	fmt.Println("Caption:  ", m2.Caption())
 	fmt.Println("Copyright:", m2.Copyright())
 	fmt.Println("Creator:  ", m2.Creator())
+	// Output:
+	// Caption:   Grand Canyon at sunset
+	// Copyright: 2024 Jane Smith
+	// Creator:   Jane Smith
 }
 
 // ExampleRead demonstrates reading metadata from an io.ReadSeeker instead of
@@ -181,6 +209,9 @@ func ExampleRead() {
 
 	fmt.Println("Format:", m.Format())
 	fmt.Println("Model: ", m.CameraModel())
+	// Output:
+	// Format: JPEG
+	// Model:  Canon DIGITAL IXUS 40
 }
 
 // ExampleWrite demonstrates writing metadata to an io.Writer. The modified
@@ -215,6 +246,8 @@ func ExampleWrite() {
 	}
 
 	fmt.Printf("output size: %d bytes\n", buf.Len())
+	// Output:
+	// output size: 236594 bytes
 }
 
 // ExampleNewMetadata demonstrates creating a Metadata value from scratch —
@@ -258,6 +291,8 @@ func ExampleMetadata_DateTimeOriginal() {
 	// Format with the standard Go time package — no special knowledge of the
 	// EXIF "YYYY:MM:DD HH:MM:SS" format is required.
 	fmt.Println("captured:", t.Format(time.RFC3339))
+	// Output:
+	// captured: 2007-09-03T16:03:45Z
 }
 
 // ExampleMetadata_Keywords demonstrates reading keywords and adding to them.
@@ -274,4 +309,7 @@ func ExampleMetadata_Keywords() {
 	// Append a new keyword to the existing set and update the Metadata.
 	m.SetKeywords(append(existing, "gometadata-example"))
 	fmt.Printf("updated keywords: %d\n", len(m.Keywords()))
+	// Output:
+	// existing keywords: 3
+	// updated keywords: 4
 }

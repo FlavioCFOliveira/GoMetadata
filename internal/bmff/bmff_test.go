@@ -456,7 +456,7 @@ func TestReadBox_HeaderTruncated(t *testing.T) {
 		'f', 't', 'y', 'p', // type
 	}
 
-	for n := 0; n < 8; n++ {
+	for n := range 8 {
 		t.Run("", func(t *testing.T) {
 			r := bytes.NewReader(valid[:n])
 			_, err := ReadBox(r)
@@ -598,8 +598,8 @@ func TestReadBox_ExtendedSize_Offset(t *testing.T) {
 // opaque 4-byte identifiers; no normalisation is applied.
 func TestReadBox_TypePreservation(t *testing.T) {
 	// Test all 256 values in each byte position independently.
-	for pos := 0; pos < 4; pos++ {
-		for v := 0; v < 256; v++ {
+	for pos := range 4 {
+		for v := range 256 {
 			var typ [4]byte
 			// Set a stable, recognisable baseline.
 			copy(typ[:], "aaaa")
@@ -629,7 +629,7 @@ func BenchmarkReadBox(b *testing.B) {
 	raw := buildStandardBox(8+payloadSize, typ, make([]byte, payloadSize))
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		r := bytes.NewReader(raw)
 		_, _ = ReadBox(r)
 	}
@@ -643,7 +643,7 @@ func BenchmarkReadBoxExtended(b *testing.B) {
 	raw := buildExtendedBox(16+payloadSize, typ, make([]byte, payloadSize))
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		r := bytes.NewReader(raw)
 		_, _ = ReadBox(r)
 	}
@@ -656,7 +656,7 @@ func BenchmarkSkipBox(b *testing.B) {
 	raw := buildStandardBox(8+payloadSize, typ, make([]byte, payloadSize))
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		r := bytes.NewReader(raw)
 		box, err := ReadBox(r)
 		if err != nil {

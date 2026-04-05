@@ -210,7 +210,7 @@ func BenchmarkReadChunk(b *testing.B) {
 	raw = append(raw, make([]byte, 1024)...)
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		r := bytes.NewReader(raw)
 		_, _ = ReadChunk(r)
 	}
