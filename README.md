@@ -4,6 +4,8 @@
 
 <img src="assets/GoMetadata-logo.png" alt="GoMetadata" width="200" height="200" />
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/FlavioCFOliveira/GoMetadata.svg)](https://pkg.go.dev/github.com/FlavioCFOliveira/GoMetadata) [![Go Report Card](https://goreportcard.com/badge/github.com/FlavioCFOliveira/GoMetadata)](https://goreportcard.com/report/github.com/FlavioCFOliveira/GoMetadata) [![CI](https://github.com/FlavioCFOliveira/GoMetadata/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/FlavioCFOliveira/GoMetadata/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat)](LICENSE) [![Go: 1.26+](https://img.shields.io/badge/Go-1.26%2B-00ADD8.svg?style=flat)](https://go.dev/doc/install) [![codecov](https://codecov.io/gh/FlavioCFOliveira/GoMetadata/branch/main/graph/badge.svg)](https://codecov.io/gh/FlavioCFOliveira/GoMetadata) [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/FlavioCFOliveira/GoMetadata/badge)](https://securityscorecards.dev/viewer/?uri=github.com/FlavioCFOliveira/GoMetadata) [![Release](https://img.shields.io/github/v/release/FlavioCFOliveira/GoMetadata?style=flat)](https://github.com/FlavioCFOliveira/GoMetadata/releases)
+
 </div>
 
 A pure Go library for reading and writing EXIF, IPTC, and XMP metadata from any image format. `GoMetadata` provides a single, unified API over all three metadata standards — EXIF 3.0 (CIPA DC-008 / TIFF 6.0), IPTC IIM 4.2, and XMP (ISO 16684-1) — across 13 container formats including JPEG, TIFF, PNG, WebP, HEIF/AVIF, and the major RAW formats (CR2, CR3, NEF, ARW, DNG, ORF, RW2).
@@ -16,7 +18,7 @@ Developers searching for a Go EXIF library, a Go IPTC parser, or a way to read a
 go get github.com/FlavioCFOliveira/GoMetadata
 ```
 
-Requires Go 1.21 or later. No non-stdlib runtime dependencies.
+Requires Go 1.26 or later. No non-stdlib runtime dependencies.
 
 ## Usage
 
