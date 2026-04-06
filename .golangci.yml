@@ -20,6 +20,8 @@ linters:
     - nilnil
     # Error wrapping scheme violations (errors.As/Is misuse).
     - errorlint
+    # Prohibits inline errors.New/fmt.Errorf; requires package-level sentinel vars.
+    - err113
     # Naked type assertions — library uses well-justified nolint suppressions.
     - forcetypeassert
     # Security: this library parses untrusted bytes from arbitrary image files.
@@ -52,6 +54,8 @@ linters:
     - wrapcheck
     # Correct spelling in exported identifiers and comments.
     - misspell
+    # Comment sentences must end with a period.
+    - godot
     # Error types named XxxError, sentinel errors named ErrXxx.
     - errname
     # Interface method parameters must be named — required for godoc readability.
@@ -62,6 +66,8 @@ linters:
     - dupword
     # Bans naked returns; max-func-lines: 0 means zero tolerance.
     - nakedret
+    # Detects functions with deeply nested if/else blocks (threshold: 5).
+    - nestif
     # ExampleXxx functions must have // Output: comments to run as tests.
     - testableexamples
     # Test helper functions must call t.Helper() as first line.
@@ -212,6 +218,11 @@ linters:
     nakedret:
       max-func-lines: 0
 
+    # --- godot: declaration comments only (doc comments for types, funcs, vars) ---
+    godot:
+      scope: declarations
+      period: true
+
     # --- nolintlint: strict mode ---
     nolintlint:
       require-specific: true
@@ -306,6 +317,18 @@ linters:
       # nolintlint: fuzz boilerplate doesn't need per-instance explanations.
       - linters: [nolintlint]
         path: "fuzz_test\\.go$"
+
+      # err113: table-driven tests routinely use inline errors.New for expected values.
+      - linters: [err113]
+        path: "_test\\.go$"
+
+      # godot: test file comments are implementation notes, not API documentation.
+      - linters: [godot]
+        path: "_test\\.go$"
+
+      # nestif: deep setup logic in test helpers is acceptable.
+      - linters: [nestif]
+        path: "_test\\.go$"
 
 formatters:
   enable:

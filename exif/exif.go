@@ -46,7 +46,7 @@ func SkipMakerNote() ParseOption { return func(c *parseConfig) { c.skipMakerNote
 // Caller must ensure len(b) >= 2.
 //
 // TIFF §2: "The byte order field contains the value 49 49h (II) for
-// little-endian (Intel) byte order, or 4D 4Dh (MM) for big-endian (Motorola)."
+// little-endian (Intel) byte order, or 4D 4Dh (MM) for big-endian (Motorola)".
 func parseByteOrder(b []byte) (binary.ByteOrder, error) {
 	switch {
 	case b[0] == 'I' && b[1] == 'I':

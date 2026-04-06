@@ -1,7 +1,6 @@
 package gometadata
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -50,7 +49,7 @@ var injectors = map[format.FormatID]func(io.ReadSeeker, io.Writer, []byte, []byt
 func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error {
 	// Guard against structurally broken metadata that would panic in encoders.
 	if m.EXIF != nil && m.EXIF.IFD0 == nil {
-		return errors.New("gometadata: EXIF struct has nil IFD0")
+		return ErrNilIFD0Write
 	}
 
 	cfg := &writeConfig{preserveUnknownSegments: true}

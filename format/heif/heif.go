@@ -35,7 +35,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	hdrPtr := iobuf.Get(headerWindow)
 	hdr := *hdrPtr
 	n, rerr := io.ReadFull(r, hdr[:headerWindow])
-	if rerr != nil && rerr != io.ErrUnexpectedEOF {
+	if rerr != nil && !errors.Is(rerr, io.ErrUnexpectedEOF) {
 		iobuf.Put(hdrPtr)
 		return nil, nil, nil, fmt.Errorf("heif: read: %w", rerr)
 	}
@@ -658,7 +658,7 @@ func isContainerBox(typ string) bool {
 // up to depth levels deep (max 32) to prevent stack exhaustion on crafted input.
 func findBox(data []byte, boxType string, depth int) ([]byte, error) {
 	if depth > 32 {
-		return nil, errors.New("heif: findBox: exceeded maximum nesting depth")
+		return nil, ErrMaxNestingDepth
 	}
 	pos := 0
 	for pos < len(data) {

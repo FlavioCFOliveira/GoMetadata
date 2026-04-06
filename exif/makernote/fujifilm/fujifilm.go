@@ -58,7 +58,6 @@ package fujifilm
 
 import (
 	"encoding/binary"
-	"errors"
 )
 
 // Tag IDs for Fujifilm MakerNote IFD entries.
@@ -103,10 +102,10 @@ type Parser struct{}
 // Returns an error if the magic prefix is absent or the payload is too short.
 func (Parser) Parse(b []byte) (map[uint16][]byte, error) {
 	if len(b) < minLength {
-		return nil, errors.New("fujifilm: makernote too short")
+		return nil, ErrMakerNoteTooShort
 	}
 	if string(b[:8]) != magic {
-		return nil, errors.New("fujifilm: invalid magic")
+		return nil, ErrInvalidMagic
 	}
 	// IFD offset at [12..15] is LE uint32 relative to b[0].
 	ifdOffset := binary.LittleEndian.Uint32(b[12:16])

@@ -61,7 +61,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, fmt.Errorf("webp: read header: %w", err)
 	}
 	if string(hdr[:4]) != "RIFF" || string(hdr[8:12]) != "WEBP" {
-		return nil, nil, nil, errors.New("webp: not a WebP file")
+		return nil, nil, nil, ErrNotWebP
 	}
 
 	rawEXIF, rawXMP, err = readWebPChunks(r)
@@ -100,7 +100,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 		return fmt.Errorf("webp: read: %w", err)
 	}
 	if len(original) < 12 {
-		return errors.New("webp: file too short")
+		return ErrFileTooShort
 	}
 
 	body := buildWebPBody(original, rawEXIF, rawXMP)

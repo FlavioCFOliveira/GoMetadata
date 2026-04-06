@@ -2,7 +2,6 @@ package xmp
 
 import (
 	"bytes"
-	"errors"
 	"strings"
 	"sync"
 	"unsafe"
@@ -417,7 +416,7 @@ func skipSpecialTag(b []byte, pos int) (newPos int, skipped bool) {
 func parseStartTag(b []byte, pos int, p *rdfParser) (newPos int, err error) {
 	p.depth++
 	if p.depth > 100 {
-		return 0, errors.New("xmp: XML nesting depth exceeded 100 levels")
+		return 0, ErrXMLNestingDepth
 	}
 
 	// Parse the tag name: [prefix:]local.

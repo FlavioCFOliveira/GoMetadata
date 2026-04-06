@@ -11,7 +11,6 @@
 package xmp
 
 import (
-	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -32,7 +31,7 @@ type XMP struct {
 // treated as the xmpmeta/RDF body directly.
 func Parse(b []byte) (*XMP, error) {
 	if len(b) == 0 {
-		return nil, errors.New("xmp: empty input")
+		return nil, ErrEmptyInput
 	}
 
 	x := &XMP{Properties: make(map[string]map[string]string)}
@@ -304,14 +303,14 @@ func (x *XMP) firstValue(ns, local string) string {
 // where R is N/S (latitude) or E/W (longitude).
 func parseXMPGPS(s string) (float64, error) {
 	if len(s) < 2 {
-		return 0, fmt.Errorf("xmp: GPS value too short: %q", s)
+		return 0, fmt.Errorf("xmp: GPS value too short: %q: %w", s, ErrGPSValueTooShort)
 	}
 	ref := string(s[len(s)-1])
 	s = s[:len(s)-1]
 
 	parts := strings.Split(s, ",")
 	if len(parts) < 2 {
-		return 0, fmt.Errorf("xmp: invalid GPS format: %q", s)
+		return 0, fmt.Errorf("xmp: invalid GPS format: %q: %w", s, ErrInvalidGPSFormat)
 	}
 
 	deg, err := strconv.ParseFloat(parts[0], 64)

@@ -88,7 +88,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, fmt.Errorf("png: read signature: %w", err)
 	}
 	if sig != pngSig {
-		return nil, nil, nil, errors.New("png: invalid signature")
+		return nil, nil, nil, ErrInvalidSignature
 	}
 
 	for {
@@ -331,7 +331,7 @@ func extractXMPFromITXt(data []byte) ([]byte, error) {
 
 	// Compressed iTXt: decompress using zlib (compMethod 0 = deflate, PNG §11.3.4).
 	if compMethod != 0 {
-		return nil, fmt.Errorf("png: compressed XMP: unsupported compression method %d", compMethod)
+		return nil, fmt.Errorf("png: compressed XMP: unsupported compression method %d: %w", compMethod, ErrUnsupportedCompression)
 	}
 	dec, err := zlibDecompress(text)
 	if err != nil {
@@ -373,7 +373,7 @@ func extractXMPFromZTxt(data []byte) ([]byte, error) {
 	compMethod := data[pos]
 	pos++
 	if compMethod != 0 {
-		return nil, fmt.Errorf("png: zTXt XMP: unsupported compression method %d", compMethod)
+		return nil, fmt.Errorf("png: zTXt XMP: unsupported compression method %d: %w", compMethod, ErrUnsupportedCompression)
 	}
 	dec, err := zlibDecompress(data[pos:])
 	if err != nil {

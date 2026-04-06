@@ -6,7 +6,6 @@ package rw2
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 
@@ -28,7 +27,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, fmt.Errorf("rw2: read: %w", err)
 	}
 	if !bytes.HasPrefix(data, rw2Magic) {
-		return nil, nil, nil, errors.New("rw2: invalid magic bytes")
+		return nil, nil, nil, ErrInvalidMagic
 	}
 
 	// Patch bytes 2-3 to standard TIFF LE magic.
@@ -64,7 +63,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 		return fmt.Errorf("rw2: read: %w", err)
 	}
 	if !bytes.HasPrefix(data, rw2Magic) {
-		return errors.New("rw2: invalid magic bytes")
+		return ErrInvalidMagic
 	}
 
 	// Patch bytes 2-3 to standard TIFF LE magic so tiff.Inject works.
@@ -81,7 +80,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 
 	out := buf.Bytes()
 	if len(out) < 4 {
-		return errors.New("rw2: output too short")
+		return ErrOutputTooShort
 	}
 	// Restore RW2 magic ("IIU\x00") in the output.
 	out[2] = rw2Magic[2]

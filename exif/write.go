@@ -2,7 +2,6 @@ package exif
 
 import (
 	"encoding/binary"
-	"errors"
 )
 
 // serialise encodes e to a raw EXIF byte stream beginning with the TIFF
@@ -24,7 +23,7 @@ import (
 //     type codes must re-inject that data after calling Encode.
 func serialise(e *EXIF) ([]byte, error) {
 	if e == nil {
-		return nil, errors.New("exif: cannot encode nil EXIF")
+		return nil, ErrNilEXIF
 	}
 
 	order := e.ByteOrder

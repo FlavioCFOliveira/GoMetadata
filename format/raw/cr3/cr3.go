@@ -6,7 +6,6 @@ package cr3
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 )
@@ -70,7 +69,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 
 	moovData := findBox(data, "moov", 0)
 	if moovData == nil {
-		return nil, nil, nil, errors.New("cr3: no moov box found")
+		return nil, nil, nil, ErrNoMoovBox
 	}
 
 	uuidData := findUUIDBox(moovData, canonUUID)

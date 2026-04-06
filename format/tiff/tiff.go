@@ -5,7 +5,6 @@ package tiff
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 
@@ -25,7 +24,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, fmt.Errorf("tiff: read: %w", err)
 	}
 	if len(data) < 8 {
-		return nil, nil, nil, errors.New("tiff: file too short")
+		return nil, nil, nil, ErrFileTooShort
 	}
 
 	order, err := byteOrder(data)
@@ -136,7 +135,7 @@ func byteOrder(b []byte) (binary.ByteOrder, error) {
 	case b[0] == 'M' && b[1] == 'M':
 		return binary.BigEndian, nil
 	}
-	return nil, fmt.Errorf("tiff: invalid byte order marker %q", b[:2])
+	return nil, fmt.Errorf("tiff: invalid byte order marker %q: %w", b[:2], ErrInvalidByteOrder)
 }
 
 // extractTagValues scans IFD0 for IPTC (0x83BB) and XMP (0x02BC) tags

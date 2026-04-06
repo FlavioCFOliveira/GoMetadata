@@ -139,7 +139,7 @@ func maybeReassembleXMP(rawXMP []byte, extended map[string][]extChunk) []byte {
 // JPEG ISO/IEC 10918-1 §B.1.1.3.
 func readSOI(soi []byte) error {
 	if soi[0] != 0xFF || soi[1] != markerSOI {
-		return fmt.Errorf("jpeg: not a JPEG file (SOI 0x%04X)", uint16(soi[0])<<8|uint16(soi[1]))
+		return fmt.Errorf("jpeg: not a JPEG file (SOI 0x%04X): %w", uint16(soi[0])<<8|uint16(soi[1]), ErrNotJPEG)
 	}
 	return nil
 }
@@ -212,7 +212,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 // APP1 length field is 16-bit; JPEG ISO/IEC 10918-1 and EXIF §4.5.4.
 func writeEXIFSegment(w io.Writer, rawEXIF []byte) error {
 	if len(identExif)+len(rawEXIF)+2 > 65535 {
-		return fmt.Errorf("jpeg: EXIF payload %d bytes exceeds APP1 segment limit; EXIF cannot be split", len(rawEXIF))
+		return fmt.Errorf("jpeg: EXIF payload %d bytes exceeds APP1 segment limit; EXIF cannot be split: %w", len(rawEXIF), ErrEXIFPayloadTooLarge)
 	}
 	exifBuf := iobuf.Get(len(identExif) + len(rawEXIF))
 	copy(*exifBuf, identExif)
@@ -244,7 +244,7 @@ func writeXMPSegments(w io.Writer, rawXMP []byte) error {
 func writeIPTCSegment(w io.Writer, rawIPTC []byte) error {
 	irb := buildIRB(rawIPTC)
 	if len(identPS)+len(irb)+2 > 65535 {
-		return fmt.Errorf("jpeg: IPTC IRB payload %d bytes exceeds APP13 segment limit", len(irb))
+		return fmt.Errorf("jpeg: IPTC IRB payload %d bytes exceeds APP13 segment limit: %w", len(irb), ErrIPTCPayloadTooLarge)
 	}
 	iptcBuf := iobuf.Get(len(identPS) + len(irb))
 	copy(*iptcBuf, identPS)
@@ -367,7 +367,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 		return fmt.Errorf("jpeg: read SOI: %w", err)
 	}
 	if soi[0] != 0xFF || soi[1] != markerSOI {
-		return errors.New("jpeg: not a JPEG file")
+		return ErrNotJPEG
 	}
 	if _, err := w.Write(soi[:]); err != nil {
 		return fmt.Errorf("jpeg: write segment: %w", err)
@@ -429,7 +429,7 @@ func writeExtendedXMP(w io.Writer, rawXMP []byte) error {
 	if len(mainXMP) > maxXMPPayload {
 		// This cannot happen in practice — the template is ~200 bytes — but
 		// guard defensively so the error is actionable rather than silent.
-		return fmt.Errorf("jpeg: extended XMP: main XMP stub (%d bytes) exceeds APP1 limit", len(mainXMP))
+		return fmt.Errorf("jpeg: extended XMP: main XMP stub (%d bytes) exceeds APP1 limit: %w", len(mainXMP), ErrXMPStubTooLarge)
 	}
 
 	// Step 3: write main APP1.
@@ -638,7 +638,7 @@ func readSegment(r io.Reader, scratch *[]byte) (marker byte, data []byte, err er
 		return 0, nil, fmt.Errorf("jpeg: read segment header: %w", err)
 	}
 	if hdr[0] != 0xFF {
-		return 0, nil, fmt.Errorf("jpeg: expected marker prefix 0xFF, got 0x%02X", hdr[0])
+		return 0, nil, fmt.Errorf("jpeg: expected marker prefix 0xFF, got 0x%02X: %w", hdr[0], ErrInvalidMarkerPrefix)
 	}
 	// Skip fill bytes (consecutive 0xFF).
 	if skipErr := skipFillBytes(r, hdr); skipErr != nil {
@@ -657,7 +657,7 @@ func readSegment(r io.Reader, scratch *[]byte) (marker byte, data []byte, err er
 	}
 	length := int(binary.BigEndian.Uint16(lenB))
 	if length < 2 {
-		return 0, nil, fmt.Errorf("jpeg: marker 0x%02X has invalid length %d", marker, length)
+		return 0, nil, fmt.Errorf("jpeg: marker 0x%02X has invalid length %d: %w", marker, length, ErrInvalidMarkerLength)
 	}
 
 	need := length - 2
@@ -677,7 +677,7 @@ func readSegment(r io.Reader, scratch *[]byte) (marker byte, data []byte, err er
 func writeSegment(w io.Writer, marker byte, data []byte) error {
 	length := len(data) + 2 // length field includes its own 2 bytes
 	if length > 65535 {
-		return fmt.Errorf("jpeg: segment 0x%02X payload %d bytes exceeds 65535-byte APP segment limit", marker, len(data))
+		return fmt.Errorf("jpeg: segment 0x%02X payload %d bytes exceeds 65535-byte APP segment limit: %w", marker, len(data), ErrSegmentTooLarge)
 	}
 	hdr := [4]byte{0xFF, marker, byte(length >> 8), byte(length)} //nolint:gosec // G115: JPEG segment length ≤ 65535 per format spec
 	if _, err := w.Write(hdr[:]); err != nil {

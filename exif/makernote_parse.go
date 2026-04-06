@@ -172,7 +172,7 @@ func parseNikonMakerNote(b []byte) *IFD {
 //
 // Sony Alpha (ILCE/ILCA/SLT) and Cybershot MakerNote structure:
 // Plain TIFF IFD at offset 0, parent byte order. No magic prefix.
-// (Sony DSLR-A100 and later; ExifTool Sony.pm)
+// (Sony DSLR-A100 and later; ExifTool Sony.pm).
 func parseSonyMakerNote(b []byte, order binary.ByteOrder) *IFD {
 	if len(b) < 6 {
 		return nil

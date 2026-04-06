@@ -1,7 +1,6 @@
 package gometadata
 
 import (
-	"errors"
 	"time"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
@@ -60,10 +59,10 @@ func (m *Metadata) Validate() error {
 		return &UnsupportedFormatError{}
 	}
 	if m.EXIF != nil && m.EXIF.IFD0 == nil {
-		return errors.New("gometadata: EXIF struct has nil IFD0; use exif.Parse to construct a valid EXIF")
+		return ErrNilIFD0
 	}
 	if m.XMP != nil && m.XMP.Properties == nil {
-		return errors.New("gometadata: XMP struct has nil Properties map")
+		return ErrNilXMPProperties
 	}
 	return nil
 }
@@ -279,16 +278,22 @@ func (m *Metadata) Software() string {
 // DateTime returns the general date/time the image was last changed (IFD0 DateTime).
 // Source: EXIF only (tag 0x0132). ok is false when not present.
 func (m *Metadata) DateTime() (time.Time, bool) {
-	if m.EXIF != nil && m.EXIF.IFD0 != nil {
-		if e := m.EXIF.IFD0.Get(exif.TagDateTime); e != nil {
-			if v := e.String(); v != "" {
-				if t, err := time.Parse("2006:01:02 15:04:05", v); err == nil {
-					return t, true
-				}
-			}
-		}
+	if m.EXIF == nil || m.EXIF.IFD0 == nil {
+		return time.Time{}, false
 	}
-	return time.Time{}, false
+	e := m.EXIF.IFD0.Get(exif.TagDateTime)
+	if e == nil {
+		return time.Time{}, false
+	}
+	v := e.String()
+	if v == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse("2006:01:02 15:04:05", v)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 // WhiteBalance returns the white balance mode from ExifIFD tag 0xA403.
