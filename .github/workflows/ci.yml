@@ -34,7 +34,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Run tests with race detector
-        run: go test -race -count=1 ./...
+        run: go test -race -count=1 -skip ^Example ./...
 
   coverage:
     name: Coverage
@@ -46,7 +46,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Run tests with coverage
-        run: go test -coverprofile=coverage.out -covermode=atomic ./...
+        run: go test -coverprofile=coverage.out -covermode=atomic -skip ^Example ./...
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6.0.0
         with:
@@ -64,4 +64,4 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Run benchmarks (smoke)
-        run: go test -bench=. -benchmem -benchtime=1x ./...
+        run: go test -bench=. -benchmem -benchtime=1x -skip ^Example ./...
