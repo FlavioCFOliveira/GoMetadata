@@ -404,3 +404,26 @@ func BenchmarkHEIFExtract(b *testing.B) {
 		_, _, _, _ = Extract(bytes.NewReader(data))
 	}
 }
+
+// BenchmarkHEIFInject measures the full Inject path for a HEIF stream:
+// parse ftyp + meta boxes, locate iloc extents, rewrite item data offsets,
+// and stream the updated ISOBMFF to the output. The synthetic input carries
+// one EXIF item so that the iloc-patching and item-rewrite paths are exercised.
+// io.Discard is used as the writer so that output-buffer growth is not timed.
+func BenchmarkHEIFInject(b *testing.B) {
+	exifData := minimalTIFFExif()
+	data := buildHEIF(exifData, nil)
+	newEXIF := append(exifData[:len(exifData)-4:len(exifData)-4], 'B', 'E', 'N', 'C')
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = Inject(bytes.NewReader(data), nopWriter{}, newEXIF, nil, nil)
+	}
+}
+
+// nopWriter is an io.Writer that discards all bytes without allocating. It is
+// used by benchmarks to avoid measuring output-buffer growth.
+type nopWriter struct{}
+
+func (nopWriter) Write(p []byte) (int, error) { return len(p), nil }

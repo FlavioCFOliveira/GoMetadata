@@ -362,14 +362,17 @@ func asciiValue(s string) []byte {
 
 // --- helpers used by encode ---
 
-// filterEntries returns a copy of ifd.Entries with the given tags removed.
+// filterEntries returns a copy of ifd.Entries with the given tags removed,
+// with capacity extended by extraCap to allow callers to append without
+// triggering a reallocation.
+//
 // All callers pass at most 3 tags, so a linear scan over the exclude slice
 // is cheaper than a map allocation (no heap escape, no hashing overhead).
 //
 // Fast path: when none of the excluded tags are present (checked via binary
 // search) the function still returns a copy because callers append to the
 // result — returning the original slice would corrupt the source IFD.
-func filterEntries(ifd *IFD, exclude ...TagID) []IFDEntry {
+func filterEntries(ifd *IFD, extraCap int, exclude ...TagID) []IFDEntry {
 	if ifd == nil {
 		return nil
 	}
@@ -383,12 +386,13 @@ func filterEntries(ifd *IFD, exclude ...TagID) []IFDEntry {
 		}
 	}
 	if !anyPresent {
-		// No excluded tags present — return a copy (callers may append to result).
-		out := make([]IFDEntry, len(ifd.Entries))
+		// No excluded tags present — return a copy with extraCap spare slots so
+		// callers can append without triggering a reallocation.
+		out := make([]IFDEntry, len(ifd.Entries), len(ifd.Entries)+extraCap)
 		copy(out, ifd.Entries)
 		return out
 	}
-	result := make([]IFDEntry, 0, len(ifd.Entries))
+	result := make([]IFDEntry, 0, len(ifd.Entries)+extraCap)
 	for _, entry := range ifd.Entries {
 		if !slices.Contains(exclude, entry.Tag) {
 			result = append(result, entry)

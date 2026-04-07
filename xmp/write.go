@@ -128,7 +128,6 @@ func writeSimpleProperty(buf *bytes.Buffer, prefix, local, val string) {
 // or Bag) is determined by collectionType(ns, local) per ISO 16684-1 §7.5.
 // For Alt collections, items may carry an xml:lang prefix encoded as "lang|value".
 func writeMultiValuedProperty(buf *bytes.Buffer, prefix, ns, local, val string) {
-	values := strings.Split(val, "\x1e")
 	ctype := collectionType(ns, local)
 	buf.WriteString("   <")
 	buf.WriteString(prefix)
@@ -137,7 +136,18 @@ func writeMultiValuedProperty(buf *bytes.Buffer, prefix, ns, local, val string) 
 	buf.WriteString(">\n    <rdf:")
 	buf.WriteString(ctype)
 	buf.WriteString(">\n")
-	for _, v := range values {
+	// Zero-alloc iteration: uses strings.IndexByte instead of strings.Split to
+	// avoid a []string heap allocation on every call (mirrors the pattern in
+	// Keywords() in xmp.go).
+	start := 0
+	for {
+		end := strings.IndexByte(val[start:], '\x1e')
+		var v string
+		if end < 0 {
+			v = val[start:]
+		} else {
+			v = val[start : start+end]
+		}
 		if ctype == "Alt" {
 			// Preserve xml:lang if stored as "lang|value" (P1-H).
 			lang, altVal, hasLang := strings.Cut(v, "|")
@@ -155,6 +165,10 @@ func writeMultiValuedProperty(buf *bytes.Buffer, prefix, ns, local, val string) 
 			writeXMLEscaped(buf, v)
 		}
 		buf.WriteString("</rdf:li>\n")
+		if end < 0 {
+			break
+		}
+		start += end + 1
 	}
 	buf.WriteString("    </rdf:")
 	buf.WriteString(ctype)

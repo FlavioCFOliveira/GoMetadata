@@ -117,7 +117,7 @@ func writeSubIFDs(out []byte, e *EXIF, exifIFDEntries []IFDEntry, order binary.B
 // and returns a sorted slice. The placeholder values are patched later by
 // patchPointers once the target offsets are known.
 func buildIFD0Entries(e *EXIF, order binary.ByteOrder, exifPtrBuf, gpsPtrBuf *[4]byte) []IFDEntry {
-	entries := filterEntries(e.IFD0,
+	entries := filterEntries(e.IFD0, 2,
 		TagExifIFDPointer, TagGPSIFDPointer, TagInteropIFDPointer)
 
 	// Reserve pointer entries so ifdTotalSize accounts for them correctly.
@@ -149,7 +149,7 @@ func buildExifIFDEntries(e *EXIF, order binary.ByteOrder, interopPtrBuf *[4]byte
 	// Strip existing InteropIFD pointer; we will re-add it with a freshly
 	// computed offset when InteropIFD is present (EXIF §4.6.3, tag 0xA005
 	// lives in ExifIFD, not IFD0).
-	entries := filterEntries(e.ExifIFD, TagInteropIFDPointer)
+	entries := filterEntries(e.ExifIFD, 2, TagInteropIFDPointer)
 	if e.InteropIFD != nil {
 		entries = append(entries, IFDEntry{Tag: TagInteropIFDPointer, Type: TypeLong, Count: 1, Value: interopPtrBuf[:], byteOrder: order})
 	}

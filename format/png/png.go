@@ -70,10 +70,13 @@ func zlibDecompress(data []byte) ([]byte, error) {
 // processExtractChunk dispatches a single PNG chunk during Extract, updating
 // rawEXIF and rawXMP as appropriate. It returns (rawEXIF, rawXMP, done, err)
 // where done is true when IEND signals the end of the chunk stream.
+// data is backed by a pooled buffer; any slice that must outlive this call is
+// cloned here or in its callees before being returned as rawEXIF/rawXMP.
 func processExtractChunk(chunkType string, data, rawEXIF, rawXMP []byte) ([]byte, []byte, bool, error) {
 	switch chunkType {
 	case "eXIf":
-		return data, rawXMP, false, nil
+		// Clone: data is pooled and will be returned to the pool after this call.
+		return bytes.Clone(data), rawXMP, false, nil
 	case "iTXt", "tEXt", "zTXt":
 		xmp, err := handleXMPChunk(chunkType, data, rawXMP)
 		if err != nil {
@@ -100,21 +103,20 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, ErrInvalidSignature
 	}
 
-	for {
-		chunkType, data, rerr := readChunk(r)
+	var done bool
+	for !done {
+		rerr := readChunk(r, func(chunkType string, data []byte) error {
+			rawEXIF, rawXMP, done, err = processExtractChunk(chunkType, data, rawEXIF, rawXMP)
+			return err
+		})
 		if rerr != nil {
 			if errors.Is(rerr, io.EOF) {
 				break
 			}
 			return nil, nil, nil, rerr
 		}
-		var done bool
-		rawEXIF, rawXMP, done, err = processExtractChunk(chunkType, data, rawEXIF, rawXMP)
 		if err != nil {
 			return nil, nil, nil, err
-		}
-		if done {
-			return rawEXIF, nil, rawXMP, nil
 		}
 	}
 	return rawEXIF, nil, rawXMP, nil
@@ -189,6 +191,23 @@ func writeInjectChunk(w io.Writer, chunkType string, data, rawEXIF, rawXMP []byt
 	return chunkType == "IEND", nil
 }
 
+// injectChunk is the per-chunk callback used by Inject's readChunk loop.
+// It skips replacement targets, writes surviving chunks, and returns errPNGDone
+// when IEND has been written so the caller can break cleanly.
+func injectChunk(w io.Writer, chunkType string, data, rawEXIF, rawXMP []byte) error {
+	if shouldDropChunk(chunkType, data) {
+		return nil
+	}
+	done, err := writeInjectChunk(w, chunkType, data, rawEXIF, rawXMP)
+	if err != nil {
+		return err
+	}
+	if done {
+		return errPNGDone
+	}
+	return nil
+}
+
 // Inject reads the PNG chunk stream from r, replaces or inserts the eXIf and
 // iTXt(XMP) chunks, and writes the result to w. IPTC is not natively
 // supported in PNG; rawIPTC is ignored.
@@ -201,31 +220,24 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	if _, err := w.Write(pngSig[:]); err != nil {
 		return fmt.Errorf("png: write signature: %w", err)
 	}
-	// Skip signature in r.
-	if _, err := io.ReadFull(r, make([]byte, 8)); err != nil {
+	// Skip signature in r (stack-allocated; avoids the make([]byte,8) heap alloc).
+	var sig [8]byte
+	if _, err := io.ReadFull(r, sig[:]); err != nil {
 		return fmt.Errorf("png: read signature: %w", err)
 	}
 
 	for {
-		chunkType, data, err := readChunk(r)
+		err := readChunk(r, func(chunkType string, data []byte) error {
+			return injectChunk(w, chunkType, data, rawEXIF, rawXMP)
+		})
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break
 			}
+			if errors.Is(err, errPNGDone) {
+				return nil
+			}
 			return err
-		}
-
-		// Skip chunks we are replacing.
-		if shouldDropChunk(chunkType, data) {
-			continue
-		}
-
-		done, err := writeInjectChunk(w, chunkType, data, rawEXIF, rawXMP)
-		if err != nil {
-			return err
-		}
-		if done {
-			break
 		}
 	}
 	return nil
@@ -249,31 +261,47 @@ func writeMetadataAfterIHDR(w io.Writer, rawEXIF, rawXMP []byte) error {
 	return nil
 }
 
-// readChunk reads one PNG chunk and returns its type and data.
+// errPNGDone is a sentinel returned from the readChunk callback to signal that
+// Inject has written the final chunk (IEND) and the loop should stop cleanly.
+var errPNGDone = errors.New("png: inject complete")
+
+// readChunk reads one PNG chunk and calls fn(chunkType, data) with a slice
+// backed by a pooled buffer. fn must not retain data after returning; call
+// bytes.Clone inside fn if the data must outlive the call.
 // The CRC is consumed but not verified.
-func readChunk(r io.Reader) (chunkType string, data []byte, err error) {
+func readChunk(r io.Reader, fn func(chunkType string, data []byte) error) error {
 	var hdr [8]byte
-	if _, err = io.ReadFull(r, hdr[:]); err != nil {
-		return "", nil, fmt.Errorf("png: read chunk data: %w", err)
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return fmt.Errorf("png: read chunk header: %w", err)
 	}
 	length := int(binary.BigEndian.Uint32(hdr[:4]))
-	chunkType = string(hdr[4:8])
+	chunkType := string(hdr[4:8])
 
+	var fnErr error
 	if length > 0 {
 		buf := iobuf.Get(length)
-		if _, err = io.ReadFull(r, (*buf)[:length]); err != nil {
+		if _, err := io.ReadFull(r, (*buf)[:length]); err != nil {
 			iobuf.Put(buf)
-			return "", nil, fmt.Errorf("png: truncated chunk %q: %w", chunkType, err)
+			return fmt.Errorf("png: truncated chunk %q: %w", chunkType, err)
 		}
-		data = bytes.Clone((*buf)[:length])
+		fnErr = fn(chunkType, (*buf)[:length])
 		iobuf.Put(buf)
+	} else {
+		fnErr = fn(chunkType, nil)
 	}
+	if fnErr != nil {
+		// Consume CRC even on fn error so the stream stays in sync.
+		var crc [4]byte
+		_, _ = io.ReadFull(r, crc[:])
+		return fnErr
+	}
+
 	// Consume CRC (4 bytes) without verifying.
 	var crc [4]byte
-	if _, err = io.ReadFull(r, crc[:]); err != nil {
-		return "", nil, fmt.Errorf("png: read CRC for %q: %w", chunkType, err)
+	if _, err := io.ReadFull(r, crc[:]); err != nil {
+		return fmt.Errorf("png: read CRC for %q: %w", chunkType, err)
 	}
-	return chunkType, data, nil
+	return nil
 }
 
 // writeChunk writes a PNG chunk with a correct CRC-32 checksum (PNG §5.4).
@@ -340,7 +368,8 @@ func extractXMPFromITXt(data []byte) ([]byte, error) {
 	text := data[pos:]
 
 	if compFlag == 0 {
-		return text, nil
+		// Clone: text is a subslice of a pooled buffer; caller retains the result.
+		return bytes.Clone(text), nil
 	}
 
 	// Compressed iTXt: decompress using zlib (compMethod 0 = deflate, PNG §11.3.4).
@@ -367,7 +396,8 @@ func extractXMPFromTExt(data []byte) []byte {
 	if len(text) == 0 {
 		return nil
 	}
-	return text
+	// Clone: text is a subslice of a pooled buffer; caller retains the result.
+	return bytes.Clone(text)
 }
 
 // extractXMPFromZTxt extracts and decompresses XMP from a zTXt chunk if its

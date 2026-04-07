@@ -32,20 +32,20 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	}
 
 	// Patch bytes 2-3 to standard TIFF LE magic so the TIFF parser works.
-	patched := make([]byte, len(data))
-	copy(patched, data)
-	patched[2] = 0x2A
-	patched[3] = 0x00
+	// data is exclusively owned (returned by io.ReadAll), so in-place mutation
+	// is safe and avoids a full-file copy (RAW files can be tens of MB).
+	data[2] = 0x2A
+	data[3] = 0x00
 
-	if len(patched) < 8 {
-		return patched, nil, nil, nil
+	if len(data) < 8 {
+		return data, nil, nil, nil
 	}
 
 	order := binary.LittleEndian
-	rawEXIF = patched
+	rawEXIF = data
 
-	ifd0Off := order.Uint32(patched[4:])
-	rawIPTC, rawXMP = extractTIFFTags(patched, ifd0Off, order)
+	ifd0Off := order.Uint32(data[4:])
+	rawIPTC, rawXMP = extractTIFFTags(data, ifd0Off, order)
 	return rawEXIF, rawIPTC, rawXMP, nil
 }
 
@@ -65,14 +65,14 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	}
 
 	// Patch bytes 2-3 to standard TIFF LE magic so tiff.Inject works.
-	patched := make([]byte, len(data))
-	copy(patched, data)
-	patched[2] = 0x2A
-	patched[3] = 0x00
+	// data is exclusively owned (returned by io.ReadAll), so in-place mutation
+	// is safe and avoids a full-file copy (RAW files can be tens of MB).
+	data[2] = 0x2A
+	data[3] = 0x00
 
 	// Buffer the TIFF output so we can restore the ORF magic bytes.
 	var buf bytes.Buffer
-	if injectErr := tiff.Inject(bytes.NewReader(patched), &buf, rawEXIF, rawIPTC, rawXMP); injectErr != nil {
+	if injectErr := tiff.Inject(bytes.NewReader(data), &buf, rawEXIF, rawIPTC, rawXMP); injectErr != nil {
 		return fmt.Errorf("orf: inject: %w", injectErr)
 	}
 

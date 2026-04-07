@@ -412,13 +412,26 @@ func parseIlocFullItem(ilocData []byte, pos int, info ilocBoxInfo) (ilocFullItem
 // buildIlocBox serialises the iloc FullBox from info (field sizes) and the
 // given items (which may differ from info.items — e.g. with updated extents).
 func buildIlocBox(info ilocBoxInfo, items []ilocFullItem) []byte {
+	// Pre-compute body size to avoid realloc churn on the write path.
+	// Fixed header: 6 bytes (version[1] + flags[3] + two nibble-pair bytes).
+	// item-count field: 2 bytes for version < 2, 4 bytes for version >= 2.
+	itemCountWidth := 2
+	if info.version >= 2 {
+		itemCountWidth = 4
+	}
+	totalBody := 6 + itemCountWidth
+	for _, item := range items {
+		totalBody += ilocItemSize(item, info)
+	}
+
 	// FullBox: version(1) + flags(3), then field-size nibble-pair bytes.
 	// G115: nibble-packed fields; values are 0–8 so byte cast is safe.
-	body := []byte{
+	body := make([]byte, 0, totalBody)
+	body = append(body,
 		info.version, 0, 0, 0,
-		byte(info.offsetSize<<4 | info.lengthSize),    //nolint:gosec // G115: nibble-packed field, values are 0–8
-		byte(info.baseOffsetSize<<4 | info.indexSize), //nolint:gosec // G115: nibble-packed field, values are 0–8
-	}
+		byte(info.offsetSize<<4|info.lengthSize),    //nolint:gosec // G115: nibble-packed field, values are 0–8
+		byte(info.baseOffsetSize<<4|info.indexSize), //nolint:gosec // G115: nibble-packed field, values are 0–8
+	)
 
 	if info.version < 2 {
 		body = appendUintN(body, 2, uint64(len(items)))
@@ -434,6 +447,39 @@ func buildIlocBox(info ilocBoxInfo, items []ilocFullItem) []byte {
 	hdr = append(hdr, 0, 0, 0, 0, 'i', 'l', 'o', 'c')
 	binary.BigEndian.PutUint32(hdr, uint32(8+len(body))) //nolint:gosec // G115: ISOBMFF box size bounded by body length
 	return append(hdr, body...)
+}
+
+// ilocItemSize returns the exact byte length that appendIlocItem would write
+// for item given the encoding parameters in info. Used to pre-size the output
+// buffer in buildIlocBox, eliminating reallocation churn on the write path.
+//
+// ISO 14496-12 §8.11.3: mirrors the conditional field layout in appendIlocItem.
+func ilocItemSize(item ilocFullItem, info ilocBoxInfo) int {
+	size := 0
+	if info.version < 2 {
+		size += 2 // item_ID (16-bit)
+	} else {
+		size += 4 // item_ID (32-bit)
+	}
+	if info.version == 1 || info.version == 2 {
+		size += 2 // construction_method
+	}
+	if info.baseOffsetSize > 0 {
+		size += info.baseOffsetSize // base_offset
+	}
+	size += 2 // extent_count (always 16-bit)
+	for range item.extents {
+		if info.indexSize > 0 {
+			size += info.indexSize
+		}
+		if info.offsetSize > 0 {
+			size += info.offsetSize
+		}
+		if info.lengthSize > 0 {
+			size += info.lengthSize
+		}
+	}
+	return size
 }
 
 // appendIlocItem serialises one iloc item entry (version-specific ID width,
@@ -472,7 +518,25 @@ func appendIlocItem(body []byte, item ilocFullItem, info ilocBoxInfo) []byte {
 // metaContent except iloc, then appending newIloc.
 // versionFlags is the 4-byte FullBox version+flags field.
 func buildMetaBox(versionFlags, metaContent, newIloc []byte) []byte {
-	var body []byte
+	// Pre-compute body size to avoid realloc churn: one pass to sum non-iloc
+	// child boxes, then allocate once before the copy pass.
+	totalBody := 4 // version+flags
+	{
+		pos := 0
+		for pos < len(metaContent) {
+			size, typ, _, ok := parseHEIFBoxHeader(metaContent, pos)
+			if !ok {
+				break
+			}
+			if typ != "iloc" {
+				totalBody += int(size) //nolint:gosec // G115: box size bounded by file size
+			}
+			pos += int(size) //nolint:gosec // G115: box size bounded by file size
+		}
+	}
+	totalBody += len(newIloc)
+
+	body := make([]byte, 0, totalBody)
 	body = append(body, versionFlags...)
 
 	pos := 0
@@ -528,13 +592,28 @@ func patchAncestorSize(data []byte, metaAbsStart, delta int) {
 }
 
 // appendUintN appends v encoded as an n-byte big-endian integer to b.
+// Uses binary.BigEndian.AppendUint* for the standard ISOBMFF field widths
+// (1, 2, 4, 8) to avoid a temporary allocation; falls back to a generic
+// loop for non-standard widths (unreachable in normal HEIF parsing).
 func appendUintN(b []byte, n int, v uint64) []byte {
-	tmp := make([]byte, n)
-	for i := n - 1; i >= 0; i-- {
-		tmp[i] = byte(v)
-		v >>= 8
+	switch n {
+	case 1:
+		return append(b, byte(v)) //nolint:gosec // G115: value range controlled by caller
+	case 2:
+		return binary.BigEndian.AppendUint16(b, uint16(v)) //nolint:gosec // G115: value range controlled by caller
+	case 4:
+		return binary.BigEndian.AppendUint32(b, uint32(v)) //nolint:gosec // G115: value range controlled by caller
+	case 8:
+		return binary.BigEndian.AppendUint64(b, v)
+	default:
+		// Fallback for non-standard widths (not reached in normal HEIF parsing).
+		tmp := make([]byte, n)
+		for i := n - 1; i >= 0; i-- {
+			tmp[i] = byte(v)
+			v >>= 8
+		}
+		return append(b, tmp...)
 	}
-	return append(b, tmp...)
 }
 
 // ---------------------------------------------------------------------------
