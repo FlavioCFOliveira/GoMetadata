@@ -6,6 +6,43 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-04-07
+
+### Performance
+
+- **XMP GPS parse**: `strings.Split` replaced with `strings.Cut`; GPS coordinate parsing is now zero-allocation (`BenchmarkGPSParse`: 0 B/op, 0 allocs/op).
+- **XMP `Keywords`**: single-pass `strings.IndexByte` scan with `strings.Count`-pre-sized result slice replaces `strings.Split`; eliminates the intermediate `[]string` allocation per call.
+- **XMP `AddKeyword`**: `strings.Builder` with pre-grown capacity replaces string concatenation; one allocation instead of two per keyword append.
+- **XMP `SetGPS`**: `strconv.AppendFloat` into a `[32]byte` stack buffer replaces `fmt.Sprintf`; eliminates heap allocation and `fmt` reflection overhead per GPS encode.
+- **XMP `writeMultiValuedProperty`**: `strings.IndexByte` loop replaces `strings.Split`; the `[]string` allocation on every multi-valued property encode is eliminated.
+- **XMP packet scanner**: `[]byte("?>")` literals extracted to package-level variables; no heap allocation on every `Scan` call.
+- **XMP RDF parser**: per-call `[]byte("-->")` and `[]byte("?>")` literals extracted to package-level; `rdf:Alt` item concatenation uses a pooled `strings.Builder`; named-entity comparison uses `switch string(ref)` (compiler-optimised zero-alloc path).
+- **IPTC ISO-8859-1 decoder**: per-call `charmap.ISO8859_1.NewDecoder()` replaced with a `sync.Pool`; decoder is `Reset()` before each use.
+- **HEIF write path**: `buildIlocBox` and `buildMetaBox` now measure required length in a first pass and allocate a single pre-sized output buffer, eliminating incremental `append` reallocs; `appendUintN` uses `binary.BigEndian.AppendUint16/32/64` instead of `make([]byte, n)` per field.
+- **JPEG segment copy**: all four `append([]byte(nil), ...)` call sites replaced with `bytes.Clone`.
+- **PNG write path**: `crc32.NewIEEE()` pooled via `sync.Pool` to avoid per-chunk hash allocation; 8-byte chunk header stack-allocated (`[8]byte` instead of `make([]byte, 8)`).
+- **PNG read path**: `readChunk` refactored to a callback pattern; the pooled buffer is passed directly to the callback without cloning in the common (non-retained) path, saving one allocation and one copy per pass-through chunk.
+- **WebP write path**: `bytes.Buffer` in `buildWebPBody` pooled via `sync.Pool`; 4-byte RIFF chunk size field stack-allocated.
+- **ORF/RW2 write path**: only the 4-byte magic header is patched in-place on the `io.ReadAll`-owned slice; the previous full-file copy is eliminated.
+- **EXIF `filterEntries`**: accepts an `extraCap` argument to pre-size the result slice, avoiding a realloc when `buildIFD0Entries` appends trailing entries.
+- **`internal/bmff`**: `Box.Equal([4]byte) bool` added for zero-alloc box type comparison.
+- **`internal/riff`**: `Chunk.Equal([4]byte) bool` added for zero-alloc FourCC comparison.
+- **XMP date layouts**: inline `[]string` literal in `metadata.DateTime()` hoisted to a package-level `[3]string` array, eliminating the per-call slice header allocation.
+
+### Changed
+
+- All packages now define package-level sentinel error variables (`ErrXxx`) for every error previously constructed inline with `errors.New` or `fmt.Errorf`; callers can now use `errors.Is` for reliable error identity checks. Affected packages: `exif`, `format/heif`, `format/jpeg`, `format/png`, `format/tiff`, `format/webp`, `format/raw/cr3`, `format/raw/orf`, `format/raw/rw2`, `xmp`, and the top-level package.
+- Import ordering enforced across all files (`gci` linter, stdlib → external → internal grouping).
+- `t.Parallel()` added to all table-driven tests and `t.Run` callbacks across all 43 test files; the entire test suite now runs with maximum parallelism under `go test -race ./...`.
+- Linter suite expanded by five additional rules: `err113` (no inline error construction), `godot` (comment punctuation), `nestif` (nesting depth ≤ 4), `godox` (no TODO/FIXME/HACK comments), `gci` (import ordering), `paralleltest`/`tparallel` (parallel test enforcement), and `funlen` (function length ≤ 80 lines / 60 statements).
+- `metadata.DateTime()` refactored from four levels of nesting to guard clauses (cyclomatic complexity reduced from 6 to 1; behaviour unchanged).
+
+### Fixed
+
+- **`sync.Pool` use-after-put race in `format/detect.go`**: `mapMakeToFormat` was called after `tiffScanPool.Put(buf)` despite `makeRaw` being a subslice of the pooled buffer; reordered to call `mapMakeToFormat` before `Put`.
+- **`sync.Pool` use-after-put race in `format/heif/heif.go`**: `extractFromMetaData` was called after `iobuf.Put(hdrPtr)` despite `metaData` being a subslice of the pooled buffer; reordered likewise.
+- **PNG data lifetime bug**: `eXIf`, `tEXt`, and `iTXt` chunk handlers in `readChunk` were retaining references to a pooled buffer slice without cloning; the callback-pattern refactor ensures retained data is always copied from the pool before the buffer is returned.
+
 ## [1.0.1] - 2026-04-06
 
 ### Changed
@@ -57,6 +94,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ---
 
-[Unreleased]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/FlavioCFOliveira/GoMetadata/releases/tag/v1.0.0
