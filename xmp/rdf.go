@@ -35,6 +35,13 @@ var liPool = sync.Pool{New: func() any { //nolint:gochecknoglobals // sync.Pool:
 // They are only taken from the pool when the input actually contains '&'.
 var builderPool = sync.Pool{New: func() any { return &strings.Builder{} }} //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
 
+// commentClose and piEnd are package-level byte slices for XML structural
+// terminators. Declared here to avoid heap-allocating []byte literals inside
+// skipComment and skipPI on every call (each []byte("...") literal in a
+// function body escapes to the heap).
+var commentClose = []byte("-->") //nolint:gochecknoglobals // immutable sentinel; avoids per-call []byte literal heap allocation
+var piEnd = []byte("?>")         //nolint:gochecknoglobals // immutable sentinel; avoids per-call []byte literal heap allocation
+
 // rdfParser holds all mutable state for a single parseRDF invocation.
 // Bundling state into a struct allows the three dispatch methods (onStartElement,
 // onEndElement, onCharData) to be extracted cleanly, reducing cyclomatic
@@ -314,7 +321,20 @@ func (p *rdfParser) onCharDataStructField(s string) {
 // Compliance: XMP Part 1 §C.2.5 (P1-H).
 func (p *rdfParser) onCharDataListItem(s string) {
 	if p.liLang != "" && p.liLang != "x-default" {
-		*p.liVals = append(*p.liVals, p.liLang+"|"+s)
+		// Build "lang|value" with a single allocation rather than two.
+		// The two-step `p.liLang+"|"+s` first allocates for the intermediate
+		// `p.liLang+"|"` string, then allocates again for the full concatenation.
+		// strings.Builder with Grow produces exactly one allocation (the final string).
+		bld := builderPool.Get().(*strings.Builder) //nolint:forcetypeassert,revive // builderPool.New always stores *strings.Builder; pool invariant
+		bld.Reset()
+		bld.Grow(len(p.liLang) + 1 + len(s))
+		bld.WriteString(p.liLang)
+		bld.WriteByte('|')
+		bld.WriteString(s)
+		result := bld.String()
+		bld.Reset()
+		builderPool.Put(bld)
+		*p.liVals = append(*p.liVals, result)
 	} else {
 		*p.liVals = append(*p.liVals, s)
 	}
@@ -358,7 +378,9 @@ func (p *rdfParser) onCharData(s string) {
 // skipComment advances pos past an XML comment construct <!-- ... -->.
 // b[pos] must be '!' at entry. Returns the updated position.
 func skipComment(b []byte, pos int) int {
-	end := bytes.Index(b[pos:], []byte("-->"))
+	// Use package-level commentClose to avoid heap-allocating a []byte literal
+	// on every call (the literal form []byte("-->") escapes to heap).
+	end := bytes.Index(b[pos:], commentClose)
 	if end < 0 {
 		return len(b) // unterminated — skip to end
 	}
@@ -368,7 +390,9 @@ func skipComment(b []byte, pos int) int {
 // skipPI advances pos past an XML processing instruction <? ... ?>.
 // b[pos] must be '?' at entry. Returns the updated position.
 func skipPI(b []byte, pos int) int {
-	end := bytes.Index(b[pos:], []byte("?>"))
+	// Use package-level piEnd to avoid heap-allocating a []byte literal
+	// on every call (the literal form []byte("?>") escapes to heap).
+	end := bytes.Index(b[pos:], piEnd)
 	if end < 0 {
 		return len(b)
 	}
@@ -784,27 +808,51 @@ func decodeCharRef(ref []byte, bld *strings.Builder) bool {
 // bld. ref is the content between '&' and ';' (e.g., []byte("amp") or
 // []byte("#65")). Handles the five predefined entities, decimal and hex numeric
 // character references, and unknown entities (emitted literally as &ref;).
+//
+// Named-entity lookup is delegated to decodeNamedEntity, which switches on
+// length and compares individual bytes directly — zero-alloc. The previous
+// bytes.Equal(ref, []byte("amp")) form allocated a []byte literal on the heap
+// on every call.
 func decodeEntity(ref []byte, bld *strings.Builder) {
-	switch {
-	case bytes.Equal(ref, []byte("amp")):
-		bld.WriteByte('&')
-	case bytes.Equal(ref, []byte("lt")):
-		bld.WriteByte('<')
-	case bytes.Equal(ref, []byte("gt")):
-		bld.WriteByte('>')
-	case bytes.Equal(ref, []byte("quot")):
-		bld.WriteByte('"')
-	case bytes.Equal(ref, []byte("apos")):
-		bld.WriteByte('\'')
-	case len(ref) > 1 && ref[0] == '#':
+	if len(ref) > 1 && ref[0] == '#' {
 		// Numeric character reference: &#N; or &#xHH;
 		decodeCharRef(ref[1:], bld)
-	default:
-		// Unknown entity — emit the original reference.
-		bld.WriteByte('&')
-		bld.Write(ref)
-		bld.WriteByte(';')
+		return
 	}
+	if decodeNamedEntity(ref, bld) {
+		return
+	}
+	// Unknown entity — emit the original reference.
+	bld.WriteByte('&')
+	bld.Write(ref)
+	bld.WriteByte(';')
+}
+
+// decodeNamedEntity writes the single character for one of the five predefined
+// XML named entities (&amp; &lt; &gt; &quot; &apos;) to bld.
+// Returns true if ref matched a predefined entity, false otherwise.
+//
+// The Go compiler optimises switch string(ref) { case "amp": ... } to a zero-alloc
+// byte comparison when the switch operand is a []byte-to-string conversion and the
+// cases are string literals. This avoids both the []byte literal heap allocation of
+// bytes.Equal(ref, []byte("amp")) and the cyclomatic complexity of a manual
+// length+byte-index dispatch.
+func decodeNamedEntity(ref []byte, bld *strings.Builder) bool {
+	switch string(ref) {
+	case "amp":
+		bld.WriteByte('&')
+	case "lt":
+		bld.WriteByte('<')
+	case "gt":
+		bld.WriteByte('>')
+	case "quot":
+		bld.WriteByte('"')
+	case "apos":
+		bld.WriteByte('\'')
+	default:
+		return false
+	}
+	return true
 }
 
 // parseHex parses a hexadecimal rune reference (without the leading "x").

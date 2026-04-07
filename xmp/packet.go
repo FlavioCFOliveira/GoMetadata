@@ -10,6 +10,11 @@ var packetHeader = []byte("<?xpacket begin=") //nolint:gochecknoglobals // packa
 // avoids false termination on processing instructions inside the XMP body.
 var xpacketClose = []byte("<?xpacket end=") //nolint:gochecknoglobals // package-level constant bytes
 
+// xmlPIEnd is the two-byte terminator of an XML processing instruction ("?>").
+// Declared at package level to avoid heap-allocating the []byte literal on
+// every Scan call (each []byte("?>") in a function body escapes to the heap).
+var xmlPIEnd = []byte("?>") //nolint:gochecknoglobals // immutable sentinel; avoids per-call []byte literal heap allocation
+
 // Scan locates the XMP packet boundaries within b and returns the slice that
 // spans from the opening <?xpacket begin=…?> to the closing <?xpacket end=…?>.
 // Returns nil if no packet is found.
@@ -19,7 +24,8 @@ func Scan(b []byte) []byte {
 		return nil
 	}
 	// Find the end of the opening processing instruction (first ?> after start).
-	openEnd := bytes.Index(b[start:], []byte("?>"))
+	// xmlPIEnd is used instead of a []byte literal to avoid a heap allocation.
+	openEnd := bytes.Index(b[start:], xmlPIEnd)
 	if openEnd < 0 {
 		return nil
 	}
@@ -34,7 +40,8 @@ func Scan(b []byte) []byte {
 	}
 	closeStart := openEnd + tail
 	// Find the ?> that terminates the closing PI.
-	closeEnd := bytes.Index(b[closeStart:], []byte("?>"))
+	// xmlPIEnd is used instead of a []byte literal to avoid a heap allocation.
+	closeEnd := bytes.Index(b[closeStart:], xmlPIEnd)
 	if closeEnd < 0 {
 		return nil
 	}

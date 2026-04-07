@@ -131,6 +131,10 @@ func (x *XMP) LensModel() string {
 
 // Keywords returns the dc:subject values (XMP §8.3).
 // dc:subject is an unordered bag; each item is returned as a separate string.
+//
+// This implementation avoids strings.Split's []string allocation by doing a
+// single-pass scan with strings.IndexByte. strings.Count pre-sizes the result
+// slice in O(n) without allocating.
 func (x *XMP) Keywords() []string {
 	if x == nil {
 		return nil
@@ -140,12 +144,19 @@ func (x *XMP) Keywords() []string {
 		return nil
 	}
 	// Multi-valued properties are joined with U+001E (record separator).
-	parts := strings.Split(v, "\x1e")
-	result := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if p != "" {
-			result = append(result, p)
+	result := make([]string, 0, strings.Count(v, "\x1e")+1)
+	for {
+		i := strings.IndexByte(v, '\x1e')
+		if i < 0 {
+			if v != "" {
+				result = append(result, v)
+			}
+			break
 		}
+		if i > 0 {
+			result = append(result, v[:i])
+		}
+		v = v[i+1:]
 	}
 	return result
 }
@@ -179,13 +190,22 @@ func (x *XMP) SetCreator(s string) { x.putProp(NSdc, "creator", s) }
 // AddKeyword appends kw to dc:subject (XMP §8.3).
 // Multiple keywords are stored joined with U+001E (record separator), matching
 // the convention used by Keywords() and the RDF encoder.
+//
+// strings.Builder with pre-grown capacity replaces the two-step string
+// concatenation `existing+"\x1e"+kw`, which would allocate an intermediate
+// string for `existing+"\x1e"` before allocating the final result.
 func (x *XMP) AddKeyword(kw string) {
 	existing := x.getProp(NSdc, "subject")
 	if existing == "" {
 		x.putProp(NSdc, "subject", kw)
-	} else {
-		x.putProp(NSdc, "subject", existing+"\x1e"+kw)
+		return
 	}
+	var sb strings.Builder
+	sb.Grow(len(existing) + 1 + len(kw))
+	sb.WriteString(existing)
+	sb.WriteByte('\x1e')
+	sb.WriteString(kw)
+	x.putProp(NSdc, "subject", sb.String())
 }
 
 // SetCameraModel sets tiff:Model to s (XMP §8.4).
@@ -204,21 +224,36 @@ func (x *XMP) SetGPS(lat, lon float64) {
 	if x == nil {
 		return
 	}
-	formatCoord := func(coord float64, posRef, negRef string) string {
-		abs := coord
-		if abs < 0 {
-			abs = -abs
-		}
-		deg := math.Floor(abs)
-		decMin := (abs - deg) * 60
-		ref := posRef
-		if coord < 0 {
-			ref = negRef
-		}
-		return fmt.Sprintf("%.0f,%.6f%s", deg, decMin, ref)
+	x.putProp(NSexif, "GPSLatitude", formatGPSCoord(lat, 'N', 'S'))
+	x.putProp(NSexif, "GPSLongitude", formatGPSCoord(lon, 'E', 'W'))
+}
+
+// formatGPSCoord serialises a decimal-degree GPS coordinate to the XMP
+// "DDD,MM.mmmmmmR" format without using fmt.Sprintf.
+//
+// Using strconv.AppendFloat into a [32]byte stack buffer avoids the reflection
+// and heap allocation that fmt.Sprintf would incur. The final string(buf[:n])
+// conversion is the only allocation.
+func formatGPSCoord(coord float64, posRef, negRef byte) string {
+	abs := coord
+	if abs < 0 {
+		abs = -abs
 	}
-	x.putProp(NSexif, "GPSLatitude", formatCoord(lat, "N", "S"))
-	x.putProp(NSexif, "GPSLongitude", formatCoord(lon, "E", "W"))
+	deg := math.Floor(abs)
+	decMin := (abs - deg) * 60
+	ref := posRef
+	if coord < 0 {
+		ref = negRef
+	}
+	// Build into a stack-allocated [32]byte buffer.
+	// Worst case: "180,59.999999W" = 14 bytes — 32 bytes is ample.
+	var raw [32]byte
+	b := raw[:0]
+	b = strconv.AppendFloat(b, deg, 'f', 0, 64)
+	b = append(b, ',')
+	b = strconv.AppendFloat(b, decMin, 'f', 6, 64)
+	b = append(b, ref)
+	return string(b)
 }
 
 // SetLensModel sets aux:Lens to s (Adobe XMP Auxiliary namespace).
@@ -301,43 +336,50 @@ func (x *XMP) firstValue(ns, local string) string {
 //	"DDD,MM,SS.sssR"   — degrees, minutes, and seconds
 //
 // where R is N/S (latitude) or E/W (longitude).
+//
+// This implementation uses strings.IndexByte instead of strings.Split to avoid
+// allocating a []string slice for the comma-delimited parts.
 func parseXMPGPS(s string) (float64, error) {
 	if len(s) < 2 {
 		return 0, fmt.Errorf("xmp: GPS value too short: %q: %w", s, ErrGPSValueTooShort)
 	}
-	ref := string(s[len(s)-1])
+	ref := s[len(s)-1]
 	s = s[:len(s)-1]
 
-	parts := strings.Split(s, ",")
-	if len(parts) < 2 {
+	degStr, rest, ok := strings.Cut(s, ",")
+	if !ok {
 		return 0, fmt.Errorf("xmp: invalid GPS format: %q: %w", s, ErrInvalidGPSFormat)
 	}
 
-	deg, err := strconv.ParseFloat(parts[0], 64)
+	deg, err := strconv.ParseFloat(degStr, 64)
 	if err != nil {
 		return 0, fmt.Errorf("xmp: GPS degrees: %w", err)
 	}
 
+	minsStr, secStr, hasSeconds := strings.Cut(rest, ",")
+
 	var result float64
-	if len(parts) == 2 {
-		mins, minsErr := strconv.ParseFloat(parts[1], 64)
+	if !hasSeconds {
+		// "DDD,MM.mmmR" — decimal minutes format.
+		mins, minsErr := strconv.ParseFloat(minsStr, 64)
 		if minsErr != nil {
 			return 0, fmt.Errorf("xmp: GPS minutes: %w", minsErr)
 		}
 		result = deg + mins/60
 	} else {
-		mins, minsErr := strconv.ParseFloat(parts[1], 64)
+		// "DDD,MM,SS.sssR" — degrees, minutes, seconds format.
+		mins, minsErr := strconv.ParseFloat(minsStr, 64)
 		if minsErr != nil {
 			return 0, fmt.Errorf("xmp: GPS minutes: %w", minsErr)
 		}
-		sec, secErr := strconv.ParseFloat(parts[2], 64)
+		sec, secErr := strconv.ParseFloat(secStr, 64)
 		if secErr != nil {
 			return 0, fmt.Errorf("xmp: GPS seconds: %w", secErr)
 		}
 		result = deg + mins/60 + sec/3600
 	}
 
-	if ref == "S" || ref == "W" {
+	if ref == 'S' || ref == 'W' {
 		result = -result
 	}
 	return result, nil
