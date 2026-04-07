@@ -26,6 +26,11 @@ func (b *Box) TypeString() string {
 	return string(b.Type[:])
 }
 
+// Equal reports whether the box type equals v without allocating.
+func (b *Box) Equal(v [4]byte) bool {
+	return b.Type == v
+}
+
 // ReadBox reads the next box header from r at the current position.
 func ReadBox(r io.ReadSeeker) (Box, error) {
 	var hdr [8]byte

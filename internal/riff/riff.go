@@ -22,6 +22,11 @@ func (c *Chunk) FourCCString() string {
 	return string(c.FourCC[:])
 }
 
+// Equal reports whether the FourCC equals v without allocating.
+func (c *Chunk) Equal(v [4]byte) bool {
+	return c.FourCC == v
+}
+
 // ReadChunk reads the next RIFF chunk header from r.
 func ReadChunk(r io.ReadSeeker) (Chunk, error) {
 	var hdr [8]byte

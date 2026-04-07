@@ -134,6 +134,14 @@ func (m *Metadata) Caption() string {
 	return ""
 }
 
+// xmpDateLayouts lists the ISO 8601 time formats used by XMP DateTimeOriginal,
+// tried in order from most specific (timezone offset) to least specific (local).
+var xmpDateLayouts = [3]string{ //nolint:gochecknoglobals // constant time layouts
+	"2006-01-02T15:04:05-07:00",
+	"2006-01-02T15:04:05Z",
+	"2006-01-02T15:04:05",
+}
+
 // DateTimeOriginal returns the original capture date/time.
 // Source priority: EXIF > XMP.
 func (m *Metadata) DateTimeOriginal() (time.Time, bool) {
@@ -145,11 +153,7 @@ func (m *Metadata) DateTimeOriginal() (time.Time, bool) {
 	if m.XMP != nil {
 		if v := m.XMP.DateTimeOriginal(); v != "" {
 			// XMP stores dates as ISO 8601: "YYYY-MM-DDTHH:MM:SS" with optional TZ.
-			for _, layout := range []string{
-				"2006-01-02T15:04:05-07:00",
-				"2006-01-02T15:04:05Z",
-				"2006-01-02T15:04:05",
-			} {
+			for _, layout := range xmpDateLayouts {
 				if t, err := time.Parse(layout, v); err == nil {
 					return t, true
 				}

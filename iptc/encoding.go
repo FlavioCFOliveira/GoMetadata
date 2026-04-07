@@ -1,6 +1,18 @@
 package iptc
 
-import "golang.org/x/text/encoding/charmap"
+import (
+	"sync"
+
+	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/charmap"
+)
+
+// iso88591DecoderPool reuses ISO-8859-1 decoder instances across calls to
+// avoid per-call heap allocation. Each decoder is Reset before use so that
+// streaming state from a prior call cannot leak into the next.
+var iso88591DecoderPool = sync.Pool{ //nolint:gochecknoglobals // pool for perf
+	New: func() any { return charmap.ISO8859_1.NewDecoder() },
+}
 
 // decodeString converts a raw IPTC byte value to a UTF-8 string.
 // If the CodedCharacterSet dataset (1:90) declares UTF-8 (ESC % G),
@@ -10,8 +22,11 @@ func decodeString(b []byte, isUTF8 bool) string {
 	if isUTF8 {
 		return string(b)
 	}
-	// ISO-8859-1 → UTF-8 via golang.org/x/text
-	decoded, err := charmap.ISO8859_1.NewDecoder().Bytes(b)
+	// ISO-8859-1 → UTF-8 via golang.org/x/text; decoder is reused from pool.
+	dec := iso88591DecoderPool.Get().(*encoding.Decoder) //nolint:forcetypeassert,revive // pool always holds *encoding.Decoder
+	dec.Reset()
+	decoded, err := dec.Bytes(b)
+	iso88591DecoderPool.Put(dec)
 	if err != nil {
 		// Fallback: treat as raw bytes; non-ASCII becomes replacement chars.
 		return string(b)
