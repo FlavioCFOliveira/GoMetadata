@@ -512,13 +512,10 @@ func BenchmarkWrite_PNG(b *testing.B) {
 	}
 }
 
-// TestMetadata_NilMetadata verifies that every accessor on a zero-value
-// Metadata returns a safe zero/empty result without panicking.
-func TestMetadata_NilMetadata(t *testing.T) {
-	t.Parallel()
-	m := &Metadata{} // EXIF, IPTC, XMP all nil
-
-	// String accessors must return "".
+// assertNilStringAccessors verifies that all string/slice accessors on a
+// zero-value Metadata return empty results without panicking.
+func assertNilStringAccessors(t *testing.T, m *Metadata) {
+	t.Helper()
 	if got := m.CameraModel(); got != "" {
 		t.Errorf("CameraModel() = %q, want empty", got)
 	}
@@ -540,13 +537,15 @@ func TestMetadata_NilMetadata(t *testing.T) {
 	if got := m.LensModel(); got != "" {
 		t.Errorf("LensModel() = %q, want empty", got)
 	}
-
-	// Slice/nil accessors.
 	if got := m.Keywords(); len(got) != 0 {
 		t.Errorf("Keywords() = %v, want nil/empty", got)
 	}
+}
 
-	// Bool-return accessors must return false / zero values.
+// assertNilBoolAccessors verifies that all bool-returning accessors on a
+// zero-value Metadata return ok=false without panicking.
+func assertNilBoolAccessors(t *testing.T, m *Metadata) {
+	t.Helper()
 	if _, _, ok := m.GPS(); ok {
 		t.Error("GPS() ok = true, want false")
 	}
@@ -601,6 +600,15 @@ func TestMetadata_NilMetadata(t *testing.T) {
 	if _, ok := m.Altitude(); ok {
 		t.Error("Altitude() ok = true, want false")
 	}
+}
+
+// TestMetadata_NilMetadata verifies that every accessor on a zero-value
+// Metadata returns a safe zero/empty result without panicking.
+func TestMetadata_NilMetadata(t *testing.T) {
+	t.Parallel()
+	m := &Metadata{} // EXIF, IPTC, XMP all nil
+	assertNilStringAccessors(t, m)
+	assertNilBoolAccessors(t, m)
 }
 
 // TestMetadata_ExifAccessors builds a JPEG with EXIF containing Make, Model,

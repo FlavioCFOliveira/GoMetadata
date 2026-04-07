@@ -1244,138 +1244,189 @@ func TestEncodeRoundTripFull(t *testing.T) {
 	}
 }
 
-// BenchmarkEXIFEncode measures the serialisation cost of a small EXIF struct
-// with three IFD0 entries and one ExifIFD pointer.
-// buildCameraEXIF constructs a realistic ~2 KB TIFF with IFD0 (15 entries),
-// ExifIFD (20 entries), and GPS IFD (8 entries) to benchmark parsing cost on
-// a real-world-sized payload.
-func buildCameraEXIF() []byte {
-	order := binary.LittleEndian
+// cameraEntry is the entry type used by buildCameraEXIF and its helpers.
+// inline4 is used when the total value size is ≤ 4 bytes; blob holds
+// out-of-line values (nil for inline).
+type cameraEntry struct {
+	tag     uint16
+	typ     uint16
+	count   uint32
+	inline4 uint32
+	blob    []byte
+}
 
-	// We build the binary manually so we can place out-of-line values and
-	// sub-IFD pointers correctly.
-	//
-	// Layout (all offsets relative to start of TIFF header):
-	//   0   – 7:   TIFF header
-	//   8   – ?:   IFD0  (15 entries)
-	//   ?   – ?:   ExifIFD (20 entries)
-	//   ?   – ?:   GPS IFD (8 entries)
-	//   ?   – ?:   out-of-line value area
-	//
-	// We use a helper that encodes an IFD given a list of (tag, type, count,
-	// inlineVal/offset) tuples plus an accompanying value blob.
+// cameraASCIIBlob returns a NUL-terminated byte slice for an ASCII TIFF value.
+func cameraASCIIBlob(s string) []byte {
+	b := make([]byte, len(s)+1)
+	copy(b, s)
+	return b
+}
 
-	type entry struct {
-		tag     uint16
-		typ     uint16
-		count   uint32
-		inline4 uint32 // used when total size ≤ 4; else offset into blob
-		blob    []byte // out-of-line value; nil for inline
-	}
+// cameraRational encodes a single RATIONAL value as 8 bytes (LE).
+func cameraRational(num, den uint32) []byte {
+	b := make([]byte, 8)
+	binary.LittleEndian.PutUint32(b, num)
+	binary.LittleEndian.PutUint32(b[4:], den)
+	return b
+}
 
-	asciiBlob := func(s string) []byte {
-		b := make([]byte, len(s)+1)
-		copy(b, s)
-		return b
+// cameraRationals encodes multiple RATIONAL pairs as a contiguous byte slice (LE).
+func cameraRationals(pairs ...[2]uint32) []byte {
+	b := make([]byte, len(pairs)*8)
+	for i, p := range pairs {
+		binary.LittleEndian.PutUint32(b[i*8:], p[0])
+		binary.LittleEndian.PutUint32(b[i*8+4:], p[1])
 	}
-	rational := func(num, den uint32) []byte {
-		b := make([]byte, 8)
-		order.PutUint32(b, num)
-		order.PutUint32(b[4:], den)
-		return b
-	}
-	rationals := func(pairs ...[2]uint32) []byte {
-		b := make([]byte, len(pairs)*8)
-		for i, p := range pairs {
-			order.PutUint32(b[i*8:], p[0])
-			order.PutUint32(b[i*8+4:], p[1])
+	return b
+}
+
+// fixASCIICounts sets the count field on any cameraEntry whose blob is non-nil
+// and count is still zero (i.e. ASCII entries built without an explicit count).
+func fixASCIICounts(entries []cameraEntry) {
+	for i := range entries {
+		if entries[i].blob != nil && entries[i].count == 0 {
+			entries[i].count = uint32(len(entries[i].blob)) //nolint:gosec // G115: test helper, intentional type cast
 		}
-		return b
 	}
+}
 
-	ifd0Entries := []entry{
+// cameraIFDSize returns the total byte size of a serialised IFD including its
+// header, entries, next-IFD pointer, and all out-of-line blob values.
+func cameraIFDSize(es []cameraEntry) uint32 {
+	sz := uint32(2 + len(es)*12 + 4) //nolint:gosec // G115: test helper, intentional type cast
+	for _, e := range es {
+		if e.blob != nil {
+			sz += uint32(len(e.blob)) //nolint:gosec // G115: test helper, intentional type cast
+		}
+	}
+	return sz
+}
+
+// encodeIFD appends a serialised IFD (entries + blobs) to buf and returns it.
+// startOff is the absolute TIFF offset at which this IFD begins; nextOff is
+// written into the next-IFD pointer field.
+func encodeIFD(buf []byte, es []cameraEntry, startOff, nextOff uint32) []byte {
+	order := binary.LittleEndian
+	n := len(es)
+	valOff := startOff + uint32(2+n*12+4) //nolint:gosec // G115: test helper, intentional type cast
+
+	var cnt [2]byte
+	order.PutUint16(cnt[:], uint16(n)) //nolint:gosec // G115: test helper, intentional type cast
+	buf = append(buf, cnt[:]...)
+
+	var entry [12]byte
+	curOff := valOff
+	var blobs []byte
+	for _, e := range es {
+		order.PutUint16(entry[:], e.tag)
+		order.PutUint16(entry[2:], e.typ)
+		order.PutUint32(entry[4:], e.count)
+		if e.blob != nil {
+			order.PutUint32(entry[8:], curOff)
+			blobs = append(blobs, e.blob...)
+			curOff += uint32(len(e.blob)) //nolint:gosec // G115: test helper, intentional type cast
+		} else {
+			order.PutUint32(entry[8:], e.inline4)
+		}
+		buf = append(buf, entry[:]...)
+	}
+	var next [4]byte
+	order.PutUint32(next[:], nextOff)
+	buf = append(buf, next[:]...)
+	buf = append(buf, blobs...)
+	return buf
+}
+
+// buildCameraIFD0Entries returns the IFD0 entries for buildCameraEXIF.
+// ExifIFDPointer and GPSIFDPointer inline4 values are left as 0; the caller
+// must patch them once sub-IFD offsets are known.
+func buildCameraIFD0Entries() []cameraEntry {
+	entries := []cameraEntry{
 		{uint16(TagImageWidth), uint16(TypeLong), 1, 6000, nil},
 		{uint16(TagImageLength), uint16(TypeLong), 1, 4000, nil},
 		{uint16(TagBitsPerSample), uint16(TypeShort), 1, 8, nil},
 		{uint16(TagCompression), uint16(TypeShort), 1, 6, nil},
 		{uint16(TagPhotometricInterp), uint16(TypeShort), 1, 2, nil},
 		{uint16(TagOrientation), uint16(TypeShort), 1, 1, nil},
-		{uint16(TagXResolution), uint16(TypeRational), 1, 0, rational(72, 1)},
-		{uint16(TagYResolution), uint16(TypeRational), 1, 0, rational(72, 1)},
+		{uint16(TagXResolution), uint16(TypeRational), 1, 0, cameraRational(72, 1)},
+		{uint16(TagYResolution), uint16(TypeRational), 1, 0, cameraRational(72, 1)},
 		{uint16(TagResolutionUnit), uint16(TypeShort), 1, 2, nil},
-		{0x010f, uint16(TypeASCII), 0, 0, asciiBlob("Canon")},          // Make
-		{0x0110, uint16(TypeASCII), 0, 0, asciiBlob("Canon EOS R5")},   // Model
-		{0x0131, uint16(TypeASCII), 0, 0, asciiBlob("Firmware 1.8.2")}, // Software
-		{0x013b, uint16(TypeASCII), 0, 0, asciiBlob("Test Author")},    // Artist
-		{uint16(TagExifIFDPointer), uint16(TypeLong), 1, 0, nil},       // patched below
-		{uint16(TagGPSIFDPointer), uint16(TypeLong), 1, 0, nil},        // patched below
+		{0x010f, uint16(TypeASCII), 0, 0, cameraASCIIBlob("Canon")},          // Make
+		{0x0110, uint16(TypeASCII), 0, 0, cameraASCIIBlob("Canon EOS R5")},   // Model
+		{0x0131, uint16(TypeASCII), 0, 0, cameraASCIIBlob("Firmware 1.8.2")}, // Software
+		{0x013b, uint16(TypeASCII), 0, 0, cameraASCIIBlob("Test Author")},    // Artist
+		{uint16(TagExifIFDPointer), uint16(TypeLong), 1, 0, nil},             // patched by caller
+		{uint16(TagGPSIFDPointer), uint16(TypeLong), 1, 0, nil},              // patched by caller
 	}
-	// Fix ascii counts.
-	for i := range ifd0Entries {
-		if ifd0Entries[i].blob != nil && ifd0Entries[i].count == 0 {
-			ifd0Entries[i].count = uint32(len(ifd0Entries[i].blob)) //nolint:gosec // G115: test helper, intentional type cast
-		}
-	}
+	fixASCIICounts(entries)
+	return entries
+}
 
-	exifEntries := []entry{
-		{0x829a, uint16(TypeRational), 1, 0, rational(1, 200)},              // ExposureTime
-		{0x829d, uint16(TypeRational), 1, 0, rational(8, 10)},               // FNumber (f/8)
-		{0x8822, uint16(TypeShort), 1, 0, nil},                              // ExposureProgram=Manual
-		{0x8827, uint16(TypeShort), 1, 400, nil},                            // ISO 400
-		{0x9003, uint16(TypeASCII), 0, 0, asciiBlob("2024:03:15 10:30:00")}, // DateTimeOriginal
-		{0x9004, uint16(TypeASCII), 0, 0, asciiBlob("2024:03:15 10:30:00")}, // DateTimeDigitized
-		{0x9201, uint16(TypeSRational), 1, 0, rational(8, 1)},               // ShutterSpeedValue
-		{0x9202, uint16(TypeRational), 1, 0, rational(3, 1)},                // ApertureValue
-		{0x9204, uint16(TypeSRational), 1, 0, rational(0, 1)},               // ExposureBiasValue
-		{0x9205, uint16(TypeRational), 1, 0, rational(4, 1)},                // MaxApertureValue
-		{0x9207, uint16(TypeShort), 1, 5, nil},                              // MeteringMode=Pattern
-		{0x9209, uint16(TypeShort), 1, 0, nil},                              // Flash=no
-		{0x920a, uint16(TypeRational), 1, 0, rational(50, 1)},               // FocalLength 50mm
-		{0xa001, uint16(TypeShort), 1, 1, nil},                              // ColorSpace=sRGB
-		{0xa002, uint16(TypeLong), 1, 6000, nil},                            // PixelXDimension
-		{0xa003, uint16(TypeLong), 1, 4000, nil},                            // PixelYDimension
-		{0xa20e, uint16(TypeRational), 1, 0, rational(300, 1)},              // FocalPlaneXResolution
-		{0xa20f, uint16(TypeRational), 1, 0, rational(300, 1)},              // FocalPlaneYResolution
-		{0xa210, uint16(TypeShort), 1, 3, nil},                              // FocalPlaneResolutionUnit
-		{0xa405, uint16(TypeShort), 1, 50, nil},                             // FocalLengthIn35mmFilm
+// buildCameraExifEntries returns the ExifIFD entries for buildCameraEXIF.
+func buildCameraExifEntries() []cameraEntry {
+	entries := []cameraEntry{
+		{0x829a, uint16(TypeRational), 1, 0, cameraRational(1, 200)},              // ExposureTime
+		{0x829d, uint16(TypeRational), 1, 0, cameraRational(8, 10)},               // FNumber (f/8)
+		{0x8822, uint16(TypeShort), 1, 0, nil},                                    // ExposureProgram=Manual
+		{0x8827, uint16(TypeShort), 1, 400, nil},                                  // ISO 400
+		{0x9003, uint16(TypeASCII), 0, 0, cameraASCIIBlob("2024:03:15 10:30:00")}, // DateTimeOriginal
+		{0x9004, uint16(TypeASCII), 0, 0, cameraASCIIBlob("2024:03:15 10:30:00")}, // DateTimeDigitized
+		{0x9201, uint16(TypeSRational), 1, 0, cameraRational(8, 1)},               // ShutterSpeedValue
+		{0x9202, uint16(TypeRational), 1, 0, cameraRational(3, 1)},                // ApertureValue
+		{0x9204, uint16(TypeSRational), 1, 0, cameraRational(0, 1)},               // ExposureBiasValue
+		{0x9205, uint16(TypeRational), 1, 0, cameraRational(4, 1)},                // MaxApertureValue
+		{0x9207, uint16(TypeShort), 1, 5, nil},                                    // MeteringMode=Pattern
+		{0x9209, uint16(TypeShort), 1, 0, nil},                                    // Flash=no
+		{0x920a, uint16(TypeRational), 1, 0, cameraRational(50, 1)},               // FocalLength 50mm
+		{0xa001, uint16(TypeShort), 1, 1, nil},                                    // ColorSpace=sRGB
+		{0xa002, uint16(TypeLong), 1, 6000, nil},                                  // PixelXDimension
+		{0xa003, uint16(TypeLong), 1, 4000, nil},                                  // PixelYDimension
+		{0xa20e, uint16(TypeRational), 1, 0, cameraRational(300, 1)},              // FocalPlaneXResolution
+		{0xa20f, uint16(TypeRational), 1, 0, cameraRational(300, 1)},              // FocalPlaneYResolution
+		{0xa210, uint16(TypeShort), 1, 3, nil},                                    // FocalPlaneResolutionUnit
+		{0xa405, uint16(TypeShort), 1, 50, nil},                                   // FocalLengthIn35mmFilm
 	}
-	for i := range exifEntries {
-		if exifEntries[i].blob != nil && exifEntries[i].count == 0 {
-			exifEntries[i].count = uint32(len(exifEntries[i].blob)) //nolint:gosec // G115: test helper, intentional type cast
-		}
-	}
+	fixASCIICounts(entries)
+	return entries
+}
 
-	gpsEntries := []entry{
-		{0x0001, uint16(TypeASCII), 2, 0, []byte("N\x00")},                                                   // GPSLatitudeRef
-		{0x0002, uint16(TypeRational), 3, 0, rationals([2]uint32{38, 1}, [2]uint32{43, 1}, [2]uint32{0, 1})}, // GPSLatitude
-		{0x0003, uint16(TypeASCII), 2, 0, []byte("W\x00")},                                                   // GPSLongitudeRef
-		{0x0004, uint16(TypeRational), 3, 0, rationals([2]uint32{9, 1}, [2]uint32{8, 1}, [2]uint32{0, 1})},   // GPSLongitude
-		{0x0005, uint16(TypeByte), 1, 0, nil},                                                                // GPSAltitudeRef=above sea
-		{0x0006, uint16(TypeRational), 1, 0, rational(150, 1)},                                               // GPSAltitude 150m
-		{0x0007, uint16(TypeRational), 3, 0, rationals([2]uint32{10, 1}, [2]uint32{30, 1}, [2]uint32{0, 1})}, // GPSTimeStamp
-		{0x001d, uint16(TypeASCII), 0, 0, asciiBlob("2024:03:15")},                                           // GPSDateStamp
+// buildCameraGPSEntries returns the GPS IFD entries for buildCameraEXIF.
+func buildCameraGPSEntries() []cameraEntry {
+	entries := []cameraEntry{
+		{0x0001, uint16(TypeASCII), 2, 0, []byte("N\x00")},                                                         // GPSLatitudeRef
+		{0x0002, uint16(TypeRational), 3, 0, cameraRationals([2]uint32{38, 1}, [2]uint32{43, 1}, [2]uint32{0, 1})}, // GPSLatitude
+		{0x0003, uint16(TypeASCII), 2, 0, []byte("W\x00")},                                                         // GPSLongitudeRef
+		{0x0004, uint16(TypeRational), 3, 0, cameraRationals([2]uint32{9, 1}, [2]uint32{8, 1}, [2]uint32{0, 1})},   // GPSLongitude
+		{0x0005, uint16(TypeByte), 1, 0, nil},                                                                      // GPSAltitudeRef=above sea
+		{0x0006, uint16(TypeRational), 1, 0, cameraRational(150, 1)},                                               // GPSAltitude 150m
+		{0x0007, uint16(TypeRational), 3, 0, cameraRationals([2]uint32{10, 1}, [2]uint32{30, 1}, [2]uint32{0, 1})}, // GPSTimeStamp
+		{0x001d, uint16(TypeASCII), 0, 0, cameraASCIIBlob("2024:03:15")},                                           // GPSDateStamp
 	}
-	for i := range gpsEntries {
-		if gpsEntries[i].blob != nil && gpsEntries[i].count == 0 {
-			gpsEntries[i].count = uint32(len(gpsEntries[i].blob)) //nolint:gosec // G115: test helper, intentional type cast
-		}
-	}
+	fixASCIICounts(entries)
+	return entries
+}
 
-	// Compute sizes so we can set offsets.
-	ifdSize := func(es []entry) uint32 {
-		sz := uint32(2 + len(es)*12 + 4) //nolint:gosec // G115: test helper, intentional type cast
-		for _, e := range es {
-			if e.blob != nil {
-				sz += uint32(len(e.blob)) //nolint:gosec // G115: test helper, intentional type cast
-			}
-		}
-		return sz
-	}
+// BenchmarkEXIFEncode measures the serialisation cost of a small EXIF struct
+// with three IFD0 entries and one ExifIFD pointer.
+// buildCameraEXIF constructs a realistic ~2 KB TIFF with IFD0 (15 entries),
+// ExifIFD (20 entries), and GPS IFD (8 entries) to benchmark parsing cost on
+// a real-world-sized payload.
+func buildCameraEXIF() []byte {
+	// Layout (all offsets relative to start of TIFF header):
+	//   0   – 7:   TIFF header
+	//   8   – ?:   IFD0  (15 entries)
+	//   ?   – ?:   ExifIFD (20 entries)
+	//   ?   – ?:   GPS IFD (8 entries)
+	//   ?   – ?:   out-of-line value area
+
+	ifd0Entries := buildCameraIFD0Entries()
+	exifEntries := buildCameraExifEntries()
+	gpsEntries := buildCameraGPSEntries()
 
 	const headerSize = uint32(8)
-	ifd0Size := ifdSize(ifd0Entries)
+	ifd0Size := cameraIFDSize(ifd0Entries)
 	exifStart := headerSize + ifd0Size
-	exifSize := ifdSize(exifEntries)
+	exifSize := cameraIFDSize(exifEntries)
 	gpsStart := exifStart + exifSize
 
 	// Patch IFD0 sub-IFD pointers.
@@ -1388,44 +1439,10 @@ func buildCameraEXIF() []byte {
 		}
 	}
 
-	// Encode an IFD list into buf starting at offset startOff.
-	encodeIFD := func(buf []byte, es []entry, startOff, nextOff uint32) []byte {
-		n := len(es)
-		// Compute out-of-line value start offset.
-		valOff := startOff + uint32(2+n*12+4) //nolint:gosec // G115: test helper, intentional type cast
-
-		var cnt [2]byte
-		order.PutUint16(cnt[:], uint16(n)) //nolint:gosec // G115: test helper, intentional type cast
-		buf = append(buf, cnt[:]...)
-
-		var entries [12]byte
-		curOff := valOff
-		var blobs []byte
-		for _, e := range es {
-			order.PutUint16(entries[:], e.tag)
-			order.PutUint16(entries[2:], e.typ)
-			order.PutUint32(entries[4:], e.count)
-			if e.blob != nil {
-				order.PutUint32(entries[8:], curOff)
-				blobs = append(blobs, e.blob...)
-				curOff += uint32(len(e.blob)) //nolint:gosec // G115: test helper, intentional type cast
-			} else {
-				order.PutUint32(entries[8:], e.inline4)
-			}
-			buf = append(buf, entries[:]...)
-		}
-		var next [4]byte
-		order.PutUint32(next[:], nextOff)
-		buf = append(buf, next[:]...)
-		buf = append(buf, blobs...)
-		return buf
-	}
-
-	// Build full buffer.
 	var buf [8]byte
 	buf[0], buf[1] = 'I', 'I'
-	order.PutUint16(buf[2:], 0x002A)
-	order.PutUint32(buf[4:], headerSize)
+	binary.LittleEndian.PutUint16(buf[2:], 0x002A)
+	binary.LittleEndian.PutUint32(buf[4:], headerSize)
 	out := append([]byte(nil), buf[:]...)
 	out = encodeIFD(out, ifd0Entries, headerSize, 0)
 	out = encodeIFD(out, exifEntries, exifStart, 0)
@@ -1473,174 +1490,223 @@ func BenchmarkEXIFEncode(b *testing.B) {
 	}
 }
 
+// newMinimalEXIF builds a minimal EXIF with IFD0 (no ExifIFD) using LE byte order.
+func newMinimalEXIF(t *testing.T) *EXIF {
+	t.Helper()
+	data := minimalTIFF(binary.LittleEndian, [][4]uint32{
+		{uint32(TagImageWidth), uint32(TypeLong), 1, 1},
+	})
+	e, err := Parse(data)
+	if err != nil {
+		t.Fatalf("newMinimalEXIF: Parse: %v", err)
+	}
+	return e
+}
+
+// exifRoundTrip encodes e and parses the result, returning the new *EXIF.
+func exifRoundTrip(t *testing.T, e *EXIF) *EXIF {
+	t.Helper()
+	b, err := Encode(e)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	e2, err := Parse(b)
+	if err != nil {
+		t.Fatalf("Parse (round-trip): %v", err)
+	}
+	return e2
+}
+
+// testEXIFSetMake is a helper for TestEXIFSetters/SetMake.
+func testEXIFSetMake(t *testing.T) {
+	t.Helper()
+	e := newMinimalEXIF(t)
+	e.SetMake("Nikon")
+	e2 := exifRoundTrip(t, e)
+	entry := e2.IFD0.Get(TagMake)
+	if entry == nil {
+		t.Fatal("TagMake missing after round-trip")
+	}
+	if got := entry.String(); got != "Nikon" {
+		t.Errorf("Make = %q, want %q", got, "Nikon")
+	}
+}
+
+// testEXIFSetDateTimeOriginal is a helper for TestEXIFSetters/SetDateTimeOriginal.
+func testEXIFSetDateTimeOriginal(t *testing.T) {
+	t.Helper()
+	e := newMinimalEXIF(t)
+	ts := time.Date(2024, 3, 15, 10, 30, 0, 0, time.UTC)
+	e.SetDateTimeOriginal(ts)
+	e2 := exifRoundTrip(t, e)
+	got, ok := e2.DateTimeOriginal()
+	if !ok {
+		t.Fatal("DateTimeOriginal missing after round-trip")
+	}
+	if !got.Equal(ts) {
+		t.Errorf("DateTimeOriginal = %v, want %v", got, ts)
+	}
+}
+
+// testEXIFSetExposureTime is a helper for TestEXIFSetters/SetExposureTime.
+func testEXIFSetExposureTime(t *testing.T) {
+	t.Helper()
+	e := newMinimalEXIF(t)
+	e.SetExposureTime(1, 1000) // 1/1000 s
+	e2 := exifRoundTrip(t, e)
+	num, den, ok := e2.ExposureTime()
+	if !ok {
+		t.Fatal("ExposureTime missing after round-trip")
+	}
+	if num != 1 || den != 1000 {
+		t.Errorf("ExposureTime = %d/%d, want 1/1000", num, den)
+	}
+}
+
+// testEXIFSetFNumber is a helper for TestEXIFSetters/SetFNumber.
+func testEXIFSetFNumber(t *testing.T) {
+	t.Helper()
+	e := newMinimalEXIF(t)
+	e.SetFNumber(2.8)
+	e2 := exifRoundTrip(t, e)
+	f, ok := e2.FNumber()
+	if !ok {
+		t.Fatal("FNumber missing after round-trip")
+	}
+	// Encoded as rational 280/100; tolerate float rounding.
+	if math.Abs(f-2.8) > 0.001 {
+		t.Errorf("FNumber = %f, want 2.8", f)
+	}
+}
+
+// testEXIFSetISO is a helper for TestEXIFSetters/SetISO.
+func testEXIFSetISO(t *testing.T) {
+	t.Helper()
+	e := newMinimalEXIF(t)
+	e.SetISO(400)
+	e2 := exifRoundTrip(t, e)
+	iso, ok := e2.ISO()
+	if !ok {
+		t.Fatal("ISO missing after round-trip")
+	}
+	if iso != 400 {
+		t.Errorf("ISO = %d, want 400", iso)
+	}
+}
+
+// testEXIFSetFocalLength is a helper for TestEXIFSetters/SetFocalLength.
+func testEXIFSetFocalLength(t *testing.T) {
+	t.Helper()
+	e := newMinimalEXIF(t)
+	e.SetFocalLength(50.0)
+	e2 := exifRoundTrip(t, e)
+	fl, ok := e2.FocalLength()
+	if !ok {
+		t.Fatal("FocalLength missing after round-trip")
+	}
+	if math.Abs(fl-50.0) > 0.001 {
+		t.Errorf("FocalLength = %f, want 50.0", fl)
+	}
+}
+
+// testEXIFSetLensModel is a helper for TestEXIFSetters/SetLensModel.
+func testEXIFSetLensModel(t *testing.T) {
+	t.Helper()
+	e := newMinimalEXIF(t)
+	e.SetLensModel("AF-S NIKKOR 50mm f/1.8G")
+	e2 := exifRoundTrip(t, e)
+	if got := e2.LensModel(); got != "AF-S NIKKOR 50mm f/1.8G" {
+		t.Errorf("LensModel = %q, want %q", got, "AF-S NIKKOR 50mm f/1.8G")
+	}
+}
+
+// testEXIFSetImageSize is a helper for TestEXIFSetters/SetImageSize.
+func testEXIFSetImageSize(t *testing.T) {
+	t.Helper()
+	e := newMinimalEXIF(t)
+	e.SetImageSize(3840, 2160)
+	e2 := exifRoundTrip(t, e)
+	w, h, ok := e2.ImageSize()
+	if !ok {
+		t.Fatal("ImageSize missing after round-trip")
+	}
+	if w != 3840 || h != 2160 {
+		t.Errorf("ImageSize = %dx%d, want 3840x2160", w, h)
+	}
+}
+
+// testEXIFNilReceiverNoPanic verifies all setters are nil-safe.
+func testEXIFNilReceiverNoPanic(_ *testing.T) {
+	var e *EXIF
+	e.SetMake("x")
+	e.SetDateTimeOriginal(time.Now())
+	e.SetExposureTime(1, 100)
+	e.SetFNumber(1.4)
+	e.SetISO(100)
+	e.SetFocalLength(35)
+	e.SetLensModel("x")
+	e.SetImageSize(100, 100)
+}
+
+// testEXIFEnsureExifIFDCreatedOnce verifies that two ExifIFD setters share
+// the same ExifIFD instance.
+func testEXIFEnsureExifIFDCreatedOnce(t *testing.T) {
+	t.Helper()
+	e := newMinimalEXIF(t)
+	if e.ExifIFD != nil {
+		t.Fatal("ExifIFD should be nil before any ExifIFD setter")
+	}
+	e.SetISO(100)
+	first := e.ExifIFD
+	e.SetFNumber(1.4)
+	if e.ExifIFD != first {
+		t.Error("ensureExifIFD created a second ExifIFD instead of reusing the first")
+	}
+}
+
 // TestEXIFSetters exercises every new setter added to EXIF.
 // Each sub-test calls the setter, encodes, re-parses, then asserts the getter
 // returns the expected value — proving full round-trip correctness.
 func TestEXIFSetters(t *testing.T) {
 	t.Parallel()
-	// newEXIF builds a minimal EXIF with IFD0 (no ExifIFD) using LE byte order.
-	newEXIF := func() *EXIF {
-		data := minimalTIFF(binary.LittleEndian, [][4]uint32{
-			{uint32(TagImageWidth), uint32(TypeLong), 1, 1},
-		})
-		e, err := Parse(data)
-		if err != nil {
-			t.Fatalf("newEXIF: Parse: %v", err)
-		}
-		return e
-	}
-
-	// roundTrip encodes e and parses the result, returning the new *EXIF.
-	roundTrip := func(t *testing.T, e *EXIF) *EXIF {
-		t.Helper()
-		b, err := Encode(e)
-		if err != nil {
-			t.Fatalf("Encode: %v", err)
-		}
-		e2, err := Parse(b)
-		if err != nil {
-			t.Fatalf("Parse (round-trip): %v", err)
-		}
-		return e2
-	}
-
 	t.Run("SetMake", func(t *testing.T) {
 		t.Parallel()
-		e := newEXIF()
-		e.SetMake("Nikon")
-		e2 := roundTrip(t, e)
-		entry := e2.IFD0.Get(TagMake)
-		if entry == nil {
-			t.Fatal("TagMake missing after round-trip")
-		}
-		if got := entry.String(); got != "Nikon" {
-			t.Errorf("Make = %q, want %q", got, "Nikon")
-		}
+		testEXIFSetMake(t)
 	})
-
 	t.Run("SetDateTimeOriginal", func(t *testing.T) {
 		t.Parallel()
-		e := newEXIF()
-		// Use a fixed time with no sub-second precision.
-		ts := time.Date(2024, 3, 15, 10, 30, 0, 0, time.UTC)
-		e.SetDateTimeOriginal(ts)
-		e2 := roundTrip(t, e)
-		got, ok := e2.DateTimeOriginal()
-		if !ok {
-			t.Fatal("DateTimeOriginal missing after round-trip")
-		}
-		if !got.Equal(ts) {
-			t.Errorf("DateTimeOriginal = %v, want %v", got, ts)
-		}
+		testEXIFSetDateTimeOriginal(t)
 	})
-
 	t.Run("SetExposureTime", func(t *testing.T) {
 		t.Parallel()
-		e := newEXIF()
-		e.SetExposureTime(1, 1000) // 1/1000 s
-		e2 := roundTrip(t, e)
-		num, den, ok := e2.ExposureTime()
-		if !ok {
-			t.Fatal("ExposureTime missing after round-trip")
-		}
-		if num != 1 || den != 1000 {
-			t.Errorf("ExposureTime = %d/%d, want 1/1000", num, den)
-		}
+		testEXIFSetExposureTime(t)
 	})
-
 	t.Run("SetFNumber", func(t *testing.T) {
 		t.Parallel()
-		e := newEXIF()
-		e.SetFNumber(2.8)
-		e2 := roundTrip(t, e)
-		f, ok := e2.FNumber()
-		if !ok {
-			t.Fatal("FNumber missing after round-trip")
-		}
-		// Encoded as rational 280/100; tolerate float rounding.
-		if math.Abs(f-2.8) > 0.001 {
-			t.Errorf("FNumber = %f, want 2.8", f)
-		}
+		testEXIFSetFNumber(t)
 	})
-
 	t.Run("SetISO", func(t *testing.T) {
 		t.Parallel()
-		e := newEXIF()
-		e.SetISO(400)
-		e2 := roundTrip(t, e)
-		iso, ok := e2.ISO()
-		if !ok {
-			t.Fatal("ISO missing after round-trip")
-		}
-		if iso != 400 {
-			t.Errorf("ISO = %d, want 400", iso)
-		}
+		testEXIFSetISO(t)
 	})
-
 	t.Run("SetFocalLength", func(t *testing.T) {
 		t.Parallel()
-		e := newEXIF()
-		e.SetFocalLength(50.0)
-		e2 := roundTrip(t, e)
-		fl, ok := e2.FocalLength()
-		if !ok {
-			t.Fatal("FocalLength missing after round-trip")
-		}
-		if math.Abs(fl-50.0) > 0.001 {
-			t.Errorf("FocalLength = %f, want 50.0", fl)
-		}
+		testEXIFSetFocalLength(t)
 	})
-
 	t.Run("SetLensModel", func(t *testing.T) {
 		t.Parallel()
-		e := newEXIF()
-		e.SetLensModel("AF-S NIKKOR 50mm f/1.8G")
-		e2 := roundTrip(t, e)
-		if got := e2.LensModel(); got != "AF-S NIKKOR 50mm f/1.8G" {
-			t.Errorf("LensModel = %q, want %q", got, "AF-S NIKKOR 50mm f/1.8G")
-		}
+		testEXIFSetLensModel(t)
 	})
-
 	t.Run("SetImageSize", func(t *testing.T) {
 		t.Parallel()
-		e := newEXIF()
-		e.SetImageSize(3840, 2160)
-		e2 := roundTrip(t, e)
-		w, h, ok := e2.ImageSize()
-		if !ok {
-			t.Fatal("ImageSize missing after round-trip")
-		}
-		if w != 3840 || h != 2160 {
-			t.Errorf("ImageSize = %dx%d, want 3840x2160", w, h)
-		}
+		testEXIFSetImageSize(t)
 	})
-
 	t.Run("NilReceiverNoPanic", func(t *testing.T) {
 		t.Parallel()
-		// All setters must be nil-safe.
-		var e *EXIF
-		e.SetMake("x")
-		e.SetDateTimeOriginal(time.Now())
-		e.SetExposureTime(1, 100)
-		e.SetFNumber(1.4)
-		e.SetISO(100)
-		e.SetFocalLength(35)
-		e.SetLensModel("x")
-		e.SetImageSize(100, 100)
+		testEXIFNilReceiverNoPanic(t)
 	})
-
 	t.Run("EnsureExifIFDCreatedOnce", func(t *testing.T) {
 		t.Parallel()
-		// Calling two ExifIFD setters must share the same ExifIFD (created once).
-		e := newEXIF()
-		if e.ExifIFD != nil {
-			t.Fatal("ExifIFD should be nil before any ExifIFD setter")
-		}
-		e.SetISO(100)
-		first := e.ExifIFD
-		e.SetFNumber(1.4)
-		if e.ExifIFD != first {
-			t.Error("ensureExifIFD created a second ExifIFD instead of reusing the first")
-		}
+		testEXIFEnsureExifIFDCreatedOnce(t)
 	})
 }

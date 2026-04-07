@@ -43,224 +43,285 @@ func newTestMetadata(t *testing.T) *Metadata {
 	return &Metadata{EXIF: e, IPTC: i, XMP: x}
 }
 
+// testSetCaption is a helper for TestMetadataSetters/SetCaption.
+func testSetCaption(t *testing.T, m *Metadata) {
+	t.Helper()
+	m.SetCaption("golden hour")
+	if got := m.EXIF.Caption(); got != "golden hour" {
+		t.Errorf("EXIF.Caption = %q, want %q", got, "golden hour")
+	}
+	if got := m.IPTC.Caption(); got != "golden hour" {
+		t.Errorf("IPTC.Caption = %q, want %q", got, "golden hour")
+	}
+	if got := m.XMP.Caption(); got != "golden hour" {
+		t.Errorf("XMP.Caption = %q, want %q", got, "golden hour")
+	}
+	// Metadata getter returns XMP value (highest priority).
+	if got := m.Caption(); got != "golden hour" {
+		t.Errorf("m.Caption() = %q, want %q", got, "golden hour")
+	}
+}
+
+// testSetCopyright is a helper for TestMetadataSetters/SetCopyright.
+func testSetCopyright(t *testing.T, m *Metadata) {
+	t.Helper()
+	m.SetCopyright("(c) 2024 Alice")
+	if got := m.EXIF.Copyright(); got != "(c) 2024 Alice" {
+		t.Errorf("EXIF.Copyright = %q", got)
+	}
+	if got := m.IPTC.Copyright(); got != "(c) 2024 Alice" {
+		t.Errorf("IPTC.Copyright = %q", got)
+	}
+	if got := m.XMP.Copyright(); got != "(c) 2024 Alice" {
+		t.Errorf("XMP.Copyright = %q", got)
+	}
+}
+
+// testSetCreator is a helper for TestMetadataSetters/SetCreator.
+func testSetCreator(t *testing.T, m *Metadata) {
+	t.Helper()
+	m.SetCreator("Bob")
+	if got := m.EXIF.Creator(); got != "Bob" {
+		t.Errorf("EXIF.Creator = %q", got)
+	}
+	if got := m.IPTC.Creator(); got != "Bob" {
+		t.Errorf("IPTC.Creator = %q", got)
+	}
+	if got := m.XMP.Creator(); got != "Bob" {
+		t.Errorf("XMP.Creator = %q", got)
+	}
+}
+
+// testSetCameraModel is a helper for TestMetadataSetters/SetCameraModel.
+func testSetCameraModel(t *testing.T, m *Metadata) {
+	t.Helper()
+	m.SetCameraModel("Canon EOS R5")
+	if got := m.EXIF.CameraModel(); got != "Canon EOS R5" {
+		t.Errorf("EXIF.CameraModel = %q", got)
+	}
+	if got := m.XMP.CameraModel(); got != "Canon EOS R5" {
+		t.Errorf("XMP.CameraModel = %q", got)
+	}
+}
+
+// testSetGPS is a helper for TestMetadataSetters/SetGPS.
+func testSetGPS(t *testing.T, m *Metadata) {
+	t.Helper()
+	m.SetGPS(51.5074, -0.1278)
+	lat, lon, ok := m.EXIF.GPS()
+	if !ok {
+		t.Fatal("EXIF.GPS() ok=false after SetGPS")
+	}
+	if math.Abs(lat-51.5074) > 0.001 {
+		t.Errorf("EXIF lat = %f, want ~51.5074", lat)
+	}
+	if math.Abs(lon-(-0.1278)) > 0.001 {
+		t.Errorf("EXIF lon = %f, want ~-0.1278", lon)
+	}
+	xlat, xlon, xok := m.XMP.GPS()
+	if !xok {
+		t.Fatal("XMP.GPS() ok=false after SetGPS")
+	}
+	if math.Abs(xlat-51.5074) > 0.001 {
+		t.Errorf("XMP lat = %f, want ~51.5074", xlat)
+	}
+	if math.Abs(xlon-(-0.1278)) > 0.001 {
+		t.Errorf("XMP lon = %f, want ~-0.1278", xlon)
+	}
+}
+
+// testSetKeywords is a helper for TestMetadataSetters/SetKeywords.
+func testSetKeywords(t *testing.T, m *Metadata) {
+	t.Helper()
+	m.SetKeywords([]string{"travel", "street"})
+	if kws := m.IPTC.Keywords(); len(kws) != 2 {
+		t.Errorf("IPTC.Keywords count = %d, want 2", len(kws))
+	}
+	if kws := m.XMP.Keywords(); len(kws) != 2 {
+		t.Errorf("XMP.Keywords count = %d, want 2", len(kws))
+	}
+}
+
+// testSetLensModel is a helper for TestMetadataSetters/SetLensModel.
+func testSetLensModel(t *testing.T, m *Metadata) {
+	t.Helper()
+	m.SetLensModel("EF 50mm f/1.2L")
+	if got := m.EXIF.LensModel(); got != "EF 50mm f/1.2L" {
+		t.Errorf("EXIF.LensModel = %q", got)
+	}
+	if got := m.XMP.LensModel(); got != "EF 50mm f/1.2L" {
+		t.Errorf("XMP.LensModel = %q", got)
+	}
+}
+
+// testSetMake is a helper for TestMetadataSetters/SetMake.
+func testSetMake(t *testing.T, m *Metadata) {
+	t.Helper()
+	m.SetMake("Canon")
+	if got := m.Make(); got != "Canon" {
+		t.Errorf("Make = %q, want Canon", got)
+	}
+}
+
+// testSetDateTimeOriginal is a helper for TestMetadataSetters/SetDateTimeOriginal.
+func testSetDateTimeOriginal(t *testing.T, m *Metadata) {
+	t.Helper()
+	ts := time.Date(2024, 6, 21, 12, 0, 0, 0, time.UTC)
+	m.SetDateTimeOriginal(ts)
+	got, ok := m.EXIF.DateTimeOriginal()
+	if !ok {
+		t.Fatal("EXIF.DateTimeOriginal missing after set")
+	}
+	if !got.Equal(ts) {
+		t.Errorf("EXIF.DateTimeOriginal = %v, want %v", got, ts)
+	}
+	xmpStr := m.XMP.DateTimeOriginal()
+	if xmpStr == "" {
+		t.Error("XMP.DateTimeOriginal empty after set")
+	}
+}
+
+// testSetExposureTime is a helper for TestMetadataSetters/SetExposureTime.
+func testSetExposureTime(t *testing.T, m *Metadata) {
+	t.Helper()
+	m.SetExposureTime(1, 250)
+	num, den, ok := m.ExposureTime()
+	if !ok {
+		t.Fatal("ExposureTime missing after set")
+	}
+	if num != 1 || den != 250 {
+		t.Errorf("ExposureTime = %d/%d, want 1/250", num, den)
+	}
+}
+
+// testSetFNumber is a helper for TestMetadataSetters/SetFNumber.
+func testSetFNumber(t *testing.T, m *Metadata) {
+	t.Helper()
+	m.SetFNumber(4.0)
+	f, ok := m.FNumber()
+	if !ok {
+		t.Fatal("FNumber missing after set")
+	}
+	if math.Abs(f-4.0) > 0.001 {
+		t.Errorf("FNumber = %f, want 4.0", f)
+	}
+}
+
+// testSetISO is a helper for TestMetadataSetters/SetISO.
+func testSetISO(t *testing.T, m *Metadata) {
+	t.Helper()
+	m.SetISO(800)
+	iso, ok := m.ISO()
+	if !ok {
+		t.Fatal("ISO missing after set")
+	}
+	if iso != 800 {
+		t.Errorf("ISO = %d, want 800", iso)
+	}
+}
+
+// testSetFocalLength is a helper for TestMetadataSetters/SetFocalLength.
+func testSetFocalLength(t *testing.T, m *Metadata) {
+	t.Helper()
+	m.SetFocalLength(85.0)
+	fl, ok := m.FocalLength()
+	if !ok {
+		t.Fatal("FocalLength missing after set")
+	}
+	if math.Abs(fl-85.0) > 0.001 {
+		t.Errorf("FocalLength = %f, want 85.0", fl)
+	}
+}
+
+// testSetOrientation is a helper for TestMetadataSetters/SetOrientation.
+func testSetOrientation(t *testing.T, m *Metadata) {
+	t.Helper()
+	m.SetOrientation(6)
+	v, ok := m.Orientation()
+	if !ok {
+		t.Fatal("Orientation missing after set")
+	}
+	if v != 6 {
+		t.Errorf("Orientation = %d, want 6", v)
+	}
+}
+
+// testSetImageSize is a helper for TestMetadataSetters/SetImageSize.
+func testSetImageSize(t *testing.T, m *Metadata) {
+	t.Helper()
+	m.SetImageSize(1920, 1080)
+	w, h, ok := m.ImageSize()
+	if !ok {
+		t.Fatal("ImageSize missing after set")
+	}
+	if w != 1920 || h != 1080 {
+		t.Errorf("ImageSize = %dx%d, want 1920x1080", w, h)
+	}
+}
+
 // TestMetadataSetters verifies that every Metadata setter writes through to
 // the underlying components and that getters return the expected values.
 func TestMetadataSetters(t *testing.T) {
 	t.Parallel()
 	t.Run("SetCaption", func(t *testing.T) {
 		t.Parallel()
-		m := newTestMetadata(t)
-		m.SetCaption("golden hour")
-		if got := m.EXIF.Caption(); got != "golden hour" {
-			t.Errorf("EXIF.Caption = %q, want %q", got, "golden hour")
-		}
-		if got := m.IPTC.Caption(); got != "golden hour" {
-			t.Errorf("IPTC.Caption = %q, want %q", got, "golden hour")
-		}
-		if got := m.XMP.Caption(); got != "golden hour" {
-			t.Errorf("XMP.Caption = %q, want %q", got, "golden hour")
-		}
-		// Metadata getter returns XMP value (highest priority).
-		if got := m.Caption(); got != "golden hour" {
-			t.Errorf("m.Caption() = %q, want %q", got, "golden hour")
-		}
+		testSetCaption(t, newTestMetadata(t))
 	})
-
 	t.Run("SetCopyright", func(t *testing.T) {
 		t.Parallel()
-		m := newTestMetadata(t)
-		m.SetCopyright("(c) 2024 Alice")
-		if got := m.EXIF.Copyright(); got != "(c) 2024 Alice" {
-			t.Errorf("EXIF.Copyright = %q", got)
-		}
-		if got := m.IPTC.Copyright(); got != "(c) 2024 Alice" {
-			t.Errorf("IPTC.Copyright = %q", got)
-		}
-		if got := m.XMP.Copyright(); got != "(c) 2024 Alice" {
-			t.Errorf("XMP.Copyright = %q", got)
-		}
+		testSetCopyright(t, newTestMetadata(t))
 	})
-
 	t.Run("SetCreator", func(t *testing.T) {
 		t.Parallel()
-		m := newTestMetadata(t)
-		m.SetCreator("Bob")
-		if got := m.EXIF.Creator(); got != "Bob" {
-			t.Errorf("EXIF.Creator = %q", got)
-		}
-		if got := m.IPTC.Creator(); got != "Bob" {
-			t.Errorf("IPTC.Creator = %q", got)
-		}
-		if got := m.XMP.Creator(); got != "Bob" {
-			t.Errorf("XMP.Creator = %q", got)
-		}
+		testSetCreator(t, newTestMetadata(t))
 	})
-
 	t.Run("SetCameraModel", func(t *testing.T) {
 		t.Parallel()
-		m := newTestMetadata(t)
-		m.SetCameraModel("Canon EOS R5")
-		if got := m.EXIF.CameraModel(); got != "Canon EOS R5" {
-			t.Errorf("EXIF.CameraModel = %q", got)
-		}
-		if got := m.XMP.CameraModel(); got != "Canon EOS R5" {
-			t.Errorf("XMP.CameraModel = %q", got)
-		}
+		testSetCameraModel(t, newTestMetadata(t))
 	})
-
 	t.Run("SetGPS", func(t *testing.T) {
 		t.Parallel()
-		m := newTestMetadata(t)
-		m.SetGPS(51.5074, -0.1278)
-		lat, lon, ok := m.EXIF.GPS()
-		if !ok {
-			t.Fatal("EXIF.GPS() ok=false after SetGPS")
-		}
-		if math.Abs(lat-51.5074) > 0.001 {
-			t.Errorf("EXIF lat = %f, want ~51.5074", lat)
-		}
-		if math.Abs(lon-(-0.1278)) > 0.001 {
-			t.Errorf("EXIF lon = %f, want ~-0.1278", lon)
-		}
-		xlat, xlon, xok := m.XMP.GPS()
-		if !xok {
-			t.Fatal("XMP.GPS() ok=false after SetGPS")
-		}
-		if math.Abs(xlat-51.5074) > 0.001 {
-			t.Errorf("XMP lat = %f, want ~51.5074", xlat)
-		}
-		if math.Abs(xlon-(-0.1278)) > 0.001 {
-			t.Errorf("XMP lon = %f, want ~-0.1278", xlon)
-		}
+		testSetGPS(t, newTestMetadata(t))
 	})
-
 	t.Run("SetKeywords", func(t *testing.T) {
 		t.Parallel()
-		m := newTestMetadata(t)
-		m.SetKeywords([]string{"travel", "street"})
-		if kws := m.IPTC.Keywords(); len(kws) != 2 {
-			t.Errorf("IPTC.Keywords count = %d, want 2", len(kws))
-		}
-		if kws := m.XMP.Keywords(); len(kws) != 2 {
-			t.Errorf("XMP.Keywords count = %d, want 2", len(kws))
-		}
+		testSetKeywords(t, newTestMetadata(t))
 	})
-
 	t.Run("SetLensModel", func(t *testing.T) {
 		t.Parallel()
-		m := newTestMetadata(t)
-		m.SetLensModel("EF 50mm f/1.2L")
-		if got := m.EXIF.LensModel(); got != "EF 50mm f/1.2L" {
-			t.Errorf("EXIF.LensModel = %q", got)
-		}
-		if got := m.XMP.LensModel(); got != "EF 50mm f/1.2L" {
-			t.Errorf("XMP.LensModel = %q", got)
-		}
+		testSetLensModel(t, newTestMetadata(t))
 	})
-
 	t.Run("SetMake", func(t *testing.T) {
 		t.Parallel()
-		m := newTestMetadata(t)
-		m.SetMake("Canon")
-		if got := m.Make(); got != "Canon" {
-			t.Errorf("Make = %q, want Canon", got)
-		}
+		testSetMake(t, newTestMetadata(t))
 	})
-
 	t.Run("SetDateTimeOriginal", func(t *testing.T) {
 		t.Parallel()
-		m := newTestMetadata(t)
-		ts := time.Date(2024, 6, 21, 12, 0, 0, 0, time.UTC)
-		m.SetDateTimeOriginal(ts)
-		got, ok := m.EXIF.DateTimeOriginal()
-		if !ok {
-			t.Fatal("EXIF.DateTimeOriginal missing after set")
-		}
-		if !got.Equal(ts) {
-			t.Errorf("EXIF.DateTimeOriginal = %v, want %v", got, ts)
-		}
-		xmpStr := m.XMP.DateTimeOriginal()
-		if xmpStr == "" {
-			t.Error("XMP.DateTimeOriginal empty after set")
-		}
+		testSetDateTimeOriginal(t, newTestMetadata(t))
 	})
-
 	t.Run("SetExposureTime", func(t *testing.T) {
 		t.Parallel()
-		m := newTestMetadata(t)
-		m.SetExposureTime(1, 250)
-		num, den, ok := m.ExposureTime()
-		if !ok {
-			t.Fatal("ExposureTime missing after set")
-		}
-		if num != 1 || den != 250 {
-			t.Errorf("ExposureTime = %d/%d, want 1/250", num, den)
-		}
+		testSetExposureTime(t, newTestMetadata(t))
 	})
-
 	t.Run("SetFNumber", func(t *testing.T) {
 		t.Parallel()
-		m := newTestMetadata(t)
-		m.SetFNumber(4.0)
-		f, ok := m.FNumber()
-		if !ok {
-			t.Fatal("FNumber missing after set")
-		}
-		if math.Abs(f-4.0) > 0.001 {
-			t.Errorf("FNumber = %f, want 4.0", f)
-		}
+		testSetFNumber(t, newTestMetadata(t))
 	})
-
 	t.Run("SetISO", func(t *testing.T) {
 		t.Parallel()
-		m := newTestMetadata(t)
-		m.SetISO(800)
-		iso, ok := m.ISO()
-		if !ok {
-			t.Fatal("ISO missing after set")
-		}
-		if iso != 800 {
-			t.Errorf("ISO = %d, want 800", iso)
-		}
+		testSetISO(t, newTestMetadata(t))
 	})
-
 	t.Run("SetFocalLength", func(t *testing.T) {
 		t.Parallel()
-		m := newTestMetadata(t)
-		m.SetFocalLength(85.0)
-		fl, ok := m.FocalLength()
-		if !ok {
-			t.Fatal("FocalLength missing after set")
-		}
-		if math.Abs(fl-85.0) > 0.001 {
-			t.Errorf("FocalLength = %f, want 85.0", fl)
-		}
+		testSetFocalLength(t, newTestMetadata(t))
 	})
-
 	t.Run("SetOrientation", func(t *testing.T) {
 		t.Parallel()
-		m := newTestMetadata(t)
-		m.SetOrientation(6)
-		v, ok := m.Orientation()
-		if !ok {
-			t.Fatal("Orientation missing after set")
-		}
-		if v != 6 {
-			t.Errorf("Orientation = %d, want 6", v)
-		}
+		testSetOrientation(t, newTestMetadata(t))
 	})
-
 	t.Run("SetImageSize", func(t *testing.T) {
 		t.Parallel()
-		m := newTestMetadata(t)
-		m.SetImageSize(1920, 1080)
-		w, h, ok := m.ImageSize()
-		if !ok {
-			t.Fatal("ImageSize missing after set")
-		}
-		if w != 1920 || h != 1080 {
-			t.Errorf("ImageSize = %dx%d, want 1920x1080", w, h)
-		}
+		testSetImageSize(t, newTestMetadata(t))
 	})
 }
 

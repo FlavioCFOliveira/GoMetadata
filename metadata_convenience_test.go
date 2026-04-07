@@ -61,6 +61,60 @@ func typeSize(t exif.DataType) int {
 	}
 }
 
+// tiffValPlacement records the buffer offset at which an out-of-line IFD entry
+// value is placed. ifdIdx identifies the IFD (0=IFD0, 1=ExifIFD, 2=GPSIFD).
+type tiffValPlacement struct {
+	ifdIdx   int
+	entryIdx int
+	off      uint32
+}
+
+// tiffPlaceEntries assigns out-of-line value offsets for all entries in one IFD
+// that do not fit inline (>4 bytes). It appends to placements and advances
+// cursor past each placed value.
+func tiffPlaceEntries(entries []tiffEntry, ifdIdx int, cursor *uint32, placements *[]tiffValPlacement) {
+	for i := range entries {
+		e := &entries[i]
+		totalSize := uint32(typeSize(e.typ)) * e.count //nolint:gosec // G115: test helper, intentional type cast
+		if totalSize > 4 && len(e.outOfLine) > 0 {
+			*placements = append(*placements, tiffValPlacement{ifdIdx, i, *cursor})
+			*cursor += uint32(len(e.outOfLine)) //nolint:gosec // G115: test helper, intentional type cast
+		}
+	}
+}
+
+// tiffWriteIFD serialises one IFD into buf at byte offset base.
+// ifdIdx is used to match entries against their tiffValPlacement records.
+func tiffWriteIFD(buf []byte, base uint32, entries []tiffEntry, ifdIdx int, nextOff uint32, placements []tiffValPlacement) {
+	order := binary.LittleEndian
+	off := int(base)
+	order.PutUint16(buf[off:], uint16(len(entries))) //nolint:gosec // G115: test helper, intentional type cast
+	off += 2
+	for i, e := range entries {
+		order.PutUint16(buf[off:], uint16(e.tag))
+		order.PutUint16(buf[off+2:], uint16(e.typ))
+		order.PutUint32(buf[off+4:], e.count)
+
+		totalSize := uint32(typeSize(e.typ)) * e.count //nolint:gosec // G115: test helper, intentional type cast
+		placed := false
+		if totalSize > 4 && len(e.outOfLine) > 0 {
+			for _, p := range placements {
+				if p.ifdIdx == ifdIdx && p.entryIdx == i {
+					order.PutUint32(buf[off+8:], p.off)
+					placed = true
+					break
+				}
+			}
+		}
+		if !placed {
+			// Inline value, left-justified (TIFF §2).
+			copy(buf[off+8:off+12], e.inline[:])
+		}
+		off += 12
+	}
+	order.PutUint32(buf[off:], nextOff) // next-IFD pointer
+}
+
 // buildTIFFMultiIFD constructs a TIFF stream (LE) from up to three IFDs.
 // ifd0Extra contains IFD0 entries (pointer tags are added automatically).
 // exifEntries and gpsEntries are the ExifIFD and GPSIFD entries respectively;
@@ -129,32 +183,14 @@ func buildTIFFMultiIFD(ifd0Extra, exifEntries, gpsEntries []tiffEntry) []byte {
 	}
 
 	// Pass 1: walk all IFDs and assign out-of-line value offsets in order.
-	// Each IFD carries its ifdIdx (0=IFD0, 1=ExifIFD, 2=GPSIFD) so that the
-	// write pass can look up the correct placement without pointer comparison.
-	type valPlacement struct {
-		ifdIdx   int
-		entryIdx int
-		off      uint32
-	}
-	var placements []valPlacement
+	var placements []tiffValPlacement
 	cursor := valueAreaStart
-
-	placeEntries := func(entries []tiffEntry, ifdIdx int) {
-		for i := range entries {
-			e := &entries[i]
-			totalSize := uint32(typeSize(e.typ)) * e.count //nolint:gosec // G115: test helper, intentional type cast
-			if totalSize > 4 && len(e.outOfLine) > 0 {
-				placements = append(placements, valPlacement{ifdIdx, i, cursor})
-				cursor += uint32(len(e.outOfLine)) //nolint:gosec // G115: test helper, intentional type cast
-			}
-		}
-	}
-	placeEntries(ifd0, 0)
+	tiffPlaceEntries(ifd0, 0, &cursor, &placements)
 	if needExif {
-		placeEntries(exifEntries, 1)
+		tiffPlaceEntries(exifEntries, 1, &cursor, &placements)
 	}
 	if needGPS {
-		placeEntries(gpsEntries, 2)
+		tiffPlaceEntries(gpsEntries, 2, &cursor, &placements)
 	}
 
 	buf := make([]byte, int(cursor))
@@ -164,43 +200,12 @@ func buildTIFFMultiIFD(ifd0Extra, exifEntries, gpsEntries []tiffEntry) []byte {
 	order.PutUint16(buf[2:], 0x002A)
 	order.PutUint32(buf[4:], ifd0Off)
 
-	// writeIFD serialises one IFD into buf at offset base.
-	// ifdIdx is used to match entries against their valPlacement records.
-	writeIFD := func(base uint32, entries []tiffEntry, ifdIdx int, nextOff uint32) {
-		off := int(base)
-		order.PutUint16(buf[off:], uint16(len(entries))) //nolint:gosec // G115: test helper, intentional type cast
-		off += 2
-		for i, e := range entries {
-			order.PutUint16(buf[off:], uint16(e.tag))
-			order.PutUint16(buf[off+2:], uint16(e.typ))
-			order.PutUint32(buf[off+4:], e.count)
-
-			totalSize := uint32(typeSize(e.typ)) * e.count //nolint:gosec // G115: test helper, intentional type cast
-			placed := false
-			if totalSize > 4 && len(e.outOfLine) > 0 {
-				for _, p := range placements {
-					if p.ifdIdx == ifdIdx && p.entryIdx == i {
-						order.PutUint32(buf[off+8:], p.off)
-						placed = true
-						break
-					}
-				}
-			}
-			if !placed {
-				// Inline value, left-justified (TIFF §2).
-				copy(buf[off+8:off+12], e.inline[:])
-			}
-			off += 12
-		}
-		order.PutUint32(buf[off:], nextOff) // next-IFD pointer
-	}
-
-	writeIFD(ifd0Off, ifd0, 0, 0)
+	tiffWriteIFD(buf, ifd0Off, ifd0, 0, 0, placements)
 	if needExif {
-		writeIFD(exifOff, exifEntries, 1, 0)
+		tiffWriteIFD(buf, exifOff, exifEntries, 1, 0, placements)
 	}
 	if needGPS {
-		writeIFD(gpsOff, gpsEntries, 2, 0)
+		tiffWriteIFD(buf, gpsOff, gpsEntries, 2, 0, placements)
 	}
 
 	// Pass 2: copy out-of-line values into the value area.
@@ -808,6 +813,42 @@ func TestMetadata_MeteringMode(t *testing.T) {
 // Combined ExifIFD methods: test multiple tags in a single ExifIFD.
 // ---------------------------------------------------------------------------
 
+// assertExifCoexistShortTags checks the short-integer ExifIFD tags that must
+// coexist correctly in TestMetadata_ExifIFDMultipleTagsCoexist.
+func assertExifCoexistShortTags(t *testing.T, m *Metadata) {
+	t.Helper()
+	if v, ok := m.WhiteBalance(); !ok || v != 1 {
+		t.Errorf("WhiteBalance() = (%d, %v), want (1, true)", v, ok)
+	}
+	if v, ok := m.Flash(); !ok || v != 0x01 {
+		t.Errorf("Flash() = (0x%02X, %v), want (0x01, true)", v, ok)
+	}
+	if v, ok := m.ExposureMode(); !ok || v != 1 {
+		t.Errorf("ExposureMode() = (%d, %v), want (1, true)", v, ok)
+	}
+	if v, ok := m.ColorSpace(); !ok || v != 0x0001 {
+		t.Errorf("ColorSpace() = (0x%04X, %v), want (0x0001, true)", v, ok)
+	}
+	if v, ok := m.MeteringMode(); !ok || v != 5 {
+		t.Errorf("MeteringMode() = (%d, %v), want (5, true)", v, ok)
+	}
+	if v, ok := m.SceneType(); !ok || v != 0x00 {
+		t.Errorf("SceneType() = (%d, %v), want (0, true)", v, ok)
+	}
+}
+
+// assertExifCoexistRationalTags checks the rational ExifIFD tags that must
+// coexist correctly in TestMetadata_ExifIFDMultipleTagsCoexist.
+func assertExifCoexistRationalTags(t *testing.T, m *Metadata) {
+	t.Helper()
+	if v, ok := m.SubjectDistance(); !ok || math.Abs(v-3.0) > 1e-9 {
+		t.Errorf("SubjectDistance() = (%f, %v), want (3.0, true)", v, ok)
+	}
+	if v, ok := m.DigitalZoomRatio(); !ok || math.Abs(v-1.5) > 1e-9 {
+		t.Errorf("DigitalZoomRatio() = (%f, %v), want (1.5, true)", v, ok)
+	}
+}
+
 // TestMetadata_ExifIFDMultipleTagsCoexist verifies that when an ExifIFD
 // contains several of the tested tags simultaneously, each accessor returns
 // the correct value independently.
@@ -832,31 +873,8 @@ func TestMetadata_ExifIFDMultipleTagsCoexist(t *testing.T) {
 		t.Fatalf("exif.Parse: %v", err)
 	}
 	m := &Metadata{EXIF: parsed}
-
-	if v, ok := m.WhiteBalance(); !ok || v != 1 {
-		t.Errorf("WhiteBalance() = (%d, %v), want (1, true)", v, ok)
-	}
-	if v, ok := m.Flash(); !ok || v != 0x01 {
-		t.Errorf("Flash() = (0x%02X, %v), want (0x01, true)", v, ok)
-	}
-	if v, ok := m.ExposureMode(); !ok || v != 1 {
-		t.Errorf("ExposureMode() = (%d, %v), want (1, true)", v, ok)
-	}
-	if v, ok := m.ColorSpace(); !ok || v != 0x0001 {
-		t.Errorf("ColorSpace() = (0x%04X, %v), want (0x0001, true)", v, ok)
-	}
-	if v, ok := m.MeteringMode(); !ok || v != 5 {
-		t.Errorf("MeteringMode() = (%d, %v), want (5, true)", v, ok)
-	}
-	if v, ok := m.SceneType(); !ok || v != 0x00 {
-		t.Errorf("SceneType() = (%d, %v), want (0, true)", v, ok)
-	}
-	if v, ok := m.SubjectDistance(); !ok || math.Abs(v-3.0) > 1e-9 {
-		t.Errorf("SubjectDistance() = (%f, %v), want (3.0, true)", v, ok)
-	}
-	if v, ok := m.DigitalZoomRatio(); !ok || math.Abs(v-1.5) > 1e-9 {
-		t.Errorf("DigitalZoomRatio() = (%f, %v), want (1.5, true)", v, ok)
-	}
+	assertExifCoexistShortTags(t, m)
+	assertExifCoexistRationalTags(t, m)
 }
 
 // TestMetadata_AltitudeAboveAndBelow verifies both positive and negative
