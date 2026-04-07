@@ -29,6 +29,12 @@ var pngSig = [8]byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A} //nolint:go
 // xmpKeyword is the iTXt keyword used by Adobe XMP (XMP Part 3 §1.1.4).
 const xmpKeyword = "XML:com.adobe.xmp"
 
+// maxZlibDecompressSize is the upper bound on decompressed output from a single
+// PNG metadata chunk. Legitimate EXIF and XMP payloads are many orders of
+// magnitude smaller; exceeding this limit indicates a decompression bomb or
+// a malformed file. Enforced via io.LimitReader to avoid unbounded allocation.
+const maxZlibDecompressSize int64 = 64 << 20 // 64 MB
+
 // zlibPool stores reusable io.ReadCloser values (zlib.NewReader return type).
 // Reusing them via zlib.Resetter avoids the ~32 KB internal decompression-state
 // allocation on every call to zlibDecompress.
@@ -60,9 +66,15 @@ func zlibDecompress(data []byte) ([]byte, error) {
 	}
 	// Return to pool without closing so it can be Reset on next use.
 	defer zlibPool.Put(zr)
-	data, err := io.ReadAll(zr)
+	// Cap decompressed output to prevent decompression bombs: a crafted zlib
+	// stream with a tiny compressed payload can expand to gigabytes of output.
+	// Reading one byte beyond the limit lets us detect overflow without reading it all.
+	data, err := io.ReadAll(io.LimitReader(zr, maxZlibDecompressSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("png: zlib decompress: %w", err)
+	}
+	if int64(len(data)) > maxZlibDecompressSize {
+		return nil, errDecompressBomb
 	}
 	return data, nil
 }
@@ -264,6 +276,10 @@ func writeMetadataAfterIHDR(w io.Writer, rawEXIF, rawXMP []byte) error {
 // errPNGDone is a sentinel returned from the readChunk callback to signal that
 // Inject has written the final chunk (IEND) and the loop should stop cleanly.
 var errPNGDone = errors.New("png: inject complete")
+
+// errDecompressBomb is returned when decompressed metadata exceeds maxZlibDecompressSize,
+// indicating a decompression bomb or malformed file.
+var errDecompressBomb = errors.New("png: decompressed metadata chunk exceeds size limit")
 
 // readChunk reads one PNG chunk and calls fn(chunkType, data) with a slice
 // backed by a pooled buffer. fn must not retain data after returning; call

@@ -35,6 +35,10 @@ var liPool = sync.Pool{New: func() any { //nolint:gochecknoglobals // sync.Pool:
 // They are only taken from the pool when the input actually contains '&'.
 var builderPool = sync.Pool{New: func() any { return &strings.Builder{} }} //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
 
+// maxUnescapedXMLBytes caps the decoded output of a single XMP attribute or
+// text node to prevent unbounded allocation from crafted numeric character refs.
+const maxUnescapedXMLBytes = 1 << 20 // 1 MiB
+
 // commentClose and piEnd are package-level byte slices for XML structural
 // terminators. Declared here to avoid heap-allocating []byte literals inside
 // skipComment and skipPI on every call (each []byte("...") literal in a
@@ -764,6 +768,11 @@ func unescapeXML(b []byte) string {
 		if b[i] != '&' {
 			bld.WriteByte(b[i])
 			i++
+			if bld.Len() > maxUnescapedXMLBytes {
+				bld.Reset()
+				builderPool.Put(bld)
+				return ""
+			}
 			continue
 		}
 		// Find the closing ';'.
@@ -776,6 +785,11 @@ func unescapeXML(b []byte) string {
 		ref := b[i+1 : i+semi] // the content between '&' and ';'
 		i += semi + 1
 		decodeEntity(ref, bld)
+		if bld.Len() > maxUnescapedXMLBytes {
+			bld.Reset()
+			builderPool.Put(bld)
+			return ""
+		}
 	}
 
 	s := bld.String()

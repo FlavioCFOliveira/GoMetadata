@@ -70,13 +70,32 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	return rawEXIF, nil, rawXMP, err
 }
 
+// maxItemPayloadSize is the upper bound on a single HEIF item payload that this
+// library will allocate. Real EXIF and XMP payloads are orders of magnitude
+// smaller; a value exceeding this indicates a malformed or adversarial file.
+// ISO 23008-12 §6.6: item payloads are compact metadata structures, not media.
+const maxItemPayloadSize = 256 << 20 // 256 MB
+
+var (
+	errItemPayloadTooLarge = errors.New("heif: item payload exceeds size limit")
+	errItemOffsetOverflow  = errors.New("heif: item location offset overflows int64")
+)
+
 // readItemPayload seeks r to loc.offset and reads loc.length bytes.
 // The returned slice is owned by the caller; r is left at an unspecified position.
 func readItemPayload(r io.ReadSeeker, loc itemLoc) ([]byte, error) {
 	if loc.length == 0 {
 		return nil, nil
 	}
-	if _, err := r.Seek(int64(loc.offset), io.SeekStart); err != nil { //nolint:gosec // G115: offset fits int64 for any realistic file
+	if loc.length > maxItemPayloadSize {
+		return nil, errItemPayloadTooLarge
+	}
+	// Validate that offset fits int64 to prevent sign-wrapping on conversion.
+	// math.MaxInt64 = 9223372036854775807; any realistic file offset is far below this.
+	if loc.offset > math.MaxInt64 {
+		return nil, errItemOffsetOverflow
+	}
+	if _, err := r.Seek(int64(loc.offset), io.SeekStart); err != nil {
 		return nil, fmt.Errorf("heif: seek to item: %w", err)
 	}
 	payload := make([]byte, loc.length)
@@ -620,6 +639,23 @@ func appendUintN(b []byte, n int, v uint64) []byte {
 // Extract helpers (unchanged from original)
 // ---------------------------------------------------------------------------
 
+// extractItemSlice returns the slice of data for the item at loc, applying
+// int-range and bounds guards. Returns nil if the location is invalid.
+//
+// Guard uint64→int conversion: on 32-bit platforms math.MaxInt is 2^31-1;
+// a pathologically large offset would wrap and panic on slice indexing.
+// ISO 23008-12 §6.6: item offsets are absolute positions within the file data.
+func extractItemSlice(data []byte, loc itemLoc) []byte {
+	if loc.offset > math.MaxInt || loc.offset+loc.length > math.MaxInt {
+		return nil
+	}
+	end := loc.offset + loc.length
+	if end > uint64(len(data)) {
+		return nil
+	}
+	return data[loc.offset:end]
+}
+
 // parseHEIFMetadata parses the box hierarchy to find EXIF and XMP items.
 // When multiple items of the same type exist, the primary item (per 'pitm' box)
 // is preferred; otherwise the item with the lowest ID is selected.
@@ -646,14 +682,13 @@ func parseHEIFMetadata(data []byte) (rawEXIF, rawXMP []byte, err error) {
 	bestXMPID, xmpFound := selectBestItem(itemTypes, primaryID, "mime", "rdf+xml")
 
 	if exifFound {
-		if loc, ok := itemLocs[bestEXIFID]; ok && loc.offset+loc.length <= uint64(len(data)) {
-			itemData := data[loc.offset : loc.offset+loc.length]
-			rawEXIF = extractExifFromData(itemData)
+		if loc, ok := itemLocs[bestEXIFID]; ok {
+			rawEXIF = extractExifFromData(extractItemSlice(data, loc))
 		}
 	}
 	if xmpFound {
-		if loc, ok := itemLocs[bestXMPID]; ok && loc.offset+loc.length <= uint64(len(data)) {
-			rawXMP = data[loc.offset : loc.offset+loc.length]
+		if loc, ok := itemLocs[bestXMPID]; ok {
+			rawXMP = extractItemSlice(data, loc)
 		}
 	}
 

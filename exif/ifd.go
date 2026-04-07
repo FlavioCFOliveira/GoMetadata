@@ -114,7 +114,11 @@ func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint
 		return nil, 0, false
 	}
 
-	ifd := &IFD{Entries: make([]IFDEntry, 0, count)}
+	// Cap initial capacity to avoid over-allocating on crafted large counts.
+	// The loop below will only append entries that fit within the validated buffer range.
+	const maxIFDEntryPrealloc = 1024
+	preallocCap := min(int(count), maxIFDEntryPrealloc)
+	ifd := &IFD{Entries: make([]IFDEntry, 0, preallocCap)}
 	for i := 0; i < int(count); i++ { //nolint:intrange // binary parser: loop variable is a byte-slice offset multiplier
 		entry, ok := parseIFDEntry(b, pos+i*12, order)
 		if !ok {

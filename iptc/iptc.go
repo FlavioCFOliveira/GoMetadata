@@ -57,6 +57,10 @@ func decodeDatasetLength(b []byte, pos int) (length, newPos int, ok bool) {
 		for j := range nBytes {
 			length = length<<8 | int(b[newPos+j])
 		}
+		// Guard against sign-bit overflow on 32-bit platforms (IIM §1.6.2).
+		if length < 0 {
+			return 0, pos, false
+		}
 		newPos += nBytes
 	} else {
 		// Standard length encoding (IIM §1.6.2): the two size bytes are the length.
@@ -85,6 +89,10 @@ func storeDataset(i *IPTC, record, dataset uint8, value []byte, utf8 *bool) {
 	})
 }
 
+// maxIPTCTotalBytes is the maximum aggregate size of all parsed IPTC dataset
+// values. This prevents memory exhaustion from streams with many large datasets.
+const maxIPTCTotalBytes = 256 << 20 // 256 MiB
+
 // Parse parses a raw IPTC IIM byte stream.
 // b must begin with (or contain) the IPTC tag marker 0x1C (IIM §1.6).
 func Parse(b []byte) (*IPTC, error) {
@@ -93,6 +101,7 @@ func Parse(b []byte) (*IPTC, error) {
 	// typically containing 5–15 datasets in a production JPEG (IIM §2).
 	i.Records[2] = make([]Dataset, 0, 12)
 	utf8 := false
+	totalBytes := 0
 
 	pos := 0
 	for pos < len(b) {
@@ -119,6 +128,11 @@ func Parse(b []byte) (*IPTC, error) {
 		// Cap individual dataset size to 1 MiB to prevent memory exhaustion
 		// from crafted IPTC streams with large declared lengths.
 		if length > 1<<20 || length < 0 || pos+length > len(b) {
+			break
+		}
+		// Cap aggregate size to prevent memory exhaustion from many large datasets.
+		totalBytes += length
+		if totalBytes > maxIPTCTotalBytes {
 			break
 		}
 
