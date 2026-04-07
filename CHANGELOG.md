@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-04-07
+
+### Security
+
+- **IPTC extended-length integer overflow** (`iptc/iptc.go`): added an immediate `length < 0` guard after the extended-length accumulation loop to prevent sign-bit overflow on 32-bit platforms (IIM §1.6.2, CWE-190).
+- **IPTC unbounded aggregate allocation** (`iptc/iptc.go`): added `maxIPTCTotalBytes = 256 MiB` cap on the total size of all parsed datasets in a single stream, preventing memory exhaustion from crafted files with many large datasets (CWE-400).
+- **XMP entity expansion** (`xmp/rdf.go`): `unescapeXML` now returns an empty string and recycles the pooled builder if the decoded output of a single attribute or text node exceeds 1 MiB, preventing unbounded allocation from crafted numeric character references (CWE-776).
+- **EXIF IFD entry over-allocation** (`exif/ifd.go`): `parseSingleIFD` caps the pre-allocated `Entries` slice capacity at 1 024, preventing a crafted `count = 0xFFFF` field from forcing a 65 535-entry allocation before the buffer-bounds check fires (CWE-190).
+- **HEIF item offset overflow** (`format/heif/heif.go`): `readItemPayload` now validates that `loc.offset` fits in `int64` before the `Seek` conversion, preventing sign-wrapping on the cast; added private `extractItemSlice` helper with the same guard for the in-memory code path.
+- **PNG decompression bomb** (`format/png/png.go`): `zlibDecompress` now reads through `io.LimitReader` capped at 64 MiB and returns a sentinel error if the limit is exceeded, preventing zip-bomb-style payloads from exhausting memory.
+
 ## [1.0.2] - 2026-04-07
 
 ### Performance
