@@ -55,6 +55,7 @@ func currentPos(t *testing.T, r io.ReadSeeker) int64 {
 // TestReadBox_Standard verifies that a well-formed 8-byte-header box is parsed
 // with correct Size, Type, Offset, and DataSize fields.
 func TestReadBox_Standard(t *testing.T) {
+	t.Parallel()
 	ftyp := [4]byte{'f', 't', 'y', 'p'}
 	mdat := [4]byte{'m', 'd', 'a', 't'}
 	free := [4]byte{'f', 'r', 'e', 'e'}
@@ -103,6 +104,7 @@ func TestReadBox_Standard(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			raw := buildStandardBox(uint32(tc.wantSize), tc.typ, tc.payload) //nolint:gosec // G115: test helper, intentional type cast
 			r := bytes.NewReader(raw)
 
@@ -132,6 +134,7 @@ func TestReadBox_Standard(t *testing.T) {
 // ReadBox reads the subsequent 8 bytes as the actual 64-bit box size, sets
 // Offset to 16 (past the 16-byte header), and computes DataSize correctly.
 func TestReadBox_ExtendedSize(t *testing.T) {
+	t.Parallel()
 	typ := [4]byte{'m', 'd', 'a', 't'}
 
 	tests := []struct {
@@ -166,6 +169,7 @@ func TestReadBox_ExtendedSize(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			raw := buildExtendedBox(tc.extSize, typ, make([]byte, tc.payloadLen))
 			r := bytes.NewReader(raw)
 
@@ -198,6 +202,7 @@ func TestReadBox_ExtendedSize(t *testing.T) {
 // ISO 14496-12 §4.2: "If size is 0, then this box is the last one in the
 // file, and its contents extend to the end of the file."
 func TestReadBox_SizeZero(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		typ     [4]byte
@@ -217,6 +222,7 @@ func TestReadBox_SizeZero(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			raw := buildSizeZeroBox(tc.typ, tc.payload)
 			r := bytes.NewReader(raw)
 
@@ -245,6 +251,7 @@ func TestReadBox_SizeZero(t *testing.T) {
 // TestReadBox_Truncated verifies that ReadBox propagates an error (io.EOF or
 // io.ErrUnexpectedEOF) when the input is shorter than a complete box header.
 func TestReadBox_Truncated(t *testing.T) {
+	t.Parallel()
 	typ := [4]byte{'f', 't', 'y', 'p'}
 	fullHeader := buildStandardBox(12, typ, []byte{0x00, 0x00, 0x00, 0x00})
 
@@ -272,6 +279,7 @@ func TestReadBox_Truncated(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			r := bytes.NewReader(tc.data)
 			_, err := ReadBox(r)
 			if err == nil {
@@ -291,6 +299,7 @@ func TestReadBox_Truncated(t *testing.T) {
 // TestReadBox_EmptyData verifies that a box whose total size equals exactly 8
 // (header only, zero data bytes) is correctly parsed with DataSize==0.
 func TestReadBox_EmptyData(t *testing.T) {
+	t.Parallel()
 	typ := [4]byte{'f', 'r', 'e', 'e'}
 	// size field = 8, no payload bytes.
 	raw := buildStandardBox(8, typ, nil)
@@ -316,6 +325,7 @@ func TestReadBox_EmptyData(t *testing.T) {
 // TestSkipBox verifies that SkipBox advances the reader to exactly the first
 // byte of the next box (i.e., box.Offset + box.DataSize).
 func TestSkipBox(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name        string
 		typ         [4]byte
@@ -344,6 +354,7 @@ func TestSkipBox(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			totalSize := 8 + tc.payloadSize
 			raw := buildStandardBox(uint32(totalSize), tc.typ, make([]byte, tc.payloadSize)) //nolint:gosec // G115: test helper, intentional type cast
 			r := bytes.NewReader(raw)
@@ -370,6 +381,7 @@ func TestSkipBox(t *testing.T) {
 // TestSkipBox_SizeZero verifies that SkipBox on a size==0 box seeks to EOF,
 // leaving the reader at the end of the stream.
 func TestSkipBox_SizeZero(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		typ     [4]byte
@@ -389,6 +401,7 @@ func TestSkipBox_SizeZero(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			raw := buildSizeZeroBox(tc.typ, tc.payload)
 			totalLen := int64(len(raw))
 			r := bytes.NewReader(raw)
@@ -419,6 +432,7 @@ func TestSkipBox_SizeZero(t *testing.T) {
 // box type as a string, including non-ASCII and null bytes, since ISOBMFF
 // type codes are binary identifiers, not text strings.
 func TestTypeString(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		typ  [4]byte
@@ -435,6 +449,7 @@ func TestTypeString(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			box := &Box{Type: tc.typ}
 			got := box.TypeString()
 			if got != tc.want {
@@ -450,6 +465,7 @@ func TestTypeString(t *testing.T) {
 // input is shorter than the minimum 8-byte header, focusing specifically on
 // each byte boundary from 0 to 7 bytes.
 func TestReadBox_HeaderTruncated(t *testing.T) {
+	t.Parallel()
 	// A valid 8-byte header for reference.
 	valid := [8]byte{
 		0x00, 0x00, 0x00, 0x10, // size = 16
@@ -458,6 +474,7 @@ func TestReadBox_HeaderTruncated(t *testing.T) {
 
 	for n := range 8 {
 		t.Run("", func(t *testing.T) {
+			t.Parallel()
 			r := bytes.NewReader(valid[:n])
 			_, err := ReadBox(r)
 			if err == nil {
@@ -476,6 +493,7 @@ func TestReadBox_HeaderTruncated(t *testing.T) {
 // when the 4-byte size field is 1 (signalling extended size) but the
 // subsequent 8-byte extended size field is missing or truncated.
 func TestReadBox_ExtendedSize_Truncated(t *testing.T) {
+	t.Parallel()
 	typ := [4]byte{'m', 'd', 'a', 't'}
 
 	tests := []struct {
@@ -490,6 +508,7 @@ func TestReadBox_ExtendedSize_Truncated(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			// Build a sentinel header (size==1) followed by a partial extended field.
 			buf := make([]byte, 8+tc.extra)
 			binary.BigEndian.PutUint32(buf[0:4], 1) // sentinel
@@ -514,6 +533,7 @@ func TestReadBox_ExtendedSize_Truncated(t *testing.T) {
 // SkipBox calls correctly traverse a concatenated multi-box stream, leaving
 // the reader at the expected byte offset after each hop.
 func TestSkipBox_PositionAfterMultipleBoxes(t *testing.T) {
+	t.Parallel()
 	// Build a stream of three consecutive boxes.
 	boxes := []struct {
 		typ         [4]byte
@@ -570,6 +590,7 @@ func TestSkipBox_PositionAfterMultipleBoxes(t *testing.T) {
 // TestReadBox_ExtendedSize_Offset confirms that Offset for an extended-size
 // box is always 16 (after the 16-byte header: 4+4+8), regardless of payload.
 func TestReadBox_ExtendedSize_Offset(t *testing.T) {
+	t.Parallel()
 	typ := [4]byte{'m', 'd', 'a', 't'}
 	payloads := []int{0, 1, 8, 100}
 
@@ -597,6 +618,7 @@ func TestReadBox_ExtendedSize_Offset(t *testing.T) {
 // of the four type positions are preserved verbatim.  ISOBMFF type codes are
 // opaque 4-byte identifiers; no normalisation is applied.
 func TestReadBox_TypePreservation(t *testing.T) {
+	t.Parallel()
 	// Test all 256 values in each byte position independently.
 	for pos := range 4 {
 		for v := range 256 {

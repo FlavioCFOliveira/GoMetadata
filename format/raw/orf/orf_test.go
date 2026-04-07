@@ -17,6 +17,7 @@ func buildORF() []byte {
 }
 
 func TestExtractHasORFMagic(t *testing.T) {
+	t.Parallel()
 	data := buildORF()
 	if !bytes.HasPrefix(data, orfMagic) {
 		t.Fatal("test data does not start with ORF magic")
@@ -24,6 +25,7 @@ func TestExtractHasORFMagic(t *testing.T) {
 }
 
 func TestExtractReturnsRawEXIF(t *testing.T) {
+	t.Parallel()
 	data := buildORF()
 	rawEXIF, rawIPTC, rawXMP, err := Extract(bytes.NewReader(data))
 	if err != nil {
@@ -45,6 +47,7 @@ func TestExtractReturnsRawEXIF(t *testing.T) {
 }
 
 func TestExtractInvalidMagicReturnsError(t *testing.T) {
+	t.Parallel()
 	data := buildORF()
 	data[0] = 'M' // corrupt magic
 	_, _, _, err := Extract(bytes.NewReader(data))
@@ -54,6 +57,7 @@ func TestExtractInvalidMagicReturnsError(t *testing.T) {
 }
 
 func TestInjectOutputHasORFMagic(t *testing.T) {
+	t.Parallel()
 	data := buildORF()
 	var out bytes.Buffer
 	if err := Inject(bytes.NewReader(data), &out, nil, nil, nil); err != nil {
@@ -71,6 +75,7 @@ func TestInjectOutputHasORFMagic(t *testing.T) {
 }
 
 func TestInjectRoundTrip(t *testing.T) {
+	t.Parallel()
 	data := buildORF()
 	var out bytes.Buffer
 	if err := Inject(bytes.NewReader(data), &out, nil, nil, nil); err != nil {
@@ -87,6 +92,7 @@ func TestInjectRoundTrip(t *testing.T) {
 }
 
 func TestInjectInvalidMagicReturnsError(t *testing.T) {
+	t.Parallel()
 	data := buildORF()
 	data[0] = 'M'
 	var out bytes.Buffer
@@ -143,6 +149,7 @@ func buildORFWithTag(tag uint16, typ uint16, value []byte) []byte {
 // TestExtractTIFFTagsIPTC verifies that an ORF containing an IFD0 entry with
 // tag 0x83BB (IPTC) causes Extract to return a non-nil rawIPTC.
 func TestExtractTIFFTagsIPTC(t *testing.T) {
+	t.Parallel()
 	iptcData := []byte{0x1C, 0x02, 0x05, 0x00, 0x03, 'A', 'B', 'C'}
 	// Type 7 = UNDEFINED (1 byte per unit); len(iptcData) = 8 → out-of-line
 	data := buildORFWithTag(0x83BB, 7, iptcData)
@@ -162,6 +169,7 @@ func TestExtractTIFFTagsIPTC(t *testing.T) {
 // --- Test L (inline variant): IPTC tag with inline value (total <= 4 bytes) ---
 
 func TestExtractTIFFTagsIPTCInline(t *testing.T) {
+	t.Parallel()
 	iptcData := []byte{0x1C, 0x02} // 2 bytes → inline
 	data := buildORFWithTag(0x83BB, 7, iptcData)
 
@@ -182,6 +190,7 @@ func TestExtractTIFFTagsIPTCInline(t *testing.T) {
 // TestExtractTIFFTagsXMP verifies that an ORF containing an IFD0 entry with
 // tag 0x02BC (XMP) causes Extract to return a non-nil rawXMP.
 func TestExtractTIFFTagsXMP(t *testing.T) {
+	t.Parallel()
 	xmpData := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta/>`)
 	data := buildORFWithTag(0x02BC, 1, xmpData) // type 1 = BYTE
 
@@ -203,6 +212,7 @@ func TestExtractTIFFTagsXMP(t *testing.T) {
 // and the unknown-type fallback by building ORF entries with each type and
 // triggering extractTIFFTags via Extract.
 func TestTypeSizeAllBranches(t *testing.T) {
+	t.Parallel()
 	// typeSize return values:
 	//  1→1 (BYTE), 2→1 (ASCII), 3→2 (SHORT), 4→4 (LONG), 5→8 (RATIONAL),
 	//  6→1 (SBYTE), 7→1 (UNDEFINED), 8→2 (SSHORT), 9→4 (SLONG),
@@ -229,6 +239,7 @@ func TestTypeSizeAllBranches(t *testing.T) {
 // TestExtractOutOfBoundsIFDOffset verifies that an ORF whose IFD0 offset
 // points past the end of the data slice does not panic and returns no error.
 func TestExtractOutOfBoundsIFDOffset(t *testing.T) {
+	t.Parallel()
 	// Start from a valid minimal ORF, then corrupt the IFD0 offset to point
 	// far beyond the data.
 	data := buildORF()
@@ -259,6 +270,7 @@ func TestExtractOutOfBoundsIFDOffset(t *testing.T) {
 // Round-trip correctness of IPTC/XMP depends on the TIFF delegate; this test
 // checks for absence of panic and correct ORF magic restoration.
 func TestInjectIPTCXMP(t *testing.T) {
+	t.Parallel()
 	data := buildORF()
 	iptcPayload := []byte{0x1C, 0x02, 0x78, 0x00, 0x03, 'N', 'e', 'w'}
 	xmpPayload := []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"/>`)
@@ -284,6 +296,7 @@ func TestInjectIPTCXMP(t *testing.T) {
 // TestExtractTIFFTagsOOBValueOffset verifies that an IFD entry whose out-of-line
 // value offset is beyond the data slice is silently skipped (no panic).
 func TestExtractTIFFTagsOOBValueOffset(t *testing.T) {
+	t.Parallel()
 	// Build an ORF where the entry claims 100 bytes of out-of-line data but
 	// the offset points past the end of the buffer.
 	const ifd0Off = 8

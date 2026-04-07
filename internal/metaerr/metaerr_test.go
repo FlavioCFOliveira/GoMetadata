@@ -12,6 +12,7 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestTruncatedFileErrorMessage(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		at   string
 		want string
@@ -30,6 +31,7 @@ func TestTruncatedFileErrorMessage(t *testing.T) {
 }
 
 func TestTruncatedFileErrorContainsAt(t *testing.T) {
+	t.Parallel()
 	e := &TruncatedFileError{At: "GPS IFD"}
 	if !strings.Contains(e.Error(), "GPS IFD") {
 		t.Errorf("error message does not contain the At field: %q", e.Error())
@@ -37,6 +39,7 @@ func TestTruncatedFileErrorContainsAt(t *testing.T) {
 }
 
 func TestTruncatedFileErrorIsPrefix(t *testing.T) {
+	t.Parallel()
 	e := &TruncatedFileError{At: "anything"}
 	if !strings.HasPrefix(e.Error(), "gometadata:") {
 		t.Errorf("error message missing 'gometadata:' prefix: %q", e.Error())
@@ -46,6 +49,7 @@ func TestTruncatedFileErrorIsPrefix(t *testing.T) {
 // TestTruncatedFileErrorAsUnwrap verifies that errors.As correctly identifies
 // a wrapped TruncatedFileError.
 func TestTruncatedFileErrorAsUnwrap(t *testing.T) {
+	t.Parallel()
 	inner := &TruncatedFileError{At: "APP1 segment"}
 	wrapped := fmt.Errorf("outer: %w", inner)
 
@@ -61,6 +65,7 @@ func TestTruncatedFileErrorAsUnwrap(t *testing.T) {
 // TestTruncatedFileErrorDirectErrors_As verifies errors.As on a direct (non-
 // wrapped) value.
 func TestTruncatedFileErrorDirectErrorsAs(t *testing.T) {
+	t.Parallel()
 	e := &TruncatedFileError{At: "direct"}
 	var target *TruncatedFileError
 	if !errors.As(e, &target) {
@@ -73,6 +78,7 @@ func TestTruncatedFileErrorDirectErrorsAs(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestCorruptMetadataErrorMessage(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		format string
 		reason string
@@ -94,6 +100,7 @@ func TestCorruptMetadataErrorMessage(t *testing.T) {
 }
 
 func TestCorruptMetadataErrorContainsFormatAndReason(t *testing.T) {
+	t.Parallel()
 	e := &CorruptMetadataError{Format: "TIFF", Reason: "negative count"}
 	msg := e.Error()
 	if !strings.Contains(msg, "TIFF") {
@@ -107,6 +114,7 @@ func TestCorruptMetadataErrorContainsFormatAndReason(t *testing.T) {
 // TestCorruptMetadataErrorAsUnwrap verifies errors.As unwrapping for
 // CorruptMetadataError.
 func TestCorruptMetadataErrorAsUnwrap(t *testing.T) {
+	t.Parallel()
 	inner := &CorruptMetadataError{Format: "XMP", Reason: "depth limit exceeded"}
 	wrapped := fmt.Errorf("parse failed: %w", inner)
 
@@ -123,6 +131,7 @@ func TestCorruptMetadataErrorAsUnwrap(t *testing.T) {
 }
 
 func TestCorruptMetadataErrorDirectErrorsAs(t *testing.T) {
+	t.Parallel()
 	e := &CorruptMetadataError{Format: "IPTC", Reason: "direct"}
 	var target *CorruptMetadataError
 	if !errors.As(e, &target) {
@@ -133,6 +142,7 @@ func TestCorruptMetadataErrorDirectErrorsAs(t *testing.T) {
 // TestErrorsAreDistinct confirms that a TruncatedFileError cannot satisfy
 // errors.As for *CorruptMetadataError, and vice versa.
 func TestErrorsAreDistinct(t *testing.T) {
+	t.Parallel()
 	trunc := &TruncatedFileError{At: "x"}
 	var corrupt *CorruptMetadataError
 	if errors.As(trunc, &corrupt) {

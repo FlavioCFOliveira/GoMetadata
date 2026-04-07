@@ -66,6 +66,7 @@ func buildFujifilmMakerNoteWithOffset() []byte {
 }
 
 func TestFujifilmParse_Valid(t *testing.T) {
+	t.Parallel()
 	b := buildFujifilmMakerNote()
 	p := Parser{}
 	result, err := p.Parse(b)
@@ -81,6 +82,7 @@ func TestFujifilmParse_Valid(t *testing.T) {
 }
 
 func TestFujifilmParse_OffsetValue(t *testing.T) {
+	t.Parallel()
 	b := buildFujifilmMakerNoteWithOffset()
 	p := Parser{}
 	result, err := p.Parse(b)
@@ -97,6 +99,7 @@ func TestFujifilmParse_OffsetValue(t *testing.T) {
 }
 
 func TestFujifilmParse_TooShort(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		b    []byte
@@ -109,6 +112,7 @@ func TestFujifilmParse_TooShort(t *testing.T) {
 	p := Parser{}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			_, err := p.Parse(tc.b)
 			if err == nil {
 				t.Error("expected error for too-short input, got nil")
@@ -118,6 +122,7 @@ func TestFujifilmParse_TooShort(t *testing.T) {
 }
 
 func TestFujifilmParse_BadMagic(t *testing.T) {
+	t.Parallel()
 	b := make([]byte, minLength)
 	copy(b[0:8], "BADMAGIC")
 	copy(b[8:12], "0100")
@@ -131,6 +136,7 @@ func TestFujifilmParse_BadMagic(t *testing.T) {
 }
 
 func TestFujifilmParse_IFDOffsetOutOfBounds(t *testing.T) {
+	t.Parallel()
 	// IFD offset points beyond the buffer.
 	b := make([]byte, minLength)
 	copy(b[0:8], "FUJIFILM")
@@ -149,6 +155,7 @@ func TestFujifilmParse_IFDOffsetOutOfBounds(t *testing.T) {
 }
 
 func TestFujifilmParse_MultipleEntries(t *testing.T) {
+	t.Parallel()
 	// Build a MakerNote with two tags.
 	const ifdOffset = 16
 	// header(16) + count(2) + 2 entries(24) = 42
@@ -187,6 +194,7 @@ func TestFujifilmParse_MultipleEntries(t *testing.T) {
 }
 
 func TestTagConstants(t *testing.T) {
+	t.Parallel()
 	if TagVersion != 0x0000 {
 		t.Errorf("TagVersion = 0x%04X, want 0x0000", TagVersion)
 	}

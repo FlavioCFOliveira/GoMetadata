@@ -29,6 +29,7 @@ func buildSonyIFD() []byte {
 }
 
 func TestParseValidIFD(t *testing.T) {
+	t.Parallel()
 	b := buildSonyIFD()
 	p := Parser{}
 	result, err := p.Parse(b)
@@ -47,6 +48,7 @@ func TestParseValidIFD(t *testing.T) {
 }
 
 func TestParseTooShortReturnsNil(t *testing.T) {
+	t.Parallel()
 	p := Parser{}
 	result, err := p.Parse([]byte{0x01})
 	if err != nil {
@@ -58,6 +60,7 @@ func TestParseTooShortReturnsNil(t *testing.T) {
 }
 
 func TestParseEmptyReturnsNil(t *testing.T) {
+	t.Parallel()
 	p := Parser{}
 	result, err := p.Parse([]byte{})
 	if err != nil {
@@ -69,6 +72,7 @@ func TestParseEmptyReturnsNil(t *testing.T) {
 }
 
 func TestTagConstants(t *testing.T) {
+	t.Parallel()
 	if TagQuality != 0x0102 {
 		t.Errorf("TagQuality = 0x%04X, want 0x0102", TagQuality)
 	}

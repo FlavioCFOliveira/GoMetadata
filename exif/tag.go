@@ -153,7 +153,7 @@ const (
 // Populated at init time; treated as read-only thereafter.
 var tagRegistry map[TagID]tagInfo
 
-func init() {
+func init() { //nolint:funlen // justified: tag registry must enumerate all ~130 EXIF/TIFF tags in one place; splitting would obscure the spec mapping
 	tagRegistry = make(map[TagID]tagInfo, 256)
 
 	// IFD0 / TIFF baseline tags (TIFF 6.0 §8).

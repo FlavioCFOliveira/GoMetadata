@@ -47,6 +47,7 @@ func writeChunkTo(buf *bytes.Buffer, chunkType string, data []byte) {
 }
 
 func TestExtractEXIF(t *testing.T) {
+	t.Parallel()
 	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00}
 	png := buildPNG(exifData, nil)
 
@@ -64,6 +65,7 @@ func TestExtractEXIF(t *testing.T) {
 }
 
 func TestExtractXMPUncompressed(t *testing.T) {
+	t.Parallel()
 	xmpData := []byte("<?xpacket begin='' uid='x'?><xmpmeta/><?xpacket end='r'?>")
 	png := buildPNG(nil, xmpData)
 
@@ -80,6 +82,7 @@ func TestExtractXMPUncompressed(t *testing.T) {
 }
 
 func TestExtractXMPCompressed(t *testing.T) {
+	t.Parallel()
 	xmpData := []byte("<?xpacket begin='' uid='x'?><xmpmeta/><?xpacket end='r'?>")
 
 	// Build compressed iTXt chunk manually.
@@ -120,6 +123,7 @@ func TestExtractXMPCompressed(t *testing.T) {
 }
 
 func TestInjectCRCCorrect(t *testing.T) {
+	t.Parallel()
 	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00}
 	png := buildPNG(nil, nil)
 
@@ -157,6 +161,7 @@ func TestInjectCRCCorrect(t *testing.T) {
 }
 
 func TestInjectRoundTrip(t *testing.T) {
+	t.Parallel()
 	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00}
 	xmpData := []byte("<?xpacket begin='' uid='x'?><x/><?xpacket end='r'?>")
 	png := buildPNG(nil, nil)
@@ -203,6 +208,7 @@ func buildPNGWithChunk(chunkType string, data []byte) []byte {
 // uncompressed tEXt chunk whose keyword is "XML:com.adobe.xmp".
 // This exercises extractXMPFromTExt (png.go:257-271).
 func TestExtractXMPFromTEXtChunk(t *testing.T) {
+	t.Parallel()
 	xmpContent := []byte("<?xpacket begin='' uid='x'?><x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/><?xpacket end='r'?>")
 
 	// tEXt chunk payload: keyword + NUL + text (PNG §11.3.3).
@@ -227,6 +233,7 @@ func TestExtractXMPFromTEXtChunk(t *testing.T) {
 // TestExtractXMPFromTEXtChunkWrongKeyword verifies that a tEXt chunk with a
 // non-XMP keyword is silently ignored and does not set rawXMP.
 func TestExtractXMPFromTEXtChunkWrongKeyword(t *testing.T) {
+	t.Parallel()
 	var payload bytes.Buffer
 	payload.WriteString("Comment") // not the XMP keyword
 	payload.WriteByte(0x00)
@@ -245,6 +252,7 @@ func TestExtractXMPFromTEXtChunkWrongKeyword(t *testing.T) {
 // TestExtractXMPFromTEXtChunkNoNul verifies that a tEXt chunk without a NUL
 // separator is safely skipped (extractXMPFromTExt returns nil).
 func TestExtractXMPFromTEXtChunkNoNul(t *testing.T) {
+	t.Parallel()
 	// Payload has no NUL byte at all — malformed but real files can have this.
 	payload := []byte("no null separator here")
 	png := buildPNGWithChunk("tEXt", payload)
@@ -262,6 +270,7 @@ func TestExtractXMPFromTEXtChunkNoNul(t *testing.T) {
 // XMP from a legacy zTXt chunk (deflate, PNG §11.3.3).
 // This exercises extractXMPFromZTxt (png.go:273-301).
 func TestExtractXMPFromZTxtChunk(t *testing.T) {
+	t.Parallel()
 	xmpContent := []byte("<?xpacket begin='' uid='x'?><x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/><?xpacket end='r'?>")
 
 	// Compress xmpContent with zlib.
@@ -297,6 +306,7 @@ func TestExtractXMPFromZTxtChunk(t *testing.T) {
 // TestExtractXMPFromZTxtChunkWrongKeyword verifies that a zTXt chunk with a
 // non-XMP keyword is silently ignored.
 func TestExtractXMPFromZTxtChunkWrongKeyword(t *testing.T) {
+	t.Parallel()
 	var compressed bytes.Buffer
 	zw := zlib.NewWriter(&compressed)
 	_, _ = zw.Write([]byte("some compressed text"))
@@ -323,6 +333,7 @@ func TestExtractXMPFromZTxtChunkWrongKeyword(t *testing.T) {
 // first and rawXMP is set, so the tEXt branch is skipped per
 // png.go:64 `if rawXMP == nil`).
 func TestExtractITxtTakesPriorityOverTEXt(t *testing.T) {
+	t.Parallel()
 	iTXtContent := []byte("<?xpacket begin='' uid='x'?><iTXt/><?xpacket end='r'?>")
 	tEXtContent := []byte("<?xpacket begin='' uid='x'?><tEXt/><?xpacket end='r'?>")
 

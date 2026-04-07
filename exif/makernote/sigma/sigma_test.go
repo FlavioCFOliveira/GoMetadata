@@ -52,6 +52,7 @@ func buildSigmaMakerNote(tags []struct {
 }
 
 func TestSigmaParserBasic(t *testing.T) {
+	t.Parallel()
 	b := buildSigmaMakerNote([]struct {
 		id  uint16
 		typ uint16
@@ -74,6 +75,7 @@ func TestSigmaParserBasic(t *testing.T) {
 }
 
 func TestSigmaParserFoveon(t *testing.T) {
+	t.Parallel()
 	// FOVEON prefix variant.
 	b := buildSigmaMakerNote([]struct {
 		id  uint16
@@ -95,6 +97,7 @@ func TestSigmaParserFoveon(t *testing.T) {
 }
 
 func TestSigmaParserBadMagic(t *testing.T) {
+	t.Parallel()
 	b := make([]byte, 20)
 	copy(b[:8], "UNKNOWN!")
 	tags, err := Parser{}.Parse(b)

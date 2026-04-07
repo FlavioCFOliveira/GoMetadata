@@ -18,6 +18,7 @@ func buildChunkHeader(fourcc [4]byte, size uint32) []byte {
 // TestReadChunkBasic verifies that ReadChunk correctly parses a well-formed
 // chunk header and records the data offset.
 func TestReadChunkBasic(t *testing.T) {
+	t.Parallel()
 	fourcc := [4]byte{'R', 'I', 'F', 'F'}
 	const dataSize = 1234
 
@@ -45,6 +46,7 @@ func TestReadChunkBasic(t *testing.T) {
 
 // TestFourCCString verifies that FourCCString returns the ASCII representation.
 func TestFourCCString(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		fourcc [4]byte
 		want   string
@@ -65,6 +67,7 @@ func TestFourCCString(t *testing.T) {
 // TestSkipChunkEvenSize verifies that SkipChunk advances the reader to the
 // byte immediately after an even-size data region (no padding byte).
 func TestSkipChunkEvenSize(t *testing.T) {
+	t.Parallel()
 	const dataSize = 10 // even
 	raw := buildChunkHeader([4]byte{'d', 'a', 't', 'a'}, dataSize)
 	raw = append(raw, make([]byte, dataSize)...)
@@ -89,6 +92,7 @@ func TestSkipChunkEvenSize(t *testing.T) {
 // TestSkipChunkOddSize verifies that SkipChunk advances one extra byte when
 // the chunk size is odd (RIFF alignment padding).
 func TestSkipChunkOddSize(t *testing.T) {
+	t.Parallel()
 	const dataSize = 7 // odd → 1 byte padding
 	raw := buildChunkHeader([4]byte{'o', 'd', 'd', ' '}, dataSize)
 	raw = append(raw, make([]byte, dataSize+1)...) // include the padding byte
@@ -113,6 +117,7 @@ func TestSkipChunkOddSize(t *testing.T) {
 // TestReadChunkTruncatedHeader verifies that ReadChunk returns an error when
 // fewer than 8 bytes are available.
 func TestReadChunkTruncatedHeader(t *testing.T) {
+	t.Parallel()
 	truncated := []byte{0x52, 0x49, 0x46} // only 3 bytes
 	r := bytes.NewReader(truncated)
 	_, err := ReadChunk(r)
@@ -123,6 +128,7 @@ func TestReadChunkTruncatedHeader(t *testing.T) {
 
 // TestReadChunkEmptyReader verifies behaviour on a completely empty reader.
 func TestReadChunkEmptyReader(t *testing.T) {
+	t.Parallel()
 	r := bytes.NewReader(nil)
 	_, err := ReadChunk(r)
 	if err == nil {
@@ -132,6 +138,7 @@ func TestReadChunkEmptyReader(t *testing.T) {
 
 // TestReadChunkZeroSize verifies that a chunk with size=0 is parsed correctly.
 func TestReadChunkZeroSize(t *testing.T) {
+	t.Parallel()
 	raw := buildChunkHeader([4]byte{'n', 'u', 'l', 'l'}, 0)
 	r := bytes.NewReader(raw)
 	c, err := ReadChunk(r)
@@ -146,6 +153,7 @@ func TestReadChunkZeroSize(t *testing.T) {
 // TestSkipChunkZeroSize verifies that SkipChunk on a zero-size chunk moves
 // the reader to offset 8 (immediately after the header).
 func TestSkipChunkZeroSize(t *testing.T) {
+	t.Parallel()
 	raw := buildChunkHeader([4]byte{'n', 'u', 'l', 'l'}, 0)
 	r := bytes.NewReader(raw)
 	c, err := ReadChunk(r)
@@ -164,6 +172,7 @@ func TestSkipChunkZeroSize(t *testing.T) {
 // TestMultipleChunksSequential verifies that back-to-back ReadChunk+SkipChunk
 // calls parse a multi-chunk stream in order.
 func TestMultipleChunksSequential(t *testing.T) {
+	t.Parallel()
 	fourccs := [][4]byte{
 		{'R', 'I', 'F', 'F'},
 		{'V', 'P', '8', ' '},

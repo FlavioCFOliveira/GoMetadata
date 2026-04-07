@@ -41,6 +41,7 @@ func buildPlainIFD(order binary.ByteOrder, tags []struct {
 }
 
 func TestLeicaParserPrefixed(t *testing.T) {
+	t.Parallel()
 	// Build "LEICA\x00\x01\x00" + plain LE IFD at offset 8.
 	ifd := buildPlainIFD(binary.LittleEndian, []struct {
 		id  uint16
@@ -66,6 +67,7 @@ func TestLeicaParserPrefixed(t *testing.T) {
 }
 
 func TestLeicaParserPlainIFD(t *testing.T) {
+	t.Parallel()
 	ifd := buildPlainIFD(binary.LittleEndian, []struct {
 		id  uint16
 		typ uint16
@@ -83,6 +85,7 @@ func TestLeicaParserPlainIFD(t *testing.T) {
 }
 
 func TestLeicaParserTooShort(t *testing.T) {
+	t.Parallel()
 	tags, err := Parser{}.Parse([]byte{0x00})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

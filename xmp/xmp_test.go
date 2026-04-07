@@ -26,6 +26,7 @@ const simpleXMP = `<?xpacket begin="" uid="W5M0MpCehiHzreSzNTczkc9d"?>
 <?xpacket end="w"?>`
 
 func TestParseSimpleProperty(t *testing.T) {
+	t.Parallel()
 	x, err := Parse([]byte(simpleXMP))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
@@ -42,6 +43,7 @@ func TestParseSimpleProperty(t *testing.T) {
 }
 
 func TestParseMultiValue(t *testing.T) {
+	t.Parallel()
 	raw := `<?xpacket begin="" uid="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -69,6 +71,7 @@ func TestParseMultiValue(t *testing.T) {
 }
 
 func TestScanPacketBoundaryWithInternalPI(t *testing.T) {
+	t.Parallel()
 	// XMP body contains a ?> that should NOT be treated as the closing packet PI.
 	raw := "<?xpacket begin=\"\" uid=\"abc\"?>" +
 		"<x:xmpmeta><!-- some comment with ?> inside --></x:xmpmeta>" +
@@ -83,6 +86,7 @@ func TestScanPacketBoundaryWithInternalPI(t *testing.T) {
 }
 
 func TestScanNoPacket(t *testing.T) {
+	t.Parallel()
 	result := Scan([]byte("<not an xmp packet>"))
 	if result != nil {
 		t.Error("Scan should return nil when no packet is found")
@@ -90,6 +94,7 @@ func TestScanNoPacket(t *testing.T) {
 }
 
 func TestScanMissingClosingPI(t *testing.T) {
+	t.Parallel()
 	raw := "<?xpacket begin=\"\" uid=\"abc\"?><x:xmpmeta/>"
 	result := Scan([]byte(raw))
 	if result != nil {
@@ -98,6 +103,7 @@ func TestScanMissingClosingPI(t *testing.T) {
 }
 
 func TestEncodeRoundTrip(t *testing.T) {
+	t.Parallel()
 	x, err := Parse([]byte(simpleXMP))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
@@ -118,6 +124,7 @@ func TestEncodeRoundTrip(t *testing.T) {
 }
 
 func TestGPSValidParsing(t *testing.T) {
+	t.Parallel()
 	raw := `<?xpacket begin="" uid="abc"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -145,6 +152,7 @@ func TestGPSValidParsing(t *testing.T) {
 }
 
 func TestGPSRangeValidation(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		latStr   string
@@ -159,6 +167,7 @@ func TestGPSRangeValidation(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			lat, err := parseXMPGPS(tc.latStr)
 			if err != nil {
 				if tc.expectOK {
@@ -182,6 +191,7 @@ func TestGPSRangeValidation(t *testing.T) {
 }
 
 func TestRDFDepthLimit(t *testing.T) {
+	t.Parallel()
 	// Build deeply nested XML that exceeds the 100-level depth limit.
 	var sb strings.Builder
 	sb.WriteString(`<?xpacket begin="" uid="abc"?>`)
@@ -201,6 +211,7 @@ func TestRDFDepthLimit(t *testing.T) {
 }
 
 func TestXMPSetters(t *testing.T) {
+	t.Parallel()
 	x := &XMP{}
 
 	x.SetCaption("Hello world")
@@ -245,6 +256,7 @@ func TestXMPSetters(t *testing.T) {
 }
 
 func TestEncodeCollectionType(t *testing.T) {
+	t.Parallel()
 	// dc:subject must be rdf:Bag, dc:creator must be rdf:Seq,
 	// dc:description must be rdf:Alt (ISO 16684-1 §7.5).
 	x := &XMP{Properties: map[string]map[string]string{
@@ -298,7 +310,9 @@ func TestEncodeCollectionType(t *testing.T) {
 // TestXMPGet verifies the public Get accessor for arbitrary namespace/property
 // combinations (XMP §7.3 — property access by namespace URI and local name).
 func TestXMPGet(t *testing.T) {
+	t.Parallel()
 	t.Run("known property returns correct value", func(t *testing.T) {
+		t.Parallel()
 		x, err := Parse([]byte(simpleXMP))
 		if err != nil {
 			t.Fatalf("Parse: %v", err)
@@ -310,6 +324,7 @@ func TestXMPGet(t *testing.T) {
 	})
 
 	t.Run("missing property returns empty string", func(t *testing.T) {
+		t.Parallel()
 		x, err := Parse([]byte(simpleXMP))
 		if err != nil {
 			t.Fatalf("Parse: %v", err)
@@ -320,6 +335,7 @@ func TestXMPGet(t *testing.T) {
 	})
 
 	t.Run("missing namespace returns empty string", func(t *testing.T) {
+		t.Parallel()
 		x, err := Parse([]byte(simpleXMP))
 		if err != nil {
 			t.Fatalf("Parse: %v", err)
@@ -330,6 +346,7 @@ func TestXMPGet(t *testing.T) {
 	})
 
 	t.Run("nil Properties map returns empty string without panic", func(t *testing.T) {
+		t.Parallel()
 		x := &XMP{} // Properties is nil
 		if got := x.Get(NStiff, "Model"); got != "" {
 			t.Errorf("Get on nil Properties = %q, want empty", got)
@@ -337,6 +354,7 @@ func TestXMPGet(t *testing.T) {
 	})
 
 	t.Run("nil XMP receiver returns empty string without panic", func(t *testing.T) {
+		t.Parallel()
 		var x *XMP
 		// get() guards against nil receiver (see xmp.go get() implementation).
 		// Get() delegates to get(), so this must not panic.
@@ -346,6 +364,7 @@ func TestXMPGet(t *testing.T) {
 	})
 
 	t.Run("xmp namespace CreatorTool", func(t *testing.T) {
+		t.Parallel()
 		// Build an XMP packet that sets xmp:CreatorTool.
 		raw := `<?xpacket begin="" uid="abc"?>` +
 			`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
@@ -363,6 +382,7 @@ func TestXMPGet(t *testing.T) {
 	})
 
 	t.Run("properties set directly survive Get round-trip", func(t *testing.T) {
+		t.Parallel()
 		// Populate Properties directly (public field) and verify Get retrieves them.
 		x := &XMP{Properties: map[string]map[string]string{
 			NSexif: {"Flash": "1"},
@@ -407,7 +427,9 @@ func BenchmarkXMPEncode(b *testing.B) {
 
 // TestXMPNewSetters exercises SetGPS, SetLensModel, SetKeywords, and Set.
 func TestXMPNewSetters(t *testing.T) {
+	t.Parallel()
 	t.Run("SetGPS_RoundTrip", func(t *testing.T) {
+		t.Parallel()
 		x := &XMP{Properties: make(map[string]map[string]string)}
 		x.SetGPS(37.7749, -122.4194)
 		lat, lon, ok := x.GPS()
@@ -424,6 +446,7 @@ func TestXMPNewSetters(t *testing.T) {
 	})
 
 	t.Run("SetGPS_SouthWest", func(t *testing.T) {
+		t.Parallel()
 		x := &XMP{Properties: make(map[string]map[string]string)}
 		x.SetGPS(-33.8688, -70.6693)
 		lat, lon, ok := x.GPS()
@@ -439,6 +462,7 @@ func TestXMPNewSetters(t *testing.T) {
 	})
 
 	t.Run("SetLensModel", func(t *testing.T) {
+		t.Parallel()
 		x := &XMP{Properties: make(map[string]map[string]string)}
 		x.SetLensModel("EF 24-70mm f/2.8L II USM")
 		if got := x.LensModel(); got != "EF 24-70mm f/2.8L II USM" {
@@ -447,6 +471,7 @@ func TestXMPNewSetters(t *testing.T) {
 	})
 
 	t.Run("SetKeywords_Replace", func(t *testing.T) {
+		t.Parallel()
 		x := &XMP{Properties: make(map[string]map[string]string)}
 		x.AddKeyword("old1")
 		x.AddKeyword("old2")
@@ -464,6 +489,7 @@ func TestXMPNewSetters(t *testing.T) {
 	})
 
 	t.Run("SetKeywords_Empty_DeletesProperty", func(t *testing.T) {
+		t.Parallel()
 		x := &XMP{Properties: make(map[string]map[string]string)}
 		x.AddKeyword("remove-me")
 		x.SetKeywords(nil)
@@ -473,6 +499,7 @@ func TestXMPNewSetters(t *testing.T) {
 	})
 
 	t.Run("SetPublicMethod", func(t *testing.T) {
+		t.Parallel()
 		x := &XMP{Properties: make(map[string]map[string]string)}
 		x.Set(NSexif, "ExposureTime", "1/500")
 		if got := x.Get(NSexif, "ExposureTime"); got != "1/500" {
@@ -481,6 +508,7 @@ func TestXMPNewSetters(t *testing.T) {
 	})
 
 	t.Run("NilReceiverNoPanic", func(t *testing.T) {
+		t.Parallel()
 		var x *XMP
 		x.SetGPS(0, 0)
 		x.SetLensModel("x")

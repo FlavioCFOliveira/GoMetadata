@@ -82,6 +82,7 @@ func buildOlympusMakerNoteWithOffset() []byte {
 }
 
 func TestOlympusParse_Valid(t *testing.T) {
+	t.Parallel()
 	b := buildOlympusMakerNote()
 	p := Parser{}
 	result, err := p.Parse(b)
@@ -97,6 +98,7 @@ func TestOlympusParse_Valid(t *testing.T) {
 }
 
 func TestOlympusParse_BigEndian(t *testing.T) {
+	t.Parallel()
 	b := buildOlympusMakerNoteBE()
 	p := Parser{}
 	result, err := p.Parse(b)
@@ -112,6 +114,7 @@ func TestOlympusParse_BigEndian(t *testing.T) {
 }
 
 func TestOlympusParse_OffsetValue(t *testing.T) {
+	t.Parallel()
 	b := buildOlympusMakerNoteWithOffset()
 	p := Parser{}
 	result, err := p.Parse(b)
@@ -128,6 +131,7 @@ func TestOlympusParse_OffsetValue(t *testing.T) {
 }
 
 func TestOlympusParse_TooShort(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		b    []byte
@@ -141,6 +145,7 @@ func TestOlympusParse_TooShort(t *testing.T) {
 	p := Parser{}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			result, err := p.Parse(tc.b)
 			if err != nil {
 				t.Errorf("expected nil error, got: %v", err)
@@ -153,6 +158,7 @@ func TestOlympusParse_TooShort(t *testing.T) {
 }
 
 func TestOlympusParse_BadMagic(t *testing.T) {
+	t.Parallel()
 	b := make([]byte, 26)
 	copy(b[0:8], "BADMAGIC")
 	b[8] = 'I'
@@ -170,6 +176,7 @@ func TestOlympusParse_BadMagic(t *testing.T) {
 }
 
 func TestOlympusParse_BadByteOrder(t *testing.T) {
+	t.Parallel()
 	b := buildOlympusMakerNote()
 	// Overwrite byte order with invalid value.
 	b[8] = 'X'
@@ -186,6 +193,7 @@ func TestOlympusParse_BadByteOrder(t *testing.T) {
 }
 
 func TestTagConstants(t *testing.T) {
+	t.Parallel()
 	if TagSpecialMode != 0x0200 {
 		t.Errorf("TagSpecialMode = 0x%04X, want 0x0200", TagSpecialMode)
 	}

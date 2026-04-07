@@ -56,6 +56,7 @@ func minimalTIFFPayload() []byte {
 }
 
 func TestRawAccessors(t *testing.T) {
+	t.Parallel()
 	tiff := minimalTIFFPayload()
 	jpeg := buildMinimalJPEG(tiff)
 
@@ -82,6 +83,7 @@ func TestRawAccessors(t *testing.T) {
 }
 
 func TestRawAccessorsNoMetadata(t *testing.T) {
+	t.Parallel()
 	jpeg := buildMinimalJPEG(nil)
 
 	m, err := Read(bytes.NewReader(jpeg))
@@ -104,6 +106,7 @@ func TestRawAccessorsNoMetadata(t *testing.T) {
 }
 
 func TestUnsupportedFormat(t *testing.T) {
+	t.Parallel()
 	// Feed random bytes that don't match any known magic.
 	_, err := Read(bytes.NewReader([]byte{0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00}))
 	if err == nil {
@@ -116,6 +119,7 @@ func TestUnsupportedFormat(t *testing.T) {
 }
 
 func TestNewMetadata(t *testing.T) {
+	t.Parallel()
 	m := NewMetadata(format.FormatJPEG)
 	if m == nil {
 		t.Fatal("NewMetadata returned nil")
@@ -129,6 +133,7 @@ func TestNewMetadata(t *testing.T) {
 }
 
 func TestValidate(t *testing.T) {
+	t.Parallel()
 	// Valid: unknown format reports error.
 	m := &Metadata{}
 	if err := m.Validate(); err == nil {
@@ -143,6 +148,7 @@ func TestValidate(t *testing.T) {
 }
 
 func TestSupportsWrite(t *testing.T) {
+	t.Parallel()
 	writable := []format.FormatID{
 		format.FormatJPEG, format.FormatTIFF, format.FormatPNG, format.FormatHEIF,
 		format.FormatWebP, format.FormatCR2, format.FormatCR3, format.FormatNEF,
@@ -161,6 +167,7 @@ func TestSupportsWrite(t *testing.T) {
 // TestReadFileNotFound verifies that ReadFile wraps the OS "not found" error
 // so callers can inspect it with errors.Is(err, fs.ErrNotExist).
 func TestReadFileNotFound(t *testing.T) {
+	t.Parallel()
 	_, err := ReadFile("/nonexistent/definitely-does-not-exist/file.jpg")
 	if err == nil {
 		t.Fatal("expected error for non-existent path, got nil")
@@ -173,6 +180,7 @@ func TestReadFileNotFound(t *testing.T) {
 // TestReadFilePermDenied verifies that ReadFile wraps the OS "permission
 // denied" error so callers can inspect it with errors.Is(err, fs.ErrPermission).
 func TestReadFilePermDenied(t *testing.T) {
+	t.Parallel()
 	// Skip when running as root because root can read any file.
 	if os.Getuid() == 0 {
 		t.Skip("running as root: permission checks are not enforced")
@@ -507,6 +515,7 @@ func BenchmarkWrite_PNG(b *testing.B) {
 // TestMetadata_NilMetadata verifies that every accessor on a zero-value
 // Metadata returns a safe zero/empty result without panicking.
 func TestMetadata_NilMetadata(t *testing.T) {
+	t.Parallel()
 	m := &Metadata{} // EXIF, IPTC, XMP all nil
 
 	// String accessors must return "".
@@ -598,6 +607,7 @@ func TestMetadata_NilMetadata(t *testing.T) {
 // Orientation, and ISOSpeedRatings, then verifies the convenience accessors on
 // the returned Metadata decode them correctly.
 func TestMetadata_ExifAccessors(t *testing.T) {
+	t.Parallel()
 	const (
 		wantMake        = "TestMake"
 		wantModel       = "TestModel"
@@ -642,6 +652,7 @@ func TestMetadata_ExifAccessors(t *testing.T) {
 // XMP caption wins over IPTC caption when both are present (metadata.go §Caption).
 // Similarly XMP copyright wins over IPTC.
 func TestMetadata_SourcePriority(t *testing.T) {
+	t.Parallel()
 	const (
 		iptcCaption = "IPTC caption"
 		xmpCaption  = "XMP caption"
@@ -679,6 +690,7 @@ func TestMetadata_SourcePriority(t *testing.T) {
 }
 
 func TestWriteFilePreservesPermissions(t *testing.T) {
+	t.Parallel()
 	// Write a minimal JPEG to a temp file with mode 0644, then WriteFile it and
 	// assert the mode is preserved after the atomic rename.
 	jpeg := buildMinimalJPEG(minimalTIFFPayload())

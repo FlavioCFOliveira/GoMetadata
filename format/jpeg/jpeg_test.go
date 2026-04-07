@@ -85,6 +85,7 @@ func minimalTIFFBytes() []byte {
 }
 
 func TestExtractEXIF(t *testing.T) {
+	t.Parallel()
 	tiffData := minimalTIFFBytes()
 	jpeg := buildJPEG(tiffData, nil, nil)
 
@@ -105,6 +106,7 @@ func TestExtractEXIF(t *testing.T) {
 }
 
 func TestExtractIPTC(t *testing.T) {
+	t.Parallel()
 	iptcData := []byte{0x1C, 0x02, 0x78, 0x00, 0x05, 'H', 'e', 'l', 'l', 'o'}
 	jpeg := buildJPEG(nil, iptcData, nil)
 
@@ -121,6 +123,7 @@ func TestExtractIPTC(t *testing.T) {
 }
 
 func TestInjectRoundTrip(t *testing.T) {
+	t.Parallel()
 	tiffData := minimalTIFFBytes()
 	iptcData := []byte{0x1C, 0x02, 0x78, 0x00, 0x05, 'H', 'e', 'l', 'l', 'o'}
 	jpeg := buildJPEG(tiffData, iptcData, nil)
@@ -281,6 +284,7 @@ func buildAPP13MultiBlock(rid1 uint16, data1, iptcData []byte) []byte {
 // markers with no data) embedded in the marker stream does not panic and returns
 // the expected metadata.
 func TestExtractRSTMarkerNoPanic(t *testing.T) {
+	t.Parallel()
 	tiffData := minimalTIFFBytes()
 
 	var buf bytes.Buffer
@@ -316,6 +320,7 @@ func TestExtractRSTMarkerNoPanic(t *testing.T) {
 // packet with HasExtendedXMP and a matching extended XMP APP1 chunk is
 // correctly merged by Extract.
 func TestExtractExtendedXMPReassembly(t *testing.T) {
+	t.Parallel()
 	const guid = "DEADBEEF00000000DEADBEEF00000000"
 
 	// Main XMP packet: minimal RDF with HasExtendedXMP as an *attribute*
@@ -359,6 +364,7 @@ func TestExtractExtendedXMPReassembly(t *testing.T) {
 // TestInjectRemoveEXIF verifies that passing nil rawEXIF to Inject removes
 // the existing EXIF APP1 from the output stream.
 func TestInjectRemoveEXIF(t *testing.T) {
+	t.Parallel()
 	tiffData := minimalTIFFBytes()
 	jpeg := buildJPEG(tiffData, nil, nil)
 
@@ -381,6 +387,7 @@ func TestInjectRemoveEXIF(t *testing.T) {
 // TestInjectXMPRoundTrip verifies that XMP injected into a JPEG with no
 // existing XMP is faithfully extracted back.
 func TestInjectXMPRoundTrip(t *testing.T) {
+	t.Parallel()
 	jpeg := buildJPEG(nil, nil, nil)
 	xmpPayload := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta>`)
 
@@ -403,6 +410,7 @@ func TestInjectXMPRoundTrip(t *testing.T) {
 // TestInjectPreservesUnknownAPP verifies that a non-metadata APP segment
 // (APP2, marker 0xE2) survives an Inject call that replaces the EXIF.
 func TestInjectPreservesUnknownAPP(t *testing.T) {
+	t.Parallel()
 	tiffData := minimalTIFFBytes()
 	app2Payload := []byte("ICC_PROFILE\x00\x01\x01some profile bytes")
 	jpeg := buildJPEGWithAPP2(tiffData, app2Payload)
@@ -432,6 +440,7 @@ func TestInjectPreservesUnknownAPP(t *testing.T) {
 // TestExtractTruncatedNoPanic verifies that a truncated JPEG (just SOI +
 // partial APP1 header) does not panic and returns without a fatal error.
 func TestExtractTruncatedNoPanic(t *testing.T) {
+	t.Parallel()
 	// SOI + marker + length byte (truncated — length says 10 bytes but only 0 follow)
 	truncated := []byte{0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x0A}
 	// Must not panic; error is acceptable.
@@ -447,6 +456,7 @@ func TestExtractTruncatedNoPanic(t *testing.T) {
 // TestExtractXMPOnly verifies that a JPEG with an XMP APP1 but no EXIF or
 // IPTC returns non-nil rawXMP and nil rawEXIF/rawIPTC.
 func TestExtractXMPOnly(t *testing.T) {
+	t.Parallel()
 	xmpData := []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta>`)
 	jpeg := buildJPEG(nil, nil, xmpData)
 
@@ -476,6 +486,7 @@ func TestExtractXMPOnly(t *testing.T) {
 // identExif is 6 bytes; the length field adds 2 bytes; so rawEXIF must be
 // > 65535 - 6 - 2 = 65527 bytes to trigger the error.
 func TestInjectOversizedEXIFReturnsError(t *testing.T) {
+	t.Parallel()
 	jpeg := buildJPEG(nil, nil, nil)
 	// 65528 bytes: len(identExif=6) + 65528 + 2 = 65536 > 65535 → error
 	oversized := make([]byte, 65528)
@@ -491,6 +502,7 @@ func TestInjectOversizedEXIFReturnsError(t *testing.T) {
 // TestExtractParseIRBMultipleBlocks verifies that parseIRB (exercised via
 // Extract) skips unknown resource blocks and returns data only from 0x0404.
 func TestExtractParseIRBMultipleBlocks(t *testing.T) {
+	t.Parallel()
 	iptcData := []byte{0x1C, 0x02, 0x78, 0x00, 0x03, 'A', 'B', 'C'}
 	// APP13 with resource 0x0405 (thumbnail — unknown) followed by 0x0404 (IPTC).
 	unknownData := []byte{0xDE, 0xAD, 0xBE, 0xEF}
@@ -514,6 +526,7 @@ func TestExtractParseIRBMultipleBlocks(t *testing.T) {
 // real marker (producing 0xFF 0xFF 0xE1 in the stream) is silently consumed
 // by readSegment, and the segment is parsed correctly.
 func TestExtractFillByteBeforeMarker(t *testing.T) {
+	t.Parallel()
 	tiffData := minimalTIFFBytes()
 	jpeg := buildJPEGWithFillByte(tiffData)
 
@@ -531,6 +544,7 @@ func TestExtractFillByteBeforeMarker(t *testing.T) {
 // TestExtractBareJPEGAllNil verifies that a JPEG with no metadata segments
 // returns no error and all nil payloads.
 func TestExtractBareJPEGAllNil(t *testing.T) {
+	t.Parallel()
 	bare := []byte{0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9}
 
 	rawEXIF, rawIPTC, rawXMP, err := Extract(bytes.NewReader(bare))
@@ -549,6 +563,7 @@ func TestExtractBareJPEGAllNil(t *testing.T) {
 // extended APP1 segments (Adobe XMP Specification Part 3 §1.1.4), and that
 // the subsequent Extract call reassembles the full XMP content.
 func TestInjectExtendedXMP(t *testing.T) {
+	t.Parallel()
 	// Build a rawXMP that is larger than maxXMPPayload (65504 bytes).
 	// We use a valid XMP envelope so that Extract's reassembleExtendedXMP can
 	// splice the extended content into it correctly.
@@ -596,6 +611,7 @@ func TestInjectExtendedXMP(t *testing.T) {
 // TestInjectExtendedXMPMultiChunk verifies that an XMP packet large enough to
 // require more than one extended APP1 chunk is split and reassembled correctly.
 func TestInjectExtendedXMPMultiChunk(t *testing.T) {
+	t.Parallel()
 	// Each extended chunk holds maxExtChunkSize (65461) bytes.
 	// We need > 65461 bytes in rawXMP to force two extended chunks.
 	const extraContentSize = 130_000 // forces at least 2 chunks
@@ -640,6 +656,7 @@ func TestInjectExtendedXMPMultiChunk(t *testing.T) {
 // TestInjectSmallXMPFastPath verifies that an XMP packet that fits within
 // maxXMPPayload is still written as a single standard APP1 (no extended split).
 func TestInjectSmallXMPFastPath(t *testing.T) {
+	t.Parallel()
 	xmpPayload := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta>`)
 	if len(xmpPayload) > maxXMPPayload {
 		t.Fatal("test precondition failed: payload must be small")
@@ -672,6 +689,7 @@ func TestInjectSmallXMPFastPath(t *testing.T) {
 // TestExtractNonJPEGReturnsError verifies that a non-JPEG byte stream
 // (wrong SOI magic) causes Extract to return an error.
 func TestExtractNonJPEGReturnsError(t *testing.T) {
+	t.Parallel()
 	notJPEG := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A} // PNG magic
 	_, _, _, err := Extract(bytes.NewReader(notJPEG))
 	if err == nil {
@@ -682,6 +700,7 @@ func TestExtractNonJPEGReturnsError(t *testing.T) {
 // TestInjectNonJPEGReturnsError verifies that Inject on a non-JPEG returns
 // an error.
 func TestInjectNonJPEGReturnsError(t *testing.T) {
+	t.Parallel()
 	notJPEG := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A}
 	var out bytes.Buffer
 	err := Inject(bytes.NewReader(notJPEG), &out, nil, nil, nil)
@@ -696,6 +715,7 @@ func TestInjectNonJPEGReturnsError(t *testing.T) {
 // HasExtendedXMP but the GUID does not match any extended chunk, the main XMP
 // is returned unchanged (graceful degradation).
 func TestExtractExtendedXMPNoMatchingGUID(t *testing.T) {
+	t.Parallel()
 	const guid = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 	const differentGUID = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 
@@ -727,6 +747,7 @@ func TestExtractExtendedXMPNoMatchingGUID(t *testing.T) {
 // TestInjectEOIPath verifies that Inject correctly handles a JPEG that ends
 // with EOI (no SOS). This exercises the markerEOI branch in Inject.
 func TestInjectEOIPath(t *testing.T) {
+	t.Parallel()
 	// Bare JPEG with just SOI + EOI (no SOS).
 	bare := []byte{0xFF, 0xD8, 0xFF, 0xD9}
 	var out bytes.Buffer
@@ -749,6 +770,7 @@ func TestInjectEOIPath(t *testing.T) {
 // TestInjectStandaloneMarkerPassthrough verifies that Inject copies standalone
 // markers (e.g., RST0) that are not metadata segments into the output unchanged.
 func TestInjectStandaloneMarkerPassthrough(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	buf.Write([]byte{0xFF, 0xD8})
 	buf.Write([]byte{0xFF, 0xD0}) // RST0 standalone marker

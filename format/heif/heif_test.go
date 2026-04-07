@@ -211,6 +211,7 @@ func minimalTIFFExif() []byte {
 }
 
 func TestExtractEXIF(t *testing.T) {
+	t.Parallel()
 	exif := minimalTIFFExif()
 	data := buildHEIF(exif, nil)
 
@@ -233,6 +234,7 @@ func TestExtractEXIF(t *testing.T) {
 }
 
 func TestExtractXMP(t *testing.T) {
+	t.Parallel()
 	xmp := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta><?xpacket end="w"?>`)
 	data := buildHEIF(nil, xmp)
 
@@ -249,6 +251,7 @@ func TestExtractXMP(t *testing.T) {
 }
 
 func TestExtractBothItems(t *testing.T) {
+	t.Parallel()
 	exif := minimalTIFFExif()
 	xmp := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta><?xpacket end="w"?>`)
 	data := buildHEIF(exif, xmp)
@@ -266,6 +269,7 @@ func TestExtractBothItems(t *testing.T) {
 }
 
 func TestExtractEmpty(t *testing.T) {
+	t.Parallel()
 	data := buildHEIF(nil, nil)
 	rawEXIF, rawIPTC, rawXMP, err := Extract(bytes.NewReader(data))
 	if err != nil {
@@ -278,6 +282,7 @@ func TestExtractEmpty(t *testing.T) {
 }
 
 func TestExtractTruncated(t *testing.T) {
+	t.Parallel()
 	// Truncated input must not panic.
 	data := buildHEIF(minimalTIFFExif(), nil)
 	for i := 0; i < len(data); i += len(data) / 8 {
@@ -286,6 +291,7 @@ func TestExtractTruncated(t *testing.T) {
 }
 
 func TestInjectRoundTrip(t *testing.T) {
+	t.Parallel()
 	exif := minimalTIFFExif()
 	data := buildHEIF(exif, nil)
 
@@ -326,6 +332,7 @@ func buildHEIFInMoov(exifData, xmpData []byte) []byte {
 }
 
 func TestInjectMetaInsideMoov(t *testing.T) {
+	t.Parallel()
 	exif := minimalTIFFExif()
 	data := buildHEIFInMoov(exif, nil)
 
@@ -346,6 +353,7 @@ func TestInjectMetaInsideMoov(t *testing.T) {
 }
 
 func TestInjectBothEXIFAndXMP(t *testing.T) {
+	t.Parallel()
 	exif := minimalTIFFExif()
 	xmp := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta><?xpacket end="w"?>`)
 	data := buildHEIF(exif, xmp)
@@ -372,6 +380,7 @@ func TestInjectBothEXIFAndXMP(t *testing.T) {
 }
 
 func TestInjectPassThroughNilPayloads(t *testing.T) {
+	t.Parallel()
 	exif := minimalTIFFExif()
 	data := buildHEIF(exif, nil)
 	original := make([]byte, len(data))

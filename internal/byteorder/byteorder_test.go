@@ -7,6 +7,7 @@ import (
 
 // TestUint16LE exercises little-endian uint16 reads at various offsets.
 func TestUint16LE(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		buf  []byte
@@ -22,6 +23,7 @@ func TestUint16LE(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			got := Uint16LE(tc.buf, tc.off)
 			if got != tc.want {
 				t.Errorf("Uint16LE(%v, %d) = 0x%04X, want 0x%04X", tc.buf, tc.off, got, tc.want)
@@ -32,6 +34,7 @@ func TestUint16LE(t *testing.T) {
 
 // TestUint16BE exercises big-endian uint16 reads at various offsets.
 func TestUint16BE(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		buf  []byte
@@ -47,6 +50,7 @@ func TestUint16BE(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			got := Uint16BE(tc.buf, tc.off)
 			if got != tc.want {
 				t.Errorf("Uint16BE(%v, %d) = 0x%04X, want 0x%04X", tc.buf, tc.off, got, tc.want)
@@ -57,6 +61,7 @@ func TestUint16BE(t *testing.T) {
 
 // TestUint32LE exercises little-endian uint32 reads.
 func TestUint32LE(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		buf  []byte
@@ -72,6 +77,7 @@ func TestUint32LE(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			got := Uint32LE(tc.buf, tc.off)
 			if got != tc.want {
 				t.Errorf("Uint32LE(%v, %d) = 0x%08X, want 0x%08X", tc.buf, tc.off, got, tc.want)
@@ -82,6 +88,7 @@ func TestUint32LE(t *testing.T) {
 
 // TestUint32BE exercises big-endian uint32 reads.
 func TestUint32BE(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		buf  []byte
@@ -97,6 +104,7 @@ func TestUint32BE(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			got := Uint32BE(tc.buf, tc.off)
 			if got != tc.want {
 				t.Errorf("Uint32BE(%v, %d) = 0x%08X, want 0x%08X", tc.buf, tc.off, got, tc.want)
@@ -108,6 +116,7 @@ func TestUint32BE(t *testing.T) {
 // TestUint16LEBESymmetry verifies that LE and BE read the same bytes in
 // opposite order, i.e. their results are byte-swapped versions of each other.
 func TestUint16LEBESymmetry(t *testing.T) {
+	t.Parallel()
 	buf := []byte{0xAB, 0xCD}
 	le := Uint16LE(buf, 0)
 	be := Uint16BE(buf, 0)
@@ -120,6 +129,7 @@ func TestUint16LEBESymmetry(t *testing.T) {
 
 // TestUint32LEBESymmetry verifies byte-swap symmetry for 32-bit reads.
 func TestUint32LEBESymmetry(t *testing.T) {
+	t.Parallel()
 	buf := []byte{0x12, 0x34, 0x56, 0x78}
 	le := Uint32LE(buf, 0)
 	be := Uint32BE(buf, 0)
@@ -132,6 +142,7 @@ func TestUint32LEBESymmetry(t *testing.T) {
 
 // TestUint16WithOrder verifies that Uint16 dispatches correctly for both orders.
 func TestUint16WithOrder(t *testing.T) {
+	t.Parallel()
 	buf := []byte{0x12, 0x34}
 	if got := Uint16(buf, 0, binary.LittleEndian); got != Uint16LE(buf, 0) {
 		t.Errorf("Uint16(LE) = 0x%04X, want 0x%04X", got, Uint16LE(buf, 0))
@@ -143,6 +154,7 @@ func TestUint16WithOrder(t *testing.T) {
 
 // TestUint32WithOrder verifies that Uint32 dispatches correctly for both orders.
 func TestUint32WithOrder(t *testing.T) {
+	t.Parallel()
 	buf := []byte{0x12, 0x34, 0x56, 0x78}
 	if got := Uint32(buf, 0, binary.LittleEndian); got != Uint32LE(buf, 0) {
 		t.Errorf("Uint32(LE) = 0x%08X, want 0x%08X", got, Uint32LE(buf, 0))
@@ -155,6 +167,7 @@ func TestUint32WithOrder(t *testing.T) {
 // TestUint16LEPanicOnShortSlice confirms that Uint16LE panics when the slice
 // is too short; callers are expected to validate bounds beforehand.
 func TestUint16LEPanicOnShortSlice(t *testing.T) {
+	t.Parallel()
 	defer func() {
 		if recover() == nil {
 			t.Error("expected panic on out-of-bounds read, got none")
@@ -165,6 +178,7 @@ func TestUint16LEPanicOnShortSlice(t *testing.T) {
 
 // TestUint32BEPanicOnShortSlice confirms that Uint32BE panics on too-short input.
 func TestUint32BEPanicOnShortSlice(t *testing.T) {
+	t.Parallel()
 	defer func() {
 		if recover() == nil {
 			t.Error("expected panic on out-of-bounds read, got none")

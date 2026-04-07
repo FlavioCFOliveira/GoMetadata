@@ -55,6 +55,7 @@ func buildWebP(exifData, xmpData []byte, vp8xFlags uint32, canvasW, canvasH uint
 }
 
 func TestExtractEXIF(t *testing.T) {
+	t.Parallel()
 	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00}
 	webp := buildWebP(exifData, nil, 0x08, 0, 0)
 
@@ -74,6 +75,7 @@ func TestExtractEXIF(t *testing.T) {
 }
 
 func TestExtractXMP(t *testing.T) {
+	t.Parallel()
 	xmpData := []byte("<?xpacket begin='' uid='x'?><x:xmpmeta xmlns:x='adobe:ns:meta/'></x:xmpmeta><?xpacket end='r'?>")
 	webp := buildWebP(nil, xmpData, 0x04, 0, 0)
 
@@ -90,6 +92,7 @@ func TestExtractXMP(t *testing.T) {
 }
 
 func TestInjectPreservesCanvasDimensions(t *testing.T) {
+	t.Parallel()
 	// Build a WebP with VP8X and specific canvas dimensions.
 	const canvasW, canvasH = uint32(1024), uint32(768)
 	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00}
@@ -134,6 +137,7 @@ func TestInjectPreservesCanvasDimensions(t *testing.T) {
 }
 
 func TestInjectRoundTrip(t *testing.T) {
+	t.Parallel()
 	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00}
 	webp := buildWebP(nil, nil, 0, 0, 0)
 

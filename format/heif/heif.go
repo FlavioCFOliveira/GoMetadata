@@ -46,8 +46,12 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if metaData != nil {
 		// Fast path: meta box fully within header window.
 		// Read item payloads by seeking rather than slicing a full in-memory copy.
-		iobuf.Put(hdrPtr)
+		// extractFromMetaData reads from metaData (a subslice of *hdrPtr), so
+		// iobuf.Put must be called AFTER extractFromMetaData returns — returning
+		// hdrPtr to the pool first would allow another goroutine to overwrite the
+		// buffer while extractFromMetaData is still reading it (data race).
 		rawEXIF, rawXMP, err = extractFromMetaData(r, metaData)
+		iobuf.Put(hdrPtr)
 		return rawEXIF, nil, rawXMP, err
 	}
 

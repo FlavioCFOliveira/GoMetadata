@@ -36,6 +36,7 @@ func minimalTIFF(order binary.ByteOrder, entries [][4]uint32) []byte {
 }
 
 func TestParseMinimalLE(t *testing.T) {
+	t.Parallel()
 	data := minimalTIFF(binary.LittleEndian, [][4]uint32{
 		{uint32(TagImageWidth), uint32(TypeLong), 1, 640},
 	})
@@ -59,6 +60,7 @@ func TestParseMinimalLE(t *testing.T) {
 }
 
 func TestParseMinimalBE(t *testing.T) {
+	t.Parallel()
 	data := minimalTIFF(binary.BigEndian, [][4]uint32{
 		{uint32(TagImageLength), uint32(TypeLong), 1, 480},
 	})
@@ -72,6 +74,7 @@ func TestParseMinimalBE(t *testing.T) {
 }
 
 func TestParseInvalidByteOrder(t *testing.T) {
+	t.Parallel()
 	data := []byte{0x00, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x08}
 	_, err := Parse(data)
 	if err == nil {
@@ -80,6 +83,7 @@ func TestParseInvalidByteOrder(t *testing.T) {
 }
 
 func TestParseTooShort(t *testing.T) {
+	t.Parallel()
 	_, err := Parse([]byte{0x49, 0x49})
 	if err == nil {
 		t.Error("expected error for too-short input")
@@ -87,6 +91,7 @@ func TestParseTooShort(t *testing.T) {
 }
 
 func TestEncodeRoundTrip(t *testing.T) {
+	t.Parallel()
 	// Build an EXIF with a couple of IFD0 entries.
 	orig := minimalTIFF(binary.LittleEndian, [][4]uint32{
 		{uint32(TagImageWidth), uint32(TypeLong), 1, 1920},
@@ -120,6 +125,7 @@ func TestEncodeRoundTrip(t *testing.T) {
 }
 
 func TestEncodeNilReturnsError(t *testing.T) {
+	t.Parallel()
 	_, err := Encode(nil)
 	if err == nil {
 		t.Error("expected error for nil EXIF")
@@ -127,6 +133,7 @@ func TestEncodeNilReturnsError(t *testing.T) {
 }
 
 func TestEncodeWithExifIFD(t *testing.T) {
+	t.Parallel()
 	// Parse a minimal TIFF, add an ExifIFD pointer manually.
 	data := minimalTIFF(binary.LittleEndian, [][4]uint32{
 		{uint32(TagImageWidth), uint32(TypeLong), 1, 100},
@@ -160,6 +167,7 @@ func TestEncodeWithExifIFD(t *testing.T) {
 }
 
 func TestGPSRoundTrip(t *testing.T) {
+	t.Parallel()
 	// Build a minimal TIFF with a GPS IFD.
 	// GPS data: lat = 37.7749 N, lon = 122.4194 W
 	data := minimalTIFF(binary.LittleEndian, [][4]uint32{
@@ -217,6 +225,7 @@ func TestGPSRoundTrip(t *testing.T) {
 }
 
 func TestGPSRangeValidation(t *testing.T) {
+	t.Parallel()
 	order := binary.LittleEndian
 	makeRationals := func(dms [3][2]uint32) []byte {
 		b := make([]byte, 24)
@@ -248,6 +257,7 @@ func TestGPSRangeValidation(t *testing.T) {
 }
 
 func TestIFD1ChainRoundTrip(t *testing.T) {
+	t.Parallel()
 	// Build EXIF with IFD0 → IFD1 chain.
 	data := minimalTIFF(binary.LittleEndian, [][4]uint32{
 		{uint32(TagImageWidth), uint32(TypeLong), 1, 1920},
@@ -284,6 +294,7 @@ func TestIFD1ChainRoundTrip(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestCameraModel(t *testing.T) {
+	t.Parallel()
 	e := &EXIF{
 		IFD0: &IFD{Entries: []IFDEntry{
 			{Tag: TagModel, Type: TypeASCII, Count: 6, Value: []byte("Canon\x00"), byteOrder: binary.LittleEndian},
@@ -300,6 +311,7 @@ func TestCameraModel(t *testing.T) {
 }
 
 func TestCopyright(t *testing.T) {
+	t.Parallel()
 	e := &EXIF{
 		IFD0: &IFD{Entries: []IFDEntry{
 			{Tag: TagCopyright, Type: TypeASCII, Count: 16, Value: []byte("2025 ACME Corp\x00"), byteOrder: binary.LittleEndian},
@@ -315,6 +327,7 @@ func TestCopyright(t *testing.T) {
 }
 
 func TestCaption(t *testing.T) {
+	t.Parallel()
 	e := &EXIF{
 		IFD0: &IFD{Entries: []IFDEntry{
 			{Tag: TagImageDescription, Type: TypeASCII, Count: 12, Value: []byte("Sunset view\x00"), byteOrder: binary.LittleEndian},
@@ -330,6 +343,7 @@ func TestCaption(t *testing.T) {
 }
 
 func TestCreator(t *testing.T) {
+	t.Parallel()
 	e := &EXIF{
 		IFD0: &IFD{Entries: []IFDEntry{
 			{Tag: TagArtist, Type: TypeASCII, Count: 12, Value: []byte("Jane Doe\x00\x00\x00\x00"), byteOrder: binary.LittleEndian},
@@ -345,6 +359,7 @@ func TestCreator(t *testing.T) {
 }
 
 func TestOrientation(t *testing.T) {
+	t.Parallel()
 	order := binary.LittleEndian
 	e := &EXIF{
 		IFD0: &IFD{Entries: []IFDEntry{
@@ -366,6 +381,7 @@ func TestOrientation(t *testing.T) {
 }
 
 func TestDateTimeOriginal(t *testing.T) {
+	t.Parallel()
 	order := binary.LittleEndian
 	e := &EXIF{
 		ExifIFD: &IFD{Entries: []IFDEntry{
@@ -391,6 +407,7 @@ func TestDateTimeOriginal(t *testing.T) {
 }
 
 func TestDateTimeOriginalWithTimezone(t *testing.T) {
+	t.Parallel()
 	order := binary.LittleEndian
 	e := &EXIF{
 		ExifIFD: &IFD{Entries: []IFDEntry{
@@ -409,6 +426,7 @@ func TestDateTimeOriginalWithTimezone(t *testing.T) {
 }
 
 func TestParseExifTZ(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		input      string
 		wantOffset int // seconds east of UTC
@@ -442,6 +460,7 @@ func TestParseExifTZ(t *testing.T) {
 	}
 }
 func TestExposureTime(t *testing.T) {
+	t.Parallel()
 	order := binary.LittleEndian
 	val := make([]byte, 8)
 	order.PutUint32(val[0:], 1)
@@ -462,6 +481,7 @@ func TestExposureTime(t *testing.T) {
 }
 
 func TestFNumber(t *testing.T) {
+	t.Parallel()
 	order := binary.LittleEndian
 	val := make([]byte, 8)
 	order.PutUint32(val[0:], 28)
@@ -482,6 +502,7 @@ func TestFNumber(t *testing.T) {
 }
 
 func TestISO(t *testing.T) {
+	t.Parallel()
 	order := binary.LittleEndian
 	e := &EXIF{
 		ExifIFD: &IFD{Entries: []IFDEntry{
@@ -499,6 +520,7 @@ func TestISO(t *testing.T) {
 }
 
 func TestFocalLength(t *testing.T) {
+	t.Parallel()
 	order := binary.LittleEndian
 	val := make([]byte, 8)
 	order.PutUint32(val[0:], 50)
@@ -519,6 +541,7 @@ func TestFocalLength(t *testing.T) {
 }
 
 func TestLensModel(t *testing.T) {
+	t.Parallel()
 	e := &EXIF{
 		ExifIFD: &IFD{Entries: []IFDEntry{
 			{Tag: TagLensModel, Type: TypeASCII, Count: 14, Value: []byte("EF 50mm f/1.8\x00"), byteOrder: binary.LittleEndian},
@@ -534,6 +557,7 @@ func TestLensModel(t *testing.T) {
 }
 
 func TestImageSize(t *testing.T) {
+	t.Parallel()
 	order := binary.LittleEndian
 	e := &EXIF{
 		ExifIFD: &IFD{Entries: []IFDEntry{
@@ -567,6 +591,7 @@ func TestImageSize(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIFDEntryInt16(t *testing.T) {
+	t.Parallel()
 	order := binary.LittleEndian
 	// -100 in little-endian signed short: 0x9C 0xFF
 	e := IFDEntry{Type: TypeSShort, Count: 1, Value: []byte{0x9C, 0xFF}, byteOrder: order}
@@ -581,6 +606,7 @@ func TestIFDEntryInt16(t *testing.T) {
 }
 
 func TestIFDEntryInt32(t *testing.T) {
+	t.Parallel()
 	order := binary.LittleEndian
 	var neg1M int32 = -1_000_000
 	val := make([]byte, 4)
@@ -596,6 +622,7 @@ func TestIFDEntryInt32(t *testing.T) {
 }
 
 func TestIFDEntryFloat32(t *testing.T) {
+	t.Parallel()
 	order := binary.LittleEndian
 	val := make([]byte, 4)
 	order.PutUint32(val, math.Float32bits(3.14))
@@ -611,6 +638,7 @@ func TestIFDEntryFloat32(t *testing.T) {
 }
 
 func TestIFDEntryFloat64(t *testing.T) {
+	t.Parallel()
 	order := binary.LittleEndian
 	val := make([]byte, 8)
 	order.PutUint64(val, math.Float64bits(2.718281828))
@@ -626,6 +654,7 @@ func TestIFDEntryFloat64(t *testing.T) {
 }
 
 func TestIFDEntryBytes(t *testing.T) {
+	t.Parallel()
 	payload := []byte{0xDE, 0xAD, 0xBE, 0xEF}
 	e := IFDEntry{Type: TypeUndefined, Count: 4, Value: payload, byteOrder: binary.LittleEndian}
 	if got := e.Bytes(); !bytes.Equal(got, payload) {
@@ -634,6 +663,7 @@ func TestIFDEntryBytes(t *testing.T) {
 }
 
 func TestIFDEntryLen(t *testing.T) {
+	t.Parallel()
 	e := IFDEntry{Type: TypeASCII, Count: 7, Value: []byte("hello\x00"), byteOrder: binary.LittleEndian}
 	if got := e.Len(); got != 7 {
 		t.Errorf("Len() = %d, want 7", got)
@@ -645,6 +675,7 @@ func TestIFDEntryLen(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIFDEntrySRational(t *testing.T) {
+	t.Parallel()
 	order := binary.LittleEndian
 	// Encode two SRational values: -1/2 and 3/4.
 	val := make([]byte, 16)
@@ -667,6 +698,7 @@ func TestIFDEntrySRational(t *testing.T) {
 }
 
 func TestIFDEntrySRationalOutOfRange(t *testing.T) {
+	t.Parallel()
 	val := make([]byte, 8) // only 1 SRational
 	e := IFDEntry{Type: TypeSRational, Count: 1, Value: val, byteOrder: binary.LittleEndian}
 	r := e.SRational(1) // index 1 is out of range
@@ -676,6 +708,7 @@ func TestIFDEntrySRationalOutOfRange(t *testing.T) {
 }
 
 func TestIFDEntrySRationalWrongType(t *testing.T) {
+	t.Parallel()
 	// Rational (unsigned) entry should not be decodable via SRational.
 	val := make([]byte, 8)
 	e := IFDEntry{Type: TypeRational, Count: 1, Value: val, byteOrder: binary.LittleEndian}
@@ -690,6 +723,7 @@ func TestIFDEntrySRationalWrongType(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIFDCycleDetection(t *testing.T) {
+	t.Parallel()
 	// Build a TIFF where IFD0's next-IFD pointer points back to IFD0 (offset 8).
 	order := binary.LittleEndian
 	buf := make([]byte, 8+2+4)
@@ -710,6 +744,7 @@ func TestIFDCycleDetection(t *testing.T) {
 }
 
 func TestMakerNotePreservedOnEncode(t *testing.T) {
+	t.Parallel()
 	// Build a minimal EXIF with a TagMakerNote entry in ExifIFD.
 	// After encode→parse, the raw MakerNote bytes must be identical.
 	makerNotePayload := []byte("FakeCanonMakerNote\x00\x01\x02\x03")
@@ -798,6 +833,7 @@ func BenchmarkEXIFParse(b *testing.B) {
 // pointer pointing to a second IFD (IFD1 / thumbnail IFD) and verifies that
 // the parser follows the chain and exposes it via IFD0.Next.
 func TestIFD1ThumbnailChain(t *testing.T) {
+	t.Parallel()
 	order := binary.LittleEndian
 
 	// Layout:
@@ -857,6 +893,7 @@ func TestIFD1ThumbnailChain(t *testing.T) {
 // TagExifIFDPointer entry pointing to an ExifIFD that holds TagColorSpace.
 // After parsing, e.ExifIFD must be non-nil and contain the ColorSpace entry.
 func TestSubIFDExtracted(t *testing.T) {
+	t.Parallel()
 	order := binary.LittleEndian
 
 	// Layout:
@@ -913,6 +950,7 @@ func TestSubIFDExtracted(t *testing.T) {
 
 // TestSetCameraModel verifies SetCameraModel sets and reads back the Model tag.
 func TestSetCameraModel(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name  string
 		input string
@@ -924,6 +962,7 @@ func TestSetCameraModel(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			e := &EXIF{
 				ByteOrder: binary.LittleEndian,
 				IFD0:      &IFD{},
@@ -945,6 +984,7 @@ func TestSetCameraModel(t *testing.T) {
 
 // TestSetCaption verifies SetCaption sets and reads back the ImageDescription tag.
 func TestSetCaption(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name  string
 		input string
@@ -955,6 +995,7 @@ func TestSetCaption(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			e := &EXIF{
 				ByteOrder: binary.LittleEndian,
 				IFD0:      &IFD{},
@@ -971,6 +1012,7 @@ func TestSetCaption(t *testing.T) {
 
 // TestSetCopyright verifies SetCopyright sets and reads back the Copyright tag.
 func TestSetCopyright(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name  string
 		input string
@@ -981,6 +1023,7 @@ func TestSetCopyright(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			e := &EXIF{
 				ByteOrder: binary.LittleEndian,
 				IFD0:      &IFD{},
@@ -997,6 +1040,7 @@ func TestSetCopyright(t *testing.T) {
 
 // TestSetCreator verifies SetCreator sets and reads back the Artist tag.
 func TestSetCreator(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name  string
 		input string
@@ -1007,6 +1051,7 @@ func TestSetCreator(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			e := &EXIF{
 				ByteOrder: binary.LittleEndian,
 				IFD0:      &IFD{},
@@ -1024,6 +1069,7 @@ func TestSetCreator(t *testing.T) {
 // TestSetOrientation verifies SetOrientation encodes and reads back the
 // Orientation tag for both byte orders.
 func TestSetOrientation(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name  string
 		order binary.ByteOrder
@@ -1038,6 +1084,7 @@ func TestSetOrientation(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			// Seed one entry so ifd0ByteOrder() resolves to tc.order.
 			seed := make([]byte, 2)
 			tc.order.PutUint16(seed, 0)
@@ -1068,6 +1115,7 @@ func TestSetOrientation(t *testing.T) {
 // TestSetGPS verifies SetGPS stores coordinates that GPS() can recover within
 // 0.0001 degrees of the original input.
 func TestSetGPS(t *testing.T) {
+	t.Parallel()
 	const tolerance = 0.0001
 
 	tests := []struct {
@@ -1085,6 +1133,7 @@ func TestSetGPS(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			e := &EXIF{
 				ByteOrder: binary.LittleEndian,
 				IFD0:      &IFD{},
@@ -1123,6 +1172,7 @@ func TestSetGPS(t *testing.T) {
 // TestEncodeRoundTripFull builds an EXIF with Make, Model, a rational (FNumber),
 // and a GPS IFD via SetGPS, then encodes and re-parses, asserting all fields survive.
 func TestEncodeRoundTripFull(t *testing.T) {
+	t.Parallel()
 	order := binary.LittleEndian
 
 	// Seed IFD0 with Make, Model, and FNumber in ExifIFD.
@@ -1427,6 +1477,7 @@ func BenchmarkEXIFEncode(b *testing.B) {
 // Each sub-test calls the setter, encodes, re-parses, then asserts the getter
 // returns the expected value — proving full round-trip correctness.
 func TestEXIFSetters(t *testing.T) {
+	t.Parallel()
 	// newEXIF builds a minimal EXIF with IFD0 (no ExifIFD) using LE byte order.
 	newEXIF := func() *EXIF {
 		data := minimalTIFF(binary.LittleEndian, [][4]uint32{
@@ -1454,6 +1505,7 @@ func TestEXIFSetters(t *testing.T) {
 	}
 
 	t.Run("SetMake", func(t *testing.T) {
+		t.Parallel()
 		e := newEXIF()
 		e.SetMake("Nikon")
 		e2 := roundTrip(t, e)
@@ -1467,6 +1519,7 @@ func TestEXIFSetters(t *testing.T) {
 	})
 
 	t.Run("SetDateTimeOriginal", func(t *testing.T) {
+		t.Parallel()
 		e := newEXIF()
 		// Use a fixed time with no sub-second precision.
 		ts := time.Date(2024, 3, 15, 10, 30, 0, 0, time.UTC)
@@ -1482,6 +1535,7 @@ func TestEXIFSetters(t *testing.T) {
 	})
 
 	t.Run("SetExposureTime", func(t *testing.T) {
+		t.Parallel()
 		e := newEXIF()
 		e.SetExposureTime(1, 1000) // 1/1000 s
 		e2 := roundTrip(t, e)
@@ -1495,6 +1549,7 @@ func TestEXIFSetters(t *testing.T) {
 	})
 
 	t.Run("SetFNumber", func(t *testing.T) {
+		t.Parallel()
 		e := newEXIF()
 		e.SetFNumber(2.8)
 		e2 := roundTrip(t, e)
@@ -1509,6 +1564,7 @@ func TestEXIFSetters(t *testing.T) {
 	})
 
 	t.Run("SetISO", func(t *testing.T) {
+		t.Parallel()
 		e := newEXIF()
 		e.SetISO(400)
 		e2 := roundTrip(t, e)
@@ -1522,6 +1578,7 @@ func TestEXIFSetters(t *testing.T) {
 	})
 
 	t.Run("SetFocalLength", func(t *testing.T) {
+		t.Parallel()
 		e := newEXIF()
 		e.SetFocalLength(50.0)
 		e2 := roundTrip(t, e)
@@ -1535,6 +1592,7 @@ func TestEXIFSetters(t *testing.T) {
 	})
 
 	t.Run("SetLensModel", func(t *testing.T) {
+		t.Parallel()
 		e := newEXIF()
 		e.SetLensModel("AF-S NIKKOR 50mm f/1.8G")
 		e2 := roundTrip(t, e)
@@ -1544,6 +1602,7 @@ func TestEXIFSetters(t *testing.T) {
 	})
 
 	t.Run("SetImageSize", func(t *testing.T) {
+		t.Parallel()
 		e := newEXIF()
 		e.SetImageSize(3840, 2160)
 		e2 := roundTrip(t, e)
@@ -1557,6 +1616,7 @@ func TestEXIFSetters(t *testing.T) {
 	})
 
 	t.Run("NilReceiverNoPanic", func(t *testing.T) {
+		t.Parallel()
 		// All setters must be nil-safe.
 		var e *EXIF
 		e.SetMake("x")
@@ -1570,6 +1630,7 @@ func TestEXIFSetters(t *testing.T) {
 	})
 
 	t.Run("EnsureExifIFDCreatedOnce", func(t *testing.T) {
+		t.Parallel()
 		// Calling two ExifIFD setters must share the same ExifIFD (created once).
 		e := newEXIF()
 		if e.ExifIFD != nil {

@@ -270,6 +270,7 @@ func makeByteEntry(tag exif.TagID, val byte) tiffEntry {
 // ---------------------------------------------------------------------------
 
 func TestMetadata_Software(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		software string
@@ -281,6 +282,7 @@ func TestMetadata_Software(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			if tc.wantOK {
 				tiff := buildTIFFMultiIFD(
 					[]tiffEntry{makeASCIIEntry(exif.TagSoftware, tc.software)},
@@ -305,6 +307,7 @@ func TestMetadata_Software(t *testing.T) {
 	}
 
 	t.Run("fallback to XMP CreatorTool", func(t *testing.T) {
+		t.Parallel()
 		// Directly populate the public Properties map — no encoder needed.
 		x := &xmp.XMP{Properties: map[string]map[string]string{
 			xmp.NSxmp: {"CreatorTool": "Capture One 23"},
@@ -316,6 +319,7 @@ func TestMetadata_Software(t *testing.T) {
 	})
 
 	t.Run("EXIF wins over XMP", func(t *testing.T) {
+		t.Parallel()
 		tiff := buildTIFFMultiIFD(
 			[]tiffEntry{makeASCIIEntry(exif.TagSoftware, "EXIF Software")},
 			nil, nil,
@@ -339,6 +343,7 @@ func TestMetadata_Software(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMetadata_DateTime(t *testing.T) {
+	t.Parallel()
 	const rawDT = "2023:06:15 12:30:00"
 	wantTime := time.Date(2023, 6, 15, 12, 30, 0, 0, time.UTC)
 
@@ -361,6 +366,7 @@ func TestMetadata_DateTime(t *testing.T) {
 	}
 
 	t.Run("tag absent", func(t *testing.T) {
+		t.Parallel()
 		tiff2 := buildTIFFMultiIFD(
 			[]tiffEntry{makeASCIIEntry(exif.TagSoftware, "dummy")},
 			nil, nil,
@@ -373,6 +379,7 @@ func TestMetadata_DateTime(t *testing.T) {
 	})
 
 	t.Run("malformed value", func(t *testing.T) {
+		t.Parallel()
 		tiff3 := buildTIFFMultiIFD(
 			[]tiffEntry{makeASCIIEntry(exif.TagDateTime, "not-a-date")},
 			nil, nil,
@@ -390,6 +397,7 @@ func TestMetadata_DateTime(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMetadata_WhiteBalance(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		val  uint16
@@ -399,6 +407,7 @@ func TestMetadata_WhiteBalance(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			tiff := buildTIFFMultiIFD(
 				nil,
 				[]tiffEntry{makeShortEntry(exif.TagWhiteBalance, tc.val)},
@@ -420,6 +429,7 @@ func TestMetadata_WhiteBalance(t *testing.T) {
 	}
 
 	t.Run("tag absent", func(t *testing.T) {
+		t.Parallel()
 		tiff := buildTIFFMultiIFD(
 			nil,
 			[]tiffEntry{makeShortEntry(exif.TagFlash, 0)},
@@ -438,6 +448,7 @@ func TestMetadata_WhiteBalance(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMetadata_Flash(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		val  uint16
@@ -449,6 +460,7 @@ func TestMetadata_Flash(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			tiff := buildTIFFMultiIFD(
 				nil,
 				[]tiffEntry{makeShortEntry(exif.TagFlash, tc.val)},
@@ -475,6 +487,7 @@ func TestMetadata_Flash(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMetadata_ExposureMode(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		val  uint16
@@ -486,6 +499,7 @@ func TestMetadata_ExposureMode(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			tiff := buildTIFFMultiIFD(
 				nil,
 				[]tiffEntry{makeShortEntry(exif.TagExposureMode, tc.val)},
@@ -512,6 +526,7 @@ func TestMetadata_ExposureMode(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMetadata_Altitude(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		num     uint32
@@ -525,6 +540,7 @@ func TestMetadata_Altitude(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			tiff := buildTIFFMultiIFD(
 				nil, nil,
 				[]tiffEntry{
@@ -548,6 +564,7 @@ func TestMetadata_Altitude(t *testing.T) {
 	}
 
 	t.Run("zero denominator", func(t *testing.T) {
+		t.Parallel()
 		tiff := buildTIFFMultiIFD(
 			nil, nil,
 			[]tiffEntry{
@@ -562,6 +579,7 @@ func TestMetadata_Altitude(t *testing.T) {
 	})
 
 	t.Run("absent GPSIFD", func(t *testing.T) {
+		t.Parallel()
 		tiff := buildTIFFMultiIFD(nil, nil, nil)
 		parsed, _ := exif.Parse(tiff)
 		m := &Metadata{EXIF: parsed}
@@ -576,6 +594,7 @@ func TestMetadata_Altitude(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMetadata_SubjectDistance(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		num  uint32
@@ -588,6 +607,7 @@ func TestMetadata_SubjectDistance(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			tiff := buildTIFFMultiIFD(
 				nil,
 				[]tiffEntry{makeRationalEntry(exif.TagSubjectDistance, tc.num, tc.den)},
@@ -610,6 +630,7 @@ func TestMetadata_SubjectDistance(t *testing.T) {
 	}
 
 	t.Run("zero denominator", func(t *testing.T) {
+		t.Parallel()
 		tiff := buildTIFFMultiIFD(
 			nil,
 			[]tiffEntry{makeRationalEntry(exif.TagSubjectDistance, 100, 0)},
@@ -628,6 +649,7 @@ func TestMetadata_SubjectDistance(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMetadata_DigitalZoomRatio(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		num  uint32
@@ -640,6 +662,7 @@ func TestMetadata_DigitalZoomRatio(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			tiff := buildTIFFMultiIFD(
 				nil,
 				[]tiffEntry{makeRationalEntry(exif.TagDigitalZoomRatio, tc.num, tc.den)},
@@ -667,6 +690,7 @@ func TestMetadata_DigitalZoomRatio(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMetadata_SceneType(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		val  byte
@@ -676,6 +700,7 @@ func TestMetadata_SceneType(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			tiff := buildTIFFMultiIFD(
 				nil,
 				[]tiffEntry{makeUndefinedEntry(exif.TagSceneType, []byte{tc.val})},
@@ -702,6 +727,7 @@ func TestMetadata_SceneType(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMetadata_ColorSpace(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		val  uint16
@@ -712,6 +738,7 @@ func TestMetadata_ColorSpace(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			tiff := buildTIFFMultiIFD(
 				nil,
 				[]tiffEntry{makeShortEntry(exif.TagColorSpace, tc.val)},
@@ -738,6 +765,7 @@ func TestMetadata_ColorSpace(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMetadata_MeteringMode(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		val  uint16
@@ -754,6 +782,7 @@ func TestMetadata_MeteringMode(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			tiff := buildTIFFMultiIFD(
 				nil,
 				[]tiffEntry{makeShortEntry(exif.TagMeteringMode, tc.val)},
@@ -783,6 +812,7 @@ func TestMetadata_MeteringMode(t *testing.T) {
 // contains several of the tested tags simultaneously, each accessor returns
 // the correct value independently.
 func TestMetadata_ExifIFDMultipleTagsCoexist(t *testing.T) {
+	t.Parallel()
 	tiff := buildTIFFMultiIFD(
 		nil,
 		[]tiffEntry{
@@ -832,6 +862,7 @@ func TestMetadata_ExifIFDMultipleTagsCoexist(t *testing.T) {
 // TestMetadata_AltitudeAboveAndBelow verifies both positive and negative
 // altitude resolution in a single TIFF with both GPS tags.
 func TestMetadata_AltitudeAboveAndBelow(t *testing.T) {
+	t.Parallel()
 	// Above sea level: 200.0 m.
 	tiffAbove := buildTIFFMultiIFD(
 		nil, nil,

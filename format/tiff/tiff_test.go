@@ -80,6 +80,7 @@ func buildMinimalTIFF(order binary.ByteOrder, iptc, xmp []byte) []byte {
 }
 
 func TestExtractBasic(t *testing.T) {
+	t.Parallel()
 	wantIPTC := []byte("iptc-test-data-long-enough-for-external-storage")
 	wantXMP := []byte("<xmpmeta xmlns:x=\"adobe:ns:meta/\"/>")
 	data := buildMinimalTIFF(binary.LittleEndian, wantIPTC, wantXMP)
@@ -100,6 +101,7 @@ func TestExtractBasic(t *testing.T) {
 }
 
 func TestExtractNoMetadata(t *testing.T) {
+	t.Parallel()
 	data := buildMinimalTIFF(binary.LittleEndian, nil, nil)
 	_, rawIPTC, rawXMP, err := Extract(bytes.NewReader(data))
 	if err != nil {
@@ -114,6 +116,7 @@ func TestExtractNoMetadata(t *testing.T) {
 }
 
 func TestExtractOverflow(t *testing.T) {
+	t.Parallel()
 	// Craft a TIFF with cnt = MaxUint32 for an IPTC tag — should not panic.
 	var buf bytes.Buffer
 	order := binary.LittleEndian
@@ -148,6 +151,7 @@ func TestExtractOverflow(t *testing.T) {
 }
 
 func TestInjectIPTCRoundTrip(t *testing.T) {
+	t.Parallel()
 	wantIPTC := []byte("original-iptc-payload-that-is-long-enough")
 	wantXMP := []byte("<xmpmeta xmlns:x=\"adobe:ns:meta/\"/>")
 	data := buildMinimalTIFF(binary.LittleEndian, wantIPTC, wantXMP)
@@ -172,6 +176,7 @@ func TestInjectIPTCRoundTrip(t *testing.T) {
 }
 
 func TestInjectXMPRoundTrip(t *testing.T) {
+	t.Parallel()
 	data := buildMinimalTIFF(binary.LittleEndian, nil, nil)
 	newXMP := []byte("<?xpacket begin='' uid='x'?><xmpmeta/><?xpacket end='r'?>")
 
@@ -190,6 +195,7 @@ func TestInjectXMPRoundTrip(t *testing.T) {
 }
 
 func TestInjectPassThrough(t *testing.T) {
+	t.Parallel()
 	// When rawIPTC and rawXMP are both nil, the output should equal the input.
 	data := buildMinimalTIFF(binary.LittleEndian, []byte("x"), nil)
 	var out bytes.Buffer
@@ -267,6 +273,7 @@ func buildTIFFWithPrivateTag(tag uint16, typ uint16, value []byte) []byte {
 // known type) survives a full Extract → Inject (with IPTC update) → Extract cycle.
 // This exercises the path where IFD0 is re-encoded by exif.Encode.
 func TestPrivateShortTagRoundTrip(t *testing.T) {
+	t.Parallel()
 	const privateTag = uint16(0x4321) // private-use tag, not in EXIF registry
 	const shortType = uint16(3)       // TypeShort
 
@@ -322,6 +329,7 @@ func TestPrivateShortTagRoundTrip(t *testing.T) {
 // UNDEFINED (type 7) has a defined byte size of 1, so exif.Encode can locate
 // and copy the value area correctly.
 func TestPrivateUndefinedTagRoundTrip(t *testing.T) {
+	t.Parallel()
 	const privateTag = uint16(0x5678)
 	const undefinedType = uint16(7) // TypeUndefined, size = 1 byte per unit
 
@@ -367,6 +375,7 @@ func TestPrivateUndefinedTagRoundTrip(t *testing.T) {
 // the data is not copied — this is an explicitly documented design constraint
 // (see exif.Encode documentation).
 func TestUnknownTypeTagRoundTrip(t *testing.T) {
+	t.Parallel()
 	const privateTag = uint16(0x9ABC)
 	const unknownType = uint16(0xFF) // not a valid TIFF type; typeSize returns 0
 

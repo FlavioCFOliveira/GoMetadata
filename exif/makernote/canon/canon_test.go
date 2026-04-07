@@ -27,6 +27,7 @@ func buildCanonIFD(entries []struct {
 }
 
 func TestParseValidIFD(t *testing.T) {
+	t.Parallel()
 	// Build a Canon MakerNote with 3 entries (minimum for tryParseIFD to succeed).
 	entries := []struct {
 		tag, typ uint16
@@ -52,6 +53,7 @@ func TestParseValidIFD(t *testing.T) {
 }
 
 func TestParseTooShortReturnsNil(t *testing.T) {
+	t.Parallel()
 	p := Parser{}
 	result, err := p.Parse([]byte{0x01})
 	if err != nil {
@@ -63,6 +65,7 @@ func TestParseTooShortReturnsNil(t *testing.T) {
 }
 
 func TestParseEmptyReturnsNil(t *testing.T) {
+	t.Parallel()
 	p := Parser{}
 	result, err := p.Parse([]byte{})
 	if err != nil {
@@ -74,6 +77,7 @@ func TestParseEmptyReturnsNil(t *testing.T) {
 }
 
 func TestParseCorruptCountReturnsNil(t *testing.T) {
+	t.Parallel()
 	// Entry count > 512 should be rejected.
 	buf := make([]byte, 2)
 	binary.LittleEndian.PutUint16(buf, 600)
@@ -88,6 +92,7 @@ func TestParseCorruptCountReturnsNil(t *testing.T) {
 }
 
 func TestTagConstants(t *testing.T) {
+	t.Parallel()
 	// Spot-check a few well-known Canon tag values from ExifTool Canon.pm.
 	if TagCameraSettings != 0x0001 {
 		t.Errorf("TagCameraSettings = 0x%04X, want 0x0001", TagCameraSettings)

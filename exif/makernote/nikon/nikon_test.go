@@ -46,6 +46,7 @@ func buildNikonType3() []byte {
 }
 
 func TestParseType1(t *testing.T) {
+	t.Parallel()
 	b := buildNikonType1IFD()
 	p := Parser{}
 	result, err := p.Parse(b)
@@ -61,6 +62,7 @@ func TestParseType1(t *testing.T) {
 }
 
 func TestParseType3(t *testing.T) {
+	t.Parallel()
 	b := buildNikonType3()
 	p := Parser{}
 	result, err := p.Parse(b)
@@ -76,6 +78,7 @@ func TestParseType3(t *testing.T) {
 }
 
 func TestParseTooShortReturnsNil(t *testing.T) {
+	t.Parallel()
 	p := Parser{}
 	result, err := p.Parse([]byte{0x00})
 	if err != nil {
@@ -87,6 +90,7 @@ func TestParseTooShortReturnsNil(t *testing.T) {
 }
 
 func TestParseEmptyReturnsNil(t *testing.T) {
+	t.Parallel()
 	p := Parser{}
 	result, err := p.Parse([]byte{})
 	if err != nil {
@@ -98,6 +102,7 @@ func TestParseEmptyReturnsNil(t *testing.T) {
 }
 
 func TestTagConstants(t *testing.T) {
+	t.Parallel()
 	if TagMakerNoteVersion != 0x0001 {
 		t.Errorf("TagMakerNoteVersion = 0x%04X, want 0x0001", TagMakerNoteVersion)
 	}

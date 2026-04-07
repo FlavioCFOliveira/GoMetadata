@@ -45,6 +45,7 @@ func corpusAllFiles(t *testing.T) []string {
 // It verifies that no file causes a panic or a CorruptMetadataError.
 // UnsupportedFormatError and TruncatedFileError are benign and skipped.
 func TestCorpusReadAll(t *testing.T) {
+	t.Parallel()
 	files := corpusAllFiles(t)
 	t.Logf("corpus: %d files", len(files))
 
@@ -80,6 +81,7 @@ func TestCorpusReadAll(t *testing.T) {
 // TestCorpusGPS verifies that GPS coordinates extracted from corpus files are
 // within valid WGS-84 ranges.
 func TestCorpusGPS(t *testing.T) {
+	t.Parallel()
 	files := corpusAllFiles(t)
 
 	for _, path := range files {
@@ -110,6 +112,7 @@ func TestCorpusGPS(t *testing.T) {
 // identical. Using WithoutEXIF/WithoutIPTC/WithoutXMP ensures Write() passes the
 // original raw bytes through without re-encoding.
 func TestCorpusRoundTrip(t *testing.T) {
+	t.Parallel()
 	files := corpusAllFiles(t)
 	t.Logf("round-trip: testing %d corpus files", len(files))
 
@@ -186,6 +189,7 @@ func TestCorpusRoundTrip(t *testing.T) {
 // TestWriteModifyRoundTrip tests the full modify-write-read cycle on a synthetic
 // JPEG. It modifies the EXIF ImageDescription, writes, and reads back to confirm.
 func TestWriteModifyRoundTrip(t *testing.T) {
+	t.Parallel()
 	const originalCaption = "original caption"
 	const newCaption = "updated caption"
 

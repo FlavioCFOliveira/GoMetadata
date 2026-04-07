@@ -47,6 +47,7 @@ func buildPanasonicMakerNote(tags []struct {
 }
 
 func TestPanasonicParserBasic(t *testing.T) {
+	t.Parallel()
 	p := Parser{}
 
 	b := buildPanasonicMakerNote([]struct {
@@ -74,6 +75,7 @@ func TestPanasonicParserBasic(t *testing.T) {
 }
 
 func TestPanasonicParserBadMagic(t *testing.T) {
+	t.Parallel()
 	// Payload without the Panasonic magic prefix.
 	b := make([]byte, 20)
 	b[0] = 0xFF // not "Panasonic..."
@@ -87,6 +89,7 @@ func TestPanasonicParserBadMagic(t *testing.T) {
 }
 
 func TestPanasonicParserTooShort(t *testing.T) {
+	t.Parallel()
 	tags, err := Parser{}.Parse([]byte("Pana"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

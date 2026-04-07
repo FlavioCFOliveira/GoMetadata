@@ -6,6 +6,7 @@ import (
 )
 
 func TestDetect(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name  string
 		magic []byte
@@ -44,6 +45,7 @@ func TestDetect(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			got, err := Detect(bytes.NewReader(tc.magic))
 			if err != nil {
 				t.Fatalf("Detect() error = %v", err)
@@ -56,6 +58,7 @@ func TestDetect(t *testing.T) {
 }
 
 func TestDetectUnknown(t *testing.T) {
+	t.Parallel()
 	unknown := [][]byte{
 		{0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
 		{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
@@ -74,6 +77,7 @@ func TestDetectUnknown(t *testing.T) {
 }
 
 func TestDetectTruncated(t *testing.T) {
+	t.Parallel()
 	cases := [][]byte{
 		{},
 		{0xFF},
@@ -87,6 +91,7 @@ func TestDetectTruncated(t *testing.T) {
 }
 
 func TestDetectSeekReset(t *testing.T) {
+	t.Parallel()
 	// Detect must leave the reader at position 0 after detection.
 	magic := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00, 0x01}
 	r := bytes.NewReader(magic)
@@ -103,6 +108,7 @@ func TestDetectSeekReset(t *testing.T) {
 }
 
 func TestAVIFDetect(t *testing.T) {
+	t.Parallel()
 	// All AVIF brands (ISO 23008-12 §B.4) must resolve to FormatAVIF.
 	brands := []struct {
 		name  string
@@ -130,18 +136,21 @@ func TestAVIFDetect(t *testing.T) {
 }
 
 func TestAVIFSupportsWrite(t *testing.T) {
+	t.Parallel()
 	if !SupportsWrite(FormatAVIF) {
 		t.Error("SupportsWrite(FormatAVIF) = false, want true")
 	}
 }
 
 func TestAVIFString(t *testing.T) {
+	t.Parallel()
 	if got := FormatAVIF.String(); got != "AVIF" {
 		t.Errorf("FormatAVIF.String() = %q, want %q", got, "AVIF")
 	}
 }
 
 func TestDetectMagic(t *testing.T) {
+	t.Parallel()
 	// Test detectMagic directly for edge cases.
 	if got := detectMagic([]byte{0xFF}); got != FormatUnknown {
 		t.Errorf("detectMagic(1 byte) = %v, want FormatUnknown", got)
@@ -209,6 +218,7 @@ func buildTIFFWithDNGTag() []byte {
 // TestRefineTIFFVariant verifies that Detect correctly identifies DNG, NEF,
 // and ARW from TIFF-magic files by reading IFD0 tags.
 func TestRefineTIFFVariant(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		data []byte
@@ -255,6 +265,7 @@ func TestRefineTIFFVariant(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			got, err := Detect(bytes.NewReader(tc.data))
 			if err != nil {
 				t.Fatalf("Detect() error = %v", err)
@@ -269,6 +280,7 @@ func TestRefineTIFFVariant(t *testing.T) {
 // TestDetectSeekAfterRefinement verifies that Detect leaves the reader at
 // position 0 even after TIFF-variant refinement reads additional bytes.
 func TestDetectSeekAfterRefinement(t *testing.T) {
+	t.Parallel()
 	data := buildTIFFWithDNGTag()
 	r := bytes.NewReader(data)
 	if _, err := Detect(r); err != nil {

@@ -26,6 +26,7 @@ func buildIPTC(records []struct {
 }
 
 func TestParseBasic(t *testing.T) {
+	t.Parallel()
 	raw := buildIPTC([]struct {
 		rec uint8
 		ds  uint8
@@ -48,6 +49,7 @@ func TestParseBasic(t *testing.T) {
 }
 
 func TestParseUTF8Declaration(t *testing.T) {
+	t.Parallel()
 	// Build a stream with Record 1, Dataset 90 = ESC % G.
 	var buf bytes.Buffer
 	buf.Write([]byte{0x1C, 0x01, 0x5A, 0x00, 0x03, 0x1B, 0x25, 0x47}) // R1:D90 UTF-8
@@ -65,6 +67,7 @@ func TestParseUTF8Declaration(t *testing.T) {
 }
 
 func TestEncodeRoundTrip(t *testing.T) {
+	t.Parallel()
 	raw := buildIPTC([]struct {
 		rec uint8
 		ds  uint8
@@ -97,6 +100,7 @@ func TestEncodeRoundTrip(t *testing.T) {
 }
 
 func TestEncodePreservesUTF8Flag(t *testing.T) {
+	t.Parallel()
 	// Stream with UTF-8 declaration + a caption.
 	var buf bytes.Buffer
 	buf.Write([]byte{0x1C, 0x01, 0x5A, 0x00, 0x03, 0x1B, 0x25, 0x47})
@@ -122,6 +126,7 @@ func TestEncodePreservesUTF8Flag(t *testing.T) {
 }
 
 func TestDatasetSizeCap(t *testing.T) {
+	t.Parallel()
 	// Build a stream with an extended-length dataset declaring 2 MiB size.
 	// The actual data is short — the parser should stop cleanly.
 	var buf bytes.Buffer
@@ -146,6 +151,7 @@ func TestDatasetSizeCap(t *testing.T) {
 }
 
 func TestKeywords(t *testing.T) {
+	t.Parallel()
 	raw := buildIPTC([]struct {
 		rec uint8
 		ds  uint8
@@ -170,6 +176,7 @@ func TestKeywords(t *testing.T) {
 }
 
 func TestKeywordsEmpty(t *testing.T) {
+	t.Parallel()
 	raw := buildIPTC([]struct {
 		rec uint8
 		ds  uint8
@@ -188,6 +195,7 @@ func TestKeywordsEmpty(t *testing.T) {
 }
 
 func TestCreator(t *testing.T) {
+	t.Parallel()
 	raw := buildIPTC([]struct {
 		rec uint8
 		ds  uint8
@@ -206,6 +214,7 @@ func TestCreator(t *testing.T) {
 }
 
 func TestCreatorEmpty(t *testing.T) {
+	t.Parallel()
 	raw := buildIPTC([]struct {
 		rec uint8
 		ds  uint8
@@ -226,6 +235,7 @@ func TestCreatorEmpty(t *testing.T) {
 // TestISO8859_1Decoding exercises the non-UTF-8 path in decodeString.
 // The byte 0xE9 is 'é' in ISO-8859-1, which should be decoded to U+00E9.
 func TestISO8859_1Decoding(t *testing.T) {
+	t.Parallel()
 	// No UTF-8 declaration → ISO-8859-1 assumed.
 	raw := buildIPTC([]struct {
 		rec uint8
@@ -250,6 +260,7 @@ func TestISO8859_1Decoding(t *testing.T) {
 // TestISO8859_1VsUTF8 confirms the same high byte is treated differently
 // depending on the coded character set declaration.
 func TestISO8859_1VsUTF8(t *testing.T) {
+	t.Parallel()
 	// With UTF-8 declaration, raw bytes are returned as-is.
 	var buf bytes.Buffer
 	buf.Write([]byte{0x1C, 0x01, 0x5A, 0x00, 0x03, 0x1B, 0x25, 0x47}) // UTF-8 decl
@@ -275,6 +286,7 @@ func TestISO8859_1VsUTF8(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestSetCaption(t *testing.T) {
+	t.Parallel()
 	i := new(IPTC)
 	i.SetCaption("First caption")
 	if got := i.Caption(); got != "First caption" {
@@ -288,6 +300,7 @@ func TestSetCaption(t *testing.T) {
 }
 
 func TestSetCopyright(t *testing.T) {
+	t.Parallel()
 	i := new(IPTC)
 	i.SetCopyright("(c) 2024 Test Corp")
 	if got := i.Copyright(); got != "(c) 2024 Test Corp" {
@@ -296,6 +309,7 @@ func TestSetCopyright(t *testing.T) {
 }
 
 func TestSetCreator(t *testing.T) {
+	t.Parallel()
 	i := new(IPTC)
 	i.SetCreator("Photographer X")
 	if got := i.Creator(); got != "Photographer X" {
@@ -304,6 +318,7 @@ func TestSetCreator(t *testing.T) {
 }
 
 func TestAddKeyword(t *testing.T) {
+	t.Parallel()
 	i := new(IPTC)
 	i.AddKeyword("alpha")
 	i.AddKeyword("beta")
@@ -318,6 +333,7 @@ func TestAddKeyword(t *testing.T) {
 }
 
 func TestSettersRoundTrip(t *testing.T) {
+	t.Parallel()
 	i := new(IPTC)
 	i.SetCaption("A test caption")
 	i.SetCopyright("(c) Test Corp")
@@ -349,6 +365,7 @@ func TestSettersRoundTrip(t *testing.T) {
 }
 
 func TestIPTCExtendedLengthRoundTrip(t *testing.T) {
+	t.Parallel()
 	// Dataset with a value that exceeds 32,767 bytes; requires extended-length
 	// encoding on write (IIM §1.6.2). Encoder previously truncated such values.
 	large := make([]byte, 40000)
@@ -389,6 +406,7 @@ func TestIPTCExtendedLengthRoundTrip(t *testing.T) {
 // TestIPTCRecord1Parsing verifies that a Record 1 dataset is stored in
 // IPTC.Records[1] after parsing.
 func TestIPTCRecord1Parsing(t *testing.T) {
+	t.Parallel()
 	// Record 1, Dataset 20 = Supplemental Category (a valid IIM R1 dataset).
 	raw := buildIPTC([]struct {
 		rec uint8
@@ -423,6 +441,7 @@ func TestIPTCRecord1Parsing(t *testing.T) {
 // TestIPTCRecordsBeyond2 verifies that datasets for records other than 1 and 2
 // (e.g. record 3) are stored in the correct Records bucket.
 func TestIPTCRecordsBeyond2(t *testing.T) {
+	t.Parallel()
 	// Record 3 is the "Pre-ObjectData Descriptor" record in IIM.
 	const rec3DS uint8 = 10 // arbitrary dataset within record 3
 	raw := buildIPTC([]struct {
@@ -460,6 +479,7 @@ func TestIPTCRecordsBeyond2(t *testing.T) {
 // 32767 bytes (0x8000) is correctly encoded using IIM §1.6.2 extended length
 // encoding and round-trips back through Parse without data loss.
 func TestEncodeExtendedLengthRoundTrip(t *testing.T) {
+	t.Parallel()
 	// Build a value that requires extended length: 40 000 bytes.
 	const valueLen = 40_000
 	large := make([]byte, valueLen)
@@ -591,7 +611,9 @@ func BenchmarkIPTCAccessors(b *testing.B) {
 // TestIPTCSetKeywords verifies that SetKeywords replaces existing keywords and
 // that a round-trip (Encode → Parse) preserves them exactly.
 func TestIPTCSetKeywords(t *testing.T) {
+	t.Parallel()
 	t.Run("ReplaceExisting", func(t *testing.T) {
+		t.Parallel()
 		raw := buildIPTC([]struct {
 			rec uint8
 			ds  uint8
@@ -635,6 +657,7 @@ func TestIPTCSetKeywords(t *testing.T) {
 	})
 
 	t.Run("EmptySliceRemovesAll", func(t *testing.T) {
+		t.Parallel()
 		raw := buildIPTC([]struct {
 			rec uint8
 			ds  uint8
@@ -650,6 +673,7 @@ func TestIPTCSetKeywords(t *testing.T) {
 	})
 
 	t.Run("PreservesOtherDatasets", func(t *testing.T) {
+		t.Parallel()
 		raw := buildIPTC([]struct {
 			rec uint8
 			ds  uint8
@@ -670,6 +694,7 @@ func TestIPTCSetKeywords(t *testing.T) {
 	})
 
 	t.Run("NilReceiverNoPanic", func(t *testing.T) {
+		t.Parallel()
 		var i *IPTC
 		i.SetKeywords([]string{"a", "b"}) // must not panic
 	})

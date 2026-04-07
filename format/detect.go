@@ -313,10 +313,13 @@ func refineTIFFVariant(r io.ReadSeeker) FormatID {
 	}
 
 	makeRaw, isDNG := findMakeTagInIFD(data, order, count, pos)
-	tiffScanPool.Put(bp)
-
-	if isDNG {
-		return FormatDNG
+	// mapMakeToFormat must be called before tiffScanPool.Put(bp): makeRaw is a
+	// subslice of the pool buffer (*bp). Putting bp back before reading makeRaw
+	// would allow another goroutine to overwrite the buffer concurrently.
+	format := FormatDNG
+	if !isDNG {
+		format = mapMakeToFormat(makeRaw)
 	}
-	return mapMakeToFormat(makeRaw)
+	tiffScanPool.Put(bp)
+	return format
 }

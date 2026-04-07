@@ -3,6 +3,7 @@ package makernote
 import "testing"
 
 func TestDispatchUnknownMake(t *testing.T) {
+	t.Parallel()
 	p := Dispatch("UNKNOWN_BRAND")
 	if p != nil {
 		t.Errorf("expected nil parser for unknown make, got %T", p)
@@ -10,6 +11,7 @@ func TestDispatchUnknownMake(t *testing.T) {
 }
 
 func TestDispatchCanon(t *testing.T) {
+	t.Parallel()
 	p := Dispatch("Canon")
 	if p == nil {
 		t.Fatal("expected non-nil parser for Canon")
@@ -25,6 +27,7 @@ func TestDispatchCanon(t *testing.T) {
 }
 
 func TestDispatchNikon(t *testing.T) {
+	t.Parallel()
 	p := Dispatch("NIKON CORPORATION")
 	if p == nil {
 		t.Fatal("expected non-nil parser for Nikon")
@@ -39,6 +42,7 @@ func TestDispatchNikon(t *testing.T) {
 }
 
 func TestDispatchSony(t *testing.T) {
+	t.Parallel()
 	p := Dispatch("SONY")
 	if p == nil {
 		t.Fatal("expected non-nil parser for Sony")
@@ -53,6 +57,7 @@ func TestDispatchSony(t *testing.T) {
 }
 
 func TestDispatchNikonAlias(t *testing.T) {
+	t.Parallel()
 	// "Nikon" (without "CORPORATION") should also match.
 	p := Dispatch("Nikon")
 	if p == nil {
@@ -61,6 +66,7 @@ func TestDispatchNikonAlias(t *testing.T) {
 }
 
 func TestDispatchFujifilm(t *testing.T) {
+	t.Parallel()
 	p := Dispatch("FUJIFILM")
 	if p == nil {
 		t.Fatal("expected non-nil parser for FUJIFILM")
@@ -74,6 +80,7 @@ func TestDispatchFujifilm(t *testing.T) {
 }
 
 func TestDispatchOlympus(t *testing.T) {
+	t.Parallel()
 	for _, make := range []string{"OLYMPUS IMAGING CORP.", "OLYMPUS CORPORATION", "Olympus"} {
 		p := Dispatch(make)
 		if p == nil {
@@ -91,6 +98,7 @@ func TestDispatchOlympus(t *testing.T) {
 }
 
 func TestDispatchPentax(t *testing.T) {
+	t.Parallel()
 	for _, make := range []string{"PENTAX Corporation", "Ricoh", "RICOH"} {
 		p := Dispatch(make)
 		if p == nil {
@@ -108,6 +116,7 @@ func TestDispatchPentax(t *testing.T) {
 }
 
 func TestDispatchPanasonic(t *testing.T) {
+	t.Parallel()
 	p := Dispatch("Panasonic")
 	if p == nil {
 		t.Fatal("expected non-nil parser for Panasonic")
@@ -121,6 +130,7 @@ func TestDispatchPanasonic(t *testing.T) {
 }
 
 func TestDispatchLeica(t *testing.T) {
+	t.Parallel()
 	for _, make := range []string{"LEICA CAMERA AG", "Leica Camera AG", "LEICA", "Leica"} {
 		p := Dispatch(make)
 		if p == nil {
@@ -135,6 +145,7 @@ func TestDispatchLeica(t *testing.T) {
 }
 
 func TestDispatchDJI(t *testing.T) {
+	t.Parallel()
 	p := Dispatch("DJI")
 	if p == nil {
 		t.Fatal("expected non-nil parser for DJI")
@@ -147,6 +158,7 @@ func TestDispatchDJI(t *testing.T) {
 }
 
 func TestDispatchSamsung(t *testing.T) {
+	t.Parallel()
 	p := Dispatch("SAMSUNG")
 	if p == nil {
 		t.Fatal("expected non-nil parser for SAMSUNG")
@@ -159,6 +171,7 @@ func TestDispatchSamsung(t *testing.T) {
 }
 
 func TestDispatchSigma(t *testing.T) {
+	t.Parallel()
 	p := Dispatch("SIGMA")
 	if p == nil {
 		t.Fatal("expected non-nil parser for SIGMA")

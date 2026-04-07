@@ -48,6 +48,7 @@ func buildSamsungMakerNote(tags []struct {
 }
 
 func TestSamsungParserBasic(t *testing.T) {
+	t.Parallel()
 	b := buildSamsungMakerNote([]struct {
 		id  uint16
 		typ uint16
@@ -70,6 +71,7 @@ func TestSamsungParserBasic(t *testing.T) {
 }
 
 func TestSamsungParserTooShort(t *testing.T) {
+	t.Parallel()
 	tags, err := Parser{}.Parse([]byte{0x00})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

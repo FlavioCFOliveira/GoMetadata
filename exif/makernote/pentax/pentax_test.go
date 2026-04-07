@@ -76,6 +76,7 @@ func buildPentaxPrefixMakerNote() []byte {
 }
 
 func TestPentaxParse_ValidAOC(t *testing.T) {
+	t.Parallel()
 	b := buildAOCMakerNote()
 	p := Parser{}
 	result, err := p.Parse(b)
@@ -91,6 +92,7 @@ func TestPentaxParse_ValidAOC(t *testing.T) {
 }
 
 func TestPentaxParse_AOCOffsetValue(t *testing.T) {
+	t.Parallel()
 	b := buildAOCMakerNoteWithOffset()
 	p := Parser{}
 	result, err := p.Parse(b)
@@ -113,6 +115,7 @@ func TestPentaxParse_AOCOffsetValue(t *testing.T) {
 }
 
 func TestPentaxParse_ValidPentaxPrefix(t *testing.T) {
+	t.Parallel()
 	b := buildPentaxPrefixMakerNote()
 	p := Parser{}
 	result, err := p.Parse(b)
@@ -128,6 +131,7 @@ func TestPentaxParse_ValidPentaxPrefix(t *testing.T) {
 }
 
 func TestPentaxParse_TooShort(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		b    []byte
@@ -141,6 +145,7 @@ func TestPentaxParse_TooShort(t *testing.T) {
 	p := Parser{}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			result, err := p.Parse(tc.b)
 			if err != nil {
 				t.Errorf("expected nil error, got: %v", err)
@@ -153,6 +158,7 @@ func TestPentaxParse_TooShort(t *testing.T) {
 }
 
 func TestPentaxParse_BadMagic(t *testing.T) {
+	t.Parallel()
 	b := make([]byte, 20)
 	copy(b[0:4], "NOPE")
 	binary.BigEndian.PutUint16(b[4:6], 0x0100)
@@ -168,6 +174,7 @@ func TestPentaxParse_BadMagic(t *testing.T) {
 }
 
 func TestPentaxParse_IFDOffsetOutOfBounds(t *testing.T) {
+	t.Parallel()
 	// Craft an AOC MakerNote where count > available entries.
 	buf := make([]byte, minLengthAOC)
 	copy(buf[0:4], magicAOC)
@@ -185,6 +192,7 @@ func TestPentaxParse_IFDOffsetOutOfBounds(t *testing.T) {
 }
 
 func TestPentaxParse_PentaxPrefixBadByteOrder(t *testing.T) {
+	t.Parallel()
 	b := buildPentaxPrefixMakerNote()
 	b[8] = 'X'
 	b[9] = 'X'
@@ -200,6 +208,7 @@ func TestPentaxParse_PentaxPrefixBadByteOrder(t *testing.T) {
 }
 
 func TestPentaxParse_MultipleEntries(t *testing.T) {
+	t.Parallel()
 	// magic(4) + version(2) + count(2) + 2 entries(24) = 32 bytes
 	buf := make([]byte, 32)
 	copy(buf[0:4], magicAOC)
@@ -235,6 +244,7 @@ func TestPentaxParse_MultipleEntries(t *testing.T) {
 }
 
 func TestTagConstants(t *testing.T) {
+	t.Parallel()
 	if TagPentaxVersion != 0x0000 {
 		t.Errorf("TagPentaxVersion = 0x%04X, want 0x0000", TagPentaxVersion)
 	}

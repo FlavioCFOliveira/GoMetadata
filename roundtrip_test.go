@@ -192,6 +192,7 @@ func rtWriteWebPChunk(buf *bytes.Buffer, fourCC string, data []byte) {
 // TestRoundTripIPTC_JPEG verifies that IPTC caption, copyright, and keywords
 // written to a JPEG survive a complete Read→Write→Read cycle.
 func TestRoundTripIPTC_JPEG(t *testing.T) {
+	t.Parallel()
 	const (
 		wantCaption   = "sunset over the bay"
 		wantCopyright = "(c) 2024 Test Corp"
@@ -250,6 +251,7 @@ func TestRoundTripIPTC_JPEG(t *testing.T) {
 // TestRoundTripXMP_JPEG verifies that XMP caption, copyright, and keywords
 // written to a JPEG survive a complete Read→Write→Read cycle.
 func TestRoundTripXMP_JPEG(t *testing.T) {
+	t.Parallel()
 	const (
 		wantCaption   = "mountain lake at dawn"
 		wantCopyright = "(c) 2024 Photographer"
@@ -302,6 +304,7 @@ func TestRoundTripXMP_JPEG(t *testing.T) {
 // TestRoundTripCaption_JPEG tests that a caption set via IPTC on a JPEG
 // survives a round-trip even when no other metadata was present initially.
 func TestRoundTripCaption_JPEG(t *testing.T) {
+	t.Parallel()
 	const wantCaption = "simple caption test"
 
 	// A bare JPEG with no metadata at all.
@@ -333,6 +336,7 @@ func TestRoundTripCaption_JPEG(t *testing.T) {
 // PNG survive a complete Read→Write→Read cycle.
 // IPTC is not supported by PNG containers; only XMP is tested here.
 func TestRoundTripXMP_PNG(t *testing.T) {
+	t.Parallel()
 	const (
 		wantCaption   = "forest trail in autumn"
 		wantCopyright = "(c) 2024 Nature Photographer"
@@ -378,6 +382,7 @@ func TestRoundTripXMP_PNG(t *testing.T) {
 // WebP survive a complete Read→Write→Read cycle.
 // IPTC is not natively carried by WebP containers; only XMP is tested here.
 func TestRoundTripXMP_WebP(t *testing.T) {
+	t.Parallel()
 	const (
 		wantCaption   = "ocean waves at high tide"
 		wantCopyright = "(c) 2024 Marine Photos"
@@ -422,6 +427,7 @@ func TestRoundTripXMP_WebP(t *testing.T) {
 // TestRoundTripTableDriven is a comprehensive table-driven test covering the
 // most important format+metadata-type combinations in a compact form.
 func TestRoundTripTableDriven(t *testing.T) {
+	t.Parallel()
 	type testCase struct {
 		name   string
 		image  func() []byte                          // build the container
@@ -537,6 +543,7 @@ func TestRoundTripTableDriven(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			img := tc.image()
 
 			m, err := gometadata.Read(bytes.NewReader(img))
@@ -569,6 +576,7 @@ func TestRoundTripTableDriven(t *testing.T) {
 // change). The invariant we enforce is that rawEXIF remains present and
 // parseable, not byte-for-byte identical to the input.
 func TestRoundTripPreservesExistingEXIF(t *testing.T) {
+	t.Parallel()
 	tiff := rtMinimalTIFF()
 	img := rtBuildJPEG(tiff)
 

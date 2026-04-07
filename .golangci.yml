@@ -70,10 +70,23 @@ linters:
     - nestif
     # ExampleXxx functions must have // Output: comments to run as tests.
     - testableexamples
+    # Detects TODO/FIXME/HACK comments that should be resolved before merging.
+    - godox
+    # Top-level tests with t.Run subtests must call t.Parallel().
+    - paralleltest
+    # t.Run subtests must call t.Parallel() as their first statement.
+    - tparallel
     # Test helper functions must call t.Helper() as first line.
     - thelper
     # All exported symbols must have conformant godoc comments.
     - godoclint
+
+    # ===========================================================================
+    # COMPLEXITY BOUNDS
+    # ===========================================================================
+
+    # Functions over 80 lines or 60 statements must be justified with //nolint:funlen.
+    - funlen
 
     # ===========================================================================
     # PERFORMANCE
@@ -233,6 +246,12 @@ linters:
     inamedparam:
       skip-single-param: false
 
+    # --- funlen: 80-line / 60-statement cap on non-test functions ---
+    funlen:
+      lines: 80
+      statements: 60
+      ignore-comments: true
+
   exclusions:
     rules:
       # exif/tag.go: deliberately global read-only map + init() for tag registry.
@@ -256,11 +275,15 @@ linters:
         path: "^examples/"
 
       # examples/ are standalone CLI main packages — library linters don't apply.
-      - linters: [gochecknoglobals, gochecknoinits, wrapcheck, errcheck]
+      - linters: [gochecknoglobals, gochecknoinits, wrapcheck, errcheck, funlen]
         path: "^examples/"
 
       # thelper and testableexamples apply only to *_test.go, not main programs.
       - linters: [thelper, testableexamples]
+        path: "^examples/"
+
+      # paralleltest/tparallel: examples/ are standalone CLI programs, not test files.
+      - linters: [paralleltest, tparallel]
         path: "^examples/"
 
       # godoclint: internal/ packages serve maintainers, not the public API.
@@ -330,10 +353,25 @@ linters:
       - linters: [nestif]
         path: "_test\\.go$"
 
+      # funlen: test functions are inherently long (setup, act, assert, subtests).
+      - linters: [funlen]
+        path: "_test\\.go$"
+
 formatters:
   enable:
     # Enforces canonical Go formatting and applies simplifications (gofmt -s).
     - gofmt
+    # Import group ordering: stdlib → external → github.com/FlavioCFOliveira prefix.
+    - gci
   settings:
     gofmt:
       simplify: true
+    # --- gci: import group ordering ---
+    # Group 1: standard library
+    # Group 2: external (everything not in stdlib or this module)
+    # Group 3: this module (github.com/FlavioCFOliveira prefix)
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/FlavioCFOliveira)

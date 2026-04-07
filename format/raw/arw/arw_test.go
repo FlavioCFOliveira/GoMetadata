@@ -17,6 +17,7 @@ func minimalTIFF() []byte {
 }
 
 func TestExtractReturnsRawEXIF(t *testing.T) {
+	t.Parallel()
 	data := minimalTIFF()
 	rawEXIF, rawIPTC, rawXMP, err := Extract(bytes.NewReader(data))
 	if err != nil {
@@ -34,6 +35,7 @@ func TestExtractReturnsRawEXIF(t *testing.T) {
 }
 
 func TestInjectRoundTrip(t *testing.T) {
+	t.Parallel()
 	data := minimalTIFF()
 
 	var out bytes.Buffer

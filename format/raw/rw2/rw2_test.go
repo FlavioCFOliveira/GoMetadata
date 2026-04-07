@@ -17,6 +17,7 @@ func buildRW2() []byte {
 }
 
 func TestExtractHasRW2Magic(t *testing.T) {
+	t.Parallel()
 	data := buildRW2()
 	if !bytes.HasPrefix(data, rw2Magic) {
 		t.Fatal("test data does not start with RW2 magic")
@@ -24,6 +25,7 @@ func TestExtractHasRW2Magic(t *testing.T) {
 }
 
 func TestExtractReturnsRawEXIF(t *testing.T) {
+	t.Parallel()
 	data := buildRW2()
 	rawEXIF, rawIPTC, rawXMP, err := Extract(bytes.NewReader(data))
 	if err != nil {
@@ -45,6 +47,7 @@ func TestExtractReturnsRawEXIF(t *testing.T) {
 }
 
 func TestExtractInvalidMagicReturnsError(t *testing.T) {
+	t.Parallel()
 	data := buildRW2()
 	data[0] = 'M' // corrupt magic
 	_, _, _, err := Extract(bytes.NewReader(data))
@@ -54,6 +57,7 @@ func TestExtractInvalidMagicReturnsError(t *testing.T) {
 }
 
 func TestInjectOutputHasRW2Magic(t *testing.T) {
+	t.Parallel()
 	data := buildRW2()
 	var out bytes.Buffer
 	if err := Inject(bytes.NewReader(data), &out, nil, nil, nil); err != nil {
@@ -71,6 +75,7 @@ func TestInjectOutputHasRW2Magic(t *testing.T) {
 }
 
 func TestInjectRoundTrip(t *testing.T) {
+	t.Parallel()
 	data := buildRW2()
 	var out bytes.Buffer
 	if err := Inject(bytes.NewReader(data), &out, nil, nil, nil); err != nil {
@@ -87,6 +92,7 @@ func TestInjectRoundTrip(t *testing.T) {
 }
 
 func TestInjectInvalidMagicReturnsError(t *testing.T) {
+	t.Parallel()
 	data := buildRW2()
 	data[0] = 'M'
 	var out bytes.Buffer
@@ -143,6 +149,7 @@ func buildRW2WithTag(tag uint16, typ uint16, value []byte) []byte {
 // TestExtractTIFFTagsIPTC verifies that an RW2 containing an IFD0 entry with
 // tag 0x83BB (IPTC) causes Extract to return a non-nil rawIPTC.
 func TestExtractTIFFTagsIPTC(t *testing.T) {
+	t.Parallel()
 	iptcData := []byte{0x1C, 0x02, 0x05, 0x00, 0x03, 'A', 'B', 'C'}
 	// Type 7 = UNDEFINED (1 byte per unit); len(iptcData) = 8 → out-of-line
 	data := buildRW2WithTag(0x83BB, 7, iptcData)
@@ -161,6 +168,7 @@ func TestExtractTIFFTagsIPTC(t *testing.T) {
 
 // TestExtractTIFFTagsIPTCInline verifies inline IPTC tag value (total <= 4 bytes).
 func TestExtractTIFFTagsIPTCInline(t *testing.T) {
+	t.Parallel()
 	iptcData := []byte{0x1C, 0x02} // 2 bytes → inline
 	data := buildRW2WithTag(0x83BB, 7, iptcData)
 
@@ -181,6 +189,7 @@ func TestExtractTIFFTagsIPTCInline(t *testing.T) {
 // TestExtractTIFFTagsXMP verifies that an RW2 containing an IFD0 entry with
 // tag 0x02BC (XMP) causes Extract to return a non-nil rawXMP.
 func TestExtractTIFFTagsXMP(t *testing.T) {
+	t.Parallel()
 	xmpData := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta/>`)
 	data := buildRW2WithTag(0x02BC, 1, xmpData) // type 1 = BYTE
 
@@ -201,6 +210,7 @@ func TestExtractTIFFTagsXMP(t *testing.T) {
 // TestTypeSizeAllBranches exercises typeSize for every defined TIFF type code
 // and the unknown-type fallback.
 func TestTypeSizeAllBranches(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		typ  uint16
 		want uint32
@@ -223,6 +233,7 @@ func TestTypeSizeAllBranches(t *testing.T) {
 // TestExtractOutOfBoundsIFDOffset verifies that an RW2 whose IFD0 offset
 // points past the end of the data slice does not panic and returns no error.
 func TestExtractOutOfBoundsIFDOffset(t *testing.T) {
+	t.Parallel()
 	data := buildRW2()
 	// Corrupt the IFD0 offset to point far beyond the data.
 	binary.LittleEndian.PutUint32(data[4:], 0xFFFFFF00)
@@ -247,6 +258,7 @@ func TestExtractOutOfBoundsIFDOffset(t *testing.T) {
 // TestInjectIPTCXMP verifies that calling Inject with IPTC and XMP payloads
 // does not panic and produces a valid RW2 output (correct magic bytes).
 func TestInjectIPTCXMP(t *testing.T) {
+	t.Parallel()
 	data := buildRW2()
 	iptcPayload := []byte{0x1C, 0x02, 0x78, 0x00, 0x03, 'N', 'e', 'w'}
 	xmpPayload := []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"/>`)
@@ -275,6 +287,7 @@ func TestInjectIPTCXMP(t *testing.T) {
 // avoids calling exif.Parse/exif.Encode entirely, preserving all non-standard
 // Panasonic IFD encoding.
 func TestInjectEXIFOnlyPassThrough(t *testing.T) {
+	t.Parallel()
 	data := buildRW2()
 
 	// rawEXIF = patched-to-TIFF copy of data (simulates what Extract returns).
@@ -312,6 +325,7 @@ func TestInjectEXIFOnlyPassThrough(t *testing.T) {
 // is a valid RW2 file with the correct magic bytes. This tests the path that
 // calls tiff.Inject with a non-nil IPTC payload.
 func TestInjectIPTCGracefulDegradation(t *testing.T) {
+	t.Parallel()
 	// Use a minimal RW2 that is also valid as a standard TIFF LE once patched.
 	data := buildRW2()
 	iptcPayload := []byte{0x1C, 0x02, 0x05, 0x00, 0x05, 'h', 'e', 'l', 'l', 'o'}
@@ -359,6 +373,7 @@ func TestInjectIPTCGracefulDegradation(t *testing.T) {
 // tiff.Inject (and therefore rw2.Inject) must propagate the parse error so
 // the caller knows the metadata update was not applied.
 func TestInjectNonStandardRW2ReturnsError(t *testing.T) {
+	t.Parallel()
 	// Build a minimal RW2 with a corrupt IFD0 offset so exif.Parse will fail.
 	data := buildRW2()
 	// Point IFD0 offset past end of file — exif.Parse will return an error.
@@ -377,6 +392,7 @@ func TestInjectNonStandardRW2ReturnsError(t *testing.T) {
 // TestExtractTIFFTagsOOBValueOffset verifies that an IFD entry whose out-of-line
 // value offset is beyond the data slice is silently skipped (no panic).
 func TestExtractTIFFTagsOOBValueOffset(t *testing.T) {
+	t.Parallel()
 	const ifd0Off = 8
 	const dataOff = 26
 

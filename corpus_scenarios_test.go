@@ -83,6 +83,7 @@ func walkCorpusDir(t *testing.T, subdir string) []string {
 // (a common combination) — the key invariant is that the XMP segment is found.
 // Source: exiftool test suite (XMP.jpg).
 func TestCorpusXMPPresent(t *testing.T) {
+	t.Parallel()
 	path := requireCorpusFile(t, "jpeg/exiftool/XMP.jpg")
 	m := openAndRead(t, path)
 
@@ -96,6 +97,7 @@ func TestCorpusXMPPresent(t *testing.T) {
 // and XMP — the "no_exif" label refers to the absence of camera-specific EXIF.
 // The test confirms the file parses without CorruptMetadataError.
 func TestCorpusNoExifSampleFile(t *testing.T) {
+	t.Parallel()
 	path := requireCorpusFile(t, "jpeg/exif-samples/no_exif.jpg")
 	m := openAndRead(t, path)
 
@@ -114,6 +116,7 @@ func TestCorpusNoExifSampleFile(t *testing.T) {
 // metadata-type path and confirms the absence of IPTC/XMP is handled gracefully.
 // Source: exiftool test suite (Unknown.jpg).
 func TestCorpusMinimalMetadata(t *testing.T) {
+	t.Parallel()
 	path := requireCorpusFile(t, "jpeg/exiftool/Unknown.jpg")
 	m := openAndRead(t, path)
 
@@ -134,6 +137,7 @@ func TestCorpusMinimalMetadata(t *testing.T) {
 // types is parsed and all three raw segments are non-nil.
 // Source: exiftool test suite (ExifTool.jpg — all-three reference image).
 func TestCorpusCombinedMetadata(t *testing.T) {
+	t.Parallel()
 	path := requireCorpusFile(t, "jpeg/exiftool/ExifTool.jpg")
 	m := openAndRead(t, path)
 
@@ -152,6 +156,7 @@ func TestCorpusCombinedMetadata(t *testing.T) {
 // MWG.jpg is a conformance target for consistent EXIF/IPTC/XMP alignment.
 // Source: exiftool test suite.
 func TestCorpusMWGCompliance(t *testing.T) {
+	t.Parallel()
 	path := requireCorpusFile(t, "jpeg/exiftool/MWG.jpg")
 	m := openAndRead(t, path)
 
@@ -169,6 +174,7 @@ func TestCorpusMWGCompliance(t *testing.T) {
 // TestCorpusIPTCOnly verifies a JPEG that carries IPTC but no EXIF.
 // Source: exiftool test suite (IPTC.jpg).
 func TestCorpusIPTCOnly(t *testing.T) {
+	t.Parallel()
 	path := requireCorpusFile(t, "jpeg/exiftool/IPTC.jpg")
 	m := openAndRead(t, path)
 
@@ -186,11 +192,13 @@ func TestCorpusIPTCOnly(t *testing.T) {
 // so encoding style should not affect extraction.
 // Source: sindresorhus/is-progressive fixture set.
 func TestCorpusProgressiveJPEG(t *testing.T) {
+	t.Parallel()
 	files := walkCorpusDir(t, "jpeg/progressive")
 	progressive := []string{"kitten-progressive.jpg", "progressive.jpg"}
 
 	for _, name := range progressive {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			path := requireCorpusFile(t, filepath.Join("jpeg", "progressive", name))
 			// Must parse without CorruptMetadataError. Other errors are benign.
 			openAndRead(t, path)
@@ -202,8 +210,10 @@ func TestCorpusProgressiveJPEG(t *testing.T) {
 // TestCorpusBaselineVsProgressive reads both a baseline and a progressive JPEG
 // and asserts neither produces a CorruptMetadataError.
 func TestCorpusBaselineVsProgressive(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"baseline.jpg", "kitten-progressive.jpg"} {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			path := requireCorpusFile(t, filepath.Join("jpeg", "progressive", name))
 			openAndRead(t, path) // CorruptMetadataError → fatal; skip otherwise
 		})
@@ -218,6 +228,7 @@ func TestCorpusBaselineVsProgressive(t *testing.T) {
 // returned coordinates are within valid WGS-84 bounds.
 // Source: exiftool test suite (GPS.jpg — purpose-built GPS fixture).
 func TestCorpusGPSCoordinates(t *testing.T) {
+	t.Parallel()
 	path := requireCorpusFile(t, "jpeg/exiftool/GPS.jpg")
 	m := openAndRead(t, path)
 
@@ -241,6 +252,7 @@ func TestCorpusGPSCoordinates(t *testing.T) {
 // XMP (GUIDed continuation segments) is reassembled and parsed correctly.
 // Source: exiftool test suite (ExtendedXMP.jpg).
 func TestCorpusExtendedXMP(t *testing.T) {
+	t.Parallel()
 	path := requireCorpusFile(t, "jpeg/exiftool/ExtendedXMP.jpg")
 	m := openAndRead(t, path)
 
@@ -258,6 +270,7 @@ func TestCorpusExtendedXMP(t *testing.T) {
 // produce non-nil EXIF data.
 // Source: libexif/libexif test/testdata (canon, fuji, olympus 2-5, pentax 2-4).
 func TestCorpusMakerNoteVariants(t *testing.T) {
+	t.Parallel()
 	dir := filepath.Join("testdata", "corpus", "jpeg", "libexif-makernotes")
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		t.Skip("libexif-makernotes not present (run testdata/download.sh)")
@@ -276,6 +289,7 @@ func TestCorpusMakerNoteVariants(t *testing.T) {
 			continue
 		}
 		t.Run(e.Name(), func(t *testing.T) {
+			t.Parallel()
 			path := filepath.Join(dir, e.Name())
 			m := openAndRead(t, path)
 			if m.RawEXIF() == nil {
@@ -294,6 +308,7 @@ func TestCorpusMakerNoteVariants(t *testing.T) {
 // specific MakerNote encoding. The key invariant is: no CorruptMetadataError
 // and EXIF is present.
 func TestCorpusMakerNoteManufacturers(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		file string
@@ -317,6 +332,7 @@ func TestCorpusMakerNoteManufacturers(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			p := filepath.Join("testdata", "corpus", tc.file)
 			if _, err := os.Stat(p); os.IsNotExist(err) {
 				t.Skipf("file absent: %s", tc.file)
@@ -339,6 +355,7 @@ func TestCorpusMakerNoteManufacturers(t *testing.T) {
 //
 // Source: iptc.org (IPTC-PhotometadataRef-Std20xx.x.jpg).
 func TestCorpusIPTCReferenceImages(t *testing.T) {
+	t.Parallel()
 	variants := []string{
 		"Std2024.1",
 		"Std2023.2",
@@ -348,6 +365,7 @@ func TestCorpusIPTCReferenceImages(t *testing.T) {
 	}
 	for _, v := range variants {
 		t.Run(v, func(t *testing.T) {
+			t.Parallel()
 			path := requireCorpusFile(t, "jpeg/iptc/IPTC-PhotometadataRef-"+v+".jpg")
 			m := openAndRead(t, path)
 
@@ -380,6 +398,7 @@ func TestCorpusIPTCReferenceImages(t *testing.T) {
 // traversal code paths beyond camera images.
 // Source: tlnagy/exampletiffs.
 func TestCorpusTIFFStructuralVariants(t *testing.T) {
+	t.Parallel()
 	files := []string{
 		"mri.tif",                              // multi-page (MRI slices)
 		"shapes_tiled_multi.tif",               // tiled, multi-page
@@ -394,6 +413,7 @@ func TestCorpusTIFFStructuralVariants(t *testing.T) {
 	}
 	for _, name := range files {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			path := requireCorpusFile(t, filepath.Join("tiff", "exampletiffs", name))
 			// Must not CorruptMetadataError. Other errors are benign (e.g. no EXIF).
 			openAndRead(t, path)
@@ -404,6 +424,7 @@ func TestCorpusTIFFStructuralVariants(t *testing.T) {
 // TestCorpusMultiPageTIFF specifically validates that a multi-page TIFF is
 // readable without corruption and returns valid (or absent) metadata.
 func TestCorpusMultiPageTIFF(t *testing.T) {
+	t.Parallel()
 	path := requireCorpusFile(t, "tiff/exampletiffs/mri.tif")
 	m := openAndRead(t, path)
 	_ = m // The key invariant is: no panic and no CorruptMetadataError.
@@ -418,12 +439,14 @@ func TestCorpusMultiPageTIFF(t *testing.T) {
 // producing a CorruptMetadataError.
 // Source: drewnoakes/metadata-extractor-images tif/BigTIFF/.
 func TestCorpusBigEndianTIFF(t *testing.T) {
+	t.Parallel()
 	files := []string{
 		"BigTIFFMotorola.tif",
 		"BigTIFFMotorolaLongStrips.tif",
 	}
 	for _, name := range files {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			path := requireCorpusFile(t, filepath.Join("tiff", "metadata-extractor", name))
 			openAndRead(t, path)
 		})
@@ -433,6 +456,7 @@ func TestCorpusBigEndianTIFF(t *testing.T) {
 // TestCorpusBigTIFFVariants reads all BigTIFF files (Intel and Motorola byte
 // order, various offset widths and SubIFD depths) to confirm graceful handling.
 func TestCorpusBigTIFFVariants(t *testing.T) {
+	t.Parallel()
 	files := []string{
 		"BigTIFF.tif",
 		"BigTIFFMotorola.tif",
@@ -444,6 +468,7 @@ func TestCorpusBigTIFFVariants(t *testing.T) {
 	}
 	for _, name := range files {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			p := filepath.Join("testdata", "corpus", "tiff", "metadata-extractor", name)
 			if _, err := os.Stat(p); os.IsNotExist(err) {
 				t.Skipf("file absent: %s", name)
@@ -461,6 +486,7 @@ func TestCorpusBigTIFFVariants(t *testing.T) {
 // (VP8 lossy, VP8L lossless, VP8X extended) plus animated WebP.
 // Source: drewnoakes/metadata-extractor-images webp/.
 func TestCorpusWebPVariants(t *testing.T) {
+	t.Parallel()
 	dir := filepath.Join("testdata", "corpus", "webp", "metadata-extractor")
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		t.Skip("webp/metadata-extractor corpus absent")
@@ -475,6 +501,7 @@ func TestCorpusWebPVariants(t *testing.T) {
 			continue
 		}
 		t.Run(e.Name(), func(t *testing.T) {
+			t.Parallel()
 			path := filepath.Join(dir, e.Name())
 			openAndRead(t, path)
 		})
@@ -489,6 +516,7 @@ func TestCorpusWebPVariants(t *testing.T) {
 // covering Apple HEIC, Nokia HEIC, Sony HEIF, and AVIF.
 // Source: drewnoakes/metadata-extractor-images heif/ and ianare/exif-samples heic/.
 func TestCorpusHEIFVariants(t *testing.T) {
+	t.Parallel()
 	paths := walkCorpusDir(t, "heif")
 	var heifFiles []string
 	for _, p := range paths {
@@ -503,6 +531,7 @@ func TestCorpusHEIFVariants(t *testing.T) {
 
 	for _, path := range heifFiles {
 		t.Run(filepath.Base(path), func(t *testing.T) {
+			t.Parallel()
 			openAndRead(t, path)
 		})
 	}
@@ -516,6 +545,7 @@ func TestCorpusHEIFVariants(t *testing.T) {
 // library (CR2, CR3, NEF, ARW, DNG, ORF, RW2) and verifies they parse
 // without CorruptMetadataError.
 func TestCorpusRawFormatCoverage(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		ext  string
@@ -530,6 +560,7 @@ func TestCorpusRawFormatCoverage(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			dir := filepath.Join("testdata", "corpus", tc.dir)
 			if _, err := os.Stat(dir); os.IsNotExist(err) {
 				t.Skipf("directory absent: %s", tc.dir)
@@ -555,6 +586,7 @@ func TestCorpusRawFormatCoverage(t *testing.T) {
 // formats (Fuji RAF, Minolta MRW, Sigma X3F, Phase One IIQ) return
 // UnsupportedFormatError and do not panic or return CorruptMetadataError.
 func TestCorpusRawGracefulUnsupported(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		file string
@@ -567,6 +599,7 @@ func TestCorpusRawGracefulUnsupported(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			p := filepath.Join("testdata", "corpus", tc.file)
 			if _, err := os.Stat(p); os.IsNotExist(err) {
 				t.Skipf("file absent: %s", tc.file)
@@ -598,6 +631,7 @@ func TestCorpusRawGracefulUnsupported(t *testing.T) {
 // target individual chunk scenarios: eXIf chunk, tEXt/Comment, and no-metadata.
 // Source: Exiv2/exiv2 test/data.
 func TestCorpusPNGEdgeCases(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name     string
 		file     string
@@ -610,6 +644,7 @@ func TestCorpusPNGEdgeCases(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			p := filepath.Join("testdata", "corpus", tc.file)
 			if _, err := os.Stat(p); os.IsNotExist(err) {
 				t.Skipf("file absent: %s", tc.file)
@@ -625,6 +660,7 @@ func TestCorpusPNGEdgeCases(t *testing.T) {
 // TestCorpusPNGInterlaced verifies that interlaced PNG files are handled
 // without error or panic.
 func TestCorpusPNGInterlaced(t *testing.T) {
+	t.Parallel()
 	path := requireCorpusFile(t, "png/metadata-extractor/photoshop-8x12-rgb24-interlaced.png")
 	openAndRead(t, path)
 }
@@ -632,6 +668,7 @@ func TestCorpusPNGInterlaced(t *testing.T) {
 // TestCorpusPNGWithAllMetadata reads a Photoshop-generated PNG that carries
 // EXIF, IPTC, and XMP in a single file.
 func TestCorpusPNGWithAllMetadata(t *testing.T) {
+	t.Parallel()
 	path := requireCorpusFile(t, "png/metadata-extractor/photoshop-8x12-rgb24-all-metadata.png")
 	m := openAndRead(t, path)
 
@@ -649,6 +686,7 @@ func TestCorpusPNGWithAllMetadata(t *testing.T) {
 // corpus are handled gracefully. They are XML documents and will return
 // UnsupportedFormatError (not JPEG/TIFF/PNG containers), which is correct.
 func TestCorpusXMPSidecars(t *testing.T) {
+	t.Parallel()
 	dirs := []string{"xmp/metadata-extractor", "xmp/exiv2", "xmp/exiftool"}
 	for _, d := range dirs {
 		dir := filepath.Join("testdata", "corpus", d)
@@ -661,6 +699,7 @@ func TestCorpusXMPSidecars(t *testing.T) {
 				continue
 			}
 			t.Run(filepath.Join(d, e.Name()), func(t *testing.T) {
+				t.Parallel()
 				path := filepath.Join(dir, e.Name())
 				f, err := os.Open(path)
 				if err != nil {

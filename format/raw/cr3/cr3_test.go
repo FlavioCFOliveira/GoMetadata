@@ -47,6 +47,7 @@ func minimalTIFF() []byte {
 }
 
 func TestExtractEXIF(t *testing.T) {
+	t.Parallel()
 	exif := minimalTIFF()
 	data := buildMinimalCR3(exif, nil)
 
@@ -69,6 +70,7 @@ func TestExtractEXIF(t *testing.T) {
 }
 
 func TestExtractXMP(t *testing.T) {
+	t.Parallel()
 	exif := minimalTIFF()
 	xmp := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta><?xpacket end="w"?>`)
 	data := buildMinimalCR3(exif, xmp)
@@ -86,6 +88,7 @@ func TestExtractXMP(t *testing.T) {
 }
 
 func TestExtractNoMoovReturnsError(t *testing.T) {
+	t.Parallel()
 	// A file with only an ftyp box — no moov.
 	ftyp := make([]byte, 16)
 	binary.BigEndian.PutUint32(ftyp, 16)
@@ -98,6 +101,7 @@ func TestExtractNoMoovReturnsError(t *testing.T) {
 }
 
 func TestExtractTruncatedNoPanic(t *testing.T) {
+	t.Parallel()
 	data := buildMinimalCR3(minimalTIFF(), nil)
 	for i := 0; i < len(data); i += len(data) / 10 {
 		_, _, _, _ = Extract(bytes.NewReader(data[:i]))
@@ -105,6 +109,7 @@ func TestExtractTruncatedNoPanic(t *testing.T) {
 }
 
 func TestInjectEXIFRoundTrip(t *testing.T) {
+	t.Parallel()
 	exif := minimalTIFF()
 	data := buildMinimalCR3(exif, nil)
 
@@ -130,6 +135,7 @@ func TestInjectEXIFRoundTrip(t *testing.T) {
 }
 
 func TestInjectXMPRoundTrip(t *testing.T) {
+	t.Parallel()
 	exif := minimalTIFF()
 	data := buildMinimalCR3(exif, nil)
 
@@ -150,6 +156,7 @@ func TestInjectXMPRoundTrip(t *testing.T) {
 }
 
 func TestInjectPassThroughWhenNoMoov(t *testing.T) {
+	t.Parallel()
 	// Without moov, Inject passes through unchanged.
 	ftyp := make([]byte, 16)
 	binary.BigEndian.PutUint32(ftyp, 16)
@@ -168,6 +175,7 @@ func TestInjectPassThroughWhenNoMoov(t *testing.T) {
 }
 
 func TestInjectUUIDBoxSizeUpdated(t *testing.T) {
+	t.Parallel()
 	exif := minimalTIFF()
 	data := buildMinimalCR3(exif, nil)
 

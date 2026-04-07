@@ -9,6 +9,7 @@ import (
 // written to, returned, and then re-obtained with at least the requested
 // length.
 func TestGetPutRoundtrip(t *testing.T) {
+	t.Parallel()
 	const n = 100
 	p := Get(n)
 	if len(*p) < n {
@@ -34,6 +35,7 @@ func TestGetPutRoundtrip(t *testing.T) {
 // TestGetLargeSlice verifies that Get correctly allocates a new backing array
 // when the pool's default-size buffers are too small.
 func TestGetLargeSlice(t *testing.T) {
+	t.Parallel()
 	const n = 8192
 	p := Get(n)
 	if len(*p) != n {
@@ -45,6 +47,7 @@ func TestGetLargeSlice(t *testing.T) {
 // TestGetDefaultSize verifies that Get(0) returns at least an empty slice
 // without panicking.
 func TestGetDefaultSize(t *testing.T) {
+	t.Parallel()
 	p := Get(0)
 	if p == nil {
 		t.Fatal("Get(0) returned nil pointer")
@@ -55,6 +58,7 @@ func TestGetDefaultSize(t *testing.T) {
 // TestGetExactDefaultSize verifies that Get of the internal defaultSize (4096)
 // is served from the pool without a new allocation path.
 func TestGetExactDefaultSize(t *testing.T) {
+	t.Parallel()
 	p := Get(defaultSize)
 	if len(*p) != defaultSize {
 		t.Fatalf("Get(%d): len = %d, want %d", defaultSize, len(*p), defaultSize)
@@ -64,6 +68,7 @@ func TestGetExactDefaultSize(t *testing.T) {
 
 // TestPutNil verifies that Put(nil) does not panic.
 func TestPutNil(t *testing.T) {
+	t.Parallel()
 	defer func() {
 		if r := recover(); r != nil {
 			t.Fatalf("Put(nil) panicked: %v", r)

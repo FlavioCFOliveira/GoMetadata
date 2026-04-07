@@ -48,6 +48,7 @@ func buildDJIMakerNote(tags []struct {
 }
 
 func TestDJIParserBasic(t *testing.T) {
+	t.Parallel()
 	b := buildDJIMakerNote([]struct {
 		id  uint16
 		typ uint16
@@ -70,6 +71,7 @@ func TestDJIParserBasic(t *testing.T) {
 }
 
 func TestDJIParserTooShort(t *testing.T) {
+	t.Parallel()
 	tags, err := Parser{}.Parse([]byte{0x00})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
