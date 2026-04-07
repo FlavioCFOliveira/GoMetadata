@@ -575,6 +575,35 @@ func (e *EXIF) SetImageSize(width, height uint32) {
 	e.ExifIFD.set(TagPixelYDimension, TypeLong, 1, bh[:])
 }
 
+// decimalToDMSBytes converts a non-negative decimal-degree coordinate to the
+// three RATIONAL pairs [degrees/1, minutes/1, seconds*1e6/1e6] encoded per the
+// EXIF GPS spec (EXIF §4.6.6). Each rational is 8 bytes (two uint32s), so the
+// returned array is 24 bytes total.
+//
+// Extracting this from a closure inside SetGPS eliminates a closure allocation
+// per SetGPS call; order is passed as a parameter instead of captured.
+func decimalToDMSBytes(coord float64, order binary.ByteOrder) [24]byte {
+	coord = math.Abs(coord)
+
+	deg := math.Floor(coord)
+	rem := (coord - deg) * 60
+	mins := math.Floor(rem)
+	sec := (rem - mins) * 60
+
+	// Scale seconds to integer numerator with denominator 1,000,000.
+	const secDenom = uint32(1_000_000)
+	secNum := uint32(math.Round(sec * float64(secDenom)))
+
+	var b [24]byte // 3 rationals × 8 bytes; stack-allocated, no heap escape
+	order.PutUint32(b[0:], uint32(deg))
+	order.PutUint32(b[4:], 1)
+	order.PutUint32(b[8:], uint32(mins))
+	order.PutUint32(b[12:], 1)
+	order.PutUint32(b[16:], secNum)
+	order.PutUint32(b[20:], secDenom)
+	return b
+}
+
 // SetGPS sets the GPS IFD from decimal-degree WGS-84 coordinates.
 // It creates GPSIFD if nil and sets the four mandatory tags:
 //
@@ -596,31 +625,6 @@ func (e *EXIF) SetGPS(lat, lon float64) {
 	// Determine byte order from IFD0 — GPS IFD entries must match the stream.
 	order := e.ifd0ByteOrder()
 
-	// decimalToDMS converts a non-negative decimal-degree value to the three
-	// RATIONAL pairs [degrees/1, minutes/1, seconds*1e6/1e6] encoded per the
-	// EXIF GPS spec (EXIF §4.6.6).  Each rational is 8 bytes (two uint32s).
-	decimalToDMS := func(coord float64) []byte {
-		coord = math.Abs(coord)
-
-		deg := math.Floor(coord)
-		rem := (coord - deg) * 60
-		mins := math.Floor(rem)
-		sec := (rem - mins) * 60
-
-		// Scale seconds to integer numerator with denominator 1,000,000.
-		const secDenom = uint32(1_000_000)
-		secNum := uint32(math.Round(sec * float64(secDenom)))
-
-		b := make([]byte, 24) // 3 rationals × 8 bytes
-		order.PutUint32(b[0:], uint32(deg))
-		order.PutUint32(b[4:], 1)
-		order.PutUint32(b[8:], uint32(mins))
-		order.PutUint32(b[12:], 1)
-		order.PutUint32(b[16:], secNum)
-		order.PutUint32(b[20:], secDenom)
-		return b
-	}
-
 	latRef := "N\x00"
 	if lat < 0 {
 		latRef = "S\x00"
@@ -635,10 +639,15 @@ func (e *EXIF) SetGPS(lat, lon float64) {
 	}
 	gps := e.GPSIFD
 
+	// decimalToDMSBytes returns a [24]byte array (stack-allocated); take a
+	// heap copy for the IFDEntry.Value slice so the entry outlives this call.
+	latDMS := decimalToDMSBytes(lat, order)
+	lonDMS := decimalToDMSBytes(lon, order)
+
 	gps.set(TagGPSLatitudeRef, TypeASCII, 2, []byte(latRef))
-	gps.set(TagGPSLatitude, TypeRational, 3, decimalToDMS(lat))
+	gps.set(TagGPSLatitude, TypeRational, 3, latDMS[:])
 	gps.set(TagGPSLongitudeRef, TypeASCII, 2, []byte(lonRef))
-	gps.set(TagGPSLongitude, TypeRational, 3, decimalToDMS(lon))
+	gps.set(TagGPSLongitude, TypeRational, 3, lonDMS[:])
 
 	// Ensure IFD0 carries a TagGPSIFDPointer entry so encode() will serialise
 	// the GPS IFD and patch the real offset.  Value 0 is a placeholder;

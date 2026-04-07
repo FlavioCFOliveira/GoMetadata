@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/FlavioCFOliveira/GoMetadata/internal/riff"
 )
@@ -104,6 +105,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	}
 
 	body := buildWebPBody(original, rawEXIF, rawXMP)
+	defer webpBufPool.Put(body)
 
 	// Write RIFF header with updated size.
 	totalSize := 4 + body.Len() // "WEBP" + chunks
@@ -121,35 +123,43 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	return nil
 }
 
+// webpBufPool stores reusable *bytes.Buffer values for buildWebPBody.
+// Reusing them avoids a large heap allocation on every Inject call.
+var webpBufPool = sync.Pool{ //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
+	New: func() any { return new(bytes.Buffer) },
+}
+
 // buildWebPBody assembles the RIFF body (everything after the 12-byte RIFF
 // header) from the original file bytes plus the new EXIF and XMP payloads.
 // It rebuilds VP8X flags, preserves all non-metadata chunks in order, and
-// appends EXIF/XMP chunks at the end.
-func buildWebPBody(original, rawEXIF, rawXMP []byte) bytes.Buffer {
+// appends EXIF/XMP chunks at the end. The caller must call webpBufPool.Put on
+// the returned buffer after all writes to w are complete.
+func buildWebPBody(original, rawEXIF, rawXMP []byte) *bytes.Buffer {
 	chunks, origVP8XData := collectOriginalChunks(original)
 
 	hasEXIF := rawEXIF != nil
 	hasXMP := rawXMP != nil
 
-	var body bytes.Buffer
+	body := webpBufPool.Get().(*bytes.Buffer) //nolint:forcetypeassert,revive // webpBufPool.New always stores *bytes.Buffer; pool invariant
+	body.Reset()
 
 	// Write VP8X if needed (EXIF or XMP present, or was already extended).
 	if hasEXIF || hasXMP || origVP8XData != nil {
 		vp8xData := buildVP8XFlags(hasEXIF, hasXMP, origVP8XData)
-		writeRIFFChunk(&body, "VP8X", vp8xData)
+		writeRIFFChunk(body, "VP8X", vp8xData)
 	}
 
 	// Write original image chunks.
 	for _, c := range chunks {
-		writeRIFFChunk(&body, c.id, c.data)
+		writeRIFFChunk(body, c.id, c.data)
 	}
 
 	// Append metadata chunks.
 	if hasEXIF {
-		writeRIFFChunk(&body, "EXIF", rawEXIF)
+		writeRIFFChunk(body, "EXIF", rawEXIF)
 	}
 	if hasXMP {
-		writeRIFFChunk(&body, "XMP ", rawXMP)
+		writeRIFFChunk(body, "XMP ", rawXMP)
 	}
 
 	return body
@@ -221,9 +231,9 @@ func buildVP8XFlags(hasEXIF, hasXMP bool, origVP8XData []byte) []byte {
 
 func writeRIFFChunk(w *bytes.Buffer, id string, data []byte) {
 	w.WriteString(id)
-	sz := make([]byte, 4)
-	binary.LittleEndian.PutUint32(sz, uint32(len(data))) //nolint:gosec // G115: RIFF chunk size bounded by buffer size
-	w.Write(sz)
+	var sz [4]byte
+	binary.LittleEndian.PutUint32(sz[:], uint32(len(data))) //nolint:gosec // G115: RIFF chunk size bounded by buffer size
+	w.Write(sz[:])
 	w.Write(data)
 	if len(data)%2 != 0 {
 		w.WriteByte(0x00)

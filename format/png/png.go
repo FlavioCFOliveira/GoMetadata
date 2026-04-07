@@ -15,9 +15,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"hash/crc32"
 	"io"
 	"sync"
+
+	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 )
 
 // pngSig is the 8-byte PNG file signature (PNG §5.2).
@@ -30,6 +33,12 @@ const xmpKeyword = "XML:com.adobe.xmp"
 // Reusing them via zlib.Resetter avoids the ~32 KB internal decompression-state
 // allocation on every call to zlibDecompress.
 var zlibPool sync.Pool //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
+
+// crc32Pool stores reusable hash.Hash32 values (crc32.NewIEEE return type).
+// Reusing them via Reset avoids a small allocation on every writeChunk call.
+var crc32Pool = sync.Pool{ //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
+	New: func() any { return crc32.NewIEEE() },
+}
 
 // zlibDecompress decompresses a zlib-deflated payload. It gets a reader from
 // zlibPool (or allocates one) and returns it to the pool when done without
@@ -251,10 +260,13 @@ func readChunk(r io.Reader) (chunkType string, data []byte, err error) {
 	chunkType = string(hdr[4:8])
 
 	if length > 0 {
-		data = make([]byte, length)
-		if _, err = io.ReadFull(r, data); err != nil {
+		buf := iobuf.Get(length)
+		if _, err = io.ReadFull(r, (*buf)[:length]); err != nil {
+			iobuf.Put(buf)
 			return "", nil, fmt.Errorf("png: truncated chunk %q: %w", chunkType, err)
 		}
+		data = bytes.Clone((*buf)[:length])
+		iobuf.Put(buf)
 	}
 	// Consume CRC (4 bytes) without verifying.
 	var crc [4]byte
@@ -266,10 +278,10 @@ func readChunk(r io.Reader) (chunkType string, data []byte, err error) {
 
 // writeChunk writes a PNG chunk with a correct CRC-32 checksum (PNG §5.4).
 func writeChunk(w io.Writer, chunkType string, data []byte) error {
-	hdr := make([]byte, 8)
+	var hdr [8]byte
 	binary.BigEndian.PutUint32(hdr[:4], uint32(len(data))) //nolint:gosec // G115: chunk data length bounded by input
 	copy(hdr[4:8], chunkType)
-	if _, err := w.Write(hdr); err != nil {
+	if _, err := w.Write(hdr[:]); err != nil {
 		return fmt.Errorf("png: write chunk header: %w", err)
 	}
 	if len(data) > 0 {
@@ -278,7 +290,9 @@ func writeChunk(w io.Writer, chunkType string, data []byte) error {
 		}
 	}
 	// CRC covers chunk type + chunk data (PNG §5.4).
-	h := crc32.NewIEEE()
+	h := crc32Pool.Get().(hash.Hash32) //nolint:forcetypeassert,revive // crc32Pool.New always stores hash.Hash32; pool invariant
+	h.Reset()
+	defer crc32Pool.Put(h)
 	_, _ = h.Write([]byte(chunkType))
 	_, _ = h.Write(data)
 	var crcB [4]byte

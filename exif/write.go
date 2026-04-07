@@ -2,6 +2,7 @@ package exif
 
 import (
 	"encoding/binary"
+	"sort"
 )
 
 // serialise encodes e to a raw EXIF byte stream beginning with the TIFF
@@ -206,18 +207,17 @@ func computeIFDOffsets(e *EXIF, ifd0Entries, exifIFDEntries []IFDEntry) (exifSta
 // buildExifIFDEntries. Because Value slices point into the stack-allocated
 // [4]byte arrays passed to the build helpers, this is a direct in-place
 // write with no allocation.
+//
+// Entries are sorted by tag (invariant maintained by buildIFD0Entries and
+// buildExifIFDEntries), so binary search locates each pointer in O(log n).
 func patchPointers(ifd0Entries, exifIFDEntries []IFDEntry, order binary.ByteOrder, exifStart, gpsStart, interopStart uint32) {
-	for i := range ifd0Entries {
-		switch ifd0Entries[i].Tag {
-		case TagExifIFDPointer:
-			order.PutUint32(ifd0Entries[i].Value, exifStart)
-		case TagGPSIFDPointer:
-			order.PutUint32(ifd0Entries[i].Value, gpsStart)
+	patchEntry := func(entries []IFDEntry, tag TagID, val uint32) {
+		i := sort.Search(len(entries), func(i int) bool { return entries[i].Tag >= tag })
+		if i < len(entries) && entries[i].Tag == tag {
+			order.PutUint32(entries[i].Value, val)
 		}
 	}
-	for i := range exifIFDEntries {
-		if exifIFDEntries[i].Tag == TagInteropIFDPointer {
-			order.PutUint32(exifIFDEntries[i].Value, interopStart)
-		}
-	}
+	patchEntry(ifd0Entries, TagExifIFDPointer, exifStart)
+	patchEntry(ifd0Entries, TagGPSIFDPointer, gpsStart)
+	patchEntry(exifIFDEntries, TagInteropIFDPointer, interopStart)
 }

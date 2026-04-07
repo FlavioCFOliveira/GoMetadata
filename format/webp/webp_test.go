@@ -161,8 +161,24 @@ func BenchmarkWebPExtract(b *testing.B) {
 	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00}
 	webp := buildWebP(exifData, nil, 0x08, 1920, 1080)
 	b.SetBytes(int64(len(webp)))
+	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
 		_, _, _, _ = Extract(bytes.NewReader(webp))
+	}
+}
+
+// BenchmarkWebPInject measures the full Inject path: rebuild the RIFF body
+// with updated EXIF and XMP chunks using the pooled bytes.Buffer.
+func BenchmarkWebPInject(b *testing.B) {
+	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00}
+	xmpData := []byte("<?xpacket begin='' uid='x'?><x:xmpmeta xmlns:x='adobe:ns:meta/'></x:xmpmeta><?xpacket end='r'?>")
+	webp := buildWebP(exifData, nil, 0x08, 1920, 1080)
+	b.SetBytes(int64(len(webp)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		var out bytes.Buffer
+		_ = Inject(bytes.NewReader(webp), &out, exifData, nil, xmpData)
 	}
 }

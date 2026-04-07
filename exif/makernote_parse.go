@@ -1,6 +1,9 @@
 package exif
 
-import "encoding/binary"
+import (
+	"bytes"
+	"encoding/binary"
+)
 
 // makerNoteParsers maps EXIF Make strings to their MakerNote IFD parser.
 // Each value is a function that takes the raw MakerNote bytes and the parent
@@ -198,7 +201,7 @@ func parseFujifilmMakerNote(b []byte) *IFD {
 	if len(b) < minLen {
 		return nil
 	}
-	if string(b[:8]) != "FUJIFILM" {
+	if !bytes.HasPrefix(b, []byte("FUJIFILM")) {
 		return nil
 	}
 	ifdOffset := binary.LittleEndian.Uint32(b[12:16])
@@ -222,7 +225,7 @@ func parseOlympusMakerNote(b []byte) *IFD {
 	if len(b) < minLen {
 		return nil
 	}
-	if string(b[:8]) != "OLYMPUS\x00" {
+	if !bytes.HasPrefix(b, []byte("OLYMPUS\x00")) {
 		return nil
 	}
 	var order binary.ByteOrder
@@ -285,9 +288,9 @@ func parsePentaxPENTAX(b []byte) *IFD {
 //     Used by older Samsung GX-series and early Pentax DSLRs.
 func parsePentaxMakerNote(b []byte) *IFD {
 	switch {
-	case len(b) >= 8 && string(b[:4]) == "AOC\x00":
+	case len(b) >= 8 && bytes.HasPrefix(b, []byte("AOC\x00")):
 		return parsePentaxAOC(b)
-	case len(b) >= 14 && string(b[:8]) == "PENTAX \x00":
+	case len(b) >= 14 && bytes.HasPrefix(b, []byte("PENTAX \x00")):
 		return parsePentaxPENTAX(b)
 	}
 	return nil
@@ -304,7 +307,7 @@ func parsePanasonicMakerNote(b []byte) *IFD {
 	if len(b) < len(magic)+2 {
 		return nil
 	}
-	if string(b[:len(magic)]) != magic {
+	if !bytes.HasPrefix(b, []byte(magic)) {
 		return nil
 	}
 	ifd, err := traverse(b, 12, binary.LittleEndian)
@@ -399,8 +402,8 @@ func parseSigmaMakerNote(b []byte) *IFD {
 		return nil
 	}
 	switch {
-	case string(b[:8]) == "SIGMA\x00\x00\x00":
-	case string(b[:8]) == "FOVEON\x00\x00":
+	case bytes.HasPrefix(b, []byte("SIGMA\x00\x00\x00")):
+	case bytes.HasPrefix(b, []byte("FOVEON\x00\x00")):
 	default:
 		return nil
 	}

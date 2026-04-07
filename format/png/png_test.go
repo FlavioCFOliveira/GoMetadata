@@ -373,6 +373,7 @@ func BenchmarkPNGExtract(b *testing.B) {
 	xmpData := []byte("<?xpacket begin='' uid='x'?><xmpmeta xmlns:x=\"adobe:ns:meta/\"/><?xpacket end='r'?>")
 	png := buildPNG(exifData, xmpData)
 	b.SetBytes(int64(len(png)))
+	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
 		_, _, _, _ = Extract(bytes.NewReader(png))
@@ -410,8 +411,37 @@ func BenchmarkPNGExtractCompressedXMP(b *testing.B) {
 
 	pngBytes := buf.Bytes()
 	b.SetBytes(int64(len(pngBytes)))
+	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
 		_, _, _, _ = Extract(bytes.NewReader(pngBytes))
+	}
+}
+
+// BenchmarkPNGInject measures the full Inject path: read all chunks, drop
+// old metadata, write new eXIf and iTXt(XMP) chunks with correct CRCs.
+func BenchmarkPNGInject(b *testing.B) {
+	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00}
+	xmpData := []byte("<?xpacket begin='' uid='x'?><xmpmeta xmlns:x=\"adobe:ns:meta/\"/><?xpacket end='r'?>")
+	png := buildPNG(nil, nil)
+	b.SetBytes(int64(len(png)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		var out bytes.Buffer
+		_ = Inject(bytes.NewReader(png), &out, exifData, nil, xmpData)
+	}
+}
+
+// BenchmarkPNGWriteChunk measures the hot inner loop: serialise one PNG chunk
+// (header + data + CRC) using the pooled crc32 hash and stack-allocated header.
+func BenchmarkPNGWriteChunk(b *testing.B) {
+	data := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00}
+	b.SetBytes(int64(8 + len(data) + 4)) // header + data + CRC
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		var out bytes.Buffer
+		_ = writeChunk(&out, "eXIf", data)
 	}
 }

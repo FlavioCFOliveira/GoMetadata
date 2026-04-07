@@ -51,13 +51,24 @@ func decodeCoordinate(entry *IFDEntry) ([3][2]uint32, bool) {
 	return dms, true
 }
 
+// refByte extracts the first byte of a GPS ref entry (e.g. GPSLatitudeRef).
+// Returns (0, false) when the entry is nil or has no value bytes.
+func refByte(entry *IFDEntry) (byte, bool) {
+	if entry == nil || len(entry.Value) == 0 {
+		return 0, false
+	}
+	return entry.Value[0], true
+}
+
 // parseGPS extracts decimal-degree coordinates from a GPS IFD.
 // DMS (degrees/minutes/seconds) values are converted per the EXIF spec
 // (EXIF §4.6.6, GPS tags 0x0002/0x0004).
 func parseGPS(ifd *IFD) (lat, lon float64, ok bool) {
-	latRefEntry := ifd.Get(TagGPSLatitudeRef)
-	lonRefEntry := ifd.Get(TagGPSLongitudeRef)
-	if latRefEntry == nil || lonRefEntry == nil {
+	// Read ref byte directly from Value[0] to avoid the String() call which
+	// allocates a new string and strips NUL bytes (unnecessary for single-char reads).
+	latRef, latRefOK := refByte(ifd.Get(TagGPSLatitudeRef))
+	lonRef, lonRefOK := refByte(ifd.Get(TagGPSLongitudeRef))
+	if !latRefOK || !lonRefOK {
 		return 0, 0, false
 	}
 
@@ -67,8 +78,8 @@ func parseGPS(ifd *IFD) (lat, lon float64, ok bool) {
 		return 0, 0, false
 	}
 
-	lat = dmsToDecimal(latDMS, latRefEntry.String())
-	lon = dmsToDecimal(lonDMS, lonRefEntry.String())
+	lat = dmsToDecimal(latDMS, latRef)
+	lon = dmsToDecimal(lonDMS, lonRef)
 
 	// Validate WGS-84 coordinate ranges (EXIF §4.6.6).
 	if lat < -90 || lat > 90 || lon < -180 || lon > 180 {
@@ -79,8 +90,9 @@ func parseGPS(ifd *IFD) (lat, lon float64, ok bool) {
 }
 
 // dmsToDecimal converts a RATIONAL triplet [degrees, minutes, seconds] to
-// a signed decimal-degree value. ref must be "N", "S", "E", or "W".
-func dmsToDecimal(dms [3][2]uint32, ref string) float64 {
+// a signed decimal-degree value. ref is the first byte of a GPSLatitudeRef or
+// GPSLongitudeRef entry: 'N', 'S', 'E', or 'W' (EXIF §4.6.6).
+func dmsToDecimal(dms [3][2]uint32, ref byte) float64 {
 	// Guard against division by zero in any denominator.
 	if dms[0][1] == 0 || dms[1][1] == 0 || dms[2][1] == 0 {
 		return 0
@@ -92,7 +104,7 @@ func dmsToDecimal(dms [3][2]uint32, ref string) float64 {
 
 	decimal := deg + mins/60 + sec/3600
 
-	if ref == "S" || ref == "W" {
+	if ref == 'S' || ref == 'W' {
 		decimal = -decimal
 	}
 

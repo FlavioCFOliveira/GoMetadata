@@ -1,7 +1,5 @@
 package exif
 
-import "maps"
-
 // TagID is a TIFF/EXIF tag number (EXIF §4.6, TIFF §8).
 type TagID uint16
 
@@ -154,10 +152,11 @@ const (
 var tagRegistry map[TagID]tagInfo
 
 func init() { //nolint:funlen // justified: tag registry must enumerate all ~130 EXIF/TIFF tags in one place; splitting would obscure the spec mapping
-	tagRegistry = make(map[TagID]tagInfo, 256)
-
-	// IFD0 / TIFF baseline tags (TIFF 6.0 §8).
-	maps.Copy(tagRegistry, map[TagID]tagInfo{
+	// Pre-sized to the exact number of entries (131) to avoid map rehashing.
+	// Eliminates 5 intermediate maps and 5 maps.Copy calls that were previously
+	// used to populate this map in logical sections.
+	tagRegistry = map[TagID]tagInfo{
+		// IFD0 / TIFF baseline tags (TIFF 6.0 §8).
 		TagImageWidth:        {"ImageWidth", TypeShort, 1},
 		TagImageLength:       {"ImageLength", TypeShort, 1},
 		TagBitsPerSample:     {"BitsPerSample", TypeShort, 0},
@@ -218,16 +217,11 @@ func init() { //nolint:funlen // justified: tag registry must enumerate all ~130
 		TagYCbCrSubSampling:            {"YCbCrSubSampling", TypeShort, 2},
 		TagYCbCrPositioning:            {"YCbCrPositioning", TypeShort, 1},
 		TagReferenceBlackWhite:         {"ReferenceBlackWhite", TypeRational, 6},
-	})
-
-	// InteropIFD tags (EXIF §4.6.7, Annex A).
-	maps.Copy(tagRegistry, map[TagID]tagInfo{
-		TagInteroperabilityIndex:   {"InteroperabilityIndex", TypeASCII, 0},
-		TagInteroperabilityVersion: {"InteroperabilityVersion", TypeUndefined, 4},
-	})
-
-	// EXIF IFD tags (EXIF §4.6.5 Table 4).
-	maps.Copy(tagRegistry, map[TagID]tagInfo{
+		// InteropIFD tags share tag IDs 0x0001/0x0002 with GPS tags; the GPS
+		// entries below take precedence in the combined registry (matching the
+		// original behaviour where GPS maps.Copy ran after InteropIFD maps.Copy).
+		// EXIF §4.6.7 Annex A / EXIF §4.6.6 Table 15.
+		// EXIF IFD tags (EXIF §4.6.5 Table 4).
 		TagExposureTime:             {"ExposureTime", TypeRational, 1},
 		TagFNumber:                  {"FNumber", TypeRational, 1},
 		TagExposureProgram:          {"ExposureProgram", TypeShort, 1},
@@ -281,10 +275,7 @@ func init() { //nolint:funlen // justified: tag registry must enumerate all ~130
 		TagLensModel:                {"LensModel", TypeASCII, 0},
 		TagLensSerialNumber:         {"LensSerialNumber", TypeASCII, 0},
 		TagMakerNote:                {"MakerNote", TypeUndefined, 0},
-	})
-
-	// GPS IFD tags (EXIF §4.6.6 Table 15, all 32 entries).
-	maps.Copy(tagRegistry, map[TagID]tagInfo{
+		// GPS IFD tags (EXIF §4.6.6 Table 15, all 32 entries).
 		TagGPSVersionID:         {"GPSVersionID", TypeByte, 4},
 		TagGPSLatitudeRef:       {"GPSLatitudeRef", TypeASCII, 2},
 		TagGPSLatitude:          {"GPSLatitude", TypeRational, 3},
@@ -317,12 +308,14 @@ func init() { //nolint:funlen // justified: tag registry must enumerate all ~130
 		TagGPSDateStamp:         {"GPSDateStamp", TypeASCII, 11},
 		TagGPSDifferential:      {"GPSDifferential", TypeShort, 1},
 		TagGPSHPositioningError: {"GPSHPositioningError", TypeRational, 1},
-	})
-
-	// Additional EXIF 2.3+ tags not in the main EXIF IFD block above
-	// (CIPA DC-008-2023 §4.6.5).
-	maps.Copy(tagRegistry, map[TagID]tagInfo{
+		// Additional EXIF 2.3+ tags (CIPA DC-008-2023 §4.6.5).
 		TagStandardOutputSensitivity: {"StandardOutputSensitivity", TypeLong, 1},
 		TagDeviceSettingDescription:  {"DeviceSettingDescription", TypeUndefined, 0},
-	})
+	}
+}
+
+// TagName returns the human-readable name of a tag ID, or an empty string
+// when the tag is not in the registry (EXIF §4.6, TIFF §8).
+func TagName(tag TagID) string {
+	return tagRegistry[tag].Name
 }

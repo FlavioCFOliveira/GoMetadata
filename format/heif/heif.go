@@ -7,6 +7,7 @@
 package heif
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -335,6 +336,7 @@ func readIlocItemID(ilocData []byte, pos int, version uint8) (id uint16, newPos 
 // whether all extents were read without truncation.
 // ISO 14496-12 §8.11.3.
 func readIlocFullExtents(ilocData []byte, pos, extentCount int, info ilocBoxInfo) (extents []ilocExtent, newPos int, ok bool) {
+	extents = make([]ilocExtent, 0, extentCount)
 	for range extentCount {
 		var ext ilocExtent
 		if info.indexSize > 0 {
@@ -785,13 +787,13 @@ func parseInfeV0V1(data []byte, pos int) (uint16, string) {
 	pos += 2
 	pos += 2 // item_protection_index
 	// Skip item_name (NUL-terminated string).
-	nul := indexByte(data[pos:], 0x00)
+	nul := bytes.IndexByte(data[pos:], 0x00)
 	if nul < 0 {
 		return id, ""
 	}
 	pos += nul + 1
 	// Read content_type (NUL-terminated MIME string).
-	nul2 := indexByte(data[pos:], 0x00)
+	nul2 := bytes.IndexByte(data[pos:], 0x00)
 	var contentType string
 	if nul2 >= 0 {
 		contentType = string(data[pos : pos+nul2])
@@ -837,16 +839,6 @@ func parseInfeV2V3(data []byte, pos int, version byte) (uint16, string) {
 	}
 	itemType := string(data[pos : pos+4])
 	return id, itemType
-}
-
-// indexByte returns the index of the first occurrence of b in s, or -1.
-func indexByte(s []byte, b byte) int {
-	for i, v := range s {
-		if v == b {
-			return i
-		}
-	}
-	return -1
 }
 
 // parseIloc parses an 'iloc' box body and returns a map from item ID to location.

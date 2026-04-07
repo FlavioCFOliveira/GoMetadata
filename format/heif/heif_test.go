@@ -398,6 +398,7 @@ func TestInjectPassThroughNilPayloads(t *testing.T) {
 func BenchmarkHEIFExtract(b *testing.B) {
 	data := buildHEIF(minimalTIFFExif(), nil)
 	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
 		_, _, _, _ = Extract(bytes.NewReader(data))

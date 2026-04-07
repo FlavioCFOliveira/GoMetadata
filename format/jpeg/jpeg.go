@@ -77,11 +77,11 @@ func processAPP1Segment(data, rawEXIF, rawXMP []byte, extended map[string][]extC
 	case bytes.HasPrefix(data, identExif):
 		// EXIF payload begins after the 6-byte "Exif\x00\x00" header.
 		// Copy: data aliases scratch and must survive the next readSegment call.
-		rawEXIF = append([]byte(nil), data[len(identExif):]...)
+		rawEXIF = bytes.Clone(data[len(identExif):])
 
 	case bytes.HasPrefix(data, identXMP):
 		// Copy: same reason as rawEXIF.
-		rawXMP = append([]byte(nil), data[len(identXMP):]...)
+		rawXMP = bytes.Clone(data[len(identXMP):])
 
 	case bytes.HasPrefix(data, identXMPNote):
 		// Extended XMP chunk: GUID (32 bytes) + fullLength (4 bytes) +
@@ -93,7 +93,7 @@ func processAPP1Segment(data, rawEXIF, rawXMP []byte, extended map[string][]extC
 			offset := binary.BigEndian.Uint32(body[36:40])
 			_ = fullLen // used only for validation; assembly is offset-driven
 			// Copy chunk data: body aliases scratch and must outlive this loop.
-			chunkData := append([]byte(nil), body[40:]...)
+			chunkData := bytes.Clone(body[40:])
 			// Lazily initialise the map on first encounter.
 			if extended == nil {
 				extended = make(map[string][]extChunk)
@@ -120,7 +120,7 @@ func processAPP13Segment(data []byte) []byte {
 	if irb == nil {
 		return nil
 	}
-	return append([]byte(nil), irb...)
+	return bytes.Clone(irb)
 }
 
 // maybeReassembleXMP returns the reassembled XMP when extended chunks are

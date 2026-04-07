@@ -1,6 +1,7 @@
 package exif
 
 import (
+	"bytes"
 	"cmp"
 	"encoding/binary"
 	"fmt"
@@ -210,12 +211,8 @@ func (e *IFDEntry) String() string {
 	if e.Type != TypeASCII || len(e.Value) == 0 {
 		return ""
 	}
-	// Strip trailing NUL bytes.
-	v := e.Value
-	for len(v) > 0 && v[len(v)-1] == 0 {
-		v = v[:len(v)-1]
-	}
-	return string(v)
+	// bytes.TrimRight avoids a byte-by-byte loop; no allocation (returns a sub-slice).
+	return string(bytes.TrimRight(e.Value, "\x00"))
 }
 
 // Uint16 decodes the first SHORT value.
@@ -331,21 +328,27 @@ func (e *IFDEntry) Len() int {
 // new entry is inherited from the existing entries in the IFD (or defaults
 // to binary.LittleEndian for an empty IFD). Entries are kept sorted by tag
 // so that Get() can use binary search.
+//
+// Insertion uses sort.Search to find the insertion point and slices.Insert to
+// place the new entry in O(n) time instead of re-sorting the whole slice (O(n
+// log n)), making bulk IFD construction O(n²) in the worst case instead of
+// the previous O(n² log n).
 func (ifd *IFD) set(tag TagID, typ DataType, count uint32, value []byte) {
 	order := binary.ByteOrder(binary.LittleEndian)
 	if len(ifd.Entries) > 0 {
 		order = ifd.Entries[0].byteOrder
 	}
 	entry := IFDEntry{Tag: tag, Type: typ, Count: count, Value: value, byteOrder: order}
-	// Replace existing entry in-place (preserves sort order).
+	// Binary search for the insertion point (entries are always sorted by tag).
 	i := sort.Search(len(ifd.Entries), func(i int) bool { return ifd.Entries[i].Tag >= tag })
 	if i < len(ifd.Entries) && ifd.Entries[i].Tag == tag {
+		// Replace existing entry in-place: sort order is preserved.
 		ifd.Entries[i] = entry
 		return
 	}
-	// New tag: append and re-sort to maintain the invariant.
-	ifd.Entries = append(ifd.Entries, entry)
-	sortEntries(ifd.Entries)
+	// New tag: insert at position i to maintain the sorted invariant without a
+	// full re-sort. slices.Insert is O(n) (one memmove) vs. sort O(n log n).
+	ifd.Entries = slices.Insert(ifd.Entries, i, entry)
 }
 
 // asciiValue encodes s as a NUL-terminated ASCII byte slice suitable for
@@ -362,9 +365,28 @@ func asciiValue(s string) []byte {
 // filterEntries returns a copy of ifd.Entries with the given tags removed.
 // All callers pass at most 3 tags, so a linear scan over the exclude slice
 // is cheaper than a map allocation (no heap escape, no hashing overhead).
+//
+// Fast path: when none of the excluded tags are present (checked via binary
+// search) the function still returns a copy because callers append to the
+// result — returning the original slice would corrupt the source IFD.
 func filterEntries(ifd *IFD, exclude ...TagID) []IFDEntry {
 	if ifd == nil {
 		return nil
+	}
+	// Fast path: check whether any excluded tag is actually present before
+	// allocating the filtered result. Binary search is O(log n) per tag.
+	anyPresent := false
+	for _, tag := range exclude {
+		if hasEntry(ifd.Entries, tag) {
+			anyPresent = true
+			break
+		}
+	}
+	if !anyPresent {
+		// No excluded tags present — return a copy (callers may append to result).
+		out := make([]IFDEntry, len(ifd.Entries))
+		copy(out, ifd.Entries)
+		return out
 	}
 	result := make([]IFDEntry, 0, len(ifd.Entries))
 	for _, entry := range ifd.Entries {
@@ -376,13 +398,11 @@ func filterEntries(ifd *IFD, exclude ...TagID) []IFDEntry {
 }
 
 // hasEntry reports whether entries contains an entry with the given tag.
+// Entries must be sorted by tag (invariant maintained by set and traverse).
+// Uses binary search — O(log n), zero allocations.
 func hasEntry(entries []IFDEntry, tag TagID) bool {
-	for _, e := range entries {
-		if e.Tag == tag {
-			return true
-		}
-	}
-	return false
+	i := sort.Search(len(entries), func(i int) bool { return entries[i].Tag >= tag })
+	return i < len(entries) && entries[i].Tag == tag
 }
 
 // sortEntries sorts entries by tag ID in ascending order (TIFF §7 requirement).
