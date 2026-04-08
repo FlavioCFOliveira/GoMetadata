@@ -6,6 +6,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-04-08
+
+### Added
+
+- **SECURITY.md**: fuzz target inventory, supported fuzz targets (`FuzzParseEXIF`, `FuzzParseIPTC`, `FuzzParseXMP`), responsible disclosure process, and the library's security model for parser hardening.
+- **CONTRIBUTING.md**: full contributor guide covering dev environment setup, build and test commands, linter configuration, fuzz testing workflow, and CI pipeline overview.
+- **`examples/copyright-stamp`**: end-to-end example that reads a JPEG, sets copyright and artist metadata via EXIF and XMP, and writes the result back.
+- **`examples/gallery-sidecar`**: example that extracts metadata from any supported image format and writes an XMP sidecar file alongside the original.
+- **`examples/multi-format-roundtrip`**: example demonstrating a full read–modify–write cycle across JPEG, PNG, WebP, HEIF, and RAW formats.
+- **`examples/raw-inspector`**: example that opens RAW files (CR2, CR3, NEF, ARW, DNG, ORF, RW2) and prints all EXIF IFD entries, MakerNote fields, and GPS data.
+- **`examples/stream-transcode`**: example that streams metadata from one image format and injects it into another without loading full pixel data.
+- **`example_test.go`**: runnable Go example functions in the top-level package covering EXIF, IPTC, and XMP reading and writing across all image formats; these serve as both API documentation and tested usage samples.
+
+### Changed
+
+- **README.md**: added an Examples section with code excerpts and links to the full example programs; added benchmark reproduction instructions so contributors can verify performance claims locally.
+- **Test coverage**: expanded from 68% to 88% across all 25 packages. New tests target previously uncovered branches in `exif/makernote` (Canon, DJI, Fujifilm, Leica, Nikon, Olympus, Panasonic, Pentax, Samsung, Sigma, Sony), `format` (HEIF, JPEG, PNG, TIFF, WebP, all RAW variants), `internal` (bmff, iobuf, riff, testutil), `iptc`, `xmp`, and the top-level API (`metadata_convenience_test.go`, `options_test.go`, `read_test.go`).
+
 ## [1.0.3] - 2026-04-07
 
 ### Security
@@ -105,7 +123,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ---
 
-[Unreleased]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.0.2...HEAD
+[Unreleased]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.0.4...HEAD
+[1.0.4]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.0.3...v1.0.4
+[1.0.3]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/FlavioCFOliveira/GoMetadata/releases/tag/v1.0.0

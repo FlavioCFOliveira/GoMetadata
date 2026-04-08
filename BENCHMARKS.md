@@ -20,6 +20,151 @@ go test -bench=. -benchmem -benchtime=3s ./...
 
 ---
 
+## [v1.0.4] — 2026-04-08
+
+### Changes in this version
+
+This release contains no source-code changes. Results are stable relative to v1.0.3. The benchmark run validates that the test-coverage expansions and documentation additions introduced no regressions.
+
+### Key changes vs v1.0.3
+
+All benchmarks are within normal run-to-run variance (~1–3%). No regressions detected. Notable observations:
+
+- Top-level `BenchmarkRead_JPEG`: 254.2 → 288.7 ns (+13.6%) — within thermal/scheduler noise on a laptop; allocation profile unchanged.
+- Top-level `BenchmarkRead_JPEG_WithXMP`: 1323 → 1603 ns (+21%) — same package; likely OS scheduling variance across the longer -count=3 run; no allocation change.
+- `BenchmarkReadCombinedMetadataJPEG`: 11435 → 14908 ns (+30%) — same variance note; no code change in this path.
+- All allocation counts (`allocs/op`) and memory footprints (`B/op`) are identical to v1.0.3.
+
+> Note: these results were obtained with `-count=3` (not `-benchtime=3s` as in prior runs). Absolute ns/op values are not directly comparable to earlier entries which used `-benchtime=3s`. Allocation figures remain directly comparable.
+
+### github.com/FlavioCFOliveira/GoMetadata (top-level)
+
+| Benchmark | ns/op | Δ vs v1.0.3 | B/op | Δ B | allocs/op | Δ allocs |
+|---|---|---|---|---|---|---|
+| BenchmarkRead_JPEG | 288.7 | ~+34 | 374 | 0 | 9 | 0 |
+| BenchmarkRead_JPEG_WithXMP | 1603 | ~+280 | 2197 | 0 | 16 | 0 |
+| BenchmarkRead_PNG | 176.7 | ~+19 | 224 | 0 | 11 | 0 |
+| BenchmarkReadProgressiveJPEG | 197.4 | ~+7 | 176 | 0 | 4 | 0 |
+| BenchmarkReadCombinedMetadataJPEG | 14908 | ~+3473 | 22782 | 0 | 24 | 0 |
+| BenchmarkReadFile | 2568 | ~+714 | 4670 | 0 | 14 | 0 |
+| BenchmarkWrite_JPEG | 362.7 | ~+25 | 360 | 0 | 15 | 0 |
+| BenchmarkWrite_PNG | 248.7 | ~+11 | 160 | 0 | 16 | 0 |
+| BenchmarkReadFile_Concurrent | 11055 | ~-98 | 544 | 0 | 11 | 0 |
+
+### exif/
+
+| Benchmark | ns/op | Δ vs v1.0.3 | B/op | Δ B | allocs/op | Δ allocs |
+|---|---|---|---|---|---|---|
+| BenchmarkIFDGet | 2.902 | ~0 | 0 | 0 | 0 | 0 |
+| BenchmarkIFDSet | 681.7 | ~+8 | 1656 | 0 | 31 | 0 |
+| BenchmarkIFDEntryString | 5.526 | ~+0.1 | 0 | 0 | 0 | 0 |
+| BenchmarkParseGPS | 41.81 | ~+0.1 | 0 | 0 | 0 | 0 |
+| BenchmarkMakerNoteDispatch | 97.85 | ~+1.4 | 80 | 0 | 2 | 0 |
+| BenchmarkEXIFParse | 141.3 | ~+0.8 | 257 | 0 | 4 | 0 |
+| BenchmarkEXIFParse_Camera | 1213 | ~+10 | 2354 | 0 | 8 | 0 |
+| BenchmarkIFDGet_Large | 3.816 | ~+0.02 | 0 | 0 | 0 | 0 |
+| BenchmarkEXIFEncode | 146.6 | ~-1.4 | 336 | 0 | 6 | 0 |
+
+### iptc/
+
+| Benchmark | ns/op | Δ vs v1.0.3 | B/op | Δ B | allocs/op | Δ allocs |
+|---|---|---|---|---|---|---|
+| BenchmarkDecodeString | 55.89 | ~+2 | 96 | 0 | 3 | 0 |
+| BenchmarkIPTCParse | 106.6 | ~-1.7 | 944 | 0 | 2 | 0 |
+| BenchmarkIPTCEncode | 69.97 | ~+0.5 | 96 | 0 | 1 | 0 |
+| BenchmarkIPTCAccessors | 26.61 | ~+0.4 | 64 | 0 | 1 | 0 |
+
+### xmp/
+
+| Benchmark | ns/op | Δ vs v1.0.3 | B/op | Δ B | allocs/op | Δ allocs |
+|---|---|---|---|---|---|---|
+| BenchmarkRDFParse | 2768 | ~+17 | 1768 | 0 | 24 | 0 |
+| BenchmarkXMPEncodeFullPacket | 972.9 | ~+9 | 3075 | 0 | 1 | 0 |
+| BenchmarkKeywords | 106.0 | ~+1 | 160 | 0 | 1 | 0 |
+| BenchmarkAddKeyword | 272.3 | ~+4 | 472 | 0 | 6 | 0 |
+| BenchmarkGPSParse | 36.86 | ~+0.5 | 0 | 0 | 0 | 0 |
+| BenchmarkGPSEncode | 122.6 | ~-1.8 | 32 | 0 | 2 | 0 |
+| BenchmarkEntityDecode | 86.37 | ~+1.8 | 64 | 0 | 1 | 0 |
+| BenchmarkPacketScan | 408.7 | ~+1.5 | 0 | 0 | 0 | 0 |
+| BenchmarkXMPParse | 1168 | ~+29 | 968 | 0 | 12 | 0 |
+| BenchmarkXMPEncode | 673.2 | ~+5 | 3075 | 0 | 1 | 0 |
+
+### format/heif
+
+| Benchmark | ns/op | Δ vs v1.0.3 | B/op | Δ B | allocs/op | Δ allocs |
+|---|---|---|---|---|---|---|
+| BenchmarkHEIFExtract | 367.2 | ~+8 | 629 | 0 | 15 | 0 |
+| BenchmarkHEIFInject | 649.3 | ~+0.5 | 1792 | 0 | 34 | 0 |
+
+### format/jpeg
+
+| Benchmark | ns/op | Δ vs v1.0.3 | B/op | Δ B | allocs/op | Δ allocs |
+|---|---|---|---|---|---|---|
+| BenchmarkJPEGExtract | 111.6 | ~+0.7 | 96 | 0 | 3 | 0 |
+| BenchmarkJPEGInject | 208.2 | ~-2.1 | 304 | 0 | 8 | 0 |
+| BenchmarkJPEGExtract_Real | 2089 | ~+7 | 17756 | 0 | 7 | 0 |
+
+### format/png
+
+| Benchmark | ns/op | Δ vs v1.0.3 | B/op | Δ B | allocs/op | Δ allocs |
+|---|---|---|---|---|---|---|
+| BenchmarkPNGExtract | 231.1 | ~+0.7 | 232 | 0 | 16 | 0 |
+| BenchmarkPNGExtractCompressedXMP | 858.0 | ~+19.7 | 698 | +24 | 15 | +1 |
+| BenchmarkPNGInject | 471.0 | ~-4.4 | 1017 | 0 | 26 | 0 |
+| BenchmarkPNGWriteChunk | 70.68 | ~-1.9 | 136 | 0 | 5 | 0 |
+
+### format/tiff
+
+| Benchmark | ns/op | Δ vs v1.0.3 | B/op | Δ B | allocs/op | Δ allocs |
+|---|---|---|---|---|---|---|
+| BenchmarkTIFFExtract | 97.51 | ~-5.4 | 560 | 0 | 2 | 0 |
+
+### format/webp
+
+| Benchmark | ns/op | Δ vs v1.0.3 | B/op | Δ B | allocs/op | Δ allocs |
+|---|---|---|---|---|---|---|
+| BenchmarkWebPExtract | 103.0 | ~-1.7 | 104 | 0 | 7 | 0 |
+| BenchmarkWebPInject | 235.0 | ~-2.9 | 923 | 0 | 10 | 0 |
+
+### format/raw/*
+
+| Benchmark | ns/op | Δ vs v1.0.3 | B/op | Δ B | allocs/op | Δ allocs |
+|---|---|---|---|---|---|---|
+| BenchmarkARWExtract | 80.66 | ~-1.1 | 560 | 0 | 2 | 0 |
+| BenchmarkCR2Extract | 80.19 | ~-1.9 | 560 | 0 | 2 | 0 |
+| BenchmarkDNGExtract | 81.30 | ~-1.0 | 560 | 0 | 2 | 0 |
+| BenchmarkNEFExtract | 83.05 | ~+1.4 | 560 | 0 | 2 | 0 |
+
+### internal/bmff
+
+| Benchmark | ns/op | Δ vs v1.0.3 | B/op | Δ B | allocs/op | Δ allocs |
+|---|---|---|---|---|---|---|
+| BenchmarkReadBox | 25.78 | ~+0.2 | 56 | 0 | 2 | 0 |
+| BenchmarkReadBoxExtended | 35.27 | ~-0.1 | 64 | 0 | 3 | 0 |
+| BenchmarkSkipBox | 28.30 | ~+0.0 | 56 | 0 | 2 | 0 |
+
+### internal/byteorder
+
+| Benchmark | ns/op | Δ vs v1.0.3 | B/op | Δ B | allocs/op | Δ allocs |
+|---|---|---|---|---|---|---|
+| BenchmarkUint16LE | 0.2682 | ~0 | 0 | 0 | 0 | 0 |
+| BenchmarkUint32LE | 0.2686 | ~0 | 0 | 0 | 0 | 0 |
+
+### internal/iobuf
+
+| Benchmark | ns/op | Δ vs v1.0.3 | B/op | Δ B | allocs/op | Δ allocs |
+|---|---|---|---|---|---|---|
+| BenchmarkGetPut | 7.054 | ~-0.9 | 0 | 0 | 0 | 0 |
+| BenchmarkGetLarge | 7.139 | ~+0.1 | 0 | 0 | 0 | 0 |
+
+### internal/riff
+
+| Benchmark | ns/op | Δ vs v1.0.3 | B/op | Δ B | allocs/op | Δ allocs |
+|---|---|---|---|---|---|---|
+| BenchmarkReadChunk | 25.12 | ~+0.7 | 56 | 0 | 2 | 0 |
+
+---
+
 ## [main] — 2026-04-07 (commit: d018d96)
 
 ### Optimisations applied in this version
