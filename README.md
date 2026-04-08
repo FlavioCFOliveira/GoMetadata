@@ -302,6 +302,41 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 Benchmarks run with `go test -bench=. -benchmem -benchtime=2s ./...` (Go 1.26, macOS, `GOMAXPROCS=10`).  
 All figures are the mean of multiple runs; allocation counts are stable across runs.
 
+### Reproducing the benchmarks
+
+Run the full suite:
+
+```
+go test -bench=. -benchmem -benchtime=2s ./...
+```
+
+Scope to a single package (e.g. the EXIF parser):
+
+```
+go test -bench=. -benchmem -benchtime=2s ./exif/...
+```
+
+Run a single named benchmark:
+
+```
+go test -bench=BenchmarkParseEXIF -benchmem -benchtime=2s ./exif/...
+```
+
+Results vary by machine. The figures in this README were collected on macOS with Go 1.26 and `GOMAXPROCS=10`. Pin `GOMAXPROCS` to make comparisons across machines more meaningful:
+
+```
+GOMAXPROCS=10 go test -bench=. -benchmem -benchtime=2s ./...
+```
+
+For lower noise, run multiple iterations and pipe through [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat):
+
+```
+go install golang.org/x/perf/cmd/benchstat@latest
+go test -bench=. -benchmem -benchtime=2s -count=5 ./... | benchstat /dev/stdin
+```
+
+`benchstat` computes the median and confidence interval across the five runs, which is more reliable than any single measurement.
+
 ### End-to-end read
 
 | Scenario | Time/op | Memory/op | Allocs/op |
