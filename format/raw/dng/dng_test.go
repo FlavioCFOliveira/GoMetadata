@@ -51,6 +51,26 @@ func TestInjectRoundTrip(t *testing.T) {
 	}
 }
 
+// TestExtractError verifies Extract wraps errors with "dng:" prefix.
+func TestExtractError(t *testing.T) {
+	t.Parallel()
+	_, _, _, err := Extract(bytes.NewReader([]byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0}))
+	if err == nil {
+		t.Fatal("expected error for non-TIFF input, got nil")
+	}
+}
+
+// TestInjectError verifies Inject wraps errors with "dng:" prefix.
+func TestInjectError(t *testing.T) {
+	t.Parallel()
+	badData := []byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0}
+	var out bytes.Buffer
+	err := Inject(bytes.NewReader(badData), &out, badData, []byte("iptc"), nil)
+	if err == nil {
+		t.Fatal("expected error for invalid TIFF input with IPTC, got nil")
+	}
+}
+
 // BenchmarkDNGExtract measures the cost of extracting metadata from a minimal
 // TIFF/DNG byte stream.
 func BenchmarkDNGExtract(b *testing.B) {

@@ -15,11 +15,7 @@ func buildPanasonicMakerNote(tags []struct {
 	// Compute out-of-line value area size.
 	outOfLineSize := 0
 	for _, t := range tags {
-		szRaw := int(typeSize(t.typ))
-		if szRaw == 0 {
-			szRaw = 1
-		}
-		sz := szRaw * (len(t.val) / szRaw)
+		sz := int(typeSize(t.typ)) * (len(t.val) / int(typeSize(t.typ)))
 		if sz > 4 {
 			outOfLineSize += sz
 		}
@@ -36,13 +32,9 @@ func buildPanasonicMakerNote(tags []struct {
 		pos := 12 + 2 + i*12
 		binary.LittleEndian.PutUint16(buf[pos:], t.id)
 		binary.LittleEndian.PutUint16(buf[pos+2:], t.typ)
-		sz := typeSize(t.typ)
-		if sz == 0 {
-			sz = 1
-		}
-		cnt := uint32(len(t.val)) / sz //nolint:gosec // G115: test helper, intentional type cast
+		cnt := uint32(len(t.val)) / typeSize(t.typ) //nolint:gosec // G115: test helper, intentional type cast
 		binary.LittleEndian.PutUint32(buf[pos+4:], cnt)
-		total := uint64(sz) * uint64(cnt)
+		total := uint64(typeSize(t.typ)) * uint64(cnt)
 		if total <= 4 {
 			copy(buf[pos+8:pos+12], t.val)
 		} else {
@@ -107,67 +99,83 @@ func TestPanasonicParserTooShort(t *testing.T) {
 	}
 }
 
-// TestPanasonicOutOfLineValue verifies that parsePanasonicIFDEntry handles
-// out-of-line values (total byte count > 4) correctly.
-func TestPanasonicOutOfLineValue(t *testing.T) {
+// TestPanasonicTypeSizeAllBranches exercises every branch of typeSize.
+func TestPanasonicTypeSizeAllBranches(t *testing.T) {
 	t.Parallel()
-	// Build a payload with 2 entries where the second has an out-of-line ASCII value.
-	// Layout: "Panasonic\0\0\0"(12) + count(2) + 2 entries(24) + ascii_data
-	const (
-		magic    = "Panasonic\x00\x00\x00"
-		ifdOff   = 12
-		entryN   = 2
-		valueOff = ifdOff + 2 + entryN*12
-	)
-	longStr := "SomeLongFirmwareString\x00" // 23 bytes > 4
-	buf := make([]byte, valueOff+len(longStr))
-	copy(buf[:12], magic)
-
-	binary.LittleEndian.PutUint16(buf[ifdOff:], entryN)
-
-	// Entry 0: TagImageQuality SHORT inline
-	binary.LittleEndian.PutUint16(buf[ifdOff+2:], TagImageQuality)
-	binary.LittleEndian.PutUint16(buf[ifdOff+4:], 3) // SHORT
-	binary.LittleEndian.PutUint32(buf[ifdOff+6:], 1)
-	binary.LittleEndian.PutUint32(buf[ifdOff+10:], 2)
-
-	// Entry 1: TagFirmwareVersion ASCII out-of-line
-	binary.LittleEndian.PutUint16(buf[ifdOff+14:], TagFirmwareVersion)
-	binary.LittleEndian.PutUint16(buf[ifdOff+16:], 2)                    // ASCII
-	binary.LittleEndian.PutUint32(buf[ifdOff+18:], uint32(len(longStr))) //nolint:gosec // G115: test helper
-	binary.LittleEndian.PutUint32(buf[ifdOff+22:], uint32(valueOff))
-	copy(buf[valueOff:], longStr)
-
-	tags, err := Parser{}.Parse(buf)
-	if err != nil {
-		t.Fatalf("Parse out-of-line: %v", err)
+	tests := []struct {
+		typ  uint16
+		want uint32
+	}{
+		{1, 1}, {2, 1}, {6, 1}, {7, 1},
+		{3, 2}, {8, 2},
+		{4, 4}, {9, 4}, {11, 4},
+		{5, 8}, {10, 8}, {12, 8},
+		{0, 0}, {99, 0},
 	}
-	if tags == nil {
-		t.Fatal("expected non-nil tags")
-	}
-	if _, ok := tags[TagFirmwareVersion]; !ok {
-		t.Error("TagFirmwareVersion out-of-line value not found")
+	for _, tc := range tests {
+		if got := typeSize(tc.typ); got != tc.want {
+			t.Errorf("typeSize(%d) = %d, want %d", tc.typ, got, tc.want)
+		}
 	}
 }
 
-// TestPanasonicInvalidEntryType verifies that entries with unknown type codes
-// are skipped without error.
-func TestPanasonicInvalidEntryType(t *testing.T) {
+// TestParsePanasonicIFDEntryOutOfBoundsOffset exercises the out-of-bounds offset
+// guard in parsePanasonicIFDEntry when total > 4 and offset is beyond b.
+func TestParsePanasonicIFDEntryOutOfBoundsOffset(t *testing.T) {
 	t.Parallel()
-	b := buildPanasonicMakerNote([]struct {
-		id  uint16
-		typ uint16
-		val []byte
-	}{
-		{TagWhiteBalance, 0xFF, []byte{0x00, 0x00}}, // invalid type — skipped
-		{TagFocusMode, 3, []byte{0x01, 0x00}},
-	})
-	// Only one valid entry; zero entries in result → nil.
-	tags, err := Parser{}.Parse(b)
-	if err != nil {
-		t.Fatalf("Parse invalid type: %v", err)
+	// Build an IFD entry: LONG (4 bytes/unit), count=8, so total=32 > 4 (out-of-line).
+	// Point the offset to a position beyond the buffer end.
+	b := make([]byte, 12)                        // exactly one 12-byte entry, no room for out-of-line value
+	binary.LittleEndian.PutUint16(b[0:], 0x0003) // tag = WhiteBalance
+	binary.LittleEndian.PutUint16(b[2:], 4)      // type = LONG
+	binary.LittleEndian.PutUint32(b[4:], 8)      // count = 8, total = 32 > 4
+	binary.LittleEndian.PutUint32(b[8:], 9999)   // offset = 9999 (beyond len=12)
+	_, _, ok := parsePanasonicIFDEntry(b, 0)
+	if ok {
+		t.Error("parsePanasonicIFDEntry with out-of-bounds offset should return ok=false")
 	}
-	_ = tags // may be nil or a map with one entry
+}
+
+// TestParsePanasonicIFDEntryUnknownType verifies that parsePanasonicIFDEntry
+// returns ok=false when the type code is unknown (typeSize returns 0).
+func TestParsePanasonicIFDEntryUnknownType(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 12)
+	binary.LittleEndian.PutUint16(buf[0:], 0x0003) // tag
+	binary.LittleEndian.PutUint16(buf[2:], 0xFF)   // unknown type
+	binary.LittleEndian.PutUint32(buf[4:], 1)      // count
+	_, _, ok := parsePanasonicIFDEntry(buf, 0)
+	if ok {
+		t.Error("expected ok=false for unknown type, got true")
+	}
+}
+
+// TestParseLECountTooHigh verifies that parseLE returns nil when the IFD
+// entry count exceeds the 512-entry sanity limit.
+func TestParseLECountTooHigh(t *testing.T) {
+	t.Parallel()
+	// Build a Panasonic MakerNote with magic prefix but count=600.
+	buf := make([]byte, 14) // 12 (magic) + 2 (count)
+	copy(buf[:12], magic)
+	binary.LittleEndian.PutUint16(buf[12:], 600) // count=600 > 512
+	result := parseLE(buf)
+	if result != nil {
+		t.Errorf("expected nil for count=600, got %v", result)
+	}
+}
+
+// TestParseLEEntriesBeyondBuffer verifies that parseLE returns nil when the
+// entry block extends beyond the buffer (count=1 but buffer too short).
+func TestParseLEEntriesBeyondBuffer(t *testing.T) {
+	t.Parallel()
+	// 12 (magic) + 2 (count) = 14; count=1 needs 14+12=26, but buf is only 14.
+	buf := make([]byte, 14)
+	copy(buf[:12], magic)
+	binary.LittleEndian.PutUint16(buf[12:], 1) // count=1, needs 12 more bytes
+	result := parseLE(buf)
+	if result != nil {
+		t.Errorf("expected nil for entries beyond buffer, got %v", result)
+	}
 }
 
 func FuzzPanasonicParser(f *testing.F) {

@@ -164,7 +164,7 @@ func parseType3(tiff []byte) map[uint16][]byte {
 		return nil
 	}
 
-	ifdOff := readU32(tiff[4:], bigEndian)
+	ifdOff := readU32(tiff[4:], bigEndian) //nolint:gosec // G602: len(tiff) >= 8 guaranteed by guard above
 	return parseIFDAt(tiff, int(ifdOff), bigEndian)
 }
 

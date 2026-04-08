@@ -168,6 +168,92 @@ func BenchmarkWebPExtract(b *testing.B) {
 	}
 }
 
+// TestExtractNotWebP verifies that Extract returns ErrNotWebP for a non-WebP file.
+func TestExtractNotWebP(t *testing.T) {
+	t.Parallel()
+	notWebP := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00, 0x01}
+	_, _, _, err := Extract(bytes.NewReader(notWebP))
+	if err == nil {
+		t.Error("Extract: expected ErrNotWebP, got nil")
+	}
+}
+
+// TestExtractTooShort verifies that Extract returns an error on too-short input.
+func TestExtractTooShort(t *testing.T) {
+	t.Parallel()
+	_, _, _, err := Extract(bytes.NewReader([]byte{0x52, 0x49, 0x46, 0x46})) // just "RIFF"
+	if err == nil {
+		t.Error("Extract: expected error for too-short input, got nil")
+	}
+}
+
+// TestInjectTooShort verifies that Inject returns ErrFileTooShort for <12 bytes.
+func TestInjectTooShort(t *testing.T) {
+	t.Parallel()
+	var out bytes.Buffer
+	err := Inject(bytes.NewReader([]byte{0x01, 0x02}), &out, nil, nil, nil)
+	if err == nil {
+		t.Error("Inject: expected ErrFileTooShort, got nil")
+	}
+}
+
+// TestReadPaddedChunkOddSize verifies that readPaddedChunk correctly advances
+// past the odd-size padding byte (RIFF spec).
+func TestReadPaddedChunkOddSize(t *testing.T) {
+	t.Parallel()
+	// Build a WebP with an odd-sized EXIF chunk (5 bytes).
+	oddExif := []byte{0x49, 0x49, 0x2A, 0x00, 0x08} // 5 bytes — odd
+
+	var body bytes.Buffer
+	// Manually write VP8X chunk (10 bytes, even).
+	vp8xPayload := make([]byte, 10)
+	binary.LittleEndian.PutUint32(vp8xPayload[0:], 0x08) // EXIF flag
+	writeRIFFChunk(&body, "VP8X", vp8xPayload)
+
+	// Write EXIF chunk with odd size — RIFF padding byte follows.
+	chunkHdr := make([]byte, 8)
+	copy(chunkHdr[:4], "EXIF")
+	binary.LittleEndian.PutUint32(chunkHdr[4:], uint32(len(oddExif))) //nolint:gosec // G115: safe test helper
+	body.Write(chunkHdr)
+	body.Write(oddExif)
+	body.WriteByte(0x00) // padding byte
+
+	totalSize := 4 + body.Len()
+	riffHdr := make([]byte, 12)
+	copy(riffHdr[:4], "RIFF")
+	binary.LittleEndian.PutUint32(riffHdr[4:], uint32(totalSize)) //nolint:gosec // G115: safe test helper
+	copy(riffHdr[8:], "WEBP")
+
+	var buf bytes.Buffer
+	buf.Write(riffHdr)
+	buf.Write(body.Bytes())
+
+	rawEXIF, _, _, err := Extract(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("Extract with odd-size EXIF: %v", err)
+	}
+	if !bytes.Equal(rawEXIF, oddExif) {
+		t.Errorf("EXIF: got %v, want %v", rawEXIF, oddExif)
+	}
+}
+
+// TestBuildVP8XFlagsNoOriginal verifies that buildVP8XFlags sets flags correctly
+// when there is no original VP8X chunk (origVP8XData is nil).
+func TestBuildVP8XFlagsNoOriginal(t *testing.T) {
+	t.Parallel()
+	flags := buildVP8XFlags(true, true, nil)
+	if len(flags) < 4 {
+		t.Fatal("buildVP8XFlags returned too few bytes")
+	}
+	f := binary.LittleEndian.Uint32(flags[0:4])
+	if f&0x08 == 0 {
+		t.Error("EXIF flag (bit 3) not set")
+	}
+	if f&0x04 == 0 {
+		t.Error("XMP flag (bit 2) not set")
+	}
+}
+
 // BenchmarkWebPInject measures the full Inject path: rebuild the RIFF body
 // with updated EXIF and XMP chunks using the pooled bytes.Buffer.
 func BenchmarkWebPInject(b *testing.B) {

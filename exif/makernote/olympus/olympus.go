@@ -174,7 +174,7 @@ func (Parser) Parse(b []byte) (map[uint16][]byte, error) {
 // bigEndian controls byte order for all multi-byte reads.
 // All value offsets are relative to b[0].
 // Returns nil if the IFD is malformed or out-of-bounds.
-func parseIFDAt(b []byte, offset int, bigEndian bool) map[uint16][]byte {
+func parseIFDAt(b []byte, offset int, bigEndian bool) map[uint16][]byte { //nolint:unparam // offset is kept for API clarity
 	if offset < 0 || offset+2 > len(b) {
 		return nil
 	}

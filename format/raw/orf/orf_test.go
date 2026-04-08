@@ -325,3 +325,27 @@ func TestExtractTIFFTagsOOBValueOffset(t *testing.T) {
 		t.Errorf("rawIPTC = %v, want nil for OOB value offset", rawIPTC)
 	}
 }
+
+// TestExtractTooShortReturnsMagicOnly verifies that when an ORF file is valid
+// (has correct magic) but too short to contain a full TIFF header (< 8 bytes),
+// Extract returns the patched bytes as rawEXIF with no IPTC/XMP.
+func TestExtractTooShortReturnsMagicOnly(t *testing.T) {
+	t.Parallel()
+	// Build a 6-byte ORF: 4-byte magic + 2 bytes — valid magic but too short for IFD.
+	data := make([]byte, 6)
+	copy(data[:4], orfMagic)
+
+	rawEXIF, rawIPTC, rawXMP, err := Extract(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("Extract too-short ORF: unexpected error: %v", err)
+	}
+	if rawEXIF == nil {
+		t.Error("rawEXIF should be non-nil even for short ORF")
+	}
+	if rawIPTC != nil {
+		t.Errorf("rawIPTC = %v, want nil for short ORF", rawIPTC)
+	}
+	if rawXMP != nil {
+		t.Errorf("rawXMP = %v, want nil for short ORF", rawXMP)
+	}
+}

@@ -105,7 +105,7 @@ func getExifIFDOffset(cmt1 []byte) uint32 {
 	default:
 		return 0
 	}
-	ifd0Off := order.Uint32(cmt1[4:8])
+	ifd0Off := order.Uint32(cmt1[4:8]) //nolint:gosec // G602: len(cmt1) >= 8 guaranteed by guard above
 	return findExifIFDOffset(cmt1, ifd0Off, order)
 }
 

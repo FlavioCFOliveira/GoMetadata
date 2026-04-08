@@ -110,6 +110,43 @@ func TestGetPutRace(t *testing.T) {
 	wg.Wait()
 }
 
+// TestGetLargePoolItemTooSmall forces the cap(*p) < n branch in the large-pool
+// path by Put-ting a small buffer into the large pool directly, then calling
+// Get with a size that exceeds defaultSize but also exceeds the put buffer's cap.
+func TestGetLargePoolItemTooSmall(t *testing.T) {
+	t.Parallel()
+	// Put a tiny buffer into the large pool so the next Get from largePool
+	// receives a buffer whose cap is less than the requested size.
+	tiny := make([]byte, 1)
+	largePool.Put(&tiny)
+
+	// Request a buffer larger than defaultSize — this will drain largePool,
+	// get the tiny buffer, and detect cap(*p) < n, triggering a new allocation.
+	n := defaultSize + 100
+	p := Get(n)
+	if len(*p) < n {
+		t.Errorf("Get(%d): len = %d, want >= %d", n, len(*p), n)
+	}
+	Put(p)
+}
+
+// TestGetSmallPoolItemTooSmall forces the cap(*p) < n branch in the small-pool
+// path by Put-ting a zero-capacity buffer into the small pool, then calling Get.
+func TestGetSmallPoolItemTooSmall(t *testing.T) {
+	t.Parallel()
+	// Put a zero-byte slice into the small pool.
+	empty := make([]byte, 0)
+	pool.Put(&empty)
+
+	// Request a non-zero size — pool returns &empty (cap=0 < n), triggering alloc.
+	n := 512
+	p := Get(n)
+	if len(*p) < n {
+		t.Errorf("Get(%d): len = %d, want >= %d", n, len(*p), n)
+	}
+	Put(p)
+}
+
 // BenchmarkGetPut measures the overhead of a Get/Put pair on the hot path.
 func BenchmarkGetPut(b *testing.B) {
 	b.ReportAllocs()

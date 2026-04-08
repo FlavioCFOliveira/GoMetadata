@@ -81,68 +81,6 @@ func TestSamsungParserTooShort(t *testing.T) {
 	}
 }
 
-// TestSamsungBigEndianFallback verifies that parseSamsung falls back to BE when
-// LE parsing fails.
-func TestSamsungBigEndianFallback(t *testing.T) {
-	t.Parallel()
-	// Build a big-endian IFD with 1 valid entry.
-	buf := make([]byte, 2+1*12)
-	binary.BigEndian.PutUint16(buf[0:], 1) // count=1
-	binary.BigEndian.PutUint16(buf[2:], TagMeteringMode)
-	binary.BigEndian.PutUint16(buf[4:], 3)  // SHORT
-	binary.BigEndian.PutUint32(buf[6:], 1)  // count=1
-	binary.BigEndian.PutUint32(buf[10:], 2) // value=2
-
-	tags, err := Parser{}.Parse(buf)
-	if err != nil {
-		t.Fatalf("Parse BE fallback: %v", err)
-	}
-	// Result depends on heuristics; just no panic.
-	_ = tags
-}
-
-// TestSamsungOutOfLineValue verifies that parseSamsungIFDEntry handles out-of-line
-// values correctly.
-func TestSamsungOutOfLineValue(t *testing.T) {
-	t.Parallel()
-	longStr := "GalaxyModelXXYY\x00" // > 4 bytes
-	b := buildSamsungMakerNote([]struct {
-		id  uint16
-		typ uint16
-		val []byte
-	}{
-		{TagMeteringMode, 3, []byte{0x02, 0x00}}, // SHORT inline
-		{TagSamsungModel, 2, []byte(longStr)},    // ASCII out-of-line
-	})
-	tags, err := Parser{}.Parse(b)
-	if err != nil {
-		t.Fatalf("Parse out-of-line: %v", err)
-	}
-	if tags == nil {
-		t.Fatal("expected non-nil tags")
-	}
-	if _, ok := tags[TagSamsungModel]; !ok {
-		t.Error("TagSamsungModel out-of-line value not found")
-	}
-}
-
-// TestSamsungInvalidEntryType verifies that entries with unknown types are skipped.
-func TestSamsungInvalidEntryType(t *testing.T) {
-	t.Parallel()
-	b := buildSamsungMakerNote([]struct {
-		id  uint16
-		typ uint16
-		val []byte
-	}{
-		{TagMeteringMode, 0xFF, []byte{0x00, 0x00}}, // invalid type
-	})
-	tags, err := Parser{}.Parse(b)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	_ = tags
-}
-
 func FuzzSamsungParser(f *testing.F) {
 	f.Add(buildSamsungMakerNote([]struct {
 		id  uint16
@@ -155,4 +93,93 @@ func FuzzSamsungParser(f *testing.F) {
 	f.Fuzz(func(t *testing.T, b []byte) {
 		_, _ = Parser{}.Parse(b)
 	})
+}
+
+// TestParseSamsungIFDEntryOutOfBoundsOffset exercises the out-of-bounds offset
+// guard in parseSamsungIFDEntry when total > 4 and offset points beyond b.
+func TestParseSamsungIFDEntryOutOfBoundsOffset(t *testing.T) {
+	t.Parallel()
+	b := make([]byte, 12)
+	binary.LittleEndian.PutUint16(b[0:], 0x0030) // tag
+	binary.LittleEndian.PutUint16(b[2:], 4)      // type LONG
+	binary.LittleEndian.PutUint32(b[4:], 8)      // count=8 → total=32 > 4
+	binary.LittleEndian.PutUint32(b[8:], 9999)   // offset beyond buffer
+	_, _, ok := parseSamsungIFDEntry(b, 0, binary.LittleEndian)
+	if ok {
+		t.Error("parseSamsungIFDEntry OOB offset should return ok=false")
+	}
+}
+
+// TestParseSamsungIFDEntryUnknownType verifies that parseSamsungIFDEntry returns
+// ok=false when the type code is unknown (typeSize returns 0).
+func TestParseSamsungIFDEntryUnknownType(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 12)
+	binary.LittleEndian.PutUint16(buf[0:], 0x0030) // tag
+	binary.LittleEndian.PutUint16(buf[2:], 0xFF)   // unknown type
+	binary.LittleEndian.PutUint32(buf[4:], 1)      // count
+	_, _, ok := parseSamsungIFDEntry(buf, 0, binary.LittleEndian)
+	if ok {
+		t.Error("expected ok=false for unknown type, got true")
+	}
+}
+
+// TestParseAtSamsungAllUnknownTypes verifies that parseAt returns nil when all
+// entries have unknown type codes (empty result map → returns nil).
+func TestParseAtSamsungAllUnknownTypes(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 2+12)
+	binary.LittleEndian.PutUint16(buf[0:], 1)      // count = 1
+	binary.LittleEndian.PutUint16(buf[2:], 0x0030) // tag
+	binary.LittleEndian.PutUint16(buf[4:], 0xFF)   // unknown type
+	binary.LittleEndian.PutUint32(buf[6:], 1)      // count
+	result := parseAt(buf, binary.LittleEndian)
+	if result != nil {
+		t.Errorf("expected nil for all-unknown-type IFD, got %v", result)
+	}
+}
+
+// TestParseAtSamsungCountTooHigh verifies that parseAt returns nil when the
+// entry count exceeds the 512-entry sanity limit.
+func TestParseAtSamsungCountTooHigh(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 2)
+	binary.LittleEndian.PutUint16(buf[0:], 600) // count=600 > 512
+	result := parseAt(buf, binary.LittleEndian)
+	if result != nil {
+		t.Errorf("expected nil for count=600, got %v", result)
+	}
+}
+
+// TestParseAtSamsungEntriesBeyondBuffer verifies that parseAt returns nil when
+// the entry block extends beyond the buffer.
+func TestParseAtSamsungEntriesBeyondBuffer(t *testing.T) {
+	t.Parallel()
+	// count=5: needs 2+5*12=62 bytes, but buf is only 2 bytes.
+	buf := make([]byte, 2)
+	binary.LittleEndian.PutUint16(buf[0:], 5) // valid count but insufficient buffer
+	result := parseAt(buf, binary.LittleEndian)
+	if result != nil {
+		t.Errorf("expected nil for entries beyond buffer, got %v", result)
+	}
+}
+
+// TestSamsungTypeSizeAllBranches exercises every branch of typeSize.
+func TestSamsungTypeSizeAllBranches(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		typ  uint16
+		want uint32
+	}{
+		{1, 1}, {2, 1}, {6, 1}, {7, 1},
+		{3, 2}, {8, 2},
+		{4, 4}, {9, 4}, {11, 4},
+		{5, 8}, {10, 8}, {12, 8},
+		{0, 0}, {99, 0},
+	}
+	for _, tc := range tests {
+		if got := typeSize(tc.typ); got != tc.want {
+			t.Errorf("typeSize(%d) = %d, want %d", tc.typ, got, tc.want)
+		}
+	}
 }

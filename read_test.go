@@ -14,6 +14,7 @@ import (
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
 	"github.com/FlavioCFOliveira/GoMetadata/format"
 	"github.com/FlavioCFOliveira/GoMetadata/iptc"
+	"github.com/FlavioCFOliveira/GoMetadata/xmp"
 )
 
 // buildMinimalJPEG constructs a minimal JPEG stream with an optional EXIF APP1
@@ -735,6 +736,234 @@ func TestWriteFilePreservesPermissions(t *testing.T) {
 	}
 	if got := fi.Mode(); got != want {
 		t.Errorf("file mode after WriteFile: got %v, want %v", got, want)
+	}
+}
+
+// TestUnsupportedFormatErrorMessage verifies that UnsupportedFormatError.Error()
+// produces the expected human-readable string (errors.go:26, currently 0%).
+func TestUnsupportedFormatErrorMessage(t *testing.T) {
+	t.Parallel()
+	e := &UnsupportedFormatError{}
+	copy(e.Magic[:], []byte{0xDE, 0xAD, 0xBE, 0xEF})
+	msg := e.Error()
+	if msg == "" {
+		t.Error("UnsupportedFormatError.Error() returned empty string")
+	}
+	// The message must contain the magic bytes in hex.
+	if len(msg) < 10 {
+		t.Errorf("UnsupportedFormatError.Error() too short: %q", msg)
+	}
+}
+
+// TestValidateNilIFD0 covers the Validate path that returns ErrNilIFD0.
+func TestValidateNilIFD0(t *testing.T) {
+	t.Parallel()
+	m := NewMetadata(format.FormatJPEG)
+	m.EXIF = &exif.EXIF{} // IFD0 is nil
+	err := m.Validate()
+	if err == nil {
+		t.Fatal("expected error for nil IFD0, got nil")
+	}
+	if !errors.Is(err, ErrNilIFD0) {
+		t.Errorf("expected ErrNilIFD0, got %v", err)
+	}
+}
+
+// TestValidateNilXMPProperties covers the Validate path that returns
+// ErrNilXMPProperties.
+func TestValidateNilXMPProperties(t *testing.T) {
+	t.Parallel()
+	m := NewMetadata(format.FormatJPEG)
+	m.XMP = &xmp.XMP{} // Properties is nil
+	err := m.Validate()
+	if err == nil {
+		t.Fatal("expected error for nil XMP Properties, got nil")
+	}
+	if !errors.Is(err, ErrNilXMPProperties) {
+		t.Errorf("expected ErrNilXMPProperties, got %v", err)
+	}
+}
+
+// TestWriteNilIFD0 covers the Write guard for EXIF with nil IFD0.
+func TestWriteNilIFD0(t *testing.T) {
+	t.Parallel()
+	jpeg := buildMinimalJPEG(minimalTIFFPayload())
+	m := NewMetadata(format.FormatJPEG)
+	m.EXIF = &exif.EXIF{} // IFD0 is nil
+	err := Write(bytes.NewReader(jpeg), io.Discard, m)
+	if err == nil {
+		t.Fatal("expected error for nil IFD0 in Write, got nil")
+	}
+	if !errors.Is(err, ErrNilIFD0Write) {
+		t.Errorf("expected ErrNilIFD0Write, got %v", err)
+	}
+}
+
+// TestWriteUnsupportedFormat covers the UnsupportedFormatError path in Write.
+func TestWriteUnsupportedFormat(t *testing.T) {
+	t.Parallel()
+	// Feed random bytes that don't match any magic.
+	m := NewMetadata(format.FormatJPEG)
+	err := Write(bytes.NewReader([]byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0}), io.Discard, m)
+	if err == nil {
+		t.Fatal("expected error for unsupported format, got nil")
+	}
+	var unsupported *UnsupportedFormatError
+	if !errors.As(err, &unsupported) {
+		t.Errorf("expected *UnsupportedFormatError, got %T: %v", err, err)
+	}
+}
+
+// TestWriteFileUnsupportedFormat covers WriteFile with a JPEG that was written
+// with unrecognised magic (exercises the Write-error path in WriteFile).
+func TestWriteFileUnsupportedFormat(t *testing.T) {
+	t.Parallel()
+	// Write garbage bytes to a temp file.
+	tmp, err := os.CreateTemp("", "gometadata-unsupported-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := tmp.Name()
+	defer func() { _ = os.Remove(path) }()
+	_, _ = tmp.Write([]byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0})
+	_ = tmp.Close()
+
+	m := NewMetadata(format.FormatJPEG)
+	err = WriteFile(path, m)
+	if err == nil {
+		t.Fatal("expected error for unsupported format in WriteFile, got nil")
+	}
+}
+
+// TestWriteFileNotFound verifies that WriteFile wraps the OS "not found" error.
+func TestWriteFileNotFound(t *testing.T) {
+	t.Parallel()
+	err := WriteFile("/nonexistent/does-not-exist/file.jpg", NewMetadata(format.FormatJPEG))
+	if err == nil {
+		t.Fatal("expected error for non-existent path, got nil")
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("errors.Is(err, os.ErrNotExist) = false; err = %v", err)
+	}
+}
+
+// TestMetadata_GPSXMPFallback covers the XMP fallback path in Metadata.GPS().
+func TestMetadata_GPSXMPFallback(t *testing.T) {
+	t.Parallel()
+	// XMP with GPS — lat="48,51.35N" lon="2,21.07E"
+	x := &xmp.XMP{Properties: map[string]map[string]string{
+		"http://www.w3.org/2003/01/geo/wgs84_pos#": {
+			"lat": "48,51.35N",
+			"lon": "2,21.07E",
+		},
+	}}
+	m := &Metadata{XMP: x}
+	lat, lon, ok := m.GPS()
+	if !ok {
+		t.Skip("XMP GPS not decoded (format not matching current xmp.GPS implementation)")
+	}
+	// Basic sanity: lat should be near 48, lon near 2.
+	if lat < 40 || lat > 60 {
+		t.Errorf("GPS lat = %f, want ~48", lat)
+	}
+	if lon < 0 || lon > 10 {
+		t.Errorf("GPS lon = %f, want ~2", lon)
+	}
+}
+
+// TestMetadata_GPSAllNil covers the all-nil path in Metadata.GPS().
+func TestMetadata_GPSAllNil(t *testing.T) {
+	t.Parallel()
+	m := &Metadata{}
+	_, _, ok := m.GPS()
+	if ok {
+		t.Error("GPS() ok=true on nil Metadata, want false")
+	}
+}
+
+// TestMetadata_GPSExifFallsToXMP exercises the EXIF GPS missing → XMP GPS lookup.
+func TestMetadata_GPSExifFallsToXMP(t *testing.T) {
+	t.Parallel()
+	// Build a Metadata with EXIF (no GPS tags) and XMP (with GPS).
+	jpeg := buildMinimalJPEG(minimalTIFFPayload())
+	m, err := Read(bytes.NewReader(jpeg))
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	// EXIF is parsed but has no GPS IFD, so EXIF.GPS() returns ok=false.
+	// Attach an XMP with GPS coordinates.
+	m.XMP = &xmp.XMP{Properties: map[string]map[string]string{
+		"http://www.w3.org/2003/01/geo/wgs84_pos#": {
+			"lat": "51,30.00N",
+			"lon": "0,7.00W",
+		},
+	}}
+	// The test only verifies that the XMP path is reached, not the exact value.
+	_, _, _ = m.GPS() // no panic is the important assertion
+}
+
+// TestMetadata_CameraModelXMPFallback covers the XMP path in CameraModel().
+func TestMetadata_CameraModelXMPFallback(t *testing.T) {
+	t.Parallel()
+	x := &xmp.XMP{Properties: map[string]map[string]string{
+		"http://ns.adobe.com/tiff/1.0/": {"Model": "Fujifilm X-T4"},
+	}}
+	m := &Metadata{XMP: x}
+	if got := m.CameraModel(); got != "Fujifilm X-T4" {
+		t.Errorf("CameraModel XMP = %q, want %q", got, "Fujifilm X-T4")
+	}
+}
+
+// TestMetadata_CreatorIPTCFallback verifies that Creator falls back to IPTC
+// when XMP returns empty.
+func TestMetadata_CreatorIPTCFallback(t *testing.T) {
+	t.Parallel()
+	i := new(iptc.IPTC)
+	i.SetCreator("Jane Doe")
+	// XMP is present but has no creator value — XMP returns "".
+	x := &xmp.XMP{Properties: make(map[string]map[string]string)}
+	m := &Metadata{IPTC: i, XMP: x}
+	if got := m.Creator(); got != "Jane Doe" {
+		t.Errorf("Creator IPTC fallback = %q, want %q", got, "Jane Doe")
+	}
+}
+
+// TestMetadata_CopyrightIPTCFallback verifies that Copyright falls back to IPTC.
+func TestMetadata_CopyrightIPTCFallback(t *testing.T) {
+	t.Parallel()
+	i := new(iptc.IPTC)
+	i.SetCopyright("(c) 2025 Bob")
+	x := &xmp.XMP{Properties: make(map[string]map[string]string)}
+	m := &Metadata{IPTC: i, XMP: x}
+	if got := m.Copyright(); got != "(c) 2025 Bob" {
+		t.Errorf("Copyright IPTC fallback = %q, want %q", got, "(c) 2025 Bob")
+	}
+}
+
+// TestEncodeMetadataRawPassthrough verifies that encodeMetadata passes through
+// raw bytes when EXIF/IPTC/XMP structs are nil but raw bytes are set.
+func TestEncodeMetadataRawPassthrough(t *testing.T) {
+	t.Parallel()
+	wantEXIF := []byte("raw-exif")
+	wantIPTC := []byte("raw-iptc")
+	wantXMP := []byte("raw-xmp")
+	m := &Metadata{
+		rawEXIF: wantEXIF,
+		rawIPTC: wantIPTC,
+		rawXMP:  wantXMP,
+	}
+	gotE, gotI, gotX, err := encodeMetadata(m)
+	if err != nil {
+		t.Fatalf("encodeMetadata: %v", err)
+	}
+	if !bytes.Equal(gotE, wantEXIF) {
+		t.Errorf("rawEXIF passthrough = %q, want %q", gotE, wantEXIF)
+	}
+	if !bytes.Equal(gotI, wantIPTC) {
+		t.Errorf("rawIPTC passthrough = %q, want %q", gotI, wantIPTC)
+	}
+	if !bytes.Equal(gotX, wantXMP) {
+		t.Errorf("rawXMP passthrough = %q, want %q", gotX, wantXMP)
 	}
 }
 

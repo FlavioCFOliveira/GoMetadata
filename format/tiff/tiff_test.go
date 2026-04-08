@@ -422,3 +422,143 @@ func TestUnknownTypeTagRoundTrip(t *testing.T) {
 		t.Errorf("4-byte IFD field after round-trip = %x, want %x", entry.Value, sentinel)
 	}
 }
+
+// TestByteOrderBigEndian verifies that byteOrder returns binary.BigEndian for
+// a "MM" byte-order marker (big-endian TIFF).
+func TestByteOrderBigEndian(t *testing.T) {
+	t.Parallel()
+	data := buildMinimalTIFF(binary.BigEndian, nil, nil)
+	order, err := byteOrder(data)
+	if err != nil {
+		t.Fatalf("byteOrder: %v", err)
+	}
+	if order != binary.BigEndian {
+		t.Errorf("byteOrder: got %v, want BigEndian", order)
+	}
+}
+
+// TestByteOrderInvalid verifies that byteOrder returns an error for an unrecognised
+// byte-order marker (e.g., "XX").
+func TestByteOrderInvalid(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 8)
+	buf[0], buf[1] = 'X', 'X'
+	_, err := byteOrder(buf)
+	if err == nil {
+		t.Error("expected error for invalid byte-order marker, got nil")
+	}
+}
+
+// TestTypeSizeAllBranches exercises every branch of typeSize, including
+// the zero-return for unknown types.
+func TestTypeSizeAllBranches(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		typ  uint16
+		want uint32
+	}{
+		// 1-byte types
+		{1, 1}, // BYTE
+		{2, 1}, // ASCII
+		{6, 1}, // SBYTE
+		{7, 1}, // UNDEFINED
+		// 2-byte types
+		{3, 2}, // SHORT
+		{8, 2}, // SSHORT
+		// 4-byte types
+		{4, 4},  // LONG
+		{9, 4},  // SLONG
+		{11, 4}, // FLOAT
+		// 8-byte types
+		{5, 8},  // RATIONAL
+		{10, 8}, // SRATIONAL
+		{12, 8}, // DOUBLE
+		// unknown
+		{0, 0},
+		{13, 0},
+		{99, 0},
+		{0xFF, 0},
+	}
+	for _, tc := range tests {
+		if got := typeSize(tc.typ); got != tc.want {
+			t.Errorf("typeSize(%d) = %d, want %d", tc.typ, got, tc.want)
+		}
+	}
+}
+
+// TestInjectWithNilRawEXIF exercises the Inject path where rawEXIF is nil and
+// the base TIFF is read from the reader instead.
+func TestInjectWithNilRawEXIF(t *testing.T) {
+	t.Parallel()
+	wantIPTC := []byte("test-iptc-data-for-nil-rawexif-path")
+	data := buildMinimalTIFF(binary.LittleEndian, nil, nil)
+
+	var out bytes.Buffer
+	// rawEXIF=nil forces Inject to read the TIFF from r.
+	if err := Inject(bytes.NewReader(data), &out, nil, wantIPTC, nil); err != nil {
+		t.Fatalf("Inject nil rawEXIF: %v", err)
+	}
+
+	_, gotIPTC, _, err := Extract(bytes.NewReader(out.Bytes()))
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if !bytes.Equal(gotIPTC, wantIPTC) {
+		t.Errorf("IPTC after inject: got %q, want %q", gotIPTC, wantIPTC)
+	}
+}
+
+// TestInjectInvalidTIFFReturnsError verifies that Inject returns an error
+// (not a panic) when rawEXIF contains an invalid TIFF stream that exif.Parse
+// rejects. This exercises the buildUpdatedTIFF error return path.
+func TestInjectInvalidTIFFReturnsError(t *testing.T) {
+	t.Parallel()
+	invalidEXIF := []byte("not-a-tiff-stream")
+	var out bytes.Buffer
+	err := Inject(bytes.NewReader([]byte{}), &out, invalidEXIF, []byte("iptc"), nil)
+	if err == nil {
+		t.Error("expected error for invalid TIFF rawEXIF, got nil")
+	}
+}
+
+// TestExtractBigEndian verifies that Extract correctly reads IPTC and XMP from
+// a big-endian ("MM") TIFF.
+func TestExtractBigEndian(t *testing.T) {
+	t.Parallel()
+	wantIPTC := []byte("big-endian-iptc-payload-long-enough")
+	wantXMP := []byte("<xmpmeta/>")
+	data := buildMinimalTIFF(binary.BigEndian, wantIPTC, wantXMP)
+
+	_, rawIPTC, rawXMP, err := Extract(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("Extract BE: %v", err)
+	}
+	if !bytes.Equal(rawIPTC, wantIPTC) {
+		t.Errorf("rawIPTC = %q, want %q", rawIPTC, wantIPTC)
+	}
+	if !bytes.Equal(rawXMP, wantXMP) {
+		t.Errorf("rawXMP = %q, want %q", rawXMP, wantXMP)
+	}
+}
+
+// TestExtractTooShort verifies that Extract returns ErrFileTooShort for a
+// buffer smaller than 8 bytes.
+func TestExtractTooShort(t *testing.T) {
+	t.Parallel()
+	_, _, _, err := Extract(bytes.NewReader([]byte{0x49, 0x49, 0x2A, 0x00}))
+	if err == nil {
+		t.Error("expected error for too-short TIFF, got nil")
+	}
+}
+
+// TestExtractInvalidByteOrder verifies that Extract returns an error for an
+// unrecognised byte-order marker.
+func TestExtractInvalidByteOrder(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 8)
+	buf[0], buf[1] = 'Z', 'Z'
+	_, _, _, err := Extract(bytes.NewReader(buf))
+	if err == nil {
+		t.Error("expected error for invalid byte-order, got nil")
+	}
+}

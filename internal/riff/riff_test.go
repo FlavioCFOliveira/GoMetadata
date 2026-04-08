@@ -213,6 +213,31 @@ func TestMultipleChunksSequential(t *testing.T) {
 	}
 }
 
+// TestChunkEqual exercises the Equal method (0% coverage).
+func TestChunkEqual(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		fourcc  [4]byte
+		compare [4]byte
+		want    bool
+	}{
+		{"matching RIFF", [4]byte{'R', 'I', 'F', 'F'}, [4]byte{'R', 'I', 'F', 'F'}, true},
+		{"non-matching", [4]byte{'R', 'I', 'F', 'F'}, [4]byte{'W', 'E', 'B', 'P'}, false},
+		{"all zeros match", [4]byte{0, 0, 0, 0}, [4]byte{0, 0, 0, 0}, true},
+		{"single byte differs", [4]byte{'V', 'P', '8', ' '}, [4]byte{'V', 'P', '8', 'L'}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := &Chunk{FourCC: tc.fourcc}
+			if got := c.Equal(tc.compare); got != tc.want {
+				t.Errorf("Equal(%v) = %v, want %v", tc.compare, got, tc.want)
+			}
+		})
+	}
+}
+
 // BenchmarkReadChunk measures the throughput of reading a chunk header.
 func BenchmarkReadChunk(b *testing.B) {
 	raw := buildChunkHeader([4]byte{'R', 'I', 'F', 'F'}, 1024)

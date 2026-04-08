@@ -206,6 +206,102 @@ func TestTagConstants(t *testing.T) {
 	}
 }
 
+// TestFujifilmReadU16U32BEAndLE exercises both branches of readU16 and readU32.
+func TestFujifilmReadU16U32BEAndLE(t *testing.T) {
+	t.Parallel()
+	b := []byte{0x12, 0x34}
+	if got := readU16(b, true); got != 0x1234 {
+		t.Errorf("readU16 BE = 0x%04X, want 0x1234", got)
+	}
+	if got := readU16(b, false); got != 0x3412 {
+		t.Errorf("readU16 LE = 0x%04X, want 0x3412", got)
+	}
+	b32 := []byte{0x01, 0x02, 0x03, 0x04}
+	if got := readU32(b32, true); got != 0x01020304 {
+		t.Errorf("readU32 BE = 0x%08X, want 0x01020304", got)
+	}
+	if got := readU32(b32, false); got != 0x04030201 {
+		t.Errorf("readU32 LE = 0x%08X, want 0x04030201", got)
+	}
+}
+
+// TestFujifilmTypeSize16AllBranches exercises every branch of typeSize16.
+func TestFujifilmTypeSize16AllBranches(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		typ  uint16
+		want uint32
+	}{
+		{1, 1}, {2, 1}, {6, 1}, {7, 1},
+		{3, 2}, {8, 2},
+		{4, 4}, {9, 4}, {11, 4},
+		{5, 8}, {10, 8}, {12, 8},
+		{0, 0}, {99, 0},
+	}
+	for _, tc := range tests {
+		if got := typeSize16(tc.typ); got != tc.want {
+			t.Errorf("typeSize16(%d) = %d, want %d", tc.typ, got, tc.want)
+		}
+	}
+}
+
+// TestParseFujifilmIFDEntryUnknownType verifies that parseFujifilmIFDEntry
+// returns ok=false when the type code is unknown (typeSize16 returns 0).
+func TestParseFujifilmIFDEntryUnknownType(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 12)
+	binary.LittleEndian.PutUint16(buf[0:], 0x1000) // tag
+	binary.LittleEndian.PutUint16(buf[2:], 0xFF)   // unknown type
+	binary.LittleEndian.PutUint32(buf[4:], 1)      // count
+	_, _, ok := parseFujifilmIFDEntry(buf, 0, false)
+	if ok {
+		t.Error("expected ok=false for unknown type, got true")
+	}
+}
+
+// TestParseFujifilmIFDEntryOOBOffset verifies that parseFujifilmIFDEntry
+// returns ok=false when the offset-based value extends beyond the buffer.
+func TestParseFujifilmIFDEntryOOBOffset(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 12)
+	binary.LittleEndian.PutUint16(buf[0:], 0x1000) // tag
+	binary.LittleEndian.PutUint16(buf[2:], 2)      // ASCII type (size=1)
+	binary.LittleEndian.PutUint32(buf[4:], 100)    // count=100 → offset-based
+	binary.LittleEndian.PutUint32(buf[8:], 0xFFFF) // OOB offset
+	_, _, ok := parseFujifilmIFDEntry(buf, 0, false)
+	if ok {
+		t.Error("expected ok=false for OOB offset, got true")
+	}
+}
+
+// TestParseIFDAtFujifilmCountTooHigh verifies that parseIFDAt returns nil when
+// the entry count exceeds the 512-entry sanity limit.
+func TestParseIFDAtFujifilmCountTooHigh(t *testing.T) {
+	t.Parallel()
+	// Build a minimal Fujifilm MakerNote buffer (16-byte header + 2-byte count).
+	// The IFD offset is at bytes 8-9 (LE uint16) in the Fujifilm format.
+	// For direct parseIFDAt testing, we just pass a tiny buffer with count=600.
+	buf := make([]byte, 2)
+	binary.LittleEndian.PutUint16(buf[0:], 600) // count=600 > 512
+	result := parseIFDAt(buf, 0, false)
+	if result != nil {
+		t.Errorf("expected nil for count=600, got %v", result)
+	}
+}
+
+// TestParseIFDAtFujifilmEntriesBeyondBuffer verifies that parseIFDAt returns nil
+// when the entry block extends beyond the buffer.
+func TestParseIFDAtFujifilmEntriesBeyondBuffer(t *testing.T) {
+	t.Parallel()
+	// count=5: needs 2+5*12=62 bytes, but buf is only 2 bytes.
+	buf := make([]byte, 2)
+	binary.LittleEndian.PutUint16(buf[0:], 5)
+	result := parseIFDAt(buf, 0, false)
+	if result != nil {
+		t.Errorf("expected nil for entries beyond buffer, got %v", result)
+	}
+}
+
 func FuzzFujifilmParse(f *testing.F) {
 	// Seed: valid minimal MakerNote.
 	f.Add(buildFujifilmMakerNote())

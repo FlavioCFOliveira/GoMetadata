@@ -877,6 +877,92 @@ func TestMetadata_ExifIFDMultipleTagsCoexist(t *testing.T) {
 	assertExifCoexistRationalTags(t, m)
 }
 
+// TestMetadata_DateTimeOriginalXMPFallback covers the XMP path in DateTimeOriginal
+// when EXIF is nil but XMP carries the date.
+func TestMetadata_DateTimeOriginalXMPFallback(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{"with offset", "2024-06-15T10:30:00+02:00"},
+		{"UTC suffix", "2024-06-15T10:30:00Z"},
+		{"no timezone", "2024-06-15T10:30:00"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			x := &xmp.XMP{Properties: map[string]map[string]string{
+				"http://ns.adobe.com/exif/1.0/": {"DateTimeOriginal": tc.value},
+			}}
+			m := &Metadata{XMP: x}
+			ts, ok := m.DateTimeOriginal()
+			if !ok {
+				t.Errorf("DateTimeOriginal(%q): ok=false, want true", tc.value)
+			}
+			if ts.Year() != 2024 || ts.Month() != 6 || ts.Day() != 15 {
+				t.Errorf("DateTimeOriginal(%q) = %v, want 2024-06-15", tc.value, ts)
+			}
+		})
+	}
+}
+
+// TestMetadata_DateTimeOriginalXMPInvalid covers the unparseable XMP date path.
+func TestMetadata_DateTimeOriginalXMPInvalid(t *testing.T) {
+	t.Parallel()
+	x := &xmp.XMP{Properties: map[string]map[string]string{
+		"http://ns.adobe.com/exif/1.0/": {"DateTimeOriginal": "not-a-date"},
+	}}
+	m := &Metadata{XMP: x}
+	_, ok := m.DateTimeOriginal()
+	if ok {
+		t.Error("DateTimeOriginal with invalid XMP date should return ok=false")
+	}
+}
+
+// TestMetadata_LensModelXMPFallback covers the XMP path in LensModel.
+func TestMetadata_LensModelXMPFallback(t *testing.T) {
+	t.Parallel()
+	x := &xmp.XMP{Properties: map[string]map[string]string{
+		"http://ns.adobe.com/exif/1.0/aux/": {"Lens": "EF 50mm f/1.4 USM"},
+	}}
+	m := &Metadata{XMP: x}
+	if got := m.LensModel(); got != "EF 50mm f/1.4 USM" {
+		t.Errorf("LensModel XMP = %q, want %q", got, "EF 50mm f/1.4 USM")
+	}
+}
+
+// TestMetadata_LensModelNilAll covers the nil-all path.
+func TestMetadata_LensModelNilAll(t *testing.T) {
+	t.Parallel()
+	m := &Metadata{}
+	if got := m.LensModel(); got != "" {
+		t.Errorf("LensModel nil all = %q, want empty", got)
+	}
+}
+
+// TestMetadata_CreatorPaths exercises all three priority branches in Creator.
+func TestMetadata_CreatorPaths(t *testing.T) {
+	t.Parallel()
+	t.Run("XMP wins", func(t *testing.T) {
+		t.Parallel()
+		x := &xmp.XMP{Properties: map[string]map[string]string{
+			"http://purl.org/dc/elements/1.1/": {"creator": "Alice"},
+		}}
+		m := &Metadata{XMP: x}
+		if got := m.Creator(); got != "Alice" {
+			t.Errorf("Creator XMP = %q, want Alice", got)
+		}
+	})
+	t.Run("nil all", func(t *testing.T) {
+		t.Parallel()
+		m := &Metadata{}
+		if got := m.Creator(); got != "" {
+			t.Errorf("Creator nil all = %q, want empty", got)
+		}
+	})
+}
+
 // TestMetadata_AltitudeAboveAndBelow verifies both positive and negative
 // altitude resolution in a single TIFF with both GPS tags.
 func TestMetadata_AltitudeAboveAndBelow(t *testing.T) {

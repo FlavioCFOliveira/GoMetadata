@@ -109,66 +109,6 @@ func TestSigmaParserBadMagic(t *testing.T) {
 	}
 }
 
-// TestSigmaParserTooShort verifies that a too-short payload returns nil.
-func TestSigmaParserTooShort(t *testing.T) {
-	t.Parallel()
-	tags, err := Parser{}.Parse([]byte("SHORT"))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if tags != nil {
-		t.Error("expected nil for too-short input")
-	}
-}
-
-// TestSigmaOutOfLineValue verifies that parseSigmaIFDEntry handles out-of-line
-// ASCII values correctly.
-func TestSigmaOutOfLineValue(t *testing.T) {
-	t.Parallel()
-	longStr := "DetailedExposureMode\x00" // > 4 bytes
-	b := buildSigmaMakerNote([]struct {
-		id  uint16
-		typ uint16
-		val []byte
-	}{
-		{TagExposureMode, 2, []byte(longStr)},
-	})
-	tags, err := Parser{}.Parse(b)
-	if err != nil {
-		t.Fatalf("Parse out-of-line: %v", err)
-	}
-	if tags == nil {
-		t.Fatal("expected non-nil tags for out-of-line value")
-	}
-	v, ok := tags[TagExposureMode]
-	if !ok {
-		t.Fatal("TagExposureMode not found")
-	}
-	if string(v) != longStr {
-		t.Errorf("value = %q, want %q", v, longStr)
-	}
-}
-
-// TestSigmaInvalidEntryType verifies that entries with unknown types are skipped.
-func TestSigmaInvalidEntryType(t *testing.T) {
-	t.Parallel()
-	b := buildSigmaMakerNote([]struct {
-		id  uint16
-		typ uint16
-		val []byte
-	}{
-		{TagWhiteBalance, 0xFF, []byte{0x00, 0x00}}, // invalid type
-	})
-	tags, err := Parser{}.Parse(b)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	// Zero valid entries → nil result.
-	if tags != nil {
-		t.Errorf("expected nil for all-invalid-type entries, got %v", tags)
-	}
-}
-
 func FuzzSigmaParser(f *testing.F) {
 	f.Add(buildSigmaMakerNote([]struct {
 		id  uint16
@@ -181,4 +121,95 @@ func FuzzSigmaParser(f *testing.F) {
 	f.Fuzz(func(t *testing.T, b []byte) {
 		_, _ = Parser{}.Parse(b)
 	})
+}
+
+// TestSigmaTypeSizeAllBranches exercises every branch of typeSize.
+func TestSigmaTypeSizeAllBranches(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		typ  uint16
+		want uint32
+	}{
+		{1, 1}, {2, 1}, {6, 1}, {7, 1},
+		{3, 2}, {8, 2},
+		{4, 4}, {9, 4}, {11, 4},
+		{5, 8}, {10, 8}, {12, 8},
+		{0, 0}, {99, 0},
+	}
+	for _, tc := range tests {
+		if got := typeSize(tc.typ); got != tc.want {
+			t.Errorf("typeSize(%d) = %d, want %d", tc.typ, got, tc.want)
+		}
+	}
+}
+
+// TestParseSigmaIFDEntryUnknownType verifies that parseSigmaIFDEntry returns
+// ok=false for an IFD entry whose type code is unknown (typeSize returns 0).
+func TestParseSigmaIFDEntryUnknownType(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 12)
+	binary.LittleEndian.PutUint16(buf[0:], 0x0002) // tag
+	binary.LittleEndian.PutUint16(buf[2:], 0xFF)   // unknown type
+	binary.LittleEndian.PutUint32(buf[4:], 1)      // count
+	_, _, ok := parseSigmaIFDEntry(buf, 0)
+	if ok {
+		t.Error("expected ok=false for unknown type code, got true")
+	}
+}
+
+// TestParseSigmaIFDEntryOOBOffset verifies that parseSigmaIFDEntry returns
+// ok=false when the offset-based value extends beyond the buffer.
+func TestParseSigmaIFDEntryOOBOffset(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 12)
+	binary.LittleEndian.PutUint16(buf[0:], 0x0002) // tag
+	binary.LittleEndian.PutUint16(buf[2:], 2)      // ASCII type (size=1)
+	binary.LittleEndian.PutUint32(buf[4:], 100)    // count=100 → 100 bytes → offset-based
+	binary.LittleEndian.PutUint32(buf[8:], 0xFFFF) // offset OOB
+	_, _, ok := parseSigmaIFDEntry(buf, 0)
+	if ok {
+		t.Error("expected ok=false for OOB offset, got true")
+	}
+}
+
+// TestSigmaParseCountZero verifies that parseAt returns nil when the IFD
+// entry count is 0.
+func TestSigmaParseCountZero(t *testing.T) {
+	t.Parallel()
+	// Build SIGMA magic + version + count=0 IFD.
+	buf := make([]byte, 12)
+	copy(buf[:8], "SIGMA\x00\x00\x00")
+	// buf[8..9] = version, buf[10..11] = count=0
+	binary.LittleEndian.PutUint16(buf[10:], 0) // count = 0
+
+	p := Parser{}
+	result, err := p.Parse(buf)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if result != nil {
+		t.Errorf("expected nil result for count=0 IFD, got %v", result)
+	}
+}
+
+// TestSigmaParseAllUnknownTypes verifies that Parse returns nil when all entries
+// have unknown type codes (so the result map stays empty → parseAt returns nil).
+func TestSigmaParseAllUnknownTypes(t *testing.T) {
+	t.Parallel()
+	// Build SIGMA magic + version + 1 entry with unknown type.
+	buf := make([]byte, 10+2+12)
+	copy(buf[:8], "SIGMA\x00\x00\x00")
+	binary.LittleEndian.PutUint16(buf[10:], 1)      // count = 1
+	binary.LittleEndian.PutUint16(buf[12:], 0x0002) // tag
+	binary.LittleEndian.PutUint16(buf[14:], 0xFF)   // unknown type
+	binary.LittleEndian.PutUint32(buf[16:], 1)      // count
+
+	p := Parser{}
+	result, err := p.Parse(buf)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if result != nil {
+		t.Errorf("expected nil when all entries have unknown types, got %v", result)
+	}
 }

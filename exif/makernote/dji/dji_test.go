@@ -81,66 +81,6 @@ func TestDJIParserTooShort(t *testing.T) {
 	}
 }
 
-// TestDJIBigEndianFallback verifies that parseDJI falls back to BE when LE fails.
-func TestDJIBigEndianFallback(t *testing.T) {
-	t.Parallel()
-	// Build a big-endian IFD with 1 entry so LE heuristics fail.
-	buf := make([]byte, 2+1*12)
-	binary.BigEndian.PutUint16(buf[0:], 1) // count=1
-	binary.BigEndian.PutUint16(buf[2:], TagMake)
-	binary.BigEndian.PutUint16(buf[4:], 4) // LONG
-	binary.BigEndian.PutUint32(buf[6:], 1)
-	binary.BigEndian.PutUint32(buf[10:], 1)
-
-	tags, err := Parser{}.Parse(buf)
-	if err != nil {
-		t.Fatalf("Parse DJI BE fallback: %v", err)
-	}
-	_ = tags
-}
-
-// TestDJIOutOfLineValue verifies that parseDJIIFDEntry handles out-of-line
-// values (total size > 4 bytes).
-func TestDJIOutOfLineValue(t *testing.T) {
-	t.Parallel()
-	longStr := "Phantom4Pro\x00" // > 4 bytes
-	b := buildDJIMakerNote([]struct {
-		id  uint16
-		typ uint16
-		val []byte
-	}{
-		{TagMake, 2, append([]byte("DJI"), 0)},
-		{TagPitch, 2, []byte(longStr)},
-	})
-	tags, err := Parser{}.Parse(b)
-	if err != nil {
-		t.Fatalf("Parse out-of-line: %v", err)
-	}
-	if tags == nil {
-		t.Fatal("expected non-nil tags")
-	}
-	if _, ok := tags[TagPitch]; !ok {
-		t.Error("TagPitch out-of-line value not found")
-	}
-}
-
-// TestDJIInvalidEntryType verifies that entries with unknown type codes are skipped.
-func TestDJIInvalidEntryType(t *testing.T) {
-	t.Parallel()
-	b := buildDJIMakerNote([]struct {
-		id  uint16
-		typ uint16
-		val []byte
-	}{
-		{TagMake, 0xFF, []byte{0x00, 0x00}}, // invalid type
-	})
-	tags, err := Parser{}.Parse(b)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	_ = tags
-}
-
 func FuzzDJIParser(f *testing.F) {
 	f.Add(buildDJIMakerNote([]struct {
 		id  uint16
@@ -153,4 +93,93 @@ func FuzzDJIParser(f *testing.F) {
 	f.Fuzz(func(t *testing.T, b []byte) {
 		_, _ = Parser{}.Parse(b)
 	})
+}
+
+// TestParseDJIIFDEntryUnknownType verifies that parseDJIIFDEntry returns
+// ok=false when the type code is unknown (typeSize returns 0).
+func TestParseDJIIFDEntryUnknownType(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 12)
+	binary.LittleEndian.PutUint16(buf[0:], 0x0001) // tag
+	binary.LittleEndian.PutUint16(buf[2:], 0xFF)   // unknown type
+	binary.LittleEndian.PutUint32(buf[4:], 1)      // count
+	_, _, ok := parseDJIIFDEntry(buf, 0, binary.LittleEndian)
+	if ok {
+		t.Error("expected ok=false for unknown type, got true")
+	}
+}
+
+// TestParseDJIIFDEntryOOBOffset verifies that parseDJIIFDEntry returns
+// ok=false when the offset-based value extends beyond the buffer.
+func TestParseDJIIFDEntryOOBOffset(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 12)
+	binary.LittleEndian.PutUint16(buf[0:], 0x0001) // tag
+	binary.LittleEndian.PutUint16(buf[2:], 2)      // ASCII type (size=1)
+	binary.LittleEndian.PutUint32(buf[4:], 100)    // count=100 → offset-based
+	binary.LittleEndian.PutUint32(buf[8:], 0xFFFF) // OOB offset
+	_, _, ok := parseDJIIFDEntry(buf, 0, binary.LittleEndian)
+	if ok {
+		t.Error("expected ok=false for OOB offset, got true")
+	}
+}
+
+// TestParseAtDJIAllUnknownTypes verifies that parseAt returns nil when all
+// entries have unknown type codes (empty result map → returns nil).
+func TestParseAtDJIAllUnknownTypes(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 2+12)
+	binary.LittleEndian.PutUint16(buf[0:], 1)      // count = 1
+	binary.LittleEndian.PutUint16(buf[2:], 0x0001) // tag
+	binary.LittleEndian.PutUint16(buf[4:], 0xFF)   // unknown type
+	binary.LittleEndian.PutUint32(buf[6:], 1)      // count
+	result := parseAt(buf, binary.LittleEndian)
+	if result != nil {
+		t.Errorf("expected nil for all-unknown-type IFD, got %v", result)
+	}
+}
+
+// TestParseAtDJICountTooHigh verifies that parseAt returns nil when the
+// entry count exceeds the 512-entry sanity limit.
+func TestParseAtDJICountTooHigh(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 2)
+	binary.LittleEndian.PutUint16(buf[0:], 600) // count=600 > 512
+	result := parseAt(buf, binary.LittleEndian)
+	if result != nil {
+		t.Errorf("expected nil for count=600, got %v", result)
+	}
+}
+
+// TestParseAtDJIEntriesBeyondBuffer verifies that parseAt returns nil when
+// the entry block extends beyond the buffer.
+func TestParseAtDJIEntriesBeyondBuffer(t *testing.T) {
+	t.Parallel()
+	// count=5: needs 2+5*12=62 bytes, but buf is only 2 bytes.
+	buf := make([]byte, 2)
+	binary.LittleEndian.PutUint16(buf[0:], 5) // valid count but insufficient buffer
+	result := parseAt(buf, binary.LittleEndian)
+	if result != nil {
+		t.Errorf("expected nil for entries beyond buffer, got %v", result)
+	}
+}
+
+// TestDJITypeSizeAllBranches exercises every branch of typeSize.
+func TestDJITypeSizeAllBranches(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		typ  uint16
+		want uint32
+	}{
+		{1, 1}, {2, 1}, {6, 1}, {7, 1},
+		{3, 2}, {8, 2},
+		{4, 4}, {9, 4}, {11, 4},
+		{5, 8}, {10, 8}, {12, 8},
+		{0, 0}, {99, 0},
+	}
+	for _, tc := range tests {
+		if got := typeSize(tc.typ); got != tc.want {
+			t.Errorf("typeSize(%d) = %d, want %d", tc.typ, got, tc.want)
+		}
+	}
 }

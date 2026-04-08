@@ -149,6 +149,17 @@ func TestAVIFString(t *testing.T) {
 	}
 }
 
+// TestFormatIDStringOutOfRange covers the out-of-range branch in String().
+// FormatID values beyond the end of the formatNames array should return "Unknown".
+func TestFormatIDStringOutOfRange(t *testing.T) {
+	t.Parallel()
+	// 255 is well beyond the end of the formatNames array.
+	f := FormatID(255)
+	if got := f.String(); got != "Unknown" {
+		t.Errorf("FormatID(255).String() = %q, want %q", got, "Unknown")
+	}
+}
+
 func TestDetectMagic(t *testing.T) {
 	t.Parallel()
 	// Test detectMagic directly for edge cases.
@@ -277,6 +288,28 @@ func TestRefineTIFFVariant(t *testing.T) {
 	}
 }
 
+// TestSupportsWrite exercises SupportsWrite for known writable, non-writable,
+// and unknown format IDs.
+func TestSupportsWrite(t *testing.T) {
+	t.Parallel()
+	writable := []FormatID{
+		FormatJPEG, FormatTIFF, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP,
+		FormatCR2, FormatCR3, FormatNEF, FormatARW, FormatDNG, FormatORF, FormatRW2,
+	}
+	for _, f := range writable {
+		if !SupportsWrite(f) {
+			t.Errorf("SupportsWrite(%v) = false, want true", f)
+		}
+	}
+	if SupportsWrite(FormatUnknown) {
+		t.Error("SupportsWrite(FormatUnknown) = true, want false")
+	}
+	// An out-of-range FormatID should return false.
+	if SupportsWrite(FormatID(255)) {
+		t.Error("SupportsWrite(255) = true, want false")
+	}
+}
+
 // TestDetectSeekAfterRefinement verifies that Detect leaves the reader at
 // position 0 even after TIFF-variant refinement reads additional bytes.
 func TestDetectSeekAfterRefinement(t *testing.T) {
@@ -289,5 +322,132 @@ func TestDetectSeekAfterRefinement(t *testing.T) {
 	pos, _ := r.Seek(0, 1)
 	if pos != 0 {
 		t.Errorf("reader position after Detect = %d, want 0", pos)
+	}
+}
+
+// buildTIFFWithInlineMakeTag builds a minimal TIFF where the Make value is
+// stored inline (string ≤ 4 bytes including NUL terminator) in the IFD
+// value-or-offset field. Exercises the `total <= 4` branch in findMakeTagInIFD.
+func buildTIFFWithInlineMakeTag(makeStr string) []byte {
+	// Layout: header(8) + IFD_count(2) + 1 entry(12) + next-IFD(4) = 26 bytes.
+	buf := make([]byte, 26)
+	buf[0], buf[1] = 'I', 'I'
+	buf[2], buf[3] = 0x2A, 0x00
+	buf[4] = 0x08 // IFD0 offset = 8
+
+	buf[8], buf[9] = 0x01, 0x00 // 1 entry
+
+	cnt := len(makeStr)           // count = length of the make string (no NUL needed for ≤4)
+	buf[10], buf[11] = 0x0F, 0x01 // tag 0x010F (Make)
+	buf[12], buf[13] = 0x02, 0x00 // TypeASCII
+	buf[14] = byte(cnt)           //nolint:gosec // G115: test helper
+	copy(buf[18:22], makeStr)     // inline value in 4-byte field
+	return buf
+}
+
+// TestFindMakeTagInIFDInline verifies that findMakeTagInIFD reads the Make
+// tag correctly when it is stored inline (string ≤ 4 bytes).
+func TestFindMakeTagInIFDInline(t *testing.T) {
+	t.Parallel()
+	// "IXY" is 3 bytes — stored inline. mapMakeToFormat won't match it exactly,
+	// so the result is FormatTIFF.
+	data := buildTIFFWithInlineMakeTag("IXY")
+	got, err := Detect(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("Detect inline make: %v", err)
+	}
+	if got != FormatTIFF {
+		t.Errorf("Detect inline make = %v, want FormatTIFF", got)
+	}
+}
+
+// TestFindMakeTagInIFDNonASCIIType verifies that findMakeTagInIFD skips a Make
+// tag whose type is not ASCII (typ != 2), exercising the `break` path.
+func TestFindMakeTagInIFDNonASCIIType(t *testing.T) {
+	t.Parallel()
+	// Build a TIFF where Make (0x010F) has type=SHORT (3) instead of ASCII.
+	buf := make([]byte, 26)
+	buf[0], buf[1] = 'I', 'I'
+	buf[2], buf[3] = 0x2A, 0x00
+	buf[4] = 0x08
+	buf[8], buf[9] = 0x01, 0x00   // 1 entry
+	buf[10], buf[11] = 0x0F, 0x01 // tag 0x010F (Make)
+	buf[12], buf[13] = 0x03, 0x00 // type=SHORT (not ASCII)
+	buf[14] = 0x01                // count=1
+
+	got, err := Detect(bytes.NewReader(buf))
+	if err != nil {
+		t.Fatalf("Detect non-ASCII make type: %v", err)
+	}
+	if got != FormatTIFF {
+		t.Errorf("Detect non-ASCII make type = %v, want FormatTIFF", got)
+	}
+}
+
+// TestParseTIFFScanHeaderBigEndian verifies that parseTIFFScanHeader correctly
+// parses a big-endian ("MM") TIFF header so refineTIFFVariant can read it.
+func TestParseTIFFScanHeaderBigEndian(t *testing.T) {
+	t.Parallel()
+	// Minimal big-endian TIFF: "MM" + 0x002A + IFD0 at offset 8 + 0 entries.
+	buf := make([]byte, 14)
+	buf[0], buf[1] = 'M', 'M'
+	buf[2], buf[3] = 0x00, 0x2A                             // magic BE
+	buf[4], buf[5], buf[6], buf[7] = 0x00, 0x00, 0x00, 0x08 // IFD0 offset=8 BE
+	buf[8], buf[9] = 0x00, 0x00                             // 0 entries
+
+	got, err := Detect(bytes.NewReader(buf))
+	if err != nil {
+		t.Fatalf("Detect BE TIFF: %v", err)
+	}
+	if got != FormatTIFF {
+		t.Errorf("Detect BE TIFF = %v, want FormatTIFF", got)
+	}
+}
+
+// TestRefineTIFFVariantCountTooHigh verifies that parseTIFFScanHeader returns
+// false (and refineTIFFVariant falls back to FormatTIFF) when the IFD0 entry
+// count exceeds the 512-entry sanity limit.
+func TestRefineTIFFVariantCountTooHigh(t *testing.T) {
+	t.Parallel()
+	// Build a minimal TIFF with count=600 (>512) — should be treated as unknown.
+	buf := make([]byte, 14)
+	buf[0], buf[1] = 'I', 'I'
+	buf[2], buf[3] = 0x2A, 0x00
+	buf[4] = 0x08
+	// IFD0 entry count = 600 in LE.
+	buf[8] = byte(600 & 0xFF)
+	buf[9] = byte((600 >> 8) & 0xFF)
+
+	got, err := Detect(bytes.NewReader(buf))
+	if err != nil {
+		t.Fatalf("Detect with count=600: %v", err)
+	}
+	if got != FormatTIFF {
+		t.Errorf("Detect with count=600 = %v, want FormatTIFF", got)
+	}
+}
+
+// TestParseTIFFScanHeaderIFD0OffsetBeyondData verifies that parseTIFFScanHeader
+// returns false when the IFD0 offset points beyond the available data.
+// This exercises the int(ifd0Off)+2 > len(data) guard.
+func TestParseTIFFScanHeaderIFD0OffsetBeyondData(t *testing.T) {
+	t.Parallel()
+	// Build a 10-byte LE TIFF with IFD0 offset = 0xFF00 (far beyond the file).
+	buf := make([]byte, 10)
+	buf[0], buf[1] = 'I', 'I'
+	buf[2], buf[3] = 0x2A, 0x00
+	buf[4] = 0x00 // IFD0 offset = 0xFF00 in LE
+	buf[5] = 0xFF
+	buf[6] = 0x00
+	buf[7] = 0x00
+	// Only 10 bytes total; ifd0Off=0xFF00 is way beyond data → parseTIFFScanHeader returns false.
+
+	got, err := Detect(bytes.NewReader(buf))
+	if err != nil {
+		t.Fatalf("Detect with OOB IFD0 offset: %v", err)
+	}
+	// Must fall back to FormatTIFF or FormatUnknown — not crash.
+	if got != FormatTIFF && got != FormatUnknown {
+		t.Errorf("Detect with OOB IFD0 offset = %v, want FormatTIFF or FormatUnknown", got)
 	}
 }

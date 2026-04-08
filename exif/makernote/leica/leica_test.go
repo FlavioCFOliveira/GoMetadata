@@ -109,3 +109,78 @@ func FuzzLeicaParser(f *testing.F) {
 		_, _ = Parser{}.Parse(b)
 	})
 }
+
+// TestParseLeicaIFDEntryUnknownType verifies that parseLeicaIFDEntry returns
+// ok=false for an entry with an unknown type code.
+func TestParseLeicaIFDEntryUnknownType(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 12)
+	binary.LittleEndian.PutUint16(buf[0:], 0x0302) // tag
+	binary.LittleEndian.PutUint16(buf[2:], 0xFF)   // unknown type
+	binary.LittleEndian.PutUint32(buf[4:], 1)
+	_, _, ok := parseLeicaIFDEntry(buf, 0, binary.LittleEndian)
+	if ok {
+		t.Error("expected ok=false for unknown type, got true")
+	}
+}
+
+// TestParseLeicaIFDEntryOOBOffset verifies that parseLeicaIFDEntry returns
+// ok=false when the offset-based value extends beyond the buffer.
+func TestParseLeicaIFDEntryOOBOffset(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 12)
+	binary.LittleEndian.PutUint16(buf[0:], 0x0302) // tag
+	binary.LittleEndian.PutUint16(buf[2:], 2)      // ASCII
+	binary.LittleEndian.PutUint32(buf[4:], 100)    // count=100 → offset-based
+	binary.LittleEndian.PutUint32(buf[8:], 0xFFFF) // OOB offset
+	_, _, ok := parseLeicaIFDEntry(buf, 0, binary.LittleEndian)
+	if ok {
+		t.Error("expected ok=false for OOB offset, got true")
+	}
+}
+
+// TestParseIFDAtAllUnknownTypes verifies that parseIFDAt returns nil when all
+// entries have unknown type codes (empty result map → returns nil).
+func TestParseIFDAtAllUnknownTypes(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 2+12)
+	binary.LittleEndian.PutUint16(buf[0:], 1)      // count = 1
+	binary.LittleEndian.PutUint16(buf[2:], 0x0302) // tag
+	binary.LittleEndian.PutUint16(buf[4:], 0xFF)   // unknown type
+	result := parseIFDAt(buf, 0, binary.LittleEndian)
+	if result != nil {
+		t.Errorf("expected nil for all-unknown-type IFD, got %v", result)
+	}
+}
+
+// TestParseIFDAtCountTooHigh verifies that parseIFDAt returns nil when the
+// entry count exceeds the 512-entry sanity limit.
+func TestParseIFDAtCountTooHigh(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 2)
+	binary.LittleEndian.PutUint16(buf[0:], 600) // count=600 > 512
+	result := parseIFDAt(buf, 0, binary.LittleEndian)
+	if result != nil {
+		t.Errorf("expected nil for count=600, got %v", result)
+	}
+}
+
+// TestLeicaTypeSizeAllBranches exercises every branch of typeSize.
+func TestLeicaTypeSizeAllBranches(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		typ  uint16
+		want uint32
+	}{
+		{1, 1}, {2, 1}, {6, 1}, {7, 1},
+		{3, 2}, {8, 2},
+		{4, 4}, {9, 4}, {11, 4},
+		{5, 8}, {10, 8}, {12, 8},
+		{0, 0}, {99, 0},
+	}
+	for _, tc := range tests {
+		if got := typeSize(tc.typ); got != tc.want {
+			t.Errorf("typeSize(%d) = %d, want %d", tc.typ, got, tc.want)
+		}
+	}
+}

@@ -433,6 +433,269 @@ func BenchmarkPNGInject(b *testing.B) {
 	}
 }
 
+// TestIsXMPChunk exercises isXMPChunk (0% coverage).
+func TestIsXMPChunk(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{
+			"valid XMP iTXt payload",
+			append([]byte(xmpKeyword+"\x00"), []byte("<?xpacket?>")...),
+			true,
+		},
+		{
+			"wrong keyword",
+			append([]byte("zTXt\x00"), []byte("data")...),
+			false,
+		},
+		{
+			"too short",
+			[]byte("XML:com.adobe.xm"), // one byte shorter than keyword
+			false,
+		},
+		{
+			"keyword present but missing NUL",
+			[]byte(xmpKeyword + "x"), // keyword byte replaced with non-NUL
+			false,
+		},
+		{
+			"empty",
+			[]byte{},
+			false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isXMPChunk(tc.data); got != tc.want {
+				t.Errorf("isXMPChunk() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestShouldDropChunk exercises all branches of shouldDropChunk.
+func TestShouldDropChunk(t *testing.T) {
+	t.Parallel()
+
+	t.Run("drops eXIf chunk", func(t *testing.T) {
+		t.Parallel()
+		if !shouldDropChunk("eXIf", []byte("any data")) {
+			t.Error("shouldDropChunk: expected true for eXIf")
+		}
+	})
+
+	t.Run("drops iTXt XMP chunk", func(t *testing.T) {
+		t.Parallel()
+		// Build a valid XMP iTXt payload.
+		data := append([]byte(xmpKeyword+"\x00"), []byte("xmp data")...)
+		if !shouldDropChunk("iTXt", data) {
+			t.Error("shouldDropChunk: expected true for iTXt XMP chunk")
+		}
+	})
+
+	t.Run("keeps iTXt non-XMP chunk", func(t *testing.T) {
+		t.Parallel()
+		data := append([]byte("Comment\x00"), []byte("some text")...)
+		if shouldDropChunk("iTXt", data) {
+			t.Error("shouldDropChunk: expected false for non-XMP iTXt")
+		}
+	})
+
+	t.Run("keeps tEXt chunk", func(t *testing.T) {
+		t.Parallel()
+		if shouldDropChunk("tEXt", []byte("Comment\x00text")) {
+			t.Error("shouldDropChunk: expected false for tEXt")
+		}
+	})
+
+	t.Run("keeps IHDR chunk", func(t *testing.T) {
+		t.Parallel()
+		if shouldDropChunk("IHDR", make([]byte, 13)) {
+			t.Error("shouldDropChunk: expected false for IHDR")
+		}
+	})
+}
+
+// TestZlibDecompressPoolReuse verifies that zlibDecompress works correctly on
+// two sequential calls, exercising the pool-reuse (Reset) path on the second call.
+func TestZlibDecompressPoolReuse(t *testing.T) {
+	t.Parallel()
+
+	compress := func(data []byte) []byte {
+		var buf bytes.Buffer
+		zw := zlib.NewWriter(&buf)
+		_, _ = zw.Write(data)
+		_ = zw.Close()
+		return buf.Bytes()
+	}
+
+	input1 := []byte("first decompression call — allocates a new zlib reader")
+	input2 := []byte("second decompression call — should reuse pooled zlib reader")
+
+	comp1 := compress(input1)
+	comp2 := compress(input2)
+
+	// First call — allocates a new zlib reader.
+	got1, err := zlibDecompress(comp1)
+	if err != nil {
+		t.Fatalf("zlibDecompress (1st): %v", err)
+	}
+	if !bytes.Equal(got1, input1) {
+		t.Errorf("zlibDecompress (1st) = %q, want %q", got1, input1)
+	}
+
+	// Second call — should reuse the pooled reader.
+	got2, err := zlibDecompress(comp2)
+	if err != nil {
+		t.Fatalf("zlibDecompress (2nd): %v", err)
+	}
+	if !bytes.Equal(got2, input2) {
+		t.Errorf("zlibDecompress (2nd) = %q, want %q", got2, input2)
+	}
+}
+
+// TestZlibDecompressBadData verifies that zlibDecompress returns an error for
+// corrupt compressed data.
+func TestZlibDecompressBadData(t *testing.T) {
+	t.Parallel()
+	_, err := zlibDecompress([]byte("this is not zlib data"))
+	if err == nil {
+		t.Error("zlibDecompress: expected error for bad zlib data, got nil")
+	}
+}
+
+// TestInjectDropsExistingEXIf verifies that Inject removes an existing eXIf
+// chunk and replaces it with the new EXIF data.
+func TestInjectDropsExistingEXIf(t *testing.T) {
+	t.Parallel()
+	oldExif := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00}
+	newExif := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0xFF, 0xFF}
+	png := buildPNG(oldExif, nil)
+
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(png), &out, newExif, nil, nil); err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+
+	rawEXIF, _, _, err := Extract(bytes.NewReader(out.Bytes()))
+	if err != nil {
+		t.Fatalf("Extract after Inject: %v", err)
+	}
+	if !bytes.Equal(rawEXIF, newExif) {
+		t.Errorf("EXIF after inject: got %v, want %v", rawEXIF, newExif)
+	}
+}
+
+// TestInjectDropsExistingXMP verifies that Inject removes an existing iTXt XMP
+// chunk and replaces it with the new XMP data.
+func TestInjectDropsExistingXMP(t *testing.T) {
+	t.Parallel()
+	oldXMP := []byte("<?xpacket begin='' uid='x'?><old/><?xpacket end='r'?>")
+	newXMP := []byte("<?xpacket begin='' uid='x'?><new/><?xpacket end='r'?>")
+	png := buildPNG(nil, oldXMP)
+
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(png), &out, nil, nil, newXMP); err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+
+	_, _, rawXMP, err := Extract(bytes.NewReader(out.Bytes()))
+	if err != nil {
+		t.Fatalf("Extract after Inject: %v", err)
+	}
+	if !bytes.Equal(rawXMP, newXMP) {
+		t.Errorf("XMP after inject: got %q, want %q", rawXMP, newXMP)
+	}
+}
+
+// TestInjectNilPayloadsPassThrough verifies that Inject with nil EXIF and XMP
+// writes a valid PNG that preserves non-metadata chunks.
+func TestInjectNilPayloadsPassThrough(t *testing.T) {
+	t.Parallel()
+	// PNG with no metadata at all.
+	png := buildPNG(nil, nil)
+
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(png), &out, nil, nil, nil); err != nil {
+		t.Fatalf("Inject nil payloads: %v", err)
+	}
+
+	// Verify the output is a valid PNG signature.
+	result := out.Bytes()
+	if len(result) < 8 {
+		t.Fatal("output too short")
+	}
+	for i, b := range pngSig {
+		if result[i] != b {
+			t.Errorf("PNG signature byte %d: got 0x%02X, want 0x%02X", i, result[i], b)
+		}
+	}
+}
+
+// TestInjectEOFAfterSignature verifies that Inject on a PNG that ends
+// immediately after the signature (no chunks) returns nil without panicking.
+// The io.EOF from the first chunk-header read triggers the break path.
+func TestInjectEOFAfterSignature(t *testing.T) {
+	t.Parallel()
+	// Just the 8-byte PNG signature, no chunks.
+	var out bytes.Buffer
+	err := Inject(bytes.NewReader(pngSig[:]), &out, nil, nil, nil)
+	if err != nil {
+		t.Errorf("expected nil for EOF-after-signature, got: %v", err)
+	}
+}
+
+// TestInjectUnexpectedEOFReturnsError verifies that Inject returns an error
+// when the chunk stream is truncated mid-header (io.ErrUnexpectedEOF path).
+func TestInjectUnexpectedEOFReturnsError(t *testing.T) {
+	t.Parallel()
+	// PNG signature + only 4 bytes of a chunk header (need 8 to read it).
+	buf := make([]byte, 8+4)
+	copy(buf[:8], pngSig[:])
+	// Only 4 bytes of the chunk header — truncated.
+	binary.BigEndian.PutUint32(buf[8:], 13) // length field of a partial IHDR
+	err := Inject(bytes.NewReader(buf), &bytes.Buffer{}, nil, nil, nil)
+	if err == nil {
+		t.Error("expected error for truncated chunk header, got nil")
+	}
+}
+
+// TestWriteMetadataAfterIHDRXMPOnly verifies that writeMetadataAfterIHDR
+// writes only the XMP chunk when rawEXIF is nil.
+func TestWriteMetadataAfterIHDRXMPOnly(t *testing.T) {
+	t.Parallel()
+	xmpData := []byte("<?xpacket begin='' uid='x'?><x/><?xpacket end='r'?>")
+	var out bytes.Buffer
+	if err := writeMetadataAfterIHDR(&out, nil, xmpData); err != nil {
+		t.Fatalf("writeMetadataAfterIHDR XMP-only: %v", err)
+	}
+	// Should have written one chunk — verify it starts with "iTXt".
+	result := out.Bytes()
+	if len(result) < 12 {
+		t.Fatal("output too short to contain chunk")
+	}
+	// Chunk type is at bytes 4-7.
+	chunkType := string(result[4:8])
+	if chunkType != "iTXt" {
+		t.Errorf("expected iTXt chunk, got %q", chunkType)
+	}
+}
+
+// TestExtractTruncatedChunkNoPanic verifies that Extract on a truncated PNG
+// (cut in the middle of a chunk) returns an error without panicking.
+func TestExtractTruncatedChunkNoPanic(t *testing.T) {
+	t.Parallel()
+	full := buildPNG([]byte{0x49, 0x49, 0x2A, 0x00}, nil)
+	// Try progressively-truncated inputs.
+	for i := 8; i < len(full); i += max(1, len(full)/20) {
+		_, _, _, _ = Extract(bytes.NewReader(full[:i]))
+	}
+}
+
 // BenchmarkPNGWriteChunk measures the hot inner loop: serialise one PNG chunk
 // (header + data + CRC) using the pooled crc32 hash and stack-allocated header.
 func BenchmarkPNGWriteChunk(b *testing.B) {

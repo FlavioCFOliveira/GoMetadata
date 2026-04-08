@@ -641,6 +641,33 @@ func TestReadBox_TypePreservation(t *testing.T) {
 	}
 }
 
+// ---- TestBoxEqual -----------------------------------------------------------
+
+// TestBoxEqual exercises the Equal method (0% coverage).
+func TestBoxEqual(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		typ     [4]byte
+		compare [4]byte
+		want    bool
+	}{
+		{"matching ftyp", [4]byte{'f', 't', 'y', 'p'}, [4]byte{'f', 't', 'y', 'p'}, true},
+		{"non-matching", [4]byte{'m', 'd', 'a', 't'}, [4]byte{'f', 't', 'y', 'p'}, false},
+		{"all zeros match", [4]byte{0, 0, 0, 0}, [4]byte{0, 0, 0, 0}, true},
+		{"single byte differs", [4]byte{'m', 'o', 'o', 'f'}, [4]byte{'m', 'o', 'o', 'v'}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			box := &Box{Type: tc.typ}
+			if got := box.Equal(tc.compare); got != tc.want {
+				t.Errorf("Equal(%v) = %v, want %v", tc.compare, got, tc.want)
+			}
+		})
+	}
+}
+
 // ---- BenchmarkReadBox -------------------------------------------------------
 
 // BenchmarkReadBox measures the throughput of reading a standard 8-byte box

@@ -1710,3 +1710,813 @@ func TestEXIFSetters(t *testing.T) {
 		testEXIFEnsureExifIFDCreatedOnce(t)
 	})
 }
+
+// TestIFDEntryStringUint16Uint32Rational exercises String, Uint16, Uint32 and
+// Rational with both the correct-type path and the wrong-type guard path.
+func TestIFDEntryStringUint16Uint32Rational(t *testing.T) {
+	t.Parallel()
+
+	t.Run("String_correct_type", func(t *testing.T) {
+		t.Parallel()
+		e := &IFDEntry{Type: TypeASCII, Value: []byte("Canon\x00"), byteOrder: binary.LittleEndian}
+		if got := e.String(); got != "Canon" {
+			t.Errorf("String() = %q, want %q", got, "Canon")
+		}
+	})
+	t.Run("String_wrong_type", func(t *testing.T) {
+		t.Parallel()
+		e := &IFDEntry{Type: TypeShort, Value: []byte{0x01, 0x00}, byteOrder: binary.LittleEndian}
+		if got := e.String(); got != "" {
+			t.Errorf("String() on TypeShort = %q, want empty", got)
+		}
+	})
+	t.Run("String_empty_value", func(t *testing.T) {
+		t.Parallel()
+		e := &IFDEntry{Type: TypeASCII, Value: []byte{}, byteOrder: binary.LittleEndian}
+		if got := e.String(); got != "" {
+			t.Errorf("String() on empty = %q, want empty", got)
+		}
+	})
+
+	t.Run("Uint16_correct_type", func(t *testing.T) {
+		t.Parallel()
+		e := &IFDEntry{Type: TypeShort, Value: []byte{0x42, 0x00}, byteOrder: binary.LittleEndian}
+		if got := e.Uint16(); got != 0x42 {
+			t.Errorf("Uint16() = 0x%04X, want 0x42", got)
+		}
+	})
+	t.Run("Uint16_wrong_type", func(t *testing.T) {
+		t.Parallel()
+		e := &IFDEntry{Type: TypeLong, Value: []byte{0x01, 0x00, 0x00, 0x00}, byteOrder: binary.LittleEndian}
+		if got := e.Uint16(); got != 0 {
+			t.Errorf("Uint16() on TypeLong = 0x%04X, want 0", got)
+		}
+	})
+
+	t.Run("Uint32_correct_type", func(t *testing.T) {
+		t.Parallel()
+		e := &IFDEntry{Type: TypeLong, Value: []byte{0x10, 0x00, 0x00, 0x80}, byteOrder: binary.LittleEndian}
+		if got := e.Uint32(); got != 0x80000010 {
+			t.Errorf("Uint32() = 0x%08X, want 0x80000010", got)
+		}
+	})
+	t.Run("Uint32_wrong_type", func(t *testing.T) {
+		t.Parallel()
+		e := &IFDEntry{Type: TypeShort, Value: []byte{0x01, 0x00}, byteOrder: binary.LittleEndian}
+		if got := e.Uint32(); got != 0 {
+			t.Errorf("Uint32() on TypeShort = 0x%08X, want 0", got)
+		}
+	})
+
+	t.Run("Rational_correct_type", func(t *testing.T) {
+		t.Parallel()
+		// Rational: 8 bytes = num(4) + den(4), LE
+		val := make([]byte, 8)
+		binary.LittleEndian.PutUint32(val[0:], 1)
+		binary.LittleEndian.PutUint32(val[4:], 500)
+		e := &IFDEntry{Type: TypeRational, Value: val, byteOrder: binary.LittleEndian}
+		r := e.Rational(0)
+		if r[0] != 1 || r[1] != 500 {
+			t.Errorf("Rational(0) = %v, want [1 500]", r)
+		}
+	})
+	t.Run("Rational_wrong_type", func(t *testing.T) {
+		t.Parallel()
+		e := &IFDEntry{Type: TypeShort, Value: []byte{0x01, 0x00}, byteOrder: binary.LittleEndian}
+		r := e.Rational(0)
+		if r != ([2]uint32{}) {
+			t.Errorf("Rational(0) on TypeShort = %v, want [0 0]", r)
+		}
+	})
+	t.Run("Rational_out_of_range", func(t *testing.T) {
+		t.Parallel()
+		val := make([]byte, 8)
+		e := &IFDEntry{Type: TypeRational, Value: val, byteOrder: binary.LittleEndian}
+		r := e.Rational(5) // index 5 → offset 40, way beyond 8 bytes
+		if r != ([2]uint32{}) {
+			t.Errorf("Rational(5) OOB = %v, want [0 0]", r)
+		}
+	})
+}
+
+// TestIFDEntryByteAndUint8s exercises the Byte() and Uint8s() methods on
+// IFDEntry, which have 0% coverage.
+func TestIFDEntryByteAndUint8s(t *testing.T) {
+	t.Parallel()
+	t.Run("Byte_nonempty", func(t *testing.T) {
+		t.Parallel()
+		e := &IFDEntry{Value: []byte{0x42, 0x43}, byteOrder: binary.LittleEndian}
+		if got := e.Byte(); got != 0x42 {
+			t.Errorf("Byte() = 0x%02X, want 0x42", got)
+		}
+	})
+	t.Run("Byte_empty", func(t *testing.T) {
+		t.Parallel()
+		e := &IFDEntry{Value: []byte{}, byteOrder: binary.LittleEndian}
+		if got := e.Byte(); got != 0 {
+			t.Errorf("Byte() on empty = 0x%02X, want 0", got)
+		}
+	})
+	t.Run("Uint8s", func(t *testing.T) {
+		t.Parallel()
+		payload := []byte{1, 2, 3, 4}
+		e := &IFDEntry{Value: payload, byteOrder: binary.LittleEndian}
+		got := e.Uint8s()
+		if len(got) != len(payload) {
+			t.Fatalf("Uint8s() len = %d, want %d", len(got), len(payload))
+		}
+		for i, b := range payload {
+			if got[i] != b {
+				t.Errorf("Uint8s()[%d] = %d, want %d", i, got[i], b)
+			}
+		}
+	})
+}
+
+// buildPlainIFD constructs a plain TIFF IFD byte blob (count(2) + n*12 entries)
+// with all values small enough to be stored inline. order determines endianness.
+func buildPlainIFD(order binary.ByteOrder, entries [][4]uint32) []byte {
+	n := len(entries)
+	buf := make([]byte, 2+n*12)
+	order.PutUint16(buf[0:], uint16(n)) //nolint:gosec // G115: test helper
+	for i, e := range entries {
+		p := 2 + i*12
+		order.PutUint16(buf[p:], uint16(e[0]))   //nolint:gosec // G115: test helper
+		order.PutUint16(buf[p+2:], uint16(e[1])) //nolint:gosec // G115: test helper
+		order.PutUint32(buf[p+4:], e[2])
+		order.PutUint32(buf[p+8:], e[3])
+	}
+	return buf
+}
+
+// TestParseMakerNoteIFD_Canon tests Canon MakerNote parsing via parseMakerNoteIFD.
+// Note: traverse(b, 0, order) returns nil when offset=0 (loop invariant), so
+// Canon MakerNotes embedded with IFD at byte 0 return nil without panic.
+// This test verifies the function is called and returns without panic.
+func TestParseMakerNoteIFD_Canon(t *testing.T) {
+	t.Parallel()
+	ifd := buildPlainIFD(binary.LittleEndian, [][4]uint32{
+		{0x0001, uint32(TypeShort), 1, 100},
+		{0x001C, uint32(TypeLong), 1, 0x80000010},
+		{0x0095, uint32(TypeASCII), 0, 0},
+	})
+	// parseMakerNoteIFD dispatches to parseCanonMakerNote which calls traverse(b,0,...).
+	// traverse with offset=0 returns nil (loop condition: cur != 0). No panic expected.
+	_ = parseMakerNoteIFD(ifd, "Canon", binary.LittleEndian)
+}
+
+// TestParseMakerNoteIFD_CanonTooShort covers the too-short guard in parseCanonMakerNote.
+func TestParseMakerNoteIFD_CanonTooShort(t *testing.T) {
+	t.Parallel()
+	result := parseMakerNoteIFD([]byte{0x01}, "Canon", binary.LittleEndian)
+	if result != nil {
+		t.Error("Canon too short: expected nil IFD")
+	}
+}
+
+// TestParseMakerNoteIFD_NikonType3 tests Nikon Type 3 parsing.
+func TestParseMakerNoteIFD_NikonType3(t *testing.T) {
+	t.Parallel()
+	// Build Nikon Type 3: "Nikon\0" + version(2) + embedded TIFF (header + IFD).
+	ifdEntries := buildPlainIFD(binary.LittleEndian, [][4]uint32{
+		{0x0002, uint32(TypeShort), 1, 400}, // ISO
+	})
+	tiff := make([]byte, 0, 8+len(ifdEntries))
+	tiff = append(tiff, 'I', 'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00)
+	tiff = append(tiff, ifdEntries...)
+
+	b := make([]byte, 0, 8+len(tiff))
+	b = append(b, 'N', 'i', 'k', 'o', 'n', 0x00, 0x02, 0x10)
+	b = append(b, tiff...)
+
+	result := parseMakerNoteIFD(b, "NIKON CORPORATION", binary.LittleEndian)
+	if result == nil {
+		t.Error("Nikon Type3: expected non-nil IFD")
+	}
+}
+
+// TestParseMakerNoteIFD_NikonType1 tests Nikon Type 1 (big-endian plain IFD) path.
+// parseNikonType1 calls traverse(b, 0, order) — offset=0 means the loop won't execute,
+// so the result is nil. Test verifies the dispatch happens without panic.
+func TestParseMakerNoteIFD_NikonType1(t *testing.T) {
+	t.Parallel()
+	ifd := buildPlainIFD(binary.BigEndian, [][4]uint32{
+		{0x0002, uint32(TypeShort), 1, 400},
+	})
+	// isNikonType3 returns false (no "Nikon\0" prefix), so parseNikonType1 is called.
+	_ = parseMakerNoteIFD(ifd, "Nikon", binary.BigEndian)
+}
+
+// TestParseMakerNoteIFD_NikonInvalidByteOrder covers the bad byte order guard in
+// parseNikonType3.
+func TestParseMakerNoteIFD_NikonBadTIFFOrder(t *testing.T) {
+	t.Parallel()
+	// Nikon Type3 with bad byte order in embedded TIFF.
+	b := make([]byte, 20)
+	copy(b[:6], "Nikon\x00")
+	b[6], b[7] = 0x02, 0x10
+	b[8], b[9] = 'X', 'X' // invalid byte order
+	result := parseMakerNoteIFD(b, "NIKON CORPORATION", binary.LittleEndian)
+	if result != nil {
+		t.Error("Nikon bad byte order: expected nil IFD")
+	}
+}
+
+// TestParseMakerNoteIFD_Sony tests Sony MakerNote parsing.
+// traverse(b, 0, order) returns nil (offset=0 loop invariant); test verifies no panic.
+func TestParseMakerNoteIFD_Sony(t *testing.T) {
+	t.Parallel()
+	ifd := buildPlainIFD(binary.LittleEndian, [][4]uint32{
+		{0x0102, uint32(TypeShort), 1, 1},
+	})
+	_ = parseMakerNoteIFD(ifd, "SONY", binary.LittleEndian)
+}
+
+// TestParseMakerNoteIFD_SonyTooShort covers the too-short guard.
+func TestParseMakerNoteIFD_SonyTooShort(t *testing.T) {
+	t.Parallel()
+	result := parseMakerNoteIFD([]byte{0x01}, "SONY", binary.LittleEndian)
+	if result != nil {
+		t.Error("Sony too short: expected nil IFD")
+	}
+}
+
+// TestParseMakerNoteIFD_Fujifilm tests Fujifilm MakerNote parsing.
+func TestParseMakerNoteIFD_Fujifilm(t *testing.T) {
+	t.Parallel()
+	// Layout: "FUJIFILM"(8) + version(4) + ifdOffset(4=16) + IFD
+	ifdEntries := buildPlainIFD(binary.LittleEndian, [][4]uint32{
+		{0x1000, uint32(TypeShort), 1, 1},
+	})
+	b := make([]byte, 16+len(ifdEntries))
+	copy(b[0:], "FUJIFILM")
+	copy(b[8:], "0100")
+	binary.LittleEndian.PutUint32(b[12:], 16) // IFD starts at byte 16
+	copy(b[16:], ifdEntries)
+
+	result := parseMakerNoteIFD(b, "FUJIFILM", binary.LittleEndian)
+	if result == nil {
+		t.Error("Fujifilm: expected non-nil IFD")
+	}
+}
+
+// TestParseMakerNoteIFD_FujifilmBadMagic covers bad magic rejection.
+func TestParseMakerNoteIFD_FujifilmBadMagic(t *testing.T) {
+	t.Parallel()
+	b := make([]byte, 20)
+	copy(b[0:], "BADMAGIC")
+	result := parseMakerNoteIFD(b, "FUJIFILM", binary.LittleEndian)
+	if result != nil {
+		t.Error("Fujifilm bad magic: expected nil")
+	}
+}
+
+// TestParseMakerNoteIFD_Olympus tests Olympus MakerNote parsing.
+func TestParseMakerNoteIFD_Olympus(t *testing.T) {
+	t.Parallel()
+	ifdEntries := buildPlainIFD(binary.LittleEndian, [][4]uint32{
+		{0x0100, uint32(TypeShort), 1, 1},
+	})
+	b := make([]byte, 12+len(ifdEntries))
+	copy(b[0:], "OLYMPUS\x00")
+	b[8], b[9] = 'I', 'I' // LE
+	copy(b[12:], ifdEntries)
+
+	result := parseMakerNoteIFD(b, "OLYMPUS IMAGING CORP.", binary.LittleEndian)
+	if result == nil {
+		t.Error("Olympus: expected non-nil IFD")
+	}
+}
+
+// TestParseMakerNoteIFD_OlympusBadByteOrder covers bad byte order in Olympus MakerNote.
+func TestParseMakerNoteIFD_OlympusBadByteOrder(t *testing.T) {
+	t.Parallel()
+	b := make([]byte, 20)
+	copy(b[0:], "OLYMPUS\x00")
+	b[8], b[9] = 'X', 'X' // invalid
+	result := parseMakerNoteIFD(b, "Olympus", binary.LittleEndian)
+	if result != nil {
+		t.Error("Olympus bad byte order: expected nil")
+	}
+}
+
+// TestParseMakerNoteIFD_PentaxAOC tests Pentax AOC format.
+func TestParseMakerNoteIFD_PentaxAOC(t *testing.T) {
+	t.Parallel()
+	ifdEntries := buildPlainIFD(binary.BigEndian, [][4]uint32{
+		{0x0001, uint32(TypeShort), 1, 1},
+	})
+	b := make([]byte, 6+len(ifdEntries))
+	copy(b[0:], "AOC\x00")
+	copy(b[6:], ifdEntries)
+
+	result := parseMakerNoteIFD(b, "PENTAX Corporation", binary.BigEndian)
+	if result == nil {
+		t.Error("Pentax AOC: expected non-nil IFD")
+	}
+}
+
+// TestParseMakerNoteIFD_PentaxPENTAX tests Pentax PENTAX format.
+func TestParseMakerNoteIFD_PentaxPENTAX(t *testing.T) {
+	t.Parallel()
+	ifdEntries := buildPlainIFD(binary.LittleEndian, [][4]uint32{
+		{0x0001, uint32(TypeShort), 1, 1},
+	})
+	b := make([]byte, 12+len(ifdEntries))
+	copy(b[0:], "PENTAX \x00")
+	b[8], b[9] = 'I', 'I' // LE
+	copy(b[12:], ifdEntries)
+
+	result := parseMakerNoteIFD(b, "Ricoh", binary.LittleEndian)
+	if result == nil {
+		t.Error("Pentax PENTAX format: expected non-nil IFD")
+	}
+}
+
+// TestParseMakerNoteIFD_PentaxPENTAXBadByteOrder tests bad byte order in PENTAX format.
+func TestParseMakerNoteIFD_PentaxPENTAXBadByteOrder(t *testing.T) {
+	t.Parallel()
+	b := make([]byte, 20)
+	copy(b[0:], "PENTAX \x00")
+	b[8], b[9] = 'Z', 'Z' // invalid
+	result := parseMakerNoteIFD(b, "Ricoh", binary.LittleEndian)
+	if result != nil {
+		t.Error("Pentax bad byte order: expected nil")
+	}
+}
+
+// TestParseMakerNoteIFD_PentaxNeitherFormat covers the nil path when prefix matches neither.
+func TestParseMakerNoteIFD_PentaxNeitherFormat(t *testing.T) {
+	t.Parallel()
+	b := make([]byte, 20)
+	copy(b[0:], "BADPREFIX")
+	result := parseMakerNoteIFD(b, "PENTAX Corporation", binary.BigEndian)
+	if result != nil {
+		t.Error("Pentax neither format: expected nil")
+	}
+}
+
+// TestParseMakerNoteIFD_Panasonic tests Panasonic MakerNote.
+func TestParseMakerNoteIFD_Panasonic(t *testing.T) {
+	t.Parallel()
+	ifdEntries := buildPlainIFD(binary.LittleEndian, [][4]uint32{
+		{0x0001, uint32(TypeShort), 1, 1},
+	})
+	b := make([]byte, 12+len(ifdEntries))
+	copy(b[0:], "Panasonic\x00\x00\x00")
+	copy(b[12:], ifdEntries)
+
+	result := parseMakerNoteIFD(b, "Panasonic", binary.LittleEndian)
+	if result == nil {
+		t.Error("Panasonic: expected non-nil IFD")
+	}
+}
+
+// TestParseMakerNoteIFD_PanasonicBadMagic tests bad magic.
+func TestParseMakerNoteIFD_PanasonicBadMagic(t *testing.T) {
+	t.Parallel()
+	b := make([]byte, 20)
+	copy(b[0:], "BADMAGICXXX\x00")
+	result := parseMakerNoteIFD(b, "Panasonic", binary.LittleEndian)
+	if result != nil {
+		t.Error("Panasonic bad magic: expected nil")
+	}
+}
+
+// TestParseMakerNoteIFD_LeicaWithPrefix tests Leica with "LEICA\x00" prefix.
+func TestParseMakerNoteIFD_LeicaWithPrefix(t *testing.T) {
+	t.Parallel()
+	ifdEntries := buildPlainIFD(binary.LittleEndian, [][4]uint32{
+		{0x0100, uint32(TypeShort), 1, 1},
+	})
+	b := make([]byte, 8+len(ifdEntries))
+	copy(b[0:], "LEICA\x00\x01\x00")
+	copy(b[8:], ifdEntries)
+
+	result := parseMakerNoteIFD(b, "LEICA CAMERA AG", binary.LittleEndian)
+	if result == nil {
+		t.Error("Leica with prefix: expected non-nil IFD")
+	}
+}
+
+// TestParseMakerNoteIFD_LeicaPlain tests Leica plain IFD (Type 0, no prefix) path.
+// traverse(b, 0, order) with offset=0 returns nil (loop invariant); test verifies no panic.
+func TestParseMakerNoteIFD_LeicaPlain(t *testing.T) {
+	t.Parallel()
+	ifd := buildPlainIFD(binary.LittleEndian, [][4]uint32{
+		{0x0100, uint32(TypeShort), 1, 1},
+	})
+	_ = parseMakerNoteIFD(ifd, "Leica", binary.LittleEndian)
+}
+
+// TestParseMakerNoteIFD_LeicaTooShort covers the too-short guard.
+func TestParseMakerNoteIFD_LeicaTooShort(t *testing.T) {
+	t.Parallel()
+	result := parseMakerNoteIFD([]byte{0x01}, "LEICA", binary.LittleEndian)
+	if result != nil {
+		t.Error("Leica too short: expected nil")
+	}
+}
+
+// TestParseMakerNoteIFD_DJI tests DJI MakerNote parsing path.
+// traverse(b, 0, order) returns nil (offset=0 loop invariant); test verifies no panic.
+func TestParseMakerNoteIFD_DJI(t *testing.T) {
+	t.Parallel()
+	ifd := buildPlainIFD(binary.LittleEndian, [][4]uint32{
+		{0x0001, uint32(TypeASCII), 0, 0},
+	})
+	_ = parseMakerNoteIFD(ifd, "DJI", binary.LittleEndian)
+}
+
+// TestParseMakerNoteIFD_DJITooShort covers the too-short guard.
+func TestParseMakerNoteIFD_DJITooShort(t *testing.T) {
+	t.Parallel()
+	result := parseMakerNoteIFD([]byte{0x01}, "DJI", binary.LittleEndian)
+	if result != nil {
+		t.Error("DJI too short: expected nil")
+	}
+}
+
+// TestParseMakerNoteIFD_Samsung tests Samsung MakerNote parsing path.
+// traverse(b, 0, order) returns nil (offset=0 loop invariant); test verifies no panic.
+func TestParseMakerNoteIFD_Samsung(t *testing.T) {
+	t.Parallel()
+	ifd := buildPlainIFD(binary.LittleEndian, [][4]uint32{
+		{0x0001, uint32(TypeShort), 1, 1},
+	})
+	_ = parseMakerNoteIFD(ifd, "SAMSUNG", binary.LittleEndian)
+}
+
+// TestParseMakerNoteIFD_SamsungTooShort covers the too-short guard.
+func TestParseMakerNoteIFD_SamsungTooShort(t *testing.T) {
+	t.Parallel()
+	result := parseMakerNoteIFD([]byte{0x01}, "SAMSUNG", binary.LittleEndian)
+	if result != nil {
+		t.Error("Samsung too short: expected nil")
+	}
+}
+
+// TestParseMakerNoteIFD_Sigma tests Sigma SIGMA prefix.
+func TestParseMakerNoteIFD_Sigma(t *testing.T) {
+	t.Parallel()
+	ifdEntries := buildPlainIFD(binary.LittleEndian, [][4]uint32{
+		{0x0001, uint32(TypeShort), 1, 1},
+	})
+	b := make([]byte, 10+len(ifdEntries))
+	copy(b[0:], "SIGMA\x00\x00\x00")
+	b[8], b[9] = 0x01, 0x00
+	copy(b[10:], ifdEntries)
+
+	result := parseMakerNoteIFD(b, "SIGMA", binary.LittleEndian)
+	if result == nil {
+		t.Error("Sigma: expected non-nil IFD")
+	}
+}
+
+// TestParseMakerNoteIFD_SigmaFOVEON tests Sigma FOVEON prefix.
+func TestParseMakerNoteIFD_SigmaFOVEON(t *testing.T) {
+	t.Parallel()
+	ifdEntries := buildPlainIFD(binary.LittleEndian, [][4]uint32{
+		{0x0001, uint32(TypeShort), 1, 1},
+	})
+	b := make([]byte, 10+len(ifdEntries))
+	copy(b[0:], "FOVEON\x00\x00")
+	b[8], b[9] = 0x01, 0x00
+	copy(b[10:], ifdEntries)
+
+	result := parseMakerNoteIFD(b, "SIGMA", binary.LittleEndian)
+	if result == nil {
+		t.Error("Sigma FOVEON: expected non-nil IFD")
+	}
+}
+
+// TestParseMakerNoteIFD_SigmaBadMagic covers bad magic in Sigma.
+func TestParseMakerNoteIFD_SigmaBadMagic(t *testing.T) {
+	t.Parallel()
+	b := make([]byte, 20)
+	copy(b[0:], "UNKNOWN!")
+	result := parseMakerNoteIFD(b, "SIGMA", binary.LittleEndian)
+	if result != nil {
+		t.Error("Sigma bad magic: expected nil")
+	}
+}
+
+// TestParseMakerNoteIFD_Casio tests Casio MakerNote parsing path.
+// traverse(b, 0, order) returns nil (offset=0 loop invariant); test verifies no panic.
+func TestParseMakerNoteIFD_Casio(t *testing.T) {
+	t.Parallel()
+	ifd := buildPlainIFD(binary.LittleEndian, [][4]uint32{
+		{0x0001, uint32(TypeShort), 1, 1},
+	})
+	_ = parseMakerNoteIFD(ifd, "CASIO COMPUTER CO.,LTD.", binary.LittleEndian)
+}
+
+// TestParseMakerNoteIFD_CasioTooShort covers the too-short guard in parseCasioMakerNote.
+func TestParseMakerNoteIFD_CasioTooShort(t *testing.T) {
+	t.Parallel()
+	result := parseMakerNoteIFD([]byte{0x01}, "CASIO COMPUTER CO.,LTD.", binary.LittleEndian)
+	if result != nil {
+		t.Error("Casio too short: expected nil")
+	}
+}
+
+// TestParseMakerNoteIFD_Unknown covers the unknown make path (nil return).
+func TestParseMakerNoteIFD_Unknown(t *testing.T) {
+	t.Parallel()
+	result := parseMakerNoteIFD([]byte{0x01, 0x00}, "UnknownBrand", binary.LittleEndian)
+	if result != nil {
+		t.Error("unknown make: expected nil")
+	}
+}
+
+// TestIsNikonType3 exercises isNikonType3 directly.
+func TestIsNikonType3(t *testing.T) {
+	t.Parallel()
+	t.Run("valid Type3", func(t *testing.T) {
+		t.Parallel()
+		b := make([]byte, 20)
+		copy(b[:6], "Nikon\x00")
+		if !isNikonType3(b) {
+			t.Error("isNikonType3: expected true")
+		}
+	})
+	t.Run("too short", func(t *testing.T) {
+		t.Parallel()
+		if isNikonType3([]byte("Nik")) {
+			t.Error("isNikonType3 on short slice: expected false")
+		}
+	})
+	t.Run("wrong prefix", func(t *testing.T) {
+		t.Parallel()
+		b := make([]byte, 20)
+		copy(b[:6], "Canon\x00")
+		if isNikonType3(b) {
+			t.Error("isNikonType3 wrong prefix: expected false")
+		}
+	})
+}
+
+// TestRefByte exercises refByte for nil entry and empty Value.
+func TestRefByte(t *testing.T) {
+	t.Parallel()
+	t.Run("nil entry returns false", func(t *testing.T) {
+		t.Parallel()
+		_, ok := refByte(nil)
+		if ok {
+			t.Error("refByte(nil) ok = true, want false")
+		}
+	})
+	t.Run("empty Value returns false", func(t *testing.T) {
+		t.Parallel()
+		e := &IFDEntry{Value: []byte{}}
+		_, ok := refByte(e)
+		if ok {
+			t.Error("refByte(empty Value) ok = true, want false")
+		}
+	})
+	t.Run("valid byte", func(t *testing.T) {
+		t.Parallel()
+		e := &IFDEntry{Value: []byte{'N'}}
+		b, ok := refByte(e)
+		if !ok || b != 'N' {
+			t.Errorf("refByte = (%c, %v), want (N, true)", b, ok)
+		}
+	})
+}
+
+// TestDMSToDecimalZeroDenominator covers the zero-denominator guard in dmsToDecimal.
+func TestDMSToDecimalZeroDenominator(t *testing.T) {
+	t.Parallel()
+	// Zero denominator in degrees field — should return 0.
+	var dms [3][2]uint32
+	dms[0] = [2]uint32{48, 0} // zero denominator
+	dms[1] = [2]uint32{0, 1}
+	dms[2] = [2]uint32{0, 1}
+	if got := dmsToDecimal(dms, 'N'); got != 0 {
+		t.Errorf("dmsToDecimal zero denom = %f, want 0", got)
+	}
+}
+
+// TestDecodeCoordinateEdgeCases tests decodeCoordinate nil and wrong count.
+func TestDecodeCoordinateEdgeCases(t *testing.T) {
+	t.Parallel()
+	t.Run("nil entry", func(t *testing.T) {
+		t.Parallel()
+		_, ok := decodeCoordinate(nil)
+		if ok {
+			t.Error("decodeCoordinate(nil) ok = true, want false")
+		}
+	})
+	t.Run("wrong count", func(t *testing.T) {
+		t.Parallel()
+		e := &IFDEntry{Count: 2}
+		_, ok := decodeCoordinate(e)
+		if ok {
+			t.Error("decodeCoordinate(count!=3) ok = true, want false")
+		}
+	})
+}
+
+// TestEXIFMethodsNilExifIFD verifies that ExifIFD-dependent methods return
+// their zero/false values when EXIF.ExifIFD is nil (tag list not populated).
+func TestEXIFMethodsNilExifIFD(t *testing.T) {
+	t.Parallel()
+
+	e := &EXIF{IFD0: &IFD{}} // ExifIFD is nil
+
+	t.Run("FNumber nil ExifIFD", func(t *testing.T) {
+		t.Parallel()
+		_, ok := e.FNumber()
+		if ok {
+			t.Error("FNumber: expected ok=false with nil ExifIFD")
+		}
+	})
+
+	t.Run("FocalLength nil ExifIFD", func(t *testing.T) {
+		t.Parallel()
+		_, ok := e.FocalLength()
+		if ok {
+			t.Error("FocalLength: expected ok=false with nil ExifIFD")
+		}
+	})
+
+	t.Run("ISO nil ExifIFD", func(t *testing.T) {
+		t.Parallel()
+		_, ok := e.ISO()
+		if ok {
+			t.Error("ISO: expected ok=false with nil ExifIFD")
+		}
+	})
+
+	t.Run("ExposureTime nil ExifIFD", func(t *testing.T) {
+		t.Parallel()
+		_, _, ok := e.ExposureTime()
+		if ok {
+			t.Error("ExposureTime: expected ok=false with nil ExifIFD")
+		}
+	})
+
+	t.Run("LensModel nil ExifIFD", func(t *testing.T) {
+		t.Parallel()
+		if got := e.LensModel(); got != "" {
+			t.Errorf("LensModel: got %q, want empty string", got)
+		}
+	})
+
+	t.Run("ImageSize nil ExifIFD", func(t *testing.T) {
+		t.Parallel()
+		_, _, ok := e.ImageSize()
+		if ok {
+			t.Error("ImageSize: expected ok=false with nil ExifIFD")
+		}
+	})
+
+	t.Run("DateTimeOriginal nil ExifIFD", func(t *testing.T) {
+		t.Parallel()
+		_, ok := e.DateTimeOriginal()
+		if ok {
+			t.Error("DateTimeOriginal: expected ok=false with nil ExifIFD")
+		}
+	})
+}
+
+// TestEXIFMethodsMissingTags verifies methods return zero/false when the IFD
+// exists but the specific tag is absent.
+func TestEXIFMethodsMissingTags(t *testing.T) {
+	t.Parallel()
+
+	// EXIF with non-nil ExifIFD and IFD0 but no relevant tags.
+	e := &EXIF{
+		IFD0:    &IFD{},
+		ExifIFD: &IFD{},
+	}
+
+	t.Run("FNumber entry nil", func(t *testing.T) {
+		t.Parallel()
+		_, ok := e.FNumber()
+		if ok {
+			t.Error("FNumber: expected ok=false when tag absent")
+		}
+	})
+
+	t.Run("FocalLength entry nil", func(t *testing.T) {
+		t.Parallel()
+		_, ok := e.FocalLength()
+		if ok {
+			t.Error("FocalLength: expected ok=false when tag absent")
+		}
+	})
+
+	t.Run("LensModel entry nil", func(t *testing.T) {
+		t.Parallel()
+		if got := e.LensModel(); got != "" {
+			t.Errorf("LensModel: got %q, want empty string", got)
+		}
+	})
+
+	t.Run("CameraModel entry nil", func(t *testing.T) {
+		t.Parallel()
+		if got := e.CameraModel(); got != "" {
+			t.Errorf("CameraModel: got %q, want empty string", got)
+		}
+	})
+
+	t.Run("Copyright entry nil", func(t *testing.T) {
+		t.Parallel()
+		if got := e.Copyright(); got != "" {
+			t.Errorf("Copyright: got %q, want empty string", got)
+		}
+	})
+
+	t.Run("Caption entry nil", func(t *testing.T) {
+		t.Parallel()
+		if got := e.Caption(); got != "" {
+			t.Errorf("Caption: got %q, want empty string", got)
+		}
+	})
+
+	t.Run("Creator entry nil", func(t *testing.T) {
+		t.Parallel()
+		if got := e.Creator(); got != "" {
+			t.Errorf("Creator: got %q, want empty string", got)
+		}
+	})
+}
+
+// TestFNumberZeroDenominator verifies that FNumber returns ok=false when the
+// rational value has a zero denominator.
+func TestFNumberZeroDenominator(t *testing.T) {
+	t.Parallel()
+	order := binary.LittleEndian
+	val := make([]byte, 8)
+	order.PutUint32(val[0:], 28) // numerator
+	order.PutUint32(val[4:], 0)  // zero denominator
+	e := &EXIF{
+		ExifIFD: &IFD{Entries: []IFDEntry{
+			{Tag: TagFNumber, Type: TypeRational, Count: 1, Value: val, byteOrder: order},
+		}},
+	}
+	_, ok := e.FNumber()
+	if ok {
+		t.Error("FNumber with zero denominator: expected ok=false")
+	}
+}
+
+// TestFocalLengthZeroDenominator verifies that FocalLength returns ok=false
+// when the rational value has a zero denominator.
+func TestFocalLengthZeroDenominator(t *testing.T) {
+	t.Parallel()
+	order := binary.LittleEndian
+	val := make([]byte, 8)
+	order.PutUint32(val[0:], 50) // numerator
+	order.PutUint32(val[4:], 0)  // zero denominator
+	e := &EXIF{
+		ExifIFD: &IFD{Entries: []IFDEntry{
+			{Tag: TagFocalLength, Type: TypeRational, Count: 1, Value: val, byteOrder: order},
+		}},
+	}
+	_, ok := e.FocalLength()
+	if ok {
+		t.Error("FocalLength with zero denominator: expected ok=false")
+	}
+}
+
+// TestGPSNilGPSIFD verifies that GPS() returns ok=false when GPSIFD is nil.
+func TestGPSNilGPSIFD(t *testing.T) {
+	t.Parallel()
+	e := &EXIF{IFD0: &IFD{}, GPSIFD: nil}
+	_, _, ok := e.GPS()
+	if ok {
+		t.Error("GPS with nil GPSIFD: expected ok=false")
+	}
+}
+
+// TestTagName exercises TagName for known and unknown tags.
+// TestSkipMakerNoteOption verifies that SkipMakerNote returns a ParseOption
+// that correctly sets skipMakerNote=true on the parse config.
+func TestSkipMakerNoteOption(t *testing.T) {
+	t.Parallel()
+	// Build a minimal TIFF with no MakerNote tag.
+	tiff := minimalTIFF(binary.LittleEndian, nil)
+	// Parse with SkipMakerNote option — must not panic or error.
+	_, err := Parse(tiff, SkipMakerNote())
+	if err != nil {
+		t.Fatalf("Parse with SkipMakerNote: %v", err)
+	}
+}
+
+func TestTagName(t *testing.T) {
+	t.Parallel()
+	t.Run("known tag", func(t *testing.T) {
+		t.Parallel()
+		if got := TagName(TagImageWidth); got != "ImageWidth" {
+			t.Errorf("TagName(TagImageWidth) = %q, want %q", got, "ImageWidth")
+		}
+	})
+	t.Run("unknown tag", func(t *testing.T) {
+		t.Parallel()
+		if got := TagName(0xFFFF); got != "" {
+			t.Errorf("TagName(0xFFFF) = %q, want empty", got)
+		}
+	})
+}

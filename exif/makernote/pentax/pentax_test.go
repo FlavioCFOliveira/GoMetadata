@@ -256,6 +256,105 @@ func TestTagConstants(t *testing.T) {
 	}
 }
 
+// TestPentaxParse_PentaxPrefixBigEndian verifies that Parse correctly decodes
+// a PENTAX-prefix MakerNote with big-endian ('M','M') byte order marker.
+func TestPentaxParse_PentaxPrefixBigEndian(t *testing.T) {
+	t.Parallel()
+	// magic(8) + "MM"(2) + version(2) + count(2) + 1 entry(12) = 26 bytes
+	buf := make([]byte, 26)
+	copy(buf[0:8], magicPENTAX)
+	buf[8] = 'M'
+	buf[9] = 'M'
+	buf[10] = 0x00
+	buf[11] = 0x01 // version
+
+	// IFD at offset 12: 1 entry (BE).
+	binary.BigEndian.PutUint16(buf[12:14], 1)
+
+	// Entry: TagISO (0x0014), SHORT, count 1, value 400.
+	binary.BigEndian.PutUint16(buf[14:16], TagISO)
+	binary.BigEndian.PutUint16(buf[16:18], 3) // SHORT
+	binary.BigEndian.PutUint32(buf[18:22], 1)
+	binary.BigEndian.PutUint32(buf[22:26], 400)
+
+	p := Parser{}
+	result, err := p.Parse(buf)
+	if err != nil {
+		t.Fatalf("Parse PENTAX prefix BE: %v", err)
+	}
+	if result == nil {
+		t.Fatal("Parse PENTAX prefix BE: got nil, want non-nil")
+	}
+	if _, ok := result[TagISO]; !ok {
+		t.Error("TagISO not found in BE result")
+	}
+}
+
+// TestParsePentaxIFDEntryUnknownType verifies that parsePentaxIFDEntry returns
+// ok=false when the type code is unknown (typeSize16 returns 0).
+func TestParsePentaxIFDEntryUnknownType(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 12)
+	binary.BigEndian.PutUint16(buf[0:], 0x0014) // tag
+	binary.BigEndian.PutUint16(buf[2:], 0xFF)   // unknown type
+	binary.BigEndian.PutUint32(buf[4:], 1)      // count
+	_, _, ok := parsePentaxIFDEntry(buf, 0, true)
+	if ok {
+		t.Error("expected ok=false for unknown type, got true")
+	}
+}
+
+// TestParsePentaxIFDEntryOOBOffset verifies that parsePentaxIFDEntry returns
+// ok=false when the offset-based value extends beyond the buffer.
+func TestParsePentaxIFDEntryOOBOffset(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 12)
+	binary.BigEndian.PutUint16(buf[0:], 0x0014) // tag
+	binary.BigEndian.PutUint16(buf[2:], 2)      // ASCII type (size=1)
+	binary.BigEndian.PutUint32(buf[4:], 100)    // count=100 → offset-based
+	binary.BigEndian.PutUint32(buf[8:], 0xFFFF) // OOB offset
+	_, _, ok := parsePentaxIFDEntry(buf, 0, true)
+	if ok {
+		t.Error("expected ok=false for OOB offset, got true")
+	}
+}
+
+// TestParseIFDAtPentaxEntriesBeyondBuffer verifies that parseIFDAt returns nil
+// when the entry block extends beyond the buffer.
+func TestParseIFDAtPentaxEntriesBeyondBuffer(t *testing.T) {
+	t.Parallel()
+	// Build an AOC header (6 bytes for magic+version) + 2-byte count.
+	// count=5: needs 6+2+5*12=68 bytes, but provide only 8.
+	buf := make([]byte, 8)
+	copy(buf[0:4], magicAOC)
+	binary.BigEndian.PutUint16(buf[4:6], 0x0100) // version
+	binary.BigEndian.PutUint16(buf[6:8], 5)      // count=5, needs 60 more bytes
+	result := parseIFDAt(buf, 6, true)
+	if result != nil {
+		t.Errorf("expected nil for entries beyond buffer, got %v", result)
+	}
+}
+
+// TestPentaxTypeSizeAllBranches exercises every branch of typeSize16.
+func TestPentaxTypeSizeAllBranches(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		typ  uint16
+		want uint32
+	}{
+		{1, 1}, {2, 1}, {6, 1}, {7, 1},
+		{3, 2}, {8, 2},
+		{4, 4}, {9, 4}, {11, 4},
+		{5, 8}, {10, 8}, {12, 8},
+		{0, 0}, {99, 0},
+	}
+	for _, tc := range tests {
+		if got := typeSize16(tc.typ); got != tc.want {
+			t.Errorf("typeSize16(%d) = %d, want %d", tc.typ, got, tc.want)
+		}
+	}
+}
+
 func FuzzPentaxParse(f *testing.F) {
 	// Seeds: valid inputs.
 	f.Add(buildAOCMakerNote())

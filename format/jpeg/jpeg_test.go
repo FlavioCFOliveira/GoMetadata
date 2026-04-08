@@ -3,6 +3,8 @@ package jpeg
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"os"
 	"testing"
 )
@@ -791,6 +793,258 @@ func TestInjectStandaloneMarkerPassthrough(t *testing.T) {
 	}
 	if !found {
 		t.Error("RST0 standalone marker (0xFF 0xD0) not found in Inject output")
+	}
+}
+
+// --- parseIRB tests ---
+
+// TestParseIRBScanForward verifies that parseIRB scans forward past bytes that
+// don't form an "8BIM" signature, eventually finding the real block.
+func TestParseIRBScanForward(t *testing.T) {
+	t.Parallel()
+	// Build an IRB blob where the first few bytes are garbage (not "8BIM"),
+	// so parseIRB must scan forward to find the real entry.
+	iptcData := []byte{0x1C, 0x02, 0x78, 0x00, 0x03, 'A', 'B', 'C'}
+
+	var irb bytes.Buffer
+	irb.WriteString("JUNK") // 4 garbage bytes that don't form "8BIM"
+	irb.WriteString("8BIM")
+	irb.Write([]byte{0x04, 0x04}) // IPTC resource ID
+	irb.Write([]byte{0x00, 0x00}) // empty pascal name
+	var sz [4]byte
+	binary.BigEndian.PutUint32(sz[:], uint32(len(iptcData))) //nolint:gosec // G115: safe test helper
+	irb.Write(sz[:])
+	irb.Write(iptcData)
+
+	got := parseIRB(irb.Bytes())
+	if got == nil {
+		t.Fatal("parseIRB scan-forward: expected non-nil result")
+	}
+	if !bytes.Equal(got, iptcData) {
+		t.Errorf("parseIRB scan-forward: got %v, want %v", got, iptcData)
+	}
+}
+
+// TestParseIRBOddPaddedData verifies that parseIRB applies the even-padding
+// rule to data blocks with an odd length and still finds the next entry.
+func TestParseIRBOddPaddedData(t *testing.T) {
+	t.Parallel()
+	// First entry: resource ID 0x0400 (not IPTC), odd-length data → padded by 1 byte.
+	// Second entry: resource ID 0x0404 (IPTC), even-length data.
+	otherData := []byte{0xAA} // 1 byte, odd → needs 1 byte padding
+	iptcData := []byte{0x1C, 0x02}
+
+	var irb bytes.Buffer
+	writeIRBEntry := func(resourceID uint16, data []byte) {
+		irb.WriteString("8BIM")
+		irb.Write([]byte{byte(resourceID >> 8), byte(resourceID)}) //nolint:gosec // G115: safe: resourceID is a known small uint16
+		irb.Write([]byte{0x00, 0x00})                              // empty pascal name
+		var sz [4]byte
+		binary.BigEndian.PutUint32(sz[:], uint32(len(data))) //nolint:gosec // G115: safe test helper
+		irb.Write(sz[:])
+		irb.Write(data)
+		if len(data)%2 != 0 {
+			irb.WriteByte(0x00) // even-pad
+		}
+	}
+
+	writeIRBEntry(0x0400, otherData) // non-IPTC with odd-length data
+	writeIRBEntry(0x0404, iptcData)  // IPTC entry
+
+	got := parseIRB(irb.Bytes())
+	if got == nil {
+		t.Fatal("parseIRB odd-padded: expected non-nil result")
+	}
+	if !bytes.Equal(got, iptcData) {
+		t.Errorf("parseIRB odd-padded: got %v, want %v", got, iptcData)
+	}
+}
+
+// TestParseIRBTruncatedDataSize verifies that parseIRB returns nil for an entry
+// where the data size field would extend beyond the buffer.
+func TestParseIRBTruncatedDataSize(t *testing.T) {
+	t.Parallel()
+	// Build an 8BIM entry where dataSize=100 but the buffer only has 4 bytes after the size field.
+	var irb bytes.Buffer
+	irb.WriteString("8BIM")
+	irb.Write([]byte{0x04, 0x04}) // IPTC resource ID
+	irb.Write([]byte{0x00, 0x00}) // empty pascal name
+	var sz [4]byte
+	binary.BigEndian.PutUint32(sz[:], 100) // claims 100 bytes of data
+	irb.Write(sz[:])
+	irb.Write([]byte{0x01, 0x02}) // only 2 bytes — truncated
+
+	got := parseIRB(irb.Bytes())
+	if got != nil {
+		t.Errorf("parseIRB truncated: expected nil, got %v", got)
+	}
+}
+
+// TestParseIRBEntryMissingResourceIDField verifies that parseIRBEntry returns
+// ok=false when the buffer is too short to hold the resource ID after "8BIM".
+func TestParseIRBEntryMissingResourceIDField(t *testing.T) {
+	t.Parallel()
+	// Exactly "8BIM" with no following bytes for the resource ID.
+	buf := []byte("8BIM")
+	_, _, _, ok := parseIRBEntry(buf, 0)
+	if ok {
+		t.Error("expected ok=false when resource ID field is missing")
+	}
+}
+
+// TestWriteMarkerError verifies that writeMarker returns an error when the
+// writer fails.
+func TestWriteMarkerError(t *testing.T) {
+	t.Parallel()
+	err := writeMarker(errorWriter{}, 0xD9)
+	if err == nil {
+		t.Error("writeMarker: expected error from failing writer, got nil")
+	}
+}
+
+// TestWriteSegmentTooLarge verifies that writeSegment returns ErrSegmentTooLarge
+// when the payload exceeds the JPEG 16-bit length field limit.
+func TestWriteSegmentTooLarge(t *testing.T) {
+	t.Parallel()
+	// 65534 bytes of data + 2-byte length = 65536, which exceeds 65535.
+	hugePaylod := make([]byte, 65534)
+	var out bytes.Buffer
+	err := writeSegment(&out, 0xE1, hugePaylod)
+	if err == nil {
+		t.Error("writeSegment: expected ErrSegmentTooLarge, got nil")
+	}
+}
+
+// TestReadSegmentFillBytes verifies that readSegment correctly skips fill bytes
+// (consecutive 0xFF bytes before the marker byte).
+func TestReadSegmentFillBytes(t *testing.T) {
+	t.Parallel()
+	// Build: 0xFF 0xFF 0xFF 0xD9 (two fill bytes before EOI marker).
+	var buf bytes.Buffer
+	buf.Write([]byte{0xFF, 0xFF, 0xFF, 0xD9})
+	scratch := make([]byte, 4096)
+	marker, data, err := readSegment(&buf, &scratch)
+	if err != nil {
+		t.Fatalf("readSegment fill bytes: %v", err)
+	}
+	if marker != markerEOI {
+		t.Errorf("marker = 0x%02X, want 0x%02X (EOI)", marker, markerEOI)
+	}
+	if data != nil {
+		t.Errorf("data = %v, want nil for standalone marker", data)
+	}
+}
+
+// TestReadSegmentInvalidLength verifies that readSegment returns an error when
+// the length field is less than 2 (violates JPEG spec).
+func TestReadSegmentInvalidLength(t *testing.T) {
+	t.Parallel()
+	// Build: 0xFF 0xE1 (APP1) with length=1 (invalid; minimum is 2).
+	var buf bytes.Buffer
+	buf.Write([]byte{0xFF, 0xE1, 0x00, 0x01})
+	scratch := make([]byte, 4096)
+	_, _, err := readSegment(&buf, &scratch)
+	if err == nil {
+		t.Error("readSegment: expected error for length=1, got nil")
+	}
+}
+
+// TestSkipPascalStringEdgeCases exercises skipPascalString when the pos is at
+// or beyond the buffer end, and when nameLen requires padding.
+func TestSkipPascalStringEdgeCases(t *testing.T) {
+	t.Parallel()
+
+	t.Run("pos at end returns pos+1, false", func(t *testing.T) {
+		t.Parallel()
+		buf := []byte{0x05}
+		newPos, ok := skipPascalString(buf, 1) // pos == len(buf)
+		if ok {
+			t.Error("expected ok=false")
+		}
+		if newPos != 2 {
+			t.Errorf("newPos = %d, want 2", newPos)
+		}
+	})
+
+	t.Run("even-length name (no padding byte)", func(t *testing.T) {
+		t.Parallel()
+		// nameLen=2 → total = 1(len) + 2(name) = 3 (odd) → padded: total = 4
+		buf := []byte{0x02, 'A', 'B', 0x00} // length + 2 chars + pad
+		newPos, ok := skipPascalString(buf, 0)
+		if !ok {
+			t.Errorf("expected ok=true, got false")
+		}
+		_ = newPos
+	})
+}
+
+// errorWriter is a test helper that always returns an error on Write.
+type errorWriter struct{}
+
+func (errorWriter) Write(_ []byte) (int, error) {
+	return 0, errors.New("simulated write error")
+}
+
+// TestProcessAPP13PhotoshopPrefixNoIRB verifies that processAPP13Segment returns
+// nil when the data starts with the Photoshop prefix but contains no valid 8BIM
+// entries (parseIRB returns nil).
+func TestProcessAPP13PhotoshopPrefixNoIRB(t *testing.T) {
+	t.Parallel()
+	// "Photoshop 3.0\x00" followed by garbage that has no "8BIM" signature.
+	data := append(append([]byte{}, identPS...), []byte("GARBAGE_NO_BIM")...)
+	result := processAPP13Segment(data)
+	if result != nil {
+		t.Errorf("expected nil for Photoshop prefix with no 8BIM, got %v", result)
+	}
+}
+
+// TestWriteSOSCopyError verifies that writeSOS returns an error when
+// io.Copy fails (failing writer after SOS segment header is written).
+func TestWriteSOSCopyError(t *testing.T) {
+	t.Parallel()
+	// writeSOS with empty data calls writeSegment (1 Write: the 4-byte header),
+	// then io.Copy. failAfter=1 lets the header write succeed, then fails on copy.
+	ew := &countingWriter{failAfter: 1}
+	data := []byte{}
+	reader := bytes.NewReader([]byte{0x01, 0x02}) // some image data to copy
+	err := writeSOS(reader, ew, data)
+	if err == nil {
+		t.Error("expected error from writeSOS when io.Copy fails, got nil")
+	}
+}
+
+// countingWriter succeeds for the first failAfter writes, then fails.
+type countingWriter struct {
+	count     int
+	failAfter int
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	w.count++
+	if w.count > w.failAfter {
+		return 0, fmt.Errorf("simulated write error after %d writes", w.failAfter)
+	}
+	return len(p), nil
+}
+
+// TestCopyNonMetadataSegmentsReadError verifies that copyNonMetadataSegments
+// returns the non-EOF error when readSegment fails.
+func TestCopyNonMetadataSegmentsReadError(t *testing.T) {
+	t.Parallel()
+	// Build a valid JPEG SOI, then one APP0 segment, then truncated data.
+	// This will cause readSegment to return a non-EOF error.
+	var buf bytes.Buffer
+	// Write an APP0 marker with length=5 (2-byte length field = 5, but data only 3 bytes follow).
+	buf.Write([]byte{0xFF, 0xE0}) // APP0 marker
+	buf.Write([]byte{0x00, 0x05}) // length=5 means 3 bytes of data
+	buf.Write([]byte{0x00, 0x00}) // only 2 bytes — truncated
+
+	scratch := make([]byte, 0, 4096)
+	var out bytes.Buffer
+	err := copyNonMetadataSegments(bytes.NewReader(buf.Bytes()), &out, &scratch)
+	// The truncated read should produce an error (non-EOF, unexpected EOF).
+	if err == nil {
+		t.Error("expected error for truncated segment, got nil")
 	}
 }
 

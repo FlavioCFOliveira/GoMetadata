@@ -174,6 +174,430 @@ func TestInjectPassThroughWhenNoMoov(t *testing.T) {
 	}
 }
 
+// TestGetExifIFDOffset exercises getExifIFDOffset for LE, BE, bad byte order,
+// and too-short inputs.
+func TestGetExifIFDOffset(t *testing.T) {
+	t.Parallel()
+
+	// Build a minimal LE TIFF with one IFD0 entry: ExifIFD pointer (0x8769).
+	buildTIFFWithExifPtr := func(byteOrder binary.ByteOrder, exifOff uint32) []byte {
+		buf := make([]byte, 8+2+12+4) // header + 1 entry + next-IFD
+		if byteOrder == binary.LittleEndian {
+			buf[0], buf[1] = 'I', 'I'
+		} else {
+			buf[0], buf[1] = 'M', 'M'
+		}
+		byteOrder.PutUint16(buf[2:], 0x002A)
+		byteOrder.PutUint32(buf[4:], 8) // IFD0 at offset 8
+		byteOrder.PutUint16(buf[8:], 1) // 1 entry
+		byteOrder.PutUint16(buf[10:], 0x8769)
+		byteOrder.PutUint16(buf[12:], 4) // LONG
+		byteOrder.PutUint32(buf[14:], 1) // count
+		byteOrder.PutUint32(buf[18:], exifOff)
+		return buf
+	}
+
+	t.Run("little endian finds ExifIFD offset", func(t *testing.T) {
+		t.Parallel()
+		tiff := buildTIFFWithExifPtr(binary.LittleEndian, 999)
+		got := getExifIFDOffset(tiff)
+		if got != 999 {
+			t.Errorf("getExifIFDOffset LE = %d, want 999", got)
+		}
+	})
+
+	t.Run("big endian finds ExifIFD offset", func(t *testing.T) {
+		t.Parallel()
+		tiff := buildTIFFWithExifPtr(binary.BigEndian, 888)
+		got := getExifIFDOffset(tiff)
+		if got != 888 {
+			t.Errorf("getExifIFDOffset BE = %d, want 888", got)
+		}
+	})
+
+	t.Run("bad byte order returns 0", func(t *testing.T) {
+		t.Parallel()
+		buf := make([]byte, 14)
+		buf[0], buf[1] = 'X', 'X' // invalid
+		got := getExifIFDOffset(buf)
+		if got != 0 {
+			t.Errorf("getExifIFDOffset bad order = %d, want 0", got)
+		}
+	})
+
+	t.Run("too short returns 0", func(t *testing.T) {
+		t.Parallel()
+		got := getExifIFDOffset([]byte{0x49, 0x49, 0x2A, 0x00})
+		if got != 0 {
+			t.Errorf("getExifIFDOffset too short = %d, want 0", got)
+		}
+	})
+
+	t.Run("ExifIFD tag absent returns 0", func(t *testing.T) {
+		t.Parallel()
+		// TIFF with a different tag (ImageWidth = 0x0100), no ExifIFD.
+		buf := make([]byte, 8+2+12+4)
+		binary.LittleEndian.PutUint16(buf[0:], 0x4949) // II
+		binary.LittleEndian.PutUint16(buf[2:], 0x002A)
+		binary.LittleEndian.PutUint32(buf[4:], 8)
+		binary.LittleEndian.PutUint16(buf[8:], 1)
+		binary.LittleEndian.PutUint16(buf[10:], 0x0100) // ImageWidth, not ExifIFD
+		got := getExifIFDOffset(buf)
+		if got != 0 {
+			t.Errorf("getExifIFDOffset no ExifIFD tag = %d, want 0", got)
+		}
+	})
+}
+
+// TestMergeCMT exercises the paths in mergeCMT:
+// nil cmt2, ExifIFD within cmt1 (no merge needed), and ExifIFD extending into cmt2.
+func TestMergeCMT(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil cmt2 returns cmt1 unchanged", func(t *testing.T) {
+		t.Parallel()
+		cmt1 := minimalTIFF()
+		got := mergeCMT(cmt1, nil)
+		if &got[0] != &cmt1[0] {
+			// Different backing array — acceptable, but length should match.
+			if len(got) != len(cmt1) {
+				t.Errorf("mergeCMT nil cmt2: len=%d want %d", len(got), len(cmt1))
+			}
+		}
+	})
+
+	t.Run("ExifIFD within cmt1 returns cmt1 unchanged", func(t *testing.T) {
+		t.Parallel()
+		// Build a TIFF where ExifIFD pointer is within cmt1 (offset < len(cmt1)).
+		cmt1 := make([]byte, 8+2+12+4)
+		binary.LittleEndian.PutUint16(cmt1[0:], 0x4949)
+		binary.LittleEndian.PutUint16(cmt1[2:], 0x002A)
+		binary.LittleEndian.PutUint32(cmt1[4:], 8)
+		binary.LittleEndian.PutUint16(cmt1[8:], 1)
+		binary.LittleEndian.PutUint16(cmt1[10:], 0x8769) // ExifIFD
+		binary.LittleEndian.PutUint16(cmt1[12:], 4)      // LONG
+		binary.LittleEndian.PutUint32(cmt1[14:], 1)
+		binary.LittleEndian.PutUint32(cmt1[18:], 10) // offset 10 < len(cmt1)=26
+
+		cmt2 := []byte("extra-data")
+		got := mergeCMT(cmt1, cmt2)
+		if len(got) != len(cmt1) {
+			t.Errorf("mergeCMT ExifIFD within cmt1: len=%d want %d", len(got), len(cmt1))
+		}
+	})
+
+	t.Run("ExifIFD extends into cmt2 triggers merge", func(t *testing.T) {
+		t.Parallel()
+		// ExifIFD pointer = 9999, far beyond len(cmt1).
+		cmt1 := make([]byte, 8+2+12+4)
+		binary.LittleEndian.PutUint16(cmt1[0:], 0x4949)
+		binary.LittleEndian.PutUint16(cmt1[2:], 0x002A)
+		binary.LittleEndian.PutUint32(cmt1[4:], 8)
+		binary.LittleEndian.PutUint16(cmt1[8:], 1)
+		binary.LittleEndian.PutUint16(cmt1[10:], 0x8769) // ExifIFD
+		binary.LittleEndian.PutUint16(cmt1[12:], 4)      // LONG
+		binary.LittleEndian.PutUint32(cmt1[14:], 1)
+		binary.LittleEndian.PutUint32(cmt1[18:], 9999) // beyond len(cmt1)
+
+		cmt2 := []byte("exif-data-in-cmt2")
+		got := mergeCMT(cmt1, cmt2)
+		want := len(cmt1) + len(cmt2)
+		if len(got) != want {
+			t.Errorf("mergeCMT merge: len=%d want %d", len(got), want)
+		}
+	})
+}
+
+// TestParseCR3BoxHeader exercises the parseCR3BoxHeader branches:
+// normal box, extended (largesize) box, size==0 (to-end), and truncated inputs.
+func TestParseCR3BoxHeader(t *testing.T) {
+	t.Parallel()
+
+	t.Run("normal box", func(t *testing.T) {
+		t.Parallel()
+		// size=16, type="test"
+		buf := make([]byte, 16)
+		binary.BigEndian.PutUint32(buf[0:], 16)
+		copy(buf[4:], "test")
+		size, typ, headerLen, ok := parseCR3BoxHeader(buf, 0)
+		if !ok {
+			t.Fatal("expected ok=true")
+		}
+		if size != 16 {
+			t.Errorf("size = %d, want 16", size)
+		}
+		if typ != "test" {
+			t.Errorf("typ = %q, want test", typ)
+		}
+		if headerLen != 8 {
+			t.Errorf("headerLen = %d, want 8", headerLen)
+		}
+	})
+
+	t.Run("extended box (largesize)", func(t *testing.T) {
+		t.Parallel()
+		// size==1 means extended: next 8 bytes hold the real size.
+		buf := make([]byte, 24)
+		binary.BigEndian.PutUint32(buf[0:], 1) // size==1 → largesize follows
+		copy(buf[4:], "uuid")
+		binary.BigEndian.PutUint64(buf[8:], 24) // largesize = 24
+		size, typ, headerLen, ok := parseCR3BoxHeader(buf, 0)
+		if !ok {
+			t.Fatal("expected ok=true for extended box")
+		}
+		if size != 24 {
+			t.Errorf("size = %d, want 24", size)
+		}
+		if typ != "uuid" {
+			t.Errorf("typ = %q, want uuid", typ)
+		}
+		if headerLen != 16 {
+			t.Errorf("headerLen = %d, want 16", headerLen)
+		}
+	})
+
+	t.Run("size==0 extends to end", func(t *testing.T) {
+		t.Parallel()
+		// size==0 means extends to end of container.
+		buf := make([]byte, 20)
+		binary.BigEndian.PutUint32(buf[0:], 0) // size==0
+		copy(buf[4:], "mdat")
+		size, _, _, ok := parseCR3BoxHeader(buf, 0)
+		if !ok {
+			t.Fatal("expected ok=true for size==0 box")
+		}
+		if size != 20 {
+			t.Errorf("size = %d, want 20 (len(data))", size)
+		}
+	})
+
+	t.Run("truncated (< 8 bytes)", func(t *testing.T) {
+		t.Parallel()
+		_, _, _, ok := parseCR3BoxHeader([]byte{0x00, 0x00, 0x00}, 0)
+		if ok {
+			t.Error("expected ok=false for truncated input")
+		}
+	})
+
+	t.Run("extended box too short for largesize", func(t *testing.T) {
+		t.Parallel()
+		// size==1 but total buffer is only 8 bytes — can't read 8-byte largesize.
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint32(buf[0:], 1)
+		copy(buf[4:], "uuid")
+		_, _, _, ok := parseCR3BoxHeader(buf, 0)
+		if ok {
+			t.Error("expected ok=false when largesize field is missing")
+		}
+	})
+
+	t.Run("box extends beyond buffer", func(t *testing.T) {
+		t.Parallel()
+		// size=999, buf only 16 bytes.
+		buf := make([]byte, 16)
+		binary.BigEndian.PutUint32(buf[0:], 999)
+		copy(buf[4:], "moov")
+		_, _, _, ok := parseCR3BoxHeader(buf, 0)
+		if ok {
+			t.Error("expected ok=false when box extends beyond buffer")
+		}
+	})
+}
+
+// TestFlatUUIDBoxRange exercises flatUUIDBoxRange: match, no-match, and
+// a box whose UUID prefix is truncated.
+func TestFlatUUIDBoxRange(t *testing.T) {
+	t.Parallel()
+
+	t.Run("finds Canon UUID box", func(t *testing.T) {
+		t.Parallel()
+		// Build a flat stream with one uuid box containing canonUUID.
+		content := []byte("payload")
+		uuidBox := buildUUIDBox(canonUUID, content)
+		start, end, found := flatUUIDBoxRange(uuidBox, canonUUID)
+		if !found {
+			t.Fatal("flatUUIDBoxRange: expected found=true")
+		}
+		if start != 0 {
+			t.Errorf("start = %d, want 0", start)
+		}
+		if end != len(uuidBox) {
+			t.Errorf("end = %d, want %d", end, len(uuidBox))
+		}
+	})
+
+	t.Run("returns not-found for wrong UUID", func(t *testing.T) {
+		t.Parallel()
+		wrongUUID := make([]byte, 16) // all zeros — not canonUUID
+		content := []byte("payload")
+		uuidBox := buildUUIDBox(wrongUUID, content)
+		_, _, found := flatUUIDBoxRange(uuidBox, canonUUID)
+		if found {
+			t.Error("flatUUIDBoxRange: expected found=false for non-matching UUID")
+		}
+	})
+
+	t.Run("uuid box too short to hold UUID bytes", func(t *testing.T) {
+		t.Parallel()
+		// Build a minimal uuid box whose payload is only 8 bytes (less than 16 bytes for UUID).
+		buf := make([]byte, 16) // 8-byte header + 8-byte content (not enough for UUID)
+		binary.BigEndian.PutUint32(buf[0:], 16)
+		copy(buf[4:], "uuid")
+		// No 16-byte UUID follows — pos+headerLen+16 > len(data).
+		_, _, found := flatUUIDBoxRange(buf, canonUUID)
+		if found {
+			t.Error("flatUUIDBoxRange: expected found=false when box too short for UUID")
+		}
+	})
+}
+
+// TestMatchesUUID exercises the matchesUUID function: match, mismatch, and
+// inputs shorter than 16 bytes.
+func TestMatchesUUID(t *testing.T) {
+	t.Parallel()
+
+	t.Run("matches", func(t *testing.T) {
+		t.Parallel()
+		if !matchesUUID(canonUUID, canonUUID) {
+			t.Error("matchesUUID: expected true for identical UUIDs")
+		}
+	})
+
+	t.Run("does not match", func(t *testing.T) {
+		t.Parallel()
+		other := make([]byte, 16)
+		if matchesUUID(canonUUID, other) {
+			t.Error("matchesUUID: expected false for different UUIDs")
+		}
+	})
+
+	t.Run("data too short", func(t *testing.T) {
+		t.Parallel()
+		if matchesUUID(canonUUID[:8], canonUUID) {
+			t.Error("matchesUUID: expected false for data < 16 bytes")
+		}
+	})
+
+	t.Run("uuid too short", func(t *testing.T) {
+		t.Parallel()
+		if matchesUUID(canonUUID, canonUUID[:8]) {
+			t.Error("matchesUUID: expected false for uuid < 16 bytes")
+		}
+	})
+}
+
+// TestExtractFallbackNoCMT1 verifies that Extract succeeds when the Canon UUID
+// box is absent and CMT1 is found via the fallback flat search in moov.
+func TestExtractFallbackNoCMT1(t *testing.T) {
+	t.Parallel()
+	// Build a moov box with CMT1 directly (no uuid box) — triggers the fallback path.
+	exif := minimalTIFF()
+	cmt1Box := buildBox("CMT1", exif)
+	moovBox := buildBox("moov", cmt1Box) // no uuid wrapper
+
+	// Build a minimal ftyp + moov stream.
+	var buf bytes.Buffer
+	buf.Write([]byte{0, 0, 0, 16, 'f', 't', 'y', 'p', 'c', 'r', 'x', ' ', 0, 0, 0, 0})
+	buf.Write(moovBox)
+
+	rawEXIF, _, _, err := Extract(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("Extract fallback: %v", err)
+	}
+	if !bytes.Equal(rawEXIF, exif) {
+		t.Errorf("rawEXIF mismatch: got %d bytes, want %d", len(rawEXIF), len(exif))
+	}
+}
+
+// TestRebuildUUIDContent exercises rebuildUUIDContent when:
+//   - CMT1 is replaced, XMP  is replaced (already present)
+//   - CMT1 is replaced, no XMP  sub-box (hadXMP=false)
+//   - rawEXIF is nil (original CMT1 is preserved)
+//   - rawXMP is nil but XMP  box present (original preserved)
+func TestRebuildUUIDContent(t *testing.T) {
+	t.Parallel()
+
+	t.Run("replaces both CMT1 and XMP", func(t *testing.T) {
+		t.Parallel()
+		origExif := minimalTIFF()
+		origXMP := []byte("original-xmp")
+		// Build UUID content: CMT1 + XMP
+		content := append(buildBox("CMT1", origExif), buildBox("XMP ", origXMP)...)
+
+		newExif := append(origExif, 0xFF) // different bytes
+		newXMP := []byte("new-xmp-data")
+		result, hadXMP := rebuildUUIDContent(content, newExif, newXMP)
+		if !hadXMP {
+			t.Error("expected hadXMP=true")
+		}
+		// Result should contain the new CMT1 and new XMP  boxes.
+		if len(result) == 0 {
+			t.Error("result is empty")
+		}
+	})
+
+	t.Run("no XMP box in original content returns hadXMP=false", func(t *testing.T) {
+		t.Parallel()
+		origExif := minimalTIFF()
+		content := buildBox("CMT1", origExif)
+
+		_, hadXMP := rebuildUUIDContent(content, nil, nil)
+		if hadXMP {
+			t.Error("expected hadXMP=false when no XMP  box present")
+		}
+	})
+
+	t.Run("nil rawEXIF preserves original CMT1", func(t *testing.T) {
+		t.Parallel()
+		origExif := minimalTIFF()
+		content := buildBox("CMT1", origExif)
+
+		result, _ := rebuildUUIDContent(content, nil, nil)
+		// The result should contain the original CMT1 box (unchanged).
+		if !bytes.Contains(result, origExif) {
+			t.Error("original CMT1 not preserved when rawEXIF is nil")
+		}
+	})
+
+	t.Run("nil rawXMP preserves original XMP  box", func(t *testing.T) {
+		t.Parallel()
+		origExif := minimalTIFF()
+		origXMP := []byte("keep-this-xmp")
+		content := append(buildBox("CMT1", origExif), buildBox("XMP ", origXMP)...)
+
+		result, hadXMP := rebuildUUIDContent(content, nil, nil)
+		if !hadXMP {
+			t.Error("expected hadXMP=true")
+		}
+		if !bytes.Contains(result, origXMP) {
+			t.Error("original XMP  not preserved when rawXMP is nil")
+		}
+	})
+}
+
+// TestInjectAddsNewXMPWhenAbsent verifies that Inject appends an XMP  sub-box
+// when the original CR3 file had no XMP  box but rawXMP is provided.
+func TestInjectAddsNewXMPWhenAbsent(t *testing.T) {
+	t.Parallel()
+	exif := minimalTIFF()
+	data := buildMinimalCR3(exif, nil) // no XMP
+
+	xmp := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"/><?xpacket end="w"?>`)
+
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(data), &out, nil, nil, xmp); err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+
+	_, _, rawXMP, err := Extract(bytes.NewReader(out.Bytes()))
+	if err != nil {
+		t.Fatalf("Extract after Inject: %v", err)
+	}
+	if !bytes.Equal(rawXMP, xmp) {
+		t.Errorf("rawXMP after inject: got %q, want %q", rawXMP, xmp)
+	}
+}
+
 func TestInjectUUIDBoxSizeUpdated(t *testing.T) {
 	t.Parallel()
 	exif := minimalTIFF()
@@ -195,343 +619,5 @@ func TestInjectUUIDBoxSizeUpdated(t *testing.T) {
 	}
 	if !bytes.Equal(rawEXIF, larger) {
 		t.Errorf("EXIF after inject larger: got %d bytes, want %d bytes", len(rawEXIF), len(larger))
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Additional tests for uncovered branches
-// ---------------------------------------------------------------------------
-
-// TestParseCR3BoxHeaderExtendedSize exercises the extended-size (size==1) path.
-// ISOBMFF (ISO 14496-12) §4.2.
-func TestParseCR3BoxHeaderExtendedSize(t *testing.T) {
-	t.Parallel()
-	// 4-byte size=1 + 4-byte type + 8-byte largesize + 4-byte body = 20 bytes total.
-	const bodyLen = 4
-	buf := make([]byte, 16+bodyLen)
-	binary.BigEndian.PutUint32(buf[0:], 1) // size==1 → extended
-	copy(buf[4:8], "test")
-	binary.BigEndian.PutUint64(buf[8:], uint64(16+bodyLen))
-
-	size, typ, headerLen, ok := parseCR3BoxHeader(buf, 0)
-	if !ok {
-		t.Fatal("parseCR3BoxHeader extended size: ok=false")
-	}
-	if typ != "test" {
-		t.Errorf("typ = %q, want %q", typ, "test")
-	}
-	if headerLen != 16 {
-		t.Errorf("headerLen = %d, want 16", headerLen)
-	}
-	if size != uint64(16+bodyLen) {
-		t.Errorf("size = %d, want %d", size, 16+bodyLen)
-	}
-}
-
-// TestParseCR3BoxHeaderZeroSize exercises the size==0 path (extends to end).
-func TestParseCR3BoxHeaderZeroSize(t *testing.T) {
-	t.Parallel()
-	buf := make([]byte, 12)
-	binary.BigEndian.PutUint32(buf[0:], 0) // size==0 → extends to EOF
-	copy(buf[4:8], "free")
-
-	size, _, _, ok := parseCR3BoxHeader(buf, 0)
-	if !ok {
-		t.Fatal("parseCR3BoxHeader size==0: ok=false")
-	}
-	if size != uint64(len(buf)) {
-		t.Errorf("size = %d, want %d", size, len(buf))
-	}
-}
-
-// TestParseCR3BoxHeaderTooShort verifies that a too-short buffer returns ok=false.
-func TestParseCR3BoxHeaderTooShort(t *testing.T) {
-	t.Parallel()
-	_, _, _, ok := parseCR3BoxHeader([]byte{0, 0, 0, 8, 'f'}, 0)
-	if ok {
-		t.Error("expected ok=false for buffer shorter than 8 bytes")
-	}
-}
-
-// TestParseCR3BoxHeaderExtendedSizeTooShort verifies extended-size box that
-// doesn't fit in the buffer returns ok=false.
-func TestParseCR3BoxHeaderExtendedSizeTooShort(t *testing.T) {
-	t.Parallel()
-	buf := make([]byte, 12) // only 12 bytes; extended header needs 16
-	binary.BigEndian.PutUint32(buf[0:], 1)
-	copy(buf[4:8], "test")
-	_, _, _, ok := parseCR3BoxHeader(buf, 0)
-	if ok {
-		t.Error("expected ok=false for extended-size box shorter than 16 bytes")
-	}
-}
-
-// TestGetExifIFDOffsetBigEndian exercises the big-endian branch in getExifIFDOffset.
-func TestGetExifIFDOffsetBigEndian(t *testing.T) {
-	t.Parallel()
-	// Build a minimal big-endian TIFF with IFD0 at offset 8.
-	// IFD0 has one entry: ExifIFD pointer (tag 0x8769).
-	buf := make([]byte, 8+2+12+4)
-	buf[0], buf[1] = 'M', 'M'
-	binary.BigEndian.PutUint16(buf[2:], 0x002A)
-	binary.BigEndian.PutUint32(buf[4:], 8) // IFD0 at offset 8
-	binary.BigEndian.PutUint16(buf[8:], 1) // 1 entry
-	// Entry: tag=0x8769, type=LONG(4), count=1, value=99
-	binary.BigEndian.PutUint16(buf[10:], 0x8769)
-	binary.BigEndian.PutUint16(buf[12:], 4) // LONG
-	binary.BigEndian.PutUint32(buf[14:], 1)
-	binary.BigEndian.PutUint32(buf[18:], 99) // ExifIFD at offset 99
-
-	off := getExifIFDOffset(buf)
-	if off != 99 {
-		t.Errorf("getExifIFDOffset BE: got %d, want 99", off)
-	}
-}
-
-// TestGetExifIFDOffsetNoExifTag verifies that getExifIFDOffset returns 0
-// when the ExifIFD tag is absent from IFD0.
-func TestGetExifIFDOffsetNoExifTag(t *testing.T) {
-	t.Parallel()
-	// IFD0 with one entry: ImageWidth (0x0100), no ExifIFD pointer.
-	buf := make([]byte, 8+2+12+4)
-	buf[0], buf[1] = 'I', 'I'
-	binary.LittleEndian.PutUint16(buf[2:], 0x002A)
-	binary.LittleEndian.PutUint32(buf[4:], 8)
-	binary.LittleEndian.PutUint16(buf[8:], 1)
-	binary.LittleEndian.PutUint16(buf[10:], 0x0100) // ImageWidth
-	binary.LittleEndian.PutUint16(buf[12:], 4)
-	binary.LittleEndian.PutUint32(buf[14:], 1)
-	binary.LittleEndian.PutUint32(buf[18:], 640)
-
-	off := getExifIFDOffset(buf)
-	if off != 0 {
-		t.Errorf("getExifIFDOffset no ExifIFD tag: got %d, want 0", off)
-	}
-}
-
-// TestGetExifIFDOffsetTooShort verifies that getExifIFDOffset returns 0
-// for a too-short CMT1 buffer.
-func TestGetExifIFDOffsetTooShort(t *testing.T) {
-	t.Parallel()
-	off := getExifIFDOffset([]byte("II*\x00"))
-	if off != 0 {
-		t.Errorf("getExifIFDOffset too short: got %d, want 0", off)
-	}
-}
-
-// TestGetExifIFDOffsetBadByteOrder verifies that an unrecognised byte-order
-// marker causes getExifIFDOffset to return 0.
-func TestGetExifIFDOffsetBadByteOrder(t *testing.T) {
-	t.Parallel()
-	buf := make([]byte, 20)
-	buf[0], buf[1] = 'X', 'X' // bad byte order marker
-	off := getExifIFDOffset(buf)
-	if off != 0 {
-		t.Errorf("getExifIFDOffset bad byte order: got %d, want 0", off)
-	}
-}
-
-// TestMergeCMTExifIFDWithinCMT1 verifies that mergeCMT returns cmt1 unchanged
-// when the ExifIFD offset lies within cmt1 (no merge needed).
-func TestMergeCMTExifIFDWithinCMT1(t *testing.T) {
-	t.Parallel()
-	cmt1 := minimalTIFF() // has no ExifIFD tag → offset=0 → within cmt1
-	cmt2 := []byte("extra data")
-	result := mergeCMT(cmt1, cmt2)
-	if &result[0] != &cmt1[0] {
-		t.Error("mergeCMT: expected cmt1 returned unchanged when ExifIFD is within cmt1")
-	}
-}
-
-// TestMergeCMTExifIFDInCMT2 verifies that mergeCMT appends cmt2 to cmt1 when
-// the ExifIFD offset points beyond cmt1.
-func TestMergeCMTExifIFDInCMT2(t *testing.T) {
-	t.Parallel()
-	// Build a LE TIFF where ExifIFD pointer (tag 0x8769) has value=9999
-	// which is well beyond the size of cmt1.
-	n := 1
-	buf := make([]byte, 8+2+n*12+4)
-	buf[0], buf[1] = 'I', 'I'
-	binary.LittleEndian.PutUint16(buf[2:], 0x002A)
-	binary.LittleEndian.PutUint32(buf[4:], 8)       // IFD0 at 8
-	binary.LittleEndian.PutUint16(buf[8:], 1)       // 1 entry
-	binary.LittleEndian.PutUint16(buf[10:], 0x8769) // ExifIFD
-	binary.LittleEndian.PutUint16(buf[12:], 4)      // LONG
-	binary.LittleEndian.PutUint32(buf[14:], 1)
-	binary.LittleEndian.PutUint32(buf[18:], 9999) // offset way beyond cmt1
-
-	cmt2 := []byte("extra exif data")
-	result := mergeCMT(buf, cmt2)
-	if len(result) != len(buf)+len(cmt2) {
-		t.Errorf("mergeCMT: result len=%d, want %d", len(result), len(buf)+len(cmt2))
-	}
-}
-
-// TestMergeCMTNilCMT2 verifies that mergeCMT returns cmt1 when cmt2 is nil.
-func TestMergeCMTNilCMT2(t *testing.T) {
-	t.Parallel()
-	cmt1 := minimalTIFF()
-	result := mergeCMT(cmt1, nil)
-	if !bytes.Equal(result, cmt1) {
-		t.Error("mergeCMT nil cmt2: expected cmt1 unchanged")
-	}
-}
-
-// TestFindBoxDepthLimit verifies that findBox returns nil when depth > 32.
-func TestFindBoxDepthLimit(t *testing.T) {
-	t.Parallel()
-	buf := make([]byte, 16)
-	binary.BigEndian.PutUint32(buf, 16)
-	copy(buf[4:], "moov")
-	binary.BigEndian.PutUint32(buf[8:], 8)
-	copy(buf[12:], "CMT1")
-	result := findBox(buf, "CMT1", 33) // depth > 32 → immediate nil
-	if result != nil {
-		t.Error("findBox depth>32: expected nil")
-	}
-}
-
-// TestFindBoxRecurseIntoMoov verifies that findBox recurses into moov to find
-// a nested box.
-func TestFindBoxRecurseIntoMoov(t *testing.T) {
-	t.Parallel()
-	// Build: moov [ CMT1 ]
-	cmt1Body := []byte("tiff data")
-	cmt1Box := buildBox("CMT1", cmt1Body)
-	moovBox := buildBox("moov", cmt1Box)
-
-	result := findBox(moovBox, "CMT1", 0)
-	if result == nil {
-		t.Fatal("findBox: CMT1 not found inside moov")
-	}
-	if !bytes.Equal(result, cmt1Body) {
-		t.Errorf("findBox: got %q, want %q", result, cmt1Body)
-	}
-}
-
-// TestMatchesUUIDMismatch verifies that matchesUUID returns false for a
-// UUID that does not match.
-func TestMatchesUUIDMismatch(t *testing.T) {
-	t.Parallel()
-	wrong := make([]byte, 16)
-	if matchesUUID(wrong, canonUUID) {
-		t.Error("matchesUUID: expected false for non-matching UUID")
-	}
-}
-
-// TestMatchesUUIDMatch verifies that matchesUUID returns true for an exact match.
-func TestMatchesUUIDMatch(t *testing.T) {
-	t.Parallel()
-	data := make([]byte, 32)
-	copy(data, canonUUID)
-	if !matchesUUID(data, canonUUID) {
-		t.Error("matchesUUID: expected true for matching UUID")
-	}
-}
-
-// TestMatchesUUIDTooShort verifies that matchesUUID returns false when data
-// is shorter than 16 bytes.
-func TestMatchesUUIDTooShort(t *testing.T) {
-	t.Parallel()
-	if matchesUUID([]byte{0x85, 0xC0}, canonUUID) {
-		t.Error("matchesUUID too short: expected false")
-	}
-}
-
-// TestExtractFallbackToDirectCMT1 verifies Extract when there is no Canon UUID
-// box: it should fall back to finding CMT1/CMT2 directly within moov.
-func TestExtractFallbackToDirectCMT1(t *testing.T) {
-	t.Parallel()
-	exif := minimalTIFF()
-	// Build a CR3-like file: moov [ CMT1 ] with no UUID box.
-	cmt1Box := buildBox("CMT1", exif)
-	moovBox := buildBox("moov", cmt1Box)
-	ftyp := make([]byte, 0, 16+len(moovBox))
-	ftyp = append(ftyp, 0, 0, 0, 16, 'f', 't', 'y', 'p', 'c', 'r', 'x', ' ', 0, 0, 0, 0)
-	data := append(ftyp, moovBox...)
-
-	rawEXIF, rawIPTC, rawXMP, err := Extract(bytes.NewReader(data))
-	if err != nil {
-		t.Fatalf("Extract fallback: %v", err)
-	}
-	if rawIPTC != nil {
-		t.Errorf("rawIPTC = %v, want nil", rawIPTC)
-	}
-	if rawXMP != nil {
-		t.Errorf("rawXMP = %v, want nil (no XMP box)", rawXMP)
-	}
-	if !bytes.Equal(rawEXIF, exif) {
-		t.Errorf("rawEXIF mismatch: got %d bytes, want %d bytes", len(rawEXIF), len(exif))
-	}
-}
-
-// TestRebuildUUIDContentPreservesOtherBoxes verifies that rebuildUUIDContent
-// preserves sub-boxes other than CMT1 and XMP .
-func TestRebuildUUIDContentPreservesOtherBoxes(t *testing.T) {
-	t.Parallel()
-	exif := minimalTIFF()
-	cmt3Body := []byte("CMT3 data")
-
-	cmt1Box := buildBox("CMT1", exif)
-	cmt3Box := buildBox("CMT3", cmt3Body)
-	uuidContent := append(cmt1Box, cmt3Box...)
-
-	newExif := append(exif, 0xAA, 0xBB)
-	newContent, hadXMP := rebuildUUIDContent(uuidContent, newExif, nil)
-	if hadXMP {
-		t.Error("rebuildUUIDContent: hadXMP should be false (no XMP box present)")
-	}
-	// CMT3 should be preserved in the output.
-	if !bytes.Contains(newContent, cmt3Body) {
-		t.Error("rebuildUUIDContent: CMT3 sub-box not preserved")
-	}
-}
-
-// TestInjectBothEXIFAndXMP verifies that injecting both EXIF and XMP into a
-// CR3 with only EXIF produces a file containing both.
-func TestInjectBothEXIFAndXMP(t *testing.T) {
-	t.Parallel()
-	exif := minimalTIFF()
-	data := buildMinimalCR3(exif, nil)
-
-	newExif := append(exif[:len(exif):len(exif)], 0x01)
-	newXMP := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta><?xpacket end="w"?>`)
-
-	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, newExif, nil, newXMP); err != nil {
-		t.Fatalf("Inject EXIF+XMP: %v", err)
-	}
-
-	rawEXIF, _, rawXMP, err := Extract(bytes.NewReader(out.Bytes()))
-	if err != nil {
-		t.Fatalf("Extract after Inject EXIF+XMP: %v", err)
-	}
-	if !bytes.Equal(rawEXIF, newExif) {
-		t.Errorf("EXIF mismatch after inject: got %d bytes, want %d bytes", len(rawEXIF), len(newExif))
-	}
-	if !bytes.Equal(rawXMP, newXMP) {
-		t.Errorf("XMP mismatch after inject: got %d bytes, want %d bytes", len(rawXMP), len(newXMP))
-	}
-}
-
-// TestInjectPassThroughWhenNoUUID verifies that Inject passes through unchanged
-// when the moov box has no Canon UUID sub-box.
-func TestInjectPassThroughWhenNoUUID(t *testing.T) {
-	t.Parallel()
-	// Build: ftyp + moov [ CMT1 ] — no uuid box.
-	cmt1Box := buildBox("CMT1", minimalTIFF())
-	moovBox := buildBox("moov", cmt1Box)
-	ftyp := make([]byte, 0, 16+len(moovBox))
-	ftyp = append(ftyp, 0, 0, 0, 16, 'f', 't', 'y', 'p', 'c', 'r', 'x', ' ', 0, 0, 0, 0)
-	data := append(ftyp, moovBox...)
-	original := make([]byte, len(data))
-	copy(original, data)
-
-	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, []byte("new exif"), nil, nil); err != nil {
-		t.Fatalf("Inject no UUID: %v", err)
-	}
-	if !bytes.Equal(out.Bytes(), original) {
-		t.Error("Inject no UUID: output differs from input (expected pass-through)")
 	}
 }

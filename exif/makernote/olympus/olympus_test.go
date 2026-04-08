@@ -205,6 +205,96 @@ func TestTagConstants(t *testing.T) {
 	}
 }
 
+// TestOlympusTypeSize16AllBranches exercises every branch of typeSize16.
+func TestOlympusTypeSize16AllBranches(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		typ  uint16
+		want uint32
+	}{
+		{1, 1}, {2, 1}, {6, 1}, {7, 1},
+		{3, 2}, {8, 2},
+		{4, 4}, {9, 4}, {11, 4},
+		{5, 8}, {10, 8}, {12, 8},
+		{0, 0}, {99, 0},
+	}
+	for _, tc := range tests {
+		if got := typeSize16(tc.typ); got != tc.want {
+			t.Errorf("typeSize16(%d) = %d, want %d", tc.typ, got, tc.want)
+		}
+	}
+}
+
+// TestParseOlympusIFDEntryUnknownType verifies that parseOlympusIFDEntry returns
+// ok=false when the type code is unknown (typeSize16 returns 0).
+func TestParseOlympusIFDEntryUnknownType(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 12)
+	binary.LittleEndian.PutUint16(buf[0:], 0x0207) // tag
+	binary.LittleEndian.PutUint16(buf[2:], 0xFF)   // unknown type
+	binary.LittleEndian.PutUint32(buf[4:], 1)      // count
+	_, _, ok := parseOlympusIFDEntry(buf, 0, false)
+	if ok {
+		t.Error("expected ok=false for unknown type, got true")
+	}
+}
+
+// TestParseOlympusIFDEntryOOBOffset verifies that parseOlympusIFDEntry returns
+// ok=false when the offset-based value extends beyond the buffer.
+func TestParseOlympusIFDEntryOOBOffset(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 12)
+	binary.LittleEndian.PutUint16(buf[0:], 0x0207) // tag
+	binary.LittleEndian.PutUint16(buf[2:], 2)      // ASCII type (size=1)
+	binary.LittleEndian.PutUint32(buf[4:], 100)    // count=100 → offset-based
+	binary.LittleEndian.PutUint32(buf[8:], 0xFFFF) // OOB offset
+	_, _, ok := parseOlympusIFDEntry(buf, 0, false)
+	if ok {
+		t.Error("expected ok=false for OOB offset, got true")
+	}
+}
+
+// TestParseIFDAtOlympusCountTooHigh verifies that parseIFDAt returns nil
+// when the IFD entry count exceeds the 512-entry sanity limit.
+func TestParseIFDAtOlympusCountTooHigh(t *testing.T) {
+	t.Parallel()
+	// Build a minimal Olympus MakerNote header (12 bytes) + 2 bytes for count.
+	buf := make([]byte, 14)
+	copy(buf[0:8], magicType2)
+	buf[8] = 'I'
+	buf[9] = 'I'
+	// IFD at offset 12: set count=600 > 512.
+	binary.LittleEndian.PutUint16(buf[12:], 600)
+	result := parseIFDAt(buf, 12, false)
+	if result != nil {
+		t.Errorf("expected nil for count=600, got %v", result)
+	}
+}
+
+// TestParseIFDAtOlympusOffsetOutOfBounds verifies that parseIFDAt returns nil
+// when offset+2 > len(b) (offset too close to end of buffer).
+func TestParseIFDAtOlympusOffsetOutOfBounds(t *testing.T) {
+	t.Parallel()
+	buf := make([]byte, 13) // only 1 byte after offset 12
+	result := parseIFDAt(buf, 12, false)
+	if result != nil {
+		t.Errorf("expected nil for offset OOB, got %v", result)
+	}
+}
+
+// TestParseIFDAtOlympusEntriesBeyondBuffer verifies that parseIFDAt returns nil
+// when count is valid but the entries extend beyond the buffer.
+func TestParseIFDAtOlympusEntriesBeyondBuffer(t *testing.T) {
+	t.Parallel()
+	// count=5, needs 2+5*12=62 bytes from offset 12, but buffer is only 14 bytes.
+	buf := make([]byte, 14)
+	binary.LittleEndian.PutUint16(buf[12:], 5) // count=5
+	result := parseIFDAt(buf, 12, false)
+	if result != nil {
+		t.Errorf("expected nil for entries beyond buffer, got %v", result)
+	}
+}
+
 func FuzzOlympusParse(f *testing.F) {
 	// Seeds: valid inputs.
 	f.Add(buildOlympusMakerNote())
