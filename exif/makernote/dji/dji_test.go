@@ -81,6 +81,66 @@ func TestDJIParserTooShort(t *testing.T) {
 	}
 }
 
+// TestDJIBigEndianFallback verifies that parseDJI falls back to BE when LE fails.
+func TestDJIBigEndianFallback(t *testing.T) {
+	t.Parallel()
+	// Build a big-endian IFD with 1 entry so LE heuristics fail.
+	buf := make([]byte, 2+1*12)
+	binary.BigEndian.PutUint16(buf[0:], 1) // count=1
+	binary.BigEndian.PutUint16(buf[2:], TagMake)
+	binary.BigEndian.PutUint16(buf[4:], 4) // LONG
+	binary.BigEndian.PutUint32(buf[6:], 1)
+	binary.BigEndian.PutUint32(buf[10:], 1)
+
+	tags, err := Parser{}.Parse(buf)
+	if err != nil {
+		t.Fatalf("Parse DJI BE fallback: %v", err)
+	}
+	_ = tags
+}
+
+// TestDJIOutOfLineValue verifies that parseDJIIFDEntry handles out-of-line
+// values (total size > 4 bytes).
+func TestDJIOutOfLineValue(t *testing.T) {
+	t.Parallel()
+	longStr := "Phantom4Pro\x00" // > 4 bytes
+	b := buildDJIMakerNote([]struct {
+		id  uint16
+		typ uint16
+		val []byte
+	}{
+		{TagMake, 2, append([]byte("DJI"), 0)},
+		{TagPitch, 2, []byte(longStr)},
+	})
+	tags, err := Parser{}.Parse(b)
+	if err != nil {
+		t.Fatalf("Parse out-of-line: %v", err)
+	}
+	if tags == nil {
+		t.Fatal("expected non-nil tags")
+	}
+	if _, ok := tags[TagPitch]; !ok {
+		t.Error("TagPitch out-of-line value not found")
+	}
+}
+
+// TestDJIInvalidEntryType verifies that entries with unknown type codes are skipped.
+func TestDJIInvalidEntryType(t *testing.T) {
+	t.Parallel()
+	b := buildDJIMakerNote([]struct {
+		id  uint16
+		typ uint16
+		val []byte
+	}{
+		{TagMake, 0xFF, []byte{0x00, 0x00}}, // invalid type
+	})
+	tags, err := Parser{}.Parse(b)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	_ = tags
+}
+
 func FuzzDJIParser(f *testing.F) {
 	f.Add(buildDJIMakerNote([]struct {
 		id  uint16

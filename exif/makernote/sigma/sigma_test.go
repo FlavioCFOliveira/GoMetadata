@@ -109,6 +109,66 @@ func TestSigmaParserBadMagic(t *testing.T) {
 	}
 }
 
+// TestSigmaParserTooShort verifies that a too-short payload returns nil.
+func TestSigmaParserTooShort(t *testing.T) {
+	t.Parallel()
+	tags, err := Parser{}.Parse([]byte("SHORT"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if tags != nil {
+		t.Error("expected nil for too-short input")
+	}
+}
+
+// TestSigmaOutOfLineValue verifies that parseSigmaIFDEntry handles out-of-line
+// ASCII values correctly.
+func TestSigmaOutOfLineValue(t *testing.T) {
+	t.Parallel()
+	longStr := "DetailedExposureMode\x00" // > 4 bytes
+	b := buildSigmaMakerNote([]struct {
+		id  uint16
+		typ uint16
+		val []byte
+	}{
+		{TagExposureMode, 2, []byte(longStr)},
+	})
+	tags, err := Parser{}.Parse(b)
+	if err != nil {
+		t.Fatalf("Parse out-of-line: %v", err)
+	}
+	if tags == nil {
+		t.Fatal("expected non-nil tags for out-of-line value")
+	}
+	v, ok := tags[TagExposureMode]
+	if !ok {
+		t.Fatal("TagExposureMode not found")
+	}
+	if string(v) != longStr {
+		t.Errorf("value = %q, want %q", v, longStr)
+	}
+}
+
+// TestSigmaInvalidEntryType verifies that entries with unknown types are skipped.
+func TestSigmaInvalidEntryType(t *testing.T) {
+	t.Parallel()
+	b := buildSigmaMakerNote([]struct {
+		id  uint16
+		typ uint16
+		val []byte
+	}{
+		{TagWhiteBalance, 0xFF, []byte{0x00, 0x00}}, // invalid type
+	})
+	tags, err := Parser{}.Parse(b)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Zero valid entries → nil result.
+	if tags != nil {
+		t.Errorf("expected nil for all-invalid-type entries, got %v", tags)
+	}
+}
+
 func FuzzSigmaParser(f *testing.F) {
 	f.Add(buildSigmaMakerNote([]struct {
 		id  uint16
