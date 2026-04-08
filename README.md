@@ -129,6 +129,137 @@ blank.SetCameraModel("Custom Device")
 blank.SetCopyright("2024 Example Corp")
 ```
 
+## Examples
+
+### Reading RAW file metadata
+
+[`examples/raw-inspector`](examples/raw-inspector/main.go) — extract camera identification, shooting parameters, GPS, and descriptive fields from any RAW format (CR2, CR3, NEF, ARW, DNG, ORF, RW2). Format is detected automatically from magic bytes.
+
+```go
+// WithoutMakerNote skips the costliest part of EXIF parsing —
+// the manufacturer-specific IFD — when only standard tags are needed.
+m, err := gometadata.ReadFile(path, gometadata.WithoutMakerNote())
+
+fmt.Printf("Format:      %s\n",     m.Format())
+fmt.Printf("Make/Model:  %s %s\n",  m.Make(), m.CameraModel())
+fmt.Printf("Lens:        %s\n",     m.LensModel())
+
+if num, den, ok := m.ExposureTime(); ok { fmt.Printf("Shutter: 1/%d s\n", den/num) }
+if f, ok := m.FNumber();             ok { fmt.Printf("Aperture: f/%.1f\n", f) }
+if iso, ok := m.ISO();               ok { fmt.Printf("ISO: %d\n", iso) }
+if fl, ok := m.FocalLength();        ok { fmt.Printf("Focal: %.0f mm\n", fl) }
+if wb, ok := m.WhiteBalance();       ok { fmt.Printf("WB: %d\n", wb) }   // 0=auto 1=manual
+if fl, ok := m.Flash();              ok { fmt.Printf("Flash fired: %v\n", fl&0x01 != 0) }
+if lat, lon, ok := m.GPS();          ok { fmt.Printf("GPS: %.6f, %.6f\n", lat, lon) }
+if alt, ok := m.Altitude();          ok { fmt.Printf("Altitude: %.1f m\n", alt) }
+```
+
+---
+
+### Batch copyright stamping
+
+[`examples/copyright-stamp`](examples/copyright-stamp/main.go) — walk a directory tree and embed copyright, creator, caption, and keywords into every image. Setters write to all non-nil metadata components (EXIF, IPTC, XMP) in one call.
+
+```go
+m, err := gometadata.ReadFile(path)
+// Distinguish corrupt / truncated files from hard I/O errors.
+var corrupt *gometadata.CorruptMetadataError
+var truncated *gometadata.TruncatedFileError
+switch {
+case errors.As(err, &corrupt):   /* skip */
+case errors.As(err, &truncated): /* skip */
+}
+
+// Each setter writes to all non-nil metadata layers simultaneously:
+// SetCopyright → EXIF tag 0x8298 + IPTC dataset 2:116 + XMP dc:rights
+m.SetCopyright("© 2025 Jane Smith. All rights reserved.")
+m.SetCreator("Jane Smith")
+m.SetCaption("Grand Canyon at sunset")
+m.SetKeywords([]string{"landscape", "canyon", "arizona"})
+
+gometadata.WriteFile(path, m) // atomic: temp file + rename
+```
+
+---
+
+### Stream pipeline (no disk I/O)
+
+[`examples/stream-transcode`](examples/stream-transcode/main.go) — read metadata from `stdin`, update fields, write to `stdout`. No temporary files. Works with any `io.ReadSeeker` and `io.Writer` — `net/http`, `bytes.Buffer`, object-store streams.
+
+```go
+m, err := gometadata.Read(os.Stdin)  // *os.File implements io.ReadSeeker
+
+m.SetCaption("...")
+m.SetGPS(48.8566, 2.3522) // Paris
+
+// Seek back so Write can re-read the original image bytes from the same handle.
+os.Stdin.Seek(0, io.SeekStart)
+
+// PreserveUnknownSegments passes APP/chunk segments the library
+// does not recognise through byte-for-byte (e.g. ICC profiles).
+gometadata.Write(os.Stdin, os.Stdout, m, gometadata.PreserveUnknownSegments(true))
+```
+
+```sh
+stream-transcode -caption "Night shot" -copyright "2025 J. Smith" < input.jpg > output.jpg
+```
+
+---
+
+### JSON metadata export
+
+[`examples/gallery-sidecar`](examples/gallery-sidecar/main.go) — parse images and emit a JSON array for static site generators, search indexes, or API responses. Optional fields use Go pointer types so absent values serialise as `null`.
+
+```go
+type imageRecord struct {
+    File        string   `json:"file"`
+    Format      string   `json:"format"`
+    Model       *string  `json:"model,omitempty"`
+    CapturedAt  *string  `json:"captured_at,omitempty"` // RFC3339
+    Latitude    *float64 `json:"latitude,omitempty"`
+    Longitude   *float64 `json:"longitude,omitempty"`
+    ISO         *uint    `json:"iso,omitempty"`
+    // ...
+}
+
+m, _ := gometadata.ReadFile(path, gometadata.WithoutMakerNote())
+rec := imageRecord{File: path, Format: m.Format().String()}
+if t, ok := m.DateTimeOriginal(); ok { s := t.Format(time.RFC3339); rec.CapturedAt = &s }
+if lat, lon, ok := m.GPS();       ok { rec.Latitude = &lat; rec.Longitude = &lon }
+if iso, ok := m.ISO();            ok { rec.ISO = &iso }
+```
+
+```sh
+gallery-sidecar -pretty photo1.jpg photo2.nef photo3.heic
+```
+
+---
+
+### Multi-format round-trip smoke test
+
+[`examples/multi-format-roundtrip`](examples/multi-format-roundtrip/main.go) — read, modify, write, and re-read across all supported formats. Exits non-zero on any mismatch. Useful as a pre-release integration test.
+
+```go
+m, _ := gometadata.ReadFile(path)
+
+// Check format before writing — not all container variants support write.
+if !format.SupportsWrite(m.Format()) { /* skip */ }
+
+m.SetCaption("roundtrip-test")
+m.SetGPS(51.5074, -0.1278)
+
+tmp, _ := os.CreateTemp(filepath.Dir(path), "roundtrip-*"+ext)
+defer os.Remove(tmp.Name())
+
+gometadata.WriteFile(tmp.Name(), m)
+
+m2, _ := gometadata.ReadFile(tmp.Name())
+fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
+    path, m.Format(), m2.Caption() == "roundtrip-test")
+```
+
+---
+
 ## Supported features
 
 | Feature | Details |
