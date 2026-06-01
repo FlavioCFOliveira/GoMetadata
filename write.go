@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
 	"github.com/FlavioCFOliveira/GoMetadata/format"
@@ -46,10 +47,14 @@ var injectors = map[format.FormatID]func(io.ReadSeeker, io.Writer, []byte, []byt
 // Write reads the image from r, applies the metadata in m, and writes the
 // result to w. Image data and unmodified metadata segments are preserved
 // byte-for-byte. r must support seeking (io.ReadSeeker).
+//
+// Write calls m.Validate before performing any I/O. A non-nil error from
+// Validate is returned unchanged so callers can inspect it with errors.Is.
 func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error {
-	// Guard against structurally broken metadata that would panic in encoders.
-	if m.EXIF != nil && m.EXIF.IFD0 == nil {
-		return ErrNilIFD0Write
+	// Validate structural consistency before any I/O. This covers nil IFD0,
+	// nil XMP.Properties, and unknown format, replacing the previous inline guard.
+	if err := m.Validate(); err != nil {
+		return err
 	}
 
 	cfg := &writeConfig{preserveUnknownSegments: true}
@@ -66,6 +71,24 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 		return &UnsupportedFormatError{}
 	}
 
+	// SPIKE #6 / epic #33 (roadmap Option A): TIFF-based containers store image
+	// data (strips, tiles, JPEG thumbnails) at offsets that are relative to the
+	// start of the TIFF stream. Rebuilding the IFD block via exif.Encode without
+	// also relocating that image data corrupts the file. Until Option A (full
+	// structural rewrite) is implemented, block all writes to TIFF-based formats
+	// at this point — before encodeMetadata allocates anything — and return an
+	// explicit, actionable error.
+	//
+	// Formats covered: TIFF, CR2, NEF, ARW, DNG, ORF, RW2.
+	// NOT covered here: CR3 (ISOBMFF container, different write path, tracked
+	// separately).
+	//
+	// To remove this gate when Option A ships: delete the isTIFFBased check and
+	// the ErrWriteNotSupported declaration in errors.go.
+	if isTIFFBased(fmtID) {
+		return ErrWriteNotSupported
+	}
+
 	rawEXIF, rawIPTC, rawXMP, err := encodeMetadata(m)
 	if err != nil {
 		return err
@@ -77,6 +100,11 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 // WriteFile reads the image at path, applies the metadata in m, and writes
 // the result back to the same file atomically. It is a convenience wrapper
 // around Write.
+//
+// The temporary file is created in the same directory as path so that the
+// final os.Rename is always an intra-filesystem operation. This prevents
+// EXDEV errors that occur when the system's default temp directory ($TMPDIR)
+// lives on a different filesystem (e.g., in containers or NAS mounts).
 func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -89,31 +117,43 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 		return fmt.Errorf("gometadata: stat file: %w", err)
 	}
 
-	tmp, err := os.CreateTemp("", "gometadata-*")
+	// Place the temp file in the same directory as path so the eventual rename
+	// is guaranteed to be atomic (same filesystem, no EXDEV).
+	tmp, err := os.CreateTemp(filepath.Dir(path), "gometadata-*")
 	if err != nil {
 		return fmt.Errorf("gometadata: create temp file: %w", err)
 	}
 	tmpName := tmp.Name()
 
+	// renamed tracks whether os.Rename has successfully moved tmpName to path.
+	// The deferred cleanup removes the temp file only when it is still on disk
+	// (i.e., rename has not yet occurred or has failed). os.Remove on a
+	// non-existent path returns an error that we silently ignore, making this
+	// safe to call unconditionally.
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
 	// Preserve original file permissions before writing any data.
 	if err := tmp.Chmod(fi.Mode()); err != nil {
 		_ = tmp.Close()
-		_ = os.Remove(tmpName)
 		return fmt.Errorf("gometadata: chmod temp file: %w", err)
 	}
 
 	if err := Write(f, tmp, m, opts...); err != nil {
 		_ = tmp.Close()
-		_ = os.Remove(tmpName)
 		return err
 	}
 	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
 		return fmt.Errorf("gometadata: close temp file: %w", err)
 	}
 	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("gometadata: rename temp file: %w", err)
 	}
+	renamed = true
 	return nil
 }
 
@@ -121,34 +161,65 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 // not modified (m.EXIF/IPTC/XMP is nil) the original raw bytes are passed
 // through unchanged. Returns the first encoding error encountered.
 func encodeMetadata(m *Metadata) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
-	if m.EXIF != nil {
-		rawEXIF, err = exif.Encode(m.EXIF)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("gometadata: encode EXIF: %w", err)
-		}
-	} else if m.rawEXIF != nil {
-		rawEXIF = m.rawEXIF
+	if rawEXIF, err = encodeEXIF(m); err != nil {
+		return nil, nil, nil, err
 	}
-
-	if m.IPTC != nil {
-		rawIPTC, err = iptc.Encode(m.IPTC)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("gometadata: encode IPTC: %w", err)
-		}
-	} else if m.rawIPTC != nil {
-		rawIPTC = m.rawIPTC
+	if rawIPTC, err = encodeIPTC(m); err != nil {
+		return nil, nil, nil, err
 	}
-
-	if m.XMP != nil {
-		rawXMP, err = xmppkg.Encode(m.XMP)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("gometadata: encode XMP: %w", err)
-		}
-	} else if m.rawXMP != nil {
-		rawXMP = m.rawXMP
+	if rawXMP, err = encodeXMP(m); err != nil {
+		return nil, nil, nil, err
 	}
-
 	return rawEXIF, rawIPTC, rawXMP, nil
+}
+
+// encodeEXIF returns the EXIF bytes to write: freshly encoded when m.EXIF is
+// non-nil, or the original raw bytes when the caller did not modify EXIF.
+func encodeEXIF(m *Metadata) ([]byte, error) {
+	if m.EXIF != nil {
+		raw, err := exif.Encode(m.EXIF)
+		if err != nil {
+			return nil, fmt.Errorf("gometadata: encode EXIF: %w", err)
+		}
+		return raw, nil
+	}
+	return m.rawEXIF, nil
+}
+
+// encodeIPTC returns the IPTC bytes to write: freshly encoded when m.IPTC is
+// non-nil, or the original raw bytes when the caller did not modify IPTC.
+func encodeIPTC(m *Metadata) ([]byte, error) {
+	if m.IPTC != nil {
+		raw, err := iptc.Encode(m.IPTC)
+		if err != nil {
+			return nil, fmt.Errorf("gometadata: encode IPTC: %w", err)
+		}
+		return raw, nil
+	}
+	return m.rawIPTC, nil
+}
+
+// encodeXMP returns the XMP bytes to write: freshly encoded when m.XMP is
+// non-nil, the wire-frame encoding when the image carried extended XMP and the
+// XMP was not modified (guarantees byte-stable round-trips), or the original
+// raw bytes otherwise.
+func encodeXMP(m *Metadata) ([]byte, error) {
+	if m.XMP != nil {
+		raw, err := xmppkg.Encode(m.XMP)
+		if err != nil {
+			return nil, fmt.Errorf("gometadata: encode XMP: %w", err)
+		}
+		return raw, nil
+	}
+	// Prefer the wire-frame encoding over the reassembled rawXMP when both are
+	// present. The wire-frame carries the original main APP1 content and the
+	// assembled extended payload so that jpeg.Inject can reproduce the extended
+	// XMP segments without regenerating the GUID — guaranteeing byte-stable
+	// round-trips for unmodified extended XMP.
+	if m.rawXMPWire != nil {
+		return m.rawXMPWire, nil
+	}
+	return m.rawXMP, nil
 }
 
 // injectByFormat dispatches to the correct container handler for segment injection.
@@ -166,4 +237,25 @@ func wrapInject(err error) error {
 		return fmt.Errorf("gometadata: %w", err)
 	}
 	return nil
+}
+
+// isTIFFBased reports whether fmtID is a TIFF-based container format.
+//
+// TIFF-based formats share the same structural problem for writes: image data
+// (strips, tiles, JPEG thumbnails) is addressed by absolute TIFF offsets that
+// become invalid when the IFD block is rebuilt without relocating that data.
+// See ErrWriteNotSupported and roadmap Option A (epic #33).
+func isTIFFBased(fmtID format.FormatID) bool {
+	switch fmtID {
+	case format.FormatTIFF,
+		format.FormatCR2,
+		format.FormatNEF,
+		format.FormatARW,
+		format.FormatDNG,
+		format.FormatORF,
+		format.FormatRW2:
+		return true
+	default:
+		return false
+	}
 }

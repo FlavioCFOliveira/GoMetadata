@@ -196,8 +196,9 @@ func buildExtendedXMPJPEG(mainXMP []byte, guid string, extContent []byte) []byte
 
 	// Extended XMP APP1
 	// Structure: identXMPNote + 32-byte GUID + 4-byte fullLen + 4-byte offset + data
+	// identXMPNote is "http://ns.adobe.com/xmp/extension/\x00" per Adobe XMP Spec Part 3 §1.1.4.
 	var extBody bytes.Buffer
-	extBody.WriteString("http://ns.adobe.com/xap/1.0/se/\x00")
+	extBody.WriteString("http://ns.adobe.com/xmp/extension/\x00")
 	extBody.WriteString(guid) // 32 bytes
 	var fullLenBuf [4]byte
 	binary.BigEndian.PutUint32(fullLenBuf[:], uint32(len(extContent))) //nolint:gosec // G115: test helper, intentional type cast
@@ -614,8 +615,8 @@ func TestInjectExtendedXMP(t *testing.T) {
 // require more than one extended APP1 chunk is split and reassembled correctly.
 func TestInjectExtendedXMPMultiChunk(t *testing.T) {
 	t.Parallel()
-	// Each extended chunk holds maxExtChunkSize (65461) bytes.
-	// We need > 65461 bytes in rawXMP to force two extended chunks.
+	// Each extended chunk holds maxExtChunkSize (65458) bytes.
+	// We need > 65458 bytes in rawXMP to force two extended chunks.
 	const extraContentSize = 130_000 // forces at least 2 chunks
 
 	padding := bytes.Repeat([]byte("y"), extraContentSize)
@@ -636,8 +637,9 @@ func TestInjectExtendedXMPMultiChunk(t *testing.T) {
 	}
 
 	// Count the number of extended XMP APP1 segments in the output.
+	// The correct extended XMP APP1 identifier is per Adobe XMP Spec Part 3 §1.1.4.
 	outBytes := out.Bytes()
-	extNoteIdent := []byte("http://ns.adobe.com/xap/1.0/se/\x00")
+	extNoteIdent := []byte("http://ns.adobe.com/xmp/extension/\x00")
 	extCount := bytes.Count(outBytes, extNoteIdent)
 	if extCount < 2 {
 		t.Errorf("expected at least 2 extended APP1 segments, found %d", extCount)
@@ -652,6 +654,65 @@ func TestInjectExtendedXMPMultiChunk(t *testing.T) {
 	}
 	if !bytes.Contains(got, padding) {
 		t.Errorf("reassembled XMP does not contain expected padding content")
+	}
+}
+
+// TestExtendedXMPSegmentIdentifier verifies that extended XMP APP1 segments
+// written by Inject carry exactly the correct APP1 identifier byte sequence
+// ("http://ns.adobe.com/xmp/extension/\x00") as mandated by Adobe XMP
+// Specification Part 3 §1.1.4, and that the old incorrect identifier
+// ("http://ns.adobe.com/xap/1.0/se/\x00") is absent from the output.
+//
+// This test guards against interoperability regressions: ExifTool, Exiv2, and
+// Adobe tools all require the correct identifier to locate extended XMP chunks.
+func TestExtendedXMPSegmentIdentifier(t *testing.T) {
+	t.Parallel()
+
+	// Build an XMP payload large enough to force the extended path.
+	padding := bytes.Repeat([]byte("z"), 66000)
+	rawXMP := []byte(
+		`<?xpacket begin="` + "\xef\xbb\xbf" + `" id="W5M0MpCehiHzreSzNTczkc9d"?>` +
+			`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+			`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+			`<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">` +
+			`<dc:creator>` + string(padding) + `</dc:creator>` +
+			`</rdf:Description>` +
+			`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`,
+	)
+	if len(rawXMP) <= maxXMPPayload {
+		t.Fatalf("test precondition failed: rawXMP (%d bytes) must exceed maxXMPPayload (%d bytes)", len(rawXMP), maxXMPPayload)
+	}
+
+	src := buildJPEG(nil, nil, nil)
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(src), &out, nil, nil, rawXMP); err != nil {
+		t.Fatalf("Inject with oversized XMP: %v", err)
+	}
+	outBytes := out.Bytes()
+
+	// Correct identifier must be present.
+	correctIdent := []byte("http://ns.adobe.com/xmp/extension/\x00")
+	if !bytes.Contains(outBytes, correctIdent) {
+		t.Errorf("correct extended XMP identifier %q not found in Inject output", correctIdent)
+	}
+
+	// Old incorrect identifier must be absent.
+	oldIdent := []byte("http://ns.adobe.com/xap/1.0/se/\x00")
+	if bytes.Contains(outBytes, oldIdent) {
+		t.Errorf("old incorrect extended XMP identifier %q found in Inject output; interoperability broken", oldIdent)
+	}
+
+	// Round-trip: Extract must reassemble and return the full XMP with padding.
+	_, _, got, err := Extract(bytes.NewReader(outBytes))
+	if err != nil {
+		t.Fatalf("Extract after extended XMP inject: %v", err)
+	}
+	if got == nil {
+		t.Fatal("Extract returned nil rawXMP; expected reassembled extended XMP")
+	}
+	if !bytes.Contains(got, padding) {
+		t.Errorf("reassembled XMP (%d bytes) does not contain the expected padding content (%d bytes of 'z')",
+			len(got), len(padding))
 	}
 }
 
@@ -671,8 +732,8 @@ func TestInjectSmallXMPFastPath(t *testing.T) {
 	}
 
 	outBytes := out.Bytes()
-	// Must have zero extended XMP segments.
-	extNoteIdent := []byte("http://ns.adobe.com/xap/1.0/se/\x00")
+	// Must have zero extended XMP segments (correct identifier per Adobe XMP Spec Part 3 §1.1.4).
+	extNoteIdent := []byte("http://ns.adobe.com/xmp/extension/\x00")
 	if bytes.Contains(outBytes, extNoteIdent) {
 		t.Error("small XMP inject produced extended APP1 segment(s); expected fast path only")
 	}
@@ -1045,6 +1106,249 @@ func TestCopyNonMetadataSegmentsReadError(t *testing.T) {
 	// The truncated read should produce an error (non-EOF, unexpected EOF).
 	if err == nil {
 		t.Error("expected error for truncated segment, got nil")
+	}
+}
+
+// --- Regression test: APP1 EXIF payload shorter than a TIFF header ---
+
+// TestExtractEXIFPayloadTooShortReturnsNil is a regression test for the fuzz
+// reproducer format/jpeg/testdata/fuzz/FuzzJPEGExtract/324ecc33f57fa484.
+//
+// An APP1 segment whose EXIF payload (after stripping the 6-byte "Exif\x00\x00"
+// identifier) is shorter than 8 bytes cannot hold a valid TIFF header and must
+// not be returned as rawEXIF. processAPP1Segment must ignore such segments so
+// that the post-condition "rawEXIF is nil or >= 8 bytes" is always true.
+func TestExtractEXIFPayloadTooShortReturnsNil(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		exifPayload []byte // bytes that follow "Exif\x00\x00" inside APP1
+	}{
+		{"zero bytes after identifier", []byte{}},
+		{"1 byte after identifier", []byte{0x01}},
+		{"4 bytes after identifier (reproducer 324ecc33f57fa484)", []byte("0000")},
+		{"7 bytes after identifier (one short of minimum)", []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Build APP1 manually so we can embed an arbitrarily short payload.
+			var buf bytes.Buffer
+			buf.Write([]byte{0xFF, 0xD8}) // SOI
+
+			app1Payload := append([]byte("Exif\x00\x00"), tc.exifPayload...)
+			length := uint16(len(app1Payload) + 2) //nolint:gosec // G115: test helper, intentional type cast
+			buf.Write([]byte{0xFF, 0xE1})
+			var lbuf [2]byte
+			binary.BigEndian.PutUint16(lbuf[:], length)
+			buf.Write(lbuf[:])
+			buf.Write(app1Payload)
+
+			buf.Write([]byte{0xFF, 0xD9}) // EOI
+
+			rawEXIF, _, _, err := Extract(bytes.NewReader(buf.Bytes()))
+			if err != nil {
+				t.Fatalf("Extract: unexpected error: %v", err)
+			}
+			if rawEXIF != nil {
+				t.Errorf("rawEXIF must be nil for %d-byte EXIF payload (< 8 bytes minimum TIFF header); got %d bytes",
+					len(tc.exifPayload), len(rawEXIF))
+			}
+		})
+	}
+
+	// Boundary: exactly 8 bytes is the minimum valid payload and must be returned.
+	t.Run("exactly 8 bytes is accepted", func(t *testing.T) {
+		t.Parallel()
+
+		// 8-byte LE TIFF header: byte-order + magic + IFD0 offset.
+		minTIFF := []byte{'I', 'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00}
+
+		var buf bytes.Buffer
+		buf.Write([]byte{0xFF, 0xD8})
+
+		app1Payload := append([]byte("Exif\x00\x00"), minTIFF...)
+		length := uint16(len(app1Payload) + 2) //nolint:gosec // G115: test helper, intentional type cast
+		buf.Write([]byte{0xFF, 0xE1})
+		var lbuf [2]byte
+		binary.BigEndian.PutUint16(lbuf[:], length)
+		buf.Write(lbuf[:])
+		buf.Write(app1Payload)
+
+		buf.Write([]byte{0xFF, 0xD9})
+
+		rawEXIF, _, _, err := Extract(bytes.NewReader(buf.Bytes()))
+		if err != nil {
+			t.Fatalf("Extract: unexpected error: %v", err)
+		}
+		if rawEXIF == nil {
+			t.Error("rawEXIF must not be nil for exactly 8-byte EXIF payload")
+		}
+		if len(rawEXIF) != 8 {
+			t.Errorf("rawEXIF length = %d, want 8", len(rawEXIF))
+		}
+	})
+}
+
+// buildMultiChunkExtendedXMPJPEG builds a JPEG with a main XMP APP1 and
+// multiple extended XMP APP1 chunks. extPayload is split into
+// chunks of at most maxExtChunkSize bytes, each in its own APP1 segment.
+// This simulates real-world extended-XMP JPEGs where the extended payload
+// is too large to fit in a single APP1 segment (e.g. Google Cardboard,
+// Android Depth Map).
+func buildMultiChunkExtendedXMPJPEG(mainXMP []byte, guid string, extPayload []byte) []byte {
+	var buf bytes.Buffer
+	buf.Write([]byte{0xFF, 0xD8})
+
+	// Main XMP APP1
+	mainData := append([]byte("http://ns.adobe.com/xap/1.0/\x00"), mainXMP...)
+	mainLen := uint16(len(mainData) + 2) //nolint:gosec // G115: test helper
+	buf.Write([]byte{0xFF, 0xE1})
+	var lbuf [2]byte
+	binary.BigEndian.PutUint16(lbuf[:], mainLen)
+	buf.Write(lbuf[:])
+	buf.Write(mainData)
+
+	// Extended XMP APP1 chunks (split at maxExtChunkSize).
+	fullLen := uint32(len(extPayload)) //nolint:gosec // G115: test helper
+	offset := uint32(0)
+	for offset < fullLen {
+		end := offset + uint32(maxExtChunkSize)
+		if end > fullLen {
+			end = fullLen
+		}
+		chunk := extPayload[offset:end]
+
+		var extBody bytes.Buffer
+		extBody.WriteString("http://ns.adobe.com/xmp/extension/\x00")
+		extBody.WriteString(guid) // 32 bytes
+		var hdr [8]byte
+		binary.BigEndian.PutUint32(hdr[0:], fullLen)
+		binary.BigEndian.PutUint32(hdr[4:], offset)
+		extBody.Write(hdr[:])
+		extBody.Write(chunk)
+
+		extData := extBody.Bytes()
+		extLen := uint16(len(extData) + 2) //nolint:gosec // G115: test helper
+		buf.Write([]byte{0xFF, 0xE1})
+		binary.BigEndian.PutUint16(lbuf[:], extLen)
+		buf.Write(lbuf[:])
+		buf.Write(extData)
+
+		offset = end
+	}
+
+	buf.Write([]byte{0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9})
+	return buf.Bytes()
+}
+
+// TestExtractWithWireExtendedXMPRoundTrip verifies that an extended-XMP JPEG
+// survives an ExtractWithWire → Inject → ExtractWithWire cycle with the
+// reassembled rawXMP unchanged (byte-stable round-trip).
+//
+// This is the regression guard for the instability introduced when the
+// extended-XMP APP1 identifier was corrected: ExtractWithWire now returns a
+// wire-frame encoding that Inject uses to reproduce the original main and
+// extended APP1 segments without regenerating the GUID, ensuring that the
+// reassembled XMP is identical before and after an unmodified write.
+func TestExtractWithWireExtendedXMPRoundTrip(t *testing.T) {
+	t.Parallel()
+	const guid = "CAFEBEEF12345678CAFEBEEF12345678"
+
+	// Main XMP packet: minimal document with HasExtendedXMP attribute.
+	mainXMP := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>` +
+		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<rdf:Description rdf:about=""` +
+		` xmlns:xmpNote="http://ns.adobe.com/xmp/note/"` +
+		` xmpNote:HasExtendedXMP="` + guid + `">` +
+		`</rdf:Description>` +
+		`</rdf:RDF></x:xmpmeta>`)
+
+	// Extended XMP payload: a self-contained XMP document with a large payload
+	// to force multi-chunk splitting (> maxExtChunkSize = 65458 bytes).
+	padding := bytes.Repeat([]byte("X"), 70000)
+	extPayload := append(
+		[]byte(`<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">`+
+			`<dc:description>`),
+		append(padding, []byte(`</dc:description></rdf:Description></rdf:RDF>`)...)...,
+	)
+
+	origJPEG := buildMultiChunkExtendedXMPJPEG(mainXMP, guid, extPayload)
+
+	// First extract.
+	rawEXIF1, rawIPTC1, rawXMP1, rawXMPWire1, err := ExtractWithWire(bytes.NewReader(origJPEG))
+	if err != nil {
+		t.Fatalf("ExtractWithWire (1): %v", err)
+	}
+	if rawXMP1 == nil {
+		t.Fatal("rawXMP1 is nil; expected reassembled XMP")
+	}
+	if rawXMPWire1 == nil {
+		t.Fatal("rawXMPWire1 is nil; expected wire-frame for extended XMP")
+	}
+	if !bytes.Contains(rawXMP1, padding[:100]) {
+		t.Fatalf("rawXMP1 does not contain expected padding content")
+	}
+
+	// Inject using the wire-frame (simulates unmodified round-trip).
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(origJPEG), &out, rawEXIF1, rawIPTC1, rawXMPWire1); err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+
+	// Second extract.
+	_, _, rawXMP2, rawXMPWire2, err := ExtractWithWire(bytes.NewReader(out.Bytes()))
+	if err != nil {
+		t.Fatalf("ExtractWithWire (2): %v", err)
+	}
+	if rawXMP2 == nil {
+		t.Fatal("rawXMP2 is nil after round-trip")
+	}
+
+	// The user-visible reassembled XMP must be byte-for-byte identical.
+	if !bytes.Equal(rawXMP1, rawXMP2) {
+		t.Errorf("rawXMP changed after round-trip: before=%d bytes, after=%d bytes",
+			len(rawXMP1), len(rawXMP2))
+	}
+
+	// The wire-frame must also survive a second round-trip (idempotence).
+	if rawXMPWire2 == nil {
+		t.Fatal("rawXMPWire2 is nil; wire-frame must survive a second round-trip")
+	}
+	var out2 bytes.Buffer
+	if err := Inject(bytes.NewReader(out.Bytes()), &out2, nil, nil, rawXMPWire2); err != nil {
+		t.Fatalf("Inject (2): %v", err)
+	}
+	_, _, rawXMP3, _, err := ExtractWithWire(bytes.NewReader(out2.Bytes()))
+	if err != nil {
+		t.Fatalf("ExtractWithWire (3): %v", err)
+	}
+	if !bytes.Equal(rawXMP1, rawXMP3) {
+		t.Errorf("rawXMP changed on second round-trip: before=%d bytes, after=%d bytes",
+			len(rawXMP1), len(rawXMP3))
+	}
+}
+
+// TestExtractWithWireNonExtendedXMPNoWireFrame verifies that ExtractWithWire
+// returns a nil rawXMPWire for a JPEG that does not carry extended XMP.
+func TestExtractWithWireNonExtendedXMPNoWireFrame(t *testing.T) {
+	t.Parallel()
+	xmpData := []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta>`)
+	j := buildJPEG(nil, nil, xmpData)
+
+	_, _, rawXMP, rawXMPWire, err := ExtractWithWire(bytes.NewReader(j))
+	if err != nil {
+		t.Fatalf("ExtractWithWire: %v", err)
+	}
+	if rawXMP == nil {
+		t.Error("rawXMP is nil for standard XMP JPEG")
+	}
+	if rawXMPWire != nil {
+		t.Errorf("rawXMPWire must be nil for non-extended XMP; got %d bytes", len(rawXMPWire))
 	}
 }
 

@@ -11,6 +11,7 @@ package iptc
 import (
 	"bytes"
 	"sync"
+	"unicode/utf8"
 )
 
 // IPTC holds the parsed IPTC datasets grouped by record number.
@@ -21,6 +22,18 @@ type IPTC struct {
 	// of a map eliminates the map allocation entirely — one fewer heap object
 	// per Parse call — and allows O(1) index access without hashing.
 	Records [10][]Dataset
+
+	// Truncated is set to true when Parse encountered one or more datasets
+	// that were skipped because of a recoverable anomaly (oversized individual
+	// dataset, declared length exceeding available bytes). It does NOT indicate
+	// that valid datasets were lost — only that some datasets were skipped.
+	//
+	// Parse always returns err == nil regardless of this field; the nil-error
+	// contract allows callers (e.g. read.go) to use recovered datasets without
+	// treating a partial skip as a fatal failure. Callers that care about data
+	// completeness can inspect this field. The DoS guard (aggregate byte cap)
+	// is the only condition that terminates parsing entirely.
+	Truncated bool
 }
 
 // Dataset is a single IPTC record:dataset value (IIM §1.6).
@@ -74,6 +87,14 @@ func decodeDatasetLength(b []byte, pos int) (length, newPos int, ok bool) {
 // IIM §1.5.1) and appends the dataset to i.Records[record] for all other
 // datasets. The utf8 pointer is updated in-place when the marker is found.
 func storeDataset(i *IPTC, record, dataset uint8, value []byte, utf8 *bool) {
+	// IIM §1.6: valid record numbers are 1–9. Record 0 is an internal
+	// pseudo-record (UTF-8 flag) never present on the wire. Any record byte
+	// outside [1, len(i.Records)-1] is out of range for the fixed-size array
+	// and must be skipped; the caller continues scanning so later valid
+	// datasets in the same stream are not lost.
+	if record < 1 || int(record) >= len(i.Records) {
+		return
+	}
 	// Record 1, dataset 90 (1:90) carries the coded character set declaration
 	// (IIM §1.5.1). ESC % G signals UTF-8.
 	if record == 1 && dataset == 90 {
@@ -95,6 +116,16 @@ const maxIPTCTotalBytes = 256 << 20 // 256 MiB
 
 // Parse parses a raw IPTC IIM byte stream.
 // b must begin with (or contain) the IPTC tag marker 0x1C (IIM §1.6).
+//
+// Parse always returns a non-nil *IPTC and a nil error. Individual malformed
+// or oversized datasets are skipped (recoverable truncation) and the
+// *IPTC.Truncated field is set to true to signal that some datasets were
+// omitted. Only the DoS aggregate-bytes guard terminates parsing entirely, but
+// even then the datasets collected so far are returned with err == nil.
+//
+// The nil-error contract is intentional: callers such as read.go treat a
+// non-nil error as a fatal segment failure and discard all recovered data.
+// Callers that need to detect partial skips should inspect IPTC.Truncated.
 func Parse(b []byte) (*IPTC, error) {
 	i := new(IPTC)
 	// Pre-allocate record 2 (Application Record) — the most common record,
@@ -116,28 +147,47 @@ func Parse(b []byte) (*IPTC, error) {
 			break
 		}
 
-		record := b[pos+1]
-		dataset := b[pos+2]
+		record := b[pos+1]  //nolint:gosec // G602: bounds guaranteed by the pos+5 guard above (IIM §1.6)
+		dataset := b[pos+2] //nolint:gosec // G602: bounds guaranteed by the pos+5 guard above (IIM §1.6)
 
 		length, newPos, ok := decodeDatasetLength(b, pos)
 		if !ok {
-			break
+			// #18: the extended-length block itself is malformed (nBytes out of
+			// range or truncated buffer). Skip to byte after the current marker
+			// byte and re-scan for the next 0x1C. This is recoverable: the
+			// malformed length block occupies a bounded number of bytes and there
+			// may be valid datasets after it.
+			pos++
+			i.Truncated = true
+			continue
 		}
-		pos = newPos
 
-		// Cap individual dataset size to 1 MiB to prevent memory exhaustion
-		// from crafted IPTC streams with large declared lengths.
-		if length > 1<<20 || length < 0 || pos+length > len(b) {
-			break
+		// #18: recover from individual dataset anomalies instead of stopping.
+		// Each condition below skips only the current dataset and advances pos
+		// past the header so the scanner does not re-examine the same 0x1C.
+		//   • length > 1 MiB: single dataset DoS guard; skip.
+		//   • pos+length > len(b): declared value extends past end of buffer; skip.
+		// The aggregate DoS guard (totalBytes > maxIPTCTotalBytes) is the only
+		// irrecoverable condition: we stop there to bound total memory use.
+		if length > 1<<20 || newPos+length > len(b) {
+			// Advance past the header so the loop re-scans from the byte after
+			// the current 0x1C, rather than looping on the same marker forever.
+			pos = newPos
+			i.Truncated = true
+			continue
 		}
+
 		// Cap aggregate size to prevent memory exhaustion from many large datasets.
 		totalBytes += length
 		if totalBytes > maxIPTCTotalBytes {
+			// Irrecoverable: we cannot bound memory usage without stopping.
+			// Return whatever we have collected so far (err == nil preserved).
+			i.Truncated = true
 			break
 		}
 
-		value := b[pos : pos+length]
-		pos += length
+		value := b[newPos : newPos+length]
+		pos = newPos + length
 
 		storeDataset(i, record, dataset, value, &utf8)
 	}
@@ -151,6 +201,30 @@ func Parse(b []byte) (*IPTC, error) {
 	return i, nil
 }
 
+// hasHighBytes reports whether b contains any byte value > 0x7F.
+// Used to determine whether a non-UTF-8-declared stream needs auto-upgrade.
+func hasHighBytes(b []byte) bool {
+	for _, c := range b {
+		if c > 0x7F {
+			return true
+		}
+	}
+	return false
+}
+
+// needsUTF8Declaration reports whether any dataset in record 2 (or other
+// records) contains bytes outside the ASCII range.
+func (i *IPTC) needsUTF8Declaration() bool {
+	for rec := uint8(1); rec <= 9; rec++ {
+		for idx := range i.Records[rec] {
+			if hasHighBytes(i.Records[rec][idx].Value) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // encBufPool reuses bytes.Buffer allocations across Encode calls. This avoids
 // repeated heap allocation of the buffer's internal byte array on every call.
 // The result is always a fresh bytes.Clone of the buffer contents, so the
@@ -158,15 +232,35 @@ func Parse(b []byte) (*IPTC, error) {
 var encBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }} //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
 
 // Encode serialises i back to an IPTC IIM byte stream.
+//
+// #19 — Auto-inject UTF-8 declaration: if the stream does not already carry a
+// coded character set declaration (1:90) but one or more dataset values contain
+// bytes outside the ASCII range (>0x7F), Encode automatically prepends the
+// 1:90 ESC % G declaration so that a reader will interpret the bytes correctly
+// as UTF-8. Without this, a receiver that defaults to ISO-8859-1 would
+// misinterpret multi-byte UTF-8 sequences (mojibake). The injected declaration
+// also updates the internal UTF-8 flag so that an immediate Parse of the result
+// returns the correct strings (round-trip correctness).
 func Encode(i *IPTC) ([]byte, error) {
 	buf := encBufPool.Get().(*bytes.Buffer) //nolint:forcetypeassert,revive // encBufPool.New always stores *bytes.Buffer; pool invariant
 	buf.Reset()
 
-	// Re-emit the coded character set declaration (IIM §1.5.1) when the
-	// original stream declared UTF-8 (ESC % G = 0x1B 0x25 0x47).
-	if i.isUTF8() {
-		// Record 1, Dataset 90: coded character set = UTF-8.
+	// Determine whether to emit the coded character set declaration (IIM §1.5.1).
+	// Emit it when:
+	//   (a) the stream was parsed with an existing 1:90 UTF-8 declaration, OR
+	//   (b) the stream has no 1:90 declaration but contains non-ASCII bytes.
+	// Case (b) is the auto-inject path for #19: writing "café" into a fresh
+	// *IPTC (no declaration) must produce a stream that round-trips correctly.
+	emitUTF8Decl := i.isUTF8() || i.needsUTF8Declaration()
+	if emitUTF8Decl {
+		// Record 1, Dataset 90: coded character set = UTF-8 (ESC % G).
 		buf.Write([]byte{0x1C, 0x01, 0x5A, 0x00, 0x03, 0x1B, 0x25, 0x47})
+		// Ensure the internal flag is set so that if the caller re-reads via
+		// the convenience accessors without an intervening Parse, the strings
+		// are still decoded correctly (no-parse round-trip path).
+		if !i.isUTF8() {
+			i.Records[0] = append(i.Records[0], Dataset{Record: 0, DataSet: 0, Value: []byte{1}})
+		}
 	}
 
 	// Write records in order for deterministic output.
@@ -201,6 +295,30 @@ func Encode(i *IPTC) ([]byte, error) {
 	return result, nil
 }
 
+// truncateToLimit truncates value to at most maxLen bytes without cutting a
+// UTF-8 multi-byte rune in half. If maxLen is 0 (no limit defined for this
+// dataset), the original slice is returned unchanged.
+//
+// Policy (#17): the library truncates silently rather than returning an error.
+// Rationale: IPTC field limits are a legacy IIM constraint; callers writing
+// "Nikon D3500, ISO 800, f/2.8, 1/200s — Coastal Portugal 2024" as a Caption
+// should not be required to handle an error for a detail they may not know
+// about. Truncation at a rune boundary ensures the output is always valid
+// UTF-8. Callers that need strict enforcement should check len(s) against the
+// IIM limits before calling setters.
+func truncateToLimit(value []byte, maxLen int) []byte {
+	if maxLen == 0 || len(value) <= maxLen {
+		return value
+	}
+	// Walk backwards from maxLen to find a valid UTF-8 rune boundary so we do
+	// not emit a partial sequence. For ASCII-only content the loop runs once.
+	trunc := value[:maxLen]
+	for len(trunc) > 0 && !utf8.Valid(trunc) {
+		trunc = trunc[:len(trunc)-1]
+	}
+	return trunc
+}
+
 // Copyright returns the value of dataset 2:116 (Copyright Notice, IIM §2.2.28).
 func (i *IPTC) Copyright() string {
 	return i.firstRecord2(DS2CopyrightNotice)
@@ -217,46 +335,100 @@ func (i *IPTC) Keywords() []string {
 	if i == nil {
 		return nil
 	}
-	utf8 := i.isUTF8()
+	utf8flag := i.isUTF8()
 	var result []string
 	for idx := range i.Records[2] {
 		if i.Records[2][idx].DataSet == DS2Keywords {
-			result = append(result, i.Records[2][idx].stringValue(utf8))
+			result = append(result, i.Records[2][idx].stringValue(utf8flag))
 		}
 	}
 	return result
 }
 
-// Creator returns the value of dataset 2:80 (By-line / author, IIM §2.2.25).
+// Creator returns the first value of dataset 2:80 (By-line / author, IIM §2.2.25).
+// By-line is a repeatable dataset; use AllCreators to retrieve all occurrences.
 func (i *IPTC) Creator() string {
 	return i.firstRecord2(DS2Byline)
 }
 
+// AllCreators returns all values of dataset 2:80 (By-line, IIM §2.2.25).
+// By-line is a repeatable dataset; each occurrence represents one creator.
+// Returns nil when there are no By-line datasets.
+func (i *IPTC) AllCreators() []string {
+	if i == nil {
+		return nil
+	}
+	utf8flag := i.isUTF8()
+	var result []string
+	for idx := range i.Records[2] {
+		if i.Records[2][idx].DataSet == DS2Byline {
+			result = append(result, i.Records[2][idx].stringValue(utf8flag))
+		}
+	}
+	return result
+}
+
+// DateCreated returns the value of dataset 2:55 (Date Created, IIM §2.2.23)
+// as a string in CCYYMMDD format (e.g. "20240315"). Returns an empty string
+// when the dataset is absent.
+func (i *IPTC) DateCreated() string {
+	return i.firstRecord2(DS2DateCreated)
+}
+
+// TimeCreated returns the value of dataset 2:60 (Time Created, IIM §2.2.23)
+// as a string in HHMMSS±HHMM format (e.g. "143000+0100"). Returns an empty
+// string when the dataset is absent.
+func (i *IPTC) TimeCreated() string {
+	return i.firstRecord2(DS2TimeCreated)
+}
+
 // SetCaption sets dataset 2:120 (Caption/Abstract) to s, replacing any existing value.
+// Values exceeding 2000 bytes are truncated at a UTF-8 rune boundary (IIM §2.2.29).
 func (i *IPTC) SetCaption(s string) {
-	i.setRecord2(DS2Caption, []byte(s))
+	i.setRecord2(DS2Caption, truncateToLimit([]byte(s), datasetMaxLen[DS2Caption]))
 }
 
 // SetCopyright sets dataset 2:116 (Copyright Notice) to s, replacing any existing value.
+// Values exceeding 128 bytes are truncated at a UTF-8 rune boundary (IIM §2.2.28).
 func (i *IPTC) SetCopyright(s string) {
-	i.setRecord2(DS2CopyrightNotice, []byte(s))
+	i.setRecord2(DS2CopyrightNotice, truncateToLimit([]byte(s), datasetMaxLen[DS2CopyrightNotice]))
 }
 
-// SetCreator sets dataset 2:80 (By-line) to s, replacing any existing value.
+// SetCreator sets the first dataset 2:80 (By-line) to s, replacing any existing
+// first occurrence. By-line is repeatable; use AddCreator to append additional
+// entries. Values exceeding 32 bytes are truncated at a UTF-8 rune boundary
+// (IIM §2.2.25).
 func (i *IPTC) SetCreator(s string) {
-	i.setRecord2(DS2Byline, []byte(s))
+	i.setRecord2(DS2Byline, truncateToLimit([]byte(s), datasetMaxLen[DS2Byline]))
+}
+
+// AddCreator appends a creator to dataset 2:80 (By-line, IIM §2.2.25).
+// By-line is a repeatable dataset; each call adds one additional entry.
+// Values exceeding 32 bytes are truncated at a UTF-8 rune boundary.
+func (i *IPTC) AddCreator(creator string) {
+	v := truncateToLimit([]byte(creator), datasetMaxLen[DS2Byline])
+	if hasHighBytes(v) && !i.isUTF8() {
+		i.Records[0] = append(i.Records[0][:0], Dataset{Record: 0, DataSet: 0, Value: []byte{1}})
+	}
+	i.Records[2] = append(i.Records[2], Dataset{Record: 2, DataSet: DS2Byline, Value: v})
 }
 
 // AddKeyword appends a keyword to dataset 2:25 (Keywords, IIM §2.2.17).
 // Keywords is a repeatable dataset; each call adds one additional entry.
+// Values exceeding 64 bytes are truncated at a UTF-8 rune boundary.
 func (i *IPTC) AddKeyword(kw string) {
-	i.Records[2] = append(i.Records[2], Dataset{Record: 2, DataSet: DS2Keywords, Value: []byte(kw)})
+	v := truncateToLimit([]byte(kw), datasetMaxLen[DS2Keywords])
+	if hasHighBytes(v) && !i.isUTF8() {
+		i.Records[0] = append(i.Records[0][:0], Dataset{Record: 0, DataSet: 0, Value: []byte{1}})
+	}
+	i.Records[2] = append(i.Records[2], Dataset{Record: 2, DataSet: DS2Keywords, Value: v})
 }
 
 // SetKeywords replaces all dataset 2:25 (Keywords, IIM §2.2.17) entries in
 // record 2 with the provided values. Existing keyword datasets are removed
 // first; then one Dataset is appended per keyword. Passing an empty slice
-// removes all keywords without adding new ones.
+// removes all keywords without adding new ones. Values exceeding 64 bytes are
+// truncated at a UTF-8 rune boundary.
 func (i *IPTC) SetKeywords(kws []string) {
 	if i == nil {
 		return
@@ -271,13 +443,26 @@ func (i *IPTC) SetKeywords(kws []string) {
 	i.Records[2] = filtered
 	// Append one Dataset per keyword (IIM §2.2.17: repeatable).
 	for _, kw := range kws {
-		i.Records[2] = append(i.Records[2], Dataset{Record: 2, DataSet: DS2Keywords, Value: []byte(kw)})
+		v := truncateToLimit([]byte(kw), datasetMaxLen[DS2Keywords])
+		i.Records[2] = append(i.Records[2], Dataset{Record: 2, DataSet: DS2Keywords, Value: v})
 	}
 }
 
 // setRecord2 replaces the first occurrence of ds in record 2 with value,
 // or appends a new dataset if none exists.
+//
+// If value contains bytes outside the ASCII range (>0x7F) and the UTF-8 flag
+// is not yet set, it is set now. All setters pass Go strings (which are always
+// UTF-8) through []byte(s), so any non-ASCII byte in value is a UTF-8 sequence
+// that must be declared as such for accessors to read it back correctly.
 func (i *IPTC) setRecord2(ds uint8, value []byte) {
+	// Auto-upgrade to UTF-8 mode when writing non-ASCII content. This ensures
+	// that accessors such as Caption() and Copyright() use the UTF-8 decode path
+	// (return string(value)) rather than the ISO-8859-1 decode path, which would
+	// produce garbage for multi-byte UTF-8 sequences.
+	if hasHighBytes(value) && !i.isUTF8() {
+		i.Records[0] = append(i.Records[0][:0], Dataset{Record: 0, DataSet: 0, Value: []byte{1}})
+	}
 	for idx := range i.Records[2] {
 		if i.Records[2][idx].DataSet == ds {
 			i.Records[2][idx].Value = value
@@ -296,10 +481,10 @@ func (i *IPTC) firstRecord2(ds uint8) string {
 	if i == nil {
 		return ""
 	}
-	utf8 := i.isUTF8()
+	utf8flag := i.isUTF8()
 	for idx := range i.Records[2] {
 		if i.Records[2][idx].DataSet == ds {
-			return i.Records[2][idx].stringValue(utf8)
+			return i.Records[2][idx].stringValue(utf8flag)
 		}
 	}
 	return ""

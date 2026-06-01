@@ -74,6 +74,20 @@ const (
 	// EXIF IFD tags (EXIF §4.6.5 Table 4).
 	TagMakerNote TagID = 0x927C
 
+	// TagUserComment stores a user-written comment in the EXIF IFD.
+	// Type: Undefined; first 8 bytes are a charset prefix (EXIF 2.32,
+	// CIPA DC-008-2023 §4.6.5 Table 4).
+	TagUserComment TagID = 0x9286
+
+	// Windows XP* tags (0x9C9B–0x9C9F): stored as null-terminated UTF-16 LE
+	// in a TypeByte field. Written by Windows Photo Gallery / Explorer.
+	// Not part of the EXIF standard; documented in Microsoft's EXIF Extension.
+	TagXPTitle    TagID = 0x9C9B
+	TagXPComment  TagID = 0x9C9C
+	TagXPAuthor   TagID = 0x9C9D
+	TagXPKeywords TagID = 0x9C9E
+	TagXPSubject  TagID = 0x9C9F
+
 	// Interoperability IFD tags (EXIF §4.6.7, Annex A).
 	TagInteroperabilityIndex   TagID = 0x0001
 	TagInteroperabilityVersion TagID = 0x0002
@@ -151,8 +165,8 @@ const (
 // Populated at init time; treated as read-only thereafter.
 var tagRegistry map[TagID]tagInfo
 
-func init() { //nolint:funlen // justified: tag registry must enumerate all ~130 EXIF/TIFF tags in one place; splitting would obscure the spec mapping
-	// Pre-sized to the exact number of entries (131) to avoid map rehashing.
+func init() { //nolint:funlen // justified: tag registry must enumerate all ~140 EXIF/TIFF tags in one place; splitting would obscure the spec mapping
+	// Pre-sized to the exact number of entries (138) to avoid map rehashing.
 	// Eliminates 5 intermediate maps and 5 maps.Copy calls that were previously
 	// used to populate this map in logical sections.
 	tagRegistry = map[TagID]tagInfo{
@@ -275,6 +289,15 @@ func init() { //nolint:funlen // justified: tag registry must enumerate all ~130
 		TagLensModel:                {"LensModel", TypeASCII, 0},
 		TagLensSerialNumber:         {"LensSerialNumber", TypeASCII, 0},
 		TagMakerNote:                {"MakerNote", TypeUndefined, 0},
+		// UserComment (EXIF §4.6.5 Table 4): TypeUndefined; first 8 bytes are the
+		// charset prefix (ASCII, UNICODE, JIS, or 8×0x00 for undefined).
+		TagUserComment: {"UserComment", TypeUndefined, 0},
+		// Windows XP* tags: TypeByte, null-terminated UTF-16 LE. Microsoft extension.
+		TagXPTitle:    {"XPTitle", TypeByte, 0},
+		TagXPComment:  {"XPComment", TypeByte, 0},
+		TagXPAuthor:   {"XPAuthor", TypeByte, 0},
+		TagXPKeywords: {"XPKeywords", TypeByte, 0},
+		TagXPSubject:  {"XPSubject", TypeByte, 0},
 		// GPS IFD tags (EXIF §4.6.6 Table 15, all 32 entries).
 		TagGPSVersionID:         {"GPSVersionID", TypeByte, 4},
 		TagGPSLatitudeRef:       {"GPSLatitudeRef", TypeASCII, 2},

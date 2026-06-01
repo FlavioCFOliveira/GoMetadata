@@ -3,6 +3,7 @@ package xmp
 import (
 	"bytes"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -79,14 +80,31 @@ func serialise(x *XMP) ([]byte, error) {
 		slices.Sort(localList)
 		*localListPtr = localList
 
-		for _, local := range localList {
+		// #14: Classify properties into three groups before serialising:
+		//   1. Top-level properties (no dot, or dot not preceded by "[N]") → simple / multi-valued.
+		//   2. Struct properties (key "parent.field") → must be emitted under one
+		//      <prefix:parent rdf:parseType="Resource"> wrapper per parent key.
+		//   3. Struct-in-list-item properties (key "parent[N].field") → must be emitted
+		//      as a sequence/bag of rdf:Description elements.
+		//
+		// Strategy: scan localList and collect the set of "top" (parent) names for
+		// struct groups. Emit top-level props first, then each struct group, then
+		// each struct-in-list group. All groups are sorted for deterministic output.
+		topProps, structParents, listStructParents := classifyProps(localList)
+
+		for _, local := range topProps {
 			val := props[local]
-			// Fast path: most properties are single-valued — avoid strings.Split alloc.
 			if strings.IndexByte(val, '\x1e') < 0 {
 				writeSimpleProperty(buf, prefix, local, val)
 			} else {
 				writeMultiValuedProperty(buf, prefix, ns, local, val)
 			}
+		}
+		for _, parent := range structParents {
+			writeStructProperty(buf, prefix, parent, props, localList)
+		}
+		for _, parent := range listStructParents {
+			writeStructInListProperty(buf, prefix, ns, parent, props, localList)
 		}
 
 		localListPool.Put(localListPtr)
@@ -177,6 +195,201 @@ func writeMultiValuedProperty(buf *bytes.Buffer, prefix, ns, local, val string) 
 	buf.WriteByte(':')
 	buf.WriteString(local)
 	buf.WriteString(">\n")
+}
+
+// classifyProps partitions a sorted list of property local names into three groups:
+//   - topProps: plain top-level properties (no dot, or multi-valued with dot in values).
+//   - structParents: sorted unique parent names of "parent.field" struct properties.
+//   - listStructParents: sorted unique parent names of "parent[N].field" struct-in-list properties.
+//
+// #14: This classification drives the serialiser's dispatch between writeSimpleProperty,
+// writeStructProperty, and writeStructInListProperty.
+func classifyProps(localList []string) (topProps, structParents, listStructParents []string) {
+	structParentSet := make(map[string]struct{})
+	listStructParentSet := make(map[string]struct{})
+	for _, local := range localList {
+		parent, _, isListStruct, isStruct := parseStructKey(local)
+		switch {
+		case isListStruct:
+			listStructParentSet[parent] = struct{}{}
+		case isStruct:
+			structParentSet[parent] = struct{}{}
+		default:
+			topProps = append(topProps, local)
+		}
+	}
+	for p := range structParentSet {
+		structParents = append(structParents, p)
+	}
+	for p := range listStructParentSet {
+		listStructParents = append(listStructParents, p)
+	}
+	slices.Sort(structParents)
+	slices.Sort(listStructParents)
+	return topProps, structParents, listStructParents
+}
+
+// parseStructKey inspects a property local name and classifies it:
+//   - "parent[N].field" → parent="parent", field="field", isListStruct=true, isStruct=false
+//   - "parent.field"    → parent="parent", field="field", isListStruct=false, isStruct=true
+//   - "plain"           → parent="", field="plain", isListStruct=false, isStruct=false
+//
+// #14 / #13: The bracket index format "parent[N].field" is produced by
+// buildStructInListKey in rdf.go; "parent.field" is produced by onCharDataStructField.
+func parseStructKey(local string) (parent, field string, isListStruct, isStruct bool) {
+	bracketIdx := strings.IndexByte(local, '[')
+	dotIdx := strings.IndexByte(local, '.')
+	if bracketIdx >= 0 && dotIdx > bracketIdx {
+		// "parent[N].field" pattern.
+		return local[:bracketIdx], local[dotIdx+1:], true, false
+	}
+	if dotIdx >= 0 {
+		// "parent.field" pattern.
+		return local[:dotIdx], local[dotIdx+1:], false, true
+	}
+	return "", local, false, false
+}
+
+// writeStructProperty emits a struct property as:
+//
+//	<prefix:parent rdf:parseType="Resource">
+//	  <prefix:field1>val1</prefix:field1>
+//	  ...
+//	</prefix:parent>
+//
+// #14 — XMP Part 1 §C.2.6: struct values must use rdf:parseType="Resource" or
+// an explicit rdf:Description child. The parseType shorthand is more compact and
+// is the canonical form emitted by Adobe tools. Element names must be valid XML
+// names (no dots), so "parent.field" keys must be split and nested.
+func writeStructProperty(buf *bytes.Buffer, prefix, parent string, props map[string]string, localList []string) {
+	buf.WriteString("   <")
+	buf.WriteString(prefix)
+	buf.WriteByte(':')
+	buf.WriteString(parent)
+	buf.WriteString(" rdf:parseType=\"Resource\">\n")
+	for _, local := range localList {
+		p, field, isListStruct, isStruct := parseStructKey(local)
+		if !isStruct || isListStruct || p != parent {
+			continue
+		}
+		buf.WriteString("    <")
+		buf.WriteString(prefix)
+		buf.WriteByte(':')
+		buf.WriteString(field)
+		buf.WriteByte('>')
+		writeXMLEscaped(buf, props[local])
+		buf.WriteString("</")
+		buf.WriteString(prefix)
+		buf.WriteByte(':')
+		buf.WriteString(field)
+		buf.WriteString(">\n")
+	}
+	buf.WriteString("   </")
+	buf.WriteString(prefix)
+	buf.WriteByte(':')
+	buf.WriteString(parent)
+	buf.WriteString(">\n")
+}
+
+// writeStructInListProperty emits a sequence/bag of struct items as:
+//
+//	<prefix:parent>
+//	  <rdf:Seq>
+//	    <rdf:li rdf:parseType="Resource">
+//	      <prefix:field1>val1</prefix:field1>
+//	    </rdf:li>
+//	    ...
+//	  </rdf:Seq>
+//	</prefix:parent>
+//
+// #14 / #13 — XMP Part 1 §C.2.5 and §C.2.6: an ordered sequence of structs is
+// an rdf:Seq whose items are rdf:li elements each containing a struct value
+// (rdf:parseType="Resource" shorthand). The collection type (Seq/Bag) is
+// determined by collectionType; xmpMM:History uses Seq.
+//
+// Items are sorted by index to ensure deterministic, correct ordering.
+func writeStructInListProperty(buf *bytes.Buffer, prefix, ns, parent string, props map[string]string, localList []string) {
+	// Collect all unique indices present for this parent.
+	indices := collectStructInListIndices(parent, localList)
+	if len(indices) == 0 {
+		return
+	}
+	slices.Sort(indices)
+
+	ctype := collectionType(ns, parent)
+	buf.WriteString("   <")
+	buf.WriteString(prefix)
+	buf.WriteByte(':')
+	buf.WriteString(parent)
+	buf.WriteString(">\n    <rdf:")
+	buf.WriteString(ctype)
+	buf.WriteString(">\n")
+
+	for _, idx := range indices {
+		buf.WriteString("     <rdf:li rdf:parseType=\"Resource\">\n")
+		// Emit all fields for this item index, in sorted order (localList is already sorted).
+		idxStr := strconv.Itoa(idx)
+		prefix2 := parent + "[" + idxStr + "]."
+		for _, local := range localList {
+			if !strings.HasPrefix(local, prefix2) {
+				continue
+			}
+			field := local[len(prefix2):]
+			buf.WriteString("      <")
+			buf.WriteString(prefix)
+			buf.WriteByte(':')
+			buf.WriteString(field)
+			buf.WriteByte('>')
+			writeXMLEscaped(buf, props[local])
+			buf.WriteString("</")
+			buf.WriteString(prefix)
+			buf.WriteByte(':')
+			buf.WriteString(field)
+			buf.WriteString(">\n")
+		}
+		buf.WriteString("     </rdf:li>\n")
+	}
+
+	buf.WriteString("    </rdf:")
+	buf.WriteString(ctype)
+	buf.WriteString(">\n   </")
+	buf.WriteString(prefix)
+	buf.WriteByte(':')
+	buf.WriteString(parent)
+	buf.WriteString(">\n")
+}
+
+// collectStructInListIndices returns the sorted unique integer indices present
+// in the "parent[N].field" keys of localList for the given parent name.
+func collectStructInListIndices(parent string, localList []string) []int {
+	seen := make(map[int]struct{})
+	for _, local := range localList {
+		p, _, isListStruct, _ := parseStructKey(local)
+		if !isListStruct || p != parent {
+			continue
+		}
+		// Extract the index from "parent[N].field".
+		bracketIdx := strings.IndexByte(local, '[')
+		if bracketIdx < 0 {
+			continue
+		}
+		// Find the ']' character after '['.
+		closeBracket := strings.IndexByte(local[bracketIdx:], ']')
+		if closeBracket < 0 {
+			continue
+		}
+		idxStr := local[bracketIdx+1 : bracketIdx+closeBracket]
+		idx, err := strconv.Atoi(idxStr)
+		if err != nil {
+			continue
+		}
+		seen[idx] = struct{}{}
+	}
+	result := make([]int, 0, len(seen))
+	for idx := range seen {
+		result = append(result, idx)
+	}
+	return result
 }
 
 // writeXMLEscaped writes s to buf with XML character escaping, operating

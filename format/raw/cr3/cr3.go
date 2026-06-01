@@ -46,6 +46,13 @@ func parseCR3BoxHeader(data []byte, pos int) (size uint64, typ string, headerLen
 		size = uint64(len(data) - pos) //nolint:gosec // G115: len(data)-pos is non-negative (guarded above)
 	}
 
+	// ISOBMFF (ISO 14496-12) §4.2: a well-formed box must be large enough to
+	// contain its own header. If size < headerLen the box is malformed — slicing
+	// data[pos+headerLen : pos+size] would panic (bounds out of range).
+	if size < headerLen {
+		return 0, "", 0, false
+	}
+
 	// Bounds check: box must not extend beyond the containing slice.
 	if size > uint64(len(data)-pos) { //nolint:gosec // G115: len(data)-pos is non-negative (guarded above)
 		return 0, "", 0, false
@@ -352,7 +359,11 @@ func findUUIDBox(data []byte, uuid []byte) []byte {
 		if !ok {
 			break
 		}
-		if typ == "uuid" && pos+int(headerLen)+16 <= len(data) { //nolint:gosec // G115: headerLen is 8 or 16
+		// ISOBMFF (ISO 14496-12) §4.2: a uuid box payload must accommodate
+		// both the header and the 16-byte UUID field before the content slice.
+		// size >= headerLen is guaranteed by parseCR3BoxHeader; also require
+		// size >= headerLen+16 so that data[pos+headerLen+16 : pos+size] is safe.
+		if typ == "uuid" && size >= headerLen+16 && pos+int(headerLen)+16 <= len(data) { //nolint:gosec // G115: headerLen is 8 or 16
 			if matchesUUID(data[pos+int(headerLen):], uuid) { //nolint:gosec // G115: headerLen is 8 or 16
 				return data[pos+int(headerLen)+16 : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by file size
 			}

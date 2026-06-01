@@ -3,6 +3,7 @@ package exif
 import (
 	"bytes"
 	"encoding/binary"
+	"strings"
 )
 
 // makerNoteParsers maps EXIF Make strings to their MakerNote IFD parser.
@@ -38,6 +39,11 @@ var makerNoteParsers = map[string]func([]byte, binary.ByteOrder) *IFD{
 // parseMakerNoteIFD attempts to parse the raw MakerNote bytes into an IFD.
 // Returns nil when the format is unrecognised or parsing fails.
 //
+// cameraMake is trimmed of leading/trailing whitespace before the dispatch
+// table lookup. Real-world camera files (e.g. Canon EOS bodies) sometimes
+// store the Make field with a trailing space ("Canon "); trimming aligns
+// our behaviour with ExifTool's MakerNote dispatch logic.
+//
 // Supported formats:
 //   - Canon: plain IFD at offset 0, parent byte order (CIPA MakerNote §Canon)
 //   - Nikon Type 3: embedded TIFF header at offset 10 within "Nikon\0" prefix
@@ -55,7 +61,11 @@ var makerNoteParsers = map[string]func([]byte, binary.ByteOrder) *IFD{
 //   - Sigma: "SIGMA\0\0\0" or "FOVEON\0\0" prefix, LE IFD at offset 10
 //   - Casio: plain IFD at offset 0, parent byte order
 func parseMakerNoteIFD(b []byte, cameraMake string, parentOrder binary.ByteOrder) *IFD {
-	if fn, ok := makerNoteParsers[cameraMake]; ok {
+	// Trim surrounding whitespace: real-world files (Canon, Nikon) sometimes store
+	// Make values with trailing spaces. ExifTool normalises the value before its
+	// own MakerNote dispatch; we do the same to avoid silent dispatch failures.
+	trimmed := strings.TrimSpace(cameraMake)
+	if fn, ok := makerNoteParsers[trimmed]; ok {
 		return fn(b, parentOrder)
 	}
 	return nil

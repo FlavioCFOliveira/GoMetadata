@@ -17,13 +17,19 @@ const (
 	TypeSRational DataType = 10 // two SLONGs (EXIF extension)
 	TypeFloat     DataType = 11 // IEEE 754 single (EXIF extension)
 	TypeDouble    DataType = 12 // IEEE 754 double (EXIF extension)
+	// TypeUTF8 is the UTF-8 string type introduced in EXIF 3.0.
+	// CIPA DC-008-2023 §4.6.3: type code 13, element size 1 byte, NUL-terminated
+	// UTF-8 string. Semantically analogous to TypeASCII but the character set is
+	// Unicode UTF-8 rather than US-ASCII.
+	TypeUTF8 DataType = 13
 )
 
 // typeSize returns the byte size of a single value of the given type.
 // Returns 0 for unknown types.
 func typeSize(t DataType) uint32 {
 	switch t {
-	case TypeByte, TypeASCII, TypeSByte, TypeUndefined:
+	case TypeByte, TypeASCII, TypeSByte, TypeUndefined, TypeUTF8:
+		// CIPA DC-008-2023 §4.6.3: TypeUTF8 (13) has element size 1, same as TypeASCII.
 		return 1
 	case TypeShort, TypeSShort:
 		return 2

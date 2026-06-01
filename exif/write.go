@@ -55,7 +55,8 @@ func serialise(e *EXIF) ([]byte, error) {
 
 // writeTIFFHeader builds the initial output buffer containing the TIFF header
 // (TIFF §2): byte order mark, magic 0x002A, and the IFD0 offset. It also
-// pre-allocates capacity for the IFD0, ExifIFD, GPS IFD, and InteropIFD blocks.
+// pre-allocates capacity for the IFD0, ExifIFD, GPS IFD, InteropIFD, and IFD1
+// chain blocks (including any JPEG thumbnail data).
 func writeTIFFHeader(e *EXIF, order binary.ByteOrder, ifd0Entries, exifIFDEntries []IFDEntry) []byte {
 	const headerSize = uint32(8)
 	var hdr [8]byte
@@ -81,7 +82,17 @@ func writeTIFFHeader(e *EXIF, order binary.ByteOrder, ifd0Entries, exifIFDEntrie
 		interopSize = ifdTotalSize(e.InteropIFD.Entries)
 	}
 
-	out := make([]byte, 0, headerSize+ifd0Size+exifSize+gpsSize+interopSize)
+	// Include the IFD1 chain (thumbnail IFDs + embedded JPEG data) in the
+	// capacity estimate to avoid reallocation when appending thumbnail bytes.
+	ifd1ChainSize := uint32(0)
+	if e.IFD0 != nil {
+		for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
+			ifd1ChainSize += ifdTotalSize(ifd.Entries)
+			ifd1ChainSize += uint32(len(ifd.ThumbnailData)) //nolint:gosec // G115: thumbnail size bounded by parse-time validation
+		}
+	}
+
+	out := make([]byte, 0, headerSize+ifd0Size+exifSize+gpsSize+interopSize+ifd1ChainSize)
 	out = append(out, hdr[:]...)
 	return out
 }
@@ -89,6 +100,12 @@ func writeTIFFHeader(e *EXIF, order binary.ByteOrder, ifd0Entries, exifIFDEntrie
 // writeSubIFDs appends the ExifIFD, GPS IFD, InteropIFD, and IFD1 chain blocks
 // to out in the order mandated by the TIFF layout (TIFF §2 / EXIF §4.5.4).
 // Returns the extended slice.
+//
+// For IFDs in the IFD1 chain that carry a JPEG thumbnail (ThumbnailData != nil),
+// the thumbnail bytes are appended immediately after the IFD block and the
+// JPEGInterchangeFormat (0x0201) entry value is patched to the new offset.
+// This fixes stale offset corruption that occurs when the TIFF is re-serialised
+// to a different position in the byte stream (EXIF §4.5.5, TIFF §2).
 func writeSubIFDs(out []byte, e *EXIF, exifIFDEntries []IFDEntry, order binary.ByteOrder) []byte {
 	if e.ExifIFD != nil {
 		out = writeIFD(out, exifIFDEntries, order, uint32(len(out)), 0) //nolint:gosec // G115: output offset bounded by buffer size
@@ -102,13 +119,71 @@ func writeSubIFDs(out []byte, e *EXIF, exifIFDEntries []IFDEntry, order binary.B
 
 	// Serialise the IFD1 chain (thumbnail IFDs, TIFF §2).
 	for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
+		// For IFDs with JPEG thumbnail data: the thumbnail bytes are placed
+		// immediately after the IFD block.  Compute the thumbnail offset now,
+		// patch the entries, then append the data.
+		//
+		// EXIF §4.5.5: JPEGInterchangeFormat (0x0201, TypeLong, Count=1) holds
+		// the absolute byte offset within the TIFF stream to the JPEG thumbnail.
+		// JPEGInterchangeFormatLength (0x0202, TypeLong, Count=1) holds its byte
+		// length.  Both are inline (4-byte) values in the IFD entry (TIFF §2:
+		// value stored inline when total size ≤ 4 bytes).
+		entries := ifd.Entries
+		if ifd.ThumbnailData != nil {
+			entries = patchThumbnailEntries(ifd.Entries, order,
+				uint32(len(out))+ifdTotalSize(ifd.Entries), //nolint:gosec // G115: output offset bounded by buffer size
+				uint32(len(ifd.ThumbnailData)),             //nolint:gosec // G115: thumbnail length bounded by parse-time validation
+			)
+		}
+
 		nextPtr := uint32(0)
 		if ifd.Next != nil {
-			nextPtr = uint32(len(out)) + ifdTotalSize(ifd.Entries) //nolint:gosec // G115: output offset bounded by buffer size
+			// nextPtr must skip past both the IFD block and any thumbnail data
+			// that follows it before the next IFD begins.
+			nextPtr = uint32(len(out)) + ifdTotalSize(entries) + uint32(len(ifd.ThumbnailData)) //nolint:gosec // G115: output offset bounded by buffer size
 		}
-		out = writeIFD(out, ifd.Entries, order, uint32(len(out)), nextPtr) //nolint:gosec // G115: output offset bounded by buffer size
+		out = writeIFD(out, entries, order, uint32(len(out)), nextPtr) //nolint:gosec // G115: output offset bounded by buffer size
+
+		// Append thumbnail bytes after the IFD block.
+		if ifd.ThumbnailData != nil {
+			out = append(out, ifd.ThumbnailData...)
+		}
 	}
 	return out
+}
+
+// patchThumbnailEntries returns a shallow copy of entries with
+// TagJPEGInterchangeFormat (0x0201) and TagJPEGInterchangeFormatLength (0x0202)
+// patched to the provided newOffset and newLength values.
+//
+// Both tags are TypeLong / Count=1 (total size = 4 bytes, stored inline in the
+// IFD entry field per TIFF §2).  The [4]byte backing arrays are stack-allocated
+// in the caller's frame; the returned slice aliases them so no heap allocation
+// is needed.
+//
+// EXIF §4.5.5: JPEGInterchangeFormat is the absolute TIFF-stream offset to the
+// JPEG thumbnail; JPEGInterchangeFormatLength is its byte length.
+func patchThumbnailEntries(entries []IFDEntry, order binary.ByteOrder, newOffset, newLength uint32) []IFDEntry {
+	// Shallow-copy the slice so we don't mutate the IFD's original entries.
+	patched := make([]IFDEntry, len(entries))
+	copy(patched, entries)
+
+	for i := range patched {
+		switch patched[i].Tag {
+		case TagJPEGInterchangeFormat:
+			// Replace the stale offset with the new one.  Allocate a fresh
+			// [4]byte value so the original IFDEntry.Value slice is not modified.
+			v := make([]byte, 4)
+			order.PutUint32(v, newOffset)
+			patched[i].Value = v
+		case TagJPEGInterchangeFormatLength:
+			// Update length in case ThumbnailData was trimmed or replaced.
+			v := make([]byte, 4)
+			order.PutUint32(v, newLength)
+			patched[i].Value = v
+		}
+	}
+	return patched
 }
 
 // buildIFD0Entries assembles the IFD0 entry slice for encoding.

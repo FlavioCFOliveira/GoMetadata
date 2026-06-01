@@ -290,20 +290,32 @@ func TestRefineTIFFVariant(t *testing.T) {
 
 // TestSupportsWrite exercises SupportsWrite for known writable, non-writable,
 // and unknown format IDs.
+//
+// SPIKE #6 / B2: TIFF-based formats (TIFF, CR2, NEF, ARW, DNG, ORF, RW2)
+// return false because metadata writes require image-data relocation, which is
+// not yet implemented (roadmap Option A, epic #33).
 func TestSupportsWrite(t *testing.T) {
 	t.Parallel()
+
 	writable := []FormatID{
-		FormatJPEG, FormatTIFF, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP,
-		FormatCR2, FormatCR3, FormatNEF, FormatARW, FormatDNG, FormatORF, FormatRW2,
+		FormatJPEG, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3,
 	}
 	for _, f := range writable {
 		if !SupportsWrite(f) {
 			t.Errorf("SupportsWrite(%v) = false, want true", f)
 		}
 	}
-	if SupportsWrite(FormatUnknown) {
-		t.Error("SupportsWrite(FormatUnknown) = true, want false")
+
+	notWritable := []FormatID{
+		FormatTIFF, FormatCR2, FormatNEF, FormatARW, FormatDNG, FormatORF, FormatRW2,
+		FormatUnknown,
 	}
+	for _, f := range notWritable {
+		if SupportsWrite(f) {
+			t.Errorf("SupportsWrite(%v) = true, want false", f)
+		}
+	}
+
 	// An out-of-range FormatID should return false.
 	if SupportsWrite(FormatID(255)) {
 		t.Error("SupportsWrite(255) = true, want false")
@@ -449,5 +461,75 @@ func TestParseTIFFScanHeaderIFD0OffsetBeyondData(t *testing.T) {
 	// Must fall back to FormatTIFF or FormatUnknown — not crash.
 	if got != FormatTIFF && got != FormatUnknown {
 		t.Errorf("Detect with OOB IFD0 offset = %v, want FormatTIFF or FormatUnknown", got)
+	}
+}
+
+// TestDetectOutOfScopeFormats verifies that magic bytes from RAW formats that
+// are outside the library's current scope (doc.go §Out-of-scope formats)
+// are detected as FormatUnknown without panicking. All of these return
+// UnsupportedFormatError when passed to the top-level Read/Write functions.
+//
+// Magic byte sources:
+//
+//   - CRW / CIFF: starts with "II" followed by 0x1A 0x00 (little-endian CIFF marker)
+//   - RAF:        "FUJIFILMCCD-RAW " (16-byte ASCII header)
+//   - MRW:        "\x00MRM" (Minolta big-endian marker)
+//   - IIQ:        "IIQPhaseOne" or the Phase One 0x49 49 header variant recognised as
+//     a plain TIFF by detectMagic; the test uses the IIQ-specific marker
+//   - X3F:        "FOVb" (Sigma/Foveon)
+//   - SRW:        Samsung RAW uses standard TIFF magic — returns FormatTIFF or
+//     FormatUnknown depending on IFD content; not tested separately (it
+//     falls through to the TIFF path and is treated as TIFF/Unknown)
+//   - PEF:        standard TIFF magic with Pentax Make; falls through to TIFF
+//   - RWL:        standard TIFF magic with Leica Make; falls through to TIFF
+//
+// The formats that share standard TIFF magic (SRW, PEF, RWL) are not included
+// below because detectMagic legitimately returns FormatTIFF for them — they are
+// disambiguated by IFD content, which this library does not yet handle. The
+// formats with unique magic bytes are tested to confirm FormatUnknown.
+func TestDetectOutOfScopeFormats(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		magic []byte
+	}{
+		{
+			// CRW / CIFF: Canon RAW v1. Magic: "II" + 0x1A 0x00 (CIFF little-endian).
+			// Distinct from TIFF because byte 2 is 0x1A, not 0x2A.
+			// Reference: Canon CIFF specification §2.
+			name:  "CRW/CIFF",
+			magic: []byte{0x49, 0x49, 0x1A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+		},
+		{
+			// RAF: Fujifilm RAW. First 8 bytes are the ASCII string "FUJIFILM".
+			// Reference: libraw / ExifTool source.
+			name:  "RAF",
+			magic: []byte{'F', 'U', 'J', 'I', 'F', 'I', 'L', 'M', 'C', 'C', 'D', '-'},
+		},
+		{
+			// MRW: Minolta RAW. Magic: 0x00 'M' 'R' 'M'.
+			// Reference: ExifTool lib/Image/ExifTool/MinoltaRaw.pm.
+			name:  "MRW",
+			magic: []byte{0x00, 0x4D, 0x52, 0x4D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+		},
+		{
+			// X3F: Sigma/Foveon RAW. Magic: "FOVb".
+			// Reference: ExifTool lib/Image/ExifTool/SigmaRaw.pm.
+			name:  "X3F",
+			magic: []byte{0x46, 0x4F, 0x56, 0x62, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := Detect(bytes.NewReader(tc.magic))
+			if err != nil {
+				t.Fatalf("Detect(%s): unexpected error: %v", tc.name, err)
+			}
+			if got != FormatUnknown {
+				t.Errorf("Detect(%s) = %v, want FormatUnknown (format is out-of-scope)", tc.name, got)
+			}
+		})
 	}
 }

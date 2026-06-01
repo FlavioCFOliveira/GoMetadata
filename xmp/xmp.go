@@ -29,8 +29,19 @@ type XMP struct {
 // Parse parses a raw XMP packet.
 // b may include the <?xpacket …?> wrapper; if absent, the bytes are
 // treated as the xmpmeta/RDF body directly.
+//
+// XMP Part 1 §7.2: if b begins with a UTF-16 or UTF-32 BOM, it is
+// automatically transcoded to UTF-8 before parsing.
 func Parse(b []byte) (*XMP, error) {
 	if len(b) == 0 {
+		return nil, ErrEmptyInput
+	}
+
+	// Normalise to UTF-8 so that the BOM-based encoding path is handled once,
+	// here, rather than duplicated across Scan and parseRDF.
+	// normaliseToUTF8 is a zero-copy no-op for UTF-8 input.
+	b = normaliseToUTF8(b)
+	if b == nil {
 		return nil, ErrEmptyInput
 	}
 

@@ -478,13 +478,19 @@ func TestIPTCRecordsBeyond2(t *testing.T) {
 // TestEncodeExtendedLengthRoundTrip verifies that a dataset whose value exceeds
 // 32767 bytes (0x8000) is correctly encoded using IIM §1.6.2 extended length
 // encoding and round-trips back through Parse without data loss.
+//
+// Note: Encode may prepend a 1:90 UTF-8 declaration (8 bytes) when the value
+// contains non-ASCII bytes (#19 auto-inject). The test scans for the Caption
+// dataset marker rather than assuming a fixed byte offset.
 func TestEncodeExtendedLengthRoundTrip(t *testing.T) {
 	t.Parallel()
 	// Build a value that requires extended length: 40 000 bytes.
+	// Use bytes 0..127 only (ASCII) to avoid triggering the #19 UTF-8
+	// auto-inject so the byte-layout assertions below remain straightforward.
 	const valueLen = 40_000
 	large := make([]byte, valueLen)
 	for i := range large {
-		large[i] = byte(i & 0xFF)
+		large[i] = byte(i % 127) // ASCII-safe; no byte > 0x7E
 	}
 
 	i := new(IPTC)
@@ -497,24 +503,36 @@ func TestEncodeExtendedLengthRoundTrip(t *testing.T) {
 		t.Fatalf("Encode: %v", err)
 	}
 
-	// Verify the extended length prefix in the encoded stream.
-	// After marker(0x1C) + record(1) + dataset(1) = 3 bytes offset:
-	//   byte 3: 0x80 (bit 15 set, upper 7 bits of byte-count = 0)
-	//   byte 4: 0x04 (lower 8 bits of byte-count = 4)
-	//   bytes 5-8: big-endian uint32 = valueLen
-	if len(encoded) < 9 {
-		t.Fatalf("encoded length %d too short to contain extended header", len(encoded))
+	// Scan for the Caption dataset (0x1C 0x02 DS2Caption) to find its position
+	// independent of any prefix headers (e.g. 1:90 declaration).
+	want3 := []byte{0x1C, 0x02, DS2Caption}
+	dsStart := -1
+	for j := 0; j+3 <= len(encoded); j++ {
+		if encoded[j] == want3[0] && encoded[j+1] == want3[1] && encoded[j+2] == want3[2] {
+			dsStart = j
+			break
+		}
 	}
-	if encoded[0] != 0x1C {
-		t.Errorf("encoded[0] = 0x%02X, want 0x1C (tag marker)", encoded[0])
+	if dsStart < 0 {
+		t.Fatal("Caption dataset marker (0x1C 0x02 DS2Caption) not found in encoded output")
 	}
-	if encoded[3] != 0x80 {
-		t.Errorf("encoded[3] (size high) = 0x%02X, want 0x80", encoded[3])
+
+	// Verify the extended length prefix in the encoded stream at dsStart.
+	// After marker(0x1C) + record(1) + dataset(1) = 3 bytes:
+	//   byte dsStart+3: 0x80 (bit 15 set, upper 7 bits of byte-count = 0)
+	//   byte dsStart+4: 0x04 (lower 8 bits of byte-count = 4)
+	//   bytes dsStart+5..+8: big-endian uint32 = valueLen
+	if len(encoded) < dsStart+9 {
+		t.Fatalf("encoded too short to contain extended header at dsStart=%d", dsStart)
 	}
-	if encoded[4] != 0x04 {
-		t.Errorf("encoded[4] (size low / byte-count) = 0x%02X, want 0x04", encoded[4])
+	if encoded[dsStart+3] != 0x80 {
+		t.Errorf("encoded[%d] (size high) = 0x%02X, want 0x80", dsStart+3, encoded[dsStart+3])
 	}
-	encodedLen := int(encoded[5])<<24 | int(encoded[6])<<16 | int(encoded[7])<<8 | int(encoded[8])
+	if encoded[dsStart+4] != 0x04 {
+		t.Errorf("encoded[%d] (size low / byte-count) = 0x%02X, want 0x04", dsStart+4, encoded[dsStart+4])
+	}
+	encodedLen := int(encoded[dsStart+5])<<24 | int(encoded[dsStart+6])<<16 |
+		int(encoded[dsStart+7])<<8 | int(encoded[dsStart+8])
 	if encodedLen != valueLen {
 		t.Errorf("extended length field = %d, want %d", encodedLen, valueLen)
 	}
@@ -537,6 +555,71 @@ func TestEncodeExtendedLengthRoundTrip(t *testing.T) {
 			t.Fatalf("value mismatch at byte %d: got 0x%02X, want 0x%02X", j, b, large[j])
 		}
 	}
+}
+
+// TestParseInvalidRecordNoPanic is a regression test for the OOB index panic
+// discovered by fuzzing. Any dataset whose record byte falls outside [1, 9]
+// must be silently skipped; Parse must return a non-nil *IPTC with no error,
+// and valid datasets elsewhere in the same stream must be preserved.
+//
+// PoC input: {0x1C, 0x30, 0x30, 0x00, 0x00} — record=0x30=48 (out of range).
+func TestParseInvalidRecordNoPanic(t *testing.T) {
+	t.Parallel()
+
+	// Each case embeds the bad record in a stream that also contains a valid
+	// Record-2 caption so we can verify continuation after the skip.
+	validSuffix := buildIPTC([]struct {
+		rec uint8
+		ds  uint8
+		val []byte
+	}{
+		{2, DS2Caption, []byte("after-bad-record")},
+	})
+
+	cases := []struct {
+		name   string
+		record byte
+	}{
+		{"record-0", 0x00},
+		{"record-10", 0x0A},
+		{"record-48", 0x30},
+		{"record-255", 0xFF},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Craft a stream: bad-record dataset first, then the valid caption.
+			bad := make([]byte, 0, 5+len(validSuffix))
+			bad = append(bad, 0x1C, tc.record, 0x30, 0x00, 0x00)
+			stream := append(bad, validSuffix...)
+
+			i, err := Parse(stream)
+			if err != nil {
+				t.Fatalf("Parse(%02X record): unexpected error: %v", tc.record, err)
+			}
+			if i == nil {
+				t.Fatalf("Parse(%02X record): returned nil *IPTC", tc.record)
+			}
+			// Valid dataset after the bad record must be preserved.
+			if got := i.Caption(); got != "after-bad-record" {
+				t.Errorf("Parse(%02X record): Caption = %q, want %q", tc.record, got, "after-bad-record")
+			}
+		})
+	}
+
+	// Also verify the exact fuzz-corpus PoC: {0x1C, 0x30, 0x30, 0x00, 0x00}.
+	t.Run("fuzz-corpus-poc", func(t *testing.T) {
+		t.Parallel()
+		i, err := Parse([]byte{0x1C, 0x30, 0x30, 0x00, 0x00})
+		if err != nil {
+			t.Fatalf("Parse(fuzz PoC): unexpected error: %v", err)
+		}
+		if i == nil {
+			t.Fatal("Parse(fuzz PoC): returned nil *IPTC")
+		}
+	})
 }
 
 func BenchmarkIPTCParse(b *testing.B) {

@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/binary"
+	"errors"
 	"hash/crc32"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -696,6 +699,85 @@ func TestExtractTruncatedChunkNoPanic(t *testing.T) {
 	}
 }
 
+// TestReadChunkTooLarge is a DoS regression test: a PNG whose single chunk
+// declares length 0xFFFFFFFF (≈4 GiB) must be rejected by ErrChunkTooLarge
+// without attempting to allocate or read that many bytes.
+func TestReadChunkTooLarge(t *testing.T) {
+	t.Parallel()
+
+	// Craft a minimal stream: PNG signature + chunk header with giant length.
+	// We use chunkType "IHDR" so the stream looks plausible; the length field
+	// (0xFFFFFFFF) is what triggers the guard. No chunk data follows — the guard
+	// must fire before any read of the payload.
+	var buf bytes.Buffer
+	buf.Write(pngSig[:])
+
+	var hdr [8]byte
+	binary.BigEndian.PutUint32(hdr[:4], 0xFFFFFFFF) // giant length
+	copy(hdr[4:8], "IHDR")
+	buf.Write(hdr[:])
+	// Deliberately write no payload bytes — the guard must reject before reading.
+
+	_, _, _, err := Extract(bytes.NewReader(buf.Bytes()))
+	if err == nil {
+		t.Fatal("Extract: expected error for oversized chunk, got nil")
+	}
+	if !errors.Is(err, ErrChunkTooLarge) {
+		t.Errorf("Extract: expected ErrChunkTooLarge, got %v", err)
+	}
+}
+
+// TestReadChunkLargeDeclaredSizeShortStream is a DoS regression test for the
+// incremental-read strategy added to readNonEmptyChunk.
+//
+// A PNG can be crafted so that a chunk's declared length field (e.g. ~200 MiB)
+// is far larger than the actual bytes in the stream (e.g. a few hundred bytes).
+// Before the fix, iobuf.Get(length) fell back to make([]byte, length) for any
+// length > largeSize (65536), allocating ~200 MiB before io.ReadFull detected
+// the truncation.
+//
+// After the fix, readNonEmptyChunk switches to io.ReadAll(io.LimitReader(...))
+// for length > largeChunkReadThreshold, which grows incrementally as bytes
+// arrive; a short stream yields a short slice without a proportional allocation,
+// and the subsequent truncation check returns an error immediately.
+func TestReadChunkLargeDeclaredSizeShortStream(t *testing.T) {
+	t.Parallel()
+
+	// Craft a PNG: signature + IHDR + one chunk with a huge declared length.
+	// The chunk payload and CRC are not written — the stream ends after the
+	// 8-byte chunk header, so the parser sees "eXIf" claiming ~200 MiB but
+	// the stream has zero payload bytes available.
+	const declaredLen = 200 << 20 // 200 MiB — well within maxPNGChunkSize
+
+	var buf bytes.Buffer
+	buf.Write(pngSig[:])
+
+	// Valid IHDR so the parser enters the chunk loop successfully.
+	ihdrData := make([]byte, 13)
+	binary.BigEndian.PutUint32(ihdrData[0:], 1) // width  = 1
+	binary.BigEndian.PutUint32(ihdrData[4:], 1) // height = 1
+	ihdrData[8] = 8                             // bit depth
+	ihdrData[9] = 2                             // colour type (RGB)
+	writeChunkTo(&buf, "IHDR", ihdrData)
+
+	// eXIf chunk header with giant declared length; no payload or CRC follow.
+	var hdr [8]byte
+	binary.BigEndian.PutUint32(hdr[:4], declaredLen)
+	copy(hdr[4:8], "eXIf")
+	buf.Write(hdr[:])
+	// Deliberately write no payload — stream ends immediately after the header.
+
+	_, _, _, err := Extract(bytes.NewReader(buf.Bytes()))
+	if err == nil {
+		t.Fatal("Extract: expected error for chunk length > stream, got nil")
+	}
+	// The error must NOT be nil: a truncated read must be detected quickly
+	// without a proportional allocation. Any non-nil error is acceptable here
+	// (io.ErrUnexpectedEOF wrapped in the readNonEmptyChunk message). We do
+	// not assert a specific sentinel because the stream ends mid-chunk, which
+	// is a different condition from ErrChunkTooLarge.
+}
+
 // BenchmarkPNGWriteChunk measures the hot inner loop: serialise one PNG chunk
 // (header + data + CRC) using the pooled crc32 hash and stack-allocated header.
 func BenchmarkPNGWriteChunk(b *testing.B) {
@@ -706,5 +788,209 @@ func BenchmarkPNGWriteChunk(b *testing.B) {
 	for range b.N {
 		var out bytes.Buffer
 		_ = writeChunk(&out, "eXIf", data)
+	}
+}
+
+// buildPNGWithBadCRC constructs a minimal PNG where the single extra chunk
+// (placed between IHDR and IEND) has its CRC corrupted by flipping all bits.
+// Used to verify ErrChunkCRCMismatch detection.
+func buildPNGWithBadCRC(chunkType string, data []byte) []byte {
+	var buf bytes.Buffer
+	buf.Write(pngSig[:])
+
+	ihdrData := make([]byte, 13)
+	binary.BigEndian.PutUint32(ihdrData[0:], 1)
+	binary.BigEndian.PutUint32(ihdrData[4:], 1)
+	ihdrData[8] = 8
+	ihdrData[9] = 2
+	writeChunkTo(&buf, "IHDR", ihdrData)
+
+	// Write the target chunk with a deliberately wrong CRC.
+	var lbuf [4]byte
+	binary.BigEndian.PutUint32(lbuf[:], uint32(len(data))) //nolint:gosec // G115: test helper
+	buf.Write(lbuf[:])
+	buf.WriteString(chunkType)
+	buf.Write(data)
+	// Corrupt: write the bitwise complement of the correct CRC.
+	h := crc32.NewIEEE()
+	_, _ = h.Write([]byte(chunkType))
+	_, _ = h.Write(data)
+	binary.BigEndian.PutUint32(lbuf[:], ^h.Sum32()) // flip all bits — guaranteed mismatch
+	buf.Write(lbuf[:])
+
+	writeChunkTo(&buf, "IEND", nil)
+	return buf.Bytes()
+}
+
+// TestReadChunkCRCMismatchDetected verifies that readChunk (and therefore
+// Extract) returns ErrChunkCRCMismatch when a metadata chunk carries a
+// corrupted CRC. Verified chunk types: eXIf, iTXt, tEXt, zTXt, IHDR.
+//
+// Note: IEND and IDAT are intentionally not in this list — the library does
+// not verify CRC for non-metadata chunks (see shouldVerifyCRC, readChunk doc).
+func TestReadChunkCRCMismatchDetected(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		chunkType string
+		data      []byte
+	}{
+		{
+			name:      "eXIf chunk with bad CRC",
+			chunkType: "eXIf",
+			data:      []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00},
+		},
+		{
+			name:      "iTXt chunk with bad CRC",
+			chunkType: "iTXt",
+			// A minimal iTXt payload (wrong keyword, so it won't be parsed as XMP).
+			data: []byte("Comment\x00\x00\x00\x00\x00some text"),
+		},
+		{
+			name:      "tEXt chunk with bad CRC",
+			chunkType: "tEXt",
+			data:      []byte("Comment\x00some plain text"),
+		},
+		{
+			name:      "IHDR chunk with bad CRC",
+			chunkType: "IHDR",
+			// A well-formed 13-byte IHDR payload (1×1 pixel, 8-bit RGB).
+			data: func() []byte {
+				d := make([]byte, 13)
+				binary.BigEndian.PutUint32(d[0:], 1)
+				binary.BigEndian.PutUint32(d[4:], 1)
+				d[8] = 8
+				d[9] = 2
+				return d
+			}(),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			png := buildPNGWithBadCRC(tc.chunkType, tc.data)
+			_, _, _, err := Extract(bytes.NewReader(png))
+			if err == nil {
+				t.Fatal("Extract: expected ErrChunkCRCMismatch, got nil")
+			}
+			if !errors.Is(err, ErrChunkCRCMismatch) {
+				t.Errorf("Extract: expected ErrChunkCRCMismatch, got %v", err)
+			}
+		})
+	}
+}
+
+// TestCRCSkippedForNonMetadataChunks verifies that Extract does NOT return
+// ErrChunkCRCMismatch for a non-metadata chunk (IDAT) with a corrupted CRC.
+// This documents the selective-verification policy: IDAT pixel data is never
+// interpreted by the metadata layer, so spending cycles on its CRC check is
+// pure overhead (see shouldVerifyCRC, readChunk doc comment).
+func TestCRCSkippedForNonMetadataChunks(t *testing.T) {
+	t.Parallel()
+
+	// Build a PNG that contains an IDAT chunk with a deliberately wrong CRC,
+	// sandwiched between IHDR and IEND (both with correct CRCs).
+	var buf bytes.Buffer
+	buf.Write(pngSig[:])
+
+	ihdrData := make([]byte, 13)
+	binary.BigEndian.PutUint32(ihdrData[0:], 1)
+	binary.BigEndian.PutUint32(ihdrData[4:], 1)
+	ihdrData[8] = 8
+	ihdrData[9] = 2
+	writeChunkTo(&buf, "IHDR", ihdrData)
+
+	// IDAT with correct data but corrupted CRC.
+	idatData := []byte{0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01} // minimal zlib IDAT
+	var lbuf [4]byte
+	binary.BigEndian.PutUint32(lbuf[:], uint32(len(idatData))) //nolint:gosec // G115: test helper
+	buf.Write(lbuf[:])
+	buf.WriteString("IDAT")
+	buf.Write(idatData)
+	// Write bitwise-complement of correct CRC — guaranteed mismatch.
+	h := crc32.NewIEEE()
+	_, _ = h.Write([]byte("IDAT"))
+	_, _ = h.Write(idatData)
+	binary.BigEndian.PutUint32(lbuf[:], ^h.Sum32())
+	buf.Write(lbuf[:])
+
+	writeChunkTo(&buf, "IEND", nil)
+
+	_, _, _, err := Extract(bytes.NewReader(buf.Bytes()))
+	if errors.Is(err, ErrChunkCRCMismatch) {
+		t.Errorf("Extract: got ErrChunkCRCMismatch for IDAT (non-metadata chunk); CRC should be skipped")
+	}
+	// Any other error (e.g. decompression) is fine — the point is CRC is not checked.
+}
+
+// TestReadChunkCRCValidPasses verifies that Extract succeeds (no error) when
+// all chunks carry correct CRCs. This is the positive case for CRC verification.
+func TestReadChunkCRCValidPasses(t *testing.T) {
+	t.Parallel()
+
+	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00}
+	xmpData := []byte("<?xpacket begin='' uid='x'?><xmpmeta/><?xpacket end='r'?>")
+	png := buildPNG(exifData, xmpData)
+
+	rawEXIF, _, rawXMP, err := Extract(bytes.NewReader(png))
+	if err != nil {
+		t.Fatalf("Extract: unexpected error on valid CRCs: %v", err)
+	}
+	if !bytes.Equal(rawEXIF, exifData) {
+		t.Errorf("EXIF mismatch: got %q, want %q", rawEXIF, exifData)
+	}
+	if !bytes.Equal(rawXMP, xmpData) {
+		t.Errorf("XMP mismatch: got %q, want %q", rawXMP, xmpData)
+	}
+}
+
+// knownGoodPNGs lists corpus files that are expected to be well-formed
+// (valid CRCs, no intentional corruption). These are original reference files
+// from the exiv2 test suite, not mutation/PoC variants.
+// Any file in this list that triggers ErrChunkCRCMismatch is a regression.
+var knownGoodPNGs = []string{ //nolint:gochecknoglobals // package-level test data
+	"testdata/corpus/png/exiv2/1343_comment.png",
+	"testdata/corpus/png/exiv2/1343_empty.png",
+	"testdata/corpus/png/exiv2/1343_exif.png",
+	"testdata/corpus/png/exiv2/exiv2-bug1074.png",
+	"testdata/corpus/png/exiv2/exiv2-bug841.png",
+	"testdata/corpus/png/exiv2/exiv2-bug922.png",
+	"testdata/corpus/png/exiv2/imagemagick.png",
+	"testdata/corpus/png/exiv2/ReaganSmallPng.png",
+	"testdata/corpus/png/exiv2/ReaganLargePng.png",
+	"testdata/corpus/png/exiv2/issue_790_poc2.png",
+}
+
+// TestCorpusPNGCRCIntegrity runs Extract against known-good PNG corpus files.
+// Each file in knownGoodPNGs must parse without ErrChunkCRCMismatch, proving
+// that CRC verification does not break extraction of legitimate real-world PNGs.
+//
+// Note: the broader corpus also contains PoC/mutation files with intentionally
+// corrupt CRCs (prefixed m1-, m2-, c-, or named issue_*_poc); those are excluded
+// here — they should trigger ErrChunkCRCMismatch by design and are covered by
+// TestReadChunkCRCMismatchDetected.
+func TestCorpusPNGCRCIntegrity(t *testing.T) {
+	t.Parallel()
+
+	corpusRoot := filepath.Join("..", "..")
+	for _, rel := range knownGoodPNGs {
+		t.Run(filepath.Base(rel), func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(corpusRoot, rel)
+			f, err := os.Open(path)
+			if err != nil {
+				t.Skipf("cannot open %s: %v", path, err)
+			}
+			defer f.Close() //nolint:errcheck // read-only
+
+			_, _, _, extractErr := Extract(f)
+			if extractErr != nil && errors.Is(extractErr, ErrChunkCRCMismatch) {
+				t.Errorf("%s: CRC mismatch on known-good corpus file (regression): %v", filepath.Base(rel), extractErr)
+			}
+			// Other errors (ErrInvalidSignature, truncated payload, etc.) are not
+			// regressions — some exiv2 files test specific parse-edge-case behaviour.
+		})
 	}
 }

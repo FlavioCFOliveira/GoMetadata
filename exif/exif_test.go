@@ -2520,3 +2520,507 @@ func TestTagName(t *testing.T) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// Thumbnail JPEG round-trip (bug fix: stale JPEGInterchangeFormat offset)
+// ---------------------------------------------------------------------------
+
+// buildEXIFWithThumbnail constructs a raw TIFF byte stream where IFD0 points to
+// an IFD1 that carries a JPEG thumbnail via tags 0x0201/0x0202.  The thumbnail
+// payload is the caller-supplied jpegBytes slice.
+//
+// Layout (all offsets relative to TIFF header byte 0):
+//
+//	0–7     TIFF header (LE, magic 0x002A, IFD0 at offset 8)
+//	8–29    IFD0: 1 entry (ImageWidth=640) + next-IFD ptr → ifd1Off
+//	ifd1Off IFD1: 2 entries (0x0201, 0x0202) + next-IFD ptr = 0
+//	thumbOff  JPEG thumbnail bytes
+//
+// IFD0 entry count=1 → IFD0 size = 2 + 12 + 4 = 18 bytes → IFD0 ends at 26.
+// IFD1 entry count=2 → IFD1 size = 2 + 24 + 4 = 30 bytes.
+// So: ifd1Off=26, thumbOff=56.
+func buildEXIFWithThumbnail(t *testing.T, jpegBytes []byte) []byte {
+	t.Helper()
+	order := binary.LittleEndian
+
+	const (
+		hdrSize  = uint32(8)
+		ifd0Off  = hdrSize              // 8
+		ifd0Size = uint32(2 + 1*12 + 4) // 18
+		ifd1Off  = ifd0Off + ifd0Size   // 26
+		ifd1Size = uint32(2 + 2*12 + 4) // 30
+		thumbOff = ifd1Off + ifd1Size   // 56
+	)
+
+	thumbLen := uint32(len(jpegBytes)) //nolint:gosec // G115: test helper, thumbnail bounded by test input
+	totalSize := thumbOff + thumbLen
+
+	buf := make([]byte, totalSize)
+
+	// TIFF header.
+	buf[0], buf[1] = 'I', 'I'
+	order.PutUint16(buf[2:], 0x002A)
+	order.PutUint32(buf[4:], ifd0Off)
+
+	// IFD0: 1 entry (ImageWidth=640), next-IFD → ifd1Off.
+	order.PutUint16(buf[ifd0Off:], 1) // entry count
+	order.PutUint16(buf[ifd0Off+2:], uint16(TagImageWidth))
+	order.PutUint16(buf[ifd0Off+4:], uint16(TypeLong))
+	order.PutUint32(buf[ifd0Off+6:], 1) // count=1
+	order.PutUint32(buf[ifd0Off+10:], 640)
+	order.PutUint32(buf[ifd0Off+14:], ifd1Off) // next-IFD pointer
+
+	// IFD1: 2 entries (JPEGInterchangeFormat, JPEGInterchangeFormatLength), next=0.
+	order.PutUint16(buf[ifd1Off:], 2)
+	// Entry 0: 0x0201 JPEGInterchangeFormat (TypeLong, count=1, inline offset).
+	order.PutUint16(buf[ifd1Off+2:], uint16(TagJPEGInterchangeFormat))
+	order.PutUint16(buf[ifd1Off+4:], uint16(TypeLong))
+	order.PutUint32(buf[ifd1Off+6:], 1)
+	order.PutUint32(buf[ifd1Off+10:], thumbOff) // thumbnail is at thumbOff
+	// Entry 1: 0x0202 JPEGInterchangeFormatLength (TypeLong, count=1, inline length).
+	order.PutUint16(buf[ifd1Off+14:], uint16(TagJPEGInterchangeFormatLength))
+	order.PutUint16(buf[ifd1Off+16:], uint16(TypeLong))
+	order.PutUint32(buf[ifd1Off+18:], 1)
+	order.PutUint32(buf[ifd1Off+22:], thumbLen)
+	// next-IFD pointer = 0.
+	order.PutUint32(buf[ifd1Off+26:], 0)
+
+	// Thumbnail bytes.
+	copy(buf[thumbOff:], jpegBytes)
+
+	return buf
+}
+
+// TestThumbnailRoundTrip verifies that:
+//  1. Parse retains the thumbnail bytes in IFD0.Next.ThumbnailData.
+//  2. After Encode→Parse, the thumbnail bytes extracted via
+//     JPEGInterchangeFormat+JPEGInterchangeFormatLength are byte-identical to
+//     the original.
+//  3. The JPEGInterchangeFormat offset (0x0201) in the re-encoded stream points
+//     exactly to the start of the thumbnail bytes in the new buffer.
+//
+// This is a regression test for the stale-offset corruption bug: previously
+// writeSubIFDs re-serialised the IFD1 entry verbatim but never appended the
+// thumbnail bytes, leaving a dangling offset (EXIF §4.5.5, TIFF §2).
+func TestThumbnailRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	// Use a minimal but non-trivial JPEG SOI+EOI marker sequence as the thumbnail.
+	// Real cameras use a full JPEG; for the round-trip test we only need the bytes
+	// to survive intact, not to be a valid image.
+	jpegPayload := []byte{
+		0xFF, 0xD8, // SOI
+		0xFF, 0xE0, 0x00, 0x10, // APP0 marker + length
+		'J', 'F', 'I', 'F', 0x00, // identifier
+		0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, // JFIF data
+		0xFF, 0xD9, // EOI
+	}
+
+	raw := buildEXIFWithThumbnail(t, jpegPayload)
+
+	// ---- Parse step --------------------------------------------------------
+	e, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if e.IFD0 == nil {
+		t.Fatal("IFD0 is nil")
+	}
+	ifd1 := e.IFD0.Next
+	if ifd1 == nil {
+		t.Fatal("IFD0.Next (IFD1) is nil; thumbnail IFD not linked")
+	}
+	if ifd1.ThumbnailData == nil {
+		t.Fatal("IFD1.ThumbnailData is nil; Parse did not retain thumbnail bytes")
+	}
+	if !bytes.Equal(ifd1.ThumbnailData, jpegPayload) {
+		t.Fatalf("Parse: ThumbnailData mismatch\n  got  %x\n  want %x", ifd1.ThumbnailData, jpegPayload)
+	}
+
+	// ---- Encode step -------------------------------------------------------
+	encoded, err := Encode(e)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	// ---- Re-parse and verify -----------------------------------------------
+	e2, err := Parse(encoded)
+	if err != nil {
+		t.Fatalf("Parse (round-trip): %v", err)
+	}
+	if e2.IFD0 == nil || e2.IFD0.Next == nil {
+		t.Fatal("IFD0.Next (IFD1) is nil after round-trip")
+	}
+	ifd1rt := e2.IFD0.Next
+
+	// Verify ThumbnailData survived the round-trip.
+	if ifd1rt.ThumbnailData == nil {
+		t.Fatal("ThumbnailData is nil after Encode→Parse round-trip")
+	}
+	if !bytes.Equal(ifd1rt.ThumbnailData, jpegPayload) {
+		t.Fatalf("round-trip ThumbnailData mismatch\n  got  %x\n  want %x", ifd1rt.ThumbnailData, jpegPayload)
+	}
+
+	// Verify the 0x0201 offset in the re-encoded buffer points to the exact
+	// start of the thumbnail bytes.
+	jifEntry := ifd1rt.Get(TagJPEGInterchangeFormat)
+	if jifEntry == nil {
+		t.Fatal("TagJPEGInterchangeFormat (0x0201) missing after round-trip")
+	}
+	if len(jifEntry.Value) < 4 {
+		t.Fatalf("TagJPEGInterchangeFormat Value too short: %d bytes", len(jifEntry.Value))
+	}
+	newOff := binary.LittleEndian.Uint32(jifEntry.Value)
+
+	// The offset must be within the encoded buffer.
+	if uint64(newOff)+uint64(len(jpegPayload)) > uint64(len(encoded)) {
+		t.Fatalf("JPEGInterchangeFormat offset %d + len %d exceeds encoded size %d",
+			newOff, len(jpegPayload), len(encoded))
+	}
+	// The bytes at the new offset must be byte-identical to jpegPayload.
+	got := encoded[newOff : uint64(newOff)+uint64(len(jpegPayload))]
+	if !bytes.Equal(got, jpegPayload) {
+		t.Fatalf("bytes at new JPEGInterchangeFormat offset are not the thumbnail:\n  got  %x\n  want %x", got, jpegPayload)
+	}
+}
+
+// TestThumbnailRoundTripBothOrders repeats TestThumbnailRoundTrip for big-endian
+// to ensure the offset patching is order-correct.
+func TestThumbnailRoundTripBothOrders(t *testing.T) {
+	t.Parallel()
+
+	jpegPayload := []byte{0xFF, 0xD8, 0xAA, 0xBB, 0xCC, 0xDD, 0xFF, 0xD9}
+
+	for _, tc := range []struct {
+		name  string
+		order binary.ByteOrder
+	}{
+		{"LE", binary.LittleEndian},
+		{"BE", binary.BigEndian},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			order := tc.order
+
+			// Build a minimal TIFF with byte order tc.order.
+			const (
+				hdrSize  = uint32(8)
+				ifd0Off  = hdrSize
+				ifd0Size = uint32(2 + 1*12 + 4) // 18
+				ifd1Off  = ifd0Off + ifd0Size   // 26
+				ifd1Size = uint32(2 + 2*12 + 4) // 30
+				thumbOff = ifd1Off + ifd1Size   // 56
+			)
+			thumbLen := uint32(len(jpegPayload)) //nolint:gosec // G115: test helper
+			buf := make([]byte, thumbOff+thumbLen)
+
+			bom := [2]byte{'I', 'I'}
+			if order == binary.BigEndian {
+				bom = [2]byte{'M', 'M'}
+			}
+			buf[0], buf[1] = bom[0], bom[1]
+			order.PutUint16(buf[2:], 0x002A)
+			order.PutUint32(buf[4:], ifd0Off)
+
+			order.PutUint16(buf[ifd0Off:], 1)
+			order.PutUint16(buf[ifd0Off+2:], uint16(TagImageWidth))
+			order.PutUint16(buf[ifd0Off+4:], uint16(TypeLong))
+			order.PutUint32(buf[ifd0Off+6:], 1)
+			order.PutUint32(buf[ifd0Off+10:], 640)
+			order.PutUint32(buf[ifd0Off+14:], ifd1Off)
+
+			order.PutUint16(buf[ifd1Off:], 2)
+			order.PutUint16(buf[ifd1Off+2:], uint16(TagJPEGInterchangeFormat))
+			order.PutUint16(buf[ifd1Off+4:], uint16(TypeLong))
+			order.PutUint32(buf[ifd1Off+6:], 1)
+			order.PutUint32(buf[ifd1Off+10:], thumbOff)
+			order.PutUint16(buf[ifd1Off+14:], uint16(TagJPEGInterchangeFormatLength))
+			order.PutUint16(buf[ifd1Off+16:], uint16(TypeLong))
+			order.PutUint32(buf[ifd1Off+18:], 1)
+			order.PutUint32(buf[ifd1Off+22:], thumbLen)
+			order.PutUint32(buf[ifd1Off+26:], 0)
+			copy(buf[thumbOff:], jpegPayload)
+
+			e, err := Parse(buf)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			if e.IFD0.Next == nil || e.IFD0.Next.ThumbnailData == nil {
+				t.Fatal("ThumbnailData not populated after Parse")
+			}
+
+			encoded, err := Encode(e)
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+
+			e2, err := Parse(encoded)
+			if err != nil {
+				t.Fatalf("Parse (round-trip): %v", err)
+			}
+			if e2.IFD0.Next == nil {
+				t.Fatal("IFD1 nil after round-trip")
+			}
+			if !bytes.Equal(e2.IFD0.Next.ThumbnailData, jpegPayload) {
+				t.Fatalf("%s: ThumbnailData mismatch after round-trip", tc.name)
+			}
+			// Verify offset correctness in the encoded buffer using the parsed byte order.
+			jifEntry := e2.IFD0.Next.Get(TagJPEGInterchangeFormat)
+			if jifEntry == nil {
+				t.Fatal("0x0201 missing after round-trip")
+			}
+			newOff := order.Uint32(jifEntry.Value)
+			end := uint64(newOff) + uint64(len(jpegPayload))
+			if end > uint64(len(encoded)) {
+				t.Fatalf("new offset %d + len %d exceeds encoded size %d", newOff, len(jpegPayload), len(encoded))
+			}
+			if !bytes.Equal(encoded[newOff:end], jpegPayload) {
+				t.Fatalf("%s: bytes at new offset not the thumbnail", tc.name)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #21 — TypeUTF8 (CIPA DC-008-2023 §4.6.3, type code 13)
+// ---------------------------------------------------------------------------
+
+// TestTypeUTF8RoundTrip verifies that an IFDEntry with TypeUTF8 survives a
+// full encode→parse cycle with the string value preserved exactly.
+func TestTypeUTF8RoundTrip(t *testing.T) {
+	t.Parallel()
+	const wantStr = "Héros & cœur" // non-ASCII, valid UTF-8
+
+	// Build a raw EXIF block with a TypeUTF8 tag value stored out-of-line
+	// (len > 4 bytes).  Use a private tag number (0xFFFE) to avoid collisions
+	// with any registered tag.
+	order := binary.LittleEndian
+	const tagUTF8Test TagID = 0xFFFE
+	payload := append([]byte(wantStr), 0x00) // NUL-terminated UTF-8
+
+	// Layout:
+	//   0–7:    TIFF header
+	//   8:      IFD0 with 1 entry (tagUTF8Test, TypeUTF8, count=len(payload), value at valueOff)
+	//   26:     next-IFD pointer = 0
+	//   30:     value data
+	const ifd0Off = 8
+	const entryCount = 1
+	const valueOff = ifd0Off + 2 + entryCount*12 + 4 // = 30
+
+	buf := make([]byte, valueOff+len(payload))
+	buf[0], buf[1] = 'I', 'I'
+	order.PutUint16(buf[2:], 0x002A)
+	order.PutUint32(buf[4:], ifd0Off)
+
+	order.PutUint16(buf[ifd0Off:], entryCount)
+	order.PutUint16(buf[ifd0Off+2:], uint16(tagUTF8Test))
+	order.PutUint16(buf[ifd0Off+4:], uint16(TypeUTF8))
+	order.PutUint32(buf[ifd0Off+6:], uint32(len(payload))) //nolint:gosec // G115: test helper
+	order.PutUint32(buf[ifd0Off+10:], valueOff)
+	order.PutUint32(buf[ifd0Off+14:], 0) // next IFD = 0
+	copy(buf[valueOff:], payload)
+
+	e, err := Parse(buf)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	entry := e.IFD0.Get(tagUTF8Test)
+	if entry == nil {
+		t.Fatal("UTF-8 test tag not found in IFD0")
+	}
+	if entry.Type != TypeUTF8 {
+		t.Fatalf("Type = %d, want TypeUTF8 (%d)", entry.Type, TypeUTF8)
+	}
+	if got := entry.String(); got != wantStr {
+		t.Errorf("String() = %q, want %q", got, wantStr)
+	}
+
+	// Round-trip: encode then re-parse.
+	encoded, err := Encode(e)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	e2, err := Parse(encoded)
+	if err != nil {
+		t.Fatalf("Parse (round-trip): %v", err)
+	}
+	entry2 := e2.IFD0.Get(tagUTF8Test)
+	if entry2 == nil {
+		t.Fatal("UTF-8 test tag missing after round-trip")
+	}
+	if entry2.Type != TypeUTF8 {
+		t.Fatalf("Type after round-trip = %d, want TypeUTF8 (%d)", entry2.Type, TypeUTF8)
+	}
+	if got := entry2.String(); got != wantStr {
+		t.Errorf("String() after round-trip = %q, want %q", got, wantStr)
+	}
+}
+
+// TestTypeUTF8TypeSize verifies typeSize returns 1 for TypeUTF8.
+func TestTypeUTF8TypeSize(t *testing.T) {
+	t.Parallel()
+	if got := typeSize(TypeUTF8); got != 1 {
+		t.Errorf("typeSize(TypeUTF8) = %d, want 1", got)
+	}
+}
+
+// TestTypeUTF8StringOnASCIIEntry verifies String() still works for TypeASCII
+// after the TypeUTF8 condition was added.
+func TestTypeUTF8StringDoesNotBreakASCII(t *testing.T) {
+	t.Parallel()
+	e := IFDEntry{Type: TypeASCII, Count: 6, Value: []byte("Canon\x00"), byteOrder: binary.LittleEndian}
+	if got := e.String(); got != "Canon" {
+		t.Errorf("String() (TypeASCII) = %q, want \"Canon\"", got)
+	}
+}
+
+// TestUTF8ValueHelper verifies utf8Value produces a NUL-terminated slice.
+func TestUTF8ValueHelper(t *testing.T) {
+	t.Parallel()
+	s := "日本語"
+	v := utf8Value(s)
+	if len(v) != len(s)+1 {
+		t.Fatalf("utf8Value len = %d, want %d", len(v), len(s)+1)
+	}
+	if v[len(v)-1] != 0 {
+		t.Error("utf8Value: missing NUL terminator")
+	}
+	if string(v[:len(s)]) != s {
+		t.Errorf("utf8Value content = %q, want %q", string(v[:len(s)]), s)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #22 — SetGPS writes GPSVersionID {2,3,0,0} (EXIF §4.6.6 Table 15)
+// ---------------------------------------------------------------------------
+
+// TestSetGPSWritesVersionID verifies that SetGPS inserts GPSVersionID = {2,3,0,0}
+// into the GPS IFD when called on a fresh EXIF struct.
+func TestSetGPSWritesVersionID(t *testing.T) {
+	t.Parallel()
+	e := &EXIF{ByteOrder: binary.LittleEndian, IFD0: &IFD{}}
+	e.SetGPS(51.5074, -0.1278) // London
+
+	if e.GPSIFD == nil {
+		t.Fatal("GPSIFD is nil after SetGPS")
+	}
+	entry := e.GPSIFD.Get(TagGPSVersionID)
+	if entry == nil {
+		t.Fatal("GPSVersionID (0x0000) not present in GPS IFD after SetGPS")
+	}
+	if entry.Type != TypeByte {
+		t.Errorf("GPSVersionID Type = %d, want TypeByte (%d)", entry.Type, TypeByte)
+	}
+	if entry.Count != 4 {
+		t.Errorf("GPSVersionID Count = %d, want 4", entry.Count)
+	}
+	want := []byte{2, 3, 0, 0}
+	if !bytes.Equal(entry.Value, want) {
+		t.Errorf("GPSVersionID value = %v, want %v", entry.Value, want)
+	}
+}
+
+// TestSetGPSDoesNotOverwriteVersionID verifies that if GPSVersionID is already
+// present in the GPS IFD, SetGPS does not overwrite it.
+func TestSetGPSDoesNotOverwriteVersionID(t *testing.T) {
+	t.Parallel()
+	e := &EXIF{ByteOrder: binary.LittleEndian, IFD0: &IFD{}}
+	// Pre-populate GPS IFD with a custom GPSVersionID.
+	e.GPSIFD = &IFD{}
+	e.GPSIFD.set(TagGPSVersionID, TypeByte, 4, []byte{2, 2, 0, 0}) // older version
+
+	e.SetGPS(48.8566, 2.3522) // Paris
+
+	entry := e.GPSIFD.Get(TagGPSVersionID)
+	if entry == nil {
+		t.Fatal("GPSVersionID missing after SetGPS with pre-existing entry")
+	}
+	want := []byte{2, 2, 0, 0}
+	if !bytes.Equal(entry.Value, want) {
+		t.Errorf("GPSVersionID overwritten: got %v, want %v", entry.Value, want)
+	}
+}
+
+// TestSetGPSVersionIDRoundTrip verifies GPSVersionID survives encode→parse.
+func TestSetGPSVersionIDRoundTrip(t *testing.T) {
+	t.Parallel()
+	e := &EXIF{ByteOrder: binary.LittleEndian, IFD0: &IFD{}}
+	e.SetGPS(35.6762, 139.6503) // Tokyo
+
+	encoded, err := Encode(e)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	e2, err := Parse(encoded)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if e2.GPSIFD == nil {
+		t.Fatal("GPSIFD nil after round-trip")
+	}
+	entry := e2.GPSIFD.Get(TagGPSVersionID)
+	if entry == nil {
+		t.Fatal("GPSVersionID missing after round-trip")
+	}
+	want := []byte{2, 3, 0, 0}
+	if !bytes.Equal(entry.Value, want) {
+		t.Errorf("GPSVersionID after round-trip = %v, want %v", entry.Value, want)
+	}
+}
+
+// TestThumbnailZeroLength verifies that an IFD1 with JPEGInterchangeFormatLength=0
+// does not populate ThumbnailData and does not panic on Encode.
+func TestThumbnailZeroLength(t *testing.T) {
+	t.Parallel()
+	order := binary.LittleEndian
+
+	const (
+		hdrSize  = uint32(8)
+		ifd0Off  = hdrSize
+		ifd0Size = uint32(2 + 1*12 + 4)
+		ifd1Off  = ifd0Off + ifd0Size
+		ifd1Size = uint32(2 + 2*12 + 4)
+	)
+	buf := make([]byte, ifd1Off+ifd1Size)
+	buf[0], buf[1] = 'I', 'I'
+	order.PutUint16(buf[2:], 0x002A)
+	order.PutUint32(buf[4:], ifd0Off)
+
+	order.PutUint16(buf[ifd0Off:], 1)
+	order.PutUint16(buf[ifd0Off+2:], uint16(TagImageWidth))
+	order.PutUint16(buf[ifd0Off+4:], uint16(TypeLong))
+	order.PutUint32(buf[ifd0Off+6:], 1)
+	order.PutUint32(buf[ifd0Off+10:], 640)
+	order.PutUint32(buf[ifd0Off+14:], ifd1Off)
+
+	order.PutUint16(buf[ifd1Off:], 2)
+	order.PutUint16(buf[ifd1Off+2:], uint16(TagJPEGInterchangeFormat))
+	order.PutUint16(buf[ifd1Off+4:], uint16(TypeLong))
+	order.PutUint32(buf[ifd1Off+6:], 1)
+	order.PutUint32(buf[ifd1Off+10:], 0) // offset = 0 (no bytes)
+	order.PutUint16(buf[ifd1Off+14:], uint16(TagJPEGInterchangeFormatLength))
+	order.PutUint16(buf[ifd1Off+16:], uint16(TypeLong))
+	order.PutUint32(buf[ifd1Off+18:], 1)
+	order.PutUint32(buf[ifd1Off+22:], 0) // length = 0
+	order.PutUint32(buf[ifd1Off+26:], 0)
+
+	e, err := Parse(buf)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if e.IFD0.Next == nil {
+		t.Fatal("IFD1 not linked")
+	}
+	if e.IFD0.Next.ThumbnailData != nil {
+		t.Error("ThumbnailData should be nil for zero-length thumbnail")
+	}
+
+	// Encode must not panic.
+	encoded, err := Encode(e)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if _, err := Parse(encoded); err != nil {
+		t.Fatalf("Parse after Encode: %v", err)
+	}
+}

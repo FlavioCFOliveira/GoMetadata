@@ -3,6 +3,7 @@ package webp
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"testing"
 )
 
@@ -251,6 +252,100 @@ func TestBuildVP8XFlagsNoOriginal(t *testing.T) {
 	}
 	if f&0x04 == 0 {
 		t.Error("XMP flag (bit 2) not set")
+	}
+}
+
+// TestReadPaddedChunkTooLarge is a DoS regression test: a WebP whose EXIF chunk
+// declares size 0xFFFFFFFF (≈4 GiB) must be rejected by ErrChunkTooLarge
+// without attempting to allocate or read that many bytes.
+func TestReadPaddedChunkTooLarge(t *testing.T) {
+	t.Parallel()
+
+	// Craft a minimal RIFF/WEBP stream with a VP8X chunk (so the file header is
+	// valid) followed by an EXIF chunk whose declared size is 0xFFFFFFFF.
+	// No payload bytes follow — the guard must fire before any read attempt.
+	var body bytes.Buffer
+
+	// VP8X chunk (10 bytes, EXIF flag set) — gives the parser a valid first chunk.
+	vp8xPayload := make([]byte, 10)
+	binary.LittleEndian.PutUint32(vp8xPayload[0:], 0x08) // EXIF feature bit
+	writeRIFFChunk(&body, "VP8X", vp8xPayload)
+
+	// EXIF chunk header with giant declared size; no payload bytes written.
+	var exifHdr [8]byte
+	copy(exifHdr[:4], "EXIF")
+	binary.LittleEndian.PutUint32(exifHdr[4:], 0xFFFFFFFF)
+	body.Write(exifHdr[:])
+
+	totalSize := 4 + body.Len() // "WEBP" + chunks
+	riffHdr := make([]byte, 12)
+	copy(riffHdr[:4], "RIFF")
+	binary.LittleEndian.PutUint32(riffHdr[4:], uint32(totalSize)) //nolint:gosec // G115: test helper, intentional type cast
+	copy(riffHdr[8:], "WEBP")
+
+	var buf bytes.Buffer
+	buf.Write(riffHdr)
+	buf.Write(body.Bytes())
+
+	_, _, _, err := Extract(bytes.NewReader(buf.Bytes()))
+	if err == nil {
+		t.Fatal("Extract: expected error for oversized chunk, got nil")
+	}
+	if !errors.Is(err, ErrChunkTooLarge) {
+		t.Errorf("Extract: expected ErrChunkTooLarge, got %v", err)
+	}
+}
+
+// TestReadPaddedChunkSizeLargerThanStream is a DoS regression test for the
+// stream-availability guard added to readPaddedChunk.
+//
+// A WebP file can be crafted so that a chunk's declared size (e.g. ~200 MiB)
+// is far larger than the actual bytes in the stream (e.g. 50 bytes total).
+// Before the fix, readPaddedChunk would call make([]byte, chunk.Size) —
+// allocating ~200 MiB — before io.ReadFull detected the truncation.
+//
+// After the fix, the Seek-based availability check detects the mismatch and
+// returns ErrChunkTooLarge without performing any proportional allocation.
+func TestReadPaddedChunkSizeLargerThanStream(t *testing.T) {
+	t.Parallel()
+
+	// Declare EXIF chunk size as ~200 MiB; write no payload bytes at all.
+	// The total file is tiny (~30 bytes), so the stream-availability guard
+	// must fire before any allocation proportional to the declared size.
+	const declaredSize = 200 << 20 // 200 MiB
+
+	var body bytes.Buffer
+
+	// VP8X chunk (10 bytes, EXIF flag set) — valid first chunk so the parser
+	// reaches the EXIF chunk header before encountering the oversized size.
+	vp8xPayload := make([]byte, 10)
+	binary.LittleEndian.PutUint32(vp8xPayload[0:], 0x08) // EXIF feature bit
+	writeRIFFChunk(&body, "VP8X", vp8xPayload)
+
+	// EXIF chunk header with a large declared size; no payload bytes follow.
+	var exifHdr [8]byte
+	copy(exifHdr[:4], "EXIF")
+	binary.LittleEndian.PutUint32(exifHdr[4:], declaredSize)
+	body.Write(exifHdr[:])
+
+	totalSize := 4 + body.Len() // "WEBP" + chunks
+	riffHdr := make([]byte, 12)
+	copy(riffHdr[:4], "RIFF")
+	binary.LittleEndian.PutUint32(riffHdr[4:], uint32(totalSize)) //nolint:gosec // G115: test helper
+	copy(riffHdr[8:], "WEBP")
+
+	var buf bytes.Buffer
+	buf.Write(riffHdr)
+	buf.Write(body.Bytes())
+
+	// The stream is ~50 bytes; declared size is 200 MiB.
+	// The availability guard must reject before any large allocation.
+	_, _, _, err := Extract(bytes.NewReader(buf.Bytes()))
+	if err == nil {
+		t.Fatal("Extract: expected error for chunk size > stream, got nil")
+	}
+	if !errors.Is(err, ErrChunkTooLarge) {
+		t.Errorf("Extract: expected ErrChunkTooLarge, got %v", err)
 	}
 }
 

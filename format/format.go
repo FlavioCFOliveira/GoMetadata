@@ -57,12 +57,19 @@ func (f FormatID) String() string {
 }
 
 // SupportsWrite reports whether the library can inject metadata into files of
-// the given format (i.e., Write and WriteFile will not return UnsupportedFormatError).
+// the given format without corrupting the image data.
+//
+// TIFF-based containers (TIFF, CR2, NEF, ARW, DNG, ORF, RW2) currently return
+// false because writing requires image-data relocation that is not yet
+// implemented (roadmap Option A, epic #33). Write and WriteFile return
+// ErrWriteNotSupported for these formats.
 func SupportsWrite(f FormatID) bool {
 	switch f {
-	case FormatJPEG, FormatTIFF, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP,
-		FormatCR2, FormatCR3, FormatNEF, FormatARW, FormatDNG, FormatORF, FormatRW2:
+	case FormatJPEG, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3:
 		return true
+	case FormatTIFF, FormatCR2, FormatNEF, FormatARW, FormatDNG, FormatORF, FormatRW2:
+		// SPIKE #6: TIFF-based write is blocked until Option A is implemented.
+		return false
 	case FormatUnknown:
 		return false
 	}

@@ -40,6 +40,14 @@ func TestReadOptions(t *testing.T) {
 			t.Error("WithoutMakerNote: skipMakerNote should be true")
 		}
 	})
+	t.Run("Strict", func(t *testing.T) {
+		t.Parallel()
+		var c readConfig
+		Strict()(&c)
+		if !c.strict {
+			t.Error("Strict: strict should be true")
+		}
+	})
 }
 
 // TestWriteOptions exercises PreserveUnknownSegments.
@@ -60,6 +68,15 @@ func TestWriteOptions(t *testing.T) {
 		PreserveUnknownSegments(false)(&c)
 		if c.preserveUnknownSegments {
 			t.Error("PreserveUnknownSegments(false): field should be false")
+		}
+	})
+	// Verify documented default: Write initialises writeConfig with
+	// preserveUnknownSegments=true before applying any options.
+	t.Run("default_is_true", func(t *testing.T) {
+		t.Parallel()
+		cfg := &writeConfig{preserveUnknownSegments: true}
+		if !cfg.preserveUnknownSegments {
+			t.Error("default writeConfig: preserveUnknownSegments should be true")
 		}
 	})
 }

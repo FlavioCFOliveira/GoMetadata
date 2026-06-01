@@ -2,6 +2,7 @@ package xmp
 
 import (
 	"bytes"
+	"slices"
 	"strings"
 	"sync"
 	"unsafe"
@@ -43,8 +44,18 @@ const maxUnescapedXMLBytes = 1 << 20 // 1 MiB
 // terminators. Declared here to avoid heap-allocating []byte literals inside
 // skipComment and skipPI on every call (each []byte("...") literal in a
 // function body escapes to the heap).
-var commentClose = []byte("-->") //nolint:gochecknoglobals // immutable sentinel; avoids per-call []byte literal heap allocation
-var piEnd = []byte("?>")         //nolint:gochecknoglobals // immutable sentinel; avoids per-call []byte literal heap allocation
+var commentClose = []byte("-->")   //nolint:gochecknoglobals // immutable sentinel; avoids per-call []byte literal heap allocation
+var piEnd = []byte("?>")           //nolint:gochecknoglobals // immutable sentinel; avoids per-call []byte literal heap allocation
+var cdataEnd = []byte("]]>")       //nolint:gochecknoglobals // immutable sentinel; XML 1.0 §2.7 CDATA section close delimiter
+var cdataOpen = []byte("![CDATA[") //nolint:gochecknoglobals // immutable sentinel; the bytes after '<' that identify a CDATA section
+
+// nsDepthEntry records how many namespace entries were in the table when an
+// element was opened, so onEndElement can restore nsCount on element close
+// (namespace scope pop). The table is parallel to element depth 1–100.
+// ISO 16684-1 §7.4: namespace bindings are scoped to the element that declares them.
+type nsDepthEntry struct {
+	nsCountBefore int // nsCount value before this element's xmlns attrs were parsed
+}
 
 // rdfParser holds all mutable state for a single parseRDF invocation.
 // Bundling state into a struct allows the three dispatch methods (onStartElement,
@@ -65,6 +76,7 @@ type rdfParser struct {
 	// True when inside an rdf:Alt / rdf:Seq / rdf:Bag.
 	inColl bool
 	// True when inside a struct value node (nested rdf:Description inside a property).
+	// #13: also true when inside a struct-in-list-item (rdf:li > rdf:Description).
 	inStruct bool
 	// Depth of the struct's rdf:Description element.
 	structDepth int
@@ -75,15 +87,35 @@ type rdfParser struct {
 	// xml:lang of the current rdf:li element (P1-H, used for rdf:Alt).
 	liLang string
 
+	// #13: struct-in-list-item tracking.
+	// inStructInList is true when the current struct was opened inside an rdf:li.
+	// liItemIndex is the 0-based index of the current rdf:li within the collection,
+	// used to generate "propLocal[N].field" keys.
+	// liItemDepth is the depth at which the enclosing rdf:li was opened.
+	inStructInList bool
+	liItemIndex    int
+	liItemDepth    int
+
 	// Stack-allocated namespace table. The scanner pushes entries as it
 	// encounters xmlns:prefix="uri" declarations; resolveNS scans backward so
 	// inner declarations shadow outer ones correctly.
-	nsTable [32]nsEntry
+	//
+	// #15: Increased from 32 to 64 to handle legitimate documents with many
+	// namespace declarations (e.g. multi-tool XMP with xmpMM:History).
+	nsTable [64]nsEntry
 	nsCount int
 
-	// Stack-allocated attribute buffer. 16 attributes per element is sufficient
-	// for all real XMP properties; excess attributes are silently dropped.
-	attrBuf [16]xmpAttr
+	// #15: Per-depth namespace scope stack. nsDepth[d] records the nsCount value
+	// before element at depth d added its xmlns declarations. onEndElement restores
+	// nsCount from this stack, implementing proper XML namespace scoping.
+	// Size matches the maximum nesting depth (100).
+	nsDepth [101]nsDepthEntry
+
+	// Stack-allocated attribute buffer.
+	// #15: Increased from 16 to 32 to handle elements with many inline attributes
+	// (e.g. rdf:Description with many shorthand properties). Excess attributes are
+	// silently dropped only beyond 32, which is sufficient for all real XMP.
+	attrBuf [32]xmpAttr
 
 	// Pooled list accumulator for rdf:li values.
 	liVals *[]string
@@ -98,9 +130,15 @@ func (p *rdfParser) closeStructField() {
 
 // closeStruct resets the struct tracking fields when the parser leaves a
 // struct value node at the current depth.
+// #13: also clears inStructInList when closing a struct-in-list-item.
 func (p *rdfParser) closeStruct() {
 	p.inStruct = false
 	p.structDepth = 0
+	if p.inStructInList {
+		p.inStructInList = false
+		// liItemIndex is intentionally preserved: the next rdf:li in the same
+		// collection will increment it.
+	}
 }
 
 // closeProp finalises a property element, flushing any accumulated rdf:li
@@ -112,30 +150,60 @@ func (p *rdfParser) closeProp() {
 	}
 	p.inColl = false
 	p.inStruct = false
+	p.inStructInList = false
+	p.liItemIndex = 0
+	p.liItemDepth = 0
 	p.propNS, p.propLocal = "", ""
 	p.propDepth = 0
+}
+
+// advanceListItemIndex advances liItemIndex when the current closing element
+// is the rdf:li that contained a struct-in-list-item, so the next sibling
+// rdf:li gets the next index.
+// #13: XMP Part 1 §C.2.5 — struct-valued list items are indexed from 0.
+func (p *rdfParser) advanceListItemIndex() {
+	if p.inColl && p.liItemDepth > 0 && p.depth == p.liItemDepth {
+		p.liItemIndex++
+		p.liItemDepth = 0
+	}
+}
+
+// popNSScope restores nsCount to the value it had before the current element's
+// xmlns attributes were registered, implementing XML namespace scoping.
+// #15: ISO 16684-1 §7.4 / XML Namespaces §3: bindings scope to the declaring element.
+func (p *rdfParser) popNSScope() {
+	if p.depth > 0 && p.depth <= 100 {
+		p.nsCount = p.nsDepth[p.depth].nsCountBefore
+	}
 }
 
 // onEndElement handles the closing-tag dispatch logic.
 // It is called both from the explicit end-tag path and from self-closing tags,
 // eliminating the duplication that previously existed between those two branches.
+//
+// Security note: malformed input may contain more close tags than open tags.
+// Guard against depth underflow: if depth is already 0 there is no open element
+// to close, so silently ignore the spurious end tag.  This preserves the
+// parser's lenient design (only ErrEmptyInput and ErrXMLNestingDepth are fatal).
 func (p *rdfParser) onEndElement() {
+	// #36: depth underflow guard — unmatched close tags must not drive depth
+	// negative.  parseStartTag indexes nsDepth[p.depth] after p.depth++; if
+	// depth were -1 before the increment the index would be -1 → panic.
+	if p.depth <= 0 {
+		return
+	}
 	switch {
 	case p.inStruct && p.structFieldDepth > 0 && p.depth == p.structFieldDepth:
-		// Closing a struct field element.
 		p.closeStructField()
-
 	case p.inStruct && p.depth == p.structDepth:
-		// Closing the struct value node.
 		p.closeStruct()
-
 	case p.depth == p.propDepth && p.propDepth > 0:
-		// Closing the current property element.
 		p.closeProp()
-
 	case p.depth == p.descDepth:
 		p.descDepth = 0
 	}
+	p.advanceListItemIndex() // #13: advance rdf:li index after struct-in-list close
+	p.popNSScope()           // #15: restore namespace scope on element close
 	p.depth--
 }
 
@@ -172,13 +240,28 @@ func (p *rdfParser) onStartCollection(ns string, tagLocal []byte) {
 // onStartListItem handles rdf:li elements inside a collection, capturing any
 // xml:lang attribute for rdf:Alt items.
 // Compliance: XMP Part 1 §C.2.5 and P1-H.
+//
+// #13: Records the current depth as liItemDepth so that onEndElement can detect
+// when the rdf:li closes and advance liItemIndex for the next sibling item.
+//
+// When applyAttrShorthands has already set inStruct=true via rdf:parseType="Resource"
+// on this rdf:li element, the rdf:li itself is the struct node. Mark inStructInList so
+// that onCharDataStructField generates "propLocal[N].field" keys instead of
+// "propLocal.field". This handles the <rdf:li rdf:parseType="Resource"> shorthand form
+// (XMP Part 1 §C.2.5 / §C.2.6).
 func (p *rdfParser) onStartListItem(attrs []xmpAttr) {
 	p.liLang = ""
+	p.liItemDepth = p.depth
 	for _, a := range attrs {
 		if a.loc == "lang" {
 			p.liLang = a.val
 			break
 		}
+	}
+	// If rdf:parseType="Resource" was already applied by applyAttrShorthands,
+	// the rdf:li itself is the struct node — mark it as a struct-in-list-item.
+	if p.inStruct && p.structDepth == p.depth {
+		p.inStructInList = true
 	}
 }
 
@@ -273,6 +356,37 @@ func (p *rdfParser) onStartStructValueNode(attrs []xmpAttr) {
 	}
 }
 
+// onStartStructInListItem handles a nested rdf:Description inside an rdf:li,
+// which is a struct-valued list item (e.g. xmpMM:History items).
+//
+// #13 — Struct-in-list-item: XMP Part 1 §C.2.5 / §C.2.6 allows rdf:li to
+// contain a full rdf:Description as its value, producing a sequence/bag of
+// structs. The field key format is "propLocal[N].fieldLocal" where N is the
+// 0-based index of the rdf:li within the collection.
+//
+// Example: xmpMM:History is an rdf:Seq of stEvt structs. After parsing:
+//   - Properties[NSxmpMM]["History[0].action"] = "saved"
+//   - Properties[NSxmpMM]["History[0].instanceID"] = "xmp.iid:..."
+//   - Properties[NSxmpMM]["History[1].action"] = "derived"
+//
+// This representation is consistent with the "parent.field" convention used
+// for non-list structs (onStartStructValueNode), extended with a 0-based index.
+func (p *rdfParser) onStartStructInListItem(attrs []xmpAttr) {
+	p.inStruct = true
+	p.inStructInList = true
+	p.structDepth = p.depth
+	// Process inline attributes as struct fields (shorthand form).
+	for _, a := range attrs {
+		if a.ns == "" || a.ns == NSrdf || a.ns == NSx {
+			continue
+		}
+		// Use the property's namespace (not the attribute's) for the key,
+		// consistent with onStartStructValueNode / onCharDataStructField.
+		key := buildStructInListKey(p.propLocal, p.liItemIndex, a.loc)
+		storeProperty(p.x, p.propNS, key, a.val)
+	}
+}
+
 // onStartTopLevelDesc handles a top-level rdf:Description element, registering
 // shorthand (inline) properties from its attributes.
 // Compliance: XMP Part 1 §C.2.4.
@@ -287,17 +401,29 @@ func (p *rdfParser) onStartTopLevelDesc(attrs []xmpAttr) {
 }
 
 // onStartDescription handles rdf:Description elements, which can be either
-// a top-level property block or a struct value node nested inside a property.
+// a top-level property block, a struct value node nested inside a property,
+// or a struct-valued rdf:li inside a collection.
 // Extracted from onStartElement to reduce its cyclomatic complexity.
 //
 // Compliance: XMP Part 1 §C.2.4 (shorthand properties) and §C.2.6 (struct value nodes).
+// #13: Extends §C.2.5 with struct-in-list-item handling.
 func (p *rdfParser) onStartDescription(attrs []xmpAttr) {
-	if p.propDepth > 0 && p.depth == p.propDepth+1 && !p.inStruct {
+	switch {
+	case p.inColl && p.depth == p.propDepth+3 && !p.inStruct:
+		// Struct-in-list-item: rdf:Description inside rdf:li inside a collection.
+		// Depth layout: prop=propDepth, coll=propDepth+1, li=propDepth+2,
+		// rdf:Description=propDepth+3.
+		// #13 — XMP Part 1 §C.2.5 / §C.2.6: an rdf:li may contain a nested
+		// rdf:Description which forms a struct value for that list item.
+		p.onStartStructInListItem(attrs)
+
+	case p.propDepth > 0 && p.depth == p.propDepth+1 && !p.inStruct:
 		// Struct value node: nested rdf:Description inside a property element
 		// (XMP Part 1 §C.2.6). Store inline attrs as "propLocal.fieldLocal"
 		// keys in the parent property's namespace.
 		p.onStartStructValueNode(attrs)
-	} else if p.descDepth == 0 {
+
+	case p.descDepth == 0:
 		// Top-level rdf:Description — begin a new property block.
 		// Shorthand properties are inline attributes (XMP Part 1 §C.2.4).
 		p.onStartTopLevelDesc(attrs)
@@ -306,17 +432,25 @@ func (p *rdfParser) onStartDescription(attrs []xmpAttr) {
 
 // onCharDataStructField stores the text content of a struct field element.
 // Compliance: XMP Part 1 §C.2.6 (P1-G).
+//
+// #13: When inside a struct-in-list-item, the key uses the "propLocal[N].field"
+// format; otherwise it uses the plain "propLocal.field" format (pre-existing).
+// Both cases store into the parent property's namespace.
 func (p *rdfParser) onCharDataStructField(s string) {
-	fieldNS := p.structFieldNS
-	if fieldNS == "" {
-		fieldNS = p.propNS
+	// Always use the parent property's namespace for struct fields.
+	// (structFieldNS is the element namespace of the field tag, which may differ
+	// from the property namespace, but XMP storage is keyed by property namespace.)
+	var key string
+	if p.inStructInList {
+		key = buildStructInListKey(p.propLocal, p.liItemIndex, p.structFieldLocal)
+	} else {
+		key = p.propLocal + "." + p.structFieldLocal
 	}
-	key := p.propLocal + "." + p.structFieldLocal
-	if p.x.Properties[fieldNS] == nil {
-		p.x.Properties[fieldNS] = make(map[string]string)
+	if p.x.Properties[p.propNS] == nil {
+		p.x.Properties[p.propNS] = make(map[string]string)
 	}
-	if p.x.Properties[fieldNS][key] == "" {
-		p.x.Properties[fieldNS][key] = s
+	if p.x.Properties[p.propNS][key] == "" {
+		p.x.Properties[p.propNS][key] = s
 	}
 }
 
@@ -403,8 +537,12 @@ func skipPI(b []byte, pos int) int {
 	return pos + end + 2
 }
 
-// skipBang advances pos past an XML <! ... > construct (CDATA, DOCTYPE, etc.)
-// b[pos] must be '!' at entry. Returns the updated position.
+// skipBang advances pos past an XML <! ... > construct (DOCTYPE, etc.)
+// b[pos] must be '!' at entry AND the construct must NOT be a CDATA section
+// (callers check isCDATA first).  Returns the updated position.
+//
+// Anti-XXE: DOCTYPE and other <!…> constructs are silently skipped; entities
+// within them are never expanded.
 func skipBang(b []byte, pos int) int {
 	end := bytes.IndexByte(b[pos:], '>')
 	if end < 0 {
@@ -413,13 +551,53 @@ func skipBang(b []byte, pos int) int {
 	return pos + end + 1
 }
 
+// isCDATA reports whether b[pos:] begins an XML CDATA section (![CDATA[).
+// b[pos] must already be '!' at entry (i.e., the '<' has been consumed and
+// b[pos] is '!').  XML 1.0 §2.7: CDSect ::= CDStart CData CDEnd;
+// CDStart ::= '<![CDATA['.
+func isCDATA(b []byte, pos int) bool {
+	return bytes.HasPrefix(b[pos:], cdataOpen)
+}
+
+// parseCDATA extracts the character data content of a CDATA section.
+// b[pos] must be '!' at entry (i.e., the '<' has been consumed and b[pos:]
+// begins '![CDATA[...').
+//
+// Returns the raw content bytes (between '![CDATA[' and ']]>') and the updated
+// position past the ']]>' close delimiter.  Content bytes are a zero-copy slice
+// into b; the caller must not write to them.
+//
+// XML 1.0 §2.7: CDATA section content is literal character data; entity
+// references within it are NOT expanded (the '&' character is literal).
+// This is enforced here by returning the raw bytes without calling unescapeXML.
+//
+// If the CDATA section is unterminated (no ']]>' found), returns nil, len(b).
+func parseCDATA(b []byte, pos int) (content []byte, newPos int) {
+	// Skip '![CDATA[' — 8 bytes: '!', '[', 'C', 'D', 'A', 'T', 'A', '['.
+	// len(cdataOpen) == 8.
+	advance := len(cdataOpen)
+	if pos+advance > len(b) {
+		return nil, len(b)
+	}
+	pos += advance // b[pos] is now the first byte of the CDATA content
+
+	end := bytes.Index(b[pos:], cdataEnd)
+	if end < 0 {
+		return nil, len(b) // unterminated — skip to end
+	}
+	content = b[pos : pos+end]    // zero-copy slice of the raw CDATA content
+	return content, pos + end + 3 // +3 for "]]>"
+}
+
 // isComment reports whether b[pos:] begins an XML comment (<!--).
 func isComment(b []byte, pos int) bool {
 	return pos+2 < len(b) && b[pos] == '!' && b[pos+1] == '-' && b[pos+2] == '-'
 }
 
 // skipSpecialTag advances pos past a comment (<!-- ... -->), processing
-// instruction (<? ... ?>), or CDATA/DOCTYPE (<! ... >) construct.
+// instruction (<? ... ?>), or non-CDATA bang (<! ... >) construct.
+// CDATA sections are NOT handled here — they are handled by the caller
+// via parseCDATA so that their content can be delivered as character data.
 // Returns the updated position and true if a special tag was consumed;
 // returns the original position and false otherwise.
 func skipSpecialTag(b []byte, pos int) (newPos int, skipped bool) {
@@ -431,7 +609,10 @@ func skipSpecialTag(b []byte, pos int) (newPos int, skipped bool) {
 		return skipComment(b, pos), true
 	case b[pos] == '?':
 		return skipPI(b, pos), true
-	case b[pos] == '!':
+	case b[pos] == '!' && !isCDATA(b, pos):
+		// Non-CDATA bang construct (DOCTYPE, etc.) — skip safely.
+		// Anti-XXE: entities inside DOCTYPE are never expanded (skipBang
+		// discards the entire construct without interpretation).
 		return skipBang(b, pos), true
 	}
 	return pos, false
@@ -446,6 +627,11 @@ func parseStartTag(b []byte, pos int, p *rdfParser) (newPos int, err error) {
 	if p.depth > 100 {
 		return 0, ErrXMLNestingDepth
 	}
+
+	// #15: Record nsCount *before* this element's xmlns attrs are scanned,
+	// so onEndElement can restore it (namespace scope pop).
+	// ISO 16684-1 §7.4 / XML Namespaces §3: bindings scope to the declaring element.
+	p.nsDepth[p.depth] = nsDepthEntry{nsCountBefore: p.nsCount}
 
 	// Parse the tag name: [prefix:]local.
 	tagPrefix, tagLocal, newPos2 := scanName(b, pos)
@@ -479,21 +665,96 @@ func parseStartTag(b []byte, pos int, p *rdfParser) (newPos int, err error) {
 	}
 
 	// ── Text content between this tag and the next '<' ────────────────
-	textEnd := bytes.IndexByte(b[pos:], '<')
-	var text []byte
-	if textEnd >= 0 {
-		text = trimSpace(b[pos : pos+textEnd])
-		// Do NOT advance pos here; the outer loop will find this '<'.
-	} else {
-		text = trimSpace(b[pos:])
-		pos = len(b)
-	}
+	// We collect text in segments separated by CDATA sections.
+	// Most elements have no CDATA — the fast path finds text before '<' directly.
+	pos, text := collectTextContent(b, pos)
 
 	if len(text) > 0 {
-		p.onCharData(unescapeXML(text))
+		p.onCharData(text)
 	}
 
 	return pos, nil
+}
+
+// collectTextContent gathers the text content of an element starting at b[pos],
+// handling interleaved CDATA sections per XML 1.0 §2.7.
+//
+// The function concatenates:
+//   - Raw text segments (entity-unescaped via unescapeXML)
+//   - CDATA section content (delivered as-is — no entity expansion inside CDATA)
+//
+// Returns the updated position (pointing at the '<' of the next tag, or len(b))
+// and the combined text string.  Returns an empty string when there is no text.
+//
+// Performance note: the common case (no CDATA) is handled without any allocation
+// by the fast inner path.  The CDATA branch uses a pooled strings.Builder and
+// allocates only when actually needed.
+func collectTextContent(b []byte, pos int) (newPos int, text string) { //nolint:cyclop // CDATA fast/slow paths plus tag-boundary detection require this branching; refactoring would obscure the spec logic
+	// Fast path: no CDATA in range — find text before '<'.
+	textEnd := bytes.IndexByte(b[pos:], '<')
+	if textEnd < 0 {
+		// No '<' at all — all remaining bytes are text.
+		s := unescapeXML(trimSpace(b[pos:]))
+		return len(b), s
+	}
+
+	// There is a '<' ahead.  Peek at what follows it.
+	ahead := pos + textEnd + 1 // position after '<'
+	if ahead >= len(b) || !isCDATA(b, ahead) {
+		// No CDATA involved — fast path: return text before '<', leave pos at '<'.
+		s := unescapeXML(trimSpace(b[pos : pos+textEnd]))
+		return pos + textEnd, s // do NOT advance past '<'; outer loop handles it
+	}
+
+	// Slow path: CDATA section(s) interleaved with text.
+	// Use a pooled builder to concatenate segments without repeated allocs.
+	bld := builderPool.Get().(*strings.Builder) //nolint:forcetypeassert,revive // builderPool.New always stores *strings.Builder; pool invariant
+	bld.Reset()
+	defer func() {
+		bld.Reset()
+		builderPool.Put(bld)
+	}()
+
+	for pos < len(b) {
+		// Find the next '<'.
+		nextTag := bytes.IndexByte(b[pos:], '<')
+		if nextTag < 0 {
+			// No more tags — append remaining text.
+			bld.WriteString(unescapeXML(trimSpace(b[pos:])))
+			pos = len(b)
+			break
+		}
+
+		// Append text segment before '<'.
+		seg := trimSpace(b[pos : pos+nextTag])
+		if len(seg) > 0 {
+			bld.WriteString(unescapeXML(seg))
+		}
+		pos = pos + nextTag + 1 // advance past '<'
+
+		if pos >= len(b) {
+			break
+		}
+
+		if isCDATA(b, pos) {
+			// XML 1.0 §2.7: CDATA content is literal text — no entity expansion.
+			// The content is appended as-is (raw bytes converted to string).
+			content, afterCDATA := parseCDATA(b, pos)
+			if len(content) > 0 {
+				bld.Write(content)
+			}
+			pos = afterCDATA
+			// Continue scanning for more text or CDATA after this section.
+			continue
+		}
+
+		// Not a CDATA section — we've reached a real tag boundary.
+		// Back up so the outer loop processes this '<'.
+		pos-- // restore the '<'
+		break
+	}
+
+	return pos, bld.String()
 }
 
 // parseRDF walks the RDF graph rooted at the x:xmpmeta element and populates
@@ -509,7 +770,7 @@ func parseStartTag(b []byte, pos int, p *rdfParser) (newPos int, err error) {
 // buffer. Only entity-escaped values and multi-valued collection joins allocate.
 //
 // Compliance: ISO 16684-1:2019 §7, Adobe XMP Specification Part 1 §C.
-func parseRDF(b []byte, x *XMP) error {
+func parseRDF(b []byte, x *XMP) error { //nolint:cyclop,gocyclo // main XML dispatch loop has inherent branching (CDATA, PI, comment, end-tag, start-tag); each branch is a single XML construct
 	p := rdfParser{x: x}
 
 	// Pooled list accumulator for rdf:li values.
@@ -531,7 +792,25 @@ func parseRDF(b []byte, x *XMP) error {
 			break
 		}
 
-		// ── Comment, PI, CDATA, DOCTYPE ─────────────────────────────────────
+		// ── CDATA section (XML 1.0 §2.7) ───────────────────────────────────
+		// CDATA is checked before the generic skipSpecialTag so that its
+		// character-data content is delivered to onCharData rather than discarded.
+		if isCDATA(b, pos) {
+			content, afterCDATA := parseCDATA(b, pos)
+			pos = afterCDATA
+			if len(content) > 0 {
+				// XML 1.0 §2.7: no entity expansion inside CDATA.
+				// unsafe.String is safe: content is a zero-copy slice into b which
+				// remains alive for the duration of parseRDF.
+				p.onCharData(string(content))
+			}
+			if pos >= len(b) {
+				break
+			}
+			continue
+		}
+
+		// ── Comment, PI, DOCTYPE ─────────────────────────────────────────────
 		if newPos, skipped := skipSpecialTag(b, pos); skipped {
 			if newPos >= len(b) {
 				break
@@ -637,7 +916,10 @@ func parseSingleAttr(b []byte, pos int) (attrPrefix, attrLocal []byte, val strin
 //
 // Returns the updated namespace count, the number of non-namespace attributes,
 // and the position after the last attribute (pointing at '>' or '/').
-func scanAttrs(b []byte, pos int, nsTable *[32]nsEntry, nsCount int, out *[16]xmpAttr) (newNsCount, nAttrs, newPos int) {
+//
+// #15: nsTable is [64]nsEntry and out is [32]xmpAttr (up from 32 and 16)
+// to handle legitimate complex documents without silent data loss.
+func scanAttrs(b []byte, pos int, nsTable *[64]nsEntry, nsCount int, out *[32]xmpAttr) (newNsCount, nAttrs, newPos int) {
 	nAttrs = 0
 	for pos < len(b) && b[pos] != '>' && b[pos] != '/' {
 		// Skip whitespace between attributes.
@@ -709,7 +991,9 @@ func parseAttributeValue(b []byte, pos int) (val string, newPos int, ok bool) {
 // classifyAndStoreAttr classifies a parsed attribute as either an xmlns
 // declaration or a regular attribute, updating the namespace table or the
 // attribute output buffer accordingly. Returns updated nsCount and nAttrs.
-func classifyAndStoreAttr(attrPrefix, attrLocal []byte, val string, nsTable *[32]nsEntry, nsCount int, out *[16]xmpAttr, nAttrs int) (int, int) {
+//
+// #15: nsTable is [64]nsEntry and out is [32]xmpAttr (up from 32 and 16).
+func classifyAndStoreAttr(attrPrefix, attrLocal []byte, val string, nsTable *[64]nsEntry, nsCount int, out *[32]xmpAttr, nAttrs int) (int, int) {
 	// string(attrPrefix) == "xmlns" is a zero-alloc comparison (Go compiler).
 	switch {
 	case string(attrPrefix) == "xmlns":
@@ -737,9 +1021,9 @@ func classifyAndStoreAttr(attrPrefix, attrLocal []byte, val string, nsTable *[32
 // Returns "" if the prefix is not found. prefix is a []byte slice (zero-copy
 // from the parse buffer); comparison uses bytes.Equal to avoid string allocation.
 func resolveNS(table []nsEntry, prefix []byte) string {
-	for i := len(table) - 1; i >= 0; i-- {
-		if bytes.Equal(table[i].prefix, prefix) {
-			return table[i].uri
+	for _, e := range slices.Backward(table) {
+		if bytes.Equal(e.prefix, prefix) {
+			return e.uri
 		}
 	}
 	return ""
@@ -920,11 +1204,68 @@ func isASCIISpace(b byte) bool {
 }
 
 // storeProperty writes val to x.Properties[ns][local], initialising inner maps
-// as needed. It does not overwrite an existing value (first writer wins), so
-// that rdf:resource attributes set before element text content take precedence.
+// as needed.
+//
+// Policy: first writer wins.
+//
+// Rationale (#12): ISO 16684-1 §7.4 permits multiple rdf:Description blocks in the
+// same namespace (common when different tools contribute metadata). If two blocks
+// declare the same property, the first declaration encountered during a forward
+// document parse takes precedence. This is consistent with onCharDataSimple (line
+// below) and with the XMP spec's intent that a property has one canonical value.
+// "First wins" is also the safest choice for round-trip fidelity: the first value
+// is the one the originating tool explicitly set; later duplicates are often
+// artefacts of copy-on-write tool workflows.
 func storeProperty(x *XMP, ns, local, val string) {
 	if x.Properties[ns] == nil {
 		x.Properties[ns] = make(map[string]string)
 	}
+	// #12: guard against overwrite — first-wins policy.
+	if x.Properties[ns][local] != "" {
+		return
+	}
 	x.Properties[ns][local] = val
+}
+
+// buildStructInListKey builds the storage key for a struct field within a
+// list item, using the format "propLocal[index].fieldLocal".
+//
+// #13 — XMP Part 1 §C.2.5 / §C.2.6: rdf:li may contain a nested rdf:Description
+// forming a struct value for that list item. We extend the "parent.field" dotted-key
+// convention with a 0-based bracket index so array entries are distinguishable.
+//
+// Allocation budget: one strings.Builder call (one alloc for the final string).
+// The builder is stack-allocated; no pool needed for this low-frequency path.
+func buildStructInListKey(propLocal string, idx int, fieldLocal string) string {
+	// Fast path for small indices: avoid strconv.Itoa overhead.
+	// Maximum realistic xmpMM:History depth is a few hundred entries.
+	var buf [32]byte
+	n := 0
+	// Write propLocal (does not allocate when assigned from a field that is already
+	// a string literal — the builder WriteString copies).
+	bld := strings.Builder{}
+	bld.Grow(len(propLocal) + 12 + len(fieldLocal))
+	bld.WriteString(propLocal)
+	bld.WriteByte('[')
+	// Render idx as decimal digits into buf.
+	if idx == 0 {
+		buf[0] = '0'
+		n = 1
+	} else {
+		i := idx
+		for i > 0 {
+			buf[n] = byte('0' + i%10)
+			n++
+			i /= 10
+		}
+		// Reverse the digits.
+		for lo, hi := 0, n-1; lo < hi; lo, hi = lo+1, hi-1 {
+			buf[lo], buf[hi] = buf[hi], buf[lo]
+		}
+	}
+	bld.Write(buf[:n])
+	bld.WriteByte(']')
+	bld.WriteByte('.')
+	bld.WriteString(fieldLocal)
+	return bld.String()
 }

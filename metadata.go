@@ -30,12 +30,36 @@ type Metadata struct {
 	IPTC *iptc.IPTC
 	XMP  *xmp.XMP
 
+	// ParseWarnings contains one entry for every metadata segment that was
+	// present in the container but failed to parse. It is populated only in
+	// best-effort mode (the default); when Strict() is active Read returns an
+	// error immediately on the first parse failure and ParseWarnings is never
+	// consulted. ParseWarnings is nil when all segments parsed successfully or
+	// when no metadata is present.
+	//
+	// A non-nil ParseWarnings does not prevent the returned Metadata from being
+	// used; the caller simply receives fewer fields than the raw container held.
+	ParseWarnings []*ParseSegmentError
+
 	// unexported: detected container format and original raw segments
 	// retained so round-trip writes can reconstruct the file correctly.
 	format  uint8
 	rawEXIF []byte
 	rawIPTC []byte
 	rawXMP  []byte
+
+	// rawXMPWire is non-nil when the image carried extended XMP (Adobe XMP
+	// Specification Part 3 §1.1.4) and the XMP was not modified by the caller.
+	// It holds the internal wire-frame encoding produced by jpeg.ExtractWithWire:
+	// the original main APP1 content and the assembled extended payload packed
+	// together. Inject uses this to reproduce the original segmentation without
+	// regenerating the GUID, guaranteeing that rawXMP is byte-stable across an
+	// unmodified round-trip.
+	//
+	// rawXMPWire is always nil when m.XMP is non-nil (user modified the XMP);
+	// in that case encodeMetadata re-encodes from the struct and the extended
+	// split path uses a freshly generated GUID.
+	rawXMPWire []byte
 }
 
 // Format returns the detected container format ID of the image.
@@ -48,6 +72,8 @@ func (m *Metadata) RawEXIF() []byte { return m.rawEXIF }
 func (m *Metadata) RawIPTC() []byte { return m.rawIPTC }
 
 // RawXMP returns the raw XMP packet bytes as read from the container.
+// When the image carried extended XMP, RawXMP returns the fully reassembled
+// (merged) packet so callers always receive a single, self-contained document.
 func (m *Metadata) RawXMP() []byte { return m.rawXMP }
 
 // Validate checks that m is in a consistent state suitable for writing.
@@ -144,10 +170,20 @@ var xmpDateLayouts = [3]string{ //nolint:gochecknoglobals // constant time layou
 
 // DateTimeOriginal returns the original capture date/time.
 // Source priority: EXIF > XMP.
+//
+// MWG timezone synthesis: when EXIF carries DateTimeOriginal without
+// OffsetTimeOriginal (EXIF 2.31+, tag 0x9011), the method checks whether XMP
+// exif:DateTimeOriginal carries a timezone offset (e.g. "+02:00") and, if so,
+// applies it to the EXIF wall-clock date/time. This follows the Metadata
+// Working Group (MWG) Guidelines §2.2.1 recommendation for reconstructing a
+// fully-qualified timestamp from split EXIF+XMP metadata.
+//
+// When neither EXIF OffsetTimeOriginal nor an XMP timezone is available, the
+// returned time.Time uses UTC (as before).
 func (m *Metadata) DateTimeOriginal() (time.Time, bool) {
 	if m.EXIF != nil {
 		if t, ok := m.EXIF.DateTimeOriginal(); ok {
-			return t, true
+			return m.applyXMPTimezone(t), true
 		}
 	}
 	if m.XMP != nil {
@@ -161,6 +197,60 @@ func (m *Metadata) DateTimeOriginal() (time.Time, bool) {
 		}
 	}
 	return time.Time{}, false
+}
+
+// applyXMPTimezone applies MWG §2.2.1 timezone synthesis to t: when EXIF
+// ExifIFD lacks OffsetTimeOriginal and XMP carries an explicit UTC offset, the
+// wall-clock time from EXIF is re-expressed in the XMP timezone. t is returned
+// unchanged when the EXIF offset is present, when XMP is absent, or when the
+// XMP date string carries no timezone offset.
+func (m *Metadata) applyXMPTimezone(t time.Time) time.Time {
+	if m.EXIF == nil || m.EXIF.ExifIFD == nil {
+		return t
+	}
+	if m.EXIF.ExifIFD.Get(exif.TagOffsetTimeOriginal) != nil {
+		// EXIF already supplied an explicit offset — do not override it.
+		return t
+	}
+	if m.XMP == nil {
+		return t
+	}
+	loc := xmpTimezone(m.XMP.DateTimeOriginal())
+	if loc == nil {
+		return t
+	}
+	// Reconstruct the same wall-clock time in the synthesised timezone.
+	// MWG §2.2.1: the EXIF wall-clock digits are authoritative; only the
+	// timezone is taken from XMP.
+	return time.Date(t.Year(), t.Month(), t.Day(),
+		t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), loc)
+}
+
+// xmpTimezone extracts a *time.Location from an XMP ISO 8601 date string when
+// it carries an explicit timezone offset (e.g. "2024-06-15T10:30:00+02:00").
+// Returns nil when the string has no offset, is empty, or uses the "Z" suffix
+// (which would confirm UTC — not useful for synthesis on top of an existing
+// UTC result that came from a no-offset EXIF tag).
+//
+// Only the "+HH:MM" / "-HH:MM" suffix form triggers synthesis; "Z" and
+// offset-free strings are treated as "no information available".
+func xmpTimezone(xmpDate string) *time.Location {
+	if len(xmpDate) < len("2006-01-02T15:04:05+07:00") {
+		return nil
+	}
+	// A "+"/"-" at position 19 is the start of a UTC offset (+HH:MM or -HH:MM).
+	sign := xmpDate[len(xmpDate)-6]
+	if sign != '+' && sign != '-' {
+		// No explicit offset (no-TZ or "Z" suffix) — nothing to contribute.
+		return nil
+	}
+	tzStr := xmpDate[len(xmpDate)-6:]
+	t, err := time.Parse("-07:00", tzStr)
+	if err != nil {
+		return nil
+	}
+	_, offset := t.Zone()
+	return time.FixedZone(tzStr, offset)
 }
 
 // ExposureTime returns the exposure time as [numerator, denominator] in seconds.

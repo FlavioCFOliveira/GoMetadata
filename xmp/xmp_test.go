@@ -1,7 +1,9 @@
 package xmp
 
 import (
+	"encoding/binary"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -398,6 +400,359 @@ func TestXMPGet(t *testing.T) {
 			t.Errorf("Get(NSdc, rights) absent = %q, want empty", got)
 		}
 	})
+}
+
+// ── Issue #12: storeProperty first-wins across multiple rdf:Description blocks ─
+
+// TestMultipleDescriptionBlocksSameNS verifies that when a document contains
+// two rdf:Description blocks in the same namespace, properties from both blocks
+// are preserved (distinct keys coexist) and repeated keys use the first value
+// (first-writer-wins policy per ISO 16684-1 §7.4).
+func TestMultipleDescriptionBlocksSameNS(t *testing.T) {
+	t.Parallel()
+	// Two rdf:Description blocks in the dc namespace:
+	// - First block: dc:title="First Title", dc:creator="Alice"
+	// - Second block: dc:title="Second Title" (same key → first-wins),
+	//                 dc:description="A description" (new key → preserved)
+	raw := `<?xpacket begin="" uid="abc"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about=""
+      xmlns:dc="http://purl.org/dc/elements/1.1/"
+      dc:title="First Title"
+      dc:creator="Alice"/>
+    <rdf:Description rdf:about=""
+      xmlns:dc="http://purl.org/dc/elements/1.1/"
+      dc:title="Second Title"
+      dc:rights="(c) 2024 Test"/>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>`
+
+	x, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	// First block wins for dc:title.
+	if got := x.Get(NSdc, "title"); got != "First Title" {
+		t.Errorf("dc:title first-wins: got %q, want %q", got, "First Title")
+	}
+	// dc:creator from first block is preserved.
+	if got := x.Get(NSdc, "creator"); got != "Alice" {
+		t.Errorf("dc:creator from first block: got %q, want %q", got, "Alice")
+	}
+	// dc:rights from second block is preserved (distinct key, not overwritten).
+	if got := x.Get(NSdc, "rights"); got != "(c) 2024 Test" {
+		t.Errorf("dc:rights from second block: got %q, want %q", got, "(c) 2024 Test")
+	}
+}
+
+// TestMultipleDescriptionBlocksDifferentNS verifies that properties from
+// different namespaces across multiple rdf:Description blocks all survive.
+func TestMultipleDescriptionBlocksDifferentNS(t *testing.T) {
+	t.Parallel()
+	raw := `<?xpacket begin="" uid="abc"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about=""
+      xmlns:tiff="http://ns.adobe.com/tiff/1.0/"
+      tiff:Model="Canon EOS R5"/>
+    <rdf:Description rdf:about=""
+      xmlns:dc="http://purl.org/dc/elements/1.1/"
+      dc:creator="Alice"/>
+    <rdf:Description rdf:about=""
+      xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+      xmp:CreatorTool="Lightroom"/>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>`
+
+	x, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := x.CameraModel(); got != "Canon EOS R5" {
+		t.Errorf("CameraModel: got %q, want %q", got, "Canon EOS R5")
+	}
+	if got := x.Get(NSdc, "creator"); got != "Alice" {
+		t.Errorf("dc:creator: got %q, want %q", got, "Alice")
+	}
+	if got := x.Get(NSxmp, "CreatorTool"); got != "Lightroom" {
+		t.Errorf("xmp:CreatorTool: got %q, want %q", got, "Lightroom")
+	}
+}
+
+// ── Issue #13 + #14: struct-in-array round-trip (xmpMM:History) ──────────────
+
+// TestStructInArrayRoundTrip verifies that an rdf:Seq of struct items
+// (xmpMM:History pattern) is parsed, stored, re-serialised as valid XML, and
+// re-parsed with full field fidelity.
+//
+// #13: Parser must not discard rdf:li > rdf:Description children.
+// #14: Serialiser must emit rdf:parseType="Resource" wrappers, not <ns:a.b> tags.
+func TestStructInArrayRoundTrip(t *testing.T) {
+	t.Parallel()
+	// xmpMM:History: an rdf:Seq of stEvt structs.
+	raw := `<?xpacket begin="" uid="abc"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about=""
+      xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/"
+      xmlns:stEvt="http://ns.adobe.com/xap/1.0/sType/ResourceEvent#">
+      <xmpMM:History>
+        <rdf:Seq>
+          <rdf:li rdf:parseType="Resource">
+            <stEvt:action>saved</stEvt:action>
+            <stEvt:instanceID>xmp.iid:1</stEvt:instanceID>
+          </rdf:li>
+          <rdf:li rdf:parseType="Resource">
+            <stEvt:action>derived</stEvt:action>
+            <stEvt:instanceID>xmp.iid:2</stEvt:instanceID>
+          </rdf:li>
+        </rdf:Seq>
+      </xmpMM:History>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>`
+
+	x, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// Verify #13: struct fields are stored under "History[N].field" keys.
+	if got := x.Get(NSxmpMM, "History[0].action"); got != "saved" {
+		t.Errorf("History[0].action: got %q, want %q", got, "saved")
+	}
+	if got := x.Get(NSxmpMM, "History[0].instanceID"); got != "xmp.iid:1" {
+		t.Errorf("History[0].instanceID: got %q, want %q", got, "xmp.iid:1")
+	}
+	if got := x.Get(NSxmpMM, "History[1].action"); got != "derived" {
+		t.Errorf("History[1].action: got %q, want %q", got, "derived")
+	}
+	if got := x.Get(NSxmpMM, "History[1].instanceID"); got != "xmp.iid:2" {
+		t.Errorf("History[1].instanceID: got %q, want %q", got, "xmp.iid:2")
+	}
+
+	// Verify #14: Encode produces valid XML (no dot in element names).
+	encoded, err := Encode(x)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	out := string(encoded)
+	if strings.Contains(out, ":History[") || strings.Contains(out, ":History.") {
+		t.Errorf("serialised XML contains invalid element name (dot or bracket): %s", out)
+	}
+	if !strings.Contains(out, "rdf:parseType=\"Resource\"") {
+		t.Errorf("serialised XML should contain rdf:parseType=\"Resource\" for struct items:\n%s", out)
+	}
+
+	// Verify round-trip: re-parse and check field fidelity.
+	x2, err := Parse(encoded)
+	if err != nil {
+		t.Fatalf("Parse (round-trip): %v", err)
+	}
+	if got := x2.Get(NSxmpMM, "History[0].action"); got != "saved" {
+		t.Errorf("round-trip History[0].action: got %q, want %q", got, "saved")
+	}
+	if got := x2.Get(NSxmpMM, "History[0].instanceID"); got != "xmp.iid:1" {
+		t.Errorf("round-trip History[0].instanceID: got %q, want %q", got, "xmp.iid:1")
+	}
+	if got := x2.Get(NSxmpMM, "History[1].action"); got != "derived" {
+		t.Errorf("round-trip History[1].action: got %q, want %q", got, "derived")
+	}
+}
+
+// TestStructInArrayInlineAttrs verifies that struct fields carried as inline
+// attributes of rdf:li > rdf:Description (shorthand form) are also captured.
+func TestStructInArrayInlineAttrs(t *testing.T) {
+	t.Parallel()
+	raw := `<?xpacket begin="" uid="abc"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about=""
+      xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/"
+      xmlns:stEvt="http://ns.adobe.com/xap/1.0/sType/ResourceEvent#">
+      <xmpMM:History>
+        <rdf:Seq>
+          <rdf:li>
+            <rdf:Description stEvt:action="converted" stEvt:softwareAgent="Photoshop"/>
+          </rdf:li>
+        </rdf:Seq>
+      </xmpMM:History>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>`
+
+	x, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := x.Get(NSxmpMM, "History[0].action"); got != "converted" {
+		t.Errorf("History[0].action (inline attr): got %q, want %q", got, "converted")
+	}
+	if got := x.Get(NSxmpMM, "History[0].softwareAgent"); got != "Photoshop" {
+		t.Errorf("History[0].softwareAgent (inline attr): got %q, want %q", got, "Photoshop")
+	}
+}
+
+// TestStructPropertyRoundTrip verifies that a plain struct property
+// (rdf:parseType="Resource") serialises as valid XML and re-parses correctly.
+// #14: "parent.field" keys must not produce <prefix:parent.field> tags.
+func TestStructPropertyRoundTrip(t *testing.T) {
+	t.Parallel()
+	// Build an XMP struct directly via Set (mimics what a parsed doc would produce).
+	x := &XMP{Properties: make(map[string]map[string]string)}
+	x.Set(NSiptcCore, "CreatorContactInfo.CiEmailWork", "test@example.com")
+	x.Set(NSiptcCore, "CreatorContactInfo.CiUrlWork", "https://example.com")
+	x.Set(NSiptcCore, "CreatorContactInfo.CiTelWork", "+1-555-0100")
+
+	encoded, err := Encode(x)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	out := string(encoded)
+
+	// Must NOT contain a dot in any element name (XML validity).
+	if strings.Contains(out, ":CreatorContactInfo.") {
+		t.Errorf("serialised XML contains dot in element name:\n%s", out)
+	}
+	// Must use rdf:parseType="Resource".
+	if !strings.Contains(out, "rdf:parseType=\"Resource\"") {
+		t.Errorf("serialised struct should use rdf:parseType=\"Resource\":\n%s", out)
+	}
+
+	// Round-trip: fields must survive parse→encode→parse.
+	x2, err := Parse(encoded)
+	if err != nil {
+		t.Fatalf("Parse (round-trip): %v", err)
+	}
+	if got := x2.Get(NSiptcCore, "CreatorContactInfo.CiEmailWork"); got != "test@example.com" {
+		t.Errorf("round-trip CiEmailWork: got %q, want %q", got, "test@example.com")
+	}
+	if got := x2.Get(NSiptcCore, "CreatorContactInfo.CiUrlWork"); got != "https://example.com" {
+		t.Errorf("round-trip CiUrlWork: got %q, want %q", got, "https://example.com")
+	}
+}
+
+// ── Issue #15: namespace scope + limits ──────────────────────────────────────
+
+// TestNamespaceScopePopping verifies that namespace declarations in one
+// rdf:Description block do not leak into sibling blocks.
+// With the pre-fix code, after 3+ blocks the [32]nsEntry table would fill and
+// later declarations would be silently dropped.
+func TestNamespaceScopePopping(t *testing.T) {
+	t.Parallel()
+	// Build a document with many sibling rdf:Description blocks, each declaring
+	// its own xmlns. Without scope-popping, nsTable fills after 32 total declarations.
+	var sb strings.Builder
+	sb.WriteString(`<?xpacket begin="" uid="abc"?>`)
+	sb.WriteString(`<x:xmpmeta xmlns:x="adobe:ns:meta/">`)
+	sb.WriteString(`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">`)
+
+	// 40 sibling rdf:Description blocks, each with a unique namespace.
+	// The 33rd+ would overflow the old [32]nsEntry table without scope-popping.
+	for i := range 40 {
+		ns := "http://example.com/ns" + strconv.Itoa(i) + "/"
+		prefix := "ns" + strconv.Itoa(i)
+		sb.WriteString(`<rdf:Description rdf:about="" xmlns:`)
+		sb.WriteString(prefix)
+		sb.WriteString(`="`)
+		sb.WriteString(ns)
+		sb.WriteString(`" `)
+		sb.WriteString(prefix)
+		sb.WriteString(`:prop="value`)
+		sb.WriteString(strconv.Itoa(i))
+		sb.WriteString(`"/>`)
+	}
+	sb.WriteString(`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`)
+
+	x, err := Parse([]byte(sb.String()))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	// All 40 properties must be present (scope-popping ensures nsTable never fills).
+	for i := range 40 {
+		ns := "http://example.com/ns" + strconv.Itoa(i) + "/"
+		want := "value" + strconv.Itoa(i)
+		if got := x.Get(ns, "prop"); got != want {
+			t.Errorf("ns %d: got %q, want %q", i, got, want)
+		}
+	}
+}
+
+// TestInlineAttrLimit verifies that an element with more than 16 inline
+// attributes (the old [16]xmpAttr limit) no longer silently drops attributes
+// beyond the 16th.
+func TestInlineAttrLimit(t *testing.T) {
+	t.Parallel()
+	// Build an rdf:Description with 25 inline properties.
+	// The old [16]xmpAttr buffer would silently drop attributes 17–25.
+	var sb strings.Builder
+	sb.WriteString(`<?xpacket begin="" uid="abc"?>`)
+	sb.WriteString(`<x:xmpmeta xmlns:x="adobe:ns:meta/">`)
+	sb.WriteString(`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">`)
+	sb.WriteString(`<rdf:Description rdf:about="" xmlns:tiff="http://ns.adobe.com/tiff/1.0/"`)
+	for i := range 25 {
+		sb.WriteString(` tiff:Tag`)
+		sb.WriteString(strconv.Itoa(i))
+		sb.WriteString(`="val`)
+		sb.WriteString(strconv.Itoa(i))
+		sb.WriteString(`"`)
+	}
+	sb.WriteString(`/>`)
+	sb.WriteString(`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`)
+
+	x, err := Parse([]byte(sb.String()))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	// Attributes 0–24 must all be present (new [32]xmpAttr buffer covers all 25 + xmlns).
+	for i := range 25 {
+		key := "Tag" + strconv.Itoa(i)
+		want := "val" + strconv.Itoa(i)
+		if got := x.Get(NStiff, key); got != want {
+			t.Errorf("attr %d: got %q, want %q", i, got, want)
+		}
+	}
+}
+
+// TestDeepNestingNSResolution verifies that deeply nested elements can still
+// resolve namespaces declared on ancestor elements after scope-popping is in
+// place (i.e. scope-popping does not accidentally remove declarations that are
+// still in scope).
+func TestDeepNestingNSResolution(t *testing.T) {
+	t.Parallel()
+	// A struct property using rdf:parseType="Resource" with fields whose namespace
+	// is declared on the rdf:Description grandparent. This exercises that scope
+	// popping correctly only removes NS entries added by each element, not parent-
+	// element declarations.
+	raw := `<?xpacket begin="" uid="abc"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about=""
+      xmlns:Iptc4xmpCore="http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/">
+      <Iptc4xmpCore:CreatorContactInfo rdf:parseType="Resource">
+        <Iptc4xmpCore:CiEmailWork>deep@example.com</Iptc4xmpCore:CiEmailWork>
+        <Iptc4xmpCore:CiUrlWork>https://deep.example.com</Iptc4xmpCore:CiUrlWork>
+      </Iptc4xmpCore:CreatorContactInfo>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>`
+
+	x, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := x.Get(NSiptcCore, "CreatorContactInfo.CiEmailWork"); got != "deep@example.com" {
+		t.Errorf("CiEmailWork: got %q, want %q", got, "deep@example.com")
+	}
+	if got := x.Get(NSiptcCore, "CreatorContactInfo.CiUrlWork"); got != "https://deep.example.com" {
+		t.Errorf("CiUrlWork: got %q, want %q", got, "https://deep.example.com")
+	}
 }
 
 func BenchmarkXMPParse(b *testing.B) {
@@ -1012,6 +1367,367 @@ func TestNamespacePrefixFallback(t *testing.T) {
 	}
 }
 
+// ── Issue #16a: UTF-16/UTF-32 XMP packets (XMP Part 1 §7.2) ─────────────────
+
+// utf8ToUTF16 encodes a UTF-8 string as UTF-16 with the given BOM, prepending
+// it at the start.  Used only in tests to build synthetic UTF-16 XMP packets.
+//
+//nolint:unparam // s is always xmpPacketBody in current tests; kept as a parameter for future test cases
+func utf8ToUTF16(s string, bigEndian bool) []byte {
+	runes := []rune(s)
+	// 2-byte BOM + 2 bytes per rune (BMP-only test strings).
+	out := make([]byte, 2+len(runes)*2)
+	if bigEndian {
+		out[0], out[1] = 0xFE, 0xFF
+	} else {
+		out[0], out[1] = 0xFF, 0xFE
+	}
+	for i, r := range runes {
+		if bigEndian {
+			binary.BigEndian.PutUint16(out[2+i*2:], uint16(r)) //nolint:gosec // G115: test helper for BMP-only strings; rune values ≤ 0xFFFF are safe to narrow to uint16
+		} else {
+			binary.LittleEndian.PutUint16(out[2+i*2:], uint16(r)) //nolint:gosec // G115: test helper for BMP-only strings; rune values ≤ 0xFFFF are safe to narrow to uint16
+		}
+	}
+	return out
+}
+
+// utf8ToUTF32 encodes a UTF-8 string as UTF-32 with the given BOM.
+func utf8ToUTF32(s string, bigEndian bool) []byte {
+	runes := []rune(s)
+	// 4-byte BOM + 4 bytes per rune.
+	out := make([]byte, 4+len(runes)*4)
+	if bigEndian {
+		out[0], out[1], out[2], out[3] = 0x00, 0x00, 0xFE, 0xFF
+	} else {
+		out[0], out[1], out[2], out[3] = 0xFF, 0xFE, 0x00, 0x00
+	}
+	for i, r := range runes {
+		if bigEndian {
+			binary.BigEndian.PutUint32(out[4+i*4:], uint32(r))
+		} else {
+			binary.LittleEndian.PutUint32(out[4+i*4:], uint32(r))
+		}
+	}
+	return out
+}
+
+// xmpPacketBody is the inner UTF-8 XMP document used for encoding tests.
+// It is reused across UTF-16 BE, UTF-16 LE, and UTF-32 sub-tests.
+const xmpPacketBody = `<?xpacket begin="" uid="W5M0MpCehiHzreSzNTczkc9d"?>` +
+	`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+	`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+	`<rdf:Description rdf:about=""` +
+	` xmlns:tiff="http://ns.adobe.com/tiff/1.0/"` +
+	` xmlns:dc="http://purl.org/dc/elements/1.1/"` +
+	` tiff:Model="Canon EOS R6"` +
+	` dc:rights="(c) 2025 UTF16Test"/>` +
+	`</rdf:RDF></x:xmpmeta>` +
+	`<?xpacket end="w"?>`
+
+// TestScanUTF16BE verifies that Scan correctly detects and transcodes a
+// UTF-16 BE XMP packet (XMP Part 1 §7.2).
+func TestScanUTF16BE(t *testing.T) {
+	t.Parallel()
+	utf16 := utf8ToUTF16(xmpPacketBody, true)
+	pkt := Scan(utf16)
+	if pkt == nil {
+		t.Fatal("Scan returned nil for UTF-16 BE packet")
+	}
+	if !strings.Contains(string(pkt), "<?xpacket begin=") {
+		t.Errorf("Scan result missing <?xpacket begin=: %q", pkt[:min(len(pkt), 60)])
+	}
+}
+
+// TestScanUTF16LE verifies that Scan correctly detects and transcodes a
+// UTF-16 LE XMP packet (XMP Part 1 §7.2).
+func TestScanUTF16LE(t *testing.T) {
+	t.Parallel()
+	utf16 := utf8ToUTF16(xmpPacketBody, false)
+	pkt := Scan(utf16)
+	if pkt == nil {
+		t.Fatal("Scan returned nil for UTF-16 LE packet")
+	}
+	if !strings.Contains(string(pkt), "<?xpacket begin=") {
+		t.Errorf("Scan result missing <?xpacket begin=: %q", pkt[:min(len(pkt), 60)])
+	}
+}
+
+// TestParseUTF16BE verifies that Parse extracts XMP properties correctly from
+// a UTF-16 BE encoded packet (XMP Part 1 §7.2).
+func TestParseUTF16BE(t *testing.T) {
+	t.Parallel()
+	utf16 := utf8ToUTF16(xmpPacketBody, true)
+	x, err := Parse(utf16)
+	if err != nil {
+		t.Fatalf("Parse UTF-16 BE: %v", err)
+	}
+	if got := x.CameraModel(); got != "Canon EOS R6" {
+		t.Errorf("CameraModel from UTF-16 BE = %q, want %q", got, "Canon EOS R6")
+	}
+	if got := x.Copyright(); got != "(c) 2025 UTF16Test" {
+		t.Errorf("Copyright from UTF-16 BE = %q, want %q", got, "(c) 2025 UTF16Test")
+	}
+}
+
+// TestParseUTF16LE verifies that Parse extracts XMP properties correctly from
+// a UTF-16 LE encoded packet (XMP Part 1 §7.2).
+func TestParseUTF16LE(t *testing.T) {
+	t.Parallel()
+	utf16 := utf8ToUTF16(xmpPacketBody, false)
+	x, err := Parse(utf16)
+	if err != nil {
+		t.Fatalf("Parse UTF-16 LE: %v", err)
+	}
+	if got := x.CameraModel(); got != "Canon EOS R6" {
+		t.Errorf("CameraModel from UTF-16 LE = %q, want %q", got, "Canon EOS R6")
+	}
+	if got := x.Copyright(); got != "(c) 2025 UTF16Test" {
+		t.Errorf("Copyright from UTF-16 LE = %q, want %q", got, "(c) 2025 UTF16Test")
+	}
+}
+
+// TestParseUTF32BE verifies that Parse handles UTF-32 BE packets.
+// UTF-32 is extremely rare in practice but legal per XMP Part 1 §7.2.
+func TestParseUTF32BE(t *testing.T) {
+	t.Parallel()
+	utf32 := utf8ToUTF32(xmpPacketBody, true)
+	x, err := Parse(utf32)
+	if err != nil {
+		t.Fatalf("Parse UTF-32 BE: %v", err)
+	}
+	if got := x.CameraModel(); got != "Canon EOS R6" {
+		t.Errorf("CameraModel from UTF-32 BE = %q, want %q", got, "Canon EOS R6")
+	}
+}
+
+// TestParseUTF32LE verifies that Parse handles UTF-32 LE packets.
+func TestParseUTF32LE(t *testing.T) {
+	t.Parallel()
+	utf32 := utf8ToUTF32(xmpPacketBody, false)
+	x, err := Parse(utf32)
+	if err != nil {
+		t.Fatalf("Parse UTF-32 LE: %v", err)
+	}
+	if got := x.CameraModel(); got != "Canon EOS R6" {
+		t.Errorf("CameraModel from UTF-32 LE = %q, want %q", got, "Canon EOS R6")
+	}
+}
+
+// TestParseUTF8NoRegression verifies that the UTF-8 fast path is not affected
+// by the BOM-detection logic added for #16a.
+func TestParseUTF8NoRegression(t *testing.T) {
+	t.Parallel()
+	x, err := Parse([]byte(simpleXMP))
+	if err != nil {
+		t.Fatalf("Parse UTF-8: %v", err)
+	}
+	if got := x.CameraModel(); got != "Canon EOS R5" {
+		t.Errorf("CameraModel UTF-8 regression: got %q, want %q", got, "Canon EOS R5")
+	}
+}
+
+// TestDetectEncoding verifies the BOM-detection logic in isolation.
+func TestDetectEncoding(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		b    []byte
+		want xmpEncoding
+	}{
+		{"UTF-8 (no BOM)", []byte("<?xpacket"), encUTF8},
+		{"UTF-16 BE (FE FF)", []byte{0xFE, 0xFF, 0x00, 0x3C}, encUTF16BE},
+		{"UTF-16 LE (FF FE)", []byte{0xFF, 0xFE, 0x3C, 0x00}, encUTF16LE},
+		{"UTF-32 BE (00 00 FE FF)", []byte{0x00, 0x00, 0xFE, 0xFF, 0x00, 0x00, 0x00, 0x3C}, encUTF32BE},
+		{"UTF-32 LE (FF FE 00 00)", []byte{0xFF, 0xFE, 0x00, 0x00, 0x3C, 0x00, 0x00, 0x00}, encUTF32LE},
+		{"empty", []byte{}, encUTF8},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := detectEncoding(tc.b); got != tc.want {
+				t.Errorf("detectEncoding = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// ── Issue #16b: CDATA sections (XML 1.0 §2.7; XMP Part 1) ───────────────────
+
+// TestCDATAInPropertyValue verifies that a CDATA section within a simple
+// property element is extracted correctly and its content treated as
+// literal character data (no entity expansion).
+//
+// XML 1.0 §2.7: "the processor MUST NOT expand any character references or
+// entity references within a CDATA section."
+func TestCDATAInPropertyValue(t *testing.T) {
+	t.Parallel()
+	raw := `<?xpacket begin="" uid="abc"?>` +
+		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<rdf:Description rdf:about="" xmlns:tiff="http://ns.adobe.com/tiff/1.0/">` +
+		`<tiff:ImageDescription><![CDATA[A description with <special> & "chars"]]></tiff:ImageDescription>` +
+		`</rdf:Description>` +
+		`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`
+	x, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse CDATA: %v", err)
+	}
+	got := x.Get(NStiff, "ImageDescription")
+	// Content must be verbatim — no entity expansion inside CDATA.
+	want := `A description with <special> & "chars"`
+	if got != want {
+		t.Errorf("CDATA value = %q, want %q", got, want)
+	}
+}
+
+// TestCDATAWithInternalBrackets verifies that a CDATA section containing ']'
+// characters (but not ']]>') is handled correctly.
+func TestCDATAWithInternalBrackets(t *testing.T) {
+	t.Parallel()
+	raw := `<?xpacket begin="" uid="abc"?>` +
+		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">` +
+		`<dc:title><![CDATA[Array[0] and Array[1] values]]></dc:title>` +
+		`</rdf:Description>` +
+		`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`
+	x, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse CDATA with brackets: %v", err)
+	}
+	got := x.Get(NSdc, "title")
+	want := "Array[0] and Array[1] values"
+	if got != want {
+		t.Errorf("CDATA bracket value = %q, want %q", got, want)
+	}
+}
+
+// TestCDATANoEntityExpansion verifies that ampersands and angle brackets
+// within a CDATA section are NOT entity-expanded (XML 1.0 §2.7).
+func TestCDATANoEntityExpansion(t *testing.T) {
+	t.Parallel()
+	raw := `<?xpacket begin="" uid="abc"?>` +
+		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">` +
+		`<dc:rights><![CDATA[© 2025 & <Company> "All rights reserved"]]></dc:rights>` +
+		`</rdf:Description>` +
+		`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`
+	x, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse CDATA no-entity: %v", err)
+	}
+	got := x.Copyright()
+	want := `© 2025 & <Company> "All rights reserved"`
+	if got != want {
+		t.Errorf("CDATA no-entity = %q, want %q", got, want)
+	}
+}
+
+// TestCDATAMixedWithText verifies that text before and after a CDATA section
+// is correctly concatenated with the CDATA content.
+func TestCDATAMixedWithText(t *testing.T) {
+	t.Parallel()
+	raw := `<?xpacket begin="" uid="abc"?>` +
+		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<rdf:Description rdf:about="" xmlns:tiff="http://ns.adobe.com/tiff/1.0/">` +
+		`<tiff:Make>before<![CDATA[middle]]>after</tiff:Make>` +
+		`</rdf:Description>` +
+		`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`
+	x, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse CDATA mixed: %v", err)
+	}
+	got := x.Get(NStiff, "Make")
+	want := "beforemiddleafter"
+	if got != want {
+		t.Errorf("CDATA mixed = %q, want %q", got, want)
+	}
+}
+
+// TestCDATAUnterminatedSafe verifies that an unterminated CDATA section does
+// not panic or return an error that breaks the parse entirely.
+func TestCDATAUnterminatedSafe(t *testing.T) {
+	t.Parallel()
+	// Property with an unterminated CDATA section — parser must not panic.
+	raw := `<?xpacket begin="" uid="abc"?>` +
+		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<rdf:Description rdf:about="" xmlns:tiff="http://ns.adobe.com/tiff/1.0/"` +
+		` tiff:Model="SafeCamera">` +
+		`<tiff:Make><![CDATA[unterminated`
+	_, _ = Parse([]byte(raw)) // must not panic
+}
+
+// TestCDATAPreservesExistingProperties verifies that the CDATA handler does not
+// interfere with properties that were correctly parsed before or after a CDATA
+// section in the same document.
+func TestCDATAPreservesExistingProperties(t *testing.T) {
+	t.Parallel()
+	raw := `<?xpacket begin="" uid="abc"?>` +
+		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<rdf:Description rdf:about=""` +
+		` xmlns:tiff="http://ns.adobe.com/tiff/1.0/"` +
+		` xmlns:dc="http://purl.org/dc/elements/1.1/"` +
+		` tiff:Model="TestCam">` +
+		`<dc:rights><![CDATA[© 2025 CDATA Corp]]></dc:rights>` +
+		`</rdf:Description>` +
+		`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`
+	x, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse CDATA with surrounding properties: %v", err)
+	}
+	if got := x.CameraModel(); got != "TestCam" {
+		t.Errorf("CameraModel after CDATA = %q, want %q", got, "TestCam")
+	}
+	if got := x.Copyright(); got != "© 2025 CDATA Corp" {
+		t.Errorf("Copyright from CDATA = %q, want %q", got, "© 2025 CDATA Corp")
+	}
+}
+
+// TestDepthLimitStillEnforced verifies that the 100-level nesting depth limit
+// is preserved after the #16a/#16b changes.
+func TestDepthLimitStillEnforced16(t *testing.T) {
+	t.Parallel()
+	var sb strings.Builder
+	sb.WriteString(`<?xpacket begin="" uid="abc"?>`)
+	sb.WriteString(`<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">`)
+	for range 102 {
+		sb.WriteString(`<a>`)
+	}
+	for range 102 {
+		sb.WriteString(`</a>`)
+	}
+	sb.WriteString(`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`)
+	_, err := Parse([]byte(sb.String()))
+	if err == nil {
+		t.Error("expected ErrXMLNestingDepth for depth > 100, got nil")
+	}
+}
+
+// TestDoctypeStillSkipped verifies that DOCTYPE constructs are still silently
+// skipped after the CDATA fix (anti-XXE regression test).
+func TestDoctypeStillSkipped(t *testing.T) {
+	t.Parallel()
+	raw := `<?xpacket begin="" uid="abc"?>` +
+		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>` +
+		`<rdf:Description rdf:about="" xmlns:tiff="http://ns.adobe.com/tiff/1.0/"` +
+		` tiff:Model="AfterDoctype"/>` +
+		`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`
+	x, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse after DOCTYPE: %v", err)
+	}
+	if got := x.CameraModel(); got != "AfterDoctype" {
+		t.Errorf("CameraModel after DOCTYPE = %q, want %q", got, "AfterDoctype")
+	}
+}
+
 func BenchmarkXMPParse_RealWorld(b *testing.B) {
 	raw, err := os.ReadFile("../testdata/corpus/jpeg/exiftool/ExifTool.jpg")
 	if err != nil {
@@ -1026,5 +1742,55 @@ func BenchmarkXMPParse_RealWorld(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		_, _ = Parse(pkt)
+	}
+}
+
+// ── Issue #36: depth underflow — unmatched close tags must not panic ──────────
+
+// TestDepthUnderflowNoPanic is a regression test for the critical security bug
+// reported in issue #36: xmp.Parse panicked with "index out of range [-1]" when
+// the input contained more close tags than open tags.
+//
+// Root cause: onEndElement decremented p.depth unconditionally; a sequence of
+// unmatched </x> tags drove depth negative; the subsequent p.depth++ in
+// parseStartTag produced p.depth == -1; nsDepth[-1] then panicked.
+//
+// The fix: onEndElement returns immediately when p.depth <= 0, treating
+// unmatched close tags as silently ignored (consistent with the parser's lenient
+// design — only ErrEmptyInput and ErrXMLNestingDepth are fatal).
+func TestDepthUnderflowNoPanic(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		input []byte
+	}{
+		// Exact reproducer from fuzz corpus FuzzParseXMP/8f08ef9ff3ff470c.
+		{"fuzz-reproducer", []byte("</></><0")},
+		// Bare unmatched close tags with no opening context.
+		{"three-unmatched-close", []byte("</a></a></a>")},
+		// Many consecutive unmatched close tags — stress the underflow guard.
+		{"many-unmatched-close", []byte(strings.Repeat("</x>", 200))},
+		// Unmatched close tags followed by a valid start tag.
+		{"unmatched-then-open", []byte("</a></a><b>text</b>")},
+		// Mix of unmatched close tags inside an otherwise valid packet.
+		{"close-then-valid-xmp", []byte(
+			`<?xpacket begin="" uid="abc"?>` +
+				`</orphan></orphan>` +
+				`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+				`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+				`<rdf:Description rdf:about="" xmlns:tiff="http://ns.adobe.com/tiff/1.0/"` +
+				` tiff:Model="StillParsed"/>` +
+				`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`,
+		)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// Must not panic — any return value (nil or non-nil) is acceptable.
+			// A panic would be caught by the testing runtime as a failure.
+			_, _ = Parse(tc.input)
+		})
 	}
 }

@@ -25,9 +25,16 @@ var visitedPool = sync.Pool{ //nolint:gochecknoglobals // sync.Pool: reuse reduc
 // Entries must remain sorted by Tag in ascending order (TIFF §7) so that
 // Get() can use binary search. Use set() to modify entries; code that
 // appends to Entries directly must call sortEntries() afterwards.
+//
+// ThumbnailData holds the raw JPEG thumbnail bytes when an IFD carries a
+// JPEG-compressed thumbnail (EXIF §4.5.5, tags 0x0201 JPEGInterchangeFormat
+// and 0x0202 JPEGInterchangeFormatLength).  It is populated by parseSingleIFD
+// so that Encode can re-append the bytes at the correct new offset and patch
+// tag 0x0201 accordingly.  Nil means no JPEG thumbnail is attached.
 type IFD struct {
-	Entries []IFDEntry
-	Next    *IFD // linked IFDs (e.g. IFD1 for thumbnail)
+	Entries       []IFDEntry
+	Next          *IFD   // linked IFDs (e.g. IFD1 for thumbnail)
+	ThumbnailData []byte // raw JPEG thumbnail bytes; non-nil when present
 }
 
 // IFDEntry represents a single TIFF directory entry (TIFF §2, 12 bytes each).
@@ -131,12 +138,44 @@ func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint
 	// Real cameras produce sorted IFDs, but non-compliant files may not.
 	sortEntries(ifd.Entries)
 
+	// Extract JPEG thumbnail bytes when both JPEGInterchangeFormat (0x0201) and
+	// JPEGInterchangeFormatLength (0x0202) are present (EXIF §4.5.5).
+	ifd.ThumbnailData = extractJPEGThumbnail(b, ifd, order)
+
 	// Read the next-IFD pointer (4 bytes after the last entry, TIFF §2).
 	nextPtrPos := pos + int(count)*12
 	if nextPtrPos+4 > len(b) {
 		return ifd, 0, true
 	}
 	return ifd, order.Uint32(b[nextPtrPos:]), true
+}
+
+// extractJPEGThumbnail extracts the raw JPEG thumbnail bytes from b when the
+// parsed ifd contains both TagJPEGInterchangeFormat (0x0201) and
+// TagJPEGInterchangeFormatLength (0x0202) with valid values (EXIF §4.5.5).
+// Returns nil when either tag is absent, malformed, or the indicated byte range
+// falls outside b.  The returned slice is an independent copy so the IFD is not
+// tied to the original parse buffer.
+func extractJPEGThumbnail(b []byte, ifd *IFD, order binary.ByteOrder) []byte {
+	jifEntry := ifd.Get(TagJPEGInterchangeFormat)
+	if jifEntry == nil || len(jifEntry.Value) < 4 {
+		return nil
+	}
+	jifLenEntry := ifd.Get(TagJPEGInterchangeFormatLength)
+	if jifLenEntry == nil || len(jifLenEntry.Value) < 4 {
+		return nil
+	}
+	jifOff := order.Uint32(jifEntry.Value)
+	jifLen := order.Uint32(jifLenEntry.Value)
+	end := uint64(jifOff) + uint64(jifLen)
+	if jifLen == 0 || end > uint64(len(b)) {
+		return nil
+	}
+	// Copy: the IFD must be independent of the original parse buffer so that
+	// callers can discard the input bytes after Parse returns (TIFF §2).
+	thumb := make([]byte, jifLen)
+	copy(thumb, b[jifOff:end])
+	return thumb
 }
 
 // traverse walks the IFD chain starting at offset within b, using the given
@@ -210,12 +249,14 @@ func (ifd *IFD) Get(tag TagID) *IFDEntry {
 	return nil
 }
 
-// String decodes the entry value as a NUL-terminated ASCII string (TypeASCII, TIFF §2).
+// String decodes the entry value as a NUL-terminated string.
+// Handles TypeASCII (TIFF §2, US-ASCII) and TypeUTF8 (CIPA DC-008-2023 §4.6.3,
+// UTF-8 encoded Unicode). Both types use element size 1 and NUL termination.
 func (e *IFDEntry) String() string {
-	if e.Type != TypeASCII || len(e.Value) == 0 {
+	if (e.Type != TypeASCII && e.Type != TypeUTF8) || len(e.Value) == 0 {
 		return ""
 	}
-	// bytes.TrimRight avoids a byte-by-byte loop; no allocation (returns a sub-slice).
+	// bytes.TrimRight avoids a byte-by-byte loop; returns a sub-slice (no allocation).
 	return string(bytes.TrimRight(e.Value, "\x00"))
 }
 
@@ -358,6 +399,16 @@ func (ifd *IFD) set(tag TagID, typ DataType, count uint32, value []byte) {
 // asciiValue encodes s as a NUL-terminated ASCII byte slice suitable for
 // IFDEntry.Value (TypeASCII, TIFF §2).
 func asciiValue(s string) []byte {
+	v := make([]byte, len(s)+1)
+	copy(v, s)
+	// v[len(s)] is already 0 (NUL terminator).
+	return v
+}
+
+// utf8Value encodes s as a NUL-terminated UTF-8 byte slice suitable for
+// IFDEntry.Value (TypeUTF8 = 13, CIPA DC-008-2023 §4.6.3). Analogous to
+// asciiValue but for the EXIF 3.0 UTF-8 string type.
+func utf8Value(s string) []byte {
 	v := make([]byte, len(s)+1)
 	copy(v, s)
 	// v[len(s)] is already 0 (NUL terminator).

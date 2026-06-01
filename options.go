@@ -12,6 +12,9 @@ type readConfig struct {
 	lazyEXIF bool
 	// skipMakerNote skips MakerNote IFD parsing inside EXIF.
 	skipMakerNote bool
+	// strict causes Read to return a ParseSegmentError immediately when a
+	// segment is present but fails to parse, instead of silently skipping it.
+	strict bool
 }
 
 // WithoutXMP skips XMP parsing, reducing allocations when XMP is not needed.
@@ -29,6 +32,21 @@ func WithoutEXIF() ReadOption { return func(c *readConfig) { c.lazyEXIF = true }
 // are not needed and you want to minimise parse latency on camera RAW files.
 func WithoutMakerNote() ReadOption { return func(c *readConfig) { c.skipMakerNote = true } }
 
+// Strict enables strict parse mode. In strict mode, Read returns a
+// *ParseSegmentError immediately if a metadata segment is present in the
+// container (raw bytes were successfully extracted) but the format parser
+// fails to decode it. The error identifies the failing segment ("EXIF",
+// "IPTC", or "XMP") and wraps the underlying parser error.
+//
+// Default behaviour (without Strict) is best-effort: parse failures are
+// non-fatal. The segment is left nil on the returned Metadata and the failure
+// is recorded in Metadata.ParseWarnings so callers can inspect it later
+// without aborting.
+//
+// Lazy options (WithoutEXIF, WithoutIPTC, WithoutXMP) take precedence over
+// Strict: a lazy segment is never parsed and therefore never fails.
+func Strict() ReadOption { return func(c *readConfig) { c.strict = true } }
+
 // WriteOption configures a Write or WriteFile call.
 type WriteOption func(*writeConfig)
 
@@ -37,8 +55,17 @@ type writeConfig struct {
 	preserveUnknownSegments bool
 }
 
-// PreserveUnknownSegments keeps APP or chunk segments that this library does
-// not recognise, passing them through unchanged. Default: true.
+// PreserveUnknownSegments controls whether APP or chunk segments that this
+// library does not recognise are passed through unchanged.
+//
+// In the current implementation segment preservation is always active: unknown
+// segments are never dropped regardless of the value passed here. This option
+// is accepted and stored so that callers can express intent in code today;
+// a future minor release will honour PreserveUnknownSegments(false) by
+// stripping unrecognised segments from writable container formats (JPEG, PNG,
+// WebP, HEIF/AVIF, CR3).
+//
+// Default: true.
 func PreserveUnknownSegments(v bool) WriteOption {
 	return func(c *writeConfig) { c.preserveUnknownSegments = v }
 }

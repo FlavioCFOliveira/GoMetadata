@@ -1001,3 +1001,212 @@ func TestMetadata_AltitudeAboveAndBelow(t *testing.T) {
 		t.Errorf("Altitude (below) = (%f, %v), want (-75.5, true)", alt, ok)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// DateTimeOriginal — MWG timezone synthesis (#30)
+// ---------------------------------------------------------------------------
+
+// TestDateTimeOriginal_MWGTimezoneSynthesis verifies that when EXIF carries
+// DateTimeOriginal without OffsetTimeOriginal (EXIF 2.31+, tag 0x9011), and
+// XMP carries exif:DateTimeOriginal with a timezone offset, the returned
+// time.Time uses the XMP timezone rather than UTC.
+//
+// MWG Guidelines §2.2.1: the timezone carried by the XMP date should be
+// applied to the EXIF wall-clock time when the EXIF offset tag is absent.
+func TestDateTimeOriginal_MWGTimezoneSynthesis(t *testing.T) {
+	t.Parallel()
+
+	// Build a minimal TIFF with ExifIFD DateTimeOriginal but NO OffsetTimeOriginal.
+	tiffData := buildTIFFMultiIFD(
+		nil,
+		[]tiffEntry{
+			makeASCIIEntry(exif.TagDateTimeOriginal, "2024:06:15 10:30:00"),
+			// TagOffsetTimeOriginal is deliberately absent.
+		},
+		nil,
+	)
+	parsed, err := exif.Parse(tiffData)
+	if err != nil {
+		t.Fatalf("exif.Parse: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		xmpDate    string
+		wantOffset int // expected UTC offset in seconds
+	}{
+		{
+			name:       "positive offset +02:00 synthesised from XMP",
+			xmpDate:    "2024-06-15T10:30:00+02:00",
+			wantOffset: 2 * 3600,
+		},
+		{
+			name:       "negative offset -05:00 synthesised from XMP",
+			xmpDate:    "2024-06-15T10:30:00-05:00",
+			wantOffset: -5 * 3600,
+		},
+		{
+			name:       "half-hour offset +05:30 synthesised from XMP",
+			xmpDate:    "2024-06-15T10:30:00+05:30",
+			wantOffset: 5*3600 + 30*60,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			x := &xmp.XMP{Properties: map[string]map[string]string{
+				xmp.NSexif: {"DateTimeOriginal": tc.xmpDate},
+			}}
+			m := &Metadata{EXIF: parsed, XMP: x}
+
+			ts, ok := m.DateTimeOriginal()
+			if !ok {
+				t.Fatalf("DateTimeOriginal() ok=false, want true")
+			}
+
+			// The wall-clock time must be unchanged.
+			if ts.Year() != 2024 || ts.Month() != 6 || ts.Day() != 15 ||
+				ts.Hour() != 10 || ts.Minute() != 30 || ts.Second() != 0 {
+				t.Errorf("wall-clock mismatch: got %v", ts)
+			}
+
+			// The timezone offset must match what XMP provided.
+			_, gotOffset := ts.Zone()
+			if gotOffset != tc.wantOffset {
+				t.Errorf("zone offset = %d s, want %d s", gotOffset, tc.wantOffset)
+			}
+		})
+	}
+}
+
+// TestDateTimeOriginal_MWGSynthesisNotAppliedWhenOffsetPresent verifies that
+// when EXIF already carries OffsetTimeOriginal the XMP timezone is NOT used
+// (the EXIF offset wins per the priority policy).
+func TestDateTimeOriginal_MWGSynthesisNotAppliedWhenOffsetPresent(t *testing.T) {
+	t.Parallel()
+
+	// Build a TIFF with ExifIFD DateTimeOriginal AND OffsetTimeOriginal "+03:00".
+	tiffData := buildTIFFMultiIFD(
+		nil,
+		[]tiffEntry{
+			makeASCIIEntry(exif.TagDateTimeOriginal, "2024:06:15 10:30:00"),
+			makeASCIIEntry(exif.TagOffsetTimeOriginal, "+03:00"),
+		},
+		nil,
+	)
+	parsed, err := exif.Parse(tiffData)
+	if err != nil {
+		t.Fatalf("exif.Parse: %v", err)
+	}
+
+	// XMP claims a different offset; it must be ignored.
+	x := &xmp.XMP{Properties: map[string]map[string]string{
+		xmp.NSexif: {"DateTimeOriginal": "2024-06-15T10:30:00+07:00"},
+	}}
+	m := &Metadata{EXIF: parsed, XMP: x}
+
+	ts, ok := m.DateTimeOriginal()
+	if !ok {
+		t.Fatalf("DateTimeOriginal() ok=false")
+	}
+
+	_, gotOffset := ts.Zone()
+	const wantOffset = 3 * 3600 // +03:00 from EXIF
+	if gotOffset != wantOffset {
+		t.Errorf("zone offset = %d s (from XMP), want %d s (from EXIF OffsetTimeOriginal)",
+			gotOffset, wantOffset)
+	}
+}
+
+// TestDateTimeOriginal_MWGSynthesisNoXMPOffset verifies that when XMP carries
+// DateTimeOriginal without a timezone offset (no TZ or "Z" suffix), the
+// returned time falls back to UTC (original behaviour — no synthesis applied).
+func TestDateTimeOriginal_MWGSynthesisNoXMPOffset(t *testing.T) {
+	t.Parallel()
+
+	tiffData := buildTIFFMultiIFD(
+		nil,
+		[]tiffEntry{
+			makeASCIIEntry(exif.TagDateTimeOriginal, "2024:06:15 10:30:00"),
+		},
+		nil,
+	)
+	parsed, err := exif.Parse(tiffData)
+	if err != nil {
+		t.Fatalf("exif.Parse: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		xmpDate string
+	}{
+		{"no timezone in XMP", "2024-06-15T10:30:00"},
+		{"UTC Z suffix — ambiguous; no synthesis", "2024-06-15T10:30:00Z"},
+		{"XMP absent", ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var m *Metadata
+			if tc.xmpDate == "" {
+				m = &Metadata{EXIF: parsed}
+			} else {
+				x := &xmp.XMP{Properties: map[string]map[string]string{
+					xmp.NSexif: {"DateTimeOriginal": tc.xmpDate},
+				}}
+				m = &Metadata{EXIF: parsed, XMP: x}
+			}
+
+			ts, ok := m.DateTimeOriginal()
+			if !ok {
+				t.Fatalf("DateTimeOriginal() ok=false")
+			}
+
+			// Without a synthesised offset the result must be UTC.
+			_, offset := ts.Zone()
+			if offset != 0 {
+				t.Errorf("zone offset = %d s, want 0 (UTC) when no XMP TZ", offset)
+			}
+		})
+	}
+}
+
+// TestXmpTimezone exercises the internal xmpTimezone helper directly.
+func TestXmpTimezone(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		input      string
+		wantNil    bool
+		wantOffset int
+	}{
+		{"2024-06-15T10:30:00+02:00", false, 7200},
+		{"2024-06-15T10:30:00-05:00", false, -18000},
+		{"2024-06-15T10:30:00+05:30", false, 19800},
+		{"2024-06-15T10:30:00Z", true, 0}, // Z suffix → nil
+		{"2024-06-15T10:30:00", true, 0},  // no TZ → nil
+		{"", true, 0},                     // empty → nil
+		{"short", true, 0},                // too short → nil
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			t.Parallel()
+			loc := xmpTimezone(tc.input)
+			if tc.wantNil {
+				if loc != nil {
+					t.Errorf("xmpTimezone(%q) = non-nil, want nil", tc.input)
+				}
+				return
+			}
+			if loc == nil {
+				t.Fatalf("xmpTimezone(%q) = nil, want non-nil", tc.input)
+			}
+			_, offset := time.Now().In(loc).Zone()
+			if offset != tc.wantOffset {
+				t.Errorf("xmpTimezone(%q) offset = %d, want %d", tc.input, offset, tc.wantOffset)
+			}
+		})
+	}
+}

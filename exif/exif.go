@@ -375,6 +375,68 @@ func (e *EXIF) ImageSize() (width, height uint32, ok bool) {
 	return w, h, w > 0 && h > 0
 }
 
+// UserComment returns the decoded value of ExifIFD tag 0x9286 (UserComment,
+// EXIF 2.32 CIPA DC-008-2023 §4.6.5). The first 8 bytes of the stored value
+// identify the character encoding; the remainder is decoded accordingly:
+//
+//   - "ASCII\x00\x00\x00" prefix → treated as UTF-8 (Windows writes ASCII prefix
+//     with UTF-8 content; both are accepted).
+//   - "UNICODE\x00"  prefix → UTF-16, byte order from the EXIF stream.
+//   - "JIS\x00..."   prefix → best-effort raw pass-through (no JIS→UTF-8 table).
+//   - all-zero prefix (Undefined) → raw bytes interpreted as UTF-8.
+//
+// Trailing NUL bytes are always stripped. Returns an empty string when the tag
+// is absent or the payload is shorter than the mandatory 8-byte charset prefix.
+func (e *EXIF) UserComment() string {
+	if e == nil || e.ExifIFD == nil {
+		return ""
+	}
+	entry := e.ExifIFD.Get(TagUserComment)
+	if entry == nil {
+		return ""
+	}
+	// Determine byte order for UNICODE prefix: follow the EXIF stream order.
+	bigEndian := e.ByteOrder == binary.BigEndian
+	return decodeUserComment(entry.Value, bigEndian)
+}
+
+// xpTagString decodes a Windows XP* tag value from the ExifIFD.
+// XP* tags store null-terminated UTF-16 LE as TypeByte.
+// Returns an empty string when the tag is absent or IFD is nil.
+func (e *EXIF) xpTagString(tag TagID) string {
+	if e == nil || e.ExifIFD == nil {
+		return ""
+	}
+	entry := e.ExifIFD.Get(tag)
+	if entry == nil {
+		return ""
+	}
+	// Windows XP* tags: TypeByte, null-terminated UTF-16 LE.
+	// Microsoft EXIF Extension: each character occupies two bytes, low byte first.
+	return decodeUTF16LE(entry.Value)
+}
+
+// XPTitle returns the decoded value of ExifIFD tag 0x9C9B (XPTitle).
+// Windows Photo Gallery writes titles here as null-terminated UTF-16 LE in a
+// TypeByte field. Not part of the EXIF standard; Microsoft EXIF Extension.
+func (e *EXIF) XPTitle() string { return e.xpTagString(TagXPTitle) }
+
+// XPComment returns the decoded value of ExifIFD tag 0x9C9C (XPComment).
+// Windows-specific; see XPTitle for encoding details.
+func (e *EXIF) XPComment() string { return e.xpTagString(TagXPComment) }
+
+// XPAuthor returns the decoded value of ExifIFD tag 0x9C9D (XPAuthor).
+// Windows-specific; see XPTitle for encoding details.
+func (e *EXIF) XPAuthor() string { return e.xpTagString(TagXPAuthor) }
+
+// XPKeywords returns the decoded value of ExifIFD tag 0x9C9E (XPKeywords).
+// Windows-specific; see XPTitle for encoding details.
+func (e *EXIF) XPKeywords() string { return e.xpTagString(TagXPKeywords) }
+
+// XPSubject returns the decoded value of ExifIFD tag 0x9C9F (XPSubject).
+// Windows-specific; see XPTitle for encoding details.
+func (e *EXIF) XPSubject() string { return e.xpTagString(TagXPSubject) }
+
 // Creator returns the artist / creator string from IFD0 tag 0x013B
 // (Artist, EXIF §4.6.4 Table 3).
 func (e *EXIF) Creator() string {
@@ -644,6 +706,12 @@ func (e *EXIF) SetGPS(lat, lon float64) {
 	latDMS := decimalToDMSBytes(lat, order)
 	lonDMS := decimalToDMSBytes(lon, order)
 
+	// Write GPSVersionID (0x0000, BYTE, count=4) = {2,3,0,0} only when not already
+	// present. EXIF §4.6.6 Table 15: GPSVersionID indicates the GPS IFD version;
+	// {2,3,0,0} corresponds to EXIF 2.3/3.0 GPS attribute information revision.
+	if gps.Get(TagGPSVersionID) == nil {
+		gps.set(TagGPSVersionID, TypeByte, 4, []byte{2, 3, 0, 0})
+	}
 	gps.set(TagGPSLatitudeRef, TypeASCII, 2, []byte(latRef))
 	gps.set(TagGPSLatitude, TypeRational, 3, latDMS[:])
 	gps.set(TagGPSLongitudeRef, TypeASCII, 2, []byte(lonRef))

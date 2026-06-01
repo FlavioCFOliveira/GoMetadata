@@ -289,6 +289,12 @@ func parseHEIFBoxHeader(data []byte, pos int) (size uint64, typ string, headerLe
 	if size > uint64(len(data)-pos) { //nolint:gosec // G115: len(data)-pos is non-negative (guarded above)
 		return 0, "", 0, false
 	}
+	// ISO 14496-12 §4.2: a box whose declared size is smaller than its own
+	// header length is unconditionally malformed — the payload slice arithmetic
+	// data[pos+headerLen : pos+size] would panic (e.g. [8:4] for size=4).
+	if size < headerLen {
+		return 0, "", 0, false
+	}
 	return size, typ, headerLen, true
 }
 

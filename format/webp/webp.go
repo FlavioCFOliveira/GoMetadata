@@ -18,6 +18,15 @@ import (
 	"github.com/FlavioCFOliveira/GoMetadata/internal/riff"
 )
 
+// maxWebPChunkSize is the maximum allowed data size for a single RIFF chunk
+// before any allocation is attempted. The RIFF spec encodes chunk sizes as
+// uint32, permitting up to ~4 GiB, but that is pathological for EXIF or XMP
+// metadata. 256 MiB is orders of magnitude larger than any real payload; any
+// chunk that declares more is either malformed or adversarial.
+// Guard applied in readPaddedChunk before make([]byte, chunk.Size) to prevent
+// a single 4-byte field in the file from causing a multi-gigabyte heap allocation.
+const maxWebPChunkSize = 256 << 20 // 256 MiB
+
 // readWebPChunks iterates over the RIFF chunk list in r, accumulating EXIF and
 // XMP payloads. r must be positioned immediately after the 12-byte RIFF/WEBP
 // header. All non-metadata chunks are skipped.
@@ -75,7 +84,43 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 // readPaddedChunk reads chunk.Size bytes from r into a new slice and seeks
 // past the RIFF odd-size padding byte when needed.
 // RIFF spec: chunks with odd byte counts are followed by a 1-byte zero pad.
+//
+// DoS defence — two-stage guard before any allocation:
+//  1. Hard cap: reject chunk.Size > maxWebPChunkSize (256 MiB) regardless.
+//  2. Stream-availability check: seek to EOF, compute bytes remaining, seek
+//     back; if chunk.Size exceeds the stream remainder, the declared size
+//     cannot be satisfied and the file is adversarial or truncated — return
+//     error without allocating.
+//
+// Stage 2 prevents a crafted file (e.g. chunk.Size = 200 MiB in a 50-byte
+// stream) from triggering a multi-hundred-megabyte make([]byte, chunk.Size)
+// before io.ReadFull inevitably fails. The Seek-based check costs two Seek
+// syscalls but avoids proportional heap allocation for adversarial inputs.
 func readPaddedChunk(r io.ReadSeeker, chunk riff.Chunk) ([]byte, error) {
+	// Stage 1: hard cap — rejects pathologically large values (> 256 MiB).
+	if chunk.Size > maxWebPChunkSize {
+		return nil, fmt.Errorf("webp: chunk %q size %d exceeds limit: %w",
+			chunk.FourCCString(), chunk.Size, ErrChunkTooLarge)
+	}
+
+	// Stage 2: stream-availability guard — seek to measure remaining bytes.
+	// chunk.Offset is the position of the first data byte (set by riff.ReadChunk).
+	// r is currently positioned at chunk.Offset (immediately after the header).
+	end, err := r.Seek(0, io.SeekEnd)
+	if err != nil {
+		return nil, fmt.Errorf("webp: seek to end for size check: %w", err)
+	}
+	// Restore position before any comparison or allocation.
+	if _, err = r.Seek(chunk.Offset, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("webp: seek back after size check: %w", err)
+	}
+	remaining := max(end-chunk.Offset, 0)
+	// chunk.Size is uint32 ≤ maxWebPChunkSize after stage 1; int64 cast is safe.
+	if int64(chunk.Size) > remaining {
+		return nil, fmt.Errorf("webp: chunk %q declared size %d exceeds available stream bytes %d: %w",
+			chunk.FourCCString(), chunk.Size, remaining, ErrChunkTooLarge)
+	}
+
 	data := make([]byte, chunk.Size)
 	if _, err := io.ReadFull(r, data); err != nil {
 		return nil, fmt.Errorf("webp: read chunk data: %w", err)

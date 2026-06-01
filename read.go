@@ -66,58 +66,108 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 	}
 
 	// Extract raw metadata segments from the container.
-	rawEXIF, rawIPTC, rawXMP, err := extractByFormat(r, fmtID)
+	// For JPEG, rawXMPWire carries the original main+extended segmentation for
+	// lossless passthrough writes when the XMP is not modified.
+	rawEXIF, rawIPTC, rawXMP, rawXMPWire, err := extractByFormat(r, fmtID)
 	if err != nil {
 		return nil, err
 	}
 
 	m := &Metadata{
-		format:  uint8(fmtID),
-		rawEXIF: rawEXIF,
-		rawIPTC: rawIPTC,
-		rawXMP:  rawXMP,
+		format:     uint8(fmtID),
+		rawEXIF:    rawEXIF,
+		rawIPTC:    rawIPTC,
+		rawXMP:     rawXMP,
+		rawXMPWire: rawXMPWire,
 	}
 
-	parseParsedMetadata(m, rawEXIF, rawIPTC, rawXMP, cfg)
+	if err := parseParsedMetadata(m, rawEXIF, rawIPTC, rawXMP, cfg); err != nil {
+		return nil, err
+	}
 
 	return m, nil
 }
 
-// parseIfPresent calls parse(raw) when raw is non-nil and lazy is false.
-// Parse failures are non-fatal and silently ignored so callers still receive
-// whatever segments were readable.
-func parseIfPresent(raw []byte, lazy bool, parse func([]byte)) {
-	if raw != nil && !lazy {
-		parse(raw)
+// applyOrWarn is the single dispatch point for a segment parse result.
+// When warn is non-nil: strict mode returns it as an error immediately;
+// best-effort mode appends it to m.ParseWarnings and continues.
+func applyOrWarn(m *Metadata, warn *ParseSegmentError, strict bool) error {
+	if warn == nil {
+		return nil
 	}
+	if strict {
+		return warn
+	}
+	m.ParseWarnings = append(m.ParseWarnings, warn)
+	return nil
 }
 
 // parseParsedMetadata parses each raw metadata segment into m unless the
-// caller opted out via cfg. Parse failures are non-fatal: an unreadable
-// segment is silently skipped so the caller still gets whatever was readable.
-func parseParsedMetadata(m *Metadata, rawEXIF, rawIPTC, rawXMP []byte, cfg *readConfig) {
-	parseIfPresent(rawEXIF, cfg.lazyEXIF, func(raw []byte) {
-		var exifOpts []exif.ParseOption
-		if cfg.skipMakerNote {
-			exifOpts = []exif.ParseOption{exif.SkipMakerNote()}
-		}
-		if e, perr := exif.Parse(raw, exifOpts...); perr == nil {
-			m.EXIF = e
-		}
-		// Non-fatal: an unreadable EXIF segment is not an error.
-	})
+// caller opted out via cfg.
+//
+// Behaviour depends on cfg.strict:
+//   - Strict mode: the first parse failure is returned immediately; subsequent
+//     segments are not attempted.
+//   - Best-effort mode (default): all segments are attempted; failures are
+//     recorded in m.ParseWarnings and the caller receives whichever segments
+//     parsed successfully.
+//
+// Lazy options (WithoutEXIF, WithoutIPTC, WithoutXMP) take precedence over
+// Strict: a lazy segment is never parsed and therefore never fails.
+func parseParsedMetadata(m *Metadata, rawEXIF, rawIPTC, rawXMP []byte, cfg *readConfig) error {
+	if err := applyOrWarn(m, parseEXIF(m, rawEXIF, cfg), cfg.strict); err != nil {
+		return err
+	}
+	if err := applyOrWarn(m, parseIPTC(m, rawIPTC, cfg), cfg.strict); err != nil {
+		return err
+	}
+	return applyOrWarn(m, parseXMP(m, rawXMP, cfg), cfg.strict)
+}
 
-	parseIfPresent(rawIPTC, cfg.lazyIPTC, func(raw []byte) {
-		if i, perr := iptc.Parse(raw); perr == nil {
-			m.IPTC = i
-		}
-	})
+// parseEXIF attempts to parse rawEXIF into m.EXIF when raw is non-nil and not lazy.
+// Returns a *ParseSegmentError on parse failure, nil on success or skip.
+func parseEXIF(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
+	if raw == nil || cfg.lazyEXIF {
+		return nil
+	}
+	var opts []exif.ParseOption
+	if cfg.skipMakerNote {
+		opts = []exif.ParseOption{exif.SkipMakerNote()}
+	}
+	e, err := exif.Parse(raw, opts...)
+	if err != nil {
+		return &ParseSegmentError{Segment: "EXIF", Err: err}
+	}
+	m.EXIF = e
+	return nil
+}
 
-	parseIfPresent(rawXMP, cfg.lazyXMP, func(raw []byte) {
-		if x, perr := xmppkg.Parse(raw); perr == nil {
-			m.XMP = x
-		}
-	})
+// parseIPTC attempts to parse rawIPTC into m.IPTC when raw is non-nil and not lazy.
+// Returns a *ParseSegmentError on parse failure, nil on success or skip.
+func parseIPTC(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
+	if raw == nil || cfg.lazyIPTC {
+		return nil
+	}
+	i, err := iptc.Parse(raw)
+	if err != nil {
+		return &ParseSegmentError{Segment: "IPTC", Err: err}
+	}
+	m.IPTC = i
+	return nil
+}
+
+// parseXMP attempts to parse rawXMP into m.XMP when raw is non-nil and not lazy.
+// Returns a *ParseSegmentError on parse failure, nil on success or skip.
+func parseXMP(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
+	if raw == nil || cfg.lazyXMP {
+		return nil
+	}
+	x, err := xmppkg.Parse(raw)
+	if err != nil {
+		return &ParseSegmentError{Segment: "XMP", Err: err}
+	}
+	m.XMP = x
+	return nil
 }
 
 // ReadFile opens the file at path and reads all metadata from it.
@@ -131,19 +181,24 @@ func ReadFile(path string, opts ...ReadOption) (*Metadata, error) {
 	return Read(f, opts...)
 }
 
-// extractByFormat dispatches to the correct container handler for raw segment extraction.
-func extractByFormat(r io.ReadSeeker, fmtID format.FormatID) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+// extractByFormat dispatches to the correct container handler for raw segment
+// extraction. For JPEG it calls ExtractWithWire so that extended XMP can be
+// reproduced byte-stably on unmodified round-trip writes.
+func extractByFormat(r io.ReadSeeker, fmtID format.FormatID) (rawEXIF, rawIPTC, rawXMP, rawXMPWire []byte, err error) {
+	if fmtID == format.FormatJPEG {
+		rawEXIF, rawIPTC, rawXMP, rawXMPWire, err = jpeg.ExtractWithWire(r)
+		if err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("gometadata: %w", err)
+		}
+		return rawEXIF, rawIPTC, rawXMP, rawXMPWire, nil
+	}
 	fn, ok := extractors[fmtID]
 	if !ok {
-		return nil, nil, nil, &UnsupportedFormatError{}
+		return nil, nil, nil, nil, &UnsupportedFormatError{}
 	}
-	return wrapExtract(fn(r))
-}
-
-// wrapExtract wraps errors from format-specific Extract calls with the library prefix.
-func wrapExtract(rawEXIF, rawIPTC, rawXMP []byte, err error) ([]byte, []byte, []byte, error) {
+	rawEXIF, rawIPTC, rawXMP, err = fn(r)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("gometadata: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("gometadata: %w", err)
 	}
-	return rawEXIF, rawIPTC, rawXMP, nil
+	return rawEXIF, rawIPTC, rawXMP, nil, nil
 }

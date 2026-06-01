@@ -1023,3 +1023,79 @@ func TestExtractExifFromData(t *testing.T) {
 		}
 	})
 }
+
+// TestExtractMalformedBoxSizeLessThanHeader is a regression test for the
+// panic "slice bounds out of range [8:N]" triggered when an ISOBMFF box
+// declares a size smaller than its own minimum header length.
+//
+// ISO 14496-12 §4.2: a box whose size field is < 8 (standard header) or
+// < 16 (extended-size header, size == 1) is unconditionally malformed.
+// parseHEIFBoxHeader must return ok=false in those cases so no caller can
+// form the slice data[pos+headerLen : pos+size].
+//
+// PoC: 8 bytes with size=4 — the fuzzer-discovered crash case.
+func TestExtractMalformedBoxSizeLessThanHeader(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input []byte
+	}{
+		{
+			// Fuzzer-discovered PoC: size=4 (< headerLen=8) followed by a type tag.
+			// findBox would compute data[pos+8 : pos+4] and panic.
+			name:  "size=4 less than standard header (8 bytes)",
+			input: []byte{0x00, 0x00, 0x00, 0x04, 't', 'e', 's', 't'},
+		},
+		{
+			// Extended-size box (size field == 1 triggers 16-byte header read),
+			// but the largesize field is set to 12 which is < headerLen=16.
+			// ISO 14496-12 §4.2: largesize must be >= 16.
+			name: "extended-size box with largesize=12 less than extended header (16 bytes)",
+			input: []byte{
+				0x00, 0x00, 0x00, 0x01, // size == 1 → extended-size form
+				't', 'e', 's', 't', // type
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, // largesize = 12
+			},
+		},
+		{
+			// size=1: the absolute minimum malformed case — only 1 byte declared.
+			name:  "size=1 single byte declared",
+			input: []byte{0x00, 0x00, 0x00, 0x01, 'm', 'e', 't', 'a'},
+		},
+		{
+			// size=0 is special (box extends to end-of-container) and is valid;
+			// include it to confirm the guard does not break the size==0 path.
+			name: "size=0 extends-to-end (valid, must not panic)",
+			input: func() []byte {
+				// Wrap a size=0 meta box inside a minimal ftyp header so Extract
+				// can reach findBox. A size=0 meta box with no payload is fine.
+				meta := []byte{
+					0x00, 0x00, 0x00, 0x00, // size=0: extends to end
+					'm', 'e', 't', 'a',
+				}
+				ftyp := make([]byte, 0, 16+len(meta))
+				ftyp = append(ftyp,
+					0x00, 0x00, 0x00, 0x10,
+					'f', 't', 'y', 'p',
+					'h', 'e', 'i', 'c',
+					0x00, 0x00, 0x00, 0x00,
+				)
+				return append(ftyp, meta...)
+			}(),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// Must not panic regardless of the malformed input.
+			rawEXIF, rawIPTC, rawXMP, _ := Extract(bytes.NewReader(tc.input))
+			// A malformed box must never produce metadata.
+			if rawEXIF != nil || rawIPTC != nil || rawXMP != nil {
+				t.Errorf("expected all nil for malformed box input, got exif=%v iptc=%v xmp=%v",
+					rawEXIF, rawIPTC, rawXMP)
+			}
+		})
+	}
+}

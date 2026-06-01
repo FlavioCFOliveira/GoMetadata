@@ -598,6 +598,82 @@ func TestInjectAddsNewXMPWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestExtractSmallSizeNoPanic is a regression test for CVE-class panic:
+// ISOBMFF boxes with size < headerLen must be rejected, not sliced.
+//
+// PoC byte sequence: \x00\x00\x00\x05moov — declares size=5, which is less
+// than the 8-byte minimum header, triggering a "slice bounds out of range
+// [8:5]" panic in findBox at data[pos+headerLen : pos+size].
+func TestExtractSmallSizeNoPanic(t *testing.T) {
+	t.Parallel()
+
+	t.Run("size less than header (findBox path)", func(t *testing.T) {
+		t.Parallel()
+		// size=5, type="moov": size < headerLen(8) → parseCR3BoxHeader must return ok=false.
+		input := []byte{0x00, 0x00, 0x00, 0x05, 'm', 'o', 'o', 'v'}
+		_, _, _, err := Extract(bytes.NewReader(input))
+		// Must not panic; must return an error (no valid moov found).
+		if err == nil {
+			t.Error("Extract: expected error for size<headerLen input, got nil")
+		}
+	})
+
+	t.Run("size exactly equals header (empty box, no content)", func(t *testing.T) {
+		t.Parallel()
+		// size=8, type="moov": valid header, zero-length content — no panic.
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint32(buf[0:], 8)
+		copy(buf[4:], "moov")
+		_, _, _, err := Extract(bytes.NewReader(buf))
+		// moov is found but has no sub-boxes → no CMT1 → nil rawEXIF, no panic.
+		if err != nil {
+			t.Errorf("Extract: unexpected error for size==headerLen: %v", err)
+		}
+	})
+
+	t.Run("uuid box size less than header+16 (findUUIDBox path)", func(t *testing.T) {
+		t.Parallel()
+		// Build a moov box containing a malformed uuid box whose declared size is
+		// headerLen(8)+10 — just enough to pass the size>=headerLen guard but not
+		// the size>=headerLen+16 guard, preventing the slice into UUID bytes.
+		uuidBoxSize := uint32(8 + 10) // 18 bytes: header(8) + 10 payload bytes (< 16 UUID)
+		inner := make([]byte, uuidBoxSize)
+		binary.BigEndian.PutUint32(inner[0:], uuidBoxSize)
+		copy(inner[4:], "uuid")
+		// Fill payload with canonical UUID prefix bytes (only 10, not 16).
+		copy(inner[8:], canonUUID[:10])
+
+		moovBox := buildBox("moov", inner)
+
+		var stream bytes.Buffer
+		stream.Write([]byte{0, 0, 0, 16, 'f', 't', 'y', 'p', 'c', 'r', 'x', ' ', 0, 0, 0, 0})
+		stream.Write(moovBox)
+
+		_, _, _, err := Extract(bytes.NewReader(stream.Bytes()))
+		// Must not panic; uuid box is skipped, fallback finds no CMT1 → nil rawEXIF is acceptable.
+		_ = err
+	})
+
+	t.Run("uuid box size less than headerLen+16 exact boundary", func(t *testing.T) {
+		t.Parallel()
+		// size = headerLen(8) + 15: one byte short of the 16-byte UUID — must not panic.
+		uuidBoxSize := uint32(8 + 15) // 23 bytes
+		inner := make([]byte, uuidBoxSize)
+		binary.BigEndian.PutUint32(inner[0:], uuidBoxSize)
+		copy(inner[4:], "uuid")
+		copy(inner[8:], canonUUID[:15])
+
+		moovBox := buildBox("moov", inner)
+
+		var stream bytes.Buffer
+		stream.Write([]byte{0, 0, 0, 16, 'f', 't', 'y', 'p', 'c', 'r', 'x', ' ', 0, 0, 0, 0})
+		stream.Write(moovBox)
+
+		// Must not panic.
+		_, _, _, _ = Extract(bytes.NewReader(stream.Bytes()))
+	})
+}
+
 func TestInjectUUIDBoxSizeUpdated(t *testing.T) {
 	t.Parallel()
 	exif := minimalTIFF()

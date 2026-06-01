@@ -150,18 +150,28 @@ func TestValidate(t *testing.T) {
 
 func TestSupportsWrite(t *testing.T) {
 	t.Parallel()
+
+	// SPIKE #6 / B2: TIFF-based formats are blocked until roadmap Option A
+	// (epic #33) is implemented. SupportsWrite must return false for them.
 	writable := []format.FormatID{
-		format.FormatJPEG, format.FormatTIFF, format.FormatPNG, format.FormatHEIF,
-		format.FormatWebP, format.FormatCR2, format.FormatCR3, format.FormatNEF,
-		format.FormatARW, format.FormatDNG, format.FormatORF, format.FormatRW2,
+		format.FormatJPEG, format.FormatPNG, format.FormatHEIF,
+		format.FormatWebP, format.FormatCR3, format.FormatAVIF,
 	}
 	for _, f := range writable {
 		if !format.SupportsWrite(f) {
 			t.Errorf("SupportsWrite(%v) = false, want true", f)
 		}
 	}
-	if format.SupportsWrite(format.FormatUnknown) {
-		t.Error("SupportsWrite(FormatUnknown) = true, want false")
+
+	notWritable := []format.FormatID{
+		format.FormatTIFF, format.FormatCR2, format.FormatNEF,
+		format.FormatARW, format.FormatDNG, format.FormatORF, format.FormatRW2,
+		format.FormatUnknown,
+	}
+	for _, f := range notWritable {
+		if format.SupportsWrite(f) {
+			t.Errorf("SupportsWrite(%v) = true, want false", f)
+		}
 	}
 }
 
@@ -785,6 +795,7 @@ func TestValidateNilXMPProperties(t *testing.T) {
 }
 
 // TestWriteNilIFD0 covers the Write guard for EXIF with nil IFD0.
+// Write delegates to m.Validate(), which returns ErrNilIFD0 for this condition.
 func TestWriteNilIFD0(t *testing.T) {
 	t.Parallel()
 	jpeg := buildMinimalJPEG(minimalTIFFPayload())
@@ -794,8 +805,9 @@ func TestWriteNilIFD0(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for nil IFD0 in Write, got nil")
 	}
-	if !errors.Is(err, ErrNilIFD0Write) {
-		t.Errorf("expected ErrNilIFD0Write, got %v", err)
+	// Write now delegates to Validate, which returns ErrNilIFD0.
+	if !errors.Is(err, ErrNilIFD0) {
+		t.Errorf("expected ErrNilIFD0, got %v", err)
 	}
 }
 
@@ -965,6 +977,219 @@ func TestEncodeMetadataRawPassthrough(t *testing.T) {
 	if !bytes.Equal(gotX, wantXMP) {
 		t.Errorf("rawXMP passthrough = %q, want %q", gotX, wantXMP)
 	}
+}
+
+// buildJPEGWithCorruptEXIF constructs a JPEG whose APP1 EXIF payload contains
+// valid-length but structurally corrupt TIFF bytes (wrong magic), so that
+// exif.Parse returns a CorruptMetadataError while the JPEG itself is valid.
+func buildJPEGWithCorruptEXIF() []byte {
+	// 8 bytes with 'II' byte-order mark but wrong TIFF magic (0x0000 instead of 0x002A).
+	corrupt := []byte{'I', 'I', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	return buildMinimalJPEG(corrupt)
+}
+
+// buildJPEGWithCorruptXMP constructs a JPEG whose APP1 XMP payload contains
+// 102 nested XML open tags without a <?xpacket…?> wrapper, which exceeds the
+// xmp parser's maximum nesting depth of 100 and causes xmp.Parse to return
+// xmp.ErrXMLNestingDepth (xmp/rdf.go: parseStartTag, p.depth > 100).
+func buildJPEGWithCorruptXMP() []byte {
+	var buf bytes.Buffer
+	buf.Write([]byte{0xFF, 0xD8}) // SOI
+
+	// APP1: XMP namespace URI prefix (stripped by the JPEG extractor) followed
+	// by 102 nested open elements — depth exceeds the parser's 100-level limit.
+	xmpNS := "http://ns.adobe.com/xap/1.0/\x00"
+	var xmlBuf bytes.Buffer
+	for i := range 102 {
+		fmt.Fprintf(&xmlBuf, "<a%d>", i)
+	}
+	payload := append([]byte(xmpNS), xmlBuf.Bytes()...)
+	length := uint16(len(payload) + 2) //nolint:gosec // G115: test helper, intentional type cast
+	buf.Write([]byte{0xFF, 0xE1})
+	var lb [2]byte
+	binary.BigEndian.PutUint16(lb[:], length)
+	buf.Write(lb[:])
+	buf.Write(payload)
+
+	// Minimal SOS + EOI.
+	buf.Write([]byte{0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9})
+	return buf.Bytes()
+}
+
+// TestStrictMode_EXIFCorrupt verifies that Strict() causes Read to return a
+// *ParseSegmentError identifying "EXIF" when the EXIF segment is present but
+// structurally corrupt.
+func TestStrictMode_EXIFCorrupt(t *testing.T) {
+	t.Parallel()
+	jpeg := buildJPEGWithCorruptEXIF()
+
+	_, err := Read(bytes.NewReader(jpeg), Strict())
+	if err == nil {
+		t.Fatal("Strict() + corrupt EXIF: expected error, got nil")
+	}
+	var pse *ParseSegmentError
+	if !errors.As(err, &pse) {
+		t.Fatalf("expected *ParseSegmentError, got %T: %v", err, err)
+	}
+	if pse.Segment != "EXIF" {
+		t.Errorf("ParseSegmentError.Segment = %q, want %q", pse.Segment, "EXIF")
+	}
+	if pse.Err == nil {
+		t.Error("ParseSegmentError.Err is nil, want non-nil underlying error")
+	}
+}
+
+// TestStrictMode_XMPCorrupt verifies that Strict() causes Read to return a
+// *ParseSegmentError identifying "XMP" when the XMP segment is present but
+// contains invalid XML.
+func TestStrictMode_XMPCorrupt(t *testing.T) {
+	t.Parallel()
+	jpeg := buildJPEGWithCorruptXMP()
+
+	_, err := Read(bytes.NewReader(jpeg), Strict())
+	if err == nil {
+		t.Fatal("Strict() + corrupt XMP: expected error, got nil")
+	}
+	var pse *ParseSegmentError
+	if !errors.As(err, &pse) {
+		t.Fatalf("expected *ParseSegmentError, got %T: %v", err, err)
+	}
+	if pse.Segment != "XMP" {
+		t.Errorf("ParseSegmentError.Segment = %q, want %q", pse.Segment, "XMP")
+	}
+	if pse.Err == nil {
+		t.Error("ParseSegmentError.Err is nil, want non-nil underlying error")
+	}
+}
+
+// TestBestEffort_CorruptEXIF verifies that without Strict() a corrupt EXIF
+// segment does not cause Read to return an error: the EXIF field is nil and
+// the failure is recorded in ParseWarnings instead.
+func TestBestEffort_CorruptEXIF(t *testing.T) {
+	t.Parallel()
+	jpeg := buildJPEGWithCorruptEXIF()
+
+	m, err := Read(bytes.NewReader(jpeg))
+	if err != nil {
+		t.Fatalf("best-effort + corrupt EXIF: unexpected error: %v", err)
+	}
+	if m.EXIF != nil {
+		t.Error("EXIF should be nil for a corrupt segment in best-effort mode")
+	}
+	if len(m.ParseWarnings) == 0 {
+		t.Fatal("ParseWarnings should be non-empty after a corrupt EXIF segment")
+	}
+	if m.ParseWarnings[0].Segment != "EXIF" {
+		t.Errorf("ParseWarnings[0].Segment = %q, want %q", m.ParseWarnings[0].Segment, "EXIF")
+	}
+	if m.ParseWarnings[0].Err == nil {
+		t.Error("ParseWarnings[0].Err is nil, want non-nil underlying error")
+	}
+}
+
+// TestBestEffort_CorruptXMP verifies that without Strict() a corrupt XMP
+// segment does not cause an error: XMP is nil and ParseWarnings records the
+// failure.
+func TestBestEffort_CorruptXMP(t *testing.T) {
+	t.Parallel()
+	jpeg := buildJPEGWithCorruptXMP()
+
+	m, err := Read(bytes.NewReader(jpeg))
+	if err != nil {
+		t.Fatalf("best-effort + corrupt XMP: unexpected error: %v", err)
+	}
+	if m.XMP != nil {
+		t.Error("XMP should be nil for a corrupt segment in best-effort mode")
+	}
+	if len(m.ParseWarnings) == 0 {
+		t.Fatal("ParseWarnings should be non-empty after a corrupt XMP segment")
+	}
+	if m.ParseWarnings[0].Segment != "XMP" {
+		t.Errorf("ParseWarnings[0].Segment = %q, want %q", m.ParseWarnings[0].Segment, "XMP")
+	}
+}
+
+// TestBestEffort_CleanParse verifies that ParseWarnings is nil (not an empty
+// slice) when all segments parse successfully — no noise for the common case.
+func TestBestEffort_CleanParse(t *testing.T) {
+	t.Parallel()
+	jpeg := buildMinimalJPEG(minimalTIFFPayload())
+
+	m, err := Read(bytes.NewReader(jpeg))
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if m.ParseWarnings != nil {
+		t.Errorf("ParseWarnings should be nil on clean parse, got %v", m.ParseWarnings)
+	}
+}
+
+// TestStrictOption_Config verifies that Strict() sets cfg.strict to true.
+func TestStrictOption_Config(t *testing.T) {
+	t.Parallel()
+	var c readConfig
+	Strict()(&c)
+	if !c.strict {
+		t.Error("Strict(): cfg.strict should be true")
+	}
+}
+
+// TestStrictMode_LazyTakesPrecedence verifies that a lazy option takes
+// precedence over Strict(): a lazy segment is never parsed so its absence
+// does not produce an error even when the raw bytes would be corrupt.
+func TestStrictMode_LazyTakesPrecedence(t *testing.T) {
+	t.Parallel()
+	jpeg := buildJPEGWithCorruptEXIF()
+
+	// WithoutEXIF + Strict: the EXIF segment is lazy, so it is skipped entirely
+	// and no parse error is returned despite the corrupt bytes.
+	m, err := Read(bytes.NewReader(jpeg), Strict(), WithoutEXIF())
+	if err != nil {
+		t.Fatalf("Strict() + WithoutEXIF() + corrupt EXIF: unexpected error: %v", err)
+	}
+	if m.EXIF != nil {
+		t.Error("EXIF should be nil when WithoutEXIF is set")
+	}
+	if len(m.ParseWarnings) != 0 {
+		t.Errorf("ParseWarnings should be empty when lazy takes precedence, got %v", m.ParseWarnings)
+	}
+}
+
+// TestParseSegmentError_ErrorString verifies that ParseSegmentError.Error()
+// includes both the segment name and the underlying error description.
+func TestParseSegmentError_ErrorString(t *testing.T) {
+	t.Parallel()
+	inner := errors.New("bad tiff magic")
+	pse := &ParseSegmentError{Segment: "EXIF", Err: inner}
+	msg := pse.Error()
+	if msg == "" {
+		t.Fatal("ParseSegmentError.Error() returned empty string")
+	}
+	if !contains(msg, "EXIF") {
+		t.Errorf("error message %q does not contain segment name %q", msg, "EXIF")
+	}
+	if !contains(msg, "bad tiff magic") {
+		t.Errorf("error message %q does not contain underlying error text", msg)
+	}
+	// Unwrap must return the inner error.
+	if !errors.Is(pse, inner) {
+		t.Error("errors.Is(pse, inner) = false; Unwrap not wired correctly")
+	}
+}
+
+// contains is a simple case-sensitive substring check used in test assertions
+// to avoid importing strings in the test file.
+func contains(s, sub string) bool {
+	return len(s) >= len(sub) && (s == sub || len(sub) == 0 || findSub(s, sub))
+}
+
+func findSub(s, sub string) bool {
+	for i := range len(s) - len(sub) + 1 {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
 }
 
 // BenchmarkReadFile_Concurrent runs ReadFile in parallel goroutines to expose

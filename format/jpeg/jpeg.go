@@ -39,9 +39,14 @@ var identExif = []byte("Exif\x00\x00") //nolint:gochecknoglobals // package-leve
 // Adobe XMP Specification Part 3 §1.1.3.
 var identXMP = []byte("http://ns.adobe.com/xap/1.0/\x00") //nolint:gochecknoglobals // package-level constant bytes
 
-// identXMPNote is the NUL-terminated namespace URI prefix for extended XMP
-// inside APP1. Adobe XMP Specification Part 3 §1.1.4.
-var identXMPNote = []byte("http://ns.adobe.com/xap/1.0/se/\x00") //nolint:gochecknoglobals // package-level constant bytes
+// identXMPNote is the NUL-terminated APP1 segment identifier for extended XMP
+// chunks. Adobe XMP Specification Part 3 §1.1.4.
+//
+// NOTE: this is the APP1 segment identifier ("http://ns.adobe.com/xmp/extension/\x00"),
+// which is distinct from the xmpNote namespace URI
+// ("http://ns.adobe.com/xap/1.0/se/Note/") used for the HasExtendedXMP property
+// inside the main XMP packet.  The two strings must never be confused.
+var identXMPNote = []byte("http://ns.adobe.com/xmp/extension/\x00") //nolint:gochecknoglobals // package-level constant bytes
 
 // identPS is the Photoshop 3.0 signature in APP13 (EXIF §4.5.6).
 var identPS = []byte("Photoshop 3.0\x00") //nolint:gochecknoglobals // package-level constant bytes
@@ -53,13 +58,65 @@ var identPS = []byte("Photoshop 3.0\x00") //nolint:gochecknoglobals // package-l
 // maxXMPPayload: max XMP packet bytes in a standard (non-extended) APP1.
 // maxExtChunkSize: max chunk data per extended XMP APP1 (Adobe XMP Spec Part 3 §1.1.4).
 //
-//	Extended APP1 layout: identXMPNote(32) + GUID(32) + fullLen(4) + offset(4) + chunk
-//	Overhead = 32 + 32 + 4 + 4 = 72 bytes → chunk data ≤ 65533 − 72 = 65461 bytes.
+//	Extended APP1 layout: identXMPNote(35) + GUID(32) + fullLen(4) + offset(4) + chunk
+//	Overhead = 35 + 32 + 4 + 4 = 75 bytes → chunk data ≤ 65533 − 75 = 65458 bytes.
 const (
 	maxAPP1Payload  = 65533               // 65535 − 2 (length field)
 	maxXMPPayload   = maxAPP1Payload - 29 // − len(identXMP)
-	maxExtChunkSize = maxAPP1Payload - 72 // − len(identXMPNote)+GUID+fullLen+offset overhead
+	maxExtChunkSize = maxAPP1Payload - 75 // − len(identXMPNote)+GUID+fullLen+offset overhead
 )
+
+// xmpWireMagic is the 8-byte magic that identifies an XMP wire-frame payload.
+//
+// A wire-frame payload is an internal encoding used when a JPEG carries
+// extended XMP (Adobe XMP Specification Part 3 §1.1.4). It carries the
+// ORIGINAL main XMP APP1 content and the ASSEMBLED extended XMP payload as a
+// single byte slice that can be passed through the rawXMP channel without
+// changing any public interface.
+//
+// Layout: [8-byte magic][4-byte mainLen BE][main bytes][ext bytes]
+//
+// The first byte 0x00 is not a valid start byte for any XMP packet (XMP
+// packets start with '<?xpacket' or whitespace followed by '<'), so the
+// magic is unambiguous in both directions.
+//
+// Wire frames are NEVER exposed to callers of the public API. RawXMP() always
+// returns the reassembled (user-visible) form.
+var xmpWireMagic = []byte("\x00XMPEXT\x00") //nolint:gochecknoglobals // package-level constant bytes
+
+// encodeXMPWire encodes the original main XMP packet and the assembled
+// extended XMP payload into a single wire-frame byte slice.
+// Returns nil if either main or ext is nil (no framing needed).
+func encodeXMPWire(main, ext []byte) []byte {
+	if main == nil || ext == nil {
+		return nil
+	}
+	mainLen := len(main)
+	total := len(xmpWireMagic) + 4 + mainLen + len(ext)
+	b := make([]byte, total)
+	n := copy(b, xmpWireMagic)
+	binary.BigEndian.PutUint32(b[n:], uint32(mainLen)) //nolint:gosec // G115: mainLen bounded by JPEG APP1 max (65533)
+	n += 4
+	n += copy(b[n:], main)
+	copy(b[n:], ext)
+	return b
+}
+
+// decodeXMPWire splits a wire-frame payload into the original main XMP packet
+// and the assembled extended XMP payload.
+// Returns (nil, nil, false) when raw does not begin with xmpWireMagic.
+func decodeXMPWire(raw []byte) (main, ext []byte, ok bool) {
+	magicLen := len(xmpWireMagic)
+	if len(raw) < magicLen+4 || !bytes.HasPrefix(raw, xmpWireMagic) {
+		return nil, nil, false
+	}
+	mainLen := int(binary.BigEndian.Uint32(raw[magicLen : magicLen+4]))
+	body := raw[magicLen+4:]
+	if mainLen > len(body) {
+		return nil, nil, false
+	}
+	return body[:mainLen], body[mainLen:], true
+}
 
 // extChunk holds one chunk of an extended XMP segment.
 // Adobe XMP Specification Part 3 §1.1.4.
@@ -76,8 +133,14 @@ func processAPP1Segment(data, rawEXIF, rawXMP []byte, extended map[string][]extC
 	switch {
 	case bytes.HasPrefix(data, identExif):
 		// EXIF payload begins after the 6-byte "Exif\x00\x00" header.
-		// Copy: data aliases scratch and must survive the next readSegment call.
-		rawEXIF = bytes.Clone(data[len(identExif):])
+		// TIFF §2: a valid TIFF stream requires at least 8 bytes (2-byte byte-order
+		// mark + 2-byte magic number + 4-byte IFD0 offset). A shorter residual is
+		// structurally corrupt and must not be returned as rawEXIF — callers rely on
+		// the invariant that rawEXIF is nil or >= 8 bytes.
+		if payload := data[len(identExif):]; len(payload) >= 8 {
+			// Copy: data aliases scratch and must survive the next readSegment call.
+			rawEXIF = bytes.Clone(payload)
+		}
 
 	case bytes.HasPrefix(data, identXMP):
 		// Copy: same reason as rawEXIF.
@@ -123,15 +186,45 @@ func processAPP13Segment(data []byte) []byte {
 	return bytes.Clone(irb)
 }
 
-// maybeReassembleXMP returns the reassembled XMP when extended chunks are
-// present, or rawXMP unchanged when there is nothing to merge.
-// Centralising this condition removes the duplicated &&-branch that would
-// otherwise appear at every early-return point in Extract.
-func maybeReassembleXMP(rawXMP []byte, extended map[string][]extChunk) []byte {
-	if rawXMP != nil && len(extended) > 0 {
-		return reassembleExtendedXMP(rawXMP, extended)
+// xmpResult bundles the two forms of XMP returned by scanMetadataSegmentsWithWire.
+// rawXMP is the user-visible reassembled form; rawXMPWire is the internal
+// wire-frame encoding (non-nil only when extended XMP was present).
+type xmpResult struct {
+	rawXMP     []byte // reassembled, user-visible
+	rawXMPWire []byte // wire-frame for lossless passthrough writes (may be nil)
+}
+
+// buildXMPResult constructs an xmpResult from the raw main packet and any
+// extended chunks collected during segment scanning.
+//
+// When extended is nil or empty: rawXMP = main, rawXMPWire = nil.
+// When extended chunks are present: rawXMP = reassembled(main, ext),
+// rawXMPWire = encodeXMPWire(main, assembledExt).
+func buildXMPResult(rawXMP []byte, extended map[string][]extChunk) xmpResult {
+	if rawXMP == nil || len(extended) == 0 {
+		return xmpResult{rawXMP: rawXMP}
 	}
-	return rawXMP
+
+	guid, found := extractGUIDFromMain(rawXMP)
+	if !found {
+		return xmpResult{rawXMP: rawXMP}
+	}
+	chunks, ok := extended[guid]
+	if !ok || len(chunks) == 0 {
+		return xmpResult{rawXMP: rawXMP}
+	}
+
+	extBytes := mergeExtendedChunks(chunks)
+
+	// Build wire-frame BEFORE modifying the extended chunks map, so that the
+	// original raw bytes are preserved verbatim for passthrough writes.
+	wire := encodeXMPWire(rawXMP, extBytes)
+
+	// Now reassemble the user-visible form.
+	extMap := map[string][]extChunk{guid: {{offset: 0, data: extBytes}}}
+	reassembled := reassembleExtendedXMP(rawXMP, extMap)
+
+	return xmpResult{rawXMP: reassembled, rawXMPWire: wire}
 }
 
 // readSOI reads and validates the 2-byte JPEG SOI marker from soi.
@@ -144,14 +237,17 @@ func readSOI(soi []byte) error {
 	return nil
 }
 
-// scanMetadataSegments reads the JPEG marker stream from r until SOS/EOI or
-// read failure, collecting EXIF, IPTC, XMP, and extended-XMP payloads.
-func scanMetadataSegments(r io.Reader, scratchPtr *[]byte) (rawEXIF, rawIPTC, rawXMP []byte) {
+// scanMetadataSegmentsWithWire reads the JPEG marker stream from r until
+// SOS/EOI or read failure, collecting EXIF, IPTC, XMP, and extended-XMP
+// payloads. It returns the reassembled XMP (for callers) and a wire-frame
+// encoding (for lossless passthrough writes when extended XMP is present).
+func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte) (rawEXIF, rawIPTC []byte, xmp xmpResult) {
 	// extended collects chunks from extended XMP APP1 segments, keyed by GUID.
 	// Adobe XMP Specification Part 3 §1.1.4.
 	// Lazily initialised: most JPEGs do not contain extended XMP, so we avoid
 	// the map allocation on the fast path.
 	var extended map[string][]extChunk
+	var mainXMP []byte
 
 	for {
 		marker, data, rerr := readSegment(r, scratchPtr)
@@ -163,18 +259,18 @@ func scanMetadataSegments(r io.Reader, scratchPtr *[]byte) (rawEXIF, rawIPTC, ra
 
 		switch marker {
 		case markerAPP1:
-			rawEXIF, rawXMP, extended = processAPP1Segment(data, rawEXIF, rawXMP, extended)
+			rawEXIF, mainXMP, extended = processAPP1Segment(data, rawEXIF, mainXMP, extended)
 		case markerAPP13:
 			if iptc := processAPP13Segment(data); iptc != nil {
 				rawIPTC = iptc
 			}
 		case markerSOS, markerEOI:
 			// SOS/EOI: no more metadata segments follow.
-			return rawEXIF, rawIPTC, maybeReassembleXMP(rawXMP, extended)
+			return rawEXIF, rawIPTC, buildXMPResult(mainXMP, extended)
 		}
 	}
 
-	return rawEXIF, rawIPTC, maybeReassembleXMP(rawXMP, extended)
+	return rawEXIF, rawIPTC, buildXMPResult(mainXMP, extended)
 }
 
 // Extract reads the JPEG marker stream from r and returns the raw payloads.
@@ -184,9 +280,39 @@ func scanMetadataSegments(r io.Reader, scratchPtr *[]byte) (rawEXIF, rawIPTC, ra
 //	resource block 0x0404 inside APP13 (nil if absent).
 //
 // rawXMP:  the full XMP packet bytes from the XMP APP1 (nil if absent).
+//
+//	When the JPEG carries extended XMP, rawXMP is the reassembled
+//	(merged) XMP document. Use ExtractWithWire for lossless passthrough.
 func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+	rawEXIF, rawIPTC, xmpRes, err := extractFull(r)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return rawEXIF, rawIPTC, xmpRes.rawXMP, nil
+}
+
+// ExtractWithWire reads the JPEG marker stream and returns raw payloads plus
+// an optional wire-frame encoding of the XMP segments.
+//
+// rawXMP is the user-visible reassembled XMP (identical to what Extract returns).
+// rawXMPWire is non-nil only when the JPEG contains extended XMP; it carries the
+// original main APP1 content and the assembled extended payload in an internal
+// framing that Inject can use to rewrite the segments byte-stably.
+//
+// Callers outside the format/jpeg package should use Extract unless they need
+// the wire-frame for passthrough writes.
+func ExtractWithWire(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP, rawXMPWire []byte, err error) {
+	rawEXIF, rawIPTC, xmpRes, err := extractFull(r)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return rawEXIF, rawIPTC, xmpRes.rawXMP, xmpRes.rawXMPWire, nil
+}
+
+// extractFull is the shared implementation of Extract and ExtractWithWire.
+func extractFull(r io.ReadSeeker) (rawEXIF, rawIPTC []byte, xmp xmpResult, err error) {
 	if _, err = r.Seek(0, io.SeekStart); err != nil {
-		return nil, nil, nil, fmt.Errorf("jpeg: seek: %w", err)
+		return nil, nil, xmpResult{}, fmt.Errorf("jpeg: seek: %w", err)
 	}
 
 	// Obtain a pooled scratch buffer first so the SOI read can reuse it,
@@ -198,14 +324,14 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	// Read and verify SOI using the pooled scratch buffer.
 	soi := (*scratchPtr)[:2]
 	if _, err = io.ReadFull(r, soi); err != nil {
-		return nil, nil, nil, fmt.Errorf("jpeg: read SOI: %w", err)
+		return nil, nil, xmpResult{}, fmt.Errorf("jpeg: read SOI: %w", err)
 	}
 	if err := readSOI(soi); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, xmpResult{}, err
 	}
 
-	rawEXIF, rawIPTC, rawXMP = scanMetadataSegments(r, scratchPtr)
-	return rawEXIF, rawIPTC, rawXMP, nil
+	rawEXIF, rawIPTC, xmp = scanMetadataSegmentsWithWire(r, scratchPtr)
+	return rawEXIF, rawIPTC, xmp, nil
 }
 
 // writeEXIFSegment writes the EXIF APP1 segment to w.
@@ -225,7 +351,20 @@ func writeEXIFSegment(w io.Writer, rawEXIF []byte) error {
 // writeXMPSegments writes a standard XMP APP1 when the payload fits within
 // maxXMPPayload, or falls back to the multi-segment extended-XMP path.
 // Adobe XMP Specification Part 3 §1.1.4.
+//
+// When rawXMP begins with xmpWireMagic (a wire-frame encoding), the function
+// decodes the original main XMP and the assembled extended payload and writes
+// them using the passthrough path — main as a standard APP1, extended as
+// re-chunked extended APP1 segments — preserving semantic content without
+// repackaging into a new random-GUID stub. This ensures that round-trip
+// writes of unmodified extended XMP are byte-stable (same reassembled content
+// before and after).
 func writeXMPSegments(w io.Writer, rawXMP []byte) error {
+	// Wire-frame passthrough: preserve original main+extended without regenerating GUID.
+	if main, ext, ok := decodeXMPWire(rawXMP); ok {
+		return writeXMPWirePassthrough(w, main, ext)
+	}
+
 	if len(rawXMP) <= maxXMPPayload {
 		// Fast path: XMP fits in a single APP1 segment.
 		xmpBuf := iobuf.Get(len(identXMP) + len(rawXMP))
@@ -237,6 +376,93 @@ func writeXMPSegments(w io.Writer, rawXMP []byte) error {
 	}
 	// Slow path: split into extended XMP segments.
 	return writeExtendedXMP(w, rawXMP)
+}
+
+// writeXMPWirePassthrough writes the original main XMP APP1 and the assembled
+// extended XMP payload as extended APP1 chunks, re-using the GUID embedded in
+// the main packet. This path is taken when rawXMP was not modified (wire-frame
+// passthrough from ExtractWithWire).
+//
+// The extended payload is re-chunked at maxExtChunkSize bytes per chunk
+// (deterministic, same as the original write path). Since the GUID is taken
+// from the main packet (not regenerated), and the extended bytes are
+// identical to what was extracted, the reassembled XMP produced by a
+// subsequent Extract call is guaranteed to equal the one produced from the
+// original file.
+func writeXMPWirePassthrough(w io.Writer, main, ext []byte) error {
+	// Write the original main XMP APP1 verbatim.
+	if err := writeRawXMPSegment(w, main); err != nil {
+		return err
+	}
+
+	// Re-chunk ext using the GUID from main. The GUID is already present in
+	// main, so readers will correctly locate the extended chunks.
+	guid, ok := extractGUIDFromMain(main)
+	if !ok || len(ext) == 0 {
+		// No extended payload (or malformed main); write just the main. This
+		// branch should not occur in practice for a well-formed wire-frame.
+		return nil
+	}
+	return writeExtendedChunks(w, []byte(guid), ext)
+}
+
+// writeRawXMPSegment writes the main XMP APP1 segment using the original main
+// packet bytes. Prepends identXMP and writes as a standard APP1.
+func writeRawXMPSegment(w io.Writer, main []byte) error {
+	totalLen := len(identXMP) + len(main)
+	if totalLen+2 > 65535 {
+		// Guard: a valid main packet is always < maxXMPPayload, so this cannot
+		// trigger for well-formed wire frames.
+		return fmt.Errorf("jpeg: XMP wire passthrough: main packet (%d bytes) exceeds APP1 limit: %w",
+			len(main), ErrXMPStubTooLarge)
+	}
+	xmpBuf := iobuf.Get(totalLen)
+	copy(*xmpBuf, identXMP)
+	copy((*xmpBuf)[len(identXMP):], main)
+	err := writeSegment(w, markerAPP1, *xmpBuf)
+	iobuf.Put(xmpBuf)
+	return err
+}
+
+// writeExtendedChunks splits ext into extended APP1 chunks and writes them.
+// guid must be exactly 32 ASCII hex characters (per Adobe XMP Spec Part 3 §1.1.4).
+func writeExtendedChunks(w io.Writer, guidBytes, ext []byte) error {
+	fullLen := uint32(len(ext)) //nolint:gosec // G115: XMP payload size bounded by input
+	offset := uint32(0)
+
+	// Pre-allocate the fixed-size extended APP1 header once.
+	// Header = identXMPNote(35) + GUID(32) + fullLen(4) + offset(4) = 75 bytes.
+	const extHdrSize = 75
+	for offset < fullLen {
+		chunkEnd := offset + uint32(maxExtChunkSize) // min builtin shadowed by test-only helper in fuzz_test.go; cannot use min here
+		if chunkEnd > fullLen {
+			chunkEnd = fullLen
+		}
+		chunk := ext[offset:chunkEnd]
+
+		extBuf := iobuf.Get(extHdrSize + len(chunk))
+		b := *extBuf
+
+		// identXMPNote (35 bytes: "http://ns.adobe.com/xmp/extension/\x00")
+		copy(b, identXMPNote)
+		// GUID (32 bytes) immediately after identifier
+		copy(b[len(identXMPNote):], guidBytes)
+		// fullLength (4 bytes BE) at offset 67 = 35 + 32
+		binary.BigEndian.PutUint32(b[67:71], fullLen)
+		// offset (4 bytes BE) at offset 71 = 35 + 32 + 4
+		binary.BigEndian.PutUint32(b[71:75], offset)
+		// chunk data starts at offset 75 = 35 + 32 + 4 + 4
+		copy(b[75:], chunk)
+
+		writeErr := writeSegment(w, markerAPP1, b)
+		iobuf.Put(extBuf)
+		if writeErr != nil {
+			return writeErr
+		}
+
+		offset = chunkEnd
+	}
+	return nil
 }
 
 // writeIPTCSegment wraps the IPTC IIM stream in a Photoshop IRB block and
@@ -356,6 +582,10 @@ func copyNonMetadataSegments(r io.Reader, w io.Writer, scratch *[]byte) error {
 // segments with the provided payloads, and writes the result to w.
 // A nil payload means the corresponding segment is removed.
 // The SOS segment and compressed image data are passed through unchanged.
+//
+// rawXMP may be a wire-frame payload (produced by ExtractWithWire) when the
+// XMP was not modified; in that case the original main and extended APP1
+// segments are reproduced byte-stably without regenerating the GUID.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("jpeg: seek: %w", err)
@@ -443,47 +673,7 @@ func writeExtendedXMP(w io.Writer, rawXMP []byte) error {
 	}
 
 	// Step 4: split rawXMP into extended APP1 chunks.
-	// Extended APP1 layout (Adobe XMP Spec Part 3 §1.1.4):
-	//   identXMPNote (32 bytes) | GUID (32 bytes) | fullLength (4 bytes BE) |
-	//   offset (4 bytes BE) | chunk data
-	fullLen := uint32(len(rawXMP)) //nolint:gosec // G115: XMP payload size bounded by input
-	offset := uint32(0)
-	guidBytes := []byte(guid) // 32 ASCII bytes
-
-	// Pre-allocate the fixed-size extended APP1 header once.
-	// Header = identXMPNote(32) + GUID(32) + fullLen(4) + offset(4) = 72 bytes.
-	const extHdrSize = 72
-	for offset < fullLen {
-		chunkEnd := offset + uint32(maxExtChunkSize) // min builtin shadowed by test-only helper in fuzz_test.go; cannot use min here
-		if chunkEnd > fullLen {
-			chunkEnd = fullLen
-		}
-		chunk := rawXMP[offset:chunkEnd]
-
-		extBuf := iobuf.Get(extHdrSize + len(chunk))
-		b := *extBuf
-
-		// identXMPNote
-		copy(b, identXMPNote)
-		// GUID
-		copy(b[len(identXMPNote):], guidBytes)
-		// fullLength (4 bytes BE)
-		binary.BigEndian.PutUint32(b[64:68], fullLen)
-		// offset (4 bytes BE)
-		binary.BigEndian.PutUint32(b[68:72], offset)
-		// chunk data
-		copy(b[72:], chunk)
-
-		writeErr = writeSegment(w, markerAPP1, b)
-		iobuf.Put(extBuf)
-		if writeErr != nil {
-			return writeErr
-		}
-
-		offset = chunkEnd
-	}
-
-	return nil
+	return writeExtendedChunks(w, []byte(guid), rawXMP)
 }
 
 // skipPascalString advances pos past a Pascal-string name field in a

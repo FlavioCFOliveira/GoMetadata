@@ -18,7 +18,19 @@ var xmlPIEnd = []byte("?>") //nolint:gochecknoglobals // immutable sentinel; avo
 // Scan locates the XMP packet boundaries within b and returns the slice that
 // spans from the opening <?xpacket begin=…?> to the closing <?xpacket end=…?>.
 // Returns nil if no packet is found.
+//
+// XMP Part 1 §7.2: XMP packets may be serialised as UTF-8, UTF-16, or UTF-32.
+// Scan detects a leading BOM and transcodes non-UTF-8 input to UTF-8 before
+// searching for the packet markers.  The UTF-8 fast path (no BOM) is unchanged.
 func Scan(b []byte) []byte {
+	// Normalise to UTF-8 so that marker searches always operate on single-byte
+	// characters regardless of the source encoding.
+	// normaliseToUTF8 returns b unchanged when no BOM is detected (zero-copy).
+	b = normaliseToUTF8(b)
+	if b == nil {
+		return nil
+	}
+
 	start := bytes.Index(b, packetHeader)
 	if start < 0 {
 		return nil
