@@ -202,6 +202,24 @@ func rebuildUUIDContent(uuidContent, rawEXIF, rawXMP []byte) (newContent []byte,
 // Inject writes a modified CR3 stream to w by rebuilding the Canon UUID box
 // with updated CMT1 (EXIF) and XMP  payloads. All other boxes are preserved
 // unchanged. Box sizes in the parent chain (UUID → moov → file) are updated.
+//
+// Safety: CR3 is ISOBMFF-based, not TIFF-based. Image data lives in a
+// top-level mdat box that is entirely outside moov and is never touched by
+// this function (written verbatim as data[moovEnd:]). EXIF IFD offsets inside
+// CMT1 are relative to the start of the CMT1 payload; exif.Encode produces a
+// self-contained TIFF stream where all internal offsets are correct. Unlike the
+// TIFF-based formats (CR2, NEF, ARW, DNG, ORF, RW2), there is no
+// StripOffsets/TileOffsets relocation problem here, so gometadata.Write does
+// NOT gate CR3 behind ErrWriteNotSupported.
+//
+// Note: if the source file uses the two-box CMT1+CMT2 split layout (ExifIFD
+// pointer in CMT1 points beyond len(CMT1) into CMT2), injecting a re-encoded
+// rawEXIF replaces CMT1 with a self-contained TIFF stream. The original CMT2
+// box is copied unchanged into the output UUID content as dead bytes (no
+// pointer addresses it). This is harmless but slightly inflates file size.
+// The orphaned CMT2 can be removed by the caller if desired by passing the
+// merged EXIF payload (as returned by Extract) through exif.Parse + exif.Encode
+// before calling Inject.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("cr3: seek: %w", err)

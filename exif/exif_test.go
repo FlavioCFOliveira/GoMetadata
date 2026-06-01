@@ -2968,6 +2968,215 @@ func TestSetGPSVersionIDRoundTrip(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// #39 — writeIFD inline-value determinism
+// ---------------------------------------------------------------------------
+
+// TestWriteIFDInlineDeterminism is the regression test for issue #39.
+//
+// Before the fix, the iobuf pool buffer used as scratch space in writeIFD was
+// not zeroed before use.  Inline values shorter than 4 bytes (e.g. TypeShort
+// with count=1 occupies 2 bytes) left the upper padding bytes of the 4-byte
+// value-or-offset field containing stale data from a previous encode call.
+// This caused two successive Encode calls on the same EXIF to produce different
+// output bytes when the pooled buffer happened to carry residual data.
+//
+// The test exercises this by encoding an EXIF that contains short inline values,
+// then verifying that two consecutive calls to Encode produce byte-identical output.
+// It also confirms the encoded form decodes back correctly.
+func TestWriteIFDInlineDeterminism(t *testing.T) {
+	t.Parallel()
+
+	order := binary.LittleEndian
+
+	// Build an EXIF with a mix of inline value sizes:
+	//   - TagOrientation  (TypeShort, 1 value = 2 bytes inline)  → 2 padding bytes
+	//   - TagResolutionUnit (TypeShort, 1 value = 2 bytes)       → 2 padding bytes
+	//   - TagImageWidth   (TypeLong,  1 value = 4 bytes)         → 0 padding bytes
+	// Any stale bytes in the 2-byte padding slots will surface as a mismatch.
+	e := &EXIF{
+		ByteOrder: order,
+		IFD0: &IFD{Entries: []IFDEntry{
+			{Tag: TagOrientation, Type: TypeShort, Count: 1, Value: []byte{0x01, 0x00}, byteOrder: order},
+			{Tag: TagResolutionUnit, Type: TypeShort, Count: 1, Value: []byte{0x02, 0x00}, byteOrder: order},
+			{Tag: TagImageWidth, Type: TypeLong, Count: 1, Value: []byte{0x80, 0x07, 0x00, 0x00}, byteOrder: order},
+		}},
+	}
+
+	enc1, err := Encode(e)
+	if err != nil {
+		t.Fatalf("Encode (first): %v", err)
+	}
+	enc2, err := Encode(e)
+	if err != nil {
+		t.Fatalf("Encode (second): %v", err)
+	}
+
+	if !bytes.Equal(enc1, enc2) {
+		t.Errorf("two consecutive Encode calls produced different output:\n  enc1: %x\n  enc2: %x", enc1, enc2)
+	}
+
+	// Verify round-trip correctness.
+	e2, err := Parse(enc1)
+	if err != nil {
+		t.Fatalf("Parse after Encode: %v", err)
+	}
+	if got, ok := e2.Orientation(); !ok || got != 1 {
+		t.Errorf("Orientation after round-trip = (%d, %v), want (1, true)", got, ok)
+	}
+	if e2.IFD0.Get(TagImageWidth) == nil {
+		t.Error("TagImageWidth missing after round-trip")
+	}
+}
+
+// TestWriteIFDInlineDeterminismPoolContamination verifies determinism even
+// when the iobuf pool may hold buffers with non-zero content.
+// It pre-contaminates the pool by encoding a DIFFERENT EXIF with distinct
+// inline values first, then checks that a subsequent encode of the target
+// EXIF is still deterministic — i.e., the contaminating data does not appear
+// in the final output.
+func TestWriteIFDInlineDeterminismPoolContamination(t *testing.T) {
+	t.Parallel()
+
+	order := binary.LittleEndian
+
+	// "Poison" encode: set all inline bytes to 0xFF by encoding an EXIF whose
+	// SHORT values are 0xFFFF.  This maximally contaminates the pool buffer.
+	poison := &EXIF{
+		ByteOrder: order,
+		IFD0: &IFD{Entries: []IFDEntry{
+			{Tag: TagOrientation, Type: TypeShort, Count: 1, Value: []byte{0xFF, 0xFF}, byteOrder: order},
+			{Tag: TagResolutionUnit, Type: TypeShort, Count: 1, Value: []byte{0xFF, 0xFF}, byteOrder: order},
+		}},
+	}
+	if _, err := Encode(poison); err != nil {
+		t.Fatalf("poison Encode: %v", err)
+	}
+
+	// Now encode the real EXIF.  If the pool buffer is not cleared, the padding
+	// bytes (positions [p+10:p+12] for a SHORT) would still be 0xFF from the
+	// poison encode.
+	target := &EXIF{
+		ByteOrder: order,
+		IFD0: &IFD{Entries: []IFDEntry{
+			{Tag: TagOrientation, Type: TypeShort, Count: 1, Value: []byte{0x01, 0x00}, byteOrder: order},
+			{Tag: TagResolutionUnit, Type: TypeShort, Count: 1, Value: []byte{0x02, 0x00}, byteOrder: order},
+		}},
+	}
+
+	enc1, err := Encode(target)
+	if err != nil {
+		t.Fatalf("Encode (enc1): %v", err)
+	}
+	enc2, err := Encode(target)
+	if err != nil {
+		t.Fatalf("Encode (enc2): %v", err)
+	}
+	if !bytes.Equal(enc1, enc2) {
+		t.Errorf("Encode non-deterministic after pool contamination:\n  enc1: %x\n  enc2: %x", enc1, enc2)
+	}
+
+	// Also verify the padding bytes in the encoded output are all zero.
+	// Each IFD entry is 12 bytes: [tag(2)][type(2)][count(4)][value(4)].
+	// For a TypeShort/count=1, value occupies bytes [8:10] of each 12-byte entry;
+	// bytes [10:12] must be 0x00 (the zero padding).
+	// The IFD entry area begins at offset 10 (after 8-byte header + 2-byte count).
+	const (
+		headerSize = 8
+		countSize  = 2
+		entrySize  = 12
+	)
+	entryBase := headerSize + countSize
+	for i := range 2 {
+		padOff := entryBase + i*entrySize + 10 // bytes [10:12] of entry
+		if enc1[padOff] != 0x00 || enc1[padOff+1] != 0x00 {
+			t.Errorf("entry[%d] padding bytes = [0x%02X 0x%02X], want [0x00 0x00]",
+				i, enc1[padOff], enc1[padOff+1])
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #35b — MakerNoteOffset populated on Parse
+// ---------------------------------------------------------------------------
+
+// TestMakerNoteOffsetPopulated is the regression test for issue #35b.
+// It verifies that Parse populates EXIF.MakerNoteOffset with the correct
+// TIFF-relative byte offset of the MakerNote value in the parsed buffer.
+func TestMakerNoteOffsetPopulated(t *testing.T) {
+	t.Parallel()
+	order := binary.LittleEndian
+
+	// Build a minimal TIFF with ExifIFD containing a TagMakerNote entry.
+	// Layout:
+	//   [0..7]   TIFF header
+	//   [8..25]  IFD0 (1 entry: ExifIFDPointer, next=0)
+	//   [26..43] ExifIFD (1 entry: MakerNote value at mnOffset, next=0)
+	//   [44..]   MakerNote payload
+	const (
+		hdrSize   = 8
+		ifd0Off   = hdrSize
+		ifd0Size  = 2 + 1*12 + 4 // count(2) + 1 entry(12) + next(4) = 18
+		exifOff   = ifd0Off + ifd0Size
+		exifSize  = 2 + 1*12 + 4
+		mnDataOff = exifOff + exifSize // expected MakerNoteOffset
+	)
+
+	makerNotePayload := []byte("FAKEMAKERNOTE\x00\x01\x02\x03\x04\x05\x06\x07")
+	buf := make([]byte, mnDataOff+len(makerNotePayload))
+
+	// TIFF header.
+	buf[0], buf[1] = 'I', 'I'
+	order.PutUint16(buf[2:], 0x002A)
+	order.PutUint32(buf[4:], ifd0Off)
+
+	// IFD0: ExifIFDPointer → exifOff, next=0.
+	order.PutUint16(buf[ifd0Off:], 1)
+	order.PutUint16(buf[ifd0Off+2:], uint16(TagExifIFDPointer))
+	order.PutUint16(buf[ifd0Off+4:], uint16(TypeLong))
+	order.PutUint32(buf[ifd0Off+6:], 1)
+	order.PutUint32(buf[ifd0Off+10:], exifOff)
+	order.PutUint32(buf[ifd0Off+14:], 0)
+
+	// ExifIFD: MakerNote (TypeUndefined, value at mnDataOff), next=0.
+	order.PutUint16(buf[exifOff:], 1)
+	order.PutUint16(buf[exifOff+2:], uint16(TagMakerNote))
+	order.PutUint16(buf[exifOff+4:], uint16(TypeUndefined))
+	order.PutUint32(buf[exifOff+6:], uint32(len(makerNotePayload))) //nolint:gosec // G115: test helper
+	order.PutUint32(buf[exifOff+10:], mnDataOff)
+	order.PutUint32(buf[exifOff+14:], 0)
+
+	// MakerNote payload.
+	copy(buf[mnDataOff:], makerNotePayload)
+
+	e, err := Parse(buf)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if e.MakerNote == nil {
+		t.Fatal("MakerNote is nil after Parse")
+	}
+	if e.MakerNoteOffset != mnDataOff {
+		t.Errorf("MakerNoteOffset = %d, want %d", e.MakerNoteOffset, mnDataOff)
+	}
+}
+
+// TestMakerNoteOffsetZeroWhenAbsent verifies that EXIF.MakerNoteOffset is 0
+// when no MakerNote is present in the parsed input.
+func TestMakerNoteOffsetZeroWhenAbsent(t *testing.T) {
+	t.Parallel()
+	data := minimalTIFF(binary.LittleEndian, [][4]uint32{
+		{uint32(TagImageWidth), uint32(TypeLong), 1, 100},
+	})
+	e, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if e.MakerNoteOffset != 0 {
+		t.Errorf("MakerNoteOffset = %d, want 0 (no MakerNote)", e.MakerNoteOffset)
+	}
+}
+
 // TestThumbnailZeroLength verifies that an IFD1 with JPEGInterchangeFormatLength=0
 // does not populate ThumbnailData and does not panic on Encode.
 func TestThumbnailZeroLength(t *testing.T) {

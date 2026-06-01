@@ -47,6 +47,11 @@ type IFDEntry struct {
 	// the original buffer (zero-copy).
 	Value     []byte
 	byteOrder binary.ByteOrder
+	// rawOffset is the TIFF-stream offset stored in the 4-byte value-or-offset
+	// field when the value is out-of-line (totalSize > 4).  Zero for inline
+	// values.  Used by parseExifSubIFDs to record MakerNoteOffset without
+	// resorting to unsafe pointer arithmetic.
+	rawOffset uint32
 }
 
 // parseIFDEntry decodes a single 12-byte IFD entry starting at byte offset e
@@ -89,6 +94,14 @@ func parseIFDEntry(b []byte, e int, order binary.ByteOrder) (IFDEntry, bool) {
 			return IFDEntry{}, false
 		}
 		value = b[valOff:end]
+		return IFDEntry{
+			Tag:       tag,
+			Type:      typ,
+			Count:     cnt,
+			Value:     value,
+			byteOrder: order,
+			rawOffset: valOff, // TIFF §2: offset to value data; used by MakerNoteOffset
+		}, true
 	default:
 		// Value is inline, left-justified in the 4-byte field (TIFF §2).
 		value = b[e+8 : e+8+int(totalSize)]
@@ -505,6 +518,14 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 
 	scratchPtr := iobuf.Get(n * 12)
 	entryBuf := (*scratchPtr)[:n*12]
+	// Zero the scratch buffer before writing: pooled slices may contain stale
+	// bytes from a prior encode call.  Without this, inline values shorter than
+	// 4 bytes (e.g. TypeShort, TypeByte) leave the unused padding bytes
+	// non-deterministic, leaking data across encode calls and producing
+	// non-reproducible output.  clear() compiles to a single memclr — no hot-path
+	// cost on the fast path.  TIFF §2: the value-or-offset field is always 4
+	// bytes; unused bytes must be zero-filled.
+	clear(entryBuf)
 	defer iobuf.Put(scratchPtr)
 	var valueArea []byte
 	curOff := valueOff

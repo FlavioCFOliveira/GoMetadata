@@ -22,3 +22,13 @@ var ErrInvalidMarkerLength = errors.New("jpeg: marker has invalid length")
 
 // ErrSegmentTooLarge is returned when a segment payload would exceed the 65535-byte APP segment limit.
 var ErrSegmentTooLarge = errors.New("jpeg: segment payload exceeds APP segment limit")
+
+// ErrExtendedXMPTruncated is returned (or signalled via the truncated flag) when
+// the total accumulated size of extended XMP chunks for a single GUID exceeds
+// maxExtendedXMPTotal. The assembled payload is truncated at the cap.
+var ErrExtendedXMPTruncated = errors.New("jpeg: extended XMP payload exceeds size limit and was truncated")
+
+// ErrIRBDataSizeTooLarge is returned by parseIRBEntry when a 4-byte data-size
+// field in a Photoshop IRB entry names a value that cannot be safely represented
+// as a Go int on the current platform, or that would exceed the containing buffer.
+var ErrIRBDataSizeTooLarge = errors.New("jpeg: IRB entry data size exceeds buffer")

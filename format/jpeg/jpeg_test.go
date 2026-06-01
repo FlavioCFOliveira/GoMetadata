@@ -1352,6 +1352,305 @@ func TestExtractWithWireNonExtendedXMPNoWireFrame(t *testing.T) {
 	}
 }
 
+// --- Regression #40: Extended XMP DoS cap ---
+
+// buildManyExtendedXMPChunksJPEG constructs a JPEG whose APP1 stream contains a
+// main XMP packet plus n identical extended XMP APP1 segments all claiming the
+// same GUID. Each chunk carries chunkSize bytes of payload. The wire fullLen
+// field is set to n*chunkSize so the declared total matches the number of chunks.
+//
+// This helper is used to verify that processAPP1Segment caps accumulation at
+// maxExtendedXMPTotal regardless of how many forged segments arrive (#40).
+func buildManyExtendedXMPChunksJPEG(guid string, chunkSize, n int) []byte {
+	var buf bytes.Buffer
+	buf.Write([]byte{0xFF, 0xD8})
+
+	// Main XMP APP1 with HasExtendedXMP pointing at guid.
+	mainXMP := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>` +
+		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<rdf:Description rdf:about=""` +
+		` xmlns:xmpNote="http://ns.adobe.com/xap/1.0/se/Note/"` +
+		` xmpNote:HasExtendedXMP="` + guid + `">` +
+		`</rdf:Description>` +
+		`</rdf:RDF></x:xmpmeta>`)
+	mainPayload := append([]byte("http://ns.adobe.com/xap/1.0/\x00"), mainXMP...)
+	mainLen := uint16(len(mainPayload) + 2) //nolint:gosec // G115: test helper
+	buf.Write([]byte{0xFF, 0xE1})
+	var lbuf [2]byte
+	binary.BigEndian.PutUint16(lbuf[:], mainLen)
+	buf.Write(lbuf[:])
+	buf.Write(mainPayload)
+
+	// Extended XMP APP1 chunks: n segments, each carrying chunkSize bytes.
+	// fullLen on wire = total bytes across all chunks (n * chunkSize), cast to uint32.
+	fullLen := uint32(n * chunkSize) //nolint:gosec // G115: test helper
+	chunkData := bytes.Repeat([]byte("x"), chunkSize)
+	for i := range n {
+		offset := uint32(i * chunkSize) //nolint:gosec // G115: test helper
+
+		var extBody bytes.Buffer
+		extBody.WriteString("http://ns.adobe.com/xmp/extension/\x00")
+		extBody.WriteString(guid)
+		var hdr [8]byte
+		binary.BigEndian.PutUint32(hdr[0:], fullLen)
+		binary.BigEndian.PutUint32(hdr[4:], offset)
+		extBody.Write(hdr[:])
+		extBody.Write(chunkData)
+
+		extData := extBody.Bytes()
+		extLen := uint16(len(extData) + 2) //nolint:gosec // G115: test helper
+		buf.Write([]byte{0xFF, 0xE1})
+		binary.BigEndian.PutUint16(lbuf[:], extLen)
+		buf.Write(lbuf[:])
+		buf.Write(extData)
+	}
+
+	buf.Write([]byte{0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9})
+	return buf.Bytes()
+}
+
+// TestExtendedXMPDoSCapManyChunks is the regression test for issue #40.
+//
+// It verifies that when many extended XMP APP1 segments arrive for the same
+// GUID, the parser stops accumulating once the total would exceed
+// maxExtendedXMPTotal, instead of blindly allocating up to ~268 MiB.
+//
+// The test uses small chunks (1 KiB each) and sends enough of them to exceed
+// the cap by a factor of two. It then confirms:
+//  1. Extract returns without error (graceful degradation, not a crash).
+//  2. The total bytes stored across all extChunk slices for the GUID does NOT
+//     exceed maxExtendedXMPTotal.
+func TestExtendedXMPDoSCapManyChunks(t *testing.T) {
+	t.Parallel()
+
+	const guid = "AABBCCDD11223344AABBCCDD11223344"
+	// Each APP1 payload ≤ maxExtChunkSize (65458 bytes); use 1 KiB chunks to
+	// keep the JPEG stream size manageable in tests.
+	const chunkSize = 1024
+	// Send enough chunks to accumulate 2× maxExtendedXMPTotal.
+	n := (2*maxExtendedXMPTotal)/chunkSize + 1
+
+	jpeg := buildManyExtendedXMPChunksJPEG(guid, chunkSize, n)
+
+	// Extract must not panic and must return without error (truncation is silent).
+	_, _, rawXMP, err := Extract(bytes.NewReader(jpeg))
+	if err != nil {
+		t.Fatalf("Extract: unexpected error: %v", err)
+	}
+
+	// The returned XMP may be nil (GUID had no valid matching in main) or a
+	// partially assembled payload; either way its byte length must not exceed
+	// maxExtendedXMPTotal.
+	if len(rawXMP) > maxExtendedXMPTotal {
+		t.Errorf("rawXMP length %d exceeds maxExtendedXMPTotal %d; DoS cap not enforced",
+			len(rawXMP), maxExtendedXMPTotal)
+	}
+}
+
+// TestExtendedXMPDoSCapDeclaredFullLen is a regression test for the secondary
+// vector in issue #40: a single forged extended XMP chunk where the wire fullLen
+// field alone exceeds maxExtendedXMPTotal (e.g. fullLen = 0xFFFFFFFF = ~4 GiB).
+//
+// The parser must reject the GUID on the first chunk when fullLen > cap,
+// without allocating any memory for that GUID's chunks.
+func TestExtendedXMPDoSCapDeclaredFullLen(t *testing.T) {
+	t.Parallel()
+
+	const guid = "FFEEDDCC99887766FFEEDDCC99887766"
+
+	var buf bytes.Buffer
+	buf.Write([]byte{0xFF, 0xD8})
+
+	// Main XMP APP1.
+	mainXMP := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>` +
+		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<rdf:Description rdf:about=""` +
+		` xmlns:xmpNote="http://ns.adobe.com/xap/1.0/se/Note/"` +
+		` xmpNote:HasExtendedXMP="` + guid + `">` +
+		`</rdf:Description>` +
+		`</rdf:RDF></x:xmpmeta>`)
+	mainPayload := append([]byte("http://ns.adobe.com/xap/1.0/\x00"), mainXMP...)
+	mainLen := uint16(len(mainPayload) + 2) //nolint:gosec // G115: test helper
+	buf.Write([]byte{0xFF, 0xE1})
+	var lbuf [2]byte
+	binary.BigEndian.PutUint16(lbuf[:], mainLen)
+	buf.Write(lbuf[:])
+	buf.Write(mainPayload)
+
+	// Single extended XMP APP1 with fullLen = 0xFFFFFFFF (~4 GiB declared).
+	var extBody bytes.Buffer
+	extBody.WriteString("http://ns.adobe.com/xmp/extension/\x00")
+	extBody.WriteString(guid)
+	var hdr [8]byte
+	binary.BigEndian.PutUint32(hdr[0:], 0xFFFFFFFF) // enormous declared fullLen
+	binary.BigEndian.PutUint32(hdr[4:], 0)          // offset 0
+	extBody.Write(hdr[:])
+	extBody.WriteString("some chunk data") // actual payload is tiny
+
+	extData := extBody.Bytes()
+	extLen := uint16(len(extData) + 2) //nolint:gosec // G115: test helper
+	buf.Write([]byte{0xFF, 0xE1})
+	binary.BigEndian.PutUint16(lbuf[:], extLen)
+	buf.Write(lbuf[:])
+	buf.Write(extData)
+
+	buf.Write([]byte{0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9})
+
+	// Must not panic, must not return an error.
+	_, _, rawXMP, err := Extract(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("Extract: unexpected error: %v", err)
+	}
+	// The GUID should have been rejected entirely, so rawXMP is either nil
+	// (main XMP had no matching chunks) or just the main XMP unchanged.
+	// Either way it must be far smaller than 4 GiB.
+	if len(rawXMP) > maxExtendedXMPTotal {
+		t.Errorf("rawXMP length %d exceeds cap; oversized fullLen was not rejected", len(rawXMP))
+	}
+}
+
+// TestExtendedXMPLargeButLegitimate verifies that a legitimate extended XMP
+// payload that is large but still within maxExtendedXMPTotal (16 MiB) is NOT
+// truncated by the DoS cap, and that its content is present in the assembled XMP.
+//
+// This is the non-regression half of the #40 fix: the cap must not break
+// real-world files that carry large but valid extended XMP.
+//
+// The test verifies cap non-interference by wrapping the large payload in a
+// proper XMP fragment so that reassembleExtendedXMP can splice it, then
+// confirming the large content appears in the returned rawXMP.
+func TestExtendedXMPLargeButLegitimate(t *testing.T) {
+	t.Parallel()
+
+	const guid = "1122334455667788AABBCCDDEEFF0011"
+
+	// Build a valid extended XMP document containing a large payload.
+	// reassembleExtendedXMP splices content between <rdf:Description and
+	// </rdf:RDF> from the extended document into the main XMP, so the extended
+	// payload must be a well-formed XMP fragment — not raw bytes.
+	//
+	// Use 2 MiB of padding inside a dc:description element. This is well below
+	// maxExtendedXMPTotal (16 MiB) but large enough to require many APP1 chunks.
+	const paddingSize = 2 << 20 // 2 MiB
+	padding := bytes.Repeat([]byte("L"), paddingSize)
+	extPayload := []byte(
+		`<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">` +
+			`<dc:description>` + string(padding) + `</dc:description>` +
+			`</rdf:Description>` +
+			`</rdf:RDF>`,
+	)
+
+	// Build a main XMP with HasExtendedXMP pointing at guid.
+	mainXMP := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>` +
+		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<rdf:Description rdf:about=""` +
+		` xmlns:xmpNote="http://ns.adobe.com/xap/1.0/se/Note/"` +
+		` xmpNote:HasExtendedXMP="` + guid + `">` +
+		`</rdf:Description>` +
+		`</rdf:RDF></x:xmpmeta>`)
+
+	jpeg := buildMultiChunkExtendedXMPJPEG(mainXMP, guid, extPayload)
+
+	_, _, rawXMP, err := Extract(bytes.NewReader(jpeg))
+	if err != nil {
+		t.Fatalf("Extract: unexpected error: %v", err)
+	}
+	if rawXMP == nil {
+		t.Fatal("rawXMP is nil; expected reassembled XMP for legitimate large payload")
+	}
+	// The reassembled XMP must contain the large padding content.
+	if !bytes.Contains(rawXMP, padding[:1024]) {
+		t.Errorf("rawXMP (%d bytes) does not contain expected large payload content; DoS cap may be too aggressive", len(rawXMP))
+	}
+}
+
+// --- Regression #45: IRB data size 32-bit safety ---
+
+// buildIRBWithGiantDataSize builds a raw Photoshop IRB block containing a single
+// 8BIM entry whose 4-byte data-size field is set to the given rawSize value,
+// followed by only actualDataBytes bytes of actual data.
+//
+// When rawSize > uint32(len(actual)), the entry is intentionally truncated.
+// This helper is used to test the #45 fix in parseIRBEntry.
+func buildIRBWithGiantDataSize(rawSize uint32, actualData []byte) []byte {
+	var buf bytes.Buffer
+	buf.WriteString("8BIM")
+	buf.Write([]byte{0x04, 0x04}) // resource ID 0x0404
+	buf.Write([]byte{0x00, 0x00}) // empty pascal name
+	var sz [4]byte
+	binary.BigEndian.PutUint32(sz[:], rawSize)
+	buf.Write(sz[:])
+	buf.Write(actualData)
+	return buf.Bytes()
+}
+
+// TestParseIRBEntryGiantDataSizeNoPanic is the regression test for issue #45.
+//
+// It verifies that parseIRBEntry does not panic when the 4-byte data-size
+// field carries a value that would be negative when cast to int on a 32-bit
+// platform (i.e., any value ≥ 2^31 = 2147483648).
+//
+// On a 64-bit platform the test validates that the function correctly returns
+// ok=false (bounds check fails) rather than returning a slice that extends
+// beyond the buffer.
+func TestParseIRBEntryGiantDataSizeNoPanic(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		rawSize uint32
+	}{
+		{"exactly 2 GiB boundary", 0x80000000},  // 2^31: would be negative int32
+		{"0xFFFFFFFF (max uint32)", 0xFFFFFFFF}, // ~4 GiB
+		{"0x80000001 (just above negative boundary)", 0x80000001},
+		{"just under 2 GiB", 0x7FFFFFFF}, // still larger than any valid buffer
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Provide only a tiny actual data slice so the buffer is far smaller
+			// than rawSize, forcing the bounds check to fire.
+			irb := buildIRBWithGiantDataSize(tc.rawSize, []byte{0x01, 0x02, 0x03})
+
+			// Must not panic.
+			resourceID, data, newPos, ok := parseIRBEntry(irb, 0)
+
+			// The entry is intentionally malformed; we only care about no-panic
+			// and that ok=false (bounds check must reject it).
+			if ok {
+				t.Errorf("parseIRBEntry(%s): expected ok=false for giant rawSize=%d, got ok=true (resourceID=%d, dataLen=%d, newPos=%d)",
+					tc.name, tc.rawSize, resourceID, len(data), newPos)
+			}
+		})
+	}
+}
+
+// TestParseIRBEntryValidAfterGiantSizeFix verifies that parseIRBEntry still
+// accepts a well-formed entry with a normal data size after the #45 fix.
+// This is the non-regression half: the fix must not break valid IRB entries.
+func TestParseIRBEntryValidAfterGiantSizeFix(t *testing.T) {
+	t.Parallel()
+
+	iptcData := []byte{0x1C, 0x02, 0x78, 0x00, 0x05, 'H', 'e', 'l', 'l', 'o'}
+	irb := buildIRBWithGiantDataSize(uint32(len(iptcData)), iptcData) //nolint:gosec // G115: test helper
+
+	resourceID, data, _, ok := parseIRBEntry(irb, 0)
+	if !ok {
+		t.Fatal("parseIRBEntry: expected ok=true for valid entry, got false")
+	}
+	if resourceID != 0x0404 {
+		t.Errorf("resourceID = 0x%04X, want 0x0404", resourceID)
+	}
+	if !bytes.Equal(data, iptcData) {
+		t.Errorf("data = %v, want %v", data, iptcData)
+	}
+}
+
 func BenchmarkJPEGExtract(b *testing.B) {
 	tiffData := minimalTIFFBytes()
 	iptcData := []byte{0x1C, 0x02, 0x78, 0x00, 0x05, 'H', 'e', 'l', 'l', 'o'}

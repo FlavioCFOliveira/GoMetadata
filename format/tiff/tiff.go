@@ -44,6 +44,15 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 // When rawIPTC or rawXMP is non-nil, the TIFF is parsed and IFD0 is updated
 // with the new values before re-encoding (affects CR2, NEF, ARW, DNG via delegation).
 //
+// WARNING — image-data corruption risk: TIFF-based containers (TIFF, CR2, NEF,
+// ARW, DNG, ORF, RW2) store image data (strips, tiles, JPEG thumbnails) at
+// offsets that are absolute within the TIFF stream. This function re-encodes
+// the IFD block via exif.Encode without relocating that image data, which
+// invalidates those offsets and corrupts the image. Do NOT call Inject directly
+// on files from a user-facing write path; use gometadata.Write instead, which
+// gates TIFF-based formats behind ErrWriteNotSupported until full structural
+// relocation is implemented (roadmap Option A, epic #33).
+//
 // Round-trip fidelity: all IFD entries whose TIFF type code is defined in
 // TIFF 6.0 §2 are faithfully preserved, including private tags with known
 // types. Entries using undefined/proprietary type codes retain their 4-byte

@@ -671,3 +671,183 @@ func TestAllCreatorsNilReceiver(t *testing.T) {
 		t.Errorf("AllCreators(nil): got %v, want nil", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #42 — isUTF8Declaration: match ESC%G anywhere in field + "UTF8" ASCII form
+// ---------------------------------------------------------------------------
+
+// buildIPTCWithRaw1_90 constructs an IPTC stream whose 1:90 dataset has the
+// given raw bytes, followed by a Caption with the provided value.
+func buildIPTCWithRaw1_90(decl []byte, caption []byte) []byte {
+	var buf bytes.Buffer
+	// Record 1, Dataset 90 header.
+	buf.WriteByte(0x1C)
+	buf.WriteByte(0x01)
+	buf.WriteByte(0x5A)
+	n := len(decl)
+	buf.WriteByte(byte(n >> 8)) //nolint:gosec // G115: test helper, intentional byte extraction
+	buf.WriteByte(byte(n))      //nolint:gosec // G115: test helper, intentional byte extraction
+	buf.Write(decl)
+	// Caption dataset.
+	buf.WriteByte(0x1C)
+	buf.WriteByte(0x02)
+	buf.WriteByte(DS2Caption)
+	m := len(caption)
+	buf.WriteByte(byte(m >> 8)) //nolint:gosec // G115: test helper, intentional byte extraction
+	buf.WriteByte(byte(m))      //nolint:gosec // G115: test helper, intentional byte extraction
+	buf.Write(caption)
+	return buf.Bytes()
+}
+
+// TestIsUTF8DeclarationVariants verifies that isUTF8Declaration recognises all
+// three valid forms of the 1:90 UTF-8 declaration (IIM §1.5.1 + real-world
+// Adobe variants as handled by ExifTool IPTC.pm DecodeCodedCharset).
+func TestIsUTF8DeclarationVariants(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		decl    []byte
+		wantUTF bool
+	}{
+		// Canonical ESC % G — must always be recognised.
+		{"canonical-ESC%G", []byte{0x1B, 0x25, 0x47}, true},
+		// ESC%G padded with a NUL byte to even length — old Photoshop/Bridge.
+		{"ESC%G-NUL-padded-4bytes", []byte{0x1B, 0x25, 0x47, 0x00}, true},
+		// ESC%G with extra leading space (edge case: sequence not at offset 0).
+		{"ESC%G-leading-space", []byte{0x20, 0x1B, 0x25, 0x47}, true},
+		// ASCII string "UTF8" — old Adobe Bridge non-standard form.
+		{"ASCII-UTF8", []byte("UTF8"), true},
+		// Empty field — not a UTF-8 declaration.
+		{"empty", []byte{}, false},
+		// ISO-8859-1 default (no declaration) — represented as missing dataset,
+		// but we test an unrecognised byte sequence explicitly.
+		{"unknown-sequence", []byte{0x1B, 0x2D, 0x41}, false}, // ESC - A = ISO 8859-1
+		// ASCII string "utf8" (lowercase) — not a known variant; must not match.
+		{"lowercase-utf8", []byte("utf8"), false},
+		// Partial ESC sequence — not a match.
+		{"partial-ESC%", []byte{0x1B, 0x25}, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := isUTF8Declaration(tc.decl)
+			if got != tc.wantUTF {
+				t.Errorf("isUTF8Declaration(%#v) = %v, want %v", tc.decl, got, tc.wantUTF)
+			}
+		})
+	}
+}
+
+// TestParseUTF8DeclarationVariantsEndToEnd verifies that each recognised 1:90
+// variant causes Parse to set the UTF-8 flag, so that a non-ASCII caption is
+// decoded correctly (no mojibake).
+func TestParseUTF8DeclarationVariantsEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	// "café" in UTF-8: 5 bytes.
+	caption := []byte("caf\xC3\xA9")
+	want := "café"
+
+	cases := []struct {
+		name string
+		decl []byte
+	}{
+		{"canonical-ESC%G", []byte{0x1B, 0x25, 0x47}},
+		{"ESC%G-NUL-padded", []byte{0x1B, 0x25, 0x47, 0x00}},
+		{"ASCII-UTF8", []byte("UTF8")},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			raw := buildIPTCWithRaw1_90(tc.decl, caption)
+			i, err := Parse(raw)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			if !i.isUTF8() {
+				t.Errorf("isUTF8() = false for decl %#v; expected UTF-8 mode to be active", tc.decl)
+			}
+			if got := i.Caption(); got != want {
+				t.Errorf("Caption: got %q, want %q (mojibake check)", got, want)
+			}
+		})
+	}
+}
+
+// TestParseNoUTF8DeclarationFallbackISO8859 verifies that a 1:90 dataset with
+// an unrecognised sequence (not ESC%G, not "UTF8") keeps the ISO-8859-1 decode
+// path active, so a legacy ISO-8859-1 caption round-trips correctly.
+func TestParseNoUTF8DeclarationFallbackISO8859(t *testing.T) {
+	t.Parallel()
+	// ESC - A designates ISO 8859-1 Latin-1 (not UTF-8).
+	unknownDecl := []byte{0x1B, 0x2D, 0x41}
+	// "café" in ISO-8859-1: 0x63 0x61 0x66 0xE9.
+	isoCaption := []byte{0x63, 0x61, 0x66, 0xE9}
+	raw := buildIPTCWithRaw1_90(unknownDecl, isoCaption)
+
+	i, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if i.isUTF8() {
+		t.Error("isUTF8() = true for unknown declaration sequence; expected ISO-8859-1 fallback")
+	}
+	if got := i.Caption(); got != "café" {
+		t.Errorf("Caption (ISO-8859-1 fallback): got %q, want %q", got, "café")
+	}
+}
+
+// TestUTF8DeclarationVariantNonASCIIRoundTrip verifies the full encode/decode
+// round-trip when the source stream used a non-canonical 1:90 declaration.
+// After Parse, the UTF-8 flag is set; Encode must re-emit the canonical ESC%G
+// form, and a second Parse must still return the correct string.
+func TestUTF8DeclarationVariantNonASCIIRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	caption := []byte("caf\xC3\xA9") // "café" in UTF-8
+	want := "café"
+
+	cases := []struct {
+		name string
+		decl []byte
+	}{
+		{"ESC%G-NUL-padded", []byte{0x1B, 0x25, 0x47, 0x00}},
+		{"ASCII-UTF8", []byte("UTF8")},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			raw := buildIPTCWithRaw1_90(tc.decl, caption)
+			i, err := Parse(raw)
+			if err != nil {
+				t.Fatalf("Parse (first): %v", err)
+			}
+
+			enc, err := Encode(i)
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+
+			// After round-trip, the canonical ESC%G declaration must be present.
+			canonical := []byte{0x1C, 0x01, 0x5A, 0x00, 0x03, 0x1B, 0x25, 0x47}
+			if !bytes.Contains(enc, canonical) {
+				t.Errorf("Encode did not emit canonical 1:90 ESC%%G declaration for decl %#v", tc.decl)
+			}
+
+			i2, err := Parse(enc)
+			if err != nil {
+				t.Fatalf("Parse (round-trip): %v", err)
+			}
+			if !i2.isUTF8() {
+				t.Error("isUTF8() = false after encode/parse round-trip")
+			}
+			if got := i2.Caption(); got != want {
+				t.Errorf("Caption after round-trip: got %q, want %q", got, want)
+			}
+		})
+	}
+}

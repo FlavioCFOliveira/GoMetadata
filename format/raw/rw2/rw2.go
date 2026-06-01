@@ -54,6 +54,14 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 // restored in the output so the file remains a valid RW2.
 // Note: RW2 uses non-standard IFD encoding; some entries may not survive the
 // round-trip, but EXIF/IPTC/XMP metadata is correctly updated.
+//
+// WARNING — image-data corruption risk: RW2 is TIFF-based. Writing metadata
+// into an RW2 file re-encodes the IFD block (via tiff.Inject → exif.Encode)
+// without relocating StripOffsets, TileOffsets, or SubIFD image-data pointers.
+// Those offsets become invalid after re-encoding, corrupting the image. Do NOT
+// call Inject directly on files from a user-facing write path; use
+// gometadata.Write instead, which gates RW2 behind ErrWriteNotSupported until
+// full structural relocation is implemented (roadmap Option A, epic #33).
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("rw2: seek: %w", err)

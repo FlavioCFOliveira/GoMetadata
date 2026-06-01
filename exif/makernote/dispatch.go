@@ -3,6 +3,8 @@
 package makernote
 
 import (
+	"strings"
+
 	"github.com/FlavioCFOliveira/GoMetadata/exif/makernote/canon"
 	"github.com/FlavioCFOliveira/GoMetadata/exif/makernote/dji"
 	"github.com/FlavioCFOliveira/GoMetadata/exif/makernote/fujifilm"
@@ -51,6 +53,11 @@ var parsers = map[string]Parser{
 
 // Dispatch selects the correct Parser for the given make string.
 // Returns nil when the make is unknown or unsupported.
+//
+// cameraMake is trimmed of leading/trailing whitespace before the lookup.
+// Real-world camera files (e.g. Canon EOS bodies) sometimes store the Make
+// field with a trailing space ("Canon "); trimming aligns behaviour with
+// parseMakerNoteIFD in exif/makernote_parse.go, which already does the same.
 func Dispatch(cameraMake string) Parser {
-	return parsers[cameraMake]
+	return parsers[strings.TrimSpace(cameraMake)]
 }

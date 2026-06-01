@@ -1,6 +1,7 @@
 package iptc
 
 import (
+	"bytes"
 	"sync"
 
 	"golang.org/x/text/encoding"
@@ -47,8 +48,31 @@ func (d *Dataset) stringValue(isUTF8 bool) string {
 	return d.decodedValue
 }
 
-// isUTF8Declaration reports whether b is the ISO 2022 escape sequence
-// that signals UTF-8 encoding in IPTC: ESC % G (IIM §1.5.1).
+// escPercentG is the ISO 2022 escape sequence for UTF-8 (ESC % G).
+// IIM §1.5.1 defines this as the coded character set declaration for UTF-8.
+var escPercentG = []byte{0x1B, 0x25, 0x47} //nolint:gochecknoglobals // immutable sentinel; avoids re-allocation on every call
+
+// isUTF8Declaration reports whether b declares UTF-8 encoding for IPTC.
+//
+// IIM §1.5.1 specifies dataset 1:90 (Coded Character Set) as a field of up
+// to 32 octets carrying an ISO 2022 designation sequence. The canonical form
+// is the 3-byte sequence ESC % G (0x1B 0x25 0x47). In practice two additional
+// encodings appear in real-world files produced by older Adobe software:
+//
+//   - ESC%G padded with NUL bytes to an even length (e.g. 4 bytes: ESC%G + 0x00).
+//     Some versions of Photoshop and Bridge write the field this way.
+//   - The ASCII string "UTF8" (0x55 0x54 0x46 0x38) — a non-standard but
+//     widely-observed variant from old Adobe Bridge and Photoshop workflows.
+//
+// Both variants are treated as equivalent to the canonical ESC%G declaration,
+// matching the behaviour of ExifTool (see ExifTool source IPTC.pm, sub
+// DecodeCodedCharset). Anything else keeps the ISO-8859-1 fallback.
 func isUTF8Declaration(b []byte) bool {
-	return len(b) == 3 && b[0] == 0x1B && b[1] == 0x25 && b[2] == 0x47
+	// Canonical: exactly ESC % G, or ESC % G appearing anywhere in the field
+	// (handles NUL-padded and leading-garbage variants).
+	if bytes.Contains(b, escPercentG) {
+		return true
+	}
+	// Adobe Bridge / old Photoshop non-standard ASCII form.
+	return bytes.Equal(b, []byte("UTF8"))
 }

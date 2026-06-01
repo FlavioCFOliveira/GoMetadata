@@ -213,9 +213,17 @@ func buildIFD0Entries(e *EXIF, order binary.ByteOrder, exifPtrBuf, gpsPtrBuf *[4
 // preserves raw MakerNote bytes if they are not already present in the entries,
 // and returns a sorted slice. Placeholder values are patched later by patchPointers.
 //
-// MakerNote bytes are preserved verbatim rather than re-serialising MakerNoteIFD
-// because MakerNote offsets are often relative to the parent TIFF start, making
-// them non-portable when moved. EXIF §4.6.3 / MakerNote interoperability notes.
+// MakerNote bytes are preserved verbatim rather than re-serialising MakerNoteIFD.
+// This is safe for manufacturers whose MakerNote offsets are relative to the
+// MakerNote blob itself (Canon, Sony, Panasonic, Olympus, Pentax AOC …) because
+// the blob is self-contained and can be moved without invalidating its internal
+// references.  It is NOT safe for manufacturers whose offsets are relative to the
+// parent TIFF start (e.g. Nikon bodies that embed an independent TIFF header inside
+// the MakerNote): if the MakerNote block moves to a different TIFF offset on
+// re-encode, those TIFF-relative offset values become stale.  Full offset rebasing
+// is deferred to a future epic; EXIF.MakerNoteOffset records the original TIFF
+// offset so callers can detect the movement.
+// Reference: EXIF §4.6.5 tag 0x927C; MakerNote interoperability survey.
 func buildExifIFDEntries(e *EXIF, order binary.ByteOrder, interopPtrBuf *[4]byte) []IFDEntry {
 	if e.ExifIFD == nil {
 		return nil

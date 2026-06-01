@@ -17,14 +17,26 @@ import (
 // EXIF holds the parsed contents of an EXIF block.
 // IFD0, ExifIFD, GPSIFD, and InteropIFD are the standard IFD subtrees.
 // MakerNote is populated only when a recognised manufacturer is detected.
+//
+// MakerNoteOffset is the absolute TIFF-stream byte offset at which the raw
+// MakerNote value begins in the original parsed buffer.  It is zero when
+// MakerNote is nil or when the ExifIFD was not parsed from a byte stream (e.g.
+// a freshly constructed EXIF with no MakerNote).
+//
+// This field is informational: callers can use it to detect whether Encode has
+// moved the MakerNote to a different position.  Manufacturers that store
+// MakerNote-internal offsets relative to the parent TIFF start (e.g. certain
+// Nikon bodies) will produce stale internal offsets if the MakerNote moves;
+// full offset rebasing is not yet implemented.  EXIF §4.6.5, tag 0x927C.
 type EXIF struct {
-	ByteOrder    binary.ByteOrder
-	IFD0         *IFD
-	ExifIFD      *IFD
-	GPSIFD       *IFD
-	InteropIFD   *IFD
-	MakerNote    []byte // raw MakerNote bytes
-	MakerNoteIFD *IFD   // parsed MakerNote IFD; nil when parsing is unsupported for this make
+	ByteOrder       binary.ByteOrder
+	IFD0            *IFD
+	ExifIFD         *IFD
+	GPSIFD          *IFD
+	InteropIFD      *IFD
+	MakerNote       []byte // raw MakerNote bytes
+	MakerNoteIFD    *IFD   // parsed MakerNote IFD; nil when parsing is unsupported for this make
+	MakerNoteOffset uint32 // absolute TIFF-stream offset of the raw MakerNote value; 0 when absent
 }
 
 // ParseOption configures a Parse call.
@@ -63,23 +75,23 @@ func parseByteOrder(b []byte) (binary.ByteOrder, error) {
 
 // parseExifSubIFDs traverses the ExifIFD sub-tree rooted at the
 // TagExifIFDPointer entry in ifd0.  It returns the ExifIFD, the raw MakerNote
-// bytes (always retained for round-trip writes), the parsed MakerNoteIFD
-// (nil when cfg.skipMakerNote is set or the make is unrecognised), and the
-// InteropIFD.  All fields are nil/empty when the corresponding pointer tag is
-// absent or the sub-IFD cannot be traversed — errors are silently discarded to
-// match the original Parse behaviour (corrupt sub-IFDs must not abort the whole
-// parse).
+// bytes (always retained for round-trip writes), the MakerNote's TIFF-relative
+// byte offset (zero if absent), the parsed MakerNoteIFD (nil when
+// cfg.skipMakerNote is set or the make is unrecognised), and the InteropIFD.
+// All fields are nil/empty when the corresponding pointer tag is absent or the
+// sub-IFD cannot be traversed — errors are silently discarded to match the
+// original Parse behaviour (corrupt sub-IFDs must not abort the whole parse).
 //
 // EXIF §4.6.3: ExifIFD pointer is tag 0x8769; InteropIFD pointer is tag 0xA005.
 // EXIF §4.6.5: MakerNote is tag 0x927C.
-func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseConfig) (exifIFD *IFD, makerNote []byte, makerNoteIFD *IFD, interopIFD *IFD) {
+func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseConfig) (exifIFD *IFD, makerNote []byte, makerNoteOffset uint32, makerNoteIFD *IFD, interopIFD *IFD) {
 	ptr := ifd0.Get(TagExifIFDPointer)
 	if ptr == nil || len(ptr.Value) < 4 {
-		return nil, nil, nil, nil
+		return nil, nil, 0, nil, nil
 	}
 	sub, err := traverse(b, order.Uint32(ptr.Value), order)
 	if err != nil {
-		return nil, nil, nil, nil
+		return nil, nil, 0, nil, nil
 	}
 	exifIFD = sub
 
@@ -87,6 +99,11 @@ func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseCon
 	// IFD parsing is skipped when SkipMakerNote() is requested.
 	if mn := sub.Get(TagMakerNote); mn != nil {
 		makerNote = mn.Value
+		// rawOffset is non-zero when the MakerNote value is out-of-line (total
+		// size > 4 bytes, which is always true for any real MakerNote payload).
+		// It records the TIFF-stream offset so EXIF.MakerNoteOffset can expose
+		// the original position for movement-detection by callers.
+		makerNoteOffset = mn.rawOffset
 		if !cfg.skipMakerNote {
 			if makeEntry := ifd0.Get(TagMake); makeEntry != nil {
 				makerNoteIFD = parseMakerNoteIFD(mn.Value, makeEntry.String(), order)
@@ -100,7 +117,7 @@ func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseCon
 			interopIFD = isub
 		}
 	}
-	return exifIFD, makerNote, makerNoteIFD, interopIFD
+	return exifIFD, makerNote, makerNoteOffset, makerNoteIFD, interopIFD
 }
 
 // parseGPSSubIFD traverses the GPS IFD rooted at the TagGPSIFDPointer entry
@@ -159,7 +176,7 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) {
 	}
 	e.IFD0 = ifd0
 
-	e.ExifIFD, e.MakerNote, e.MakerNoteIFD, e.InteropIFD = parseExifSubIFDs(b, ifd0, order, &cfg)
+	e.ExifIFD, e.MakerNote, e.MakerNoteOffset, e.MakerNoteIFD, e.InteropIFD = parseExifSubIFDs(b, ifd0, order, &cfg)
 	e.GPSIFD = parseGPSSubIFD(b, ifd0, order)
 
 	return e, nil

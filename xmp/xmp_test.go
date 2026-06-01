@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 )
 
 const simpleXMP = `<?xpacket begin="" uid="W5M0MpCehiHzreSzNTczkc9d"?>
@@ -1792,5 +1793,291 @@ func TestDepthUnderflowNoPanic(t *testing.T) {
 			// A panic would be caught by the testing runtime as a failure.
 			_, _ = Parse(tc.input)
 		})
+	}
+}
+
+// ── Issue #38: UTF-16 transcode size cap (DoS prevention) ────────────────────
+
+// TestUTF16TranscodeCapRejectsLargeInput verifies that toUTF8 returns nil for
+// UTF-16 inputs larger than maxXMPTranscodeBytes WITHOUT allocating a transcode
+// buffer.  This prevents a DoS via a crafted PNG/HEIF chunk carrying a ~256 MiB
+// UTF-16 XMP packet (which would cause transform.Bytes to allocate ~512 MiB).
+func TestUTF16TranscodeCapRejectsLargeInput(t *testing.T) {
+	t.Parallel()
+	// Build a buffer whose length exceeds the cap. We don't need it to contain
+	// valid UTF-16 — the size check fires before any decoding attempt.
+	// Use a minimal allocation: make a slice larger than the cap, put a UTF-16
+	// BE BOM at the front so detectEncoding returns encUTF16BE.
+	oversized := make([]byte, maxXMPTranscodeBytes+1)
+	oversized[0], oversized[1] = 0xFE, 0xFF // UTF-16 BE BOM
+
+	// Confirm the size guard fires: toUTF8 must return nil.
+	got := toUTF8(oversized, encUTF16BE)
+	if got != nil {
+		t.Errorf("toUTF8 with oversized UTF-16 BE input: want nil, got %d bytes", len(got))
+	}
+
+	// Same for UTF-16 LE.
+	oversized[0], oversized[1] = 0xFF, 0xFE // UTF-16 LE BOM
+	got = toUTF8(oversized, encUTF16LE)
+	if got != nil {
+		t.Errorf("toUTF8 with oversized UTF-16 LE input: want nil, got %d bytes", len(got))
+	}
+}
+
+// TestUTF16TranscodeCapAllowsNormalInput verifies that valid UTF-16 packets
+// smaller than maxXMPTranscodeBytes are still transcoded and parsed correctly
+// (regression guard: the cap must not block legitimate traffic).
+func TestUTF16TranscodeCapAllowsNormalInput(t *testing.T) {
+	t.Parallel()
+	// xmpPacketBody is well under 1 MiB; must parse without error.
+	utf16be := utf8ToUTF16(xmpPacketBody, true)
+	if len(utf16be) >= maxXMPTranscodeBytes {
+		t.Skip("test packet unexpectedly exceeds cap; adjust test constant")
+	}
+	x, err := Parse(utf16be)
+	if err != nil {
+		t.Fatalf("Parse normal UTF-16 BE after cap added: %v", err)
+	}
+	if got := x.CameraModel(); got != "Canon EOS R6" {
+		t.Errorf("CameraModel = %q, want %q", got, "Canon EOS R6")
+	}
+}
+
+// TestNormaliseToUTF8CapPropagates verifies that the nil return propagates
+// through normaliseToUTF8 so that Parse returns ErrEmptyInput rather than
+// crashing or returning garbage.
+func TestNormaliseToUTF8CapPropagates(t *testing.T) {
+	t.Parallel()
+	oversized := make([]byte, maxXMPTranscodeBytes+1)
+	oversized[0], oversized[1] = 0xFE, 0xFF // UTF-16 BE BOM
+
+	_, err := Parse(oversized)
+	// Parse must not panic and must return a non-nil error.
+	if err == nil {
+		t.Error("Parse oversized UTF-16: want error, got nil")
+	}
+}
+
+// ── Issue #41: UTF-32 invalid code point substitution ────────────────────────
+
+// TestDecodeUTF32InvalidCodePoints verifies that code points above U+10FFFF
+// and UTF-16 surrogate code points (U+D800–U+DFFF) are replaced with U+FFFD
+// (REPLACEMENT CHARACTER) rather than producing invalid UTF-8 sequences.
+func TestDecodeUTF32InvalidCodePoints(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		cp   uint32
+		want rune // expected rune in decoded output
+	}{
+		{"above U+10FFFF", 0x110000, unicode.ReplacementChar},
+		{"max invalid", 0xFFFFFFFF, unicode.ReplacementChar},
+		{"surrogate low D800", 0xD800, unicode.ReplacementChar},
+		{"surrogate high DFFF", 0xDFFF, unicode.ReplacementChar},
+		{"surrogate mid D900", 0xD900, unicode.ReplacementChar},
+		{"valid BMP A", 0x0041, 'A'},          // U+0041 LATIN CAPITAL LETTER A
+		{"valid 2-byte 0x80", 0x0080, 0x0080}, // U+0080
+		{"valid 3-byte 4E00", 0x4E00, 0x4E00}, // U+4E00 CJK unified
+		{"valid max 10FFFF", 0x10FFFF, 0x10FFFF},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// Build a minimal UTF-32 BE buffer: 4-byte BOM + 4-byte code point.
+			b := make([]byte, 8)
+			b[0], b[1], b[2], b[3] = 0x00, 0x00, 0xFE, 0xFF // BE BOM
+			b[4] = byte(tc.cp >> 24)
+			b[5] = byte(tc.cp >> 16) //nolint:gosec // G115: intentional narrow to byte for big-endian UTF-32 encoding in test
+			b[6] = byte(tc.cp >> 8)  //nolint:gosec // G115: intentional narrow to byte for big-endian UTF-32 encoding in test
+			b[7] = byte(tc.cp)       //nolint:gosec // G115: intentional narrow to byte for big-endian UTF-32 encoding in test
+
+			out := decodeUTF32(b, true)
+			if len(out) == 0 {
+				t.Fatalf("decodeUTF32 returned empty output for cp=0x%X", tc.cp)
+			}
+			// Decode the first rune from the UTF-8 output.
+			r, _ := decodeFirstRune(out)
+			if r != tc.want {
+				t.Errorf("cp=0x%X: decoded rune = U+%04X, want U+%04X", tc.cp, r, tc.want)
+			}
+		})
+	}
+}
+
+// TestDecodeUTF32SurrogateRoundTrip verifies that a UTF-32 buffer composed
+// entirely of surrogate code points produces a stream of U+FFFD characters
+// and does not panic or produce invalid UTF-8.
+func TestDecodeUTF32SurrogateRoundTrip(t *testing.T) {
+	t.Parallel()
+	// Build a UTF-32 BE buffer with 3 surrogate code points.
+	// Expected output: 3 × U+FFFD (3 × 3 UTF-8 bytes = 9 bytes).
+	surrogates := []uint32{0xD800, 0xDC00, 0xDFFF}
+	b := make([]byte, 4+len(surrogates)*4)
+	b[0], b[1], b[2], b[3] = 0x00, 0x00, 0xFE, 0xFF // BE BOM
+	for i, cp := range surrogates {
+		off := 4 + i*4
+		b[off] = byte(cp >> 24)
+		b[off+1] = byte(cp >> 16) //nolint:gosec // G115: intentional narrow for big-endian UTF-32 test encoding
+		b[off+2] = byte(cp >> 8)  //nolint:gosec // G115: intentional narrow for big-endian UTF-32 test encoding
+		b[off+3] = byte(cp)       //nolint:gosec // G115: intentional narrow for big-endian UTF-32 test encoding
+	}
+
+	out := decodeUTF32(b, true)
+	// Count replacement characters in the output.
+	replacements := strings.Count(string(out), string(rune(unicode.ReplacementChar)))
+	if replacements != len(surrogates) {
+		t.Errorf("surrogate substitution: got %d U+FFFD, want %d", replacements, len(surrogates))
+	}
+}
+
+// decodeFirstRune is a test helper that decodes the first UTF-8 rune from b.
+func decodeFirstRune(b []byte) (rune, int) {
+	if len(b) == 0 {
+		return unicode.ReplacementChar, 0
+	}
+	r := rune(b[0])
+	if r < 0x80 {
+		return r, 1
+	}
+	// 2-byte sequence: 110xxxxx 10xxxxxx
+	if r&0xE0 == 0xC0 && len(b) >= 2 && b[1]&0xC0 == 0x80 {
+		return (r&0x1F)<<6 | rune(b[1]&0x3F), 2
+	}
+	// 3-byte sequence: 1110xxxx 10xxxxxx 10xxxxxx
+	if r&0xF0 == 0xE0 && len(b) >= 3 && b[1]&0xC0 == 0x80 && b[2]&0xC0 == 0x80 {
+		return (r&0x0F)<<12 | rune(b[1]&0x3F)<<6 | rune(b[2]&0x3F), 3
+	}
+	// 4-byte sequence: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+	if r&0xF8 == 0xF0 && len(b) >= 4 && b[1]&0xC0 == 0x80 && b[2]&0xC0 == 0x80 && b[3]&0xC0 == 0x80 {
+		return (r&0x07)<<18 | rune(b[1]&0x3F)<<12 | rune(b[2]&0x3F)<<6 | rune(b[3]&0x3F), 4
+	}
+	return unicode.ReplacementChar, 1
+}
+
+// ── Issue #43: xmpMM ordered arrays serialised as rdf:Seq ────────────────────
+
+// TestCollectionTypeXmpMMSeq verifies that collectionType returns "Seq" for
+// xmpMM:History, xmpMM:Ingredients, and xmpMM:Pantry per Adobe XMP Spec Part 2 §1.2.8.
+func TestCollectionTypeXmpMMSeq(t *testing.T) {
+	t.Parallel()
+	seqProps := []string{"History", "Ingredients", "Pantry"}
+	for _, local := range seqProps {
+		t.Run(local, func(t *testing.T) {
+			t.Parallel()
+			if got := collectionType(NSxmpMM, local); got != "Seq" {
+				t.Errorf("collectionType(%q, %q) = %q, want %q", NSxmpMM, local, got, "Seq")
+			}
+		})
+	}
+}
+
+// TestCollectionTypeXmpMMOtherBag verifies that other xmpMM properties that are
+// not explicitly listed still default to "Bag".
+func TestCollectionTypeXmpMMOtherBag(t *testing.T) {
+	t.Parallel()
+	if got := collectionType(NSxmpMM, "SomeUnknownProp"); got != "Bag" {
+		t.Errorf("collectionType(NSxmpMM, SomeUnknownProp) = %q, want %q", got, "Bag")
+	}
+}
+
+// TestXmpMMHistorySerialiseAsSeq verifies that an xmpMM:History list is
+// serialised as <rdf:Seq> (not <rdf:Bag>) in the encoded XMP packet.
+// Adobe XMP Specification Part 2 §1.2.8.
+func TestXmpMMHistorySerialiseAsSeq(t *testing.T) {
+	t.Parallel()
+	x := &XMP{Properties: map[string]map[string]string{
+		NSxmpMM: {
+			"History[0].action":     "saved",
+			"History[0].instanceID": "xmp.iid:1",
+			"History[1].action":     "derived",
+			"History[1].instanceID": "xmp.iid:2",
+		},
+	}}
+
+	encoded, err := Encode(x)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	out := string(encoded)
+
+	// Must use rdf:Seq, not rdf:Bag.
+	if !strings.Contains(out, "<rdf:Seq>") {
+		t.Errorf("xmpMM:History should be serialised as rdf:Seq:\n%s", out)
+	}
+	if strings.Contains(out, "<rdf:Bag>") {
+		t.Errorf("xmpMM:History must NOT be serialised as rdf:Bag:\n%s", out)
+	}
+}
+
+// TestXmpMMHistoryOrderPreservedRoundTrip verifies that xmpMM:History items
+// survive a parse → encode → parse round-trip with their original order and
+// field values intact.  Order preservation is the reason History must be rdf:Seq.
+func TestXmpMMHistoryOrderPreservedRoundTrip(t *testing.T) {
+	t.Parallel()
+	// Build an XMP document with a three-item History sequence.
+	raw := `<?xpacket begin="" uid="abc"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about=""
+      xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/"
+      xmlns:stEvt="http://ns.adobe.com/xap/1.0/sType/ResourceEvent#">
+      <xmpMM:History>
+        <rdf:Seq>
+          <rdf:li rdf:parseType="Resource">
+            <stEvt:action>created</stEvt:action>
+            <stEvt:instanceID>xmp.iid:1</stEvt:instanceID>
+          </rdf:li>
+          <rdf:li rdf:parseType="Resource">
+            <stEvt:action>saved</stEvt:action>
+            <stEvt:instanceID>xmp.iid:2</stEvt:instanceID>
+          </rdf:li>
+          <rdf:li rdf:parseType="Resource">
+            <stEvt:action>derived</stEvt:action>
+            <stEvt:instanceID>xmp.iid:3</stEvt:instanceID>
+          </rdf:li>
+        </rdf:Seq>
+      </xmpMM:History>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>`
+
+	x, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// Encode and re-parse.
+	encoded, err := Encode(x)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	// Re-encode output must use rdf:Seq.
+	if !strings.Contains(string(encoded), "<rdf:Seq>") {
+		t.Errorf("re-encoded xmpMM:History should use rdf:Seq:\n%s", string(encoded))
+	}
+
+	x2, err := Parse(encoded)
+	if err != nil {
+		t.Fatalf("Parse round-trip: %v", err)
+	}
+
+	// Verify all three items in order.
+	want := []struct{ action, id string }{
+		{"created", "xmp.iid:1"},
+		{"saved", "xmp.iid:2"},
+		{"derived", "xmp.iid:3"},
+	}
+	for i, w := range want {
+		actionKey := "History[" + strconv.Itoa(i) + "].action"
+		idKey := "History[" + strconv.Itoa(i) + "].instanceID"
+		if got := x2.Get(NSxmpMM, actionKey); got != w.action {
+			t.Errorf("round-trip %s = %q, want %q", actionKey, got, w.action)
+		}
+		if got := x2.Get(NSxmpMM, idKey); got != w.id {
+			t.Errorf("round-trip %s = %q, want %q", idKey, got, w.id)
+		}
 	}
 }

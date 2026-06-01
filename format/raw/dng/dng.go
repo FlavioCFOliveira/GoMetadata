@@ -19,7 +19,15 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	return rawEXIF, rawIPTC, rawXMP, nil
 }
 
-// Inject writes a modified DNG stream to w.
+// Inject writes a modified DNG stream to w by delegating to the TIFF writer.
+//
+// WARNING — image-data corruption risk: DNG is TIFF-based. Writing metadata
+// into a DNG file re-encodes the IFD block (via tiff.Inject → exif.Encode)
+// without relocating StripOffsets, TileOffsets, or SubIFD image-data pointers.
+// Those offsets become invalid after re-encoding, corrupting the image. Do NOT
+// call Inject directly on files from a user-facing write path; use
+// gometadata.Write instead, which gates DNG behind ErrWriteNotSupported until
+// full structural relocation is implemented (roadmap Option A, epic #33).
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
 	if err := tiff.Inject(r, w, rawEXIF, rawIPTC, rawXMP); err != nil {
 		return fmt.Errorf("dng: %w", err)

@@ -52,6 +52,14 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 // Inject writes a modified ORF stream to w by delegating to the TIFF writer.
 // ORF magic bytes are patched to standard TIFF LE before injection and
 // restored in the output so the file remains a valid ORF.
+//
+// WARNING — image-data corruption risk: ORF is TIFF-based. Writing metadata
+// into an ORF file re-encodes the IFD block (via tiff.Inject → exif.Encode)
+// without relocating StripOffsets, TileOffsets, or SubIFD image-data pointers.
+// Those offsets become invalid after re-encoding, corrupting the image. Do NOT
+// call Inject directly on files from a user-facing write path; use
+// gometadata.Write instead, which gates ORF behind ErrWriteNotSupported until
+// full structural relocation is implemented (roadmap Option A, epic #33).
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("orf: seek: %w", err)

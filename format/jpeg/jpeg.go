@@ -60,10 +60,18 @@ var identPS = []byte("Photoshop 3.0\x00") //nolint:gochecknoglobals // package-l
 //
 //	Extended APP1 layout: identXMPNote(35) + GUID(32) + fullLen(4) + offset(4) + chunk
 //	Overhead = 35 + 32 + 4 + 4 = 75 bytes → chunk data ≤ 65533 − 75 = 65458 bytes.
+//
+// maxExtendedXMPTotal: aggregate cap on all extended XMP chunk bytes accumulated
+// for a single GUID during parsing. Adobe XMP Specification Part 3 §1.1.4 allows
+// an extended XMP document up to 2^32−1 bytes on wire, but accepting that from an
+// untrusted JPEG stream would allow a ~268 MiB memory exhaustion attack (#40).
+// 16 MiB is generous for any real-world extended XMP use (Google Cardboard depth
+// maps, panorama metadata) while bounding worst-case allocation to a safe level.
 const (
-	maxAPP1Payload  = 65533               // 65535 − 2 (length field)
-	maxXMPPayload   = maxAPP1Payload - 29 // − len(identXMP)
-	maxExtChunkSize = maxAPP1Payload - 75 // − len(identXMPNote)+GUID+fullLen+offset overhead
+	maxAPP1Payload      = 65533               // 65535 − 2 (length field)
+	maxXMPPayload       = maxAPP1Payload - 29 // − len(identXMP)
+	maxExtChunkSize     = maxAPP1Payload - 75 // − len(identXMPNote)+GUID+fullLen+offset overhead
+	maxExtendedXMPTotal = 16 << 20            // 16 MiB aggregate cap per GUID (#40 DoS mitigation)
 )
 
 // xmpWireMagic is the 8-byte magic that identifies an XMP wire-frame payload.
@@ -125,11 +133,76 @@ type extChunk struct {
 	data   []byte
 }
 
+// appendExtendedXMPChunk adds one extended XMP chunk body to the accumulation
+// maps, enforcing the maxExtendedXMPTotal aggregate cap per GUID (#40).
+//
+// body must be at least 40 bytes (32-byte GUID + 4-byte fullLen + 4-byte offset
+// + chunk data). It is the caller's responsibility to verify this precondition.
+//
+// Returns updated extended and extSizes maps and the (possibly set) extTruncated
+// flag. DoS mitigation: the wire fullLen field from the first chunk for a GUID
+// is validated against maxExtendedXMPTotal; if it exceeds the cap the GUID is
+// blacklisted. Subsequent chunks are individually bounded by the same cap.
+// Adobe XMP Specification Part 3 §1.1.4 describes the wire fullLen field.
+func appendExtendedXMPChunk(
+	body []byte,
+	extended map[string][]extChunk,
+	extSizes map[string]uint64,
+	extTruncated bool,
+) (map[string][]extChunk, map[string]uint64, bool) {
+	guid := string(body[:32])
+	// fullLen is the wire-declared total size for this GUID's assembled payload.
+	fullLen := uint64(binary.BigEndian.Uint32(body[32:36]))
+	offset := binary.BigEndian.Uint32(body[36:40])
+	chunkData := body[40:]
+
+	// Lazily initialise maps on first encounter.
+	if extended == nil {
+		extended = make(map[string][]extChunk)
+	}
+	if extSizes == nil {
+		extSizes = make(map[string]uint64)
+	}
+
+	// First-seen check: validate the declared total against the cap.
+	// If it exceeds the cap, blacklist the GUID and mark truncated.
+	if _, seen := extSizes[guid]; !seen {
+		if fullLen > maxExtendedXMPTotal {
+			return extended, extSizes, true // extTruncated
+		}
+		extSizes[guid] = 0 // mark as seen with zero bytes accumulated
+	}
+
+	// Per-chunk running total check: drop this chunk if it would exceed the cap.
+	accumulated := extSizes[guid]
+	chunkSize := uint64(len(chunkData))
+	if accumulated+chunkSize > maxExtendedXMPTotal {
+		return extended, extSizes, true // extTruncated
+	}
+
+	// Copy chunk data: body aliases scratch and must outlive this loop.
+	extSizes[guid] = accumulated + chunkSize
+	extended[guid] = append(extended[guid], extChunk{
+		offset: offset,
+		data:   bytes.Clone(chunkData),
+	})
+	return extended, extSizes, extTruncated
+}
+
 // processAPP1Segment dispatches an APP1 segment payload to the appropriate
 // metadata bucket (EXIF, standard XMP, or extended XMP).
-// It returns updated values for rawEXIF, rawXMP, and the extended map;
-// pass-through values are returned unchanged when not applicable.
-func processAPP1Segment(data, rawEXIF, rawXMP []byte, extended map[string][]extChunk) ([]byte, []byte, map[string][]extChunk) {
+//
+// It returns updated values for rawEXIF, rawXMP, the extended chunk map,
+// the per-GUID accumulated byte counter map, and the extTruncated flag.
+// Pass-through values are returned unchanged when the segment does not apply.
+//
+// Extended XMP DoS mitigation is delegated to appendExtendedXMPChunk (#40).
+func processAPP1Segment(
+	data, rawEXIF, rawXMP []byte,
+	extended map[string][]extChunk,
+	extSizes map[string]uint64,
+	extTruncated bool,
+) ([]byte, []byte, map[string][]extChunk, map[string]uint64, bool) {
 	switch {
 	case bytes.HasPrefix(data, identExif):
 		// EXIF payload begins after the 6-byte "Exif\x00\x00" header.
@@ -149,26 +222,12 @@ func processAPP1Segment(data, rawEXIF, rawXMP []byte, extended map[string][]extC
 	case bytes.HasPrefix(data, identXMPNote):
 		// Extended XMP chunk: GUID (32 bytes) + fullLength (4 bytes) +
 		// offset (4 bytes) + chunk data. Adobe XMP Spec Part 3 §1.1.4.
-		body := data[len(identXMPNote):]
-		if len(body) >= 40 {
-			guid := string(body[:32])
-			fullLen := binary.BigEndian.Uint32(body[32:36])
-			offset := binary.BigEndian.Uint32(body[36:40])
-			_ = fullLen // used only for validation; assembly is offset-driven
-			// Copy chunk data: body aliases scratch and must outlive this loop.
-			chunkData := bytes.Clone(body[40:])
-			// Lazily initialise the map on first encounter.
-			if extended == nil {
-				extended = make(map[string][]extChunk)
-			}
-			extended[guid] = append(extended[guid], extChunk{
-				offset: offset,
-				data:   chunkData,
-			})
+		if body := data[len(identXMPNote):]; len(body) >= 40 {
+			extended, extSizes, extTruncated = appendExtendedXMPChunk(body, extended, extSizes, extTruncated)
 		}
 	}
 
-	return rawEXIF, rawXMP, extended
+	return rawEXIF, rawXMP, extended, extSizes, extTruncated
 }
 
 // processAPP13Segment checks a segment payload for the Photoshop IRB prefix and,
@@ -246,7 +305,12 @@ func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte) (rawEXIF, raw
 	// Adobe XMP Specification Part 3 §1.1.4.
 	// Lazily initialised: most JPEGs do not contain extended XMP, so we avoid
 	// the map allocation on the fast path.
+	//
+	// extSizes tracks accumulated byte totals per GUID for the #40 DoS cap.
+	// extTruncated is set true when any GUID's payload was capped.
 	var extended map[string][]extChunk
+	var extSizes map[string]uint64
+	var extTruncated bool
 	var mainXMP []byte
 
 	for {
@@ -259,17 +323,21 @@ func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte) (rawEXIF, raw
 
 		switch marker {
 		case markerAPP1:
-			rawEXIF, mainXMP, extended = processAPP1Segment(data, rawEXIF, mainXMP, extended)
+			rawEXIF, mainXMP, extended, extSizes, extTruncated = processAPP1Segment(
+				data, rawEXIF, mainXMP, extended, extSizes, extTruncated,
+			)
 		case markerAPP13:
 			if iptc := processAPP13Segment(data); iptc != nil {
 				rawIPTC = iptc
 			}
 		case markerSOS, markerEOI:
 			// SOS/EOI: no more metadata segments follow.
+			_ = extTruncated // truncation is currently informational; callers get partial XMP
 			return rawEXIF, rawIPTC, buildXMPResult(mainXMP, extended)
 		}
 	}
 
+	_ = extTruncated // truncation is currently informational; callers get partial XMP
 	return rawEXIF, rawIPTC, buildXMPResult(mainXMP, extended)
 }
 
@@ -732,15 +800,26 @@ func parseIRBEntry(b []byte, pos int) (resourceID uint16, data []byte, newPos in
 	if pos+4 > len(b) {
 		return 0, nil, pos + 1, false
 	}
-	// binary.BigEndian.Uint32 returns uint32; on 64-bit platforms the int cast
-	// is always non-negative. The subsequent bounds check catches truncation.
-	dataSize := int(binary.BigEndian.Uint32(b[pos:]))
+	// #45 (32-bit safety): read as uint64 before any arithmetic to prevent the
+	// negative-int wrap-around on 32-bit platforms where int is 32 bits.
+	// binary.BigEndian.Uint32 returns uint32 (max ~4 GiB); on a 32-bit platform
+	// casting directly to int would produce a negative value for sizes ≥ 2 GiB,
+	// bypassing the bounds check below and panicking on the slice expression.
+	// We validate using uint64 arithmetic throughout, then convert to int only
+	// after confirming the value fits within the buffer (which is at most
+	// MaxInt32 bytes on 32-bit, so the conversion is always safe at that point).
+	dataSizeU64 := uint64(binary.BigEndian.Uint32(b[pos:]))
 	pos += 4
 
-	if pos+dataSize > len(b) {
+	// Bounds check entirely in uint64 to be safe on 32-bit platforms.
+	// pos is a non-negative int (it has been advanced past the fixed-size header
+	// fields without exceeding len(b)); the cast is safe.
+	posU64 := uint64(pos) //nolint:gosec // G115: pos is always non-negative (bounded by len(b))
+	if posU64+dataSizeU64 > uint64(len(b)) {
 		return 0, nil, pos + 1, false
 	}
-
+	// Safe to convert: dataSizeU64 ≤ len(b)−pos ≤ len(b) ≤ MaxInt (both 32 and 64-bit).
+	dataSize := int(dataSizeU64) //nolint:gosec // G115: safe; bounded by uint64 check above
 	return resourceID, b[pos : pos+dataSize], pos + dataSize, true
 }
 

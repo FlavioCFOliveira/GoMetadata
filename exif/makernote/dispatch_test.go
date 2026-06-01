@@ -10,6 +10,35 @@ func TestDispatchUnknownMake(t *testing.T) {
 	}
 }
 
+// TestDispatchTrimSpace is the regression test for issue #44.
+// Before the fix, Dispatch did an exact map lookup without trimming whitespace,
+// so "Canon " (with trailing space) — a value that real Canon EOS bodies store
+// in the Make tag — would return nil instead of the Canon parser.
+// parseMakerNoteIFD already trimmed before dispatch; Dispatch was inconsistent.
+func TestDispatchTrimSpace(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		make string
+	}{
+		{"Canon trailing space", "Canon "},
+		{"Canon leading space", " Canon"},
+		{"Canon both spaces", " Canon "},
+		{"SONY trailing space", "SONY "},
+		{"Nikon leading tab", "\tNikon"},
+		{"FUJIFILM trailing newline", "FUJIFILM\n"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			p := Dispatch(tc.make)
+			if p == nil {
+				t.Errorf("Dispatch(%q) = nil; want non-nil parser (trimmed make should resolve)", tc.make)
+			}
+		})
+	}
+}
+
 func TestDispatchCanon(t *testing.T) {
 	t.Parallel()
 	p := Dispatch("Canon")

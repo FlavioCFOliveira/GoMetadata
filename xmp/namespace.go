@@ -27,6 +27,14 @@ const (
 // collectionType returns the RDF collection element name (Bag, Seq, or Alt)
 // for the given namespace URI and local property name per ISO 16684-1 §7.5.
 // Defaults to "Bag" for unrecognised properties.
+//
+// xmpMM ordered sequences (#43):
+// Adobe XMP Specification Part 2 §1.2.8 specifies that xmpMM:History,
+// xmpMM:Ingredients, and xmpMM:Pantry are ordered arrays (rdf:Seq), not bags.
+// History records the sequence of operations applied to a document; Ingredients
+// and Pantry record ordered lists of referenced/embedded resources.  Emitting
+// them as rdf:Bag would violate the spec and break interoperability with
+// Photoshop, Bridge, and ExifTool.
 func collectionType(ns, local string) string {
 	if ns == NSdc {
 		switch local {
@@ -34,6 +42,13 @@ func collectionType(ns, local string) string {
 			return "Seq"
 		case "rights", "description", "title":
 			return "Alt"
+		}
+	}
+	// #43: Adobe XMP Specification Part 2 §1.2.8 — xmpMM ordered arrays.
+	if ns == NSxmpMM {
+		switch local {
+		case "History", "Ingredients", "Pantry":
+			return "Seq"
 		}
 	}
 	return "Bag"
