@@ -32,6 +32,16 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, err
 	}
 
+	// TIFF 6.0 §2: magic number is 42 (0x002A) for classic TIFF.
+	// BigTIFF uses 43 (0x002B) and has a fundamentally different header layout
+	// (8-byte IFD offsets, 16-byte header). Reject BigTIFF explicitly so that
+	// the caller gets an actionable error rather than a silently misparsed result.
+	magic := order.Uint16(data[2:])
+	if magic != 0x002A {
+		return nil, nil, nil, fmt.Errorf("tiff: unsupported magic 0x%04X (classic TIFF 0x002A required; BigTIFF 0x002B is not supported): %w",
+			magic, ErrUnsupportedMagic)
+	}
+
 	// The whole TIFF data IS the EXIF payload (TIFF §2).
 	rawEXIF = data
 
