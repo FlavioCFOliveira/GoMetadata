@@ -65,3 +65,25 @@ jobs:
           cache: true
       - name: Run benchmarks (smoke)
         run: go test -bench=. -benchmem -benchtime=1x -skip ^Example ./...
+
+  fuzz:
+    name: Fuzz (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: FuzzRead — end-to-end entry point
+        run: go test -fuzz=FuzzRead -fuzztime=10s -race .
+      - name: FuzzParseEXIF — EXIF/TIFF parser
+        run: go test -fuzz=FuzzParseEXIF -fuzztime=10s -race ./exif/...
+      - name: FuzzParseIPTC — IPTC IIM parser
+        run: go test -fuzz=FuzzParseIPTC -fuzztime=10s -race ./iptc/...
+      - name: FuzzParseXMP — XMP/RDF parser
+        run: go test -fuzz=FuzzParseXMP -fuzztime=10s -race ./xmp/...
+      - name: FuzzJPEGExtract — JPEG container extractor
+        run: go test -fuzz=FuzzJPEGExtract -fuzztime=10s -race ./format/jpeg/...
+      - name: FuzzHEIFExtract — HEIF/AVIF container extractor
+        run: go test -fuzz=FuzzHEIFExtract -fuzztime=10s -race ./format/heif/...
