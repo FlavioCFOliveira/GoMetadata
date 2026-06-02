@@ -13,3 +13,7 @@ var ErrGPSValueTooShort = errors.New("xmp: GPS value too short")
 
 // ErrInvalidGPSFormat is returned when an XMP GPS coordinate string does not match the expected format.
 var ErrInvalidGPSFormat = errors.New("xmp: invalid GPS format")
+
+// ErrDocumentTooLarge is returned when the XMP document body exceeds maxXMPDocumentBytes
+// after UTF-8 normalisation. This is a local security policy; ISO 16684-1 imposes no limit.
+var ErrDocumentTooLarge = errors.New("xmp: document exceeds maximum size")

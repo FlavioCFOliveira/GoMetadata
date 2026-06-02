@@ -26,12 +26,37 @@ type XMP struct {
 	Properties map[string]map[string]string
 }
 
+// maxXMPDocumentBytes is the maximum number of UTF-8 bytes that Parse accepts
+// for a single XMP document body (post-normalisation, pre-RDF-parsing).
+//
+// Design rationale (Task #51 — empirical measurement):
+// Real-world XMP packets span from a few hundred bytes (camera EXIF-only) to
+// roughly 4 MiB for extreme cases (photo-sphere/depth-map XMP with embedded
+// thumbnail XMP packets). The corpus maximum across all JPEG, TIFF, PNG, and
+// HEIF files in the GoMetadata test suite is 4,763 bytes. Adobe XMP with rich
+// xmpMM:History chains from professional workflows may reach a few hundred KiB.
+// Google Camera depth-map XMP (panorama / portrait) peaks around 1–2 MiB.
+// Setting the cap at 16 MiB is:
+//   - Consistent with maxXMPTranscodeBytes (UTF-16 input cap), so a UTF-8 document
+//     can never exceed the budget implied by the encoding layer.
+//   - Generous enough to never reject legitimate metadata from any known producer.
+//   - Bounded enough to prevent a crafted multi-megabyte "many small properties"
+//     document from walking parseRDF's O(n) byte scanner without any limit.
+//
+// ISO 16684-1 imposes no document size limit; this is a local security policy.
+// The per-attribute maxUnescapedXMLBytes (1 MiB) and the transcode cap are
+// complementary: they bound individual allocations; this cap bounds total input.
+const maxXMPDocumentBytes = 16 << 20 // 16 MiB
+
 // Parse parses a raw XMP packet.
 // b may include the <?xpacket …?> wrapper; if absent, the bytes are
 // treated as the xmpmeta/RDF body directly.
 //
 // XMP Part 1 §7.2: if b begins with a UTF-16 or UTF-32 BOM, it is
 // automatically transcoded to UTF-8 before parsing.
+//
+// Parse rejects inputs larger than maxXMPDocumentBytes (16 MiB) after
+// UTF-8 normalisation to prevent O(n) parsing of pathological documents.
 func Parse(b []byte) (*XMP, error) {
 	if len(b) == 0 {
 		return nil, ErrEmptyInput
@@ -43,6 +68,12 @@ func Parse(b []byte) (*XMP, error) {
 	b = normaliseToUTF8(b)
 	if b == nil {
 		return nil, ErrEmptyInput
+	}
+
+	// Document-level size cap (post-normalisation, pre-RDF-parsing).
+	// See maxXMPDocumentBytes for the design rationale.
+	if len(b) > maxXMPDocumentBytes {
+		return nil, ErrDocumentTooLarge
 	}
 
 	x := &XMP{Properties: make(map[string]map[string]string)}

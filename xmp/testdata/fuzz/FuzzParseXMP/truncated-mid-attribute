@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("<?xpacket begin=\"\" uid=\"abc\"?><x attr=\"")
