@@ -254,13 +254,19 @@ func Encode(i *IPTC) ([]byte, error) {
 	emitUTF8Decl := i.isUTF8() || i.needsUTF8Declaration()
 	if emitUTF8Decl {
 		// Record 1, Dataset 90: coded character set = UTF-8 (ESC % G).
+		// IIM §1.5.1: ESC % G (0x1B 0x25 0x47) is the ISO 2022 designation for UTF-8.
+		//
+		// FINDING-002 fix: Encode must NOT mutate its receiver. The previous
+		// implementation appended to i.Records[0] here to update the internal UTF-8
+		// flag, which caused a data race when two goroutines called Encode (or Write)
+		// concurrently on the same *IPTC carrying non-ASCII content — they both wrote
+		// to the Records[0] slice header without synchronisation.
+		//
+		// The fix: emit the 1:90 declaration into the encoded byte stream only.
+		// The receiver is left unchanged. Callers that need the UTF-8 flag set on the
+		// *IPTC after encoding should call Parse on the encoded output (which is the
+		// canonical path — Encode produces a byte stream, not a new *IPTC).
 		buf.Write([]byte{0x1C, 0x01, 0x5A, 0x00, 0x03, 0x1B, 0x25, 0x47})
-		// Ensure the internal flag is set so that if the caller re-reads via
-		// the convenience accessors without an intervening Parse, the strings
-		// are still decoded correctly (no-parse round-trip path).
-		if !i.isUTF8() {
-			i.Records[0] = append(i.Records[0], Dataset{Record: 0, DataSet: 0, Value: []byte{1}})
-		}
 	}
 
 	// Write records in order for deterministic output.
