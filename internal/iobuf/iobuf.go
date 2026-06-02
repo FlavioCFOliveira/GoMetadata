@@ -1,6 +1,18 @@
 // Package iobuf provides sync.Pool-backed reusable byte buffers for use in
 // performance-critical parsing paths. All parsers that need temporary scratch
 // space must obtain it from here rather than allocating directly.
+//
+// # Buffer contract
+//
+// Get does NOT zero the returned buffer. Callers that need a clean buffer
+// must zero it themselves (e.g. with the built-in clear, bytes.Equal, or a
+// manual loop). This matches the pattern used by writeIFD in exif/ifd.go,
+// which calls clear() on the pooled slice before encoding entries —
+// preventing stale bytes from leaking across encode calls.
+//
+// Callers must not read from or write to a buffer after calling Put. The
+// pointer is returned to the pool and may be handed out to another goroutine
+// immediately.
 package iobuf
 
 import "sync"
@@ -27,9 +39,20 @@ var largePool = sync.Pool{ //nolint:gochecknoglobals // sync.Pool: reuse reduces
 }
 
 // Get returns a pointer to a byte slice from the appropriate pool tier.
-// The caller must call Put when finished. The slice is at least n bytes long;
-// it may be longer.
+// The returned slice has len == max(n,0) and cap >= max(n,0).
+//
+// Contract: the buffer is NOT zeroed. Callers must zero it when needed.
+// See package-level documentation for the full buffer contract.
+//
+// The caller must call Put when finished. After Put the pointer must not
+// be used.
 func Get(n int) *[]byte {
+	if n < 0 {
+		// Clamp negative requests to zero rather than panicking. Callers that
+		// pass a computed size should not receive a panic; an empty slice is the
+		// correct defensive return.
+		n = 0
+	}
 	if n > defaultSize {
 		p := largePool.Get().(*[]byte) //nolint:forcetypeassert,revive // largePool.New always stores *[]byte; pool invariant
 		if cap(*p) < n {
@@ -50,12 +73,25 @@ func Get(n int) *[]byte {
 
 // Put returns a buffer to the appropriate pool tier. The caller must not use
 // the buffer after calling Put.
+//
+// Buffers whose capacity exceeds the canonical tier cap (largeSize = 65536)
+// are discarded rather than pooled to prevent unbounded pool growth. A buffer
+// that was originally from the small pool but grew via append is also discarded
+// if its cap now exceeds largeSize; this closes the channel by which a single
+// runaway append could contaminate the pool with an arbitrarily large buffer.
 func Put(p *[]byte) {
 	if p == nil {
 		return
 	}
-	*p = (*p)[:cap(*p)]
-	if cap(*p) > defaultSize {
+	c := cap(*p)
+	// Discard buffers that grew beyond the large-tier canonical cap. Retaining
+	// them would allow a single large encode to permanently enlarge the pool,
+	// defeating the memory-budget goal of the two-tier design.
+	if c > largeSize {
+		return
+	}
+	*p = (*p)[:c]
+	if c > defaultSize {
 		largePool.Put(p)
 	} else {
 		pool.Put(p)
