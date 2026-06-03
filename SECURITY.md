@@ -49,7 +49,13 @@ GoMetadata is a parsing library. Its primary attack surface is **untrusted bytes
 
 ## Fuzz test coverage
 
-All 26 fuzz targets run continuously in CI using Go's built-in fuzzer. Crash-inducing inputs found during a run are committed to `testdata/fuzz/<Target>/` and are replayed automatically on every subsequent `go test` invocation.
+All 27 fuzz targets run continuously in CI using Go's built-in fuzzer. Crash-inducing inputs found during a run are committed to `testdata/fuzz/<Target>/` and are replayed automatically on every subsequent `go test` invocation.
+
+### End-to-end
+
+| Target | Package | What it covers |
+|---|---|---|
+| `FuzzRead` | `.` (root) | End-to-end fuzzing of the public `Read` entry point: magic-byte format detection, container dispatch, and EXIF/IPTC/XMP reconciliation across all supported container formats; strict mode surfaces all parser errors, best-effort mode guarantees no panic |
 
 ### Core parsers
 

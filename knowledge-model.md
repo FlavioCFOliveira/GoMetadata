@@ -17,7 +17,7 @@ both in the same step.
 
 ---
 
-## Node labels (10)
+## Node labels (11)
 
 | Label | Key | Count* | Properties |
 |---|---|---|---|
@@ -31,6 +31,7 @@ both in the same step.
 | `Spec` | `name` | 9 | `name, standard, ref, domain, gitCommit, gitDate` |
 | `Commit` | `hash` | 12 | `hash, short_hash, message, author, date, scope, gitCommit, gitDate` |
 | `Test` | `name` | ~4 | `name, package, file, type, description, commit_introduced, gitCommit, gitDate` |
+| `FormatCapability` | `format` | 13 | `format, extensions, read, write, exif, iptc, xmp, container, gitCommit, gitDate` |
 
 \* approximate at bootstrap (`402a067`, 2026-06-01).
 
@@ -48,6 +49,37 @@ Computed from the graph's own `DEPENDS_ON` edges: `true` if the package is the e
 23 `false` (8 `example` alternate-entry packages + the 12-package `exif/makernote` dead
 subtree + 3 `internal` orphans). Query the dead/unused code with
 `MATCH (p:Package {entryReachable:false}) WHERE p.layer <> 'example' RETURN p.name`.
+
+---
+
+## Capabilities matrix (`FormatCapability`)
+
+To make the module's **real, code-verified capabilities** directly queryable (added
+2026-06-03, for the v1.1.0 release), the graph carries one `FormatCapability` node per
+supported container format (13). Each node is the authoritative answer to "what can the module
+do with format X" and mirrors the README *Supported formats* table and `format.SupportsWrite`:
+
+| Property | Meaning |
+|---|---|
+| `format` | container name — JPEG, TIFF, PNG, WebP, HEIF, AVIF, CR2, CR3, NEF, ARW, DNG, ORF, RW2 |
+| `extensions` | recognised extensions (detection is by magic bytes, never by extension) |
+| `read` | metadata read supported — `true` for all 13 |
+| `write` | metadata write supported — **equals `format.SupportsWrite`**: `true` for JPEG/PNG/WebP/HEIF/AVIF/CR3; `false` for the 7 TIFF-based (TIFF/CR2/NEF/ARW/DNG/ORF/RW2), which are read-only pending epic `#33` |
+| `exif` / `iptc` / `xmp` | which metadata blocks the format carries on read (`iptc` only JPEG + TIFF) |
+| `container` | structural family: `JPEG` / `TIFF` / `TIFF-based` / `ISOBMFF` / `RIFF` / `PNG` |
+
+These are **standalone nodes** (no edges) — consistent with engine constraint #2 (heterogeneous
+edges to pre-existing nodes cannot be added incrementally); the `format` / `container`
+properties carry the linkage. Example queries:
+
+```cypher
+MATCH (c:FormatCapability {write:true})              RETURN c.format            // writable formats (6)
+MATCH (c:FormatCapability {iptc:true})               RETURN c.format            // carry IPTC (JPEG, TIFF)
+MATCH (c:FormatCapability {container:'TIFF-based'})  RETURN c.format, c.write   // the 7 read-only RAWs
+```
+
+Out-of-scope formats (CRW, RAF, MRW, IIQ, X3F, SRW, PEF, RWL — see `doc.go`) are intentionally
+NOT modelled as `FormatCapability` nodes: the module returns `UnsupportedFormatError` for them.
 
 ---
 
