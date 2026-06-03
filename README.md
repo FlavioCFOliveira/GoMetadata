@@ -265,8 +265,8 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 | Feature | Details |
 |---|---|
 | Metadata standards | EXIF 3.0 (CIPA DC-008 / TIFF 6.0), IPTC IIM 4.2, XMP (ISO 16684-1) |
-| Read | All three standards across all 13 container formats |
-| Write | All three standards; preserves unmodified metadata byte-for-byte |
+| Read | Whichever of EXIF / IPTC / XMP the container carries, across all 13 formats (IPTC is only carried by JPEG and TIFF) |
+| Write | All three standards for JPEG, PNG, WebP, HEIF, AVIF, and CR3; preserves unmodified metadata byte-for-byte. TIFF-based formats (TIFF, CR2, NEF, ARW, DNG, ORF, RW2) are read-only — see the Supported formats table |
 | Atomic writes | `WriteFile` uses temp file + rename — no partial writes |
 | Format detection | Magic bytes only; file extension is never consulted |
 | MakerNote (read) | Canon, Nikon, Sony, Olympus, Panasonic, Pentax, DJI, FujiFilm, Leica, Samsung, Sigma, Minolta, Casio |
@@ -275,7 +275,7 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 | Priority resolution | Each getter documents its source order (e.g., EXIF > XMP); the caller always gets one answer |
 | Lazy parsing | `WithoutEXIF()`, `WithoutIPTC()`, `WithoutXMP()`, `WithoutMakerNote()` skip unwanted work |
 | Allocation budget | Zero/near-zero heap allocation in parsing fast paths; `sync.Pool` for reusable buffers |
-| Fuzz testing | 18 fuzz targets covering all parsers |
+| Fuzz testing | 27 fuzz targets covering all parsers and format extractors |
 | Race safety | Clean under `go test -race ./...` |
 | Corpus coverage | 3,000+ real-world images tested, 0 failures |
 
@@ -284,18 +284,20 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 | Format | Extension(s) | Read | Write | EXIF | IPTC | XMP |
 |---|---|:---:|:---:|:---:|:---:|:---:|
 | JPEG | .jpg, .jpeg | Yes | Yes | Yes | Yes | Yes |
-| TIFF | .tif, .tiff | Yes | Yes | Yes | Yes | Yes |
+| TIFF | .tif, .tiff | Yes | No¹ | Yes | Yes | Yes |
 | PNG | .png | Yes | Yes | Yes | No | Yes |
 | WebP | .webp | Yes | Yes | Yes | No | Yes |
 | HEIF | .heif, .heic | Yes | Yes | Yes | No | Yes |
 | AVIF | .avif | Yes | Yes | Yes | No | Yes |
-| Canon CR2 | .cr2 | Yes | Yes | Yes | No | Yes |
+| Canon CR2 | .cr2 | Yes | No¹ | Yes | No | Yes |
 | Canon CR3 | .cr3 | Yes | Yes | Yes | No | Yes |
-| Nikon NEF | .nef | Yes | Yes | Yes | No | Yes |
-| Sony ARW | .arw | Yes | Yes | Yes | No | Yes |
-| Adobe DNG | .dng | Yes | Yes | Yes | No | Yes |
-| Olympus ORF | .orf | Yes | Yes | Yes | No | Yes |
-| Panasonic RW2 | .rw2 | Yes | Yes | Yes | No | Yes |
+| Nikon NEF | .nef | Yes | No¹ | Yes | No | Yes |
+| Sony ARW | .arw | Yes | No¹ | Yes | No | Yes |
+| Adobe DNG | .dng | Yes | No¹ | Yes | No | Yes |
+| Olympus ORF | .orf | Yes | No¹ | Yes | No | Yes |
+| Panasonic RW2 | .rw2 | Yes | No¹ | Yes | No | Yes |
+
+> ¹ **TIFF-based containers are read-only.** `Write` and `WriteFile` return `ErrWriteNotSupported` for TIFF, CR2, NEF, ARW, DNG, ORF, and RW2. Writing into these formats requires relocating embedded image-data offsets (strip/tile pointers) — a structural rewrite tracked on the roadmap. Reading is fully supported for all seven. Use `format.SupportsWrite(id)` to check programmatically.
 
 ## Performance
 
