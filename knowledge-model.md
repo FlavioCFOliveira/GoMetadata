@@ -1,0 +1,208 @@
+# Knowledge Model — GoMetadata
+
+This file is the authoritative description of the project's knowledge graph (a Label
+Property Graph stored in `rmp graph`, roadmap `gometadata`). **The file and the graph must
+mirror each other** — whenever a new label, edge type, or property is introduced, update
+both in the same step.
+
+- **Provenance**: every node **and** edge carries `gitCommit` (full hash of the commit when
+  the element was last confirmed) and `gitDate` (ISO date, e.g. `2026-06-01`).
+- **Granularity decision**: the project has 1026 tests and 1000 exported functions. These are
+  **not** modeled one-node-each (that would be noise). Tests live as a `testCount` property on
+  `Package` (individual `Test` nodes exist only when a test verifies a tracked `Feature`).
+  Functions are modeled only for the public API surface. Benchmarks and fuzz targets *are*
+  modeled individually — they are bounded (60 / 27) and security/performance-relevant.
+- **Source of truth**: files are ground truth. On a graph/file mismatch, trust the files,
+  fix the graph, and note the discrepancy.
+
+---
+
+## Node labels (10)
+
+| Label | Key | Count* | Properties |
+|---|---|---|---|
+| `Package` | `name` | 43 | `name, path, module, layer, description, testCount, entryReachable, gitCommit, gitDate` |
+| `File` | `path` | 75 | `path, name, package, gitCommit, gitDate` |
+| `Type` | `name`+`package` | 34 | `name, package, file, kind, exported, gitCommit, gitDate` |
+| `Function` | `name`+`package` | 11 | `name, package, file, signature, kind, gitCommit, gitDate` |
+| `Feature` | `name` | 34 | `name, description, domain, package, file, spec_ref, type, commit_introduced, commit_fixed, gitCommit, gitDate` |
+| `FuzzTarget` | `name` | 27 | `name, package, file, gitCommit, gitDate` |
+| `Benchmark` | `name` | 60 | `name, package, file, gitCommit, gitDate` |
+| `Spec` | `name` | 9 | `name, standard, ref, domain, gitCommit, gitDate` |
+| `Commit` | `hash` | 12 | `hash, short_hash, message, author, date, scope, gitCommit, gitDate` |
+| `Test` | `name` | ~4 | `name, package, file, type, description, commit_introduced, gitCommit, gitDate` |
+
+\* approximate at bootstrap (`402a067`, 2026-06-01).
+
+### `layer` values for `Package`
+`entry` (root `gometadata`) · `exif` · `makernote` · `format` · `format-container`
+(jpeg/png/webp/heif/tiff) · `format-raw` (arw/cr2/cr3/dng/nef/orf/rw2) · `internal` ·
+`example`.
+
+### `domain` values for `Feature` / `Spec`
+`exif` · `iptc` · `xmp` · `container` · `api` · `hardening`.
+
+### `entryReachable` on `Package` (boolean)
+Computed from the graph's own `DEPENDS_ON` edges: `true` if the package is the entry
+(`gometadata`) or transitively imported by it; `false` otherwise. At `402a067`: 20 `true`,
+23 `false` (8 `example` alternate-entry packages + the 12-package `exif/makernote` dead
+subtree + 3 `internal` orphans). Query the dead/unused code with
+`MATCH (p:Package {entryReachable:false}) WHERE p.layer <> 'example' RETURN p.name`.
+
+---
+
+## Edge types (10)
+
+**Structural**
+
+| Type | Pattern | Meaning |
+|---|---|---|
+| `PART_OF` | `Package → Package` | directory/structural nesting (e.g. `exif/makernote → exif`) |
+| `DEPENDS_ON` | `Package → Package` | Go import dependency (intra-module only) |
+| `CONTAINS` | `Package → {File, Feature, Type, Function, FuzzTarget, Benchmark}` | package owns the element |
+| `DEFINES` | `File → {Type, Function}` | file declares the type/function |
+
+**Semantic**
+
+| Type | Pattern | Meaning |
+|---|---|---|
+| `COMPLIES_WITH` | `Feature → Spec` | feature implements/conforms to a standard |
+| `FUZZES` | `FuzzTarget → {Package, Feature}` | robustness surface under test |
+| `TESTS` | `Test → {Feature, Package}` | test verifies the target |
+| `HAS_TEST` | `Package → Test` | package owns the (feature-linked) test |
+| `INTRODUCED` | `Commit → Feature` | commit that introduced the feature |
+| `FIXED` | `Commit → Feature` | commit that fixed/hardened the feature |
+
+---
+
+## Notable structural facts (at `402a067`)
+
+- The **root package is the dispatcher**: it imports every container/format package
+  (`exif`, `format`, `format/{jpeg,png,webp,heif,tiff}`, `format/raw/*`, `iptc`, `xmp`,
+  `internal/metaerr`) and reconciles results into the unified `Metadata`.
+- `format` itself only does container **detection** (`FormatID`, `Container`,
+  `SupportsWrite`); per-format extraction lives in the subpackages.
+- TIFF-based RAW formats (`arw, cr2, dng, nef, orf, rw2`) `DEPENDS_ON` `format/tiff`, which
+  `DEPENDS_ON` `exif`. `cr3` is **self-contained** (BMFF parsed inline; depends on no
+  intra-module package).
+- **Orphan internal packages** (no intra-module importers at bootstrap):
+  `internal/bmff`, `internal/byteorder`, `internal/testutil`. HEIF/CR3 inline their own
+  BMFF parsing; code uses `encoding/binary` directly. Flagged as potential dead code — kept
+  in the graph as `Package` nodes with no inbound `DEPENDS_ON`.
+- **`exif/makernote` subtree is a parallel, unimported implementation.** No package imports
+  `exif/makernote`; it is **unreachable from the entry package** (verified by DEPENDS_ON
+  reachability). The live MakerNote dispatch is an inline table (`makerNoteParsers`) in
+  `exif/makernote_parse.go` within the `exif` package. The `exif/makernote/*` tree (dispatch
+  + 11 vendor `Parser` packages) is exercised by its own tests only. The whitespace-trim fix
+  exists in **both** paths (`exif/makernote_parse.go:67` and `exif/makernote/dispatch.go:62`).
+  Net: 15 of 43 packages (the makernote subtree + 3 internal orphans) are not reachable from
+  the public API entry point.
+
+---
+
+## Maintenance
+
+- **Post-commit sync**: `git diff --name-only HEAD~1 HEAD`; for each changed file, update its
+  `File` node's provenance, MERGE new nodes, DETACH DELETE removed ones, and bump the
+  provenance of touched `Feature`/`Package` nodes.
+- **Hygiene**: label-less or orphaned nodes are data-quality bugs —
+  `MATCH (n) WHERE size(labels(n)) = 0 RETURN count(n)` must return 0.
+
+---
+
+## Bootstrap result (2026-06-01, commit `402a067`)
+
+Materialized **296 nodes, 422 edges**; zero label-less nodes, zero nodes missing provenance.
+
+| Label | n | | Label | n |
+|---|---|---|---|---|
+| File | 75 | | FuzzTarget | 26 |
+| Benchmark | 60 | | Function | 11 |
+| Package | 43 | | Spec | 9 |
+| Type | 34 | | Commit | 5 |
+| Feature | 29 | | Test | 4 |
+
+Edges: `CONTAINS` 235 · `DEPENDS_ON` 50 · `DEFINES` 45 · `FUZZES` 26 · `PART_OF` 24 ·
+`COMPLIES_WITH` 26 · `TESTS` 7 · `HAS_TEST` 4 · `FIXED` 3 · `INTRODUCED` 2.
+
+Accepted orphans: 4 `Commit` nodes (release/history commits not tied to a single tracked
+feature — linking them would be fabrication).
+
+---
+
+## Update — Sprint 8 hardening battery (2026-06-03, commits `dcc23f7`..`af1c9e0`)
+
+Sprint 8 (test-hardening battery, now CLOSED) raised coverage and closed several DoS/robustness
+gaps across the Tier 1/2 critical packages. Graph after this update: **309 nodes, 428 edges**
+(was 296 / 422); zero label-less nodes; every Sprint-8 commit present exactly once.
+
+**Provenance + `testCount` bumped** on the 7 touched `Package` nodes (and the 7 changed
+production `File` nodes):
+
+| Package | testCount (was → now) | confirmed at |
+|---|---|---|
+| `internal/iobuf` | 8 → 21 | `dcc23f7` (2026-06-02) |
+| `exif` | 201 → 216 | `b26f020` (2026-06-02) |
+| `format/tiff` | 17 → 38 | `d79db96` (2026-06-02) |
+| `gometadata` | 109 → 130 | `236acb5` (2026-06-03) |
+| `xmp` | 70 → 108 | `2330d74` (2026-06-03) |
+| `iptc` | 51 → 74 | `3f5768e` (2026-06-03) |
+| `format/jpeg` | 43 → 84 | `af1c9e0` (2026-06-03) |
+
+**New nodes**: 7 `Commit` (the Sprint-8 commits), 5 `Feature` (domain `hardening`), 1
+`FuzzTarget` (`FuzzRead`, the root end-to-end target; total fuzz targets 26 → 27).
+
+**New hardening `Feature` nodes** (each linked `Commit -[:FIXED]-> Feature`):
+
+| Feature `id` | package | commit_fixed |
+|---|---|---|
+| `feat:iobuf:pool_safety_caps` | `internal/iobuf` | `dcc23f7` |
+| `feat:tiff:bigtiff_magic_gate` | `format/tiff` | `d79db96` |
+| `feat:xmp:document_size_cap` | `xmp` | `2330d74` |
+| `feat:iptc:encode_receiver_purity` | `iptc` | `3f5768e` |
+| `feat:jpeg:extended_xmp_guid_cap` | `format/jpeg` | `af1c9e0` |
+
+`236acb5 -[:INTRODUCED]-> (FuzzTarget FuzzRead)`. Edge totals: `FIXED` 3 → 8, `INTRODUCED` 2 → 3.
+
+**Incremental-edge compromise** (consequence of engine constraint #2 below): the 5 new
+`Feature` nodes and the `FuzzRead` `FuzzTarget` were attached to their owning packages via the
+`package` **property**, not a `CONTAINS`/`FUZZES` edge — heterogeneous edges to pre-existing
+nodes cannot be added via `MATCH`+`MERGE`, and a single-`CREATE` form would duplicate the
+existing `Package` node. Query these by property, e.g.
+`MATCH (f:Feature {package:'xmp', domain:'hardening'}) RETURN f.name`. A future full rebuild
+would restore the structural edges. The `Commit -[:FIXED/INTRODUCED]-> {Feature,FuzzTarget}`
+edges WERE created (both endpoints new, via the single-`CREATE` working pattern).
+
+**Orphan commit**: `b26f020` (exif test-only commit) is tracked as a `Commit` node with no
+feature edge — it added tests/fuzz seeds without a production-code feature. Accepted orphans
+are now 5.
+
+**Transversal Sprint-8 outcomes** (not modelled as nodes; recorded here): the CI workflow
+gained a `fuzz` job running 6 targets (`FuzzRead`, `FuzzParseEXIF`, `FuzzParseIPTC`,
+`FuzzParseXMP`, `FuzzJPEGExtract`, `FuzzHEIFExtract`) at 10s `-race` each; the final
+security-auditor pass cleared the sprint with **no MEDIUM+ findings open** and a bounded
+aggregate memory model (~336 MiB worst-case for an adversarial ~260 MiB JPEG). Backlog `#54`
+(full BigTIFF read support) was opened to track the deferred scope from `feat:tiff:bigtiff_magic_gate`.
+
+---
+
+## ⚠️ Engine constraints — Groadmap `rmp graph` v1.6.0 (READ BEFORE MUTATING)
+
+Discovered empirically during bootstrap. Violating these corrupts the store:
+
+1. **NEVER run unfiltered `MATCH (n) DETACH DELETE n`.** It does not delete nodes — it
+   *strips their labels and properties*, leaving undeletable ghost records and corrupting the
+   append-only WAL. Any `DELETE` carries WAL-corruption risk; prefer a full rebuild.
+2. **Heterogeneous edges cannot be added between pre-existing nodes.**
+   `MATCH (a:LabelA …) MATCH (b:LabelB …) MERGE (a)-[:R]->(b)` silently creates **0** edges
+   when `LabelA ≠ LabelB` (every MATCH form tested). It works only for **same-label**
+   endpoints (e.g. `Package`→`Package`, used for `PART_OF`/`DEPENDS_ON`).
+3. **Working pattern for heterogeneous edges**: a single `CREATE` declaring *both* endpoint
+   nodes as variables and the edge between them. The whole connected graph is therefore built
+   as one ~75 KB `CREATE` produced by the regenerator (kept at `/tmp/gen_kg.py` during the
+   bootstrap session).
+4. **Guard rails**: `create` accepts only `CREATE`/`MERGE` (no `SET`; no pattern predicates in
+   `WHERE`); `update` only `SET`/`REMOVE`; `delete` only `DELETE`/`DETACH DELETE`.
+5. **Full-rebuild recipe**: reset the WAL (`mv ~/.roadmaps/gometadata/graph/wal` aside so
+   `rmp` recreates an empty store), run the mega-`CREATE`, then add the same-label
+   `PART_OF`/`DEPENDS_ON` edges via `MATCH`+`MERGE`.
