@@ -186,6 +186,32 @@ aggregate memory model (~336 MiB worst-case for an adversarial ~260 MiB JPEG). B
 
 ---
 
+## Update — Sprint 9: production-readiness doc corrections (2026-06-03)
+
+A production-readiness re-assessment (commit `84993f0` baseline) returned **APTO COM
+CONDIÇÕES**: build/vet/lint/staticcheck/govulncheck clean, 83.6% coverage, 27 fuzz targets
+(~120M execs, 0 crashers), race-clean, single indirect dependency (`golang.org/x/text`),
+zero open MEDIUM+ security findings, and a performance profile meeting the ultra-performance
+goal (zero-alloc hot paths confirmed). The one blocking condition was a **documentation
+defect**, fixed in Sprint 9 (task #55):
+
+- The code was already faithful — the write gate (`write.go:88`), `format.SupportsWrite`
+  (`format/format.go:66`), `doc.go` and `ErrWriteNotSupported` all correctly report that the
+  7 TIFF-based containers (TIFF, CR2, NEF, ARW, DNG, ORF, RW2) are read-only.
+- Only the docs diverged: `README.md` (Supported formats Write column `Yes`→`No¹` for those 7
+  + footnote; feature rows; fuzz count `18`→`27`) and `CHANGELOG.md` (the `[1.0.0]` "read and
+  write" bullet). Now every format's documented Write capability matches `format.SupportsWrite`.
+
+Deferred (tracked, not done): full RAW/TIFF write support (epic `#33`), an optional
+`WithMaxInputBytes` guard (LOW), removal of the unreachable `exif/makernote/*` duplicate
+subtree (LOW tech-debt), and per-MakerNote / ORF / RW2 / CR3 benchmark gaps (LOW).
+
+Graph delta: +2 orphan `Commit` nodes (the `docs:` fidelity fix `348704c` and this model-sync
+commit). `Commit` 12 → 14; accepted orphans 5 → 7. **No new labels, edge types, or
+properties** — the graph shape is unchanged.
+
+---
+
 ## ⚠️ Engine constraints — Groadmap `rmp graph` v1.6.0 (READ BEFORE MUTATING)
 
 Discovered empirically during bootstrap. Violating these corrupts the store:
