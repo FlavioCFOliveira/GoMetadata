@@ -6,6 +6,38 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-06-03
+
+### Added
+
+- **`tiff.ErrUnsupportedMagic`**: new exported sentinel error returned when the TIFF parser encounters a BigTIFF magic number (`0x002B`). Previously the library silently misidentified BigTIFF files as ordinary TIFF; now callers can detect and handle this case explicitly with `errors.Is(err, tiff.ErrUnsupportedMagic)`.
+- **`xmp.ErrDocumentTooLarge`**: new exported sentinel error returned when an XMP document exceeds the `maxXMPDocumentBytes` input cap (16 MiB, compile-time constant). Callers can use `errors.Is` to distinguish this condition from malformed-XML errors.
+- **`FuzzRead`**: end-to-end fuzz target at the top-level package (`FuzzRead`) that drives the full `Read` orchestrator with arbitrary input. This joins 26 existing fuzz targets for a total of 27.
+- **CI fuzz job**: a new `fuzz` CI job runs 6 fuzz targets for 10 seconds each under `-race`, catching regressions on every pull request.
+- **FormatCapability knowledge-graph matrix**: the format capability matrix (which combinations of format and operation are supported) is now recorded in the project knowledge graph (the `FormatCapability` matrix mirroring `format.SupportsWrite`).
+
+### Changed
+
+- **JPEG ExtendedXMP GUID cap**: the JPEG parser now caps the number of distinct ExtendedXMP GUIDs at 4 per file during reassembly of multi-segment ExtendedXMP payloads (each GUID is itself capped at 16 MiB, giving a 64 MiB aggregate ceiling). Excess GUIDs beyond the fourth are dropped and the reassembled payload is marked truncated, preventing memory exhaustion from crafted multi-segment JPEGs without aborting the parse.
+- **Write-support documentation corrected**: README, CHANGELOG, SECURITY.md, and `doc.go` now precisely state that `Write` is supported for JPEG, PNG, WebP, HEIF/AVIF, and Canon CR3. TIFF-based containers (TIFF, CR2, NEF, ARW, DNG, ORF, RW2) are read-only; `Write` returns `ErrWriteNotSupported` for those formats.
+- **`go.mod`**: `golang.org/x/text` reclassified as a direct dependency (the `// indirect` annotation removed by `go mod tidy`).
+- **Test coverage**: +207 tests added since v1.0.4. New tests cover EXIF/TIFF adversarial fuzz seeds, the `internal/iobuf` buffer pool (race, contamination, and DoS scenarios), and the top-level read orchestrator.
+
+### Fixed
+
+- **`iptc.Encode` receiver mutation** (`iptc/iptc.go`): `Encode` previously appended the IPTC 1:90 UTF-8 `CodedCharacterSet` marker directly to the receiver's `Records[0]` slice when emitting non-ASCII content, mutating shared state and creating a data race under concurrent `Write` calls. The fix emits the 1:90 declaration to the encoded output only (via the existing `needsUTF8Declaration` path); the receiver is now pure and idempotent.
+- **`internal/iobuf` pool hardening** (`internal/iobuf/iobuf.go`): `Get(n)` now clamps negative `n` to zero instead of passing it to `make`, which would have panicked. `Put` now discards buffers whose capacity exceeds the large-tier canonical cap (`largeSize = 65536`) rather than returning them, preventing unbounded pool growth from adversarially crafted payloads.
+- **DoS caps and write determinism** (`exif`, `iptc`, `xmp`, `format/jpeg`): follow-up fixes from the Sprint 8 re-audit — additional byte-count caps on IFD entry aggregation, IPTC dataset aggregation, and XMP attribute accumulation; deterministic output ordering for EXIF and IPTC write paths.
+- **Untrusted-input crash sites** (`exif`, `iptc`, `xmp`, `format/*`): elimination of the remaining nil-dereference and out-of-bounds-slice-index paths reachable from attacker-controlled binary data identified in the Sprint 8 audit.
+
+### Security
+
+- **XMP document-level input cap** (`xmp/`): introduced `maxXMPDocumentBytes` (16 MiB, compile-time constant) as a hard ceiling on the total UTF-8 bytes accepted by a single XMP parse (checked post-normalisation, before the RDF scan). Exceeding the cap returns `xmp.ErrDocumentTooLarge` without allocating further memory, preventing memory-exhaustion attacks from crafted XMP payloads (CWE-400).
+- **TIFF/BigTIFF discrimination** (`format/tiff/`): the TIFF parser now reads the magic word and immediately returns `tiff.ErrUnsupportedMagic` for BigTIFF (`0x002B`). Previously the parser would misinterpret BigTIFF offsets as TIFF-6 offsets and could seek to arbitrary positions in the file or allocate large intermediate buffers (CWE-125, CWE-400).
+- **JPEG ExtendedXMP GUID cap** (`format/jpeg/`): the parser caps distinct ExtendedXMP GUIDs at 4 per file (each GUID itself capped at 16 MiB, giving a 64 MiB aggregate ceiling); excess GUIDs are dropped and the result marked truncated, preventing memory exhaustion from crafted multi-segment JPEGs (CWE-400).
+- **`iptc.Encode` data race eliminated** (`iptc/`): the receiver-mutation bug described under Fixed was also a data-race vulnerability under concurrent use; the fix eliminates the race without API change (CWE-362).
+- **`internal/iobuf` pool hardening** (`internal/iobuf/`): the `Get(n<0)` panic path and the oversized-buffer pool-retention path are both closed, removing two crash/memory-exhaustion vectors reachable from attacker-controlled input sizes (CWE-400, CWE-476).
+
 ## [1.0.4] - 2026-04-08
 
 ### Added
@@ -123,7 +155,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ---
 
-[Unreleased]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.0.4...HEAD
+[Unreleased]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.0.4...v1.1.0
 [1.0.4]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.0.1...v1.0.2
