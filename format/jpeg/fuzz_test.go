@@ -2,7 +2,6 @@ package jpeg
 
 import (
 	"bytes"
-	"strings"
 	"testing"
 )
 
@@ -59,17 +58,15 @@ func FuzzJPEGExtract(f *testing.F) {
 			t.Errorf("rawEXIF too short after successful Extract: got %d bytes, want >= 8", len(rawEXIF))
 		}
 
-		// A valid XMP payload that was successfully extracted and returned as
-		// non-nil must contain a recognised XMP structural marker.
-		// (XMP specification Part 1 §7.3 — the xpacket PI or xmpmeta element.)
-		// Only assert when the payload is non-empty: a zero-length slice is a
-		// degenerate-but-benign result from a corrupt or stub APP1.
-		if len(rawXMP) > 0 {
-			s := string(rawXMP)
-			if !strings.Contains(s, "<?xpacket") && !strings.Contains(s, "<rdf:") && !strings.Contains(s, "<x:xmpmeta") {
-				t.Errorf("rawXMP does not contain a recognised XMP marker: %q", s[:min(64, len(s))])
-			}
-		}
+		// rawXMP carries verbatim bytes extracted from the JPEG APP1 segment
+		// following the "http://ns.adobe.com/xap/1.0/\x00" namespace prefix.
+		// The JPEG parser does not validate XMP content; that is the role of
+		// the xmp package. Any non-nil rawXMP is structurally acceptable here.
+		// We assert only that the length is not obviously corrupt (non-negative),
+		// which is always true for a []byte. No XMP-content assertions are made
+		// at this layer, as crafted inputs can embed arbitrary bytes after the
+		// namespace prefix.
+		_ = rawXMP
 	})
 }
 

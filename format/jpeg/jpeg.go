@@ -67,11 +67,20 @@ var identPS = []byte("Photoshop 3.0\x00") //nolint:gochecknoglobals // package-l
 // untrusted JPEG stream would allow a ~268 MiB memory exhaustion attack (#40).
 // 16 MiB is generous for any real-world extended XMP use (Google Cardboard depth
 // maps, panorama metadata) while bounding worst-case allocation to a safe level.
+//
+// maxExtendedXMPGUIDs: maximum number of distinct GUID keys accumulated in the
+// extended map during a single Extract call. Adobe XMP Specification Part 3
+// §1.1.3.1 states that a conforming file carries extended XMP under exactly ONE
+// GUID per file. Accepting N distinct GUIDs each up to maxExtendedXMPTotal bytes
+// would allow an adversary to aggregate N × 16 MiB of memory (e.g. 100 GUIDs →
+// 1.6 GiB). We cap at 4 — four times the spec-mandated 1 — to be permissive with
+// non-conforming files while bounding worst-case memory to 64 MiB.
 const (
 	maxAPP1Payload      = 65533               // 65535 − 2 (length field)
 	maxXMPPayload       = maxAPP1Payload - 29 // − len(identXMP)
 	maxExtChunkSize     = maxAPP1Payload - 75 // − len(identXMPNote)+GUID+fullLen+offset overhead
 	maxExtendedXMPTotal = 16 << 20            // 16 MiB aggregate cap per GUID (#40 DoS mitigation)
+	maxExtendedXMPGUIDs = 4                   // cap on distinct GUIDs per file (spec: 1; we allow 4)
 )
 
 // xmpWireMagic is the 8-byte magic that identifies an XMP wire-frame payload.
@@ -164,9 +173,19 @@ func appendExtendedXMPChunk(
 		extSizes = make(map[string]uint64)
 	}
 
-	// First-seen check: validate the declared total against the cap.
-	// If it exceeds the cap, blacklist the GUID and mark truncated.
+	// First-seen check: validate the declared total against the cap and enforce
+	// the per-file GUID count cap.
+	//
+	// Adobe XMP Specification Part 3 §1.1.3.1: a conforming file uses exactly
+	// one GUID. We allow up to maxExtendedXMPGUIDs (4) to tolerate non-conforming
+	// files without permitting unbounded memory growth: an adversary crafting a
+	// JPEG with many distinct GUIDs (each up to maxExtendedXMPTotal bytes) could
+	// otherwise aggregate far beyond 16 MiB of allocations.
 	if _, seen := extSizes[guid]; !seen {
+		if len(extSizes) >= maxExtendedXMPGUIDs {
+			// Too many distinct GUIDs: stop accumulating and mark truncated.
+			return extended, extSizes, true // extTruncated
+		}
 		if fullLen > maxExtendedXMPTotal {
 			return extended, extSizes, true // extTruncated
 		}
