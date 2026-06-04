@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
 )
@@ -129,7 +130,17 @@ func buildUpdatedTIFF(base []byte, rawIPTC, rawXMP []byte) ([]byte, error) {
 	return updated, nil
 }
 
-// upsertIFD0Entry adds or replaces an entry in ifd for the given tag.
+// upsertIFD0Entry adds or replaces an entry in ifd for the given tag while
+// maintaining the sorted-by-tag invariant required by IFD.Get (binary search).
+//
+// TIFF 6.0 §7: each tag in an IFD must appear exactly once and entries must be
+// stored in ascending tag order. Violating this invariant causes filterEntries'
+// binary search to misidentify present tags as absent, producing duplicate
+// entries in the re-encoded output.
+//
+// Implementation: binary search locates the insertion point in O(log n).
+// Replace in-place when the tag already exists; otherwise slices.Insert places
+// the new entry at the correct sorted position in O(n) (one memmove).
 func upsertIFD0Entry(ifd *exif.IFD, tag exif.TagID, typ exif.DataType, value []byte) {
 	entry := exif.IFDEntry{
 		Tag:   tag,
@@ -137,13 +148,30 @@ func upsertIFD0Entry(ifd *exif.IFD, tag exif.TagID, typ exif.DataType, value []b
 		Count: uint32(len(value)), //nolint:gosec // G115: IFD value length bounded by input
 		Value: value,
 	}
-	for i, e := range ifd.Entries {
-		if e.Tag == tag {
-			ifd.Entries[i] = entry
-			return
+
+	// Binary search for the insertion point. Entries are expected to be sorted
+	// (parseSingleIFD calls sortEntries; prior upsertIFD0Entry calls maintain
+	// the invariant after this fix).
+	n := len(ifd.Entries)
+	lo, hi := 0, n
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if ifd.Entries[mid].Tag < tag {
+			lo = mid + 1
+		} else {
+			hi = mid
 		}
 	}
-	ifd.Entries = append(ifd.Entries, entry)
+	i := lo
+
+	if i < n && ifd.Entries[i].Tag == tag {
+		// Replace existing entry in-place; sorted order is preserved.
+		ifd.Entries[i] = entry
+		return
+	}
+	// Insert at position i to maintain sorted order.
+	// slices.Insert is O(n) (one memmove) vs. append-then-sort O(n log n).
+	ifd.Entries = slices.Insert(ifd.Entries, i, entry)
 }
 
 // byteOrder determines the TIFF byte order from the first 2 bytes.

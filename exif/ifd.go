@@ -298,9 +298,21 @@ func (e *IFDEntry) Uint32() uint32 {
 }
 
 // Rational decodes the i-th RATIONAL value as [numerator, denominator].
-// Returns [0, 0] on out-of-range access.
+// Returns [2]uint32{} when the entry type is not TypeRational or the index is
+// out of range.
+//
+// EXIF 2.32 CIPA DC-008-2023 §4.6.3: RATIONAL and SRATIONAL are distinct types
+// with different sign semantics. Rational() accepts only TypeRational (unsigned
+// numerator and denominator). For TypeSRational entries — such as
+// ExposureBiasValue (0x9204), ShutterSpeedValue (0x9201), and BrightnessValue
+// (0x9203) — use SRational() instead, which performs the correct int32
+// bit-reinterpretation. Calling Rational() on a TypeSRational entry would
+// silently return the two's-complement bit-pattern of a negative int32 as a
+// large uint32 (e.g. −2 → 4294967294).
 func (e *IFDEntry) Rational(i int) [2]uint32 {
-	if e.Type != TypeRational && e.Type != TypeSRational {
+	// EXIF 2.32 CIPA DC-008-2023 §4.6.3: only TypeRational is accepted here.
+	// TypeSRational is intentionally excluded; callers must use SRational().
+	if e.Type != TypeRational {
 		return [2]uint32{}
 	}
 	off := i * 8
@@ -496,8 +508,21 @@ func sortEntries(entries []IFDEntry) {
 
 // ifdTotalSize returns the total bytes occupied by the serialised IFD block:
 // 2 (entry count) + len(entries)*12 (entry list) + 4 (next-IFD pointer) + value area.
+//
+// Accumulation is performed in uint64 to avoid uint32 wrap-around when an
+// IFDEntry has a manually-constructed Count value close to math.MaxUint32
+// (e.g. Count=0xFFFFFFFF, TypeRational gives a value area of ~34 GiB).
+// If the true size would exceed math.MaxUint32, the function returns
+// math.MaxUint32 (saturated). This prevents the caller (writeTIFFHeader,
+// computeIFDOffsets) from using a falsely small size to pre-allocate buffers
+// or compute sub-IFD offsets, which would produce silently corrupt output.
+//
+// Note: parsed IFDs are bounded by their input buffer (JPEG APP1 ≤ 65533 bytes;
+// TIFF limited by file size) so overflow can only occur when the caller manually
+// constructs an IFD with an extreme Count value.
 func ifdTotalSize(entries []IFDEntry) uint32 {
-	sz := uint32(2 + len(entries)*12 + 4) //nolint:gosec // G115: IFD size bounded by validated entry count
+	// Use uint64 throughout to avoid wrap-around on extreme Count values.
+	sz := uint64(2 + len(entries)*12 + 4)
 	for _, e := range entries {
 		ts := typeSize(e.Type)
 		if ts == 0 {
@@ -505,10 +530,16 @@ func ifdTotalSize(entries []IFDEntry) uint32 {
 		}
 		total := uint64(ts) * uint64(e.Count)
 		if total > 4 {
-			sz += uint32(total) //nolint:gosec // G115: total is bounded by IFD size constraints
+			sz += total
+			// Saturate at MaxUint32 rather than wrapping. Any value above
+			// MaxUint32 cannot be represented in a 32-bit TIFF stream; callers
+			// that see MaxUint32 must treat the IFD as un-encodable.
+			if sz > math.MaxUint32 {
+				return math.MaxUint32
+			}
 		}
 	}
-	return sz
+	return uint32(sz) //nolint:gosec // G115: sz <= MaxUint32 is enforced by the saturation check above
 }
 
 // writeIFD appends the serialised IFD block to out and returns the extended slice.
