@@ -3,6 +3,7 @@ package tiff
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"testing"
 )
 
@@ -115,5 +116,110 @@ func FuzzTIFFExtract(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic regardless of input.
 		_, _, _, _ = Extract(bytes.NewReader(data))
+	})
+}
+
+// FuzzTIFFInject feeds arbitrary bytes as the source TIFF container and asserts
+// that Inject never panics — it must return an error or write valid output,
+// never crash.
+//
+// The TIFF Inject path calls exif.Parse (and therefore the IFD traversal cycle
+// guard and all field-width arithmetic) whenever rawIPTC or rawXMP is non-nil.
+// Seeds cover the key structural variations that stress the write path:
+//   - valid LE/BE TIFF headers so Inject can reach the exif.Parse call
+//   - cyclic IFD chains (exercises cycle-detection in exif.traverse)
+//   - truncated inputs (exercises early-return error paths)
+//   - BigTIFF (exercises the unsupported-magic rejection path)
+//
+// Note: the top-level gometadata.Write gates TIFF-based camera formats behind
+// ErrWriteNotSupported. tiff.Inject itself does not return that error; it
+// processes the call and either succeeds or returns a parse/encode error.
+// The fuzz target exercises tiff.Inject directly so the write logic is covered
+// regardless of the top-level gate.
+func FuzzTIFFInject(f *testing.F) {
+	// Seed 1: minimal LE TIFF with 0 entries — Inject with IPTC/XMP must call
+	// exif.Parse and succeed (empty IFD0, no cycle, valid header).
+	minLE := buildMinimalTIFF(binary.LittleEndian,
+		[]byte("fuzz-iptc-seed"),
+		[]byte("<xmpmeta/>"),
+	)
+	f.Add(minLE)
+
+	// Seed 2: minimal BE TIFF — exercises big-endian parsing in exif.Parse.
+	minBE := buildMinimalTIFF(binary.BigEndian,
+		[]byte("fuzz-iptc-be"),
+		[]byte("<xmpmeta be='1'/>"),
+	)
+	f.Add(minBE)
+
+	// Seed 3: empty input — exercises ErrFileTooShort path.
+	f.Add([]byte{})
+
+	// Seed 4: truncated header — 4 bytes (valid byte-order mark, no magic/offset).
+	f.Add([]byte{'I', 'I', 0x2A, 0x00})
+
+	// Seed 5: cyclic IFD chain — exercises the cycle-detection guard in
+	// exif.traverse when Inject triggers exif.Parse.
+	f.Add(buildCyclicIFDTIFF())
+
+	// Seed 6: multi-page TIFF (IFD chain) — exercises IFD traversal with IPTC
+	// in IFD0 and XMP in IFD1 (IFD1 payload is not extracted by tiff.Extract).
+	f.Add(buildMultiPageTIFF(
+		[]byte("iptc-fuzz-inject-seed"),
+		[]byte("<xmpmeta inject='1'/>"),
+	))
+
+	// Seed 7: BigTIFF LE — exercises the ErrUnsupportedMagic rejection path
+	// (magic 0x002B) inside Inject → buildUpdatedTIFF → exif.Parse.
+	bigTIFFLE := make([]byte, 16)
+	bigTIFFLE[0], bigTIFFLE[1] = 'I', 'I'
+	binary.LittleEndian.PutUint16(bigTIFFLE[2:], 0x002B) // BigTIFF magic
+	binary.LittleEndian.PutUint16(bigTIFFLE[4:], 8)
+	binary.LittleEndian.PutUint16(bigTIFFLE[6:], 0)
+	binary.LittleEndian.PutUint64(bigTIFFLE[8:], 16)
+	f.Add(bigTIFFLE)
+
+	// Seed 8: TIFF with max-value count entry — exercises overflow guards in
+	// exif.Parse field-width arithmetic.
+	{
+		buf := make([]byte, 26)
+		buf[0], buf[1] = 'I', 'I'
+		binary.LittleEndian.PutUint16(buf[2:], 0x002A)
+		binary.LittleEndian.PutUint32(buf[4:], 8)
+		binary.LittleEndian.PutUint16(buf[8:], 1)
+		binary.LittleEndian.PutUint16(buf[10:], 0x83BB) // IPTC tag
+		binary.LittleEndian.PutUint16(buf[12:], 7)      // UNDEFINED
+		binary.LittleEndian.PutUint32(buf[14:], 0xFFFFFFFF)
+		binary.LittleEndian.PutUint32(buf[18:], 0xFFFFFFFF)
+		f.Add(buf)
+	}
+
+	// Seed 9: valid LE TIFF with IFD0 offset == 0x80000000 — exercises the
+	// uint64 bounds guard in the IFD-offset reader (task #74 regression seed).
+	{
+		buf := make([]byte, 8)
+		buf[0], buf[1] = 'I', 'I'
+		binary.LittleEndian.PutUint16(buf[2:], 0x002A)
+		binary.LittleEndian.PutUint32(buf[4:], 0x80000000)
+		f.Add(buf)
+	}
+
+	// Fixed metadata payloads used for all fuzz iterations. The fuzzer varies
+	// the container bytes; the IPTC/XMP payloads are kept short and constant
+	// so that Inject reaches exif.Parse on every iteration.
+	rawIPTC := []byte("fuzz-iptc-data")
+	rawXMP := []byte("<xmpmeta/>")
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		// Must not panic regardless of input. Inject must return an error or
+		// write valid output — a panic is always a bug in the write path.
+		//
+		// Pass data as both the reader (source container) and as rawEXIF so that
+		// Inject uses the fuzz-controlled bytes as the base TIFF to parse.
+		// When rawIPTC and rawXMP are non-nil, Inject calls exif.Parse on the
+		// base, which exercises the full IFD traversal, cycle detection, and
+		// field-width arithmetic.
+		err := Inject(bytes.NewReader(data), io.Discard, data, rawIPTC, rawXMP, true)
+		_ = err
 	})
 }
