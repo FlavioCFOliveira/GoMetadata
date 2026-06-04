@@ -1108,6 +1108,15 @@ func readSegment(r io.Reader, scratch *[]byte) (marker byte, data []byte, err er
 
 	need := length - 2
 	if need > len(*scratch) {
+		// Return the current pooled buffer before overwriting *scratch so it is
+		// not orphaned. Assigning *scratch to a local variable and taking its
+		// address causes the variable to escape to the heap (sync.Pool stores
+		// the pointer externally), which makes the Put safe: the pool holds a
+		// valid reference to the old backing array until the next Get recycles it.
+		// Without this Put the original 4096-byte pooled buffer is silently
+		// abandoned, depleting the pool under sustained load. (#77)
+		old := *scratch
+		iobuf.Put(&old)
 		*scratch = make([]byte, need)
 	}
 	data = (*scratch)[:need]
