@@ -153,9 +153,11 @@ func TestSupportsWrite(t *testing.T) {
 
 	// SPIKE #6 / B2: TIFF-based formats are blocked until roadmap Option A
 	// (epic #33) is implemented. SupportsWrite must return false for them.
+	// CR3 is also blocked (task #56): stco/co64 offset relocation not yet
+	// implemented; see cr3.ErrWriteNotSupported.
 	writable := []format.FormatID{
 		format.FormatJPEG, format.FormatPNG, format.FormatHEIF,
-		format.FormatWebP, format.FormatCR3, format.FormatAVIF,
+		format.FormatWebP, format.FormatAVIF,
 	}
 	for _, f := range writable {
 		if !format.SupportsWrite(f) {
@@ -164,7 +166,7 @@ func TestSupportsWrite(t *testing.T) {
 	}
 
 	notWritable := []format.FormatID{
-		format.FormatTIFF, format.FormatCR2, format.FormatNEF,
+		format.FormatTIFF, format.FormatCR2, format.FormatCR3, format.FormatNEF,
 		format.FormatARW, format.FormatDNG, format.FormatORF, format.FormatRW2,
 		format.FormatUnknown,
 	}

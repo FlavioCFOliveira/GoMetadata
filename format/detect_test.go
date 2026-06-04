@@ -292,13 +292,18 @@ func TestRefineTIFFVariant(t *testing.T) {
 // and unknown format IDs.
 //
 // SPIKE #6 / B2: TIFF-based formats (TIFF, CR2, NEF, ARW, DNG, ORF, RW2)
-// return false because metadata writes require image-data relocation, which is
+// return false because metadata writes require image-data relocation that is
 // not yet implemented (roadmap Option A, epic #33).
+//
+// CR3 also returns false: although CR3 is ISOBMFF-based (not TIFF), the
+// trak/stbl chunk-offset tables (stco/co64) inside moov store absolute mdat
+// offsets that become stale when moov size changes. Full CR3 write support
+// requires a stco/co64 relocation pass deferred to a follow-up (task #56).
 func TestSupportsWrite(t *testing.T) {
 	t.Parallel()
 
 	writable := []FormatID{
-		FormatJPEG, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3,
+		FormatJPEG, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP,
 	}
 	for _, f := range writable {
 		if !SupportsWrite(f) {
@@ -307,7 +312,7 @@ func TestSupportsWrite(t *testing.T) {
 	}
 
 	notWritable := []FormatID{
-		FormatTIFF, FormatCR2, FormatNEF, FormatARW, FormatDNG, FormatORF, FormatRW2,
+		FormatTIFF, FormatCR2, FormatCR3, FormatNEF, FormatARW, FormatDNG, FormatORF, FormatRW2,
 		FormatUnknown,
 	}
 	for _, f := range notWritable {

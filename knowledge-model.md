@@ -64,7 +64,7 @@ do with format X" and mirrors the README *Supported formats* table and `format.S
 | `format` | container name — JPEG, TIFF, PNG, WebP, HEIF, AVIF, CR2, CR3, NEF, ARW, DNG, ORF, RW2 |
 | `extensions` | recognised extensions (detection is by magic bytes, never by extension) |
 | `read` | metadata read supported — `true` for all 13 |
-| `write` | metadata write supported — **equals `format.SupportsWrite`**: `true` for JPEG/PNG/WebP/HEIF/AVIF/CR3; `false` for the 7 TIFF-based (TIFF/CR2/NEF/ARW/DNG/ORF/RW2), which are read-only pending epic `#33` |
+| `write` | metadata write supported — **equals `format.SupportsWrite`**: `true` for JPEG/PNG/WebP/HEIF/AVIF; `false` for CR3 and the 7 TIFF-based (TIFF/CR2/NEF/ARW/DNG/ORF/RW2), which are read-only. CR3 is gated by `cr3.ErrWriteNotSupported` (task #56 safe gate; deferred: stco/co64 relocation pending epic #33 follow-up); TIFF-based are gated by `ErrWriteNotSupported` (epic #33) |
 | `exif` / `iptc` / `xmp` | which metadata blocks the format carries on read (`iptc` only JPEG + TIFF) |
 | `container` | structural family: `JPEG` / `TIFF` / `TIFF-based` / `ISOBMFF` / `RIFF` / `PNG` |
 
@@ -73,7 +73,7 @@ edges to pre-existing nodes cannot be added incrementally); the `format` / `cont
 properties carry the linkage. Example queries:
 
 ```cypher
-MATCH (c:FormatCapability {write:true})              RETURN c.format            // writable formats (6)
+MATCH (c:FormatCapability {write:true})              RETURN c.format            // writable formats (5: JPEG, PNG, WebP, HEIF, AVIF)
 MATCH (c:FormatCapability {iptc:true})               RETURN c.format            // carry IPTC (JPEG, TIFF)
 MATCH (c:FormatCapability {container:'TIFF-based'})  RETURN c.format, c.write   // the 7 read-only RAWs
 ```

@@ -199,28 +199,36 @@ func rebuildUUIDContent(uuidContent, rawEXIF, rawXMP []byte) (newContent []byte,
 	return buf.Bytes(), hadXMP
 }
 
-// Inject writes a modified CR3 stream to w by rebuilding the Canon UUID box
-// with updated CMT1 (EXIF) and XMP  payloads. All other boxes are preserved
-// unchanged. Box sizes in the parent chain (UUID → moov → file) are updated.
+// Inject returns ErrWriteNotSupported for any call that would modify metadata.
 //
-// Safety: CR3 is ISOBMFF-based, not TIFF-based. Image data lives in a
-// top-level mdat box that is entirely outside moov and is never touched by
-// this function (written verbatim as data[moovEnd:]). EXIF IFD offsets inside
-// CMT1 are relative to the start of the CMT1 payload; exif.Encode produces a
-// self-contained TIFF stream where all internal offsets are correct. Unlike the
-// TIFF-based formats (CR2, NEF, ARW, DNG, ORF, RW2), there is no
-// StripOffsets/TileOffsets relocation problem here, so gometadata.Write does
-// NOT gate CR3 behind ErrWriteNotSupported.
+// CR3 is ISOBMFF-based. The Canon UUID box lives inside moov, which precedes
+// the mdat box(es) that hold the actual image and preview data. The trak/stbl
+// chunk-offset tables (stco/co64) inside moov store ABSOLUTE file offsets into
+// mdat. Replacing CMT1 with a re-encoded EXIF payload of a different size
+// changes the total length of moov by delta bytes and shifts every subsequent
+// byte in the file by that delta — but the stco/co64 tables would still point
+// at the pre-shift offsets, silently corrupting every image/preview chunk
+// reference. Patching those tables requires a full ISOBMFF offset-relocation
+// pass that is not yet implemented.
 //
-// Note: if the source file uses the two-box CMT1+CMT2 split layout (ExifIFD
-// pointer in CMT1 points beyond len(CMT1) into CMT2), injecting a re-encoded
-// rawEXIF replaces CMT1 with a self-contained TIFF stream. The original CMT2
-// box is copied unchanged into the output UUID content as dead bytes (no
-// pointer addresses it). This is harmless but slightly inflates file size.
-// The orphaned CMT2 can be removed by the caller if desired by passing the
-// merged EXIF payload (as returned by Extract) through exif.Parse + exif.Encode
-// before calling Inject.
+// This gate fires before any I/O so that no partial or corrupt output is
+// produced. Reading CR3 files is fully supported via Extract.
+//
+// Full CR3 write support (with stco/co64 relocation) is tracked as a
+// follow-up to roadmap epic #33.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
+	// SAFE GATE: reject any write that would change metadata.
+	// A nil rawEXIF, nil rawIPTC, and nil rawXMP means "preserve everything as-is"
+	// — that is a no-op pass-through and is always safe, so we allow it.
+	// Any non-nil payload would trigger a CMT1/XMP  replacement inside moov,
+	// shifting mdat and invalidating the stco/co64 tables. Block it immediately
+	// before performing any I/O so no corrupt output is produced.
+	if rawEXIF != nil || rawIPTC != nil || rawXMP != nil {
+		return ErrWriteNotSupported
+	}
+
+	// All payloads are nil: pass the source bytes through unchanged.
+	// moov size does not change, so stco/co64 tables remain valid.
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("cr3: seek: %w", err)
 	}
@@ -228,58 +236,8 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	if err != nil {
 		return fmt.Errorf("cr3: read: %w", err)
 	}
-
-	// Find the moov box in the flat file data.
-	moovStart, moovEnd, found := flatBoxRange(data, "moov")
-	if !found {
-		_, err = w.Write(data)
-		if err != nil {
-			return fmt.Errorf("cr3: write chunk: %w", err)
-		}
-		return nil
-	}
-	moovContent := data[moovStart+8 : moovEnd]
-
-	// Find the Canon UUID box within moov.
-	uuidStart, uuidEnd, found := flatUUIDBoxRange(moovContent, canonUUID)
-	if !found {
-		_, err = w.Write(data)
-		if err != nil {
-			return fmt.Errorf("cr3: write chunk data: %w", err)
-		}
-		return nil
-	}
-	// uuidContent is the payload after the 8-byte box header + 16-byte UUID.
-	uuidContent := moovContent[uuidStart+8+16 : uuidEnd]
-
-	// Rebuild UUID content: replace CMT1/XMP  sub-boxes as needed.
-	newUUIDContentBytes, hadXMP := rebuildUUIDContent(uuidContent, rawEXIF, rawXMP)
-
-	// If the UUID box didn't have an XMP  sub-box but we have rawXMP, append it.
-	if !hadXMP && rawXMP != nil {
-		newUUIDContentBytes = append(newUUIDContentBytes, buildBox("XMP ", rawXMP)...)
-	}
-
-	// Build the new UUID box: 8-byte header + 16-byte Canon UUID + new content.
-	newUUIDBox := buildUUIDBox(canonUUID, newUUIDContentBytes)
-
-	// Splice: replace the old UUID box in moov content with the new one.
-	newMoovContent := make([]byte, 0, len(moovContent)-uuidEnd+len(newUUIDBox)+uuidStart)
-	newMoovContent = append(newMoovContent, moovContent[:uuidStart]...)
-	newMoovContent = append(newMoovContent, newUUIDBox...)
-	newMoovContent = append(newMoovContent, moovContent[uuidEnd:]...)
-
-	// Build the new moov box.
-	newMoovBox := buildBox("moov", newMoovContent)
-
-	// Write: data before moov + new moov + data after moov.
-	var out bytes.Buffer
-	out.Write(data[:moovStart])
-	out.Write(newMoovBox)
-	out.Write(data[moovEnd:])
-	_, err = w.Write(out.Bytes())
-	if err != nil {
-		return fmt.Errorf("cr3: write box: %w", err)
+	if _, err = w.Write(data); err != nil {
+		return fmt.Errorf("cr3: write: %w", err)
 	}
 	return nil
 }
@@ -303,23 +261,6 @@ func buildUUIDBox(uuid []byte, content []byte) []byte {
 	copy(box[8:24], uuid)
 	copy(box[24:], content)
 	return box
-}
-
-// flatBoxRange finds the first box of the given type in data (flat scan).
-// Returns the start and end (exclusive) of the full box (header + content).
-func flatBoxRange(data []byte, boxType string) (start, end int, found bool) {
-	pos := 0
-	for pos+8 <= len(data) {
-		size, typ, _, ok := parseCR3BoxHeader(data, pos)
-		if !ok {
-			break
-		}
-		if typ == boxType {
-			return pos, pos + int(size), true //nolint:gosec // G115: ISOBMFF box size bounded by file size
-		}
-		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
-	}
-	return 0, 0, false
 }
 
 // flatUUIDBoxRange finds the Canon UUID box in data (flat scan).

@@ -15,7 +15,7 @@
 //   - AVIF (read + write)
 //   - WebP (read + write)
 //   - CR2 — Canon RAW v2, TIFF-based (read only)
-//   - CR3 — Canon RAW v3, ISOBMFF-based (read + write)
+//   - CR3 — Canon RAW v3, ISOBMFF-based (read only; write blocked pending stco/co64 offset relocation — see cr3.ErrWriteNotSupported)
 //   - NEF — Nikon RAW, TIFF-based (read only)
 //   - ARW — Sony RAW, TIFF-based (read only)
 //   - DNG — Adobe Digital Negative, TIFF-based (read only)

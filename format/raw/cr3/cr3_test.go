@@ -3,6 +3,7 @@ package cr3
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"testing"
 )
 
@@ -108,33 +109,46 @@ func TestExtractTruncatedNoPanic(t *testing.T) {
 	}
 }
 
-func TestInjectEXIFRoundTrip(t *testing.T) {
+// TestInjectEXIFGate verifies that Inject returns ErrWriteNotSupported (not a
+// successful corrupting write) when rawEXIF is non-nil.
+//
+// Background: the old implementation performed the write, but silently
+// corrupted the mdat chunk-offset tables (stco/co64) whenever the re-encoded
+// CMT1 had a different size than the original. This test was previously named
+// TestInjectEXIFRoundTrip and asserted a successful write; it now asserts the
+// safe gate introduced by task #56 to prevent that corruption.
+//
+// Full CR3 write support (with stco/co64 offset relocation) is deferred; when
+// implemented, this test should be replaced with a true round-trip assertion
+// that also verifies stco/co64 correctness.
+func TestInjectEXIFGate(t *testing.T) {
 	t.Parallel()
 	exif := minimalTIFF()
 	data := buildMinimalCR3(exif, nil)
 
-	exif = append(exif, 0x00, 0x01, 0x02, 0x03) // extend to differ from original
-	newExif := exif
-
-	// Patch IFD offset to keep it valid for the extended slice.
-	newData := make([]byte, len(newExif))
-	copy(newData, newExif)
+	newExif := append(exif, 0x00, 0x01, 0x02, 0x03) // different size than original
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, newExif, nil, nil); err != nil {
-		t.Fatalf("Inject: %v", err)
+	err := Inject(bytes.NewReader(data), &out, newExif, nil, nil)
+	if err == nil {
+		t.Fatal("Inject with non-nil rawEXIF: expected ErrWriteNotSupported, got nil")
 	}
-
-	rawEXIF, _, _, err := Extract(bytes.NewReader(out.Bytes()))
-	if err != nil {
-		t.Fatalf("Extract after Inject: %v", err)
+	if !errors.Is(err, ErrWriteNotSupported) {
+		t.Errorf("Inject error = %v; want errors.Is(err, ErrWriteNotSupported) == true", err)
 	}
-	if !bytes.Equal(rawEXIF, newExif) {
-		t.Errorf("EXIF after inject: got %d bytes, want %d bytes", len(rawEXIF), len(newExif))
+	if out.Len() != 0 {
+		t.Errorf("Inject produced %d output bytes; want 0 (no partial/corrupt output)", out.Len())
 	}
 }
 
-func TestInjectXMPRoundTrip(t *testing.T) {
+// TestInjectXMPGate verifies that Inject returns ErrWriteNotSupported (not a
+// successful corrupting write) when rawXMP is non-nil.
+//
+// This test was previously named TestInjectXMPRoundTrip and asserted a
+// successful write. It now asserts the safe gate introduced by task #56.
+// The same stco/co64 corruption hazard applies regardless of which metadata
+// payload changes moov size.
+func TestInjectXMPGate(t *testing.T) {
 	t.Parallel()
 	exif := minimalTIFF()
 	data := buildMinimalCR3(exif, nil)
@@ -142,16 +156,15 @@ func TestInjectXMPRoundTrip(t *testing.T) {
 	xmp := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta><?xpacket end="w"?>`)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, nil, nil, xmp); err != nil {
-		t.Fatalf("Inject (XMP): %v", err)
+	err := Inject(bytes.NewReader(data), &out, nil, nil, xmp)
+	if err == nil {
+		t.Fatal("Inject with non-nil rawXMP: expected ErrWriteNotSupported, got nil")
 	}
-
-	_, _, rawXMP, err := Extract(bytes.NewReader(out.Bytes()))
-	if err != nil {
-		t.Fatalf("Extract after Inject (XMP): %v", err)
+	if !errors.Is(err, ErrWriteNotSupported) {
+		t.Errorf("Inject error = %v; want errors.Is(err, ErrWriteNotSupported) == true", err)
 	}
-	if !bytes.Equal(rawXMP, xmp) {
-		t.Errorf("XMP after inject: got %d bytes, want %d bytes", len(rawXMP), len(xmp))
+	if out.Len() != 0 {
+		t.Errorf("Inject produced %d output bytes; want 0 (no partial/corrupt output)", out.Len())
 	}
 }
 
@@ -575,9 +588,14 @@ func TestRebuildUUIDContent(t *testing.T) {
 	})
 }
 
-// TestInjectAddsNewXMPWhenAbsent verifies that Inject appends an XMP  sub-box
-// when the original CR3 file had no XMP  box but rawXMP is provided.
-func TestInjectAddsNewXMPWhenAbsent(t *testing.T) {
+// TestInjectAddsNewXMPWhenAbsentGate verifies that Inject returns
+// ErrWriteNotSupported (not a successful write) when rawXMP is provided but the
+// original CR3 file had no XMP  sub-box.
+//
+// This test was previously named TestInjectAddsNewXMPWhenAbsent and asserted a
+// successful write that appended an XMP  sub-box. It now asserts the safe gate
+// introduced by task #56: any non-nil payload is rejected before I/O.
+func TestInjectAddsNewXMPWhenAbsentGate(t *testing.T) {
 	t.Parallel()
 	exif := minimalTIFF()
 	data := buildMinimalCR3(exif, nil) // no XMP
@@ -585,16 +603,15 @@ func TestInjectAddsNewXMPWhenAbsent(t *testing.T) {
 	xmp := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"/><?xpacket end="w"?>`)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, nil, nil, xmp); err != nil {
-		t.Fatalf("Inject: %v", err)
+	err := Inject(bytes.NewReader(data), &out, nil, nil, xmp)
+	if err == nil {
+		t.Fatal("Inject with non-nil rawXMP: expected ErrWriteNotSupported, got nil")
 	}
-
-	_, _, rawXMP, err := Extract(bytes.NewReader(out.Bytes()))
-	if err != nil {
-		t.Fatalf("Extract after Inject: %v", err)
+	if !errors.Is(err, ErrWriteNotSupported) {
+		t.Errorf("Inject error = %v; want errors.Is(err, ErrWriteNotSupported) == true", err)
 	}
-	if !bytes.Equal(rawXMP, xmp) {
-		t.Errorf("rawXMP after inject: got %q, want %q", rawXMP, xmp)
+	if out.Len() != 0 {
+		t.Errorf("Inject produced %d output bytes; want 0 (no partial/corrupt output)", out.Len())
 	}
 }
 
@@ -674,26 +691,109 @@ func TestExtractSmallSizeNoPanic(t *testing.T) {
 	})
 }
 
-func TestInjectUUIDBoxSizeUpdated(t *testing.T) {
+// TestInjectLargerEXIFGate verifies that Inject returns ErrWriteNotSupported
+// when a larger rawEXIF is provided (size-changing write).
+//
+// This test was previously named TestInjectUUIDBoxSizeUpdated and verified that
+// moov box size was correctly updated after a larger EXIF was injected. It now
+// asserts the safe gate introduced by task #56. The name of the old test
+// describes exactly the corruption vector: the moov box size was updated, but
+// the stco/co64 tables inside it were not, silently breaking every mdat offset.
+//
+// When full CR3 write support with stco/co64 relocation is implemented, replace
+// this test with one that:
+//  1. Builds a CR3 with ftyp + moov{uuid{CMT1}} + co64(offset=O into mdat) + mdat,
+//  2. Calls Inject with a rawEXIF larger by delta bytes,
+//  3. Asserts the post-Inject co64 offset equals O+delta, and
+//  4. Asserts the bytes at that offset still match the original mdat sentinel.
+func TestInjectLargerEXIFGate(t *testing.T) {
 	t.Parallel()
 	exif := minimalTIFF()
 	data := buildMinimalCR3(exif, nil)
 
-	// After injecting a larger EXIF, the moov box must be at least as large
-	// as the new CMT1 content — verify the output is parseable and returns the new data.
-	larger := make([]byte, len(exif)+100)
+	larger := make([]byte, len(exif)+100) // different size — would shift mdat
 	copy(larger, exif)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, larger, nil, nil); err != nil {
-		t.Fatalf("Inject larger EXIF: %v", err)
+	err := Inject(bytes.NewReader(data), &out, larger, nil, nil)
+	if err == nil {
+		t.Fatal("Inject with larger rawEXIF: expected ErrWriteNotSupported, got nil")
+	}
+	if !errors.Is(err, ErrWriteNotSupported) {
+		t.Errorf("Inject error = %v; want errors.Is(err, ErrWriteNotSupported) == true", err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("Inject (larger EXIF) produced %d output bytes; want 0 (no partial/corrupt output)", out.Len())
+	}
+}
+
+// TestInjectWriteGateNoCorruptOutput is the primary regression test for task #56.
+//
+// It asserts that Inject returns ErrWriteNotSupported AND produces exactly zero
+// output bytes for every combination of non-nil metadata payload. Before the
+// fix, Inject would silently produce a corrupt CR3 stream: the moov box was
+// rebuilt with the new CMT1, but the stco/co64 chunk-offset tables inside moov
+// still pointed at the pre-shift mdat offsets (off by delta = new_moov_size -
+// old_moov_size bytes), making all image/preview data unreadable.
+//
+// The test matrix covers:
+//   - Non-nil rawEXIF only
+//   - Non-nil rawXMP only
+//   - Non-nil rawIPTC only
+//   - All three non-nil simultaneously
+//
+// The nil/nil/nil (pass-through) case is covered by TestInjectNilPayloadsPassThrough.
+func TestInjectWriteGateNoCorruptOutput(t *testing.T) {
+	t.Parallel()
+
+	tiff := minimalTIFF()
+	xmp := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"/><?xpacket end="w"?>`)
+	iptcBytes := []byte{0x1C, 0x01, 0x5A, 0x00, 0x03, 'U', 'T', 'F'} // minimal IPTC 1:90
+
+	cases := []struct {
+		name    string
+		rawEXIF []byte
+		rawIPTC []byte
+		rawXMP  []byte
+	}{
+		{"non-nil EXIF only", tiff, nil, nil},
+		{"non-nil XMP only", nil, nil, xmp},
+		{"non-nil IPTC only", nil, iptcBytes, nil},
+		{"all three non-nil", tiff, iptcBytes, xmp},
 	}
 
-	rawEXIF, _, _, err := Extract(bytes.NewReader(out.Bytes()))
-	if err != nil {
-		t.Fatalf("Extract after inject larger EXIF: %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			data := buildMinimalCR3(minimalTIFF(), nil)
+			var out bytes.Buffer
+			err := Inject(bytes.NewReader(data), &out, tc.rawEXIF, tc.rawIPTC, tc.rawXMP)
+			if err == nil {
+				t.Fatalf("Inject(%s): expected ErrWriteNotSupported, got nil", tc.name)
+			}
+			if !errors.Is(err, ErrWriteNotSupported) {
+				t.Errorf("Inject(%s) error = %v; want errors.Is(err, ErrWriteNotSupported) == true", tc.name, err)
+			}
+			if out.Len() != 0 {
+				t.Errorf("Inject(%s) produced %d output bytes; want 0 (no partial/corrupt output)", tc.name, out.Len())
+			}
+		})
 	}
-	if !bytes.Equal(rawEXIF, larger) {
-		t.Errorf("EXIF after inject larger: got %d bytes, want %d bytes", len(rawEXIF), len(larger))
+}
+
+// TestInjectNilPayloadsPassThrough verifies that Inject with all-nil payloads
+// is a safe pass-through: it copies the source bytes unchanged and returns nil.
+// This is the only non-gated Inject path, and it is safe because moov size
+// does not change (no stco/co64 invalidation).
+func TestInjectNilPayloadsPassThrough(t *testing.T) {
+	t.Parallel()
+	data := buildMinimalCR3(minimalTIFF(), nil)
+
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(data), &out, nil, nil, nil); err != nil {
+		t.Fatalf("Inject(nil,nil,nil): unexpected error: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), data) {
+		t.Errorf("Inject(nil,nil,nil): output differs from input (got %d bytes, want %d)", out.Len(), len(data))
 	}
 }

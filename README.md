@@ -266,7 +266,7 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 |---|---|
 | Metadata standards | EXIF 3.0 (CIPA DC-008 / TIFF 6.0), IPTC IIM 4.2, XMP (ISO 16684-1) |
 | Read | Whichever of EXIF / IPTC / XMP the container carries, across all 13 formats (IPTC is only carried by JPEG and TIFF) |
-| Write | All three standards for JPEG, PNG, WebP, HEIF, AVIF, and CR3; preserves unmodified metadata byte-for-byte. TIFF-based formats (TIFF, CR2, NEF, ARW, DNG, ORF, RW2) are read-only — see the Supported formats table |
+| Write | All three standards for JPEG, PNG, WebP, HEIF, and AVIF; preserves unmodified metadata byte-for-byte. TIFF-based formats (TIFF, CR2, NEF, ARW, DNG, ORF, RW2) and CR3 are read-only — see the Supported formats table |
 | Atomic writes | `WriteFile` uses temp file + rename — no partial writes |
 | Format detection | Magic bytes only; file extension is never consulted |
 | MakerNote (read) | Canon, Nikon, Sony, Olympus, Panasonic, Pentax, DJI, FujiFilm, Leica, Samsung, Sigma, Minolta, Casio |
@@ -290,7 +290,7 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 | HEIF | .heif, .heic | Yes | Yes | Yes | No | Yes |
 | AVIF | .avif | Yes | Yes | Yes | No | Yes |
 | Canon CR2 | .cr2 | Yes | No¹ | Yes | No | Yes |
-| Canon CR3 | .cr3 | Yes | Yes | Yes | No | Yes |
+| Canon CR3 | .cr3 | Yes | No² | Yes | No | Yes |
 | Nikon NEF | .nef | Yes | No¹ | Yes | No | Yes |
 | Sony ARW | .arw | Yes | No¹ | Yes | No | Yes |
 | Adobe DNG | .dng | Yes | No¹ | Yes | No | Yes |
@@ -298,6 +298,8 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 | Panasonic RW2 | .rw2 | Yes | No¹ | Yes | No | Yes |
 
 > ¹ **TIFF-based containers are read-only.** `Write` and `WriteFile` return `ErrWriteNotSupported` for TIFF, CR2, NEF, ARW, DNG, ORF, and RW2. Writing into these formats requires relocating embedded image-data offsets (strip/tile pointers) — a structural rewrite tracked on the roadmap. Reading is fully supported for all seven. Use `format.SupportsWrite(id)` to check programmatically.
+>
+> ² **CR3 is read-only.** Although CR3 uses an ISOBMFF container (not TIFF), the `trak/stbl` chunk-offset tables (`stco`/`co64`) inside `moov` store absolute file offsets into the `mdat` box. Replacing the EXIF payload with a re-encoded stream of a different size shifts `mdat` by delta bytes, but the offset tables are not patched — silently corrupting every image and preview chunk reference. Full CR3 write support requires a `stco`/`co64` relocation pass that is deferred to a follow-up release. Until then `Write` and `WriteFile` return `cr3.ErrWriteNotSupported` for CR3 files.
 
 ## Performance
 
