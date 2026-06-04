@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"unicode"
 )
 
 // nsEntry maps an XML namespace prefix to its URI.
@@ -252,7 +253,13 @@ func (p *rdfParser) onStartListItem(attrs []xmpAttr) {
 	p.liLang = ""
 	p.liItemDepth = p.depth
 	for _, a := range attrs {
-		if a.loc == "lang" {
+		// XML Namespaces §6.1: xml:lang is in the XML namespace
+		// (http://www.w3.org/XML/1998/namespace). The 'xml' prefix is pre-bound
+		// and may resolve to either the empty string or the canonical URI
+		// depending on whether the document declares it explicitly. Reject any
+		// 'lang' attribute from a foreign namespace (e.g. ex:lang) to prevent
+		// contamination of the stored value with a bogus lang prefix.
+		if a.loc == "lang" && (a.ns == "" || a.ns == "http://www.w3.org/XML/1998/namespace") {
 			p.liLang = a.val
 			break
 		}
@@ -1170,7 +1177,22 @@ func decodeNamedEntity(ref []byte, bld *strings.Builder) bool {
 }
 
 // parseHex parses a hexadecimal rune reference (without the leading "x").
+//
+// XML 1.0 §4.1: a numeric character reference is only valid when the code
+// point is a legal XML character and a Unicode scalar value (≤ U+10FFFF,
+// not a surrogate U+D800–U+DFFF). References outside this range are rejected
+// by returning (0, false), which causes decodeCharRef to return false and
+// decodeEntity to emit the original &ref; literal — a safe, spec-conformant
+// fallback. This mirrors the guard in decodeUTF32 (encoding.go).
+//
+//nolint:gocyclo // switch on hex digit range is inherently > 10 complexity; refactoring would reduce readability without correctness benefit
 func parseHex(b []byte) (rune, bool) {
+	// Reject inputs that are obviously too long to represent a valid Unicode
+	// scalar value (U+10FFFF = 6 hex digits). More than 7 digits can only
+	// produce a value > 0x10FFFF or overflow int32; reject early.
+	if len(b) > 7 {
+		return 0, false
+	}
 	var v rune
 	for _, c := range b {
 		v <<= 4
@@ -1185,17 +1207,38 @@ func parseHex(b []byte) (rune, bool) {
 			return 0, false
 		}
 	}
+	// XML 1.0 §4.1 / Unicode §3.9: reject surrogates and values above U+10FFFF.
+	if v > unicode.MaxRune || (v >= 0xD800 && v <= 0xDFFF) {
+		return 0, false
+	}
 	return v, true
 }
 
 // parseDec parses a decimal rune reference.
+//
+// XML 1.0 §4.1: a numeric character reference is only valid when the code
+// point is a legal XML character and a Unicode scalar value (≤ U+10FFFF,
+// not a surrogate U+D800–U+DFFF). References outside this range are rejected
+// by returning (0, false), which causes decodeCharRef to return false and
+// decodeEntity to emit the original &ref; literal — a safe, spec-conformant
+// fallback. This mirrors the guard in decodeUTF32 (encoding.go).
 func parseDec(b []byte) (rune, bool) {
+	// Reject inputs that are obviously too long to represent a valid Unicode
+	// scalar value (U+10FFFF = 1114111 = 7 decimal digits). More than 7 digits
+	// can only produce a value > 0x10FFFF or overflow int32; reject early.
+	if len(b) > 7 {
+		return 0, false
+	}
 	var v rune
 	for _, c := range b {
 		if c < '0' || c > '9' {
 			return 0, false
 		}
 		v = v*10 + rune(c-'0')
+	}
+	// XML 1.0 §4.1 / Unicode §3.9: reject surrogates and values above U+10FFFF.
+	if v > unicode.MaxRune || (v >= 0xD800 && v <= 0xDFFF) {
+		return 0, false
 	}
 	return v, true
 }

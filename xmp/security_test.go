@@ -1241,3 +1241,218 @@ func TestDecodeUTF32CapPrecise(t *testing.T) {
 			len(out), maxUnescapedXMLBytes, len(out)-maxUnescapedXMLBytes)
 	}
 }
+
+// ── Task #79: Numeric char-ref Unicode scalar validation ────────────────────
+//
+// parseHex and parseDec must reject any reference whose code point is outside
+// the Unicode scalar value range (> U+10FFFF or a surrogate U+D800–U+DFFF).
+// Out-of-range references must produce either an empty property value (the
+// reference is the only content) or the literal &ref; text — but NEVER an
+// arbitrary code point, a U+FFFD replacement character, or ill-formed UTF-8.
+//
+// XML 1.0 §4.1; Unicode §3.9.
+
+// TestNumericCharRefOverflow verifies that out-of-range numeric character
+// references do not produce U+FFFD, arbitrary code points, or ill-formed
+// UTF-8 in stored property values.
+//
+// Cases tested:
+//   - &#1114112; (decimal, one above U+10FFFF = 1114111)
+//   - &#2147483648; (decimal, overflows int32 without early rejection)
+//   - &#x80000000; (hex, overflows int32 without early rejection)
+//   - &#xFFFFFFFF; (hex, massively out of range)
+//   - &#xD800; and &#xDFFF; (surrogate range — forbidden by XML 1.0 §2.2)
+func TestNumericCharRefOverflow(t *testing.T) {
+	t.Parallel()
+
+	// replacementCharUTF8 is the 3-byte UTF-8 encoding of U+FFFD.
+	const replacementCharUTF8 = "�"
+
+	// buildModel builds an XMP packet with tiff:Model set to the given raw XML
+	// text (which may contain character references).
+	buildModel := func(rawContent string) []byte {
+		return []byte(
+			`<?xpacket begin="" uid="abc"?>` +
+				`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+				`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+				`<rdf:Description rdf:about="" xmlns:tiff="http://ns.adobe.com/tiff/1.0/">` +
+				`<tiff:Model>` + rawContent + `</tiff:Model>` +
+				`</rdf:Description>` +
+				`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`,
+		)
+	}
+
+	cases := []struct {
+		name       string
+		rawContent string // XML text to embed as tiff:Model element content
+	}{
+		// One above U+10FFFF — &#1114112; must not store 0x100000 or U+FFFD.
+		{"decimal-one-above-max", "&#1114112;"},
+		// int32 overflow via decimal — parseDec('2147483648') wraps to -2147483648.
+		{"decimal-int32-overflow", "&#2147483648;"},
+		// int32 overflow via hex — parseHex('80000000') wraps to -2147483648.
+		{"hex-int32-overflow", "&#x80000000;"},
+		// Far above range via hex.
+		{"hex-far-out-of-range", "&#xFFFFFFFF;"},
+		// Surrogate pair start — forbidden by XML 1.0 §2.2.
+		{"hex-surrogate-low", "&#xD800;"},
+		// Surrogate pair end — forbidden by XML 1.0 §2.2.
+		{"hex-surrogate-high", "&#xDFFF;"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			x, err := Parse(buildModel(tc.rawContent))
+			if err != nil {
+				t.Fatalf("Parse returned unexpected error: %v", err)
+			}
+			got := x.Get(NStiff, "Model")
+
+			// The stored value must NOT contain U+FFFD (replacement character).
+			// U+FFFD in a value is the hallmark of the pre-fix behaviour: an
+			// overflowed rune passed to WriteRune produced the replacement char.
+			if strings.Contains(got, replacementCharUTF8) {
+				t.Errorf("stored value %q contains U+FFFD — out-of-range char-ref was silently substituted (pre-fix behaviour)", got)
+			}
+
+			// The stored value must NOT be a non-empty string whose bytes are
+			// valid UTF-8 encoding of a code point above U+10FFFF. Go's
+			// strings.Builder.WriteRune will not produce such bytes (it clamps to
+			// U+FFFD), but we guard here for future changes.
+			for _, r := range got {
+				if r > '\U0010FFFF' {
+					t.Errorf("stored value %q contains out-of-range code point U+%X", got, r)
+				}
+			}
+		})
+	}
+}
+
+// TestNumericCharRefValidBoundary verifies that valid references at and just
+// below the Unicode boundary continue to decode correctly after the fix.
+//
+// U+10FFFF (1114111 decimal / x10FFFF hex) is the last valid Unicode scalar
+// value. U+10FFFE is one below. Both must decode to their correct runes.
+func TestNumericCharRefValidBoundary(t *testing.T) {
+	t.Parallel()
+
+	buildModel := func(rawContent string) []byte {
+		return []byte(
+			`<?xpacket begin="" uid="abc"?>` +
+				`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+				`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+				`<rdf:Description rdf:about="" xmlns:tiff="http://ns.adobe.com/tiff/1.0/">` +
+				`<tiff:Model>` + rawContent + `</tiff:Model>` +
+				`</rdf:Description>` +
+				`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`,
+		)
+	}
+
+	cases := []struct {
+		name    string
+		raw     string
+		wantLen int // expected number of runes in the decoded value
+	}{
+		// U+10FFFF — last valid Unicode scalar value.
+		{"hex-U+10FFFF", "&#x10FFFF;", 1},
+		// Same via decimal: 1114111.
+		{"dec-1114111", "&#1114111;", 1},
+		// U+10FFFE — one below U+10FFFF.
+		{"hex-U+10FFFE", "&#x10FFFE;", 1},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			x, err := Parse(buildModel(tc.raw))
+			if err != nil {
+				t.Fatalf("Parse returned unexpected error: %v", err)
+			}
+			got := x.Get(NStiff, "Model")
+			if got == "" {
+				t.Errorf("valid char-ref %q decoded to empty string — valid references must not be rejected", tc.raw)
+			}
+			// Must decode to exactly the expected number of runes.
+			runes := []rune(got)
+			if len(runes) != tc.wantLen {
+				t.Errorf("char-ref %q: got %d runes (%q), want %d", tc.raw, len(runes), got, tc.wantLen)
+			}
+		})
+	}
+}
+
+// ── Task #80: xml:lang namespace check on rdf:li ────────────────────────────
+//
+// onStartListItem must only capture xml:lang when the attribute's resolved
+// namespace is the XML namespace (or empty, for the pre-bound 'xml' prefix).
+// A foreign attribute with local name 'lang' (e.g. ex:lang="bogus") must be
+// silently ignored — not captured as p.liLang, which would corrupt the
+// stored value as "bogus|<value>".
+//
+// XML Namespaces §6.1: xml:lang is in the XML namespace URI
+// http://www.w3.org/XML/1998/namespace.
+
+// TestXmlLangNamespaceCheck verifies that a non-XML-namespace 'lang' attribute
+// on rdf:li does not contaminate the stored keyword value.
+//
+// Without the fix: rdf:li with ex:lang="bogus" stores "bogus|keyword".
+// With the fix:    the keyword is stored as "keyword" (no prefix).
+func TestXmlLangNamespaceCheck(t *testing.T) {
+	t.Parallel()
+
+	// dc:subject carries a rdf:Bag whose sole item has ex:lang="bogus" (not a
+	// valid xml:lang attribute — 'ex' is bound to a foreign URI).
+	raw := `<?xpacket begin="" uid="abc"?>` +
+		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">` +
+		`<dc:subject>` +
+		`<rdf:Bag>` +
+		`<rdf:li xmlns:ex="http://example.com/" ex:lang="bogus">keyword</rdf:li>` +
+		`</rdf:Bag>` +
+		`</dc:subject>` +
+		`</rdf:Description>` +
+		`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`
+
+	x, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse returned unexpected error: %v", err)
+	}
+
+	kws := x.Keywords()
+	if len(kws) != 1 {
+		t.Fatalf("Keywords() = %v (len %d), want exactly [\"keyword\"]", kws, len(kws))
+	}
+	if kws[0] != "keyword" {
+		t.Errorf("Keywords()[0] = %q, want %q — ex:lang contaminated the value", kws[0], "keyword")
+	}
+}
+
+// TestXmlLangRealNamespaceAccepted verifies that the real xml:lang attribute
+// (namespace http://www.w3.org/XML/1998/namespace, resolved by the pre-bound
+// 'xml' prefix) is still captured correctly after the fix.
+func TestXmlLangRealNamespaceAccepted(t *testing.T) {
+	t.Parallel()
+
+	// rdf:Alt with real xml:lang="x-default" — must decode caption correctly.
+	raw := `<?xpacket begin="" uid="abc"?>` +
+		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">` +
+		`<dc:description>` +
+		`<rdf:Alt>` +
+		`<rdf:li xml:lang="x-default">My caption</rdf:li>` +
+		`</rdf:Alt>` +
+		`</dc:description>` +
+		`</rdf:Description>` +
+		`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`
+
+	x, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse returned unexpected error: %v", err)
+	}
+	if got := x.Caption(); got != "My caption" {
+		t.Errorf("Caption() = %q, want %q — real xml:lang was not captured", got, "My caption")
+	}
+}
