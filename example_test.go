@@ -247,7 +247,7 @@ func ExampleWrite() {
 
 	fmt.Printf("output size: %d bytes\n", buf.Len())
 	// Output:
-	// output size: 236594 bytes
+	// output size: 239073 bytes
 }
 
 // ExampleNewMetadata demonstrates creating a Metadata value from scratch —

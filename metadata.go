@@ -1,6 +1,7 @@
 package gometadata
 
 import (
+	"encoding/binary"
 	"time"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
@@ -10,8 +11,11 @@ import (
 )
 
 // NewMetadata returns an empty Metadata ready for writing to a file of the
-// given format. All metadata fields are nil; populate m.EXIF, m.IPTC, or
-// m.XMP before passing m to Write or WriteFile.
+// given format. All metadata fields are nil; use the convenience Set* methods
+// to populate them — the Set* methods auto-create any required component when
+// nil and the format supports it (task #88 AUTO-CREATE policy). Alternatively,
+// assign m.EXIF, m.IPTC, or m.XMP directly before passing m to Write or
+// WriteFile.
 func NewMetadata(fmtID format.FormatID) *Metadata {
 	return &Metadata{format: uint8(fmtID)}
 }
@@ -527,12 +531,105 @@ func (m *Metadata) Creator() string {
 }
 
 // ---------------------------------------------------------------------------
-// Write setters — write to all non-nil component structs that support the
-// field. Components are never created; only existing ones are written.
+// Auto-create helpers — task #88 (AUTO-CREATE policy)
+//
+// When a convenience Set* targets a component that is nil, the helpers below
+// construct a minimal VALID component so that the value persists and the
+// subsequent Write/Validate cycle succeeds. Construction is conditional on the
+// detected container format: components are only created when the format's
+// injector can actually carry them (format-appropriateness).
+//
+// Format capabilities (derived from format.SupportsWrite and the injector
+// dispatch table in write.go):
+//
+//	JPEG     → EXIF ✓  IPTC ✓  XMP ✓
+//	PNG      → EXIF ✓  IPTC ✗  XMP ✓
+//	WebP     → EXIF ✓  IPTC ✗  XMP ✓
+//	HEIF     → EXIF ✓  IPTC ✗  XMP ✓
+//	AVIF     → EXIF ✓  IPTC ✗  XMP ✓
+//	TIFF-based / CR3 / Unknown → write not supported; no auto-create.
+//
+// Callers that set m.format = FormatUnknown via NewMetadata(FormatUnknown)
+// or that read an unsupported container will never auto-create a component;
+// the Write call will fail with UnsupportedFormatError as before.
 // ---------------------------------------------------------------------------
 
-// SetCaption writes s to all non-nil metadata components (EXIF, IPTC, XMP).
+// canCarryEXIF reports whether the detected format can carry an EXIF segment
+// on write. All writable formats support EXIF.
+func (m *Metadata) canCarryEXIF() bool {
+	return format.SupportsWrite(format.FormatID(m.format))
+}
+
+// canCarryIPTC reports whether the detected format can carry an IPTC segment
+// on write. Only JPEG supports IPTC (via the APP13 / Photoshop IRB envelope);
+// all other writable formats (PNG, WebP, HEIF, AVIF) have no IPTC pathway.
+func (m *Metadata) canCarryIPTC() bool {
+	return format.FormatID(m.format) == format.FormatJPEG ||
+		format.FormatID(m.format) == format.FormatTIFF
+}
+
+// canCarryXMP reports whether the detected format can carry an XMP packet
+// on write. All writable formats support XMP.
+func (m *Metadata) canCarryXMP() bool {
+	return format.SupportsWrite(format.FormatID(m.format))
+}
+
+// ensureEXIF constructs a minimal valid *exif.EXIF when m.EXIF is nil and the
+// detected format can carry EXIF. The constructed EXIF has a non-nil IFD0 and
+// ByteOrder = binary.LittleEndian so that m.Validate() and exif.Encode() succeed.
+//
+// EXIF validity invariant: m.EXIF != nil ⟹ m.EXIF.IFD0 != nil (Validate §).
+func (m *Metadata) ensureEXIF() {
+	if m.EXIF != nil || !m.canCarryEXIF() {
+		return
+	}
+	m.EXIF = &exif.EXIF{
+		ByteOrder: binary.LittleEndian,
+		IFD0:      &exif.IFD{},
+	}
+}
+
+// ensureIPTC constructs a minimal valid *iptc.IPTC when m.IPTC is nil and the
+// detected format can carry IPTC. new(iptc.IPTC) is sufficient: the zero value
+// of IPTC (with its [10][]Dataset array) is ready for use by all write-path
+// helpers in the iptc package.
+func (m *Metadata) ensureIPTC() {
+	if m.IPTC != nil || !m.canCarryIPTC() {
+		return
+	}
+	m.IPTC = new(iptc.IPTC)
+}
+
+// ensureXMP constructs a minimal valid *xmp.XMP when m.XMP is nil and the
+// detected format can carry XMP. The Properties map must be non-nil to satisfy
+// the Validate invariant (m.XMP != nil ⟹ m.XMP.Properties != nil).
+func (m *Metadata) ensureXMP() {
+	if m.XMP != nil || !m.canCarryXMP() {
+		return
+	}
+	m.XMP = &xmp.XMP{Properties: make(map[string]map[string]string)}
+}
+
+// ---------------------------------------------------------------------------
+// Write setters — AUTO-CREATE policy (task #88).
+//
+// Each setter now calls the appropriate ensure* helpers before writing. When
+// the relevant component was nil but the format supports it, the component is
+// constructed in-place so the value is persisted on the next Write call.
+// Components that the format cannot carry (e.g. IPTC for PNG) are never
+// constructed, and the setter silently skips writing to that component —
+// consistent with the previous behaviour for format-incompatible metadata.
+//
+// Setter signatures are unchanged (void) — this is a non-breaking change.
+// ---------------------------------------------------------------------------
+
+// SetCaption writes s to all metadata components that can carry a caption
+// (EXIF, IPTC, XMP). If a component is nil but the detected format supports
+// it, the component is auto-created before writing.
 func (m *Metadata) SetCaption(s string) {
+	m.ensureEXIF()
+	m.ensureIPTC()
+	m.ensureXMP()
 	if m.EXIF != nil {
 		m.EXIF.SetCaption(s)
 	}
@@ -544,8 +641,13 @@ func (m *Metadata) SetCaption(s string) {
 	}
 }
 
-// SetCopyright writes s to all non-nil metadata components (EXIF, IPTC, XMP).
+// SetCopyright writes s to all metadata components that can carry a copyright
+// notice (EXIF, IPTC, XMP). Components are auto-created when nil and the
+// format supports them.
 func (m *Metadata) SetCopyright(s string) {
+	m.ensureEXIF()
+	m.ensureIPTC()
+	m.ensureXMP()
 	if m.EXIF != nil {
 		m.EXIF.SetCopyright(s)
 	}
@@ -557,8 +659,13 @@ func (m *Metadata) SetCopyright(s string) {
 	}
 }
 
-// SetCreator writes s to all non-nil metadata components (EXIF, IPTC, XMP).
+// SetCreator writes s to all metadata components that can carry a creator
+// (EXIF, IPTC, XMP). Components are auto-created when nil and the format
+// supports them.
 func (m *Metadata) SetCreator(s string) {
+	m.ensureEXIF()
+	m.ensureIPTC()
+	m.ensureXMP()
 	if m.EXIF != nil {
 		m.EXIF.SetCreator(s)
 	}
@@ -570,8 +677,11 @@ func (m *Metadata) SetCreator(s string) {
 	}
 }
 
-// SetCameraModel writes s to EXIF and XMP when those components are non-nil.
+// SetCameraModel writes s to EXIF and XMP. Components are auto-created when
+// nil and the format supports them.
 func (m *Metadata) SetCameraModel(s string) {
+	m.ensureEXIF()
+	m.ensureXMP()
 	if m.EXIF != nil {
 		m.EXIF.SetCameraModel(s)
 	}
@@ -580,9 +690,11 @@ func (m *Metadata) SetCameraModel(s string) {
 	}
 }
 
-// SetGPS writes the WGS-84 decimal-degree coordinates to EXIF and XMP when
-// those components are non-nil.
+// SetGPS writes the WGS-84 decimal-degree coordinates to EXIF and XMP.
+// Components are auto-created when nil and the format supports them.
 func (m *Metadata) SetGPS(lat, lon float64) {
+	m.ensureEXIF()
+	m.ensureXMP()
 	if m.EXIF != nil {
 		m.EXIF.SetGPS(lat, lon)
 	}
@@ -591,8 +703,12 @@ func (m *Metadata) SetGPS(lat, lon float64) {
 	}
 }
 
-// SetKeywords writes kws to IPTC and XMP when those components are non-nil.
+// SetKeywords writes kws to IPTC and XMP. Components are auto-created when nil
+// and the format supports them. For formats that cannot carry IPTC (PNG, WebP,
+// HEIF, AVIF), only XMP is populated so the keywords are not silently dropped.
 func (m *Metadata) SetKeywords(kws []string) {
+	m.ensureIPTC()
+	m.ensureXMP()
 	if m.IPTC != nil {
 		m.IPTC.SetKeywords(kws)
 	}
@@ -601,8 +717,11 @@ func (m *Metadata) SetKeywords(kws []string) {
 	}
 }
 
-// SetLensModel writes s to EXIF and XMP when those components are non-nil.
+// SetLensModel writes s to EXIF and XMP. Components are auto-created when nil
+// and the format supports them.
 func (m *Metadata) SetLensModel(s string) {
+	m.ensureEXIF()
+	m.ensureXMP()
 	if m.EXIF != nil {
 		m.EXIF.SetLensModel(s)
 	}
@@ -611,16 +730,20 @@ func (m *Metadata) SetLensModel(s string) {
 	}
 }
 
-// SetMake writes s to EXIF when it is non-nil.
+// SetMake writes s to EXIF. EXIF is auto-created when nil and the format
+// supports it.
 func (m *Metadata) SetMake(s string) {
+	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetMake(s)
 	}
 }
 
-// SetDateTimeOriginal writes t to EXIF and XMP when those components are
-// non-nil.
+// SetDateTimeOriginal writes t to EXIF and XMP. Components are auto-created
+// when nil and the format supports them.
 func (m *Metadata) SetDateTimeOriginal(t time.Time) {
+	m.ensureEXIF()
+	m.ensureXMP()
 	if m.EXIF != nil {
 		m.EXIF.SetDateTimeOriginal(t)
 	}
@@ -629,43 +752,55 @@ func (m *Metadata) SetDateTimeOriginal(t time.Time) {
 	}
 }
 
-// SetExposureTime writes the rational exposure time to EXIF when non-nil.
+// SetExposureTime writes the rational exposure time to EXIF. EXIF is
+// auto-created when nil and the format supports it.
 func (m *Metadata) SetExposureTime(num, den uint32) {
+	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetExposureTime(num, den)
 	}
 }
 
-// SetFNumber writes the F-number to EXIF when non-nil.
+// SetFNumber writes the F-number to EXIF. EXIF is auto-created when nil and
+// the format supports it.
 func (m *Metadata) SetFNumber(f float64) {
+	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetFNumber(f)
 	}
 }
 
-// SetISO writes the ISO speed rating to EXIF when non-nil.
+// SetISO writes the ISO speed rating to EXIF. EXIF is auto-created when nil
+// and the format supports it.
 func (m *Metadata) SetISO(iso uint) {
+	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetISO(iso)
 	}
 }
 
-// SetFocalLength writes the focal length in millimetres to EXIF when non-nil.
+// SetFocalLength writes the focal length in millimetres to EXIF. EXIF is
+// auto-created when nil and the format supports it.
 func (m *Metadata) SetFocalLength(mm float64) {
+	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetFocalLength(mm)
 	}
 }
 
-// SetOrientation writes the orientation tag to EXIF when non-nil.
+// SetOrientation writes the orientation tag to EXIF. EXIF is auto-created
+// when nil and the format supports it.
 func (m *Metadata) SetOrientation(v uint16) {
+	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetOrientation(v)
 	}
 }
 
-// SetImageSize writes the pixel dimensions to EXIF when non-nil.
+// SetImageSize writes the pixel dimensions to EXIF. EXIF is auto-created when
+// nil and the format supports it.
 func (m *Metadata) SetImageSize(width, height uint32) {
+	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetImageSize(width, height)
 	}
