@@ -151,6 +151,30 @@ func BenchmarkEntityDecode(b *testing.B) {
 	}
 }
 
+// BenchmarkUnescapeXMLNoEntity measures unescapeXML for entity-free input.
+//
+// This is the hot fast-path for the overwhelming majority of XMP property
+// values (camera model, date, GPS coordinates, etc.). Task #72 replaced the
+// former unsafe.String zero-copy return with string(b) — a standard heap copy.
+// This benchmark quantifies the allocation cost introduced by that change:
+// one alloc (the string copy) per entity-free segment, same as the entity path
+// already paid. The trade-off is correct API semantics: no parse-buffer aliasing.
+func BenchmarkUnescapeXMLNoEntity(b *testing.B) {
+	// Realistic attribute value lengths: camera model, copyright, date, GPS.
+	inputs := [][]byte{
+		[]byte("Canon EOS R5"),
+		[]byte("Copyright 2024 Benchmark Photographer"),
+		[]byte("2024-06-04T10:30:00+00:00"),
+		[]byte("37,46.494N"),
+		[]byte("Adobe Photoshop Lightroom Classic 13.0"),
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		_ = unescapeXML(inputs[i%len(inputs)])
+	}
+}
+
 // BenchmarkPacketScan measures Scan() on a realistic-sized XMP packet.
 func BenchmarkPacketScan(b *testing.B) {
 	// Embed the representative XMP inside a larger byte slice to simulate

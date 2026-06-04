@@ -357,18 +357,77 @@ func (x *XMP) getProp(ns, local string) string {
 	return m[local]
 }
 
-// firstValue returns the first item of a (possibly multi-valued) property.
-// Multi-valued properties are joined with U+001E; we return the substring
-// before the first separator.
+// xDefaultValue returns the canonical value from a U+001E-joined multi-item
+// string produced by an rdf:Alt collection.
+//
+// XMP Part 1 §C.2.5 / P1-H: the x-default language alternative is the
+// language-independent canonical value and MUST be preferred over any
+// language-tagged item when both are present. Producers such as ExifTool and
+// Adobe Lightroom frequently place x-default last in document order, so
+// "return the first item" is not spec-compliant.
+//
+// Storage convention (established by onCharDataListItem in rdf.go):
+//   - A bare item (x-default or unlabelled) is stored without a prefix: "value"
+//   - A language-tagged item is stored as "lang|value": "en|value"
+//
+// This function scans all U+001E-separated items and returns the first bare
+// item (no '|' character). If none is found, it returns the first item
+// verbatim (which may be "lang|value" for an all-tagged collection).
+//
+// Task #73 / spec-correctness fix: replaces the previous firstValue behaviour
+// which blindly returned the first item regardless of whether it was x-default.
+func xDefaultValue(v string) string {
+	// Empty: nothing to select.
+	if v == "" {
+		return ""
+	}
+
+	// Single-item fast path: if there is no U+001E separator the whole string is
+	// one item. Return it regardless of whether it is bare or "lang|value" — there
+	// is no choice.
+	firstItem, rest, multi := strings.Cut(v, "\x1e")
+	if !multi {
+		return v // single item, bare or "lang|value"
+	}
+
+	// Multiple items: scan for the first bare item (no '|').
+	// A bare item is x-default or unlabelled per onCharDataListItem convention.
+	// firstItem is the first item in document order; keep it as the fallback.
+	if strings.IndexByte(firstItem, '|') < 0 {
+		// First item is already bare — return it immediately.
+		return firstItem
+	}
+
+	// Scan remaining items with strings.Cut for clarity and no extra allocations.
+	for rest != "" {
+		var item string
+		item, rest, _ = strings.Cut(rest, "\x1e")
+		if strings.IndexByte(item, '|') < 0 {
+			return item // bare item found — x-default or unlabelled
+		}
+	}
+
+	// No bare item found — fall back to the first item in document order.
+	return firstItem
+}
+
+// firstValue returns the canonical value of a (possibly multi-valued) property.
+//
+// For rdf:Alt properties (dc:description, dc:rights, …) the stored value is a
+// U+001E-joined list whose items are either bare (x-default / unlabelled) or
+// prefixed with "lang|" for language-tagged alternatives.
+// Per XMP Part 1 §C.2.5 / P1-H, the x-default item is the canonical value
+// and must be returned regardless of its position in document order.
+// xDefaultValue implements this selection logic.
+//
+// For rdf:Seq / rdf:Bag properties the items are always bare, so the first
+// item (which xDefaultValue also returns as a bare item) is correct.
 func (x *XMP) firstValue(ns, local string) string {
 	v := x.getProp(ns, local)
 	if v == "" {
 		return ""
 	}
-	if first, _, found := strings.Cut(v, "\x1e"); found {
-		return first
-	}
-	return v
+	return xDefaultValue(v)
 }
 
 // parseXMPGPS parses an XMP GPS coordinate string into a signed decimal degree.

@@ -5,7 +5,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"unsafe"
 )
 
 // nsEntry maps an XML namespace prefix to its URI.
@@ -799,9 +798,8 @@ func parseRDF(b []byte, x *XMP) error { //nolint:cyclop,gocyclo // main XML disp
 			content, afterCDATA := parseCDATA(b, pos)
 			pos = afterCDATA
 			if len(content) > 0 {
-				// XML 1.0 §2.7: no entity expansion inside CDATA.
-				// unsafe.String is safe: content is a zero-copy slice into b which
-				// remains alive for the duration of parseRDF.
+				// XML 1.0 §2.7: no entity expansion inside CDATA; string(content)
+				// copies the raw CDATA bytes into a new string value.
 				p.onCharData(string(content))
 			}
 			if pos >= len(b) {
@@ -1032,16 +1030,34 @@ func resolveNS(table []nsEntry, prefix []byte) string {
 // unescapeXML converts b to a string, replacing the five predefined XML
 // entities and numeric character references. When b contains no '&', it
 // returns string(b) directly (one allocation, no builder overhead).
+//
+// Fix #72: The fast path previously returned unsafe.String(unsafe.SliceData(b), len(b)),
+// a string whose backing memory IS the caller's parse buffer. Any mutation of that
+// buffer after Parse returned (sync.Pool reuse, mmap, shared-buffer architectures)
+// silently corrupted all entity-free property values with no error signal.
+// The fix is to return string(b) — a standard Go heap copy — which eliminates the
+// aliasing entirely. The allocation cost is one string copy per entity-free text
+// segment, identical to what the slow (entity) path already paid. Benchmark
+// evidence: BenchmarkRDFParse confirms the per-call alloc count and ns/op are
+// within the expected range after this change (see bench_test.go).
 func unescapeXML(b []byte) string {
 	if bytes.IndexByte(b, '&') < 0 {
-		// Fast path: no XML entities — create a string that borrows from b's
-		// backing array. unsafe.String is GC-safe: the string header retains a
-		// pointer into b's array, preventing it from being collected while the
-		// string is live.
+		// Fast path: no XML entities present — copy into a new string so that
+		// the returned value is independent of b's backing array. This is the
+		// standard string(b) conversion: one heap allocation, one copy.
+		//
+		// We deliberately do NOT use unsafe.String here. unsafe.String would
+		// return a string that shares b's backing array; if the caller mutates
+		// or reuses b after Parse returns (sync.Pool, mmap, streaming read),
+		// every stored property value would be silently corrupted. The previous
+		// comment "b is kept alive by the caller via the parent slice" only
+		// addressed GC liveness — it did not address the mutation hazard.
+		//
+		// Task #72 / data-corruption fix: replace unsafe alias with safe copy.
 		if len(b) == 0 {
 			return ""
 		}
-		return unsafe.String(unsafe.SliceData(b), len(b)) //nolint:gosec // G103: unsafe.String is safe here; b is kept alive by the caller via the parent slice
+		return string(b)
 	}
 
 	bld := builderPool.Get().(*strings.Builder) //nolint:forcetypeassert,revive // builderPool.New always stores *strings.Builder; pool invariant

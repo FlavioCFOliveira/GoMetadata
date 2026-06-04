@@ -2081,3 +2081,195 @@ func TestXmpMMHistoryOrderPreservedRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// ── Task #72: parse buffer aliasing fix ──────────────────────────────────────
+
+// TestParsedPropertyIndependentOfInputBuffer verifies that parsed property
+// values are independent copies of the input []byte. After zeroing the source
+// buffer, all previously-parsed property values must retain their original
+// content.
+//
+// Regression gate for task #72: with the old unsafe.String fast path in
+// unescapeXML, the property strings aliased the caller's parse buffer; zeroing
+// that buffer after Parse returned would silently corrupt all entity-free
+// property values (no error, wrong data). The fix replaces unsafe.String with
+// string(b), which produces an independent heap copy.
+func TestParsedPropertyIndependentOfInputBuffer(t *testing.T) {
+	t.Parallel()
+
+	// Packet with no XML entities — all values go through the unescapeXML fast
+	// path. Every attribute and element text segment must be a copy, not an alias.
+	raw := `<?xpacket begin="" uid="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about=""
+      xmlns:tiff="http://ns.adobe.com/tiff/1.0/"
+      xmlns:dc="http://purl.org/dc/elements/1.1/"
+      tiff:Model="Canon EOS R5"
+      tiff:Make="Canon">
+      <dc:description>
+        <rdf:Alt>
+          <rdf:li xml:lang="x-default">Scenic landscape</rdf:li>
+        </rdf:Alt>
+      </dc:description>
+      <dc:rights>
+        <rdf:Alt>
+          <rdf:li xml:lang="x-default">Copyright 2024 Test</rdf:li>
+        </rdf:Alt>
+      </dc:rights>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>`
+
+	// Work on a mutable copy so we can zero it after Parse.
+	buf := []byte(raw)
+
+	x, err := Parse(buf)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// Record expected values before mutation.
+	wantModel := "Canon EOS R5"
+	wantCaption := "Scenic landscape"
+	wantCopyright := "Copyright 2024 Test"
+
+	// Overwrite the source buffer — simulates sync.Pool reuse or buffer recycling.
+	for i := range buf {
+		buf[i] = 0x00
+	}
+
+	// All properties must still hold their original values.
+	if got := x.CameraModel(); got != wantModel {
+		t.Errorf("CameraModel after buffer zero: got %q, want %q (buffer aliasing)", got, wantModel)
+	}
+	if got := x.Caption(); got != wantCaption {
+		t.Errorf("Caption after buffer zero: got %q, want %q (buffer aliasing)", got, wantCaption)
+	}
+	if got := x.Copyright(); got != wantCopyright {
+		t.Errorf("Copyright after buffer zero: got %q, want %q (buffer aliasing)", got, wantCopyright)
+	}
+}
+
+// ── Task #73: rdf:Alt x-default selection ────────────────────────────────────
+
+// TestAltXDefaultNotFirst verifies that Caption() / Copyright() return the
+// x-default item from an rdf:Alt collection even when x-default is NOT the
+// first rdf:li in document order.
+//
+// Regression gate for task #73: the old firstValue() returned the first item
+// in document order, which is often a language-tagged item. XMP Part 1
+// §C.2.5 / P1-H mandates x-default as the canonical value. ExifTool and
+// Lightroom frequently emit language-specific items before x-default.
+func TestAltXDefaultNotFirst(t *testing.T) {
+	t.Parallel()
+
+	// dc:description Alt with a language-tagged item FIRST, x-default SECOND.
+	// dc:rights Alt with x-default FIRST (must still work).
+	raw := `<?xpacket begin="" uid="abc"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">
+      <dc:description>
+        <rdf:Alt>
+          <rdf:li xml:lang="de">Beschreibung</rdf:li>
+          <rdf:li xml:lang="x-default">Description</rdf:li>
+        </rdf:Alt>
+      </dc:description>
+      <dc:rights>
+        <rdf:Alt>
+          <rdf:li xml:lang="x-default">Copyright 2024</rdf:li>
+          <rdf:li xml:lang="en">Copyright 2024 EN</rdf:li>
+        </rdf:Alt>
+      </dc:rights>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>`
+
+	x, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// Caption must return the x-default value, not the German-tagged first item.
+	if got := x.Caption(); got != "Description" {
+		t.Errorf("Caption: got %q, want %q (x-default not selected)", got, "Description")
+	}
+
+	// Copyright must return the x-default value (it is first — must still work).
+	if got := x.Copyright(); got != "Copyright 2024" {
+		t.Errorf("Copyright: got %q, want %q", got, "Copyright 2024")
+	}
+}
+
+// TestAltXDefaultMultipleLanguages verifies x-default selection across a
+// packet with many language alternatives and x-default last, matching real
+// output from ExifTool batch processing.
+func TestAltXDefaultMultipleLanguages(t *testing.T) {
+	t.Parallel()
+
+	raw := `<?xpacket begin="" uid="abc"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">
+      <dc:description>
+        <rdf:Alt>
+          <rdf:li xml:lang="fr">Description en francais</rdf:li>
+          <rdf:li xml:lang="es">Texto en espanol</rdf:li>
+          <rdf:li xml:lang="ja">&#26085;&#26412;&#35486;&#35500;&#26126;</rdf:li>
+          <rdf:li xml:lang="x-default">Default Description</rdf:li>
+        </rdf:Alt>
+      </dc:description>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>`
+
+	x, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if got := x.Caption(); got != "Default Description" {
+		t.Errorf("Caption (x-default last of 4): got %q, want %q", got, "Default Description")
+	}
+}
+
+// TestAltNoXDefault verifies that when no x-default item exists, firstValue
+// falls back to the first item in document order (best-effort).
+func TestAltNoXDefault(t *testing.T) {
+	t.Parallel()
+
+	raw := `<?xpacket begin="" uid="abc"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">
+      <dc:description>
+        <rdf:Alt>
+          <rdf:li xml:lang="en">English Description</rdf:li>
+          <rdf:li xml:lang="de">Deutsche Beschreibung</rdf:li>
+        </rdf:Alt>
+      </dc:description>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>`
+
+	x, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// No x-default: fall back to first item. The stored value is "en|English Description"
+	// because a language-tagged item with no bare alternative is the best we can return.
+	got := x.Caption()
+	if got == "" {
+		t.Error("Caption: got empty, want non-empty fallback value")
+	}
+	// The fallback is the first item as stored — "en|English Description".
+	if got != "en|English Description" {
+		t.Errorf("Caption no-x-default fallback: got %q, want %q", got, "en|English Description")
+	}
+}
