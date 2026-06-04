@@ -1099,3 +1099,213 @@ func TestExtractMalformedBoxSizeLessThanHeader(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// TestInjectNormalizesConstructionMethod
+// ---------------------------------------------------------------------------
+
+// buildHEIFV1Iloc constructs a minimal ISOBMFF/HEIF stream whose iloc box uses
+// version=1 and stores the XMP item with construction_method=1 (idat-relative).
+// This exercises the bug path: before the fix, Inject left construction_method
+// as 1 while writing an absolute file offset, producing a corrupt output.
+//
+// Stream layout:
+//
+//	ftyp (16 bytes)
+//	meta (FullBox: version/flags + iinf + iloc v1)
+//	<XMP payload at absolute offset>
+func buildHEIFV1Iloc(xmpPayload []byte) []byte {
+	const xmpItemID uint16 = 1
+
+	// --- infe v2 for XMP item ---
+	// infe v2: version(1)+flags(3)+item_id(2)+item_protection_index(2)+item_type(4)+item_name(NUL)
+	infeBody := make([]byte, 4+2+2+4+1)
+	infeBody[0] = 2 // version 2
+	binary.BigEndian.PutUint16(infeBody[4:], xmpItemID)
+	copy(infeBody[8:], "mime")
+	infeBody[12] = 0 // NUL-terminated item name
+	infeHdr := make([]byte, 0, 8+len(infeBody))
+	infeHdr = append(infeHdr, 0, 0, 0, 0, 'i', 'n', 'f', 'e')
+	binary.BigEndian.PutUint32(infeHdr, uint32(8+len(infeBody))) //nolint:gosec // G115: test helper, bounded size
+	infeBox := append(infeHdr, infeBody...)
+
+	// --- iinf box ---
+	iinfBody := make([]byte, 0, 6+len(infeBox))   // version+flags(4)+item_count(2)+infe
+	iinfBody = append(iinfBody, 0, 0, 0, 0, 0, 1) // version 0 + flags (4) + item_count=1 (2)
+	iinfBody = append(iinfBody, infeBox...)
+	iinfHdr := make([]byte, 0, 8+len(iinfBody))
+	iinfHdr = append(iinfHdr, 0, 0, 0, 0, 'i', 'i', 'n', 'f')
+	binary.BigEndian.PutUint32(iinfHdr, uint32(8+len(iinfBody))) //nolint:gosec // G115: test helper, bounded size
+	iinfBox := append(iinfHdr, iinfBody...)
+
+	// --- iloc v1 box with construction_method=1 ---
+	// iloc v1 body layout (ISO 14496-12 §8.11.3):
+	//   version(1) + flags(3)
+	//   offset_size(4bits) + length_size(4bits)   = 0x44 (4,4)
+	//   base_offset_size(4bits) + index_size(4bits) = 0x00
+	//   item_count(2)
+	//   for each item:
+	//     item_ID(2)
+	//     construction_method(2)   [v1/v2 only]
+	//     base_offset (0 bytes, base_offset_size=0)
+	//     extent_count(2) = 1
+	//     extent_offset(4)
+	//     extent_length(4)
+	//
+	// We set construction_method=1 (idat-relative) to trigger the bug.
+	// The extent offset is a placeholder; we will patch it after computing
+	// the final meta box size.
+	makeIlocV1 := func(extentOffset uint32) []byte {
+		// Fixed body: version+flags(4)+sizes(2)+item_count(2)+item_ID(2)+
+		//             construction_method(2)+extent_count(2)+offset(4)+length(4) = 22 bytes.
+		body := make([]byte, 0, 22)
+		body = append(body,
+			0x01, 0x00, 0x00, 0x00, // version=1, flags=0
+			0x44,       // offset_size=4, length_size=4
+			0x00,       // base_offset_size=0, index_size=0
+			0x00, 0x01, // item_count = 1
+			0x00, byte(xmpItemID), // item_ID = 1 //nolint:gosec // G115: constant 1
+			0x00, 0x01, // construction_method = 1 (idat-relative)
+			// base_offset: omitted (base_offset_size=0)
+			0x00, 0x01, // extent_count = 1
+		)
+		off := [4]byte{}
+		binary.BigEndian.PutUint32(off[:], extentOffset)
+		body = append(body, off[:]...)
+		ln := [4]byte{}
+		binary.BigEndian.PutUint32(ln[:], uint32(len(xmpPayload))) //nolint:gosec // G115: test helper, bounded size
+		body = append(body, ln[:]...)
+		hdr := make([]byte, 0, 8+len(body))
+		hdr = append(hdr, 0, 0, 0, 0, 'i', 'l', 'o', 'c')
+		binary.BigEndian.PutUint32(hdr, uint32(8+len(body))) //nolint:gosec // G115: test helper, bounded size
+		return append(hdr, body...)
+	}
+
+	// --- ftyp box ---
+	ftyp := make([]byte, 16)
+	binary.BigEndian.PutUint32(ftyp, 16)
+	copy(ftyp[4:], "ftyp")
+	copy(ftyp[8:], "heic")
+
+	// Build meta box with placeholder iloc offset=0.
+	buildMeta := func(ilocBox []byte) []byte {
+		metaBody := make([]byte, 0, 4+len(iinfBox)+len(ilocBox)) // version+flags(4)+iinf+iloc
+		metaBody = append(metaBody, 0, 0, 0, 0)                  // version + flags
+		metaBody = append(metaBody, iinfBox...)
+		metaBody = append(metaBody, ilocBox...)
+		hdr := make([]byte, 0, 8)
+		hdr = append(hdr, 0, 0, 0, 0, 'm', 'e', 't', 'a')
+		binary.BigEndian.PutUint32(hdr, uint32(8+len(metaBody))) //nolint:gosec // G115: test helper, bounded size
+		return append(hdr, metaBody...)
+	}
+
+	// Pass 1: compute meta size to determine where XMP payload starts.
+	pass1Meta := buildMeta(makeIlocV1(0))
+	xmpStart := uint32(len(ftyp)) + uint32(len(pass1Meta)) //nolint:gosec // G115: test helper, bounded size
+
+	// Pass 2: rebuild with the correct offset.
+	finalIloc := makeIlocV1(xmpStart)
+	finalMeta := buildMeta(finalIloc)
+
+	// Recheck: if meta size changed between passes, do one more iteration.
+	if len(finalMeta) != len(pass1Meta) {
+		xmpStart2 := uint32(len(ftyp)) + uint32(len(finalMeta)) //nolint:gosec // G115: test helper, bounded size
+		finalIloc = makeIlocV1(xmpStart2)
+		finalMeta = buildMeta(finalIloc)
+	}
+
+	result := make([]byte, 0, len(ftyp)+len(finalMeta)+len(xmpPayload))
+	result = append(result, ftyp...)
+	result = append(result, finalMeta...)
+	result = append(result, xmpPayload...)
+	return result
+}
+
+// TestInjectNormalizesConstructionMethod is the regression gate for issue #61.
+//
+// It verifies that when Inject relocates an iloc item whose original
+// construction_method is 1 (idat-relative), the rebuilt iloc entry has
+// construction_method==0 (file offset) and its extent_offset points at the
+// appended payload in the output stream.
+//
+// ISO 14496-12 §8.11.3: construction_method 0 = file offset,
+// 1 = idat-relative, 2 = item-relative.  Writing an absolute file offset with
+// construction_method still set to 1 would cause conformant readers to
+// misresolve the metadata location.
+func TestInjectNormalizesConstructionMethod(t *testing.T) {
+	t.Parallel()
+
+	originalXMP := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta><?xpacket end="w"?>`)
+	newXMP := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"/></x:xmpmeta><?xpacket end="w"?>`)
+
+	// Build a HEIF whose XMP item uses iloc v1 with construction_method=1.
+	input := buildHEIFV1Iloc(originalXMP)
+
+	// Verify that the input really does encode construction_method=1.
+	// findBox returns meta box content with version+flags stripped (per its contract).
+	{
+		metaContent, err := findBox(input, "meta", 0)
+		if err != nil || len(metaContent) == 0 {
+			t.Fatalf("setup: meta box not found in synthetic input (err=%v)", err)
+		}
+		ilocInfo, ok := parseIlocFull(metaContent)
+		if !ok || len(ilocInfo.items) == 0 {
+			t.Fatal("setup: could not parse iloc from synthetic input")
+		}
+		if ilocInfo.items[0].constructMethod != 1 {
+			t.Fatalf("setup: expected construction_method=1 in input iloc, got %d", ilocInfo.items[0].constructMethod)
+		}
+	}
+
+	// Inject new XMP.
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(input), &out, nil, nil, newXMP); err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	output := out.Bytes()
+
+	// Parse the output iloc and assert:
+	// 1. construction_method of the XMP item is 0 (file offset).
+	// 2. The extent_offset points at the appended XMP payload.
+	outMetaContent, err := findBox(output, "meta", 0)
+	if err != nil || len(outMetaContent) == 0 {
+		t.Fatalf("output: meta box not found (err=%v)", err)
+	}
+	ilocInfo, ok := parseIlocFull(outMetaContent)
+	if !ok || len(ilocInfo.items) == 0 {
+		t.Fatal("output: could not parse iloc")
+	}
+
+	item := ilocInfo.items[0]
+	if item.constructMethod != 0 {
+		t.Errorf("output iloc construction_method = %d, want 0 (file offset)", item.constructMethod)
+	}
+
+	if len(item.extents) == 0 {
+		t.Fatal("output iloc item has no extents")
+	}
+	extOff := item.extents[0].offset
+	extLen := item.extents[0].length
+	if extOff == 0 {
+		t.Error("output iloc extent_offset is 0, want a valid file offset")
+	}
+	if extOff+extLen > uint64(len(output)) {
+		t.Errorf("output iloc extent [%d, %d) exceeds output file size %d",
+			extOff, extOff+extLen, len(output))
+	}
+
+	// The payload at that offset must equal the injected XMP.
+	got := output[extOff : extOff+extLen]
+	if !bytes.Equal(got, newXMP) {
+		t.Errorf("payload at iloc extent does not match injected XMP:\ngot  %q\nwant %q", got, newXMP)
+	}
+
+	// Also verify round-trip: Extract must return the same XMP.
+	_, _, extractedXMP, extractErr := Extract(bytes.NewReader(output))
+	if extractErr != nil {
+		t.Fatalf("Extract after Inject: %v", extractErr)
+	}
+	if !bytes.Equal(extractedXMP, newXMP) {
+		t.Errorf("Extract XMP mismatch after Inject:\ngot  %q\nwant %q", extractedXMP, newXMP)
+	}
+}

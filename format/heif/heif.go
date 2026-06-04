@@ -1168,14 +1168,24 @@ func mapPendingItems(itemTypes map[uint16]string, rawEXIF, rawXMP []byte) map[ui
 }
 
 // updateIlocItems returns a copy of items with each item that appears in
-// pendingByID having its base offset zeroed and its extents collapsed to a
-// single placeholder extent (offset=0, length=0). Real values are assigned
-// later by assignItemOffsets once the output layout is known.
+// pendingByID having its construction_method forced to 0 (file-offset), its
+// base offset zeroed, and its extents collapsed to a single placeholder extent
+// (offset=0, length=0). Real values are assigned later by assignItemOffsets
+// once the output layout is known.
+//
+// ISO 14496-12 §8.11.3: construction_method 0 = file offset, 1 = idat-relative,
+// 2 = item-relative. Because relocation always appends the payload at an absolute
+// file position, we must force construction_method to 0 regardless of the
+// original value. Leaving it as 1 or 2 while writing an absolute file offset
+// would cause conformant readers to mis-resolve the metadata location.
 func updateIlocItems(items []ilocFullItem, pendingByID map[uint16][]byte) []ilocFullItem {
 	updated := make([]ilocFullItem, len(items))
 	copy(updated, items)
 	for i, item := range updated {
 		if _, ok := pendingByID[item.id]; ok {
+			// Force to file-offset semantics: the relocated payload is always
+			// written at an absolute file position (construction_method == 0).
+			updated[i].constructMethod = 0
 			updated[i].baseOffset = 0
 			updated[i].extents = []ilocExtent{{offset: 0, length: 0}}
 		}
