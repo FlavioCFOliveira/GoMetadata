@@ -2969,6 +2969,140 @@ func TestSetGPSVersionIDRoundTrip(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// #68 — SetGPS WGS-84 validation: reject NaN / ±Inf / out-of-range
+// ---------------------------------------------------------------------------
+
+// TestSetGPSRejectsInvalid is the regression test for task #68.
+//
+// Before the fix, SetGPS called decimalToDMSBytes on unvalidated float64 values.
+// uint32(math.Floor(NaN)) returns 0 on arm64 (encoding the Gulf of Guinea),
+// uint32(+Inf) returns 4294967295 (MaxUint32), and out-of-range values such as
+// lat=91 or lon=200 were written verbatim into the GPS IFD with no error signal.
+//
+// After the fix, SetGPS returns early without modifying state whenever lat or lon
+// is NaN, ±Inf, |lat|>90, or |lon|>180.  GPSIFD must remain nil.
+func TestSetGPSRejectsInvalid(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		lat  float64
+		lon  float64
+	}{
+		{"NaN lat and lon", math.NaN(), math.NaN()},
+		{"NaN lat only", math.NaN(), 0},
+		{"NaN lon only", 0, math.NaN()},
+		{"+Inf lat", math.Inf(1), 0},
+		{"-Inf lat", math.Inf(-1), 0},
+		{"+Inf lon", 0, math.Inf(1)},
+		{"-Inf lon", 0, math.Inf(-1)},
+		{"+Inf lat and lon", math.Inf(1), math.Inf(1)},
+		{"lat out of range >90", 91, 0},
+		{"lat out of range <-90", -91, 0},
+		{"lon out of range >180", 0, 181},
+		{"lon out of range <-180", 0, -181},
+		{"both out of range", 91, 200},
+		{"lat=90.0001 boundary", 90.0001, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			e := &EXIF{ByteOrder: binary.LittleEndian, IFD0: &IFD{}}
+			e.SetGPS(tc.lat, tc.lon)
+
+			// GPS IFD must remain nil — no partial write.
+			if e.GPSIFD != nil {
+				t.Errorf("GPSIFD must remain nil for invalid input (%s), got non-nil", tc.name)
+			}
+			// GPS() must return ok=false.
+			_, _, ok := e.GPS()
+			if ok {
+				t.Errorf("GPS() must return ok=false for invalid input (%s)", tc.name)
+			}
+		})
+	}
+}
+
+// TestSetGPSRejectsInvalidPreservesExisting verifies that when a GPS IFD already
+// exists and SetGPS is called with invalid coordinates, the existing GPS data is
+// left intact (not cleared).
+func TestSetGPSRejectsInvalidPreservesExisting(t *testing.T) {
+	t.Parallel()
+
+	const (
+		wantLat = 48.8566
+		wantLon = 2.3522
+		tol     = 0.0001
+	)
+
+	e := &EXIF{ByteOrder: binary.LittleEndian, IFD0: &IFD{}}
+	// Write a valid coordinate first.
+	e.SetGPS(wantLat, wantLon)
+	if e.GPSIFD == nil {
+		t.Fatal("GPSIFD nil after valid SetGPS (test setup failure)")
+	}
+
+	// Now attempt to overwrite with invalid coordinates.
+	e.SetGPS(math.NaN(), math.NaN())
+	e.SetGPS(math.Inf(1), math.Inf(-1))
+	e.SetGPS(91, 200)
+
+	// GPS IFD must still contain the original valid coordinates.
+	gotLat, gotLon, ok := e.GPS()
+	if !ok {
+		t.Fatal("GPS() returned ok=false after invalid SetGPS on pre-existing GPS IFD")
+	}
+	if d := gotLat - wantLat; d > tol || d < -tol {
+		t.Errorf("lat = %f, want ~%f after invalid SetGPS", gotLat, wantLat)
+	}
+	if d := gotLon - wantLon; d > tol || d < -tol {
+		t.Errorf("lon = %f, want ~%f after invalid SetGPS", gotLon, wantLon)
+	}
+}
+
+// TestSetGPSPositiveControl confirms that valid boundary coordinates are still
+// accepted correctly after the validation guard is in place.
+func TestSetGPSPositiveControl(t *testing.T) {
+	t.Parallel()
+	const tol = 0.0001
+
+	tests := []struct {
+		name string
+		lat  float64
+		lon  float64
+	}{
+		{"exact north pole", 90.0, 0.0},
+		{"exact south pole", -90.0, 0.0},
+		{"antimeridian east", 0.0, 180.0},
+		{"antimeridian west", 0.0, -180.0},
+		{"zero island", 0.0, 0.0},
+		{"Paris", 48.8566, 2.3522},
+		{"Sydney", -33.8688, 151.2093},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			e := &EXIF{ByteOrder: binary.LittleEndian, IFD0: &IFD{}}
+			e.SetGPS(tc.lat, tc.lon)
+
+			if e.GPSIFD == nil {
+				t.Fatalf("GPSIFD is nil for valid input lat=%f lon=%f", tc.lat, tc.lon)
+			}
+			gotLat, gotLon, ok := e.GPS()
+			if !ok {
+				t.Fatalf("GPS() returned ok=false for valid input lat=%f lon=%f", tc.lat, tc.lon)
+			}
+			if d := gotLat - tc.lat; d > tol || d < -tol {
+				t.Errorf("lat = %f, want ~%f (diff %f)", gotLat, tc.lat, d)
+			}
+			if d := gotLon - tc.lon; d > tol || d < -tol {
+				t.Errorf("lon = %f, want ~%f (diff %f)", gotLon, tc.lon, d)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // #39 — writeIFD inline-value determinism
 // ---------------------------------------------------------------------------
 

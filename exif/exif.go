@@ -654,6 +654,19 @@ func (e *EXIF) SetImageSize(width, height uint32) {
 	e.ExifIFD.set(TagPixelYDimension, TypeLong, 1, bh[:])
 }
 
+// validWGS84Coords reports whether lat and lon are finite, non-NaN values
+// within the WGS-84 bounds accepted by the EXIF GPS IFD.
+//
+// CIPA DC-008-2019 §4.6.6: GPSLatitude valid range [0,90]; GPSLongitude [0,180].
+// The signed ranges accepted here are [-90,90] for latitude and [-180,180] for
+// longitude; SetGPS converts to absolute values and stores the hemisphere in
+// the Ref tag.
+func validWGS84Coords(lat, lon float64) bool {
+	return !math.IsNaN(lat) && !math.IsNaN(lon) &&
+		!math.IsInf(lat, 0) && !math.IsInf(lon, 0) &&
+		lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180
+}
+
 // decimalToDMSBytes converts a non-negative decimal-degree coordinate to the
 // three RATIONAL pairs [degrees/1, minutes/1, seconds*1e6/1e6] encoded per the
 // EXIF GPS spec (EXIF §4.6.6). Each rational is 8 bytes (two uint32s), so the
@@ -696,8 +709,21 @@ func decimalToDMSBytes(coord float64, order binary.ByteOrder) [24]byte {
 //
 // A placeholder TagGPSIFDPointer entry is also inserted into IFD0 so that
 // Encode() detects the GPS IFD and wires the offset correctly.
+//
+// WGS-84 range validation: lat must be in [-90, 90] and lon in [-180, 180].
+// NaN, ±Inf, and out-of-range values are rejected silently — the GPS IFD is
+// left unset (or unchanged if already present) and no error is returned. This
+// matches the void signature contract of all Set* methods.
 func (e *EXIF) SetGPS(lat, lon float64) {
 	if e == nil || e.IFD0 == nil {
+		return
+	}
+
+	// WGS-84 range validation. NaN/Inf values must be rejected before reaching
+	// decimalToDMSBytes: uint32(math.Floor(NaN)) yields 0 on arm64 (silently
+	// encoding the Gulf of Guinea) and uint32(+Inf) yields 4294967295.
+	// Both produce well-formed but semantically invalid GPS IFDs.
+	if !validWGS84Coords(lat, lon) {
 		return
 	}
 
