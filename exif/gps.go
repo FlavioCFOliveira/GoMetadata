@@ -38,10 +38,21 @@ const (
 
 // decodeCoordinate extracts a DMS (degrees/minutes/seconds) triplet from an
 // IFDEntry that must carry exactly 3 RATIONAL values (EXIF §4.6.6).
-// Returns (zero, false) when entry is nil, Count != 3, or any Rational call
-// returns an out-of-bounds result.
+// Returns (zero, false) when entry is nil, Count != 3, or the entry Type is
+// not TypeRational/TypeSRational.
+//
+// EXIF 2.32 CIPA DC-008-2023 §4.6.6 Table 15: GPSLatitude and GPSLongitude
+// are defined as RATIONAL with Count=3.  An entry whose Type is anything other
+// than RATIONAL/SRATIONAL must be rejected — Rational(i) silently returns
+// [0,0] for wrong-typed entries, which would produce (0,0,true) "Null Island"
+// instead of the correct (0,0,false) absent signal.
 func decodeCoordinate(entry *IFDEntry) ([3][2]uint32, bool) {
 	if entry == nil || entry.Count != 3 {
+		return [3][2]uint32{}, false
+	}
+	// Reject non-RATIONAL types explicitly; do not rely on Rational()'s silent
+	// [0,0] fallback which collapses wrong-typed entries to Null Island.
+	if entry.Type != TypeRational && entry.Type != TypeSRational {
 		return [3][2]uint32{}, false
 	}
 	var dms [3][2]uint32
@@ -91,7 +102,13 @@ func parseGPS(ifd *IFD) (lat, lon float64, ok bool) {
 
 // dmsToDecimal converts a RATIONAL triplet [degrees, minutes, seconds] to
 // a signed decimal-degree value. ref is the first byte of a GPSLatitudeRef or
-// GPSLongitudeRef entry: 'N', 'S', 'E', or 'W' (EXIF §4.6.6).
+// GPSLongitudeRef entry: 'N', 'S', 'E', or 'W' (EXIF §4.6.6, Table 15).
+//
+// The sign comparison is case-insensitive: some non-compliant cameras write
+// lowercase 's'/'w' instead of the spec-required uppercase 'S'/'W'. ExifTool
+// and libexif both apply a case-insensitive check for maximum compatibility.
+// Using the bitmask `ref|0x20` folds any ASCII letter to its lowercase form
+// without a branch or allocation (0x20 is the ASCII upper→lower bit).
 func dmsToDecimal(dms [3][2]uint32, ref byte) float64 {
 	// Guard against division by zero in any denominator.
 	if dms[0][1] == 0 || dms[1][1] == 0 || dms[2][1] == 0 {
@@ -104,7 +121,10 @@ func dmsToDecimal(dms [3][2]uint32, ref byte) float64 {
 
 	decimal := deg + mins/60 + sec/3600
 
-	if ref == 'S' || ref == 'W' {
+	// EXIF 2.32 CIPA DC-008-2023 §4.6.6 Table 15 specifies uppercase 'S'/'W',
+	// but non-compliant cameras may write lowercase. Fold to lowercase via bitmask
+	// before comparing to maximise compatibility, matching ExifTool/libexif behaviour.
+	if ref|0x20 == 's' || ref|0x20 == 'w' {
 		decimal = -decimal
 	}
 

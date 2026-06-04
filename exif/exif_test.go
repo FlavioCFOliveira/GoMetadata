@@ -2317,6 +2317,141 @@ func TestDecodeCoordinateEdgeCases(t *testing.T) {
 	})
 }
 
+// TestDMSToDecimalLowercaseRef verifies that dmsToDecimal applies the correct
+// negative sign for lowercase 's' (south) and 'w' (west) ref bytes.
+//
+// EXIF 2.32 CIPA DC-008-2023 §4.6.6 Table 15 requires uppercase 'S'/'W', but
+// non-compliant cameras (e.g. certain Android devices) write lowercase.
+// ExifTool and libexif both treat the comparison case-insensitively; this test
+// confirms the library matches that behaviour (task #75).
+func TestDMSToDecimalLowercaseRef(t *testing.T) {
+	t.Parallel()
+
+	// Sydney, Australia: approximately 33°52'00" S, 151°12'00" E
+	latDMS := [3][2]uint32{{33, 1}, {52, 1}, {0, 1}}
+	lonDMS := [3][2]uint32{{151, 1}, {12, 1}, {0, 1}}
+
+	tests := []struct {
+		name    string
+		dms     [3][2]uint32
+		ref     byte
+		wantNeg bool
+	}{
+		{"lowercase s → negative latitude", latDMS, 's', true},
+		{"uppercase S → negative latitude", latDMS, 'S', true},
+		{"lowercase w → negative longitude", lonDMS, 'w', true},
+		{"uppercase W → negative longitude", lonDMS, 'W', true},
+		{"lowercase n → positive latitude", latDMS, 'n', false},
+		{"uppercase N → positive latitude", latDMS, 'N', false},
+		{"lowercase e → positive longitude", lonDMS, 'e', false},
+		{"uppercase E → positive longitude", lonDMS, 'E', false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := dmsToDecimal(tc.dms, tc.ref)
+			if tc.wantNeg && got >= 0 {
+				t.Errorf("dmsToDecimal ref=%c = %f, want negative (southern/western hemisphere)", tc.ref, got)
+			}
+			if !tc.wantNeg && got <= 0 {
+				t.Errorf("dmsToDecimal ref=%c = %f, want positive (northern/eastern hemisphere)", tc.ref, got)
+			}
+		})
+	}
+}
+
+// TestParseGPSWrongTypeReportsAbsent verifies that a GPSLatitude entry with
+// Count==3 but Type==TypeShort (instead of TypeRational) causes parseGPS to
+// return ok==false rather than the silent (0,0,true) "Null Island" result.
+//
+// When the entry Type is wrong, IFDEntry.Rational() returns [0,0] for every
+// element; all denominators are 0, so dmsToDecimal returns 0. Without an
+// explicit type check in decodeCoordinate the coordinate (0°N 0°E) — Null
+// Island — would be returned as present. This test confirms the fix (task #75).
+func TestParseGPSWrongTypeReportsAbsent(t *testing.T) {
+	t.Parallel()
+
+	order := binary.LittleEndian
+	makeShortValue := func(count int) []byte {
+		// TypeShort: 2 bytes per element.
+		b := make([]byte, count*2)
+		for i := range count {
+			order.PutUint16(b[i*2:], uint16(i+1))
+		}
+		return b
+	}
+	makeRationals := func(dms [3][2]uint32) []byte {
+		b := make([]byte, 24)
+		for i, r := range dms {
+			order.PutUint32(b[i*8:], r[0])
+			order.PutUint32(b[i*8+4:], r[1])
+		}
+		return b
+	}
+
+	validLonDMS := [3][2]uint32{{151, 1}, {12, 1}, {0, 1}}
+
+	tests := []struct {
+		name     string
+		latType  DataType
+		latValue []byte
+		wantOK   bool
+		// wantLat is the expected signed decimal-degree latitude (negative = south).
+		// Only checked when wantOK is true.
+		wantLat float64
+	}{
+		{
+			name:     "GPSLatitude TypeShort Count=3 → absent",
+			latType:  TypeShort,
+			latValue: makeShortValue(3),
+			wantOK:   false,
+		},
+		{
+			// latRef='S', dms=33°52'0" → -33.866... (southern hemisphere)
+			name:     "GPSLatitude TypeRational Count=3 → present",
+			latType:  TypeRational,
+			latValue: makeRationals([3][2]uint32{{33, 1}, {52, 1}, {0, 1}}),
+			wantOK:   true,
+			wantLat:  -(33.0 + 52.0/60.0), // 'S' ref negates the value
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gpsIFD := &IFD{
+				Entries: []IFDEntry{
+					{Tag: TagGPSLatitudeRef, Type: TypeASCII, Count: 2, Value: []byte("S\x00"), byteOrder: order},
+					{Tag: TagGPSLatitude, Type: tc.latType, Count: 3, Value: tc.latValue, byteOrder: order},
+					{Tag: TagGPSLongitudeRef, Type: TypeASCII, Count: 2, Value: []byte("E\x00"), byteOrder: order},
+					{Tag: TagGPSLongitude, Type: TypeRational, Count: 3, Value: makeRationals(validLonDMS), byteOrder: order},
+				},
+			}
+			sortEntries(gpsIFD.Entries)
+
+			lat, lon, ok := parseGPS(gpsIFD)
+			if ok != tc.wantOK {
+				t.Errorf("parseGPS ok = %v, want %v (lat=%f, lon=%f)", ok, tc.wantOK, lat, lon)
+			}
+			if tc.wantOK {
+				const eps = 1e-6
+				if absFloat64(lat-tc.wantLat) > eps {
+					t.Errorf("parseGPS lat = %f, want %f", lat, tc.wantLat)
+				}
+			}
+		})
+	}
+}
+
+// absFloat64 returns the absolute value of f.
+func absFloat64(f float64) float64 {
+	if f < 0 {
+		return -f
+	}
+	return f
+}
+
 // TestEXIFMethodsNilExifIFD verifies that ExifIFD-dependent methods return
 // their zero/false values when EXIF.ExifIFD is nil (tag list not populated).
 func TestEXIFMethodsNilExifIFD(t *testing.T) {
