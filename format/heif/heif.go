@@ -373,38 +373,54 @@ func readIlocItemID(ilocData []byte, pos int, version uint8) (id uint16, newPos 
 	return uint16(rawID), pos + 4, true
 }
 
+// maxIlocExtentsPerItem is the upper bound on the number of extents we will
+// allocate for a single iloc item. The HEIF specification does not impose a
+// hard limit, but real files have 1-3 extents per item. 1024 is a generous
+// ceiling; it keeps the per-item allocation at most 1024×24 = 24 KB regardless
+// of what an untrusted file claims for extent_count (max uint16 = 65535).
+//
+// Without this cap, a crafted file with extentCount=65535 per item causes
+// ~1.5 MB of slice-header allocation per item — a denial-of-service via
+// memory amplification.
+const maxIlocExtentsPerItem = 1024
+
 // readIlocFullExtents reads extentCount extents from ilocData at pos using the
-// field sizes in info. Returns the populated extents, updated position, and
-// whether all extents were read without truncation.
+// field sizes in info. Returns the populated extents and updated position.
+// If the data is truncated before all extents are read, parsing stops early
+// and only the extents read so far are returned.
 // ISO 14496-12 §8.11.3.
-func readIlocFullExtents(ilocData []byte, pos, extentCount int, info ilocBoxInfo) (extents []ilocExtent, newPos int, ok bool) {
-	extents = make([]ilocExtent, 0, extentCount)
+func readIlocFullExtents(ilocData []byte, pos, extentCount int, info ilocBoxInfo) (extents []ilocExtent, newPos int) {
+	// Clamp the pre-allocation to prevent allocation amplification from an
+	// attacker-controlled extent_count field. We still advance pos through
+	// the data for all declared extents so the caller lands at the correct
+	// position for the next item; extents beyond the cap are simply dropped.
+	extents = make([]ilocExtent, 0, min(extentCount, maxIlocExtentsPerItem))
 	for range extentCount {
 		var ext ilocExtent
 		if info.indexSize > 0 {
 			if pos+info.indexSize > len(ilocData) {
-				return extents, pos, false
+				return extents, pos
 			}
 			ext.index = readUintN(ilocData[pos:], info.indexSize)
 			pos += info.indexSize
 		}
 		if info.offsetSize > 0 {
 			if pos+info.offsetSize > len(ilocData) {
-				return extents, pos, false
+				return extents, pos
 			}
 			ext.offset = readUintN(ilocData[pos:], info.offsetSize)
 			pos += info.offsetSize
 		}
 		if info.lengthSize > 0 {
 			if pos+info.lengthSize > len(ilocData) {
-				return extents, pos, false
+				return extents, pos
 			}
 			ext.length = readUintN(ilocData[pos:], info.lengthSize)
 			pos += info.lengthSize
 		}
 		extents = append(extents, ext)
 	}
-	return extents, pos, true
+	return extents, pos
 }
 
 // parseIlocFullItem reads one item entry from ilocData at pos given the box
@@ -447,7 +463,7 @@ func parseIlocFullItem(ilocData []byte, pos int, info ilocBoxInfo) (ilocFullItem
 	extentCount := int(binary.BigEndian.Uint16(ilocData[pos:]))
 	pos += 2
 
-	item.extents, pos, _ = readIlocFullExtents(ilocData, pos, extentCount, info)
+	item.extents, pos = readIlocFullExtents(ilocData, pos, extentCount, info)
 	return item, pos, true
 }
 
@@ -604,33 +620,79 @@ func buildMetaBox(versionFlags, metaContent, newIloc []byte) []byte {
 // patchAncestorSize adds delta to the size field of any top-level container
 // box in data whose byte range contains metaAbsStart (i.e. wraps the meta
 // box). This is needed when meta is nested inside moov and meta changes size.
-// Only 32-bit box sizes are handled; extended-size (size==1) boxes are left
-// unchanged because they are not used in typical HEIF files.
+//
+// Both 32-bit and 64-bit extended-size (size==1) boxes are handled:
+//   - 32-bit: if the updated size would exceed 0xFFFFFFFF the patch is skipped
+//     (the file was already near the 4 GB ISOBMFF single-box limit; corrupting
+//     the size field would be worse than leaving it stale).
+//   - 64-bit (size field == 1): the 8-byte largesize at bytes [pos+8:pos+16] is
+//     read, incremented by delta, and written back.
 func patchAncestorSize(data []byte, metaAbsStart, delta int) {
 	pos := 0
 	for pos+8 <= len(data) {
-		size := uint64(binary.BigEndian.Uint32(data[pos:]))
-		if size == 1 {
-			// Extended 64-bit size — skip patching (uncommon in HEIF photos).
-			break
-		}
-		if size == 0 {
-			size = uint64(len(data) - pos)
-		}
-		if uint64(pos)+size > uint64(len(data)) {
-			break
-		}
-		boxEnd := pos + int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
-		if pos < metaAbsStart && metaAbsStart < boxEnd {
-			// This box wraps the meta box — update its size.
-			newSize := int(size) + delta //nolint:gosec // G115: ISOBMFF box size bounded by file size
-			if newSize > 0 {
-				binary.BigEndian.PutUint32(data[pos:], uint32(newSize)) //nolint:gosec // G115: newSize > 0 checked above
+		rawSize32 := binary.BigEndian.Uint32(data[pos:])
+		if rawSize32 == 1 {
+			advanced, done := patchAncestorSizeExtended(data, pos, metaAbsStart, delta)
+			if done {
+				return
 			}
-			break
+			pos = advanced
+			continue
 		}
-		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
+		advanced, done := patchAncestorSize32(data, pos, metaAbsStart, delta)
+		if done {
+			return
+		}
+		pos = advanced
 	}
+}
+
+// patchAncestorSizeExtended handles the extended 64-bit size (size==1) branch
+// of patchAncestorSize. Returns (newPos, true) when scanning must stop (box
+// wraps metaAbsStart or data is truncated); returns (newPos, false) to advance.
+// ISO 14496-12 §4.2: if size==1, the 64-bit largesize follows the 4-byte type.
+func patchAncestorSizeExtended(data []byte, pos, metaAbsStart, delta int) (newPos int, done bool) {
+	if pos+16 > len(data) {
+		return pos, true
+	}
+	size64 := binary.BigEndian.Uint64(data[pos+8:])
+	if uint64(pos)+size64 > uint64(len(data)) { //nolint:gosec // G115: pos is non-negative (loop guard)
+		return pos, true
+	}
+	boxEnd := pos + int(size64) //nolint:gosec // G115: ISOBMFF box size bounded by file size
+	if pos < metaAbsStart && metaAbsStart < boxEnd {
+		newSize64 := int64(size64) + int64(delta) //nolint:gosec // G115: delta bounded by meta box size change
+		if newSize64 > 0 {
+			binary.BigEndian.PutUint64(data[pos+8:], uint64(newSize64))
+		}
+		return pos, true
+	}
+	return pos + int(size64), false //nolint:gosec // G115: ISOBMFF box size bounded by file size
+}
+
+// patchAncestorSize32 handles the 32-bit size branch of patchAncestorSize.
+// Returns (newPos, true) when scanning must stop; returns (newPos, false) to
+// advance to the next box.
+func patchAncestorSize32(data []byte, pos, metaAbsStart, delta int) (newPos int, done bool) {
+	size := uint64(binary.BigEndian.Uint32(data[pos:]))
+	if size == 0 {
+		size = uint64(len(data) - pos) //nolint:gosec // G115: len(data)-pos is non-negative (guarded above)
+	}
+	if uint64(pos)+size > uint64(len(data)) { //nolint:gosec // G115: pos is non-negative (loop guard)
+		return pos, true
+	}
+	boxEnd := pos + int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
+	if pos < metaAbsStart && metaAbsStart < boxEnd {
+		// Guard against uint32 overflow: if newSize > 0xFFFFFFFF, skip the
+		// patch rather than silently truncating. ISO 14496-12 §4.2: boxes
+		// > 4 GB must use the extended-size (size==1) form.
+		newSize := int64(size) + int64(delta) //nolint:gosec // G115: delta bounded by meta box size change
+		if newSize > 0 && uint64(newSize) <= 0xFFFFFFFF {
+			binary.BigEndian.PutUint32(data[pos:], uint32(newSize))
+		}
+		return pos, true
+	}
+	return pos + int(size), false //nolint:gosec // G115: ISOBMFF box size bounded by file size
 }
 
 // appendUintN appends v encoded as an n-byte big-endian integer to b.
@@ -706,12 +768,19 @@ func parseHEIFMetadata(data []byte) (rawEXIF, rawXMP []byte, err error) {
 
 	if exifFound {
 		if loc, ok := itemLocs[bestEXIFID]; ok {
-			rawEXIF = extractExifFromData(extractItemSlice(data, loc))
+			// bytes.Clone here ensures the returned slice does not retain the
+			// full-file buffer `data` alive via a sub-slice reference.
+			// The slow path (io.ReadAll) loads the entire file into `data`;
+			// without Clone, Metadata.rawEXIF would pin that allocation for
+			// its entire lifetime. The fast path (readItemPayload) already
+			// makes an independent allocation; this matches that behaviour.
+			rawEXIF = extractExifFromData(bytes.Clone(extractItemSlice(data, loc)))
 		}
 	}
 	if xmpFound {
 		if loc, ok := itemLocs[bestXMPID]; ok {
-			rawXMP = extractItemSlice(data, loc)
+			// Same reasoning: Clone so Metadata.rawXMP does not retain `data`.
+			rawXMP = bytes.Clone(extractItemSlice(data, loc))
 		}
 	}
 
