@@ -299,7 +299,7 @@ func TestInjectRoundTrip(t *testing.T) {
 	exif = append(exif[:len(exif)-4], 'X', 'X', 'X', 'X')
 	newExif := exif
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, newExif, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, newExif, nil, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -340,7 +340,7 @@ func TestInjectMetaInsideMoov(t *testing.T) {
 	exif = append(exif[:len(exif)-4], 'Y', 'Y', 'Y', 'Y')
 	newExif := exif
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, newExif, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, newExif, nil, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -364,7 +364,7 @@ func TestInjectBothEXIFAndXMP(t *testing.T) {
 	newXMP := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"/></x:xmpmeta><?xpacket end="w"?>`)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, newExif, nil, newXMP); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, newExif, nil, newXMP, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -388,7 +388,7 @@ func TestInjectPassThroughNilPayloads(t *testing.T) {
 	copy(original, data)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, nil, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, nil, nil, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 	if !bytes.Equal(out.Bytes(), original) {
@@ -587,7 +587,7 @@ func BenchmarkHEIFInject(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		_ = Inject(bytes.NewReader(data), nopWriter{}, newEXIF, nil, nil)
+		_ = Inject(bytes.NewReader(data), nopWriter{}, newEXIF, nil, nil, true)
 	}
 }
 
@@ -1260,7 +1260,7 @@ func TestInjectNormalizesConstructionMethod(t *testing.T) {
 
 	// Inject new XMP.
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(input), &out, nil, nil, newXMP); err != nil {
+	if err := Inject(bytes.NewReader(input), &out, nil, nil, newXMP, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 	output := out.Bytes()
@@ -1565,7 +1565,7 @@ func TestHEIFInjectLargeExtentCountBounded(t *testing.T) {
 		newXMP := []byte(`<?xpacket begin="" id="x"?><x:xmpmeta><new/></x:xmpmeta><?xpacket end="r"?>`)
 		var out bytes.Buffer
 		// Must not panic, OOM, or hang.
-		_ = Inject(bytes.NewReader(data), &out, nil, nil, newXMP)
+		_ = Inject(bytes.NewReader(data), &out, nil, nil, newXMP, true)
 		// We do not assert a specific return value — the crafted truncated iloc
 		// may cause graceful early-termination. The key invariant is: no crash.
 	})

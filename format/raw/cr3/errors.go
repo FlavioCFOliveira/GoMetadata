@@ -23,3 +23,12 @@ var ErrNoMoovBox = errors.New("cr3: no moov box found")
 //	    // CR3 write not yet supported; use a read-only workflow
 //	}
 var ErrWriteNotSupported = errors.New("cr3: metadata write not supported: stco/co64 offset relocation is required but not yet implemented")
+
+// ErrPreserveUnknownSegmentsNotSupported is returned by Inject when
+// preserveUnknownSegments is false. CR3 is an ISOBMFF container; its boxes
+// (ftyp, moov, mdat, UUID, etc.) are structurally mandatory. There is no
+// concept of an "unknown optional segment" analogous to JPEG's APPn segments.
+// Stripping non-metadata boxes would corrupt the container.
+//
+// Use PreserveUnknownSegments(true) (the default) when writing to CR3.
+var ErrPreserveUnknownSegmentsNotSupported = errors.New("cr3: PreserveUnknownSegments(false) is not supported for CR3; ISOBMFF boxes are structurally mandatory")

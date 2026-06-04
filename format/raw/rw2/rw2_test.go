@@ -60,7 +60,7 @@ func TestInjectOutputHasRW2Magic(t *testing.T) {
 	t.Parallel()
 	data := buildRW2()
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, nil, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, nil, nil, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 	result := out.Bytes()
@@ -78,7 +78,7 @@ func TestInjectRoundTrip(t *testing.T) {
 	t.Parallel()
 	data := buildRW2()
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, nil, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, nil, nil, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -96,7 +96,7 @@ func TestInjectInvalidMagicReturnsError(t *testing.T) {
 	data := buildRW2()
 	data[0] = 'M'
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader(data), &out, nil, nil, nil)
+	err := Inject(bytes.NewReader(data), &out, nil, nil, nil, true)
 	if err == nil {
 		t.Error("Inject with invalid magic: expected error, got nil")
 	}
@@ -264,7 +264,7 @@ func TestInjectIPTCXMP(t *testing.T) {
 	xmpPayload := []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"/>`)
 
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader(data), &out, nil, iptcPayload, xmpPayload)
+	err := Inject(bytes.NewReader(data), &out, nil, iptcPayload, xmpPayload, true)
 	if err != nil {
 		t.Fatalf("Inject with IPTC+XMP: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestInjectEXIFOnlyPassThrough(t *testing.T) {
 	patched[3] = 0x00
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, patched, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, patched, nil, nil, true); err != nil {
 		t.Fatalf("Inject (EXIF-only): %v", err)
 	}
 
@@ -331,7 +331,7 @@ func TestInjectIPTCGracefulDegradation(t *testing.T) {
 	iptcPayload := []byte{0x1C, 0x02, 0x05, 0x00, 0x05, 'h', 'e', 'l', 'l', 'o'}
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, nil, iptcPayload, nil); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, nil, iptcPayload, nil, true); err != nil {
 		t.Fatalf("Inject with IPTC: %v", err)
 	}
 
@@ -381,7 +381,7 @@ func TestInjectNonStandardRW2ReturnsError(t *testing.T) {
 
 	iptcPayload := []byte{0x1C, 0x02, 0x78, 0x00, 0x03, 'a', 'b', 'c'}
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader(data), &out, nil, iptcPayload, nil)
+	err := Inject(bytes.NewReader(data), &out, nil, iptcPayload, nil, true)
 	// Inject must return an error: silently discarding the metadata update would
 	// leave the caller with no indication that the write failed.
 	if err == nil {

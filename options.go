@@ -55,15 +55,25 @@ type writeConfig struct {
 	preserveUnknownSegments bool
 }
 
-// PreserveUnknownSegments controls whether APP or chunk segments that this
-// library does not recognise are passed through unchanged.
+// PreserveUnknownSegments controls whether segments that this library does not
+// recognise as metadata are passed through unchanged.
 //
-// In the current implementation segment preservation is always active: unknown
-// segments are never dropped regardless of the value passed here. This option
-// is accepted and stored so that callers can express intent in code today;
-// a future minor release will honour PreserveUnknownSegments(false) by
-// stripping unrecognised segments from writable container formats (JPEG, PNG,
-// WebP, HEIF/AVIF, CR3).
+// When true (the default), all non-metadata segments are copied verbatim to the
+// output. This is the safe default and is byte-identical to the output of
+// previous releases.
+//
+// When false:
+//   - JPEG: APPn segments (APP0–APP15) that are not one of the three recognised
+//     metadata segments (EXIF APP1, XMP APP1, Photoshop APP13) are stripped from
+//     the output. Structural markers (SOF, DQT, DHT), SOS, and compressed image
+//     data are never affected. Use this to remove unknown application payloads
+//     that may carry sensitive data (e.g. GPS embedded in a proprietary APPn).
+//   - PNG, WebP, HEIF/AVIF, CR3: returns an error wrapping
+//     ErrPreserveUnknownSegmentsNotSupported for that format, because those
+//     containers do not have an equivalent concept of "unknown optional segment"
+//     — every non-metadata chunk or box is required for correct decoding.
+//     TIFF-based formats (TIFF, CR2, NEF, ARW, DNG, ORF, RW2) are blocked by
+//     ErrWriteNotSupported before this option has any effect.
 //
 // Default: true.
 func PreserveUnknownSegments(v bool) WriteOption {

@@ -60,7 +60,7 @@ func TestInjectOutputHasORFMagic(t *testing.T) {
 	t.Parallel()
 	data := buildORF()
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, nil, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, nil, nil, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 	result := out.Bytes()
@@ -78,7 +78,7 @@ func TestInjectRoundTrip(t *testing.T) {
 	t.Parallel()
 	data := buildORF()
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, nil, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, nil, nil, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -96,7 +96,7 @@ func TestInjectInvalidMagicReturnsError(t *testing.T) {
 	data := buildORF()
 	data[0] = 'M'
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader(data), &out, nil, nil, nil)
+	err := Inject(bytes.NewReader(data), &out, nil, nil, nil, true)
 	if err == nil {
 		t.Error("Inject with invalid magic: expected error, got nil")
 	}
@@ -276,7 +276,7 @@ func TestInjectIPTCXMP(t *testing.T) {
 	xmpPayload := []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"/>`)
 
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader(data), &out, nil, iptcPayload, xmpPayload)
+	err := Inject(bytes.NewReader(data), &out, nil, iptcPayload, xmpPayload, true)
 	if err != nil {
 		t.Fatalf("Inject with IPTC+XMP: %v", err)
 	}

@@ -715,10 +715,27 @@ func writeSOS(r io.Reader, w io.Writer, data []byte) error {
 	return nil
 }
 
+// isAppMarker reports whether m is an APPn marker (APP0–APP15, markers
+// 0xE0–0xEF). These segments carry optional application-specific data and are
+// never required for image decoding.
+//
+// JPEG ISO/IEC 10918-1 §B.2.4.6: APPn markers are application extension
+// segments. Only the metadata-carrying APP1 (EXIF/XMP) and APP13 (Photoshop
+// IPTC) segments are explicitly handled by this library; all others are
+// "unknown" application payloads from the library's perspective.
+func isAppMarker(m byte) bool {
+	return m >= 0xE0 && m <= 0xEF
+}
+
 // copyNonMetadataSegments reads segments from r, skips old metadata APP
 // segments, and passes the rest through to w. It terminates on SOS (copying
 // the compressed stream verbatim) or EOI.
-func copyNonMetadataSegments(r io.Reader, w io.Writer, scratch *[]byte) error {
+//
+// When preserveUnknownSegments is false, APPn segments (APP0–APP15) that are
+// not the recognised metadata segments (EXIF APP1, XMP APP1, IPTC APP13) are
+// also dropped. Structural markers, DQT, DHT, SOF, SOS, and compressed image
+// data are never dropped regardless of this flag.
+func copyNonMetadataSegments(r io.Reader, w io.Writer, scratch *[]byte, preserveUnknownSegments bool) error {
 	for {
 		marker, data, err := readSegment(r, scratch)
 		if err != nil {
@@ -730,6 +747,18 @@ func copyNonMetadataSegments(r io.Reader, w io.Writer, scratch *[]byte) error {
 
 		// Skip segments we replaced (or removed when payload is nil).
 		if isOldMetadataSegment(marker, data) {
+			continue
+		}
+
+		// When preserveUnknownSegments is false, drop any APPn segment that
+		// is not a recognised metadata segment. isOldMetadataSegment already
+		// handles EXIF APP1, XMP APP1 (standard and extended), and
+		// Photoshop APP13 — so any remaining APPn here is "unknown" to the
+		// library (e.g. APP0/JFIF, APP2/ICC, APP12/Ducky, APP14/Adobe DCT).
+		//
+		// JPEG ISO/IEC 10918-1 §B.2.4.6: APPn markers are application
+		// extension segments; no APPn is required for image decoding.
+		if !preserveUnknownSegments && isAppMarker(marker) {
 			continue
 		}
 
@@ -791,12 +820,19 @@ func extractOriginalIRB(r io.ReadSeeker, scratch *[]byte) []byte {
 // XMP was not modified; in that case the original main and extended APP1
 // segments are reproduced byte-stably without regenerating the GUID.
 //
+// When preserveUnknownSegments is false, APPn segments (APP0–APP15) that are
+// not one of the three recognised metadata segments (EXIF APP1, XMP APP1,
+// Photoshop APP13) are stripped from the output. This allows callers to remove
+// unknown application payloads that may carry sensitive data. Structural
+// markers (SOF, DQT, DHT), SOS, and compressed image data are never affected.
+// The default (true) behaviour is byte-identical to previous releases.
+//
 // When the source JPEG carries a Photoshop APP13 segment that contains 8BIM
 // resources in addition to the 0x0404 IPTC block (e.g. IPTC digest 0x0425,
 // thumbnail 0x040C, ICC clipping path 0x040F), Inject preserves all sibling
 // resources verbatim and only replaces the 0x0404 block with rawIPTC. When the
 // source has no APP13, or when rawIPTC is nil, the behaviour is unchanged.
-func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
+func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("jpeg: seek: %w", err)
 	}
@@ -840,7 +876,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	injectScratch := iobuf.Get(4096)
 	defer iobuf.Put(injectScratch)
 
-	return copyNonMetadataSegments(r, w, injectScratch)
+	return copyNonMetadataSegments(r, w, injectScratch, preserveUnknownSegments)
 }
 
 // writeExtendedXMP splits rawXMP across a main APP1 and one or more extended

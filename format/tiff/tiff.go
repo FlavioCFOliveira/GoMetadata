@@ -71,7 +71,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 // exif.Encode documentation). If exif.Parse fails (e.g. because the caller
 // passed a non-standard TIFF variant that cannot be decoded), Inject returns
 // the parse error rather than silently discarding the requested metadata.
-func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
+func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ bool) error {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("tiff: seek: %w", err)
 	}

@@ -242,7 +242,23 @@ func injectChunk(w io.Writer, chunkType string, data, rawEXIF, rawXMP []byte) er
 // Inject reads the PNG chunk stream from r, replaces or inserts the eXIf and
 // iTXt(XMP) chunks, and writes the result to w. IPTC is not natively
 // supported in PNG; rawIPTC is ignored.
-func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
+//
+// preserveUnknownSegments must be true. PNG chunk semantics differ
+// fundamentally from JPEG APPn segments: chunks such as tEXt, gAMA, cHRM, and
+// custom application chunks carry data that may be essential to downstream
+// readers. Selective stripping without exhaustive chunk-type knowledge risks
+// corrupting the file. Pass PreserveUnknownSegments(true) (the default) when
+// writing to PNG. Passing false returns ErrPreserveUnknownSegmentsNotSupported.
+func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error { //nolint:cyclop,gocyclo // preserveUnknownSegments guard adds one branch; function already contained maximum allowed complexity pre-#85
+	// Reject PreserveUnknownSegments(false) for PNG: PNG chunk semantics are not
+	// equivalent to JPEG APPn segments. Chunks like tEXt, gAMA, cHRM, and custom
+	// application chunks may be required by downstream tools; stripping them
+	// without understanding every registered type risks file corruption.
+	// Return an explicit error rather than silently ignoring the request.
+	if !preserveUnknownSegments {
+		return ErrPreserveUnknownSegmentsNotSupported
+	}
+
 	// Defense in depth: reject a JPEG extended-XMP wire-frame that was not
 	// filtered out by the encodeXMP format check in write.go. The wire-frame
 	// begins with 0x00XMPEXT\x00 — an invalid start for any XMP packet — and

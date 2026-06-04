@@ -213,7 +213,19 @@ func buildInjectComponents(data []byte, metaAbsStart, metaAbsEnd, metaContentOff
 // preserving all other items unchanged. Any enclosing container box sizes
 // (e.g. moov) are patched if the meta box size changes. New item payloads
 // are appended at the end of the output file.
-func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
+//
+// preserveUnknownSegments must be true. HEIF/AVIF ISOBMFF boxes (ftyp, moov,
+// mdat, etc.) are structurally mandatory; there is no concept of an "unknown
+// optional segment" analogous to JPEG's APPn. Passing false returns
+// ErrPreserveUnknownSegmentsNotSupported.
+func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error { //nolint:cyclop,gocyclo // preserveUnknownSegments guard adds one branch; function already contained maximum allowed complexity pre-#85
+	// Reject PreserveUnknownSegments(false) for HEIF/AVIF: ISOBMFF boxes are
+	// structurally mandatory. There is no concept of "unknown optional segment"
+	// in ISOBMFF analogous to JPEG's APPn segments.
+	if !preserveUnknownSegments {
+		return ErrPreserveUnknownSegmentsNotSupported
+	}
+
 	// Defense in depth: reject a JPEG extended-XMP wire-frame that was not
 	// filtered out by the encodeXMP format check in write.go. The wire-frame
 	// begins with 0x00XMPEXT\x00 — an invalid start for any XMP packet — and

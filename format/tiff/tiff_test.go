@@ -158,7 +158,7 @@ func TestInjectIPTCRoundTrip(t *testing.T) {
 
 	newIPTC := []byte("updated-iptc-data")
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, data, newIPTC, nil); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, data, newIPTC, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -181,7 +181,7 @@ func TestInjectXMPRoundTrip(t *testing.T) {
 	newXMP := []byte("<?xpacket begin='' uid='x'?><xmpmeta/><?xpacket end='r'?>")
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, data, nil, newXMP); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, data, nil, newXMP, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -199,7 +199,7 @@ func TestInjectPassThrough(t *testing.T) {
 	// When rawIPTC and rawXMP are both nil, the output should equal the input.
 	data := buildMinimalTIFF(binary.LittleEndian, []byte("x"), nil)
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, data, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, data, nil, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 	if !bytes.Equal(out.Bytes(), data) {
@@ -289,7 +289,7 @@ func TestPrivateShortTagRoundTrip(t *testing.T) {
 	// Inject a new IPTC payload — this forces re-encoding of the whole TIFF.
 	newIPTC := []byte("iptc-payload-for-private-tag-test-long-enough")
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, data, newIPTC, nil); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, data, newIPTC, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -343,7 +343,7 @@ func TestPrivateUndefinedTagRoundTrip(t *testing.T) {
 
 	newXMP := []byte("<?xpacket begin='' id='x'?><xmpmeta/><?xpacket end='r'?>")
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, data, nil, newXMP); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, data, nil, newXMP, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -400,7 +400,7 @@ func TestUnknownTypeTagRoundTrip(t *testing.T) {
 	// Force re-encoding via Inject with an IPTC update.
 	newIPTC := []byte("iptc-for-unknown-type-tag-test-data-that-is-long-enough")
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, data, newIPTC, nil); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, data, newIPTC, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -495,7 +495,7 @@ func TestInjectWithNilRawEXIF(t *testing.T) {
 
 	var out bytes.Buffer
 	// rawEXIF=nil forces Inject to read the TIFF from r.
-	if err := Inject(bytes.NewReader(data), &out, nil, wantIPTC, nil); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, nil, wantIPTC, nil, true); err != nil {
 		t.Fatalf("Inject nil rawEXIF: %v", err)
 	}
 
@@ -515,7 +515,7 @@ func TestInjectInvalidTIFFReturnsError(t *testing.T) {
 	t.Parallel()
 	invalidEXIF := []byte("not-a-tiff-stream")
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader([]byte{}), &out, invalidEXIF, []byte("iptc"), nil)
+	err := Inject(bytes.NewReader([]byte{}), &out, invalidEXIF, []byte("iptc"), nil, true)
 	if err == nil {
 		t.Error("expected error for invalid TIFF rawEXIF, got nil")
 	}

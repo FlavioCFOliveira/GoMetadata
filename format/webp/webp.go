@@ -145,7 +145,19 @@ func readPaddedChunk(r io.ReadSeeker, chunk riff.Chunk) ([]byte, error) {
 
 // Inject writes a modified WebP stream to w with updated EXIF and XMP chunks.
 // rawIPTC is ignored (WebP has no IPTC support).
-func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
+//
+// preserveUnknownSegments must be true. WebP RIFF chunks other than EXIF and
+// XMP (VP8, VP8L, VP8X, ANIM, ANMF, ALPH, etc.) are structurally required for
+// correct image decoding and are never "unknown" in the JPEG APPn sense.
+// Passing false returns ErrPreserveUnknownSegmentsNotSupported.
+func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
+	// Reject PreserveUnknownSegments(false) for WebP: all non-metadata RIFF
+	// chunks (VP8, VP8L, VP8X, ANIM, ANMF, ALPH) are required for correct image
+	// decoding. There is no equivalent of JPEG's "unknown APPn" in WebP.
+	if !preserveUnknownSegments {
+		return ErrPreserveUnknownSegmentsNotSupported
+	}
+
 	// Defense in depth: reject a JPEG extended-XMP wire-frame that was not
 	// filtered out by the encodeXMP format check in write.go. The wire-frame
 	// begins with 0x00XMPEXT\x00 — an invalid start for any XMP packet — and

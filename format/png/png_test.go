@@ -132,7 +132,7 @@ func TestInjectCRCCorrect(t *testing.T) {
 	png := buildPNG(nil, nil)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(png), &out, exifData, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(png), &out, exifData, nil, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -171,7 +171,7 @@ func TestInjectRoundTrip(t *testing.T) {
 	png := buildPNG(nil, nil)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(png), &out, exifData, nil, xmpData); err != nil {
+	if err := Inject(bytes.NewReader(png), &out, exifData, nil, xmpData, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -433,7 +433,7 @@ func BenchmarkPNGInject(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		var out bytes.Buffer
-		_ = Inject(bytes.NewReader(png), &out, exifData, nil, xmpData)
+		_ = Inject(bytes.NewReader(png), &out, exifData, nil, xmpData, true)
 	}
 }
 
@@ -581,7 +581,7 @@ func TestInjectDropsExistingEXIf(t *testing.T) {
 	png := buildPNG(oldExif, nil)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(png), &out, newExif, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(png), &out, newExif, nil, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -603,7 +603,7 @@ func TestInjectDropsExistingXMP(t *testing.T) {
 	png := buildPNG(nil, oldXMP)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(png), &out, nil, nil, newXMP); err != nil {
+	if err := Inject(bytes.NewReader(png), &out, nil, nil, newXMP, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -624,7 +624,7 @@ func TestInjectNilPayloadsPassThrough(t *testing.T) {
 	png := buildPNG(nil, nil)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(png), &out, nil, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(png), &out, nil, nil, nil, true); err != nil {
 		t.Fatalf("Inject nil payloads: %v", err)
 	}
 
@@ -647,7 +647,7 @@ func TestInjectEOFAfterSignature(t *testing.T) {
 	t.Parallel()
 	// Just the 8-byte PNG signature, no chunks.
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader(pngSig[:]), &out, nil, nil, nil)
+	err := Inject(bytes.NewReader(pngSig[:]), &out, nil, nil, nil, true)
 	if err != nil {
 		t.Errorf("expected nil for EOF-after-signature, got: %v", err)
 	}
@@ -662,7 +662,7 @@ func TestInjectUnexpectedEOFReturnsError(t *testing.T) {
 	copy(buf[:8], pngSig[:])
 	// Only 4 bytes of the chunk header — truncated.
 	binary.BigEndian.PutUint32(buf[8:], 13) // length field of a partial IHDR
-	err := Inject(bytes.NewReader(buf), &bytes.Buffer{}, nil, nil, nil)
+	err := Inject(bytes.NewReader(buf), &bytes.Buffer{}, nil, nil, nil, true)
 	if err == nil {
 		t.Error("expected error for truncated chunk header, got nil")
 	}

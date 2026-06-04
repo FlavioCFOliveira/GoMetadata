@@ -119,7 +119,7 @@ func TestInjectPreservesScanData(t *testing.T) {
 
 	newTIFF := minimalTIFFBytes()
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(src.Bytes()), &out, newTIFF, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(src.Bytes()), &out, newTIFF, nil, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -285,7 +285,7 @@ func TestInjectCombinedMetadataRoundTrip(t *testing.T) {
 
 	src := buildJPEG(nil, nil, nil) // start with a bare JPEG
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(src), &out, tiffData, iptcData, xmpData); err != nil {
+	if err := Inject(bytes.NewReader(src), &out, tiffData, iptcData, xmpData, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -362,7 +362,7 @@ func TestInjectPreservesCOMSegment(t *testing.T) {
 
 	newTIFF := minimalTIFFBytes()
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(j), &out, newTIFF, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(j), &out, newTIFF, nil, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -396,7 +396,7 @@ func TestInjectPreservesAPP4Segment(t *testing.T) {
 	j := buildJPEGWithUnknownSegments(nil, nil, app4Payload)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(j), &out, nil, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(j), &out, nil, nil, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -430,7 +430,7 @@ func TestInjectSegmentOrderPreserved(t *testing.T) {
 
 	newTIFF := minimalTIFFBytes()
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(src), &out, newTIFF, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(src), &out, newTIFF, nil, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -974,7 +974,7 @@ func TestInjectAllThreeMetadataPreservesUnknownAndScan(t *testing.T) {
 	newXMP := []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta>`)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(src.Bytes()), &out, newTIFF, newIPTC, newXMP); err != nil {
+	if err := Inject(bytes.NewReader(src.Bytes()), &out, newTIFF, newIPTC, newXMP, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -1095,7 +1095,7 @@ func TestExtendedXMPHeaderLayout(t *testing.T) {
 
 	src := buildJPEG(nil, nil, nil)
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(src), &out, nil, nil, rawXMP); err != nil {
+	if err := Inject(bytes.NewReader(src), &out, nil, nil, rawXMP, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 

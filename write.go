@@ -26,8 +26,13 @@ import (
 
 // injectors maps each FormatID to its Inject function.
 //
+// The preserveUnknownSegments bool is the last parameter: when false, each
+// injector either drops non-essential segments (JPEG) or returns
+// ErrPreserveUnknownSegmentsNotSupported (PNG, WebP, HEIF/AVIF, CR3).
+// TIFF-based formats are gated earlier by isTIFFBased and never reach this map.
+//
 //nolint:gochecknoglobals // dispatch table: read-only after init, never mutated
-var injectors = map[format.FormatID]func(io.ReadSeeker, io.Writer, []byte, []byte, []byte) error{
+var injectors = map[format.FormatID]func(io.ReadSeeker, io.Writer, []byte, []byte, []byte, bool) error{
 	format.FormatJPEG: jpeg.Inject,
 	format.FormatTIFF: tiff.Inject,
 	format.FormatPNG:  png.Inject,
@@ -94,7 +99,7 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 		return err
 	}
 
-	return injectByFormat(r, w, fmtID, rawEXIF, rawIPTC, rawXMP)
+	return injectByFormat(r, w, fmtID, rawEXIF, rawIPTC, rawXMP, cfg.preserveUnknownSegments)
 }
 
 // WriteFile reads the image at path, applies the metadata in m, and writes
@@ -239,12 +244,16 @@ func encodeXMP(m *Metadata, fmtID format.FormatID) ([]byte, error) {
 }
 
 // injectByFormat dispatches to the correct container handler for segment injection.
-func injectByFormat(r io.ReadSeeker, w io.Writer, fmtID format.FormatID, rawEXIF, rawIPTC, rawXMP []byte) error {
+// preserveUnknownSegments is forwarded to the format-specific injector: JPEG
+// honours it by dropping unknown APPn segments when false; PNG, WebP, HEIF/AVIF,
+// and CR3 return ErrPreserveUnknownSegmentsNotSupported when false; TIFF-based
+// formats are gated before this function is ever reached.
+func injectByFormat(r io.ReadSeeker, w io.Writer, fmtID format.FormatID, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
 	fn, ok := injectors[fmtID]
 	if !ok {
 		return &UnsupportedFormatError{}
 	}
-	return wrapInject(fn(r, w, rawEXIF, rawIPTC, rawXMP))
+	return wrapInject(fn(r, w, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments))
 }
 
 // wrapInject wraps errors from format-specific Inject calls with the library prefix.

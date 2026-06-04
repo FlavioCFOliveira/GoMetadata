@@ -185,14 +185,14 @@ func TestJPEGReadSegmentPoolReuseInject(t *testing.T) { //nolint:paralleltest //
 	// Warm up.
 	for range 3 {
 		var out bytes.Buffer
-		_ = Inject(bytes.NewReader(jpegData), &out, tiffData, nil, nil)
+		_ = Inject(bytes.NewReader(jpegData), &out, tiffData, nil, nil, true)
 	}
 	runtime.GC()
 
 	const measureRuns = 50
 	allocs := testing.AllocsPerRun(measureRuns, func() {
 		var out bytes.Buffer
-		_ = Inject(bytes.NewReader(jpegData), &out, tiffData, nil, nil)
+		_ = Inject(bytes.NewReader(jpegData), &out, tiffData, nil, nil, true)
 	})
 
 	// Inject allocates more than Extract (output buffer, EXIF segment buffer,

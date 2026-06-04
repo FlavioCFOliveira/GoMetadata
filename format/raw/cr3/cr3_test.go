@@ -129,7 +129,7 @@ func TestInjectEXIFGate(t *testing.T) {
 	newExif := append(exif, 0x00, 0x01, 0x02, 0x03) // different size than original
 
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader(data), &out, newExif, nil, nil)
+	err := Inject(bytes.NewReader(data), &out, newExif, nil, nil, true)
 	if err == nil {
 		t.Fatal("Inject with non-nil rawEXIF: expected ErrWriteNotSupported, got nil")
 	}
@@ -156,7 +156,7 @@ func TestInjectXMPGate(t *testing.T) {
 	xmp := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta><?xpacket end="w"?>`)
 
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader(data), &out, nil, nil, xmp)
+	err := Inject(bytes.NewReader(data), &out, nil, nil, xmp, true)
 	if err == nil {
 		t.Fatal("Inject with non-nil rawXMP: expected ErrWriteNotSupported, got nil")
 	}
@@ -179,7 +179,7 @@ func TestInjectPassThroughWhenNoMoov(t *testing.T) {
 	copy(original, ftyp)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(ftyp), &out, nil, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(ftyp), &out, nil, nil, nil, true); err != nil {
 		t.Fatalf("Inject pass-through: %v", err)
 	}
 	if !bytes.Equal(out.Bytes(), original) {
@@ -603,7 +603,7 @@ func TestInjectAddsNewXMPWhenAbsentGate(t *testing.T) {
 	xmp := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"/><?xpacket end="w"?>`)
 
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader(data), &out, nil, nil, xmp)
+	err := Inject(bytes.NewReader(data), &out, nil, nil, xmp, true)
 	if err == nil {
 		t.Fatal("Inject with non-nil rawXMP: expected ErrWriteNotSupported, got nil")
 	}
@@ -715,7 +715,7 @@ func TestInjectLargerEXIFGate(t *testing.T) {
 	copy(larger, exif)
 
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader(data), &out, larger, nil, nil)
+	err := Inject(bytes.NewReader(data), &out, larger, nil, nil, true)
 	if err == nil {
 		t.Fatal("Inject with larger rawEXIF: expected ErrWriteNotSupported, got nil")
 	}
@@ -767,7 +767,7 @@ func TestInjectWriteGateNoCorruptOutput(t *testing.T) {
 			t.Parallel()
 			data := buildMinimalCR3(minimalTIFF(), nil)
 			var out bytes.Buffer
-			err := Inject(bytes.NewReader(data), &out, tc.rawEXIF, tc.rawIPTC, tc.rawXMP)
+			err := Inject(bytes.NewReader(data), &out, tc.rawEXIF, tc.rawIPTC, tc.rawXMP, true)
 			if err == nil {
 				t.Fatalf("Inject(%s): expected ErrWriteNotSupported, got nil", tc.name)
 			}
@@ -790,7 +790,7 @@ func TestInjectNilPayloadsPassThrough(t *testing.T) {
 	data := buildMinimalCR3(minimalTIFF(), nil)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, nil, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, nil, nil, nil, true); err != nil {
 		t.Fatalf("Inject(nil,nil,nil): unexpected error: %v", err)
 	}
 	if !bytes.Equal(out.Bytes(), data) {

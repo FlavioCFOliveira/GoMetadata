@@ -62,7 +62,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 // call Inject directly on files from a user-facing write path; use
 // gometadata.Write instead, which gates RW2 behind ErrWriteNotSupported until
 // full structural relocation is implemented (roadmap Option A, epic #33).
-func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
+func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("rw2: seek: %w", err)
 	}
@@ -82,7 +82,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 
 	// Buffer the TIFF output so we can restore the RW2 magic bytes.
 	var buf bytes.Buffer
-	if injectErr := tiff.Inject(bytes.NewReader(data), &buf, rawEXIF, rawIPTC, rawXMP); injectErr != nil {
+	if injectErr := tiff.Inject(bytes.NewReader(data), &buf, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments); injectErr != nil {
 		return fmt.Errorf("rw2: inject: %w", injectErr)
 	}
 

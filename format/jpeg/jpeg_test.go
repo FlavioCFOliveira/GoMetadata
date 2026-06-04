@@ -132,7 +132,7 @@ func TestInjectRoundTrip(t *testing.T) {
 
 	newIPTC := []byte{0x1C, 0x02, 0x78, 0x00, 0x03, 'N', 'e', 'w'}
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(jpeg), &out, tiffData, newIPTC, nil); err != nil {
+	if err := Inject(bytes.NewReader(jpeg), &out, tiffData, newIPTC, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -372,7 +372,7 @@ func TestInjectRemoveEXIF(t *testing.T) {
 	jpeg := buildJPEG(tiffData, nil, nil)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(jpeg), &out, nil, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(jpeg), &out, nil, nil, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -395,7 +395,7 @@ func TestInjectXMPRoundTrip(t *testing.T) {
 	xmpPayload := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta>`)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(jpeg), &out, nil, nil, xmpPayload); err != nil {
+	if err := Inject(bytes.NewReader(jpeg), &out, nil, nil, xmpPayload, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -420,7 +420,7 @@ func TestInjectPreservesUnknownAPP(t *testing.T) {
 
 	newEXIF := minimalTIFFBytes()
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(jpeg), &out, newEXIF, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(jpeg), &out, newEXIF, nil, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -494,7 +494,7 @@ func TestInjectOversizedEXIFReturnsError(t *testing.T) {
 	// 65528 bytes: len(identExif=6) + 65528 + 2 = 65536 > 65535 → error
 	oversized := make([]byte, 65528)
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader(jpeg), &out, oversized, nil, nil)
+	err := Inject(bytes.NewReader(jpeg), &out, oversized, nil, nil, true)
 	if err == nil {
 		t.Error("Inject with oversized EXIF: expected error, got nil")
 	}
@@ -591,7 +591,7 @@ func TestInjectExtendedXMP(t *testing.T) {
 
 	src := buildJPEG(nil, nil, nil)
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(src), &out, nil, nil, rawXMP); err != nil {
+	if err := Inject(bytes.NewReader(src), &out, nil, nil, rawXMP, true); err != nil {
 		t.Fatalf("Inject with oversized XMP: %v", err)
 	}
 
@@ -632,7 +632,7 @@ func TestInjectExtendedXMPMultiChunk(t *testing.T) {
 
 	src := buildJPEG(nil, nil, nil)
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(src), &out, nil, nil, rawXMP); err != nil {
+	if err := Inject(bytes.NewReader(src), &out, nil, nil, rawXMP, true); err != nil {
 		t.Fatalf("Inject multi-chunk extended XMP: %v", err)
 	}
 
@@ -685,7 +685,7 @@ func TestExtendedXMPSegmentIdentifier(t *testing.T) {
 
 	src := buildJPEG(nil, nil, nil)
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(src), &out, nil, nil, rawXMP); err != nil {
+	if err := Inject(bytes.NewReader(src), &out, nil, nil, rawXMP, true); err != nil {
 		t.Fatalf("Inject with oversized XMP: %v", err)
 	}
 	outBytes := out.Bytes()
@@ -727,7 +727,7 @@ func TestInjectSmallXMPFastPath(t *testing.T) {
 
 	src := buildJPEG(nil, nil, nil)
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(src), &out, nil, nil, xmpPayload); err != nil {
+	if err := Inject(bytes.NewReader(src), &out, nil, nil, xmpPayload, true); err != nil {
 		t.Fatalf("Inject small XMP: %v", err)
 	}
 
@@ -766,7 +766,7 @@ func TestInjectNonJPEGReturnsError(t *testing.T) {
 	t.Parallel()
 	notJPEG := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A}
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader(notJPEG), &out, nil, nil, nil)
+	err := Inject(bytes.NewReader(notJPEG), &out, nil, nil, nil, true)
 	if err == nil {
 		t.Error("Inject on non-JPEG: expected error, got nil")
 	}
@@ -814,7 +814,7 @@ func TestInjectEOIPath(t *testing.T) {
 	// Bare JPEG with just SOI + EOI (no SOS).
 	bare := []byte{0xFF, 0xD8, 0xFF, 0xD9}
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(bare), &out, nil, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(bare), &out, nil, nil, nil, true); err != nil {
 		t.Fatalf("Inject EOI-only JPEG: %v", err)
 	}
 	result := out.Bytes()
@@ -840,7 +840,7 @@ func TestInjectStandaloneMarkerPassthrough(t *testing.T) {
 	buf.Write([]byte{0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9})
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(buf.Bytes()), &out, nil, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(buf.Bytes()), &out, nil, nil, nil, true); err != nil {
 		t.Fatalf("Inject with RST marker: %v", err)
 	}
 
@@ -1148,7 +1148,7 @@ func TestCopyNonMetadataSegmentsReadError(t *testing.T) {
 
 	scratch := make([]byte, 0, 4096)
 	var out bytes.Buffer
-	err := copyNonMetadataSegments(bytes.NewReader(buf.Bytes()), &out, &scratch)
+	err := copyNonMetadataSegments(bytes.NewReader(buf.Bytes()), &out, &scratch, true)
 	// The truncated read should produce an error (non-EOF, unexpected EOF).
 	if err == nil {
 		t.Error("expected error for truncated segment, got nil")
@@ -1342,7 +1342,7 @@ func TestExtractWithWireExtendedXMPRoundTrip(t *testing.T) {
 
 	// Inject using the wire-frame (simulates unmodified round-trip).
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(origJPEG), &out, rawEXIF1, rawIPTC1, rawXMPWire1); err != nil {
+	if err := Inject(bytes.NewReader(origJPEG), &out, rawEXIF1, rawIPTC1, rawXMPWire1, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -1366,7 +1366,7 @@ func TestExtractWithWireExtendedXMPRoundTrip(t *testing.T) {
 		t.Fatal("rawXMPWire2 is nil; wire-frame must survive a second round-trip")
 	}
 	var out2 bytes.Buffer
-	if err := Inject(bytes.NewReader(out.Bytes()), &out2, nil, nil, rawXMPWire2); err != nil {
+	if err := Inject(bytes.NewReader(out.Bytes()), &out2, nil, nil, rawXMPWire2, true); err != nil {
 		t.Fatalf("Inject (2): %v", err)
 	}
 	_, _, rawXMP3, _, err := ExtractWithWire(bytes.NewReader(out2.Bytes()))
@@ -1719,7 +1719,7 @@ func BenchmarkJPEGInject(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		var out bytes.Buffer
-		_ = Inject(bytes.NewReader(jpeg), &out, tiffData, newIPTC, nil)
+		_ = Inject(bytes.NewReader(jpeg), &out, tiffData, newIPTC, nil, true)
 	}
 }
 

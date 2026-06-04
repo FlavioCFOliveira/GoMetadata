@@ -216,7 +216,18 @@ func rebuildUUIDContent(uuidContent, rawEXIF, rawXMP []byte) (newContent []byte,
 //
 // Full CR3 write support (with stco/co64 relocation) is tracked as a
 // follow-up to roadmap epic #33.
-func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
+//
+// preserveUnknownSegments must be true; passing false returns
+// ErrPreserveUnknownSegmentsNotSupported because CR3 ISOBMFF boxes are
+// structurally mandatory and cannot be selectively stripped.
+func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
+	// Reject PreserveUnknownSegments(false) for CR3: ISOBMFF boxes are
+	// structurally mandatory. There is no concept of "unknown optional segment"
+	// in ISOBMFF analogous to JPEG's APPn segments.
+	if !preserveUnknownSegments {
+		return ErrPreserveUnknownSegmentsNotSupported
+	}
+
 	// SAFE GATE: reject any write that would change metadata.
 	// A nil rawEXIF, nil rawIPTC, and nil rawXMP means "preserve everything as-is"
 	// — that is a no-op pass-through and is always safe, so we allow it.

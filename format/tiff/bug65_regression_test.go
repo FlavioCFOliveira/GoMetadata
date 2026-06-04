@@ -150,7 +150,7 @@ func TestInjectXMPIntoTIFFWithIPTCAndExifPtrNoTagDuplicate(t *testing.T) {
 	// Inject a non-nil XMP payload. This triggers the upsertIFD0Entry path.
 	rawXMP := []byte("<?xpacket begin='' id='x'?><xmpmeta/><?xpacket end='r'?>")
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, data, nil, rawXMP); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, data, nil, rawXMP, true); err != nil {
 		t.Fatalf("Inject with XMP: %v", err)
 	}
 

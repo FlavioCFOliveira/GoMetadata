@@ -457,7 +457,7 @@ func TestInjectCyclicIFDChainNoInfiniteLoop(t *testing.T) {
 	var out bytes.Buffer
 	// Inject with IPTC forces exif.Parse; the cyclic TIFF either parses with
 	// the cycle guard or fails gracefully — no infinite loop permitted.
-	_ = Inject(bytes.NewReader(data), &out, data, iptcPayload, nil)
+	_ = Inject(bytes.NewReader(data), &out, data, iptcPayload, nil, true)
 	// We do NOT require a specific error/success outcome: a cyclic minimal TIFF
 	// (0 entries in IFD0) may succeed if traverse stops at IFD0 without entering
 	// the cycle (because IFD0 has 0 entries and no linked sub-IFDs).
@@ -500,7 +500,7 @@ func TestInjectLongIFDChainDoSBound(t *testing.T) {
 	var out bytes.Buffer
 	// This may succeed or fail (exif.Parse may reject the chain if none of the
 	// IFDs have IPTC/XMP tags), but it must return rather than hanging.
-	_ = Inject(bytes.NewReader(data), &out, data, iptcPayload, nil)
+	_ = Inject(bytes.NewReader(data), &out, data, iptcPayload, nil, true)
 }
 
 // TestExtractHugeOffsetNoOOM verifies that an IFD entry with a huge value
@@ -581,7 +581,7 @@ func TestExtractBigEndianFullRoundTrip(t *testing.T) {
 	data := buildMinimalTIFF(binary.BigEndian, nil, nil)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, data, wantIPTC, wantXMP); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, data, wantIPTC, wantXMP, true); err != nil {
 		t.Fatalf("Inject BE: %v", err)
 	}
 	// exif.Encode always writes LE; the injected output will be LE.

@@ -177,7 +177,7 @@ func TestInjectPreservesNonIPTC8BIM(t *testing.T) {
 
 	// Inject with unchanged rawIPTC (same IIM bytes).
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(srcJPEG), &out, nil, iptcData, nil); err != nil {
+	if err := Inject(bytes.NewReader(srcJPEG), &out, nil, iptcData, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -229,7 +229,7 @@ func TestInjectPreservesNonIPTC8BIMOrderPreserved(t *testing.T) {
 	srcJPEG := buildJPEGWithRawAPP13(app13Payload)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(srcJPEG), &out, nil, iptcData, nil); err != nil {
+	if err := Inject(bytes.NewReader(srcJPEG), &out, nil, iptcData, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -324,7 +324,7 @@ func TestInjectNoAPP13SourceStillWritesIPTC(t *testing.T) {
 	iptcData := []byte{0x1C, 0x02, 0x78, 0x00, 0x05, 'h', 'e', 'l', 'l', 'o'}
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(srcJPEG), &out, nil, iptcData, nil); err != nil {
+	if err := Inject(bytes.NewReader(srcJPEG), &out, nil, iptcData, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 

@@ -34,3 +34,13 @@ var ErrChunkCRCMismatch = errors.New("png: chunk CRC mismatch")
 // internal JPEG extended-XMP wire-frame to the PNG injector; the wire-frame is a
 // JPEG-only internal encoding that cannot be stored as a PNG XMP chunk.
 var ErrCorruptXMP = errors.New("png: corrupt or invalid XMP data")
+
+// ErrPreserveUnknownSegmentsNotSupported is returned by Inject when
+// preserveUnknownSegments is false. PNG chunk semantics differ fundamentally
+// from JPEG APPn segments: every chunk type carries application-defined data
+// (tEXt, iTXt, gAMA, cHRM, etc.) that may be essential to downstream readers.
+// Selective stripping without understanding every registered chunk type risks
+// corrupting the image; therefore this option is not implemented for PNG.
+//
+// Use PreserveUnknownSegments(true) (the default) when writing to PNG.
+var ErrPreserveUnknownSegmentsNotSupported = errors.New("png: PreserveUnknownSegments(false) is not supported for PNG; all non-metadata chunks must be preserved")

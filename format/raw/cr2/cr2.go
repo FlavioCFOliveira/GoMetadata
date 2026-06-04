@@ -31,8 +31,8 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 // call Inject directly on files from a user-facing write path; use
 // gometadata.Write instead, which gates CR2 behind ErrWriteNotSupported until
 // full structural relocation is implemented (roadmap Option A, epic #33).
-func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
-	if err := tiff.Inject(r, w, rawEXIF, rawIPTC, rawXMP); err != nil {
+func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
+	if err := tiff.Inject(r, w, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments); err != nil {
 		return fmt.Errorf("cr2: %w", err)
 	}
 	return nil

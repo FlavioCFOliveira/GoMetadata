@@ -101,7 +101,7 @@ func TestInjectPreservesCanvasDimensions(t *testing.T) {
 
 	newEXIF := []byte{0x4D, 0x4D, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x08}
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(webp), &out, newEXIF, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(webp), &out, newEXIF, nil, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -144,7 +144,7 @@ func TestInjectRoundTrip(t *testing.T) {
 
 	newEXIF := []byte{0x4D, 0x4D, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x08}
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(webp), &out, newEXIF, nil, nil); err != nil {
+	if err := Inject(bytes.NewReader(webp), &out, newEXIF, nil, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -192,7 +192,7 @@ func TestExtractTooShort(t *testing.T) {
 func TestInjectTooShort(t *testing.T) {
 	t.Parallel()
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader([]byte{0x01, 0x02}), &out, nil, nil, nil)
+	err := Inject(bytes.NewReader([]byte{0x01, 0x02}), &out, nil, nil, nil, true)
 	if err == nil {
 		t.Error("Inject: expected ErrFileTooShort, got nil")
 	}
@@ -401,7 +401,7 @@ func TestInjectTruncatedVP8XNoPanic(t *testing.T) {
 			}
 		}()
 		var buf bytes.Buffer
-		_ = Inject(bytes.NewReader(out), &buf, rawEXIF, nil, nil)
+		_ = Inject(bytes.NewReader(out), &buf, rawEXIF, nil, nil, true)
 		return false
 	}()
 
@@ -480,7 +480,7 @@ func TestInjectVP8XTruncatedChunkNoCrossChunkRead(t *testing.T) {
 	// Inject an XMP payload to force VP8X rebuild with the XMP flag set.
 	xmpPayload := []byte("<x:xmpmeta/>")
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(input), &out, nil, nil, xmpPayload); err != nil {
+	if err := Inject(bytes.NewReader(input), &out, nil, nil, xmpPayload, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -540,7 +540,7 @@ func TestInjectPreservesVP8XFeatureFlagsAndCanvas(t *testing.T) {
 
 	xmpPayload := []byte("<x:xmpmeta/>")
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(input), &out, nil, nil, xmpPayload); err != nil {
+	if err := Inject(bytes.NewReader(input), &out, nil, nil, xmpPayload, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -590,7 +590,7 @@ func BenchmarkWebPInject(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		var out bytes.Buffer
-		_ = Inject(bytes.NewReader(webp), &out, exifData, nil, xmpData)
+		_ = Inject(bytes.NewReader(webp), &out, exifData, nil, xmpData, true)
 	}
 }
 
@@ -651,7 +651,7 @@ func TestCollectOriginalChunksLargeSize(t *testing.T) {
 			// Inject must not panic; the result may be an error or a valid output.
 			exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00}
 			var out bytes.Buffer
-			_ = Inject(bytes.NewReader(stream), &out, exifData, nil, nil)
+			_ = Inject(bytes.NewReader(stream), &out, exifData, nil, nil, true)
 			// Primary assertion: we reached here without panicking.
 		})
 	}

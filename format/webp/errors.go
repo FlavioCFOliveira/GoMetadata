@@ -18,3 +18,12 @@ var ErrChunkTooLarge = errors.New("webp: chunk size exceeds limit")
 // internal JPEG extended-XMP wire-frame to the WebP injector; the wire-frame is a
 // JPEG-only internal encoding that cannot be stored as a WebP XMP chunk.
 var ErrCorruptXMP = errors.New("webp: corrupt or invalid XMP data")
+
+// ErrPreserveUnknownSegmentsNotSupported is returned by Inject when
+// preserveUnknownSegments is false. WebP RIFF chunks other than EXIF and XMP
+// (VP8, VP8L, VP8X, ANIM, ANMF, ALPH, etc.) are structurally required for
+// correct image decoding and must never be stripped. Selective removal of
+// "unknown" chunks is therefore not supported.
+//
+// Use PreserveUnknownSegments(true) (the default) when writing to WebP.
+var ErrPreserveUnknownSegmentsNotSupported = errors.New("webp: PreserveUnknownSegments(false) is not supported for WebP; image and structural chunks must be preserved")

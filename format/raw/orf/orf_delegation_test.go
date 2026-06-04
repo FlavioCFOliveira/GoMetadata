@@ -173,7 +173,7 @@ func TestORFInjectAndExtractRoundTripWithIPTCXMP(t *testing.T) {
 	wantXMP := []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"/>`)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, nil, wantIPTC, wantXMP); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, nil, wantIPTC, wantXMP, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 

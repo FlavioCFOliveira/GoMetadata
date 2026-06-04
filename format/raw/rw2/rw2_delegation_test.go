@@ -160,7 +160,7 @@ func TestRW2InjectAndExtractRoundTripWithIPTCXMP(t *testing.T) {
 	wantXMP := []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"/>`)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(data), &out, nil, wantIPTC, wantXMP); err != nil {
+	if err := Inject(bytes.NewReader(data), &out, nil, wantIPTC, wantXMP, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 
@@ -220,7 +220,7 @@ func TestRW2InjectErrorWrapping(t *testing.T) {
 
 	iptcPayload := []byte{0x1C, 0x02, 0x78, 0x00, 0x03, 'a', 'b', 'c'}
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader(data), &out, nil, iptcPayload, nil)
+	err := Inject(bytes.NewReader(data), &out, nil, iptcPayload, nil, true)
 	if err == nil {
 		t.Fatal("expected error for corrupt IFD0 offset, got nil")
 	}
@@ -257,7 +257,7 @@ func TestRW2InjectWithBigTIFFRawEXIFProducesError(t *testing.T) {
 	var out bytes.Buffer
 	// tiff.Inject will use badRawEXIF as base, call buildUpdatedTIFF → exif.Parse
 	// which rejects BigTIFF magic → tiff.Inject returns error → rw2.Inject wraps it.
-	err := Inject(bytes.NewReader(validRW2), &out, badRawEXIF, iptcPayload, nil)
+	err := Inject(bytes.NewReader(validRW2), &out, badRawEXIF, iptcPayload, nil, true)
 	if err == nil {
 		t.Fatal("expected error for BigTIFF rawEXIF, got nil")
 	}
