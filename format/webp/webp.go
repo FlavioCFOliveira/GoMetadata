@@ -230,7 +230,12 @@ func collectOriginalChunks(original []byte) (chunks []struct {
 		switch id {
 		case "VP8X":
 			// Capture original VP8X payload so canvas dimensions can be preserved.
-			if size >= 10 {
+			// Guard: use the ACTUAL available bytes (dataEnd-dataStart), not the
+			// declared size. dataEnd is clamped to len(original), so for a truncated
+			// VP8X chunk the actual slice can be shorter than 10 bytes even when the
+			// declared size says >= 10. Only capture when the full 10 bytes are truly
+			// present; otherwise treat as absent so buildVP8XFlags rebuilds from scratch.
+			if dataEnd-dataStart >= 10 {
 				origVP8XData = original[dataStart:dataEnd]
 			}
 		case "EXIF", "XMP ":
@@ -255,7 +260,11 @@ func collectOriginalChunks(original []byte) (chunks []struct {
 // when present, preserving ICC, animation, alpha, and dimension information.
 func buildVP8XFlags(hasEXIF, hasXMP bool, origVP8XData []byte) []byte {
 	vp8xData := make([]byte, 10)
-	if origVP8XData != nil {
+	// Guard: only copy from origVP8XData when it is known to hold at least 10
+	// bytes. collectOriginalChunks now enforces this invariant at capture time,
+	// but the explicit len check here makes the safety guarantee local and
+	// prevents a future caller from accidentally passing a short slice.
+	if len(origVP8XData) >= 10 {
 		copy(vp8xData, origVP8XData[:10])
 	}
 	// Update only the EXIF (bit 3) and XMP (bit 2) feature flags.

@@ -349,6 +349,67 @@ func TestReadPaddedChunkSizeLargerThanStream(t *testing.T) {
 	}
 }
 
+// TestInjectTruncatedVP8XNoPanic is the regression test for the OOB-slice panic
+// triggered by origVP8XData[:10] when the VP8X chunk is truncated.
+//
+// Reproduction: build a RIFF/WEBP whose VP8X chunk *declares* size=10 but
+// whose data region is only 4 bytes (truncated file). Copy the bytes into an
+// exactly-sized backing array (cap == len == buffer length) so no spare
+// capacity hides the bug. Call Inject with rawEXIF to force a VP8X rebuild.
+//
+// Before the fix: copy(vp8xData, origVP8XData[:10]) panics with
+// "slice bounds out of range [:10] with capacity 4".
+// After the fix: Inject returns an error or valid output without panicking.
+func TestInjectTruncatedVP8XNoPanic(t *testing.T) {
+	t.Parallel()
+
+	// Craft the file: RIFF header (12 bytes) + VP8X chunk header (8 bytes) +
+	// 4 data bytes only (declared size is 10 — truncated).
+	//
+	// Layout:
+	//   [0..3]   "RIFF"
+	//   [4..7]   file body size LE = 4 ("WEBP") + 8 (chunk hdr) + 4 (data) = 16
+	//   [8..11]  "WEBP"
+	//   [12..15] "VP8X"
+	//   [16..19] uint32 LE = 10  (declared chunk size — larger than actual data)
+	//   [20..23] 4 data bytes    (truncated: only 4 of the 10 declared bytes present)
+	const totalLen = 12 + 8 + 4 // 24 bytes
+	raw := []byte{
+		'R', 'I', 'F', 'F',
+		16, 0, 0, 0, // body size: "WEBP"(4) + VP8X header(8) + 4 data bytes = 16
+		'W', 'E', 'B', 'P',
+		'V', 'P', '8', 'X',
+		10, 0, 0, 0, // declared size = 10
+		0x01, 0x02, 0x03, 0x04, // only 4 data bytes — truncated
+	}
+
+	// Copy into a backing array whose capacity equals its length so that any
+	// attempt at origVP8XData[:10] on a 4-byte slice panics immediately.
+	// bytes.Buffer.Bytes() over-allocates; only make+copy guarantees cap==len.
+	out := make([]byte, totalLen)
+	copy(out, raw)
+
+	rawEXIF := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00}
+
+	// Use a recover-based wrapper so a panic is reported as a test failure
+	// rather than terminating the test binary (proving the fix prevents the crash).
+	didPanic := func() (panicked bool) {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked = true
+				t.Errorf("Inject panicked with truncated VP8X: %v", r)
+			}
+		}()
+		var buf bytes.Buffer
+		_ = Inject(bytes.NewReader(out), &buf, rawEXIF, nil, nil)
+		return false
+	}()
+
+	if didPanic {
+		t.Fatal("Inject must not panic on a truncated VP8X chunk")
+	}
+}
+
 // BenchmarkWebPInject measures the full Inject path: rebuild the RIFF body
 // with updated EXIF and XMP chunks using the pooled bytes.Buffer.
 func BenchmarkWebPInject(b *testing.B) {
