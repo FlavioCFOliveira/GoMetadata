@@ -554,8 +554,19 @@ func writeExtendedChunks(w io.Writer, guidBytes, ext []byte) error {
 
 // writeIPTCSegment wraps the IPTC IIM stream in a Photoshop IRB block and
 // writes it as an APP13 segment. APP13 length field is 16-bit; EXIF §4.5.6.
-func writeIPTCSegment(w io.Writer, rawIPTC []byte) error {
-	irb := buildIRB(rawIPTC)
+//
+// When origIRB is non-nil it is used as the base IRB: the 0x0404 resource
+// block within it is replaced with one built from rawIPTC while every other
+// 8BIM resource in origIRB is copied verbatim (CLAUDE.md §5: write operations
+// must preserve all existing metadata not explicitly modified). When origIRB is
+// nil a bare 0x0404-only IRB is built from rawIPTC.
+func writeIPTCSegment(w io.Writer, rawIPTC, origIRB []byte) error {
+	var irb []byte
+	if origIRB != nil {
+		irb = spliceIPTCIntoIRB(origIRB, rawIPTC)
+	} else {
+		irb = buildIRB(rawIPTC)
+	}
 	if len(identPS)+len(irb)+2 > 65535 {
 		return fmt.Errorf("jpeg: IPTC IRB payload %d bytes exceeds APP13 segment limit: %w", len(irb), ErrIPTCPayloadTooLarge)
 	}
@@ -567,10 +578,80 @@ func writeIPTCSegment(w io.Writer, rawIPTC []byte) error {
 	return writeErr
 }
 
+// spliceIPTCIntoIRB returns a new IRB byte slice that is identical to origIRB
+// except the 0x0404 (IPTC-NAA) resource block is replaced with a freshly built
+// block wrapping newIPTCData. All other 8BIM blocks are appended verbatim in
+// their original order and with their original padding.
+//
+// If origIRB contains no 0x0404 block the new block is appended at the end.
+// If origIRB is malformed (parseIRBEntry fails before a replacement position is
+// found), the function falls back to buildIRB(newIPTCData) to ensure the
+// essential IPTC data is never lost.
+//
+// EXIF §4.5.6: each 8BIM block is 4 ('8BIM') + 2 (ID) + pascal-name + 4 (size)
+// + data [+ 1 padding if data size is odd].
+func spliceIPTCIntoIRB(origIRB, newIPTCData []byte) []byte {
+	newBlock := buildIRB(newIPTCData) // the replacement 0x0404 block
+
+	// Pre-allocate a conservative capacity. The result is at most
+	// len(origIRB) + len(newBlock) (old 0x0404 replaced, not just appended).
+	out := make([]byte, 0, len(origIRB)+len(newBlock))
+
+	replaced := false
+	pos := 0
+	for pos < len(origIRB) {
+		entryStart := pos
+		resourceID, data, newPos, ok := parseIRBEntry(origIRB, pos)
+		if !ok {
+			if newPos == pos {
+				// Signature mismatch: advance one byte (scan-forward miss).
+				pos++
+				continue
+			}
+			// Structural failure: stop processing; emit what we have so far.
+			break
+		}
+
+		// Compute the end of the full encoded block including even-padding.
+		// We use the raw bytes from origIRB directly rather than re-encoding,
+		// preserving non-standard pascal names, reserved fields, etc.
+		blockEnd := newPos
+		if len(data)%2 != 0 {
+			blockEnd++ // skip the even-padding byte
+		}
+
+		if resourceID == 0x0404 {
+			// Replace the IPTC block with the freshly built one.
+			out = append(out, newBlock...)
+			replaced = true
+		} else {
+			// Copy the block verbatim — 8BIM header + data + any padding byte.
+			// blockEnd is bounded by origIRB length (validated inside parseIRBEntry).
+			if blockEnd > len(origIRB) {
+				blockEnd = len(origIRB)
+			}
+			out = append(out, origIRB[entryStart:blockEnd]...)
+		}
+
+		pos = blockEnd
+	}
+
+	if !replaced {
+		// No 0x0404 block was found in the original IRB: append the new one.
+		out = append(out, newBlock...)
+	}
+	return out
+}
+
 // writeNewMetadataSegments writes EXIF APP1, XMP APP1 (with extended-XMP
 // splitting when the payload exceeds the single-segment limit), and IPTC
 // APP13 segments to w. Returns the first error encountered.
-func writeNewMetadataSegments(w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
+//
+// origIRB is the full Photoshop IRB block (the bytes after the "Photoshop
+// 3.0\x00" header) from the source JPEG, or nil if the source had no APP13.
+// When non-nil it is used by writeIPTCSegment to preserve sibling 8BIM
+// resources while replacing only the 0x0404 block.
+func writeNewMetadataSegments(w io.Writer, rawEXIF, rawIPTC, rawXMP, origIRB []byte) error {
 	if rawEXIF != nil {
 		if err := writeEXIFSegment(w, rawEXIF); err != nil {
 			return err
@@ -582,7 +663,7 @@ func writeNewMetadataSegments(w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) erro
 		}
 	}
 	if rawIPTC != nil {
-		if err := writeIPTCSegment(w, rawIPTC); err != nil {
+		if err := writeIPTCSegment(w, rawIPTC, origIRB); err != nil {
 			return err
 		}
 	}
@@ -665,6 +746,42 @@ func copyNonMetadataSegments(r io.Reader, w io.Writer, scratch *[]byte) error {
 	}
 }
 
+// extractOriginalIRB performs a pre-scan of the JPEG in r to locate the first
+// Photoshop APP13 segment and return a copy of its IRB bytes (the content after
+// the "Photoshop 3.0\x00" header). Returns nil when no APP13 is present or the
+// segment does not carry the Photoshop prefix.
+//
+// The caller is responsible for seeking r back to the desired position after
+// this call. scratch is used as an internal read buffer and must not be nil.
+func extractOriginalIRB(r io.ReadSeeker, scratch *[]byte) []byte {
+	// Seek past the SOI (already validated by the caller — 2 bytes).
+	if _, err := r.Seek(2, io.SeekStart); err != nil {
+		return nil
+	}
+	for {
+		marker, data, err := readSegment(r, scratch)
+		if err != nil {
+			return nil
+		}
+		switch marker {
+		case markerAPP13:
+			if bytes.HasPrefix(data, identPS) {
+				// Copy the IRB bytes (data[len(identPS):]) so they survive
+				// beyond the next readSegment call that would overwrite scratch.
+				irb := data[len(identPS):]
+				if len(irb) == 0 {
+					return nil
+				}
+				out := make([]byte, len(irb))
+				copy(out, irb)
+				return out
+			}
+		case markerSOS, markerEOI:
+			return nil
+		}
+	}
+}
+
 // Inject reads the JPEG marker stream from r, replaces the relevant APP
 // segments with the provided payloads, and writes the result to w.
 // A nil payload means the corresponding segment is removed.
@@ -673,7 +790,29 @@ func copyNonMetadataSegments(r io.Reader, w io.Writer, scratch *[]byte) error {
 // rawXMP may be a wire-frame payload (produced by ExtractWithWire) when the
 // XMP was not modified; in that case the original main and extended APP1
 // segments are reproduced byte-stably without regenerating the GUID.
+//
+// When the source JPEG carries a Photoshop APP13 segment that contains 8BIM
+// resources in addition to the 0x0404 IPTC block (e.g. IPTC digest 0x0425,
+// thumbnail 0x040C, ICC clipping path 0x040F), Inject preserves all sibling
+// resources verbatim and only replaces the 0x0404 block with rawIPTC. When the
+// source has no APP13, or when rawIPTC is nil, the behaviour is unchanged.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("jpeg: seek: %w", err)
+	}
+
+	// Pre-scan to capture the original Photoshop IRB (all 8BIM blocks) so that
+	// sibling resources are preserved when we write the new APP13 below.
+	// We use a pooled buffer for this scan only; it is returned before the
+	// second seek so that the main copy loop can reuse its own buffer cleanly.
+	var origIRB []byte
+	if rawIPTC != nil {
+		preScratch := iobuf.Get(4096)
+		origIRB = extractOriginalIRB(r, preScratch)
+		iobuf.Put(preScratch)
+	}
+
+	// Seek back to the start for the main copy pass.
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("jpeg: seek: %w", err)
 	}
@@ -691,7 +830,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error
 	}
 
 	// Write new metadata segments before any existing ones.
-	if err := writeNewMetadataSegments(w, rawEXIF, rawIPTC, rawXMP); err != nil {
+	if err := writeNewMetadataSegments(w, rawEXIF, rawIPTC, rawXMP, origIRB); err != nil {
 		return err
 	}
 
