@@ -593,3 +593,66 @@ func BenchmarkWebPInject(b *testing.B) {
 		_ = Inject(bytes.NewReader(webp), &out, exifData, nil, xmpData)
 	}
 }
+
+// TestCollectOriginalChunksLargeSize is the 32-bit-safe regression test for
+// task #74 (WebP path).
+//
+// collectOriginalChunks historically used `size := int(binary.LittleEndian.Uint32(...))`.
+// On a 32-bit platform (GOARCH=386/arm, int=32 bits), a RIFF chunk size field of
+// 0x80000000 or higher becomes negative after the int cast. The subsequent
+// `dataStart+size` expression then underflows, `dataEnd` is clamped to a wrong
+// offset by min(), and subsequent chunks are silently dropped or miscounted.
+//
+// After the fix, collectOriginalChunks checks `rawSize > math.MaxInt32` and breaks
+// early, treating the rest of the stream as unreadable. The test exercises Inject
+// (which calls collectOriginalChunks internally) with such a stream and verifies
+// that it completes without panicking. Inject is expected to succeed (writing a
+// valid output with only the provided metadata), never panic.
+func TestCollectOriginalChunksLargeSize(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		rawSize uint32
+	}{
+		{"0x80000000", 0x80000000},
+		{"0x80000001", 0x80000001},
+		{"0xFFFFFFFF", 0xFFFFFFFF},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// Build a RIFF/WEBP stream with a VP8X chunk (valid) followed by a chunk
+			// whose declared size is the oversized value. The oversized chunk body is
+			// empty — we only write the 8-byte RIFF chunk header so the stream is
+			// short enough to fit in a test buffer, but the declared size is huge.
+			var buf bytes.Buffer
+			// Write a VP8X chunk (10 bytes payload, flags for EXIF).
+			vp8xPayload := make([]byte, 10)
+			binary.LittleEndian.PutUint32(vp8xPayload[0:], 0x08) // EXIF flag
+			writeRIFFChunk(&buf, "VP8X", vp8xPayload)
+			// Write a chunk with oversized declared size but no actual body bytes
+			// (simulates a truncated or adversarial stream).
+			var oversized [8]byte
+			copy(oversized[:4], "VP8 ")
+			binary.LittleEndian.PutUint32(oversized[4:], tc.rawSize)
+			buf.Write(oversized[:])
+
+			// Wrap in a RIFF/WEBP envelope.
+			body := buf.Bytes()
+			totalSize := 4 + len(body)
+			stream := make([]byte, 0, 12+len(body))
+			stream = append(stream, 'R', 'I', 'F', 'F')
+			var sizeBuf [4]byte
+			binary.LittleEndian.PutUint32(sizeBuf[:], uint32(totalSize)) //nolint:gosec // G115: test helper, intentional type cast
+			stream = append(stream, sizeBuf[:]...)
+			stream = append(stream, 'W', 'E', 'B', 'P')
+			stream = append(stream, body...)
+
+			// Inject must not panic; the result may be an error or a valid output.
+			exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00}
+			var out bytes.Buffer
+			_ = Inject(bytes.NewReader(stream), &out, exifData, nil, nil)
+			// Primary assertion: we reached here without panicking.
+		})
+	}
+}

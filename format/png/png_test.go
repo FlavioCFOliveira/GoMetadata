@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -991,6 +992,59 @@ func TestCorpusPNGCRCIntegrity(t *testing.T) {
 			}
 			// Other errors (ErrInvalidSignature, truncated payload, etc.) are not
 			// regressions — some exiv2 files test specific parse-edge-case behaviour.
+		})
+	}
+}
+
+// TestPNGReadChunkLargeLength is the 32-bit-safe regression test for task #74.
+//
+// readChunk historically used `length := int(binary.BigEndian.Uint32(hdr[:4]))`.
+// On a 32-bit build (GOARCH=386/arm, int=32 bits), a chunk length field of
+// 0x80000000 or higher produces a negative int after the cast. The negative
+// value is less than maxPNGChunkSize (a positive constant), so the guard passes
+// silently; then `length > 0` evaluates to false and the chunk is processed as
+// zero-length — wrong behaviour, and a silent data-corruption path.
+//
+// After the fix, readChunk checks `rawLen > math.MaxInt32` before the int cast
+// and returns ErrChunkTooLarge, ensuring correct rejection on all platform widths.
+// On 64-bit platforms (current target) the test is also meaningful: the raw
+// uint32 0x80000000 == 2147483648 > math.MaxInt32, so ErrChunkTooLarge must fire.
+func TestPNGReadChunkLargeLength(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		rawLen uint32
+	}{
+		// Exactly 2^31: the first value that overflows to negative on 32-bit int.
+		{"0x80000000", 0x80000000},
+		// 2^31 + 1: next value beyond the boundary.
+		{"0x80000001", 0x80000001},
+		// max uint32.
+		{"0xFFFFFFFF", 0xFFFFFFFF},
+		// math.MaxInt32 + 1 == 0x80000000 (duplicate of first; kept for clarity).
+		{"MaxInt32+1", math.MaxInt32 + 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// Build a minimal PNG stream with the PNG signature followed by a single
+			// chunk whose length field is the oversized value. The chunk type is
+			// "IHDR" so the stream looks plausible. The actual body is empty beyond
+			// the 8-byte header because readChunk returns before reading the body.
+			var buf bytes.Buffer
+			buf.Write(pngSig[:])
+			var hdr [8]byte
+			binary.BigEndian.PutUint32(hdr[:4], tc.rawLen)
+			copy(hdr[4:8], "IHDR")
+			buf.Write(hdr[:])
+
+			_, _, _, err := Extract(bytes.NewReader(buf.Bytes()))
+			if err == nil {
+				t.Fatalf("Extract with chunk length 0x%08X: expected ErrChunkTooLarge, got nil", tc.rawLen)
+			}
+			if !errors.Is(err, ErrChunkTooLarge) {
+				t.Errorf("Extract with chunk length 0x%08X: got %v, want wrapping ErrChunkTooLarge", tc.rawLen, err)
+			}
 		})
 	}
 }

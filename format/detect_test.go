@@ -2,6 +2,7 @@ package format
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 )
 
@@ -534,6 +535,59 @@ func TestDetectOutOfScopeFormats(t *testing.T) {
 			}
 			if got != FormatUnknown {
 				t.Errorf("Detect(%s) = %v, want FormatUnknown (format is out-of-scope)", tc.name, got)
+			}
+		})
+	}
+}
+
+// TestDetectTIFFHighIFD0Offset is the 32-bit-safe regression test for task #74.
+//
+// parseTIFFScanHeader reads IFD0 offset as a uint32 and historically used
+// `int(ifd0Off)+2 > len(data)` as the bounds guard. On a 32-bit platform
+// (GOARCH=386/arm, int=32 bits), an IFD0 offset >= 0x80000000 becomes negative
+// after the int cast; the guard passes; and `data[ifd0Off:]` panics with
+// slice-bounds-out-of-range. After the fix, the comparison is done in uint64.
+//
+// On 64-bit platforms the test is still meaningful: the tiffScanSize buffer
+// (1034 bytes) is always smaller than 0x80000000, so the uint64 guard fires and
+// Detect returns FormatTIFF (the fallback) without panicking.
+func TestDetectTIFFHighIFD0Offset(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		order   binary.ByteOrder
+		magic   [2]byte
+		ifd0Off uint32
+	}{
+		// LE TIFF with IFD0 offset == 0x80000000
+		{"LE 0x80000000", binary.LittleEndian, [2]byte{'I', 'I'}, 0x80000000},
+		// BE TIFF with IFD0 offset == 0x80000000
+		{"BE 0x80000000", binary.BigEndian, [2]byte{'M', 'M'}, 0x80000000},
+		// LE TIFF with IFD0 offset == 0xFFFFFFFF (max uint32)
+		{"LE 0xFFFFFFFF", binary.LittleEndian, [2]byte{'I', 'I'}, 0xFFFFFFFF},
+		// BE TIFF with IFD0 offset == 0xFFFFFFFE
+		{"BE 0xFFFFFFFE", binary.BigEndian, [2]byte{'M', 'M'}, 0xFFFFFFFE},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// Build a 12-byte buffer: TIFF magic (4 bytes) + 42 marker (2 bytes) +
+			// IFD0 offset (4 bytes) + 2 padding bytes. The IFD0 offset is always
+			// beyond the buffer, so parseTIFFScanHeader must reject it gracefully.
+			buf := make([]byte, 12)
+			buf[0] = tc.magic[0]
+			buf[1] = tc.magic[1]
+			tc.order.PutUint16(buf[2:], 0x002A)
+			tc.order.PutUint32(buf[4:], tc.ifd0Off)
+
+			// Detect must not panic; it should return FormatTIFF (the safe fallback
+			// when refineTIFFVariant cannot read a valid IFD0) without panicking.
+			got, err := Detect(bytes.NewReader(buf))
+			if err != nil {
+				t.Fatalf("Detect() unexpected error: %v", err)
+			}
+			if got != FormatTIFF {
+				t.Errorf("Detect() = %v, want FormatTIFF for unreadable IFD0 offset 0x%08X", got, tc.ifd0Off)
 			}
 		})
 	}

@@ -284,7 +284,11 @@ func parseTIFFScanHeader(r io.ReadSeeker) (order binary.ByteOrder, count, pos in
 	}
 
 	ifd0Off := order.Uint32(data[4:])
-	if int(ifd0Off)+2 > len(data) {
+	// Use uint64 arithmetic to avoid int truncation on 32-bit platforms
+	// (GOARCH=386/arm): int(uint32 >= 2^31) is negative, which would cause the
+	// guard to pass while the subsequent slice panics. Performing the comparison
+	// in uint64 is safe on all platforms (task #74).
+	if uint64(ifd0Off)+2 > uint64(len(data)) {
 		tiffScanPool.Put(bp)
 		return nil, 0, 0, nil, nil, false
 	}

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sync"
 
 	"github.com/FlavioCFOliveira/GoMetadata/internal/riff"
@@ -222,7 +223,16 @@ func collectOriginalChunks(original []byte) (chunks []struct {
 	pos := 12 // skip RIFF header
 	for pos+8 <= len(original) {
 		id := string(original[pos : pos+4])
-		size := int(binary.LittleEndian.Uint32(original[pos+4:]))
+		// Read the raw uint32 chunk size BEFORE converting to int. On a 32-bit
+		// platform (GOARCH=386/arm, int=32 bits), a RIFF chunk size >= 2^31 would
+		// become negative after int(uint32), causing dataStart+size to underflow
+		// and dataEnd to be clamped to a wrong position. Skip oversized chunks
+		// (they cannot contain valid EXIF/XMP metadata anyway) (task #74).
+		rawSize := binary.LittleEndian.Uint32(original[pos+4:])
+		if rawSize > math.MaxInt32 {
+			break // chunk claims to be >= 2 GiB; treat rest of stream as unreadable
+		}
+		size := int(rawSize)
 		dataStart := pos + 8
 		// Clamp to available data so subsequent chunks are not silently dropped
 		// when chunk size exceeds remaining bytes (truncated or RIFF size mismatch).

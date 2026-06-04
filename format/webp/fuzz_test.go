@@ -2,6 +2,7 @@ package webp
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 )
 
@@ -30,6 +31,22 @@ func FuzzWebPExtract(f *testing.F) {
 
 	// Seed: truncated RIFF header.
 	f.Add([]byte{'R', 'I', 'F', 'F', 0x00, 0x00})
+
+	// Seed: RIFF/WEBP with a chunk whose declared size is 0x80000000 (task #74
+	// regression seed). On a 32-bit build, int(0x80000000) == -2147483648;
+	// collectOriginalChunks must break early rather than computing a negative
+	// dataStart+size and passing it to min() with a wrong result.
+	{
+		// 12-byte RIFF/WEBP header + 8-byte chunk header (FourCC + uint32 size).
+		var streamBuf [20]byte
+		copy(streamBuf[0:4], "RIFF")
+		binary.LittleEndian.PutUint32(streamBuf[4:8], 12) // RIFF body size
+		copy(streamBuf[8:12], "WEBP")
+		// VP8 chunk with declared size 0x80000000, no body bytes.
+		copy(streamBuf[12:16], "VP8 ")
+		binary.LittleEndian.PutUint32(streamBuf[16:20], 0x80000000)
+		f.Add(streamBuf[:])
+	}
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic regardless of input.

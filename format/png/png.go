@@ -18,6 +18,7 @@ import (
 	"hash"
 	"hash/crc32"
 	"io"
+	"math"
 	"sync"
 
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
@@ -448,8 +449,19 @@ func readChunk(r io.Reader, fn func(chunkType string, data []byte) error) error 
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return fmt.Errorf("png: read chunk header: %w", err)
 	}
-	length := int(binary.BigEndian.Uint32(hdr[:4]))
 	chunkType := string(hdr[4:8])
+
+	// Read the raw uint32 length BEFORE converting to int. On a 32-bit platform
+	// (GOARCH=386/arm, int=32 bits), a chunk length >= 2^31 would become negative
+	// after int(uint32), silently passing the maxPNGChunkSize guard and causing
+	// the chunk to be processed as zero-length — wrong behaviour. Checking the
+	// uint32 value against math.MaxInt32 first ensures correctness on all platform
+	// widths. PNG spec ISO 15948 §11.2.1 caps chunk length at 2^31−1 anyway (task #74).
+	rawLen := binary.BigEndian.Uint32(hdr[:4])
+	if rawLen > math.MaxInt32 {
+		return fmt.Errorf("png: chunk %q length %d exceeds 2^31-1: %w", chunkType, rawLen, ErrChunkTooLarge)
+	}
+	length := int(rawLen)
 
 	// Guard against adversarial or malformed chunk lengths before any allocation.
 	// PNG spec ISO 15948 §11.2.1 permits up to 2^31−1 bytes, but that is

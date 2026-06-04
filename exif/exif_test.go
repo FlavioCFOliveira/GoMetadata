@@ -3302,3 +3302,54 @@ func TestEncodeNilByteOrderDefaultsToLE(t *testing.T) {
 		t.Fatalf("Parse after Encode: %v", err)
 	}
 }
+
+// TestParseHighOffsetIFD is the 32-bit-safe regression test for task #74.
+//
+// On a 32-bit build (GOARCH=386/arm), an IFD0 offset >= 0x80000000 stored in
+// the TIFF header becomes negative after int(uint32), which causes the
+// `int(offset)+2 > len(b)` bounds guard to pass silently — and the subsequent
+// `b[offset:]` slice to panic with slice-bounds-out-of-range. After the fix,
+// all bounds arithmetic is performed in uint64, so the guard reliably fires
+// and Parse returns an error instead of panicking.
+//
+// On 64-bit platforms the offset (0x80000000) is well within the int range, but
+// the buffer is only 10 bytes, so the guard fires correctly regardless. The test
+// is therefore meaningful on all platforms: it asserts that a large IFD0 offset
+// pointing beyond the buffer is gracefully rejected with an error, never a panic.
+func TestParseHighOffsetIFD(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		byteOrder binary.ByteOrder
+		ifd0Off   uint32
+	}{
+		// ifd0Off == 0x80000000: on 32-bit int(0x80000000) == -2147483648
+		{"LE high offset 0x80000000", binary.LittleEndian, 0x80000000},
+		{"BE high offset 0x80000000", binary.BigEndian, 0x80000000},
+		// ifd0Off == 0xFFFFFFFF: on 32-bit int(0xFFFFFFFF) == -1
+		{"LE max uint32 offset", binary.LittleEndian, 0xFFFFFFFF},
+		{"BE max uint32 offset", binary.BigEndian, 0xFFFFFFFF},
+		// ifd0Off == 0x7FFFFFFF: largest value that is still positive on 32-bit.
+		// The buffer is only 10 bytes, so this must also be rejected.
+		{"LE offset just below 2^31", binary.LittleEndian, 0x7FFFFFFF},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// Build a minimal 10-byte TIFF header pointing to ifd0Off.
+			buf := make([]byte, 10)
+			if tc.byteOrder == binary.LittleEndian {
+				buf[0], buf[1] = 'I', 'I'
+			} else {
+				buf[0], buf[1] = 'M', 'M'
+			}
+			tc.byteOrder.PutUint16(buf[2:], 0x002A)
+			tc.byteOrder.PutUint32(buf[4:], tc.ifd0Off)
+			// buf is only 10 bytes; the requested offset is always out-of-bounds.
+			_, err := Parse(buf)
+			if err == nil {
+				t.Errorf("Parse with ifd0Off=0x%08X: expected error (out-of-bounds IFD0 offset), got nil", tc.ifd0Off)
+			}
+		})
+	}
+}

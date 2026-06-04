@@ -92,6 +92,26 @@ func FuzzTIFFExtract(f *testing.F) {
 		f.Add(buf)
 	}
 
+	// Seed 12: TIFF LE with IFD0 offset == 0x80000000 (task #74 regression seed).
+	// On a 32-bit build, int(0x80000000) == -2147483648; the uint64 bounds guard
+	// must fire and return an error rather than allowing a slice-OOB panic.
+	{
+		buf := make([]byte, 8)
+		buf[0], buf[1] = 'I', 'I'
+		binary.LittleEndian.PutUint16(buf[2:], 0x002A)
+		binary.LittleEndian.PutUint32(buf[4:], 0x80000000)
+		f.Add(buf)
+	}
+
+	// Seed 13: TIFF BE with IFD0 offset == 0xFFFFFFFF (max uint32, task #74).
+	{
+		buf := make([]byte, 8)
+		buf[0], buf[1] = 'M', 'M'
+		binary.BigEndian.PutUint16(buf[2:], 0x002A)
+		binary.BigEndian.PutUint32(buf[4:], 0xFFFFFFFF)
+		f.Add(buf)
+	}
+
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic regardless of input.
 		_, _, _, _ = Extract(bytes.NewReader(data))

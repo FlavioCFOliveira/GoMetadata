@@ -122,7 +122,11 @@ func parseIFDEntry(b []byte, e int, order binary.ByteOrder) (IFDEntry, bool) {
 //
 // Callers are responsible for cycle detection before calling this function.
 func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint32, bool) {
-	if int(offset)+2 > len(b) {
+	// Use uint64 arithmetic to avoid int truncation on 32-bit platforms
+	// (GOARCH=386/arm): int(uint32 >= 2^31) is negative, which would cause the
+	// guard to pass while the subsequent slice panics. Performing the comparison
+	// in uint64 is safe on all platforms (task #74).
+	if uint64(offset)+2 > uint64(len(b)) {
 		return nil, 0, false
 	}
 
@@ -197,7 +201,11 @@ func extractJPEGThumbnail(b []byte, ifd *IFD, order binary.ByteOrder) []byte {
 // The next-IFD pointer chain is followed iteratively (not recursively) to
 // prevent stack overflows on cyclic or deeply nested inputs (fuzz safety).
 func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, error) {
-	if int(offset)+2 > len(b) {
+	// Use uint64 arithmetic to avoid int truncation on 32-bit platforms
+	// (GOARCH=386/arm): int(uint32 >= 2^31) is negative, which would cause the
+	// guard to pass while the subsequent slice panics. Performing the comparison
+	// in uint64 is safe on all platforms (task #74).
+	if uint64(offset)+2 > uint64(len(b)) {
 		return nil, &metaerr.CorruptMetadataError{
 			Format: "EXIF",
 			Reason: fmt.Sprintf("IFD offset %d out of bounds (buf len %d)", offset, len(b)),
