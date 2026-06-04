@@ -941,6 +941,52 @@ func TestParseIRBTruncatedDataSize(t *testing.T) {
 	}
 }
 
+// TestParseIRBLongPascalNameDoesNotDropIPTC is the regression test for #67.
+//
+// A crafted/corrupt 8BIM block may carry a Pascal-name length byte (0xFF = 255)
+// whose declared extent exceeds the remaining buffer. Before the fix,
+// skipPascalString returned (overflowed_pos, true), parseIRBEntry subsequently
+// detected the overrun and returned (newPos > pos, false), which made parseIRB
+// take the terminal-break path — silently dropping all subsequent 8BIM blocks,
+// including a perfectly valid 0x0404 IPTC resource.
+//
+// After the fix, the overflowing Pascal-name is treated as a recoverable miss:
+// parseIRBEntry returns (entryPos, false) (newPos == pos), causing parseIRB to
+// advance by 1 byte and continue scanning until it finds the 0x0404 block.
+func TestParseIRBLongPascalNameDoesNotDropIPTC(t *testing.T) {
+	t.Parallel()
+
+	iptcData := []byte{0x1C, 0x02, 0x78, 0x00, 0x03, 'A', 'B', 'C'}
+
+	var irb bytes.Buffer
+
+	// Block 1: resource ID 0x0401 (non-IPTC) with a Pascal-name length of 0xFF
+	// (255) but only 2 real name bytes in the buffer — a deliberate overrun.
+	// skipPascalString must detect the overrun and return ok=false, so that
+	// parseIRB recovers and continues scanning rather than terminating.
+	irb.WriteString("8BIM")
+	irb.Write([]byte{0x04, 0x01}) // non-IPTC resource ID
+	irb.WriteByte(0xFF)           // Pascal-name length = 255 (overflows the buffer)
+	irb.Write([]byte{'X', 'Y'})   // only 2 actual name bytes — declared 255 → overrun
+
+	// Block 2: valid 8BIM 0x0404 IPTC resource that must NOT be dropped.
+	irb.WriteString("8BIM")
+	irb.Write([]byte{0x04, 0x04}) // IPTC resource ID
+	irb.Write([]byte{0x00, 0x00}) // empty Pascal name
+	var sz [4]byte
+	binary.BigEndian.PutUint32(sz[:], uint32(len(iptcData))) //nolint:gosec // G115: safe test helper
+	irb.Write(sz[:])
+	irb.Write(iptcData)
+
+	got := parseIRB(irb.Bytes())
+	if got == nil {
+		t.Fatal("parseIRB: expected IPTC data to be found after oversized Pascal-name entry, got nil (#67 regression)")
+	}
+	if !bytes.Equal(got, iptcData) {
+		t.Errorf("parseIRB: got %v, want %v", got, iptcData)
+	}
+}
+
 // TestParseIRBEntryMissingResourceIDField verifies that parseIRBEntry returns
 // ok=false when the buffer is too short to hold the resource ID after "8BIM".
 func TestParseIRBEntryMissingResourceIDField(t *testing.T) {

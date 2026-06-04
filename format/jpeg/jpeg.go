@@ -913,6 +913,16 @@ func skipPascalString(b []byte, pos int) (int, bool) {
 	nameLen := int(b[pos])
 	pos++ // consume length byte
 	pos += nameLen
+	// Bounds check after advancing by nameLen: a crafted/corrupt Pascal-name
+	// length byte can push pos past the end of the buffer. Without this check
+	// the function would return (pos, true) for an overrun, letting the caller
+	// interpret a garbage position as valid and eventually triggering a terminal
+	// break in parseIRB that silently drops all subsequent 8BIM blocks
+	// (including a valid 0x0404 IPTC block). Returning false here allows
+	// parseIRBEntry to signal a recoverable miss. EXIF §4.5.6.
+	if pos > len(b) {
+		return pos, false
+	}
 	if (nameLen+1)%2 != 0 {
 		pos++ // even-padding byte
 	}
@@ -924,14 +934,19 @@ func skipPascalString(b []byte, pos int) (int, bool) {
 // slice, new position, and a success flag.
 //
 // Two distinct failure modes:
-//   - signature mismatch: returns (0, nil, pos, false) — newPos == pos signals
-//     this; the caller may advance by 1 to scan forward.
+//   - signature mismatch / recoverable miss: returns (0, nil, entryPos, false) —
+//     newPos == entryPos (the pos at call time) signals this; the caller may
+//     advance by 1 to scan forward. This includes an overflowing Pascal-name,
+//     which is treated as a recoverable miss so that later 8BIM blocks are not
+//     silently dropped.
 //   - structural failure (truncated data, bad size): returns with newPos > pos;
 //     the caller treats this as terminal.
 //
 // IRB format: "8BIM" + 2-byte resource ID + Pascal string name + 4-byte size + data.
 // EXIF §4.5.6.
 func parseIRBEntry(b []byte, pos int) (resourceID uint16, data []byte, newPos int, ok bool) {
+	entryPos := pos // saved so we can signal a recoverable miss (newPos == entryPos)
+
 	if pos+4 > len(b) {
 		return 0, nil, pos + 1, false // terminal: not enough bytes even for signature
 	}
@@ -950,9 +965,13 @@ func parseIRBEntry(b []byte, pos int) (resourceID uint16, data []byte, newPos in
 	pos += 2
 
 	// Skip the Pascal-string name field (1-byte length + name + even padding).
+	// If the declared name length overflows the buffer, skipPascalString returns
+	// ok=false. We treat this as a recoverable miss (return entryPos) rather than
+	// a terminal failure so that parseIRB continues scanning for subsequent valid
+	// 8BIM blocks (including the 0x0404 IPTC resource). EXIF §4.5.6.
 	pos, ok = skipPascalString(b, pos)
 	if !ok {
-		return 0, nil, pos, false
+		return 0, nil, entryPos, false
 	}
 
 	if pos+4 > len(b) {
