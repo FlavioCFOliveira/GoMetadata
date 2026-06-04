@@ -28,3 +28,9 @@ var ErrChunkTooLarge = errors.New("png: chunk size exceeds limit")
 // metadata for recovery purposes can detect this error with
 // errors.Is(err, ErrChunkCRCMismatch) and choose to proceed.
 var ErrChunkCRCMismatch = errors.New("png: chunk CRC mismatch")
+
+// ErrCorruptXMP is returned when the rawXMP bytes passed to Inject are not a
+// valid XMP packet. This includes the case where a caller accidentally passes an
+// internal JPEG extended-XMP wire-frame to the PNG injector; the wire-frame is a
+// JPEG-only internal encoding that cannot be stored as a PNG XMP chunk.
+var ErrCorruptXMP = errors.New("png: corrupt or invalid XMP data")

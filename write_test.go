@@ -4,6 +4,7 @@ package gometadata
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"os"
@@ -467,4 +468,195 @@ type countingWriter struct {
 func (c *countingWriter) Write(p []byte) (int, error) {
 	c.n += len(p)
 	return len(p), nil
+}
+
+// ---------------------------------------------------------------------------
+// Task #70: extended-XMP wire-frame must never leak to non-JPEG containers
+// ---------------------------------------------------------------------------
+
+// xmpWireFramePrefix is the 8-byte magic that identifies a JPEG extended-XMP
+// wire-frame payload. It is duplicated here from format/jpeg to avoid an import
+// cycle and to make the assertion in TestWriteJPEGExtendedXMPToPNG self-contained.
+var xmpWireFramePrefix = []byte("\x00XMPEXT\x00") //nolint:gochecknoglobals // test-package constant; read-only after init
+
+// buildXMPWireFrame constructs a minimal JPEG extended-XMP wire-frame payload
+// as produced by jpeg.encodeXMPWire. Layout:
+// [8-byte magic][4-byte mainLen BE][main bytes][ext bytes].
+//
+// This is the same internal encoding that jpeg.ExtractWithWire stores in
+// rawXMPWire when a JPEG carries multi-segment extended XMP.
+func buildXMPWireFrame(main, ext []byte) []byte {
+	magic := xmpWireFramePrefix
+	buf := make([]byte, len(magic)+4+len(main)+len(ext))
+	n := copy(buf, magic)
+	binary.BigEndian.PutUint32(buf[n:], uint32(len(main))) //nolint:gosec // G115: test helper
+	n += 4
+	n += copy(buf[n:], main)
+	copy(buf[n:], ext)
+	return buf
+}
+
+// buildMetadataWithWireFrame constructs a Metadata that mimics what Read()
+// returns for a JPEG carrying extended XMP. rawXMPWire is set to a wire-frame
+// encoding and rawXMP is set to the reassembled (user-visible) packet.
+// The format field is set to FormatJPEG to match the source container.
+//
+// This helper lets us test the bug #70 fix without needing a real extended-XMP
+// JPEG on disk: the internal state is constructed directly because the test
+// lives in package gometadata (the same package as Metadata) and therefore has
+// access to unexported fields.
+func buildMetadataWithWireFrame() *Metadata {
+	// A minimal but well-formed XMP packet for the "main" APP1 segment.
+	mainXMP := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>` +
+		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">` +
+		`<dc:description><rdf:Alt><rdf:li xml:lang="x-default">test caption</rdf:li></rdf:Alt></dc:description>` +
+		`</rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end="w"?>`)
+
+	// A minimal extended payload (could be any bytes in the real case; here
+	// we use a short RDF snippet to make the wire-frame non-trivial).
+	extPayload := []byte(`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"/>`)
+
+	wireFrame := buildXMPWireFrame(mainXMP, extPayload)
+
+	return &Metadata{
+		format:     uint8(format.FormatJPEG),
+		rawXMP:     mainXMP, // the reassembled, user-visible packet
+		rawXMPWire: wireFrame,
+	}
+}
+
+// TestWriteJPEGExtendedXMPToPNG is the regression test for bug #70.
+//
+// When a JPEG carrying extended XMP (multi-segment APP1) is read, the Metadata
+// struct holds an internal wire-frame encoding in rawXMPWire. Before the fix,
+// Write used rawXMPWire as-is for any destination format; writing a JPEG
+// Metadata to a PNG container caused the wire-frame bytes to be stored verbatim
+// as the iTXt XMP payload — producing a corrupt non-XMP blob starting with 0x00.
+//
+// After the fix, encodeXMP only returns rawXMPWire when the destination format
+// is JPEG. For PNG (and all other non-JPEG containers) it falls back to rawXMP,
+// the fully reassembled, user-visible XMP packet.
+func TestWriteJPEGExtendedXMPToPNG(t *testing.T) {
+	t.Parallel()
+
+	// Construct a Metadata that mimics what Read() returns for a JPEG with
+	// extended XMP. rawXMPWire is set directly because this test is in package
+	// gometadata (internal) and has access to unexported fields.
+	m := buildMetadataWithWireFrame()
+
+	// Precondition: rawXMPWire must start with the wire-frame magic.
+	if !bytes.HasPrefix(m.rawXMPWire, xmpWireFramePrefix) {
+		t.Fatal("precondition: rawXMPWire does not start with wire-frame magic")
+	}
+	// Precondition: rawXMP must be the reassembled packet (valid XMP).
+	if !bytes.HasPrefix(m.rawXMP, []byte("<?xpacket")) {
+		t.Fatalf("precondition: rawXMP does not start with '<?xpacket': %q", m.rawXMP[:min(32, len(m.rawXMP))])
+	}
+
+	// Write the JPEG-source Metadata to a PNG container (change of format).
+	pngData := buildMinimalPNG()
+	var pngOut bytes.Buffer
+	if err := Write(bytes.NewReader(pngData), &pngOut, m); err != nil {
+		t.Fatalf("Write to PNG: %v", err)
+	}
+
+	// Read back the PNG. The XMP stored in the PNG must be rawXMP (the
+	// reassembled packet), NOT rawXMPWire (the wire-frame). A wire-frame starts
+	// with 0x00 which is an invalid XMP packet header.
+	m2, err := Read(bytes.NewReader(pngOut.Bytes()))
+	if err != nil {
+		t.Fatalf("Read back PNG: %v", err)
+	}
+
+	rawXMPBack := m2.RawXMP()
+	if rawXMPBack == nil {
+		t.Fatal("RawXMP() is nil after Write-to-PNG: XMP was not written or was lost")
+	}
+
+	// Assert: XMP in PNG must NOT begin with the wire-frame magic bytes.
+	// Before the fix this assertion failed: encodeXMP returned rawXMPWire
+	// unconditionally, so the wire-frame was written verbatim to the PNG iTXt.
+	if bytes.HasPrefix(rawXMPBack, xmpWireFramePrefix) {
+		t.Errorf("task #70 regression: XMP in PNG begins with JPEG wire-frame magic %q — corrupt blob written; first 16 bytes: %x",
+			xmpWireFramePrefix, rawXMPBack[:min(16, len(rawXMPBack))])
+	}
+
+	// Assert: XMP in PNG must start with a valid XMP packet leader.
+	if !bytes.HasPrefix(rawXMPBack, []byte("<?xpacket")) {
+		t.Errorf("XMP in PNG does not start with '<?xpacket': first 32 bytes: %q",
+			rawXMPBack[:min(32, len(rawXMPBack))])
+	}
+}
+
+// TestWriteJPEGExtendedXMPToWebP is the regression test for bug #70 on WebP.
+// Same as TestWriteJPEGExtendedXMPToPNG but writes to a WebP container.
+func TestWriteJPEGExtendedXMPToWebP(t *testing.T) {
+	t.Parallel()
+
+	m := buildMetadataWithWireFrame()
+
+	webpData := buildMinimalWebP()
+	var webpOut bytes.Buffer
+	if err := Write(bytes.NewReader(webpData), &webpOut, m); err != nil {
+		t.Fatalf("Write to WebP: %v", err)
+	}
+
+	m2, err := Read(bytes.NewReader(webpOut.Bytes()))
+	if err != nil {
+		t.Fatalf("Read back WebP: %v", err)
+	}
+
+	rawXMPBack := m2.RawXMP()
+	if rawXMPBack == nil {
+		t.Fatal("RawXMP() is nil after Write-to-WebP")
+	}
+	if bytes.HasPrefix(rawXMPBack, xmpWireFramePrefix) {
+		t.Errorf("task #70 regression: XMP in WebP begins with JPEG wire-frame magic — corrupt blob written; first 16 bytes: %x",
+			rawXMPBack[:min(16, len(rawXMPBack))])
+	}
+	if !bytes.HasPrefix(rawXMPBack, []byte("<?xpacket")) {
+		t.Errorf("XMP in WebP does not start with '<?xpacket': first 32 bytes: %q",
+			rawXMPBack[:min(32, len(rawXMPBack))])
+	}
+}
+
+// buildMinimalWebP builds a minimal valid WebP byte stream.
+// VP8X chunk with XMP feature flag (0x04) to allow XMP injection.
+func buildMinimalWebP() []byte {
+	var body bytes.Buffer
+
+	// VP8X chunk: flags=0x04 (XMP present), 1×1 canvas.
+	vp8xPayload := make([]byte, 10)
+	binary.LittleEndian.PutUint32(vp8xPayload[0:], 0x04) // XMP flag
+	// canvas: 1×1 (stored as width-1, height-1 in 3 bytes each; zero = 1px)
+	writeWebPChunk(&body, "VP8X", vp8xPayload)
+
+	// Minimal VP8 lossy bitstream stub.
+	vp8stub := []byte{0x30, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x01, 0x00, 0x01, 0x00}
+	writeWebPChunk(&body, "VP8 ", vp8stub)
+
+	// RIFF header.
+	totalBodySize := uint32(4 + body.Len()) //nolint:gosec // G115: test helper, bounded by local build
+	var out bytes.Buffer
+	out.WriteString("RIFF")
+	var sz [4]byte
+	binary.LittleEndian.PutUint32(sz[:], totalBodySize)
+	out.Write(sz[:])
+	out.WriteString("WEBP")
+	out.Write(body.Bytes())
+	return out.Bytes()
+}
+
+// writeWebPChunk appends a RIFF chunk to buf.
+func writeWebPChunk(buf *bytes.Buffer, fourCC string, data []byte) {
+	buf.WriteString(fourCC)
+	var sz [4]byte
+	binary.LittleEndian.PutUint32(sz[:], uint32(len(data))) //nolint:gosec // G115: test helper
+	buf.Write(sz[:])
+	buf.Write(data)
+	if len(data)%2 != 0 {
+		buf.WriteByte(0x00) // RIFF alignment
+	}
 }

@@ -89,7 +89,7 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 		return ErrWriteNotSupported
 	}
 
-	rawEXIF, rawIPTC, rawXMP, err := encodeMetadata(m)
+	rawEXIF, rawIPTC, rawXMP, err := encodeMetadata(m, fmtID)
 	if err != nil {
 		return err
 	}
@@ -160,14 +160,18 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 // encodeMetadata serialises each modified metadata segment. If a segment was
 // not modified (m.EXIF/IPTC/XMP is nil) the original raw bytes are passed
 // through unchanged. Returns the first encoding error encountered.
-func encodeMetadata(m *Metadata) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+//
+// fmtID is the detected destination container format. It is forwarded to
+// encodeXMP so that the JPEG extended-XMP wire-frame is never handed to a
+// non-JPEG injector.
+func encodeMetadata(m *Metadata, fmtID format.FormatID) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if rawEXIF, err = encodeEXIF(m); err != nil {
 		return nil, nil, nil, err
 	}
 	if rawIPTC, err = encodeIPTC(m); err != nil {
 		return nil, nil, nil, err
 	}
-	if rawXMP, err = encodeXMP(m); err != nil {
+	if rawXMP, err = encodeXMP(m, fmtID); err != nil {
 		return nil, nil, nil, err
 	}
 	return rawEXIF, rawIPTC, rawXMP, nil
@@ -201,9 +205,18 @@ func encodeIPTC(m *Metadata) ([]byte, error) {
 
 // encodeXMP returns the XMP bytes to write: freshly encoded when m.XMP is
 // non-nil, the wire-frame encoding when the image carried extended XMP and the
-// XMP was not modified (guarantees byte-stable round-trips), or the original
-// raw bytes otherwise.
-func encodeXMP(m *Metadata) ([]byte, error) {
+// XMP was not modified (guarantees byte-stable round-trips for JPEG), or the
+// original raw bytes otherwise.
+//
+// fmtID is the destination container format. The wire-frame encoding is only
+// valid for JPEG: jpeg.Inject is the only injector that knows how to decode it
+// (via writeXMPSegments → decodeXMPWire). For every other container format the
+// wire-frame is bypassed and rawXMP (the reassembled, user-visible packet) is
+// returned instead, preventing a corrupt XMP blob from being written to
+// PNG/WebP/HEIF/AVIF and other non-JPEG containers.
+//
+// See task #70: Extended-XMP wire-frame leaks to PNG/WebP/HEIF inject.
+func encodeXMP(m *Metadata, fmtID format.FormatID) ([]byte, error) {
 	if m.XMP != nil {
 		raw, err := xmppkg.Encode(m.XMP)
 		if err != nil {
@@ -211,12 +224,15 @@ func encodeXMP(m *Metadata) ([]byte, error) {
 		}
 		return raw, nil
 	}
-	// Prefer the wire-frame encoding over the reassembled rawXMP when both are
-	// present. The wire-frame carries the original main APP1 content and the
-	// assembled extended payload so that jpeg.Inject can reproduce the extended
-	// XMP segments without regenerating the GUID — guaranteeing byte-stable
-	// round-trips for unmodified extended XMP.
-	if m.rawXMPWire != nil {
+	// The wire-frame encoding (rawXMPWire) carries the original JPEG main APP1
+	// content and the assembled extended XMP payload packed together. Only
+	// jpeg.Inject can decode it — passing it to any other injector would write
+	// the raw wire-frame bytes verbatim as the XMP packet, producing a corrupt
+	// non-XMP blob in the destination container.
+	//
+	// Return rawXMPWire only when the destination format is JPEG; fall back to
+	// rawXMP (the fully reassembled, user-visible packet) for all other formats.
+	if m.rawXMPWire != nil && fmtID == format.FormatJPEG {
 		return m.rawXMPWire, nil
 	}
 	return m.rawXMP, nil

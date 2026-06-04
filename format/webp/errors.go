@@ -12,3 +12,9 @@ var ErrFileTooShort = errors.New("webp: file too short")
 // maxWebPChunkSize. This prevents a crafted 4-byte size field from triggering
 // a multi-gigabyte allocation before any I/O takes place.
 var ErrChunkTooLarge = errors.New("webp: chunk size exceeds limit")
+
+// ErrCorruptXMP is returned when the rawXMP bytes passed to Inject are not a
+// valid XMP packet. This includes the case where a caller accidentally passes an
+// internal JPEG extended-XMP wire-frame to the WebP injector; the wire-frame is a
+// JPEG-only internal encoding that cannot be stored as a WebP XMP chunk.
+var ErrCorruptXMP = errors.New("webp: corrupt or invalid XMP data")

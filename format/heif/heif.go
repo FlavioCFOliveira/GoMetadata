@@ -18,6 +18,15 @@ import (
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 )
 
+// xmpWireFrameMagic is the 8-byte sentinel that identifies a JPEG extended-XMP
+// wire-frame payload (defined in format/jpeg; duplicated here to avoid an import
+// cycle). The wire-frame is an internal encoding used exclusively by jpeg.Inject;
+// it must never reach the HEIF injector.
+//
+// Layout: [0x00]['X']['M']['P']['E']['X']['T'][0x00]
+// The leading 0x00 is unambiguous: no valid XMP packet starts with a null byte.
+var xmpWireFrameMagic = [8]byte{0x00, 'X', 'M', 'P', 'E', 'X', 'T', 0x00} //nolint:gochecknoglobals // package-level constant bytes
+
 // Extract navigates the ISOBMFF box hierarchy of r and extracts raw payloads.
 // rawEXIF has the 4-byte TIFF-header offset prefix stripped before return.
 //
@@ -205,6 +214,14 @@ func buildInjectComponents(data []byte, metaAbsStart, metaAbsEnd, metaContentOff
 // (e.g. moov) are patched if the meta box size changes. New item payloads
 // are appended at the end of the output file.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
+	// Defense in depth: reject a JPEG extended-XMP wire-frame that was not
+	// filtered out by the encodeXMP format check in write.go. The wire-frame
+	// begins with 0x00XMPEXT\x00 — an invalid start for any XMP packet — and
+	// can only be decoded by jpeg.Inject. Writing it verbatim to a HEIF XMP
+	// item would produce a corrupt, non-XMP blob. (Bug #70.)
+	if len(rawXMP) >= len(xmpWireFrameMagic) && [8]byte(rawXMP[:8]) == xmpWireFrameMagic {
+		return fmt.Errorf("heif: rawXMP contains an internal JPEG wire-frame encoding that cannot be stored in a HEIF/AVIF container: %w", ErrCorruptXMP)
+	}
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("heif: seek: %w", err)
 	}

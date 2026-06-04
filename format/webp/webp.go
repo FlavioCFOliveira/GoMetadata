@@ -28,6 +28,15 @@ import (
 // a single 4-byte field in the file from causing a multi-gigabyte heap allocation.
 const maxWebPChunkSize = 256 << 20 // 256 MiB
 
+// xmpWireFrameMagic is the 8-byte sentinel that identifies a JPEG extended-XMP
+// wire-frame payload (defined in format/jpeg; duplicated here to avoid an import
+// cycle). The wire-frame is an internal encoding used exclusively by jpeg.Inject;
+// it must never reach the WebP injector.
+//
+// Layout: [0x00]['X']['M']['P']['E']['X']['T'][0x00]
+// The leading 0x00 is unambiguous: no valid XMP packet starts with a null byte.
+var xmpWireFrameMagic = [8]byte{0x00, 'X', 'M', 'P', 'E', 'X', 'T', 0x00} //nolint:gochecknoglobals // package-level constant bytes
+
 // readWebPChunks iterates over the RIFF chunk list in r, accumulating EXIF and
 // XMP payloads. r must be positioned immediately after the 12-byte RIFF/WEBP
 // header. All non-metadata chunks are skipped.
@@ -137,6 +146,14 @@ func readPaddedChunk(r io.ReadSeeker, chunk riff.Chunk) ([]byte, error) {
 // Inject writes a modified WebP stream to w with updated EXIF and XMP chunks.
 // rawIPTC is ignored (WebP has no IPTC support).
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte) error {
+	// Defense in depth: reject a JPEG extended-XMP wire-frame that was not
+	// filtered out by the encodeXMP format check in write.go. The wire-frame
+	// begins with 0x00XMPEXT\x00 — an invalid start for any XMP packet — and
+	// can only be decoded by jpeg.Inject. Writing it verbatim to a WebP XMP
+	// chunk would produce a corrupt, non-XMP blob. (Bug #70.)
+	if len(rawXMP) >= len(xmpWireFrameMagic) && [8]byte(rawXMP[:8]) == xmpWireFrameMagic {
+		return fmt.Errorf("webp: rawXMP contains an internal JPEG wire-frame encoding that cannot be stored in a WebP container: %w", ErrCorruptXMP)
+	}
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("webp: seek: %w", err)
 	}
