@@ -183,6 +183,21 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) {
 }
 
 // Encode serialises e back to a raw EXIF byte stream (TIFF header + IFDs).
+//
+// Round-trip fidelity guarantee:
+//   - Known-type inline entries (total value size ≤ 4 bytes) are perfectly preserved.
+//   - Known-type out-of-line entries (total value size > 4 bytes) are re-serialised
+//     into a fresh value area; their data is preserved exactly.
+//   - Unknown-type entries (TIFF type codes not defined in TIFF 6.0) are stored
+//     during parsing as their raw 4-byte IFD field. On re-encode that 4-byte field
+//     is written back verbatim as an inline value. If the original field was an
+//     offset into a private data blob, that blob is NOT copied — the offset in the
+//     new stream will be stale and the pointed-to data will be silently lost.
+//
+// This is an inherent constraint: without a known type size it is impossible to
+// locate or copy the out-of-line data. Callers that embed private data under
+// unknown type codes must re-inject that data into the stream after calling Encode.
+// Task #84 pins this behaviour; any change to it is a conscious, tested decision.
 func Encode(e *EXIF) ([]byte, error) {
 	return serialise(e)
 }

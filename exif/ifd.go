@@ -299,7 +299,7 @@ func (e *IFDEntry) Uint32() uint32 {
 
 // Rational decodes the i-th RATIONAL value as [numerator, denominator].
 // Returns [2]uint32{} when the entry type is not TypeRational or the index is
-// out of range.
+// out of range (including negative indices).
 //
 // EXIF 2.32 CIPA DC-008-2023 §4.6.3: RATIONAL and SRATIONAL are distinct types
 // with different sign semantics. Rational() accepts only TypeRational (unsigned
@@ -315,6 +315,13 @@ func (e *IFDEntry) Rational(i int) [2]uint32 {
 	if e.Type != TypeRational {
 		return [2]uint32{}
 	}
+	// Task #87: reject negative indices before computing the byte offset.
+	// Without this guard, off = i*8 = -8 for i=-1, making off+8 = 0, which
+	// passes the "off+8 > len(e.Value)" check (0 > len is false for any
+	// non-empty slice) and causes e.Value[-8:] to panic with a negative index.
+	if i < 0 {
+		return [2]uint32{}
+	}
 	off := i * 8
 	if off+8 > len(e.Value) {
 		return [2]uint32{}
@@ -326,11 +333,18 @@ func (e *IFDEntry) Rational(i int) [2]uint32 {
 }
 
 // SRational decodes the i-th SRATIONAL value as [numerator, denominator].
-// Returns [0, 0] on out-of-range access.
+// Returns [0, 0] on out-of-range access (including negative indices).
 // Use this instead of Rational for signed tags such as ShutterSpeedValue (0x9201),
 // BrightnessValue (0x9203), and ExposureBiasValue (0x9204) (EXIF 2.x §4.6.3).
 func (e *IFDEntry) SRational(i int) [2]int32 {
 	if e.Type != TypeSRational {
+		return [2]int32{}
+	}
+	// Task #87: reject negative indices before computing the byte offset.
+	// Without this guard, off = i*8 = -8 for i=-1, making off+8 = 0, which
+	// passes the "off+8 > len(e.Value)" check (0 > len is false for any
+	// non-empty slice) and causes e.Value[-8:] to panic with a negative index.
+	if i < 0 {
 		return [2]int32{}
 	}
 	off := i * 8
