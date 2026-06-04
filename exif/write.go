@@ -28,6 +28,15 @@ func serialise(e *EXIF) ([]byte, error) {
 	}
 
 	order := e.ByteOrder
+	// Task #59: e.ByteOrder is a nil interface value when the caller constructs
+	// an EXIF struct without setting ByteOrder (zero value for interface). Every
+	// internal setter uses ifd0ByteOrder() which defaults to LittleEndian, so
+	// a freshly-built EXIF is always LE unless the caller explicitly chose BE.
+	// Default here to match that convention so Encode never panics on a nil
+	// interface dereference (first triggered at order.PutUint32 in patchPointers).
+	if order == nil {
+		order = binary.LittleEndian
+	}
 
 	// Stack-allocated arrays avoid one heap allocation per sub-IFD pointer.
 	var exifPtrBuf, gpsPtrBuf, interopPtrBuf [4]byte
@@ -118,6 +127,12 @@ func writeSubIFDs(out []byte, e *EXIF, exifIFDEntries []IFDEntry, order binary.B
 	}
 
 	// Serialise the IFD1 chain (thumbnail IFDs, TIFF §2).
+	// Task #58: guard matches the identical nil-check in writeTIFFHeader (line 88).
+	// e.IFD0 is nil when the caller sets only ExifIFD/GPSIFD without IFD0; the
+	// IFD1 chain is unreachable in that case so skipping it is correct.
+	if e.IFD0 == nil {
+		return out
+	}
 	for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
 		// For IFDs with JPEG thumbnail data: the thumbnail bytes are placed
 		// immediately after the IFD block.  Compute the thumbnail offset now,

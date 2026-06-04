@@ -3233,3 +3233,72 @@ func TestThumbnailZeroLength(t *testing.T) {
 		t.Fatalf("Parse after Encode: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for task #58 and task #59
+// ---------------------------------------------------------------------------
+
+// TestEncodeNilIFD0DoesNotPanic is the regression gate for task #58 (variant A).
+// A freshly-constructed EXIF with ByteOrder set but IFD0 == nil must not panic.
+// Before the fix, writeSubIFDs dereferenced e.IFD0.Next unconditionally at
+// write.go:121, causing a nil pointer dereference.
+func TestEncodeNilIFD0DoesNotPanic(t *testing.T) {
+	t.Parallel()
+	e := &EXIF{ByteOrder: binary.LittleEndian}
+	got, err := Encode(e)
+	if err != nil {
+		t.Fatalf("Encode returned error: %v", err)
+	}
+	if len(got) == 0 {
+		t.Fatal("Encode returned empty output")
+	}
+}
+
+// TestEncodeNilIFD0WithExifIFD is the regression gate for task #58 (variant B).
+// A caller-constructed EXIF with ExifIFD set but IFD0 == nil is a valid state
+// and must encode without panicking, producing output that round-trips through Parse.
+// Before the fix, writeSubIFDs dereferenced e.IFD0.Next unconditionally.
+func TestEncodeNilIFD0WithExifIFD(t *testing.T) {
+	t.Parallel()
+	e := &EXIF{
+		ByteOrder: binary.LittleEndian,
+		ExifIFD: &IFD{Entries: []IFDEntry{
+			{Tag: TagColorSpace, Type: TypeShort, Count: 1, Value: []byte{1, 0, 0, 0}},
+		}},
+	}
+	got, err := Encode(e)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if _, err := Parse(got); err != nil {
+		t.Fatalf("Parse after Encode: %v", err)
+	}
+}
+
+// TestEncodeNilByteOrderDefaultsToLE is the regression gate for task #59.
+// When ByteOrder is nil (zero value for interface — the common case for a
+// manually-constructed EXIF struct), Encode must default to LittleEndian and
+// not panic. Before the fix, the nil interface caused a nil method call at the
+// first order.PutUint32 in patchPointers (write.go:~300).
+// The test also validates that the LE byte-order mark ('II') is present in the
+// encoded output, confirming the default was applied correctly.
+func TestEncodeNilByteOrderDefaultsToLE(t *testing.T) {
+	t.Parallel()
+	e := &EXIF{IFD0: &IFD{}}
+	e.SetGPS(47.0, 11.0)
+	got, err := Encode(e)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if len(got) < 2 {
+		t.Fatalf("encoded output too short: %d bytes", len(got))
+	}
+	// TIFF §2: LE byte-order mark is 'II' (0x4949).
+	if got[0] != 'I' || got[1] != 'I' {
+		t.Errorf("expected LE byte-order mark 'II', got %02x %02x", got[0], got[1])
+	}
+	// Must also parse cleanly.
+	if _, err := Parse(got); err != nil {
+		t.Fatalf("Parse after Encode: %v", err)
+	}
+}
