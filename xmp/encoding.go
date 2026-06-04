@@ -167,10 +167,15 @@ func decodeUTF32(b []byte, bigEndian bool) []byte { //nolint:cyclop // big/littl
 		if cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) {
 			cp = uint32(unicode.ReplacementChar)
 		}
-		out = appendUTF8Rune(out, cp)
-		if len(out) >= maxUnescapedXMLBytes {
+		// #81: Check cap BEFORE appending. A supplementary code point (U+10000–
+		// U+10FFFF) encodes to 4 UTF-8 bytes; checking AFTER the append allowed
+		// len(out) to reach maxUnescapedXMLBytes+1..+3, triggering an unexpected
+		// backing-array reallocation. The pre-check ensures len(out) never exceeds
+		// the cap regardless of UTF-8 sequence length (1–4 bytes).
+		if len(out)+4 > maxUnescapedXMLBytes {
 			break
 		}
+		out = appendUTF8Rune(out, cp)
 	}
 	return out
 }

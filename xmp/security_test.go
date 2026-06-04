@@ -1173,3 +1173,71 @@ func buildBillionLaughsInput() string {
 	// the parser's tolerance for arbitrary input.
 	return strings.Repeat("<a>", 200) + strings.Repeat("</a>", 200)
 }
+
+// ── decodeUTF32 output cap precision (#81) ───────────────────────────────────
+//
+// encoding.go decodeUTF32: the cap check must fire BEFORE appendUTF8Rune appends
+// so that len(out) never exceeds maxUnescapedXMLBytes. For supplementary code
+// points (U+10000–U+10FFFF) each UTF-8 encoding is 4 bytes. When exactly
+// (maxUnescapedXMLBytes/4) such code points are fed in, the pre-allocated
+// capacity is exactly maxUnescapedXMLBytes and the output must not exceed it.
+//
+// Pre-fix defect: the check ran AFTER append, so the last code point could push
+// len(out) to maxUnescapedXMLBytes+1..+3, triggering a backing-array realloc.
+// Fix: check BEFORE append — `if len(out)+4 > maxUnescapedXMLBytes { break }`.
+
+// TestDecodeUTF32CapPrecise builds a UTF-32 BE buffer that exercises the exact
+// cap-boundary overshoot: (maxUnescapedXMLBytes-3) ASCII code points followed by
+// supplementary code points (U+10001, 4 UTF-8 bytes each). This forces
+// len(out) == maxUnescapedXMLBytes-3 before the next append, so with the old
+// post-check code a 4-byte append produces len == maxUnescapedXMLBytes+1 (overshoot
+// of 1 byte). With the fixed pre-check `len(out)+4 > maxUnescapedXMLBytes`, the
+// loop stops before that append and len(out) never exceeds maxUnescapedXMLBytes.
+//
+// Encoding choices (XMP Part 1 §7.2):
+//   - ASCII 'A' (U+0041): 1 UTF-8 byte → fill (maxUnescapedXMLBytes-3) positions
+//   - U+10001 (supplementary): 4 UTF-8 bytes → append after the ASCII block
+func TestDecodeUTF32CapPrecise(t *testing.T) {
+	t.Parallel()
+
+	// We need len(out) to reach maxUnescapedXMLBytes-3 via 1-byte code points,
+	// then one 4-byte supplementary to attempt the overshoot.
+	// ASCII part: (maxUnescapedXMLBytes - 3) U+0041 code points.
+	// Supplementary part: 4 U+10001 code points (enough to ensure the loop hits the boundary).
+	asciiCount := maxUnescapedXMLBytes - 3
+	suppCount := 4 // extra supplementary code points after the ASCII block
+	totalCodePoints := asciiCount + suppCount
+
+	// Build UTF-32 BE: 4-byte BOM + totalCodePoints × 4 bytes.
+	buf := make([]byte, 4+totalCodePoints*4)
+	// UTF-32 BE BOM: 00 00 FE FF (XMP Part 1 §7.2).
+	buf[0], buf[1], buf[2], buf[3] = 0x00, 0x00, 0xFE, 0xFF
+
+	// ASCII 'A' (U+0041) in UTF-32 BE: 00 00 00 41.
+	for i := range asciiCount {
+		off := 4 + i*4
+		buf[off+0] = 0x00
+		buf[off+1] = 0x00
+		buf[off+2] = 0x00
+		buf[off+3] = 0x41
+	}
+	// U+10001 in UTF-32 BE: 00 01 00 01.
+	for i := range suppCount {
+		off := 4 + (asciiCount+i)*4
+		buf[off+0] = 0x00
+		buf[off+1] = 0x01
+		buf[off+2] = 0x00
+		buf[off+3] = 0x01
+	}
+
+	out := decodeUTF32(buf, true)
+
+	// With the fixed pre-check, len(out) must never exceed maxUnescapedXMLBytes.
+	// With the old post-check, after appending the first supplementary code point
+	// the length becomes (maxUnescapedXMLBytes-3)+4 = maxUnescapedXMLBytes+1,
+	// violating the invariant.
+	if len(out) > maxUnescapedXMLBytes {
+		t.Errorf("decodeUTF32 output len = %d, want <= %d (cap overshoot by %d bytes)",
+			len(out), maxUnescapedXMLBytes, len(out)-maxUnescapedXMLBytes)
+	}
+}
