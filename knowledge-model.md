@@ -21,7 +21,7 @@ both in the same step.
 
 | Label | Key | Count* | Properties |
 |---|---|---|---|
-| `Package` | `name` | 43 | `name, path, module, layer, description, testCount, entryReachable, gitCommit, gitDate` |
+| `Package` | `name` | 29 | `name, path, module, layer, description, testCount, entryReachable, gitCommit, gitDate` |
 | `File` | `path` | 75 | `path, name, package, gitCommit, gitDate` |
 | `Type` | `name`+`package` | 34 | `name, package, file, kind, exported, gitCommit, gitDate` |
 | `Function` | `name`+`package` | 11 | `name, package, file, signature, kind, gitCommit, gitDate` |
@@ -36,7 +36,7 @@ both in the same step.
 \* approximate at bootstrap (`402a067`, 2026-06-01).
 
 ### `layer` values for `Package`
-`entry` (root `gometadata`) · `exif` · `makernote` · `format` · `format-container`
+`entry` (root `gometadata`) · `exif` · `format` · `format-container`
 (jpeg/png/webp/heif/tiff) · `format-raw` (arw/cr2/cr3/dng/nef/orf/rw2) · `internal` ·
 `example`.
 
@@ -45,10 +45,11 @@ both in the same step.
 
 ### `entryReachable` on `Package` (boolean)
 Computed from the graph's own `DEPENDS_ON` edges: `true` if the package is the entry
-(`gometadata`) or transitively imported by it; `false` otherwise. At `402a067`: 20 `true`,
-23 `false` (8 `example` alternate-entry packages + the 12-package `exif/makernote` dead
-subtree + 3 `internal` orphans). Query the dead/unused code with
-`MATCH (p:Package {entryReachable:false}) WHERE p.layer <> 'example' RETURN p.name`.
+(`gometadata`) or transitively imported by it; `false` otherwise. At `402a067` (bootstrap):
+20 `true`, 23 `false` (8 `example` alternate-entry packages + the 12-package
+`exif/makernote` dead subtree + 3 `internal` orphans). After task #89 (dead-code removal,
+see below): all 14 dead non-example packages deleted; the `false` set is now 8 `example`
+packages only. Query: `MATCH (p:Package {entryReachable:false}) RETURN p.name`.
 
 ---
 
@@ -117,18 +118,14 @@ NOT modelled as `FormatCapability` nodes: the module returns `UnsupportedFormatE
 - TIFF-based RAW formats (`arw, cr2, dng, nef, orf, rw2`) `DEPENDS_ON` `format/tiff`, which
   `DEPENDS_ON` `exif`. `cr3` is **self-contained** (BMFF parsed inline; depends on no
   intra-module package).
-- **Orphan internal packages** (no intra-module importers at bootstrap):
-  `internal/bmff`, `internal/byteorder`, `internal/testutil`. HEIF/CR3 inline their own
-  BMFF parsing; code uses `encoding/binary` directly. Flagged as potential dead code — kept
-  in the graph as `Package` nodes with no inbound `DEPENDS_ON`.
-- **`exif/makernote` subtree is a parallel, unimported implementation.** No package imports
-  `exif/makernote`; it is **unreachable from the entry package** (verified by DEPENDS_ON
-  reachability). The live MakerNote dispatch is an inline table (`makerNoteParsers`) in
-  `exif/makernote_parse.go` within the `exif` package. The `exif/makernote/*` tree (dispatch
-  + 11 vendor `Parser` packages) is exercised by its own tests only. The whitespace-trim fix
-  exists in **both** paths (`exif/makernote_parse.go:67` and `exif/makernote/dispatch.go:62`).
-  Net: 15 of 43 packages (the makernote subtree + 3 internal orphans) are not reachable from
-  the public API entry point.
+- `internal/testutil` has no intra-module production importer (test-only helper); it is kept
+  because it is imported by test files across the module and provides no dead-code risk.
+- **Dead-code subtrees removed in task #89 (2026-06-05):** `exif/makernote/` (dispatch.go +
+  11 vendor packages: canon, dji, fujifilm, leica, nikon, olympus, panasonic, pentax,
+  samsung, sigma, sony), `internal/bmff`, and `internal/byteorder` — 14 packages / 33 files
+  deleted. None had any live intra-module importer (confirmed by `grep` before deletion). The
+  live MakerNote dispatch remains at `exif/makernote_parse.go` inside the `exif` package.
+  Package count: 43 → 29.
 
 ---
 
@@ -150,7 +147,7 @@ Materialized **296 nodes, 422 edges**; zero label-less nodes, zero nodes missing
 |---|---|---|---|---|
 | File | 75 | | FuzzTarget | 26 |
 | Benchmark | 60 | | Function | 11 |
-| Package | 43 | | Spec | 9 |
+| Package | 43 (29 after task #89) | | Spec | 9 |
 | Type | 34 | | Commit | 5 |
 | Feature | 29 | | Test | 4 |
 
@@ -235,12 +232,34 @@ defect**, fixed in Sprint 9 (task #55):
   write" bullet). Now every format's documented Write capability matches `format.SupportsWrite`.
 
 Deferred (tracked, not done): full RAW/TIFF write support (epic `#33`), an optional
-`WithMaxInputBytes` guard (LOW), removal of the unreachable `exif/makernote/*` duplicate
-subtree (LOW tech-debt), and per-MakerNote / ORF / RW2 / CR3 benchmark gaps (LOW).
+`WithMaxInputBytes` guard (LOW), and per-MakerNote / ORF / RW2 / CR3 benchmark gaps (LOW).
+The unreachable `exif/makernote/*` duplicate subtree, `internal/bmff`, and `internal/byteorder`
+were subsequently removed in task #89 (2026-06-05).
 
 Graph delta: +2 orphan `Commit` nodes (the `docs:` fidelity fix `348704c` and this model-sync
 commit). `Commit` 12 → 14; accepted orphans 5 → 7. **No new labels, edge types, or
 properties** — the graph shape is unchanged.
+
+---
+
+## Update — Task #89: dead-code removal (2026-06-05)
+
+Deleted three unreachable subtrees after confirming zero live importers via `grep`:
+
+| Subtree removed | Files deleted | Reason |
+|---|---|---|
+| `exif/makernote/` (dispatch + 11 vendor pkgs) | 29 | Parallel implementation; live dispatch is `exif/makernote_parse.go` |
+| `internal/bmff/` | 2 | HEIF/CR3 inline their own BMFF parsing |
+| `internal/byteorder/` | 2 | Code uses `encoding/binary` directly |
+
+**Total**: 14 packages / 33 files deleted. Package count: 43 → **29**.
+
+Graph delta: 14 `Package` nodes removed (and their `PART_OF`/`DEPENDS_ON`/`CONTAINS` edges).
+The `makernote` layer value is now obsolete. No new labels, edge types, or properties added.
+`entryReachable:false` set reduced from 23 to 8 (example packages only).
+
+The `exif/makernote_parse.go` file (package `exif`) is **NOT removed** — it is the live
+MakerNote dispatch and is entry-reachable via the `exif` package.
 
 ---
 
