@@ -35,17 +35,17 @@ func decodeString(b []byte, isUTF8 bool) string {
 	return string(decoded)
 }
 
-// stringValue returns the Dataset value as a UTF-8 string, caching the result
-// so that repeated calls (e.g. iterating Keywords) pay the ISO-8859-1 → UTF-8
-// conversion cost only once. The pointer receiver is required to write back
-// the cached result to the Dataset stored in the slice.
-func (d *Dataset) stringValue(isUTF8 bool) string {
-	if d.decoded {
-		return d.decodedValue
-	}
+// setDecodedValue pre-populates d.decodedValue from d.Value using the stream's
+// charset flag. Called by Parse after the full first pass (when the UTF-8 flag
+// from dataset 1:90 is known) and by write-path helpers whenever a new Dataset
+// is constructed. After this call d.decodedValue is stable and never written
+// again by any read accessor, which makes concurrent reads race-free without
+// any additional synchronisation.
+//
+// Callers that supply values already in UTF-8 (all write-path setters — Go
+// strings are always UTF-8) pass isUTF8=true to skip the ISO-8859-1 decoder.
+func (d *Dataset) setDecodedValue(isUTF8 bool) {
 	d.decodedValue = decodeString(d.Value, isUTF8)
-	d.decoded = true
-	return d.decodedValue
 }
 
 // escPercentG is the ISO 2022 escape sequence for UTF-8 (ESC % G).

@@ -41,11 +41,14 @@ type Dataset struct {
 	Record  uint8
 	DataSet uint8
 	Value   []byte
-	// decodedValue and decoded implement a one-shot charset decode cache so
-	// that callers that read the same field repeatedly (e.g. Keywords in a
-	// loop) pay the ISO-8859-1 → UTF-8 conversion cost only once.
+	// decodedValue holds the Value decoded to UTF-8. It is populated eagerly
+	// by Parse (after the full first pass when the 1:90 charset flag is known)
+	// and by every write-path helper that constructs a Dataset. Once set, it
+	// is never written by any read accessor, making concurrent reads race-free
+	// without synchronisation. Task #60: replaces the former lazy-decode cache
+	// (d.decoded bool + d.decodedValue written inside stringValue()) which was
+	// a data race when two goroutines called read accessors concurrently.
 	decodedValue string
-	decoded      bool
 }
 
 // decodeDatasetLength decodes the 2-byte size field starting at b[pos+3..pos+4]
@@ -126,7 +129,7 @@ const maxIPTCTotalBytes = 256 << 20 // 256 MiB
 // The nil-error contract is intentional: callers such as read.go treat a
 // non-nil error as a fatal segment failure and discard all recovered data.
 // Callers that need to detect partial skips should inspect IPTC.Truncated.
-func Parse(b []byte) (*IPTC, error) {
+func Parse(b []byte) (*IPTC, error) { //nolint:gocyclo // IIM scanner has inherent branching (tag-marker scan, standard/extended length, per-dataset guards, aggregate cap); the post-parse decode pass adds one loop but extracting it reduces cohesion without reducing real complexity
 	i := new(IPTC)
 	// Pre-allocate record 2 (Application Record) — the most common record,
 	// typically containing 5–15 datasets in a production JPEG (IIM §2).
@@ -196,6 +199,21 @@ func Parse(b []byte) (*IPTC, error) {
 	// methods can retrieve it without re-scanning record 1.
 	if utf8 {
 		i.Records[0] = append(i.Records[0], Dataset{Record: 0, DataSet: 0, Value: []byte{1}})
+	}
+
+	// Task #60: eager pre-decode pass. Now that the full stream has been scanned
+	// and the UTF-8 flag (from 1:90) is final, decode every dataset value to
+	// UTF-8 and store the result in decodedValue. Read accessors return this
+	// pre-decoded string directly, so they never write to the Dataset after
+	// Parse returns — concurrent reads are race-free without synchronisation.
+	//
+	// The 1:90 declaration can appear at any position in the stream (IIM places
+	// no ordering constraint), which is why decoding must happen after the loop
+	// rather than inline during dataset storage.
+	for rec := range i.Records {
+		for idx := range i.Records[rec] {
+			i.Records[rec][idx].setDecodedValue(utf8)
+		}
 	}
 
 	return i, nil
@@ -341,11 +359,21 @@ func (i *IPTC) Keywords() []string {
 	if i == nil {
 		return nil
 	}
-	utf8flag := i.isUTF8()
-	var result []string
+	// Pre-count to allocate the result slice in one shot, avoiding repeated
+	// append growth. Each string copy is a header copy (no allocation).
+	n := 0
 	for idx := range i.Records[2] {
 		if i.Records[2][idx].DataSet == DS2Keywords {
-			result = append(result, i.Records[2][idx].stringValue(utf8flag))
+			n++
+		}
+	}
+	if n == 0 {
+		return nil
+	}
+	result := make([]string, 0, n)
+	for idx := range i.Records[2] {
+		if i.Records[2][idx].DataSet == DS2Keywords {
+			result = append(result, i.Records[2][idx].decodedValue)
 		}
 	}
 	return result
@@ -364,11 +392,20 @@ func (i *IPTC) AllCreators() []string {
 	if i == nil {
 		return nil
 	}
-	utf8flag := i.isUTF8()
-	var result []string
+	// Pre-count to allocate the result slice in one shot.
+	n := 0
 	for idx := range i.Records[2] {
 		if i.Records[2][idx].DataSet == DS2Byline {
-			result = append(result, i.Records[2][idx].stringValue(utf8flag))
+			n++
+		}
+	}
+	if n == 0 {
+		return nil
+	}
+	result := make([]string, 0, n)
+	for idx := range i.Records[2] {
+		if i.Records[2][idx].DataSet == DS2Byline {
+			result = append(result, i.Records[2][idx].decodedValue)
 		}
 	}
 	return result
@@ -416,7 +453,9 @@ func (i *IPTC) AddCreator(creator string) {
 	if hasHighBytes(v) && !i.isUTF8() {
 		i.Records[0] = append(i.Records[0][:0], Dataset{Record: 0, DataSet: 0, Value: []byte{1}})
 	}
-	i.Records[2] = append(i.Records[2], Dataset{Record: 2, DataSet: DS2Byline, Value: v})
+	d := Dataset{Record: 2, DataSet: DS2Byline, Value: v}
+	d.setDecodedValue(true) // write-path: v is always UTF-8 (truncated from a Go string)
+	i.Records[2] = append(i.Records[2], d)
 }
 
 // AddKeyword appends a keyword to dataset 2:25 (Keywords, IIM §2.2.17).
@@ -427,7 +466,9 @@ func (i *IPTC) AddKeyword(kw string) {
 	if hasHighBytes(v) && !i.isUTF8() {
 		i.Records[0] = append(i.Records[0][:0], Dataset{Record: 0, DataSet: 0, Value: []byte{1}})
 	}
-	i.Records[2] = append(i.Records[2], Dataset{Record: 2, DataSet: DS2Keywords, Value: v})
+	d := Dataset{Record: 2, DataSet: DS2Keywords, Value: v}
+	d.setDecodedValue(true) // write-path: v is always UTF-8 (truncated from a Go string)
+	i.Records[2] = append(i.Records[2], d)
 }
 
 // SetKeywords replaces all dataset 2:25 (Keywords, IIM §2.2.17) entries in
@@ -450,7 +491,9 @@ func (i *IPTC) SetKeywords(kws []string) {
 	// Append one Dataset per keyword (IIM §2.2.17: repeatable).
 	for _, kw := range kws {
 		v := truncateToLimit([]byte(kw), datasetMaxLen[DS2Keywords])
-		i.Records[2] = append(i.Records[2], Dataset{Record: 2, DataSet: DS2Keywords, Value: v})
+		d := Dataset{Record: 2, DataSet: DS2Keywords, Value: v}
+		d.setDecodedValue(true) // write-path: v is always UTF-8 (truncated from a Go string)
+		i.Records[2] = append(i.Records[2], d)
 	}
 }
 
@@ -461,6 +504,10 @@ func (i *IPTC) SetKeywords(kws []string) {
 // is not yet set, it is set now. All setters pass Go strings (which are always
 // UTF-8) through []byte(s), so any non-ASCII byte in value is a UTF-8 sequence
 // that must be declared as such for accessors to read it back correctly.
+//
+// After updating or appending the Dataset, decodedValue is set immediately to
+// string(value) (the caller always supplies UTF-8 bytes, so no ISO-8859-1
+// decode is needed on the write path).
 func (i *IPTC) setRecord2(ds uint8, value []byte) {
 	// Auto-upgrade to UTF-8 mode when writing non-ASCII content. This ensures
 	// that accessors such as Caption() and Copyright() use the UTF-8 decode path
@@ -472,14 +519,15 @@ func (i *IPTC) setRecord2(ds uint8, value []byte) {
 	for idx := range i.Records[2] {
 		if i.Records[2][idx].DataSet == ds {
 			i.Records[2][idx].Value = value
-			// Invalidate the decode cache so the new value is re-decoded on
-			// the next read (the old decoded string no longer matches Value).
-			i.Records[2][idx].decoded = false
-			i.Records[2][idx].decodedValue = ""
+			// Re-decode immediately: write-path values are always UTF-8 (Go strings),
+			// so isUTF8=true. decodedValue = string(value) via setDecodedValue.
+			i.Records[2][idx].setDecodedValue(true)
 			return
 		}
 	}
-	i.Records[2] = append(i.Records[2], Dataset{Record: 2, DataSet: ds, Value: value})
+	d := Dataset{Record: 2, DataSet: ds, Value: value}
+	d.setDecodedValue(true) // write-path: value is always UTF-8
+	i.Records[2] = append(i.Records[2], d)
 }
 
 // firstRecord2 returns the first string value of the given Record 2 dataset.
@@ -487,10 +535,9 @@ func (i *IPTC) firstRecord2(ds uint8) string {
 	if i == nil {
 		return ""
 	}
-	utf8flag := i.isUTF8()
 	for idx := range i.Records[2] {
 		if i.Records[2][idx].DataSet == ds {
-			return i.Records[2][idx].stringValue(utf8flag)
+			return i.Records[2][idx].decodedValue
 		}
 	}
 	return ""

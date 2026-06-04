@@ -663,9 +663,9 @@ func BenchmarkIPTCEncode(b *testing.B) {
 }
 
 // BenchmarkIPTCAccessors measures the cost of repeated Caption/Copyright/Keywords
-// reads on a parsed IPTC struct. The decode cache means the ISO-8859-1 → UTF-8
-// conversion is paid only on the first call; subsequent calls return the cached
-// string with zero extra allocations.
+// reads on a parsed IPTC struct. Values are pre-decoded eagerly by Parse, so
+// read accessors return the decodedValue string field directly with zero extra
+// allocations per call and no synchronisation overhead (task #60 fix).
 func BenchmarkIPTCAccessors(b *testing.B) {
 	raw := buildIPTC([]struct {
 		rec uint8
