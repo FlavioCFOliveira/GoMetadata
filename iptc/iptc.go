@@ -89,20 +89,32 @@ func decodeDatasetLength(b []byte, pos int) (length, newPos int, ok bool) {
 // storeDataset handles the UTF-8 marker detection (record 1, dataset 90;
 // IIM §1.5.1) and appends the dataset to i.Records[record] for all other
 // datasets. The utf8 pointer is updated in-place when the marker is found.
-func storeDataset(i *IPTC, record, dataset uint8, value []byte, utf8 *bool) {
+// count tracks the total number of Dataset structs stored so far across all
+// records; storeDataset increments it and returns false (stop) when the
+// maxIPTCDatasets cap is reached, true (continue) otherwise.
+func storeDataset(i *IPTC, record, dataset uint8, value []byte, utf8 *bool, count *int) bool {
 	// IIM §1.6: valid record numbers are 1–9. Record 0 is an internal
 	// pseudo-record (UTF-8 flag) never present on the wire. Any record byte
 	// outside [1, len(i.Records)-1] is out of range for the fixed-size array
 	// and must be skipped; the caller continues scanning so later valid
 	// datasets in the same stream are not lost.
 	if record < 1 || int(record) >= len(i.Records) {
-		return
+		return true
 	}
 	// Record 1, dataset 90 (1:90) carries the coded character set declaration
-	// (IIM §1.5.1). ESC % G signals UTF-8.
+	// (IIM §1.5.1). ESC % G signals UTF-8. This is not a stored Dataset so it
+	// does not count against maxIPTCDatasets.
 	if record == 1 && dataset == 90 {
 		*utf8 = isUTF8Declaration(value)
-		return
+		return true
+	}
+	// Cap total Dataset struct allocations to bound per-struct memory overhead.
+	// Each zero-length dataset (5 bytes on wire) allocates ~67 bytes in memory:
+	// 13× amplification that the byte-aggregate cap (maxIPTCTotalBytes) misses
+	// because it only counts value bytes (task #71).
+	*count++
+	if *count > maxIPTCDatasets {
+		return false
 	}
 	// We store datasets as raw bytes; charset decoding happens on access
 	// (see firstRecord2 / stringValue).
@@ -111,11 +123,21 @@ func storeDataset(i *IPTC, record, dataset uint8, value []byte, utf8 *bool) {
 		DataSet: dataset,
 		Value:   value,
 	})
+	return true
 }
 
 // maxIPTCTotalBytes is the maximum aggregate size of all parsed IPTC dataset
 // values. This prevents memory exhaustion from streams with many large datasets.
 const maxIPTCTotalBytes = 256 << 20 // 256 MiB
+
+// maxIPTCDatasets is the maximum total number of Dataset structs that Parse
+// will store across all records. Each Dataset is ~67 bytes on 64-bit; 65 536
+// entries cap the struct-allocation budget at ~4 MiB regardless of value size.
+// This bounds the amplification attack where N zero-length datasets (5 bytes
+// each on wire) bypass the byte-aggregate cap (maxIPTCTotalBytes counts value
+// bytes only, not struct overhead). When the cap is reached Truncated is set
+// and parsing stops.
+const maxIPTCDatasets = 65536
 
 // Parse parses a raw IPTC IIM byte stream.
 // b must begin with (or contain) the IPTC tag marker 0x1C (IIM §1.6).
@@ -136,6 +158,7 @@ func Parse(b []byte) (*IPTC, error) { //nolint:gocyclo // IIM scanner has inhere
 	i.Records[2] = make([]Dataset, 0, 12)
 	utf8 := false
 	totalBytes := 0
+	datasetCount := 0 // tracks total Dataset structs stored; capped at maxIPTCDatasets (task #71)
 
 	pos := 0
 	for pos < len(b) {
@@ -170,8 +193,9 @@ func Parse(b []byte) (*IPTC, error) { //nolint:gocyclo // IIM scanner has inhere
 		// past the header so the scanner does not re-examine the same 0x1C.
 		//   • length > 1 MiB: single dataset DoS guard; skip.
 		//   • pos+length > len(b): declared value extends past end of buffer; skip.
-		// The aggregate DoS guard (totalBytes > maxIPTCTotalBytes) is the only
-		// irrecoverable condition: we stop there to bound total memory use.
+		// The aggregate DoS guards (totalBytes > maxIPTCTotalBytes and
+		// datasetCount > maxIPTCDatasets) are the only irrecoverable conditions:
+		// we stop there to bound total memory use.
 		if length > 1<<20 || newPos+length > len(b) {
 			// Advance past the header so the loop re-scans from the byte after
 			// the current 0x1C, rather than looping on the same marker forever.
@@ -192,7 +216,14 @@ func Parse(b []byte) (*IPTC, error) { //nolint:gocyclo // IIM scanner has inhere
 		value := b[newPos : newPos+length]
 		pos = newPos + length
 
-		storeDataset(i, record, dataset, value, &utf8)
+		if !storeDataset(i, record, dataset, value, &utf8, &datasetCount) {
+			// maxIPTCDatasets cap reached: struct-allocation bomb guard (task #71).
+			// A stream of N zero-length datasets contributes 0 to totalBytes but
+			// allocates one Dataset struct each (~67 bytes). Cap total structs at
+			// maxIPTCDatasets (~4 MiB) regardless of value size.
+			i.Truncated = true
+			break
+		}
 	}
 
 	// Store the UTF-8 flag as a pseudo-dataset in record 0 so convenience
@@ -450,9 +481,7 @@ func (i *IPTC) SetCreator(s string) {
 // Values exceeding 32 bytes are truncated at a UTF-8 rune boundary.
 func (i *IPTC) AddCreator(creator string) {
 	v := truncateToLimit([]byte(creator), datasetMaxLen[DS2Byline])
-	if hasHighBytes(v) && !i.isUTF8() {
-		i.Records[0] = append(i.Records[0][:0], Dataset{Record: 0, DataSet: 0, Value: []byte{1}})
-	}
+	i.setUTF8IfNeeded(v)
 	d := Dataset{Record: 2, DataSet: DS2Byline, Value: v}
 	d.setDecodedValue(true) // write-path: v is always UTF-8 (truncated from a Go string)
 	i.Records[2] = append(i.Records[2], d)
@@ -463,12 +492,26 @@ func (i *IPTC) AddCreator(creator string) {
 // Values exceeding 64 bytes are truncated at a UTF-8 rune boundary.
 func (i *IPTC) AddKeyword(kw string) {
 	v := truncateToLimit([]byte(kw), datasetMaxLen[DS2Keywords])
-	if hasHighBytes(v) && !i.isUTF8() {
-		i.Records[0] = append(i.Records[0][:0], Dataset{Record: 0, DataSet: 0, Value: []byte{1}})
-	}
+	i.setUTF8IfNeeded(v)
 	d := Dataset{Record: 2, DataSet: DS2Keywords, Value: v}
 	d.setDecodedValue(true) // write-path: v is always UTF-8 (truncated from a Go string)
 	i.Records[2] = append(i.Records[2], d)
+}
+
+// setUTF8IfNeeded sets the internal UTF-8 flag (Records[0]) when v contains
+// bytes outside the ASCII range and the flag is not yet set. All write-path
+// helpers that accept user-supplied strings call this so that in-memory reads
+// via accessors (Keywords, Caption, etc.) return correct UTF-8 strings without
+// an Encode/Parse round-trip. Without this guard the accessors would fall back
+// to the ISO-8859-1 decode path and produce mojibake for multi-byte sequences.
+//
+// Thread-safety: not safe for concurrent use. Write-path helpers are not
+// designed to be called concurrently on the same *IPTC; only read accessors
+// need to be concurrent-safe (task #60 addresses that separately).
+func (i *IPTC) setUTF8IfNeeded(v []byte) {
+	if hasHighBytes(v) && !i.isUTF8() {
+		i.Records[0] = append(i.Records[0][:0], Dataset{Record: 0, DataSet: 0, Value: []byte{1}})
+	}
 }
 
 // SetKeywords replaces all dataset 2:25 (Keywords, IIM §2.2.17) entries in
@@ -476,6 +519,11 @@ func (i *IPTC) AddKeyword(kw string) {
 // first; then one Dataset is appended per keyword. Passing an empty slice
 // removes all keywords without adding new ones. Values exceeding 64 bytes are
 // truncated at a UTF-8 rune boundary.
+//
+// If any keyword contains bytes outside the ASCII range the UTF-8 flag is set
+// so that Keywords() returns correct UTF-8 strings before an Encode/Parse
+// round-trip (task #63 fix: mirrors the guard already present in AddKeyword
+// and setRecord2).
 func (i *IPTC) SetKeywords(kws []string) {
 	if i == nil {
 		return
@@ -489,8 +537,11 @@ func (i *IPTC) SetKeywords(kws []string) {
 	}
 	i.Records[2] = filtered
 	// Append one Dataset per keyword (IIM §2.2.17: repeatable).
+	// Set the UTF-8 flag before appending so that the first keyword read-back
+	// already sees the correct charset context.
 	for _, kw := range kws {
 		v := truncateToLimit([]byte(kw), datasetMaxLen[DS2Keywords])
+		i.setUTF8IfNeeded(v) // task #63: set UTF-8 flag when keyword has non-ASCII bytes
 		d := Dataset{Record: 2, DataSet: DS2Keywords, Value: v}
 		d.setDecodedValue(true) // write-path: v is always UTF-8 (truncated from a Go string)
 		i.Records[2] = append(i.Records[2], d)
@@ -513,9 +564,7 @@ func (i *IPTC) setRecord2(ds uint8, value []byte) {
 	// that accessors such as Caption() and Copyright() use the UTF-8 decode path
 	// (return string(value)) rather than the ISO-8859-1 decode path, which would
 	// produce garbage for multi-byte UTF-8 sequences.
-	if hasHighBytes(value) && !i.isUTF8() {
-		i.Records[0] = append(i.Records[0][:0], Dataset{Record: 0, DataSet: 0, Value: []byte{1}})
-	}
+	i.setUTF8IfNeeded(value)
 	for idx := range i.Records[2] {
 		if i.Records[2][idx].DataSet == ds {
 			i.Records[2][idx].Value = value
