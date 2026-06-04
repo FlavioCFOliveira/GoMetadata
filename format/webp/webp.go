@@ -230,13 +230,28 @@ func collectOriginalChunks(original []byte) (chunks []struct {
 		switch id {
 		case "VP8X":
 			// Capture original VP8X payload so canvas dimensions can be preserved.
-			// Guard: use the ACTUAL available bytes (dataEnd-dataStart), not the
-			// declared size. dataEnd is clamped to len(original), so for a truncated
-			// VP8X chunk the actual slice can be shorter than 10 bytes even when the
-			// declared size says >= 10. Only capture when the full 10 bytes are truly
-			// present; otherwise treat as absent so buildVP8XFlags rebuilds from scratch.
-			if dataEnd-dataStart >= 10 {
-				origVP8XData = original[dataStart:dataEnd]
+			//
+			// Cross-chunk contamination guard (rmp task #57):
+			// A malformed file can declare VP8X size=10 while writing only N < 10
+			// real VP8X bytes, followed immediately by the next RIFF chunk. Because
+			// dataEnd is clamped to len(original), the condition
+			// "dataEnd-dataStart >= 10" passes even though 5 of the 10 captured bytes
+			// belong to the adjacent chunk header (its FourCC and size bytes).
+			// Those bytes would corrupt canvas width/height in the rebuilt VP8X.
+			//
+			// Similarly, "dataStart+size <= len(original)" also passes when the file
+			// continues past the declared VP8X region — the 10 declared bytes are
+			// available in the backing array even though they span into adjacent data.
+			//
+			// Robust fix: after the declared VP8X region we must see either EOF or a
+			// recognised WebP chunk FourCC. If the bytes at dataStart+size are not
+			// a known FourCC (and are not EOF), the declared size is wrong and the
+			// captured slice contains contaminating bytes from the adjacent chunk.
+			// In that case we discard origVP8XData; buildVP8XFlags produces a
+			// zero-canvas payload with only the requested EXIF/XMP flags set.
+			nextPos := dataStart + size
+			if size >= 10 && nextPos <= len(original) && isEOFOrKnownFourCC(original, nextPos) {
+				origVP8XData = original[dataStart:nextPos]
 			}
 		case "EXIF", "XMP ":
 			// Drop: caller will re-append updated versions.
@@ -281,6 +296,36 @@ func buildVP8XFlags(hasEXIF, hasXMP bool, origVP8XData []byte) []byte {
 	}
 	binary.LittleEndian.PutUint32(vp8xData[0:], flags)
 	return vp8xData
+}
+
+// knownWebPFourCCs is the exhaustive set of chunk FourCC identifiers defined
+// by the WebP container specification (https://developers.google.com/speed/webp/docs/riff_container).
+// Used by isEOFOrKnownFourCC to validate VP8X region boundaries.
+var knownWebPFourCCs = [...]string{ //nolint:gochecknoglobals // immutable lookup table
+	"VP8 ", "VP8L", "VP8X",
+	"ANIM", "ANMF", "ALPH",
+	"ICCP", "EXIF", "XMP ",
+}
+
+// isEOFOrKnownFourCC reports whether position pos in data is either past the
+// end of data (EOF) or the start of a recognised WebP chunk FourCC (4 bytes).
+// A VP8X declared region is only trusted when the byte immediately following
+// it satisfies this predicate — otherwise the declared size is wrong and the
+// captured bytes span into an adjacent chunk.
+func isEOFOrKnownFourCC(data []byte, pos int) bool {
+	if pos >= len(data) {
+		return true // EOF is valid
+	}
+	if pos+4 > len(data) {
+		return false // not enough bytes to read a FourCC
+	}
+	candidate := string(data[pos : pos+4])
+	for _, known := range knownWebPFourCCs {
+		if candidate == known {
+			return true
+		}
+	}
+	return false
 }
 
 func writeRIFFChunk(w *bytes.Buffer, id string, data []byte) {

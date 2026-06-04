@@ -410,6 +410,175 @@ func TestInjectTruncatedVP8XNoPanic(t *testing.T) {
 	}
 }
 
+// buildTruncatedVP8XWebP constructs a WebP where the VP8X chunk declares
+// size=10 in its header but only actualDataBytes of VP8X data are present
+// before the next chunk (VP8). The next-chunk FourCC and size bytes are
+// written immediately after the truncated VP8X data so they are within the
+// file boundary — making dataEnd-dataStart == 10 possible in collectOriginalChunks.
+// nextChunkFirstByte is the first byte of the adjacent chunk's size field,
+// used to make contamination detectable (e.g. 0xFF means an unmistakable value).
+func buildTruncatedVP8XWebP(actualDataBytes int, vp8xFlags uint32, nextChunkFirstByte byte) []byte {
+	var body bytes.Buffer
+
+	// VP8X chunk: declare size=10 but only write actualDataBytes.
+	body.Write([]byte{'V', 'P', '8', 'X'})
+	var vp8xHdrSize [4]byte
+	binary.LittleEndian.PutUint32(vp8xHdrSize[:], 10) // DECLARED size = 10
+	body.Write(vp8xHdrSize[:])
+	vp8xPartial := make([]byte, actualDataBytes)
+	binary.LittleEndian.PutUint32(vp8xPartial[:min(4, actualDataBytes)], vp8xFlags)
+	body.Write(vp8xPartial)
+	// Do NOT write the remaining bytes — the next chunk follows immediately.
+
+	// VP8 image chunk (minimal). Its FourCC bytes will be at position
+	// dataStart+actualDataBytes inside the flat original[] slice.
+	// Use nextChunkFirstByte as the first byte of the VP8 payload so the test
+	// can detect whether it leaked into the canvas region.
+	vp8Payload := []byte{nextChunkFirstByte, 0x01, 0x00, 0x9d}
+	body.Write([]byte{'V', 'P', '8', ' '})
+	var vp8Size [4]byte
+	binary.LittleEndian.PutUint32(vp8Size[:], uint32(len(vp8Payload))) //nolint:gosec // G115: test helper
+	body.Write(vp8Size[:])
+	body.Write(vp8Payload)
+
+	totalSize := 4 + body.Len()
+	riffHdr := make([]byte, 12)
+	copy(riffHdr[:4], "RIFF")
+	binary.LittleEndian.PutUint32(riffHdr[4:], uint32(totalSize)) //nolint:gosec // G115: test helper
+	copy(riffHdr[8:], "WEBP")
+
+	var out bytes.Buffer
+	out.Write(riffHdr)
+	out.Write(body.Bytes())
+	return out.Bytes()
+}
+
+// TestInjectVP8XTruncatedChunkNoCrossChunkRead is the acceptance-criteria
+// regression for rmp task #57.
+//
+// Scenario: a WebP file declares VP8X size=10 but only 5 data bytes exist
+// before the adjacent VP8 chunk whose FourCC starts with 0xFF as first byte.
+// The 10 bytes available at dataStart are: 5 VP8X bytes + 5 bytes from the VP8
+// chunk header (FourCC + first byte of size). Without the fix, dataEnd-dataStart
+// equals 10 (the clamp does not help), so origVP8XData contains those 5
+// contaminating bytes, and canvas bytes [4:10] will contain VP8 chunk header
+// bytes instead of zeros.
+//
+// The fix must ensure canvas bytes [4:10] are all zero when the VP8X data is
+// genuinely shorter than 10 bytes.
+//
+// Fail-before-fix: canvas bytes contain VP8 FourCC bytes ('V','P','8',' ') +
+// first size byte rather than zeros.
+// Pass-after-fix: canvas bytes [4:10] are all zero; flags byte = 0x08 (EXIF).
+func TestInjectVP8XTruncatedChunkNoCrossChunkRead(t *testing.T) {
+	t.Parallel()
+
+	// 5 real VP8X data bytes; VP8 chunk starts immediately after.
+	// nextChunkFirstByte=0xFF is used to make any leak obvious (0xFF in canvas).
+	input := buildTruncatedVP8XWebP(5, 0x00, 0xFF)
+
+	// Inject an XMP payload to force VP8X rebuild with the XMP flag set.
+	xmpPayload := []byte("<x:xmpmeta/>")
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(input), &out, nil, nil, xmpPayload); err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+
+	result := out.Bytes()
+	// Locate the VP8X chunk in the output.
+	pos := 12
+	for pos+8 <= len(result) {
+		chunkID := string(result[pos : pos+4])
+		chunkSize := int(binary.LittleEndian.Uint32(result[pos+4:]))
+		if chunkID == "VP8X" {
+			if chunkSize < 10 {
+				t.Fatalf("VP8X output chunk size %d < 10", chunkSize)
+			}
+			payload := result[pos+8 : pos+8+10]
+
+			// flags [0:4]: only XMP bit (0x04) must be set; no contamination.
+			flags := binary.LittleEndian.Uint32(payload[0:4])
+			if flags != 0x04 {
+				t.Errorf("VP8X flags = 0x%08X, want 0x00000004 (XMP-only)", flags)
+			}
+
+			// Canvas bytes [4:10]: must all be zero — VP8X was truncated, so no
+			// dimension information is available; buildVP8XFlags must not copy
+			// bytes from the adjacent VP8 chunk into this region.
+			for i := 4; i < 10; i++ {
+				if payload[i] != 0x00 {
+					t.Errorf("canvas byte [%d] = 0x%02X, want 0x00 (cross-chunk leak)", i, payload[i])
+				}
+			}
+			return
+		}
+		pos += 8 + chunkSize
+		if chunkSize%2 != 0 {
+			pos++
+		}
+	}
+	t.Error("VP8X chunk not found in Inject output")
+}
+
+// TestInjectPreservesVP8XFeatureFlagsAndCanvas verifies that when a valid
+// VP8X chunk (10 real bytes, within file bounds) is present, Inject preserves
+// all feature flag bits OTHER than EXIF/XMP (e.g. ICC=0x20, Alpha=0x10,
+// Animation=0x02) and the full canvas dimensions, while correctly setting
+// only the requested EXIF/XMP bits.
+func TestInjectPreservesVP8XFeatureFlagsAndCanvas(t *testing.T) {
+	t.Parallel()
+
+	// Original VP8X: ICC (0x20) + Alpha (0x10) bits set; canvas 800x600.
+	const (
+		origFlags = uint32(0x20 | 0x10) // ICC + Alpha
+		canvasW   = uint32(800)
+		canvasH   = uint32(600)
+		wantFlags = uint32(0x20 | 0x10 | 0x04) // ICC + Alpha + XMP (added)
+	)
+
+	input := buildWebP(nil, nil, origFlags, canvasW, canvasH)
+
+	xmpPayload := []byte("<x:xmpmeta/>")
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(input), &out, nil, nil, xmpPayload); err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+
+	result := out.Bytes()
+	pos := 12
+	for pos+8 <= len(result) {
+		chunkID := string(result[pos : pos+4])
+		chunkSize := int(binary.LittleEndian.Uint32(result[pos+4:]))
+		if chunkID == "VP8X" {
+			if chunkSize < 10 {
+				t.Fatalf("VP8X output chunk size %d < 10", chunkSize)
+			}
+			payload := result[pos+8 : pos+8+10]
+
+			gotFlags := binary.LittleEndian.Uint32(payload[0:4])
+			if gotFlags != wantFlags {
+				t.Errorf("VP8X flags = 0x%08X, want 0x%08X", gotFlags, wantFlags)
+			}
+
+			// Canvas: 3-byte LE width-1, height-1.
+			gotW := uint32(payload[4]) | uint32(payload[5])<<8 | uint32(payload[6])<<16 + 1
+			gotH := uint32(payload[7]) | uint32(payload[8])<<8 | uint32(payload[9])<<16 + 1
+			if gotW != canvasW {
+				t.Errorf("canvas width = %d, want %d", gotW, canvasW)
+			}
+			if gotH != canvasH {
+				t.Errorf("canvas height = %d, want %d", gotH, canvasH)
+			}
+			return
+		}
+		pos += 8 + chunkSize
+		if chunkSize%2 != 0 {
+			pos++
+		}
+	}
+	t.Error("VP8X chunk not found in Inject output")
+}
+
 // BenchmarkWebPInject measures the full Inject path: rebuild the RIFF body
 // with updated EXIF and XMP chunks using the pooled bytes.Buffer.
 func BenchmarkWebPInject(b *testing.B) {
