@@ -408,14 +408,36 @@ func patchRW2RawDataOffsetInFinalTIFF(finalTIFF []byte, rawDataBlock *imageBlock
 //
 //  1. Insert the 16-byte GUID at byte position 8.
 //  2. Update header bytes [4:8] from 8 to 24.
-//  3. Walk IFD0 and add +16 to every OOL val_or_off field.
+//  3. Walk ALL IFDs reachable from IFD0 (IFD0, ExifIFD, GPS IFD, InteropIFD) and
+//     add +16 to every OOL val_or_off field and every inline sub-IFD pointer.
 //  4. Add +16 to the 0x0118 inline val_or_off (raw sensor data pointer).
 //  5. Restore RW2 magic "IIU\x00".
 //
+// Why we must walk ALL IFDs (not just IFD0):
+//
+//	exif.Encode produces a standard TIFF where ALL IFDs are placed at absolute
+//	offsets starting at 8.  When we insert 16 bytes at position 8, every single
+//	absolute offset in the entire file shifts by +16.  This includes:
+//	  - IFD0 OOL entry val_or_off fields (the value area pointers).
+//	  - Sub-IFD inline pointer entries: 0x8769 (ExifIFD), 0x8825 (GPS IFD),
+//	    0xA005 (InteropIFD) are TypeLong, Count=1 (total=4 ≤ 4) → "inline"
+//	    in the TIFF sense, but their VALUES are absolute file offsets.
+//	  - ExifIFD OOL entry val_or_off fields.
+//	  - GPS IFD OOL entry val_or_off fields.
+//	  - InteropIFD OOL entry val_or_off fields.
+//
+//	Task #104 bug: only IFD0 OOL entries were shifted.  The ExifIFD pointer
+//	(0x8769) and all ExifIFD-internal OOL pointers were missed, causing:
+//	  - "Bad format (N) for ExifIFD entry 0" — 0x8769 pointer off by 16.
+//	  - "Value for ExifIFD tag ... overlaps IFD" — ExifIFD OOL pointers off by 16.
+//	  - 4 ExifIFD tags (ExposureTime, FNumber, ExposureBiasValue, FocalLength,
+//	    DateTimeOriginal, CreateDate) unreadable due to stale OOL offsets.
+//
+//	The fix: use rebaseAllIFDsAfterGUID to walk ALL IFDs and shift ALL
+//	file-absolute pointers consistently.
+//
 // finalTIFF is mutated: the standard 8-byte TIFF header is extended by 16 bytes
 // (GUID insertion), and the returned slice is the complete RW2 output.
-//
-//nolint:cyclop,gocyclo // IFD scanning with OOL/inline dispatch is inherent to the TIFF §2 format
 func insertRW2GUIDAndShiftOffsets(
 	finalTIFF []byte,
 	guid [rw2GUIDLen]byte,
@@ -446,25 +468,51 @@ func insertRW2GUIDAndShiftOffsets(
 	// at offset 24.  Update header bytes [4:8].
 	order.PutUint32(out[4:], uint32(rw2IFD0Offset)) // 24
 
-	// ── Step B4: walk IFD0 and rebase OOL pointers by +16 ────────────────────
-	//
-	// TIFF 6.0 §2: IFD0 is at the offset stored in header bytes [4:8] = 24.
-	//
-	// For every IFD entry with total > 4 bytes (OOL), val_or_off holds a
-	// TIFF-absolute file offset.  After inserting 16 bytes at position 8,
-	// every such offset that was ≥ 8 in the pre-insertion space has shifted
-	// by +16 (all data is at offset ≥ 24 in the final output).
-	//
-	// For inline entries (total ≤ 4), the val_or_off IS the value.
-	// One RW2-specific inline entry carries an absolute file offset:
-	//   - tag 0x0118 (RawDataOffset): was already patched with newOffset in
-	//     patchRW2RawDataOffsetInFinalTIFF; now needs +16 for GUID shift.
+	// ── Step B4: rebase ALL IFDs reachable from IFD0 ─────────────────────────
+	// Walk IFD0 and all sub-IFDs (ExifIFD, GPS IFD, InteropIFD), shifting every
+	// TIFF-absolute OOL pointer by +16.  Also shift inline sub-IFD pointer entries
+	// (0x8769, 0x8825, 0xA005) and the RW2-specific 0x0118 inline raw-data pointer.
 	ifd0Start := int(rw2IFD0Offset) // 24
 	if ifd0Start+2 > len(out) {
 		return nil, fmt.Errorf("rw2: insert GUID: %w (offset=%d, len=%d)", ErrRW2IFD0OutOfBounds, ifd0Start, len(out))
 	}
-	ifdCount := int(order.Uint16(out[ifd0Start:]))
-	ifdPos := ifd0Start + 2
+	rebaseAllIFDsAfterGUID(out, ifd0Start, rawDataBlock, order)
+
+	// ── Step B5: restore RW2 magic ────────────────────────────────────────────
+	// Replace the standard TIFF header bytes [0:4] with RW2 magic "IIU\x00".
+	// Bytes 0-1 are already "II" (little-endian byte-order marker, preserved).
+	out[0] = rw2MagicBytes[0] // 'I'
+	out[1] = rw2MagicBytes[1] // 'I'
+	out[2] = rw2MagicBytes[2] // 'U'
+	out[3] = rw2MagicBytes[3] // 0x00
+
+	return out, nil
+}
+
+// rebaseAllIFDsAfterGUID walks the IFD starting at ifdStart in out and shifts
+// all TIFF-absolute file offsets by +rw2GUIDLen (16) to account for the GUID
+// inserted at file position 8.
+//
+// For each IFD entry:
+//   - OOL entries (total > 4): shift val_or_off by +16.
+//   - Inline sub-IFD pointer tags (0x8769, 0x8825, 0xA005): shift the inline
+//     value by +16 AND recursively rebase the pointed-to sub-IFD.
+//   - Tag 0x0118 (RawDataOffset): shift the inline value by +16.
+//
+// This function is called once for IFD0 (at rw2IFD0Offset=24 in the output),
+// and recursively for each sub-IFD encountered via pointer tags.
+//
+// TIFF 6.0 §2: IFD entries are 12 bytes: tag(2)+type(2)+count(4)+val_or_off(4).
+// EXIF §4.6.3: sub-IFD pointers (0x8769, 0x8825, 0xA005) are TypeLong, Count=1,
+// total=4 ≤ 4, stored inline with the val_or_off field holding the sub-IFD offset.
+//
+//nolint:cyclop,gocyclo // recursive IFD walk with OOL/inline/pointer dispatch is inherent to the TIFF §2 format
+func rebaseAllIFDsAfterGUID(out []byte, ifdStart int, rawDataBlock *imageBlock, order binary.ByteOrder) {
+	if ifdStart+2 > len(out) {
+		return
+	}
+	ifdCount := int(order.Uint16(out[ifdStart:]))
+	ifdPos := ifdStart + 2
 
 	for i := range ifdCount {
 		e := ifdPos + i*12
@@ -483,39 +531,50 @@ func insertRW2GUIDAndShiftOffsets(
 
 		if total > 4 {
 			// OOL entry: val_or_off is a TIFF-absolute pointer to the value area.
-			// All value areas are now 16 bytes further from the start of the file.
+			// After GUID insertion every such offset shifts by +rw2GUIDLen.
 			// TIFF 6.0 §2: all offsets are measured from byte 0 of the TIFF stream.
 			oldVOO := order.Uint32(out[e+8:])
 			// Guard: only rebase offsets that were at or beyond the original IFD start
-			// (offset 8 in the pre-insertion space, which corresponds to offset 24 now).
-			// All OOL values were placed at offsets ≥ 8 by exif.Encode.
+			// (offset 8 in the pre-insertion space = rw2GUIDOffset).
+			// exif.Encode never places values at offsets < 8.
 			if oldVOO >= rw2GUIDOffset {
 				order.PutUint32(out[e+8:], oldVOO+uint32(rw2GUIDLen))
 			}
 			continue
 		}
 
-		// Inline entry (total ≤ 4): check for RW2-specific tags whose inline
-		// value is an absolute file offset that needs +16 adjustment.
+		// Inline entry (total ≤ 4): only specific tags carry absolute file offsets.
 		//
-		// Tag 0x0118 (RawDataOffset): its inline value was patched in step B1
-		// with the new raw data offset in the standard-TIFF coordinate space.
-		// Now add +16 for the GUID shift.
-		if entryTag == rw2TagRawDataOffset && rawDataBlock != nil {
+		// (A) Sub-IFD pointer tags: 0x8769 (ExifIFD), 0x8825 (GPS IFD), 0xA005 (InteropIFD).
+		//     Their inline values are absolute file offsets to IFD structures.
+		//     Shift the pointer AND recursively rebase the sub-IFD's entries.
+		//
+		// (B) Tag 0x0118 (RawDataOffset): inline absolute file offset to raw sensor data.
+		//     Was patched by patchRW2RawDataOffsetInFinalTIFF; now add +16 for GUID.
+		//
+		// EXIF §4.6.3 / TIFF 6.0 §2: sub-IFD pointer tags are always TypeLong, Count=1.
+		switch entryTag {
+		case exif.TagExifIFDPointer, exif.TagGPSIFDPointer, exif.TagInteropIFDPointer:
+			// Rebase sub-IFD pointer and recursively rebase the sub-IFD.
 			oldVal := order.Uint32(out[e+8:])
-			if oldVal >= rw2GUIDOffset {
-				order.PutUint32(out[e+8:], oldVal+uint32(rw2GUIDLen))
+			if oldVal < rw2GUIDOffset {
+				continue // guard: implausibly small offset
+			}
+			newVal := oldVal + uint32(rw2GUIDLen)
+			order.PutUint32(out[e+8:], newVal)
+			// Recurse into the sub-IFD at its new position.
+			// The sub-IFD was at oldVal in the pre-GUID space; it is now at newVal.
+			subIFDStart := int(newVal)
+			if subIFDStart+2 <= len(out) {
+				rebaseAllIFDsAfterGUID(out, subIFDStart, nil, order) // no rawDataBlock in sub-IFDs
+			}
+		case rw2TagRawDataOffset:
+			if rawDataBlock != nil {
+				oldVal := order.Uint32(out[e+8:])
+				if oldVal >= rw2GUIDOffset {
+					order.PutUint32(out[e+8:], oldVal+uint32(rw2GUIDLen))
+				}
 			}
 		}
 	}
-
-	// ── Step B5: restore RW2 magic ────────────────────────────────────────────
-	// Replace the standard TIFF header bytes [0:4] with RW2 magic "IIU\x00".
-	// Bytes 0-1 are already "II" (little-endian byte-order marker, preserved).
-	out[0] = rw2MagicBytes[0] // 'I'
-	out[1] = rw2MagicBytes[1] // 'I'
-	out[2] = rw2MagicBytes[2] // 'U'
-	out[3] = rw2MagicBytes[3] // 0x00
-
-	return out, nil
 }
