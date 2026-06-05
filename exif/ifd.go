@@ -21,6 +21,13 @@ var visitedPool = sync.Pool{ //nolint:gochecknoglobals // sync.Pool: reuse reduc
 	New: func() any { return make(map[uint32]bool) },
 }
 
+// visitedPoolBigTIFF recycles the maps used by traverseBigTIFF() to track
+// visited IFD offsets. BigTIFF uses uint64 offsets, so a separate pool is
+// needed to avoid a type assertion in the hot path.
+var visitedPoolBigTIFF = sync.Pool{ //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure on BigTIFF parse path
+	New: func() any { return make(map[uint64]bool) },
+}
+
 // IFD represents a TIFF Image File Directory (TIFF §2).
 // Entries must remain sorted by Tag in ascending order (TIFF §7) so that
 // Get() can use binary search. Use set() to modify entries; code that
@@ -253,6 +260,265 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, error) {
 		}
 	}
 	return root, nil
+}
+
+// ---------------------------------------------------------------------------
+// BigTIFF IFD traversal (BigTIFF spec §2, Aware Systems / libtiff)
+// ---------------------------------------------------------------------------
+//
+// BigTIFF uses 64-bit offsets and a 20-byte IFD entry layout:
+//
+//	bytes 0-1   tag (uint16)
+//	bytes 2-3   type (uint16)
+//	bytes 4-11  count (uint64)
+//	bytes 12-19 value-or-offset (uint64): inline when typeSizeBigTIFF(type)*count ≤ 8
+//
+// The IFD count field is 8 bytes (uint64) and the next-IFD pointer is 8 bytes.
+// The inline threshold is 8 bytes (vs 4 in classic TIFF).
+//
+// The classic paths (parseIFDEntry, parseSingleIFD, traverse) are left
+// completely unchanged to preserve their zero-overhead hot path.
+//
+// BigTIFF-only type codes (16/17/18) produce an IFDEntry whose Type field
+// carries the BigTIFF type code; callers that decode values must account for
+// the 8-byte element size. All sub-IFD pointer tags (ExifIFDPointer=0x8769,
+// GPSIFDPointer=0x8825, InteropIFDPointer=0xA005) may use either TypeLong (4)
+// or TypeIFD8/TypeLong8 (8) in BigTIFF files produced by libtiff/tiffcp;
+// readBigTIFFOffset handles both.
+
+// bigTIFFMaxEntries caps the entry count per IFD to guard against DoS via
+// crafted huge uint64 counts. Classic TIFF uses uint16 (max 65535) for its
+// entry count; applying the same cap here prevents OOM on malicious inputs.
+const bigTIFFMaxEntries = 65535
+
+// parseIFDEntryBigTIFF decodes a single 20-byte BigTIFF IFD entry starting at
+// byte offset e within b (BigTIFF spec §2, Aware Systems / libtiff).
+//
+// BigTIFF entry layout (20 bytes):
+//
+//	bytes 0-1:   tag (uint16)
+//	bytes 2-3:   type (uint16)
+//	bytes 4-11:  count (uint64)
+//	bytes 12-19: value-or-offset (uint64)
+//	             inline when typeSizeBigTIFF(type)*count ≤ 8 (BigTIFF §2)
+//	             otherwise: uint64 file offset to the value data
+//
+// For unknown/BigTIFF-only types whose element size fits in 8 bytes
+// (e.g. TypeLong8=16), the value-or-offset field stores the value inline when
+// count*8 ≤ 8 (i.e. count == 1). Out-of-line LONG8/SLONG8/IFD8 arrays have
+// their offset stored in the 8-byte field.
+//
+// For completely unknown types (sz == 0), the raw 8-byte field is stored as
+// the value verbatim — the caller cannot compute the true size, so no OOL
+// fetch is attempted.
+//
+// Anti-DoS: count*sz overflow is checked in uint64 before multiplication.
+// Returns (zero, false) on any out-of-bounds or overflow condition.
+func parseIFDEntryBigTIFF(b []byte, e int, order binary.ByteOrder) (IFDEntry, bool) {
+	// BigTIFF spec §2: each entry is exactly 20 bytes.
+	if e+20 > len(b) {
+		return IFDEntry{}, false
+	}
+
+	tag := TagID(order.Uint16(b[e:]))
+	typ := DataType(order.Uint16(b[e+2:]))
+	cnt := order.Uint64(b[e+4:])
+
+	// Anti-DoS: reject pathological counts early — no real IFD entry has
+	// more than a few thousand elements.  This also prevents the count*sz
+	// overflow check below from needing to handle wrap-around when cnt
+	// is near MaxUint64.
+	const maxBigTIFFCount = uint64(1 << 30) // 1 GiB elements max; still DoS-safe
+	if cnt > maxBigTIFFCount {
+		return IFDEntry{}, false
+	}
+
+	sz := typeSizeBigTIFF(typ)
+	if sz == 0 {
+		// Unknown type: store the raw 8-byte value-or-offset field verbatim.
+		// We cannot determine whether this is inline or OOL, so treat it as
+		// an inline value of at most 8 bytes. This preserves the tag for
+		// callers without attempting a potentially bogus OOL fetch.
+		return IFDEntry{
+			Tag:       tag,
+			Type:      typ,
+			Count:     uint32(cnt), // safe: cnt ≤ maxBigTIFFCount (2^30) < MaxUint32
+			Value:     b[e+12 : e+20],
+			byteOrder: order,
+		}, true
+	}
+
+	// Anti-DoS: guard count*sz against uint64 overflow before multiplying.
+	// sz ≤ 8; cnt ≤ maxBigTIFFCount ≤ 2^30, so cnt*8 ≤ 2^33 — no overflow.
+	// The check is explicit for clarity and future-proofing.
+	const maxUint64 = ^uint64(0)
+	if cnt > maxUint64/sz {
+		return IFDEntry{}, false
+	}
+	totalSize := sz * cnt
+
+	// BigTIFF spec §2: inline threshold is 8 bytes (vs 4 in classic TIFF).
+	if totalSize <= 8 {
+		// Value fits inline in the 8-byte value-or-offset field.
+		// Left-justified: the first totalSize bytes are the value.
+		end := e + 12 + int(totalSize) // safe: totalSize ≤ 8 (inline threshold)
+		return IFDEntry{
+			Tag:       tag,
+			Type:      typ,
+			Count:     uint32(cnt), // safe: cnt ≤ maxBigTIFFCount (2^30) < MaxUint32
+			Value:     b[e+12 : end],
+			byteOrder: order,
+		}, true
+	}
+
+	// Out-of-line: the 8-byte field is a uint64 file offset.
+	valOff := order.Uint64(b[e+12:])
+	// Anti-DoS: bounds check before slicing.
+	if valOff > uint64(len(b)) || totalSize > uint64(len(b))-valOff {
+		return IFDEntry{}, false
+	}
+	return IFDEntry{
+		Tag:       tag,
+		Type:      typ,
+		Count:     uint32(cnt), // safe: cnt ≤ maxBigTIFFCount (2^30) < MaxUint32
+		Value:     b[valOff : valOff+totalSize],
+		byteOrder: order,
+		rawOffset: uint32(valOff & 0xFFFFFFFF), // truncation intentional: BigTIFF offsets may exceed uint32; rawOffset is diagnostic-only
+	}, true
+}
+
+// parseSingleIFDBigTIFF parses all entries at a single BigTIFF IFD offset
+// within b and returns the parsed IFD, the next-IFD offset (0 if absent or
+// unreadable), and whether parsing succeeded. It does not follow the next-IFD
+// chain — callers are responsible for cycle detection.
+//
+// BigTIFF spec §2: IFD layout — count(8) + entries(count×20) + nextIFD(8).
+func parseSingleIFDBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IFD, uint64, bool) {
+	// Guard: IFD offset + 8-byte count field must fit in b.
+	if offset > uint64(len(b)) || uint64(len(b))-offset < 8 {
+		return nil, 0, false
+	}
+
+	count := order.Uint64(b[offset:])
+	// Cap count to bigTIFFMaxEntries to prevent DoS (same cap as extractTagValuesBigTIFF).
+	count = min(count, bigTIFFMaxEntries)
+
+	// Each BigTIFF entry is 20 bytes; validate the total entry area fits.
+	const bigTIFFEntrySize = 20
+	maxEntries := (uint64(len(b)) - offset - 8) / bigTIFFEntrySize
+	count = min(count, maxEntries)
+
+	pos := offset + 8 // first entry starts after the 8-byte count field
+
+	const maxPrealloc = 1024
+	preallocCap := min(int(count), maxPrealloc) //nolint:gosec // G115: count ≤ bigTIFFMaxEntries (65535) so fits int on all supported platforms
+	ifd := &IFD{Entries: make([]IFDEntry, 0, preallocCap)}
+	for i := uint64(0); i < count; i++ { //nolint:intrange // BigTIFF parser: loop variable is a byte-slice offset multiplier
+		entry, ok := parseIFDEntryBigTIFF(b, int(pos+i*bigTIFFEntrySize), order) //nolint:gosec // G115: pos+i*20 bounded by count clamping above
+		if !ok {
+			continue
+		}
+		ifd.Entries = append(ifd.Entries, entry)
+	}
+
+	// Sort entries by tag so Get() can use binary search (TIFF §7).
+	sortEntries(ifd.Entries)
+
+	// BigTIFF JPEG thumbnails (if any) — reuse the same extraction logic;
+	// the thumbnail offset stored as TypeLong (4-byte) will be read correctly
+	// by the existing extractJPEGThumbnail which uses order.Uint32.
+	ifd.ThumbnailData = extractJPEGThumbnail(b, ifd, order)
+
+	// Read the next-IFD pointer (8 bytes after the last entry, BigTIFF spec §2).
+	nextPtrPos := pos + count*bigTIFFEntrySize
+	if nextPtrPos+8 > uint64(len(b)) {
+		return ifd, 0, true
+	}
+	return ifd, order.Uint64(b[nextPtrPos:]), true
+}
+
+// traverseBigTIFF walks the BigTIFF IFD chain starting at offset within b,
+// returning the root IFD. The next-IFD chain is followed iteratively to prevent
+// stack overflows. Cycle detection uses a uint64 visited-offset set recycled
+// from visitedPoolBigTIFF to avoid per-call allocations.
+func traverseBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IFD, error) {
+	if offset > uint64(len(b)) || uint64(len(b))-offset < 8 {
+		return nil, &metaerr.CorruptMetadataError{
+			Format: "EXIF",
+			Reason: fmt.Sprintf("BigTIFF IFD offset %d out of bounds (buf len %d)", offset, len(b)),
+		}
+	}
+
+	// Recycle the visited map from the pool to avoid per-call allocation.
+	visited := visitedPoolBigTIFF.Get().(map[uint64]bool) //nolint:forcetypeassert,revive // visitedPoolBigTIFF.New always stores map[uint64]bool; pool invariant
+	defer func() {
+		for k := range visited {
+			delete(visited, k)
+		}
+		visitedPoolBigTIFF.Put(visited)
+	}()
+
+	var root, current *IFD
+	cur := offset
+
+	for cur != 0 {
+		if visited[cur] {
+			break // cycle detected
+		}
+		visited[cur] = true
+
+		ifd, next, ok := parseSingleIFDBigTIFF(b, cur, order)
+		if !ok {
+			break
+		}
+
+		if root == nil {
+			root = ifd
+		} else {
+			current.Next = ifd
+		}
+		current = ifd
+		cur = next
+	}
+
+	if root == nil {
+		return nil, &metaerr.CorruptMetadataError{
+			Format: "EXIF",
+			Reason: fmt.Sprintf("BigTIFF IFD at offset %d could not be parsed (buf len %d)", offset, len(b)),
+		}
+	}
+	return root, nil
+}
+
+// readBigTIFFSubIFDOffset reads a sub-IFD pointer value from an IFDEntry,
+// handling both the classic 32-bit (TypeLong=4) and BigTIFF 64-bit
+// (TypeLong8=16, TypeIFD8=18) pointer representations.
+//
+// tiffcp / libtiff write sub-IFD pointers as TypeLong (4-byte) even in BigTIFF
+// files for many tags; some newer writers use TypeIFD8 (18). Both are valid.
+//
+// Returns (offset, true) when the entry carries a readable pointer, or
+// (0, false) when the entry is nil, has an unrecognised type, or has an
+// insufficient value length.
+func readBigTIFFSubIFDOffset(e *IFDEntry) (uint64, bool) {
+	if e == nil {
+		return 0, false
+	}
+	switch e.Type { //nolint:exhaustive // only TypeLong/TypeLong8/TypeIFD8 are valid sub-IFD pointer types; all others fall through to (0,false)
+	case TypeLong:
+		// TypeLong (4 bytes): used by tiffcp / libtiff even in BigTIFF containers.
+		if len(e.Value) < 4 {
+			return 0, false
+		}
+		return uint64(e.byteOrder.Uint32(e.Value)), true
+	case TypeLong8, TypeIFD8:
+		// TypeLong8/TypeIFD8 (8 bytes): BigTIFF-native pointer types.
+		if len(e.Value) < 8 {
+			return 0, false
+		}
+		return e.byteOrder.Uint64(e.Value), true
+	}
+	return 0, false
 }
 
 // Get returns the entry matching tag, or nil if not found.

@@ -102,6 +102,99 @@ func FuzzRead(f *testing.F) {
 	// --- Seed: TIFF big-endian magic ---
 	f.Add([]byte{'M', 'M', 0x00, 0x2A, 0x00, 0x00, 0x00, 0x08})
 
+	// --- BigTIFF seeds (task #54 final pass) ---
+
+	// Seed: minimal BigTIFF LE — valid 16-byte header + zero-entry IFD0.
+	// BigTIFF spec §2: magic 0x002B, offset-bytesize=8.
+	{
+		buf := make([]byte, 16+8+8)
+		buf[0], buf[1] = 'I', 'I'
+		binary.LittleEndian.PutUint16(buf[2:], 0x002B)
+		binary.LittleEndian.PutUint16(buf[4:], 8)
+		binary.LittleEndian.PutUint16(buf[6:], 0)
+		binary.LittleEndian.PutUint64(buf[8:], 16)
+		// IFD0 count=0, next-IFD=0 (already zero).
+		f.Add(buf)
+	}
+
+	// Seed: minimal BigTIFF BE — same as LE seed but big-endian.
+	{
+		buf := make([]byte, 16+8+8)
+		buf[0], buf[1] = 'M', 'M'
+		binary.BigEndian.PutUint16(buf[2:], 0x002B)
+		binary.BigEndian.PutUint16(buf[4:], 8)
+		binary.BigEndian.PutUint16(buf[6:], 0)
+		binary.BigEndian.PutUint64(buf[8:], 16)
+		f.Add(buf)
+	}
+
+	// Seed: BigTIFF LE with one Make entry (6-byte inline ASCII "Canon\x00").
+	// Tests the BigTIFF inline path: 6 bytes ≤ 8-byte threshold → inline.
+	{
+		const (
+			hdrSize  = 16
+			cntSize  = 8
+			entSize  = 20
+			nextSize = 8
+		)
+		buf := make([]byte, hdrSize+cntSize+entSize+nextSize)
+		buf[0], buf[1] = 'I', 'I'
+		binary.LittleEndian.PutUint16(buf[2:], 0x002B)
+		binary.LittleEndian.PutUint16(buf[4:], 8)
+		binary.LittleEndian.PutUint16(buf[6:], 0)
+		binary.LittleEndian.PutUint64(buf[8:], hdrSize)
+		binary.LittleEndian.PutUint64(buf[hdrSize:], 1)
+		p := hdrSize + cntSize
+		binary.LittleEndian.PutUint16(buf[p:], 0x010F) // Make tag
+		binary.LittleEndian.PutUint16(buf[p+2:], 2)    // TypeASCII
+		binary.LittleEndian.PutUint64(buf[p+4:], 6)    // count=6
+		copy(buf[p+12:], "Canon\x00")                  // inline (6 ≤ 8)
+		f.Add(buf)
+	}
+
+	// Seed: BigTIFF with bad offset-bytesize (must reject cleanly, no panic).
+	{
+		buf := make([]byte, 16)
+		buf[0], buf[1] = 'I', 'I'
+		binary.LittleEndian.PutUint16(buf[2:], 0x002B)
+		binary.LittleEndian.PutUint16(buf[4:], 4) // invalid bytesize
+		binary.LittleEndian.PutUint64(buf[8:], 16)
+		f.Add(buf)
+	}
+
+	// Seed: BigTIFF with IFD0 offset pointing far past EOF (OOB robustness).
+	{
+		buf := make([]byte, 16)
+		buf[0], buf[1] = 'I', 'I'
+		binary.LittleEndian.PutUint16(buf[2:], 0x002B)
+		binary.LittleEndian.PutUint16(buf[4:], 8)
+		binary.LittleEndian.PutUint64(buf[8:], 0xFFFFFFFFFFFFFF00)
+		f.Add(buf)
+	}
+
+	// Seed: BigTIFF with huge IFD0 entry count (DoS guard — must clamp).
+	{
+		buf := make([]byte, 32)
+		buf[0], buf[1] = 'I', 'I'
+		binary.LittleEndian.PutUint16(buf[2:], 0x002B)
+		binary.LittleEndian.PutUint16(buf[4:], 8)
+		binary.LittleEndian.PutUint64(buf[8:], 16)
+		binary.LittleEndian.PutUint64(buf[16:], ^uint64(0)) // MaxUint64
+		f.Add(buf)
+	}
+
+	// Seed: BigTIFF with a cyclic IFD chain (cycle detection must terminate).
+	{
+		buf := make([]byte, 16+8+8)
+		buf[0], buf[1] = 'I', 'I'
+		binary.LittleEndian.PutUint16(buf[2:], 0x002B)
+		binary.LittleEndian.PutUint16(buf[4:], 8)
+		binary.LittleEndian.PutUint64(buf[8:], 16)
+		binary.LittleEndian.PutUint64(buf[16:], 0)  // count=0
+		binary.LittleEndian.PutUint64(buf[24:], 16) // next-IFD = self (cycle)
+		f.Add(buf)
+	}
+
 	// --- Seed: truncated JPEG APP1 with valid length but no body ---
 	f.Add([]byte{0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x0A})
 

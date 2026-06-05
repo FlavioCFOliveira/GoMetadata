@@ -56,6 +56,106 @@ func FuzzParseEXIF(f *testing.F) {
 		f.Add(buf)
 	}
 
+	// --- BigTIFF seeds (task #54 final pass) ---
+
+	// Seed: minimal BigTIFF LE header only (no IFD entries).
+	// BigTIFF spec §2: magic 0x002B, offset-bytesize=8.
+	{
+		buf := make([]byte, 16+8+8) // header + count(8) + next(8)
+		order := binary.LittleEndian
+		buf[0], buf[1] = 'I', 'I'
+		order.PutUint16(buf[2:], 0x002B) // BigTIFF magic
+		order.PutUint16(buf[4:], 8)      // offset-bytesize=8
+		order.PutUint16(buf[6:], 0)      // constant 0
+		order.PutUint64(buf[8:], 16)     // IFD0 at offset 16
+		order.PutUint64(buf[16:], 0)     // count = 0
+		// next-IFD = 0 (already zero)
+		f.Add(buf)
+	}
+
+	// Seed: minimal BigTIFF BE header only.
+	{
+		buf := make([]byte, 16+8+8)
+		order := binary.BigEndian
+		buf[0], buf[1] = 'M', 'M'
+		order.PutUint16(buf[2:], 0x002B)
+		order.PutUint16(buf[4:], 8)
+		order.PutUint16(buf[6:], 0)
+		order.PutUint64(buf[8:], 16)
+		order.PutUint64(buf[16:], 0)
+		f.Add(buf)
+	}
+
+	// Seed: BigTIFF LE with one Make entry (6-byte ASCII "Canon\x00", inline).
+	// BigTIFF inline threshold = 8, so 6-byte ASCII is stored inline.
+	{
+		const (
+			hdrSize  = 16
+			cntSize  = 8
+			entSize  = 20
+			nextSize = 8
+		)
+		buf := make([]byte, hdrSize+cntSize+entSize+nextSize)
+		order := binary.LittleEndian
+		buf[0], buf[1] = 'I', 'I'
+		order.PutUint16(buf[2:], 0x002B)
+		order.PutUint16(buf[4:], 8)
+		order.PutUint16(buf[6:], 0)
+		order.PutUint64(buf[8:], hdrSize)
+		order.PutUint64(buf[hdrSize:], 1) // 1 entry
+		p := hdrSize + cntSize
+		order.PutUint16(buf[p:], 0x010F) // Make
+		order.PutUint16(buf[p+2:], 2)    // TypeASCII
+		order.PutUint64(buf[p+4:], 6)    // count = 6 ("Canon\x00")
+		copy(buf[p+12:], "Canon\x00")    // inline value (6 bytes ≤ 8)
+		f.Add(buf)
+	}
+
+	// Seed: BigTIFF LE with bad offset-bytesize (should be rejected cleanly).
+	{
+		buf := make([]byte, 16)
+		buf[0], buf[1] = 'I', 'I'
+		binary.LittleEndian.PutUint16(buf[2:], 0x002B)
+		binary.LittleEndian.PutUint16(buf[4:], 4) // invalid: not 8
+		binary.LittleEndian.PutUint64(buf[8:], 16)
+		f.Add(buf)
+	}
+
+	// Seed: BigTIFF LE with IFD0 offset pointing beyond EOF.
+	{
+		buf := make([]byte, 16)
+		buf[0], buf[1] = 'I', 'I'
+		binary.LittleEndian.PutUint16(buf[2:], 0x002B)
+		binary.LittleEndian.PutUint16(buf[4:], 8)
+		binary.LittleEndian.PutUint64(buf[8:], 0xFFFFFFFFFFFFFF00) // way past EOF
+		f.Add(buf)
+	}
+
+	// Seed: BigTIFF LE with one entry using LONG8 type (type code 16).
+	// StripOffsets as LONG8, count=1, value=0x10 (inline, 8 bytes).
+	{
+		const (
+			hdrSize  = 16
+			cntSize  = 8
+			entSize  = 20
+			nextSize = 8
+		)
+		buf := make([]byte, hdrSize+cntSize+entSize+nextSize)
+		order := binary.LittleEndian
+		buf[0], buf[1] = 'I', 'I'
+		order.PutUint16(buf[2:], 0x002B)
+		order.PutUint16(buf[4:], 8)
+		order.PutUint16(buf[6:], 0)
+		order.PutUint64(buf[8:], hdrSize)
+		order.PutUint64(buf[hdrSize:], 1)
+		p := hdrSize + cntSize
+		order.PutUint16(buf[p:], 0x0111)  // StripOffsets
+		order.PutUint16(buf[p+2:], 16)    // LONG8
+		order.PutUint64(buf[p+4:], 1)     // count=1
+		order.PutUint64(buf[p+12:], 0x10) // inline value=16
+		f.Add(buf)
+	}
+
 	f.Fuzz(func(t *testing.T, b []byte) {
 		// Must not panic on any input.
 		e, err := Parse(b)
