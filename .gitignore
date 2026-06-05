@@ -2,5 +2,24 @@
 testdata/corpus/**/*
 !testdata/corpus/**/.gitkeep
 
-# Go test artifacts
+# Go test / coverage artifacts
 cover.out
+coverage.out
+*.test
+*.out
+
+# macOS
+.DS_Store
+
+# Local scheduler/loop lock
+.claude/scheduled_tasks.lock
+
+# Example command binaries accidentally built in the repo root
+/read-metadata
+/write-metadata
+/raw-inspector
+/copyright-stamp
+/batch-keywords
+/gallery-sidecar
+/multi-format-roundtrip
+/stream-transcode
