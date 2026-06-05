@@ -302,8 +302,12 @@ func TestRefineTIFFVariant(t *testing.T) {
 // XResolution/YResolution, etc.) by updating their valOrOff pointers to the
 // new absolute positions after relocation.
 //
-// The five RAW variants (CR2, NEF, ARW, ORF, RW2) remain read-only until
-// task #95 (manufacturer-specific offset rebasing).
+// Task #95: FormatCR2 is now writable. CR2 uses standard LE TIFF magic (II*\0)
+// and routes through the same writeTIFF copy-and-relocate path as FormatTIFF/DNG.
+// Canon MakerNote blobs are copied verbatim (SPIKE #24: blob-relative offsets).
+// FormatNEF and FormatARW remain gated: real-corpus tests (2026-06-05) found
+// MakerNote data loss and SubIFD OOL value corruption for both.
+// FormatORF and FormatRW2 remain read-only: non-standard TIFF magic.
 //
 // CR3 returns true as of task #91: cr3.Inject now implements stco/co64 offset
 // relocation, walking every trak/stbl/{stco,co64} table inside the rebuilt
@@ -311,8 +315,14 @@ func TestRefineTIFFVariant(t *testing.T) {
 func TestSupportsWrite(t *testing.T) {
 	t.Parallel()
 
+	// Task #95: CR2 is now writable — standard LE TIFF magic, MakerNote verbatim
+	// copy validated against real Canon EOS 350D corpus file.
+	// NEF and ARW remain gated: real-corpus tests (2026-06-05) found:
+	//   NEF: SubIFD OOL RATIONAL corruption, PreviewIFD lost, hash mismatch.
+	//   ARW: 52 Sony MakerNote tags lost, SR2Private IFD corrupted.
 	writable := []FormatID{
 		FormatJPEG, FormatTIFF, FormatDNG, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3,
+		FormatCR2,
 	}
 	for _, f := range writable {
 		if !SupportsWrite(f) {
@@ -320,9 +330,9 @@ func TestSupportsWrite(t *testing.T) {
 		}
 	}
 
-	// The five RAW variants remain read-only until task #95.
+	// NEF/ARW: real-corpus validation failed; ORF/RW2: non-standard magic.
 	notWritable := []FormatID{
-		FormatCR2, FormatNEF, FormatARW, FormatORF, FormatRW2,
+		FormatNEF, FormatARW, FormatORF, FormatRW2,
 		FormatUnknown,
 	}
 	for _, f := range notWritable {

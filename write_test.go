@@ -267,21 +267,6 @@ func listDir(t *testing.T, dir string) []string {
 // SPIKE #6 / B2: TIFF-based write gate
 // ---------------------------------------------------------------------------
 
-// buildMinimalCR2 returns a minimal CR2 byte stream. CR2 is standard TIFF LE
-// with a "CR" marker at bytes 8–9 (CR2 specification §3.1).
-func buildMinimalCR2() []byte {
-	base := minimalTIFFPayload()
-	// Ensure the buffer is large enough for the CR2 marker (bytes 8–9).
-	if len(base) < 10 {
-		extended := make([]byte, 10)
-		copy(extended, base)
-		base = extended
-	}
-	base[8] = 0x43 // 'C'
-	base[9] = 0x52 // 'R'
-	return base
-}
-
 // buildMinimalORF returns a minimal ORF byte stream: standard TIFF LE bytes
 // with Olympus magic ("IIRO") replacing bytes 2–3.
 func buildMinimalORF() []byte {
@@ -301,16 +286,22 @@ func buildMinimalRW2() []byte {
 }
 
 // TestWriteRAWFormatsReturnErrWriteNotSupported verifies that Write returns
-// ErrWriteNotSupported for the RAW formats that remain gated (CR2, ORF, RW2).
-// These formats require SubIFD recursion (task #94) and/or manufacturer-specific
-// offset handling (task #95) that is not yet implemented.
+// ErrWriteNotSupported for the RAW formats that remain gated (ORF, RW2).
+// These formats use non-standard TIFF magic bytes (ORF: IIRS; RW2: IIU\0) and
+// require format-specific outer-framing work before the copy-and-relocate path
+// can apply safely (task #95 follow-up).
 //
 // FormatTIFF was removed from this test in tasks #92/#93: tiff.Inject now uses
 // the copy-and-relocate serializer and TIFF writes succeed.
 //
-// NEF, ARW, and DNG are covered by TestWriteTIFFBasedFormatsFromCorpus, which
-// uses real fixture files (those formats require IFD tag inspection to be
-// distinguished from plain TIFF and cannot be built synthetically).
+// CR2 was removed from this test in task #95: it uses standard LE TIFF magic
+// and now routes through writeTIFF; see TestWriteCR2RoundTrip.
+//
+// NEF and ARW remain gated: real-corpus tests (2026-06-05) found MakerNote
+// data loss and SubIFD OOL value corruption for both; see write_test.go
+// comments for the full failure analysis. The synthetic minimal files used
+// here are detected as plain TIFF (not NEF/ARW), so this test uses real
+// corpus fixtures via TestWriteNEFFromCorpusStillGated.
 func TestWriteRAWFormatsReturnErrWriteNotSupported(t *testing.T) {
 	t.Parallel()
 
@@ -318,7 +309,6 @@ func TestWriteRAWFormatsReturnErrWriteNotSupported(t *testing.T) {
 		name string
 		data []byte
 	}{
-		{"CR2", buildMinimalCR2()},
 		{"ORF", buildMinimalORF()},
 		{"RW2", buildMinimalRW2()},
 	}
@@ -375,54 +365,46 @@ func TestWriteTIFFSucceeds(t *testing.T) {
 	_ = m2
 }
 
-// TestWriteTIFFBasedFormatsFromCorpus verifies ErrWriteNotSupported for NEF
-// using a real fixture file from the test corpus. NEF shares the standard TIFF
-// magic and is only distinguished by IFD tag inspection, so a synthetic minimal
-// file would be detected as plain TIFF.
+// TestWriteNEFFromCorpusStillGated verifies that Write returns
+// ErrWriteNotSupported for a real NEF fixture file from the test corpus.
+// NEF shares the standard TIFF magic (MM\0*) and is only distinguishable from
+// plain TIFF by IFD tag inspection; a synthetic minimal file would be detected
+// as plain TIFF, so this test uses a real corpus fixture.
 //
-// DNG is no longer included here (bug #98 fixed): DNG write is re-enabled as of
-// the bug #98 fix; see TestDNGWriteRoundTrip for the DNG round-trip test.
-func TestWriteTIFFBasedFormatsFromCorpus(t *testing.T) {
+// NEF remains gated after task #95 empirical validation (2026-06-05):
+// real-corpus test against Canon EOS 350D found that SubIFD OOL RATIONAL
+// values (XResolution/YResolution) were corrupted (72→1), the PreviewIFD and
+// NikonScanIFD were lost, and the ImageDataHash did not match (5.6 MB → 4.9 MB).
+// Un-gating NEF is deferred to a follow-up task that adds Nikon-specific
+// SubIFD and MakerNote handling.
+func TestWriteNEFFromCorpusStillGated(t *testing.T) {
 	t.Parallel()
 
-	cases := []struct {
-		name string
-		path string
-	}{
-		{"NEF", "testdata/corpus/raw/exiftool/Nikon.nef"},
+	path := "testdata/corpus/raw/exiftool/Nikon.nef"
+	f, err := os.Open(path)
+	if err != nil {
+		t.Skipf("fixture not found (%s): %v", path, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	m, err := Read(f)
+	if err != nil {
+		t.Fatalf("Read NEF: %v", err)
+	}
+	if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
+		t.Fatalf("Seek NEF: %v", seekErr)
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			f, err := os.Open(tc.path)
-			if err != nil {
-				t.Skipf("fixture not found (%s): %v", tc.path, err)
-			}
-			defer func() { _ = f.Close() }()
-
-			m, err := Read(f)
-			if err != nil {
-				t.Fatalf("Read: %v", err)
-			}
-
-			if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
-				t.Fatalf("Seek: %v", seekErr)
-			}
-
-			var wBuf countingWriter
-			writeErr := Write(f, &wBuf, m)
-			if writeErr == nil {
-				t.Fatal("Write returned nil; want ErrWriteNotSupported")
-			}
-			if !errors.Is(writeErr, ErrWriteNotSupported) {
-				t.Errorf("errors.Is(err, ErrWriteNotSupported) = false; got: %v", writeErr)
-			}
-			if wBuf.n > 0 {
-				t.Errorf("Write wrote %d byte(s) to output; want 0", wBuf.n)
-			}
-		})
+	var wBuf countingWriter
+	writeErr := Write(f, &wBuf, m)
+	if writeErr == nil {
+		t.Fatal("Write NEF returned nil; want ErrWriteNotSupported (NEF still gated after task #95 validation failure)")
+	}
+	if !errors.Is(writeErr, ErrWriteNotSupported) {
+		t.Errorf("errors.Is(err, ErrWriteNotSupported) = false; got: %v", writeErr)
+	}
+	if wBuf.n > 0 {
+		t.Errorf("Write wrote %d byte(s) to output; want 0", wBuf.n)
 	}
 }
 
@@ -585,16 +567,17 @@ func TestDNGWriteRoundTrip(t *testing.T) { //nolint:paralleltest // not parallel
 
 // TestWriteFileBlocksRAWBased verifies that WriteFile returns ErrWriteNotSupported
 // and does NOT overwrite the original file for a RAW format that remains gated
-// (CR2 as the representative case).
+// (ORF as the representative case; CR2 is now writable as of task #95).
 //
 // For FormatTIFF, see TestWriteFileTIFFSucceeds.
+// For CR2 (now writable), see TestWriteCR2RoundTrip.
 func TestWriteFileBlocksRAWBased(t *testing.T) {
 	t.Parallel()
 
-	original := buildMinimalCR2()
+	original := buildMinimalORF()
 
 	dir := t.TempDir()
-	target := filepath.Join(dir, "image.cr2")
+	target := filepath.Join(dir, "image.orf")
 	if err := os.WriteFile(target, original, 0o644); err != nil { //nolint:gosec // G306: 0644 is the correct permission for an image file in a test
 		t.Fatalf("setup WriteFile: %v", err)
 	}
@@ -614,7 +597,7 @@ func TestWriteFileBlocksRAWBased(t *testing.T) {
 
 	// File must not have been modified.
 	remaining := listDir(t, dir)
-	if len(remaining) != 1 || remaining[0] != "image.cr2" {
+	if len(remaining) != 1 || remaining[0] != "image.orf" {
 		t.Errorf("unexpected files after WriteFile error: %v", remaining)
 	}
 	got, readErr := os.ReadFile(target)
@@ -877,5 +860,193 @@ func writeWebPChunk(buf *bytes.Buffer, fourCC string, data []byte) {
 	buf.Write(data)
 	if len(data)%2 != 0 {
 		buf.WriteByte(0x00) // RIFF alignment
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task #95: CR2/NEF/ARW write round-trip tests
+// ---------------------------------------------------------------------------
+
+// buildTIFFWithStrip constructs a minimal standard-magic TIFF stream with a
+// single strip image block and an optional Canon-marker payload at bytes 8–9.
+// It accepts a byteOrder parameter so it can produce both LE (CR2/ARW) and BE (NEF).
+// The strip data is appended after the IFD block and the offset entry points to it,
+// so the round-trip verifies that image data survives verbatim.
+//
+// When canonMarker is true the Canon CR2 "CR" signature is placed at bytes 8–9
+// (Canon CR2 spec §3.1) and IFD0 is pushed to offset 16 to avoid overlap with the
+// marker bytes. The standard TIFF header stores the IFD0 offset at bytes 4–7.
+//
+// Layout without Canon marker: TIFF header (8) + IFD0 (2+3×12+4) + stripData
+// Layout with Canon marker:    TIFF header (8) + CR marker (2) + padding (6) +
+//
+//	IFD0 (2+3×12+4) + stripData
+func buildTIFFWithStrip(order binary.ByteOrder, bigEndian bool, stripData []byte, canonMarker bool) []byte {
+	// IFD0: 3 entries: ImageWidth (0x0100), StripOffsets (0x0111), StripByteCounts (0x0117).
+	const nEntries = 3
+	const ifdEntries = 2 + nEntries*12 + 4 // count(2) + entries + next-IFD(4)
+
+	var ifd0Off int
+	if canonMarker {
+		// Push IFD0 past the Canon marker area (bytes 8–9) plus 6 bytes padding
+		// to keep IFD0 aligned at a 4-byte boundary (offset 16).
+		ifd0Off = 16
+	} else {
+		ifd0Off = 8
+	}
+
+	stripOff := ifd0Off + ifdEntries
+	bufLen := stripOff + len(stripData)
+
+	buf := make([]byte, bufLen)
+
+	// TIFF header (bytes 0–7).
+	if bigEndian {
+		buf[0], buf[1] = 'M', 'M'
+	} else {
+		buf[0], buf[1] = 'I', 'I'
+	}
+	order.PutUint16(buf[2:], 0x002A)
+	order.PutUint32(buf[4:], uint32(ifd0Off)) // ifd0Off is either 8 or 16; fits uint32
+
+	// Canon CR2 marker at bytes 8–9 (Canon CR2 spec §3.1).
+	// Bytes 8–9 are in the TIFF header "reserved" area when IFD0 > 8.
+	if canonMarker {
+		buf[8] = 'C'
+		buf[9] = 'R'
+	}
+
+	// IFD0
+	p := ifd0Off
+	order.PutUint16(buf[p:], nEntries)
+	p += 2
+
+	putEntry := func(tag, typ uint16, count, val uint32) {
+		order.PutUint16(buf[p:], tag)
+		order.PutUint16(buf[p+2:], typ)
+		order.PutUint32(buf[p+4:], count)
+		order.PutUint32(buf[p+8:], val)
+		p += 12
+	}
+
+	putEntry(0x0100, 4, 1, 1)                      // ImageWidth = 1
+	putEntry(0x0111, 4, 1, uint32(stripOff))       // StripOffsets → strip
+	putEntry(0x0117, 4, 1, uint32(len(stripData))) //nolint:gosec // G115: test helper
+	order.PutUint32(buf[p:], 0)                    // next-IFD = 0
+	copy(buf[stripOff:], stripData)
+
+	return buf
+}
+
+// TestWriteCR2RoundTrip verifies that gometadata.Write succeeds for a synthetic
+// CR2-like TIFF stream (task #95: CR2 write un-gate).
+//
+// The test confirms:
+//   - format.Detect classifies the file as FormatCR2
+//   - format.SupportsWrite(FormatCR2) = true
+//   - Write succeeds and produces non-empty output
+//   - The written metadata (XMP caption) round-trips correctly
+//   - Strip image data is byte-identical in the output (image-block integrity)
+func TestWriteCR2RoundTrip(t *testing.T) { //nolint:paralleltest // not parallel: uses t.TempDir for file I/O
+	stripData := []byte("CR2-ROUNDTRIP-STRIP-DATA-GUARD!")
+	original := buildTIFFWithStrip(binary.LittleEndian, false, stripData, true /*Canon marker*/)
+
+	detectedFmt, detErr := format.Detect(bytes.NewReader(original))
+	if detErr != nil {
+		t.Fatalf("format.Detect: %v", detErr)
+	}
+	if detectedFmt != format.FormatCR2 {
+		t.Fatalf("format.Detect = %v, want FormatCR2", detectedFmt)
+	}
+	if !format.SupportsWrite(format.FormatCR2) {
+		t.Fatal("format.SupportsWrite(FormatCR2) = false; expected true after task #95")
+	}
+
+	m, err := Read(bytes.NewReader(original))
+	if err != nil {
+		t.Fatalf("Read CR2: %v", err)
+	}
+	m.XMP = &xmp.XMP{Properties: make(map[string]map[string]string)}
+	const wantCaption = "CR2 round-trip task #95"
+	m.XMP.SetCaption(wantCaption)
+
+	var outBuf bytes.Buffer
+	if writeErr := Write(bytes.NewReader(original), &outBuf, m); writeErr != nil {
+		t.Fatalf("Write CR2 returned unexpected error: %v", writeErr)
+	}
+	if outBuf.Len() == 0 {
+		t.Fatal("Write CR2 produced no output bytes")
+	}
+
+	output := outBuf.Bytes()
+
+	// Caption must round-trip.
+	m2, err := Read(bytes.NewReader(output))
+	if err != nil {
+		t.Fatalf("Read after Write CR2: %v", err)
+	}
+	if got := m2.Caption(); got != wantCaption {
+		t.Errorf("Caption: got %q, want %q", got, wantCaption)
+	}
+
+	// Image block must be byte-identical.
+	if !bytes.Contains(output, stripData) {
+		t.Error("CR2 round-trip: strip data bytes not found verbatim in output")
+	}
+
+	// WriteFile path.
+	dir := t.TempDir()
+	cr2Path := filepath.Join(dir, "test.cr2")
+	if err := os.WriteFile(cr2Path, original, 0o644); err != nil { //nolint:gosec // G306: test helper
+		t.Fatalf("WriteFile setup: %v", err)
+	}
+	mf, err := ReadFile(cr2Path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	mf.XMP = &xmp.XMP{Properties: make(map[string]map[string]string)}
+	mf.XMP.SetCaption(wantCaption)
+	if err := WriteFile(cr2Path, mf); err != nil {
+		t.Fatalf("WriteFile CR2: %v", err)
+	}
+	mf2, err := ReadFile(cr2Path)
+	if err != nil {
+		t.Fatalf("ReadFile after WriteFile CR2: %v", err)
+	}
+	if got := mf2.Caption(); got != wantCaption {
+		t.Errorf("WriteFile Caption: got %q, want %q", got, wantCaption)
+	}
+}
+
+// TestWriteNEFStillGated verifies that format.SupportsWrite(FormatNEF) = false
+// after task #95 (empirical validation failure).
+//
+// Real-corpus tests (2026-06-05) against a real Nikon NEF file found:
+//   - SubIFD OOL RATIONAL values corrupted (XResolution/YResolution: 72 → 1)
+//   - PreviewIFD and NikonScanIFD structures lost
+//   - ImageDataHash mismatch (5.6 MB input → 4.9 MB output)
+//
+// This gate regression test ensures the format is not accidentally re-enabled.
+// The full corpus-level gating test (with real fixture) is TestWriteNEFFromCorpusStillGated.
+func TestWriteNEFStillGated(t *testing.T) {
+	t.Parallel()
+	if format.SupportsWrite(format.FormatNEF) {
+		t.Error("format.SupportsWrite(FormatNEF) = true; NEF should remain gated after task #95 validation failure")
+	}
+}
+
+// TestWriteARWStillGated verifies that format.SupportsWrite(FormatARW) = false
+// after task #95 (empirical validation failure).
+//
+// Real-corpus tests (2026-06-05) against a real Sony ARW file found:
+//   - 52 Sony MakerNote tags lost
+//   - SR2Private IFD structure corrupted
+//   - SubIFD StripOffsets wrong (917504 → 50979)
+//
+// This gate regression test ensures the format is not accidentally re-enabled.
+func TestWriteARWStillGated(t *testing.T) {
+	t.Parallel()
+	if format.SupportsWrite(format.FormatARW) {
+		t.Error("format.SupportsWrite(FormatARW) = true; ARW should remain gated after task #95 validation failure")
 	}
 }

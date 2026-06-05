@@ -158,11 +158,14 @@ func TestSupportsWrite(t *testing.T) {
 	// XResolution/YResolution, etc.) by updating their valOrOff pointers to the
 	// new absolute positions. CR3 is writable as of task #91: stco/co64 offset
 	// relocation is implemented in cr3.Inject; SupportsWrite(FormatCR3) returns true.
-	// The five RAW variants (CR2, NEF, ARW, ORF, RW2) remain read-only until
-	// task #95 (manufacturer-specific offset rebasing).
+	// Task #95: CR2 is now writable — standard LE TIFF magic, MakerNote verbatim copy
+	// validated against real Canon EOS 350D file (ImageDataHash IN==OUT, all tags kept).
+	// NEF and ARW remain gated: real-corpus tests found MakerNote/SubIFD data loss.
+	// ORF and RW2 remain read-only (non-standard magic; task #95 follow-up).
 	writable := []format.FormatID{
 		format.FormatJPEG, format.FormatTIFF, format.FormatDNG, format.FormatPNG,
 		format.FormatHEIF, format.FormatWebP, format.FormatAVIF, format.FormatCR3,
+		format.FormatCR2,
 	}
 	for _, f := range writable {
 		if !format.SupportsWrite(f) {
@@ -170,10 +173,10 @@ func TestSupportsWrite(t *testing.T) {
 		}
 	}
 
-	// The five RAW variants remain read-only until task #95.
+	// NEF/ARW: real-corpus validation failed (task #95); ORF/RW2: non-standard magic.
 	notWritable := []format.FormatID{
-		format.FormatCR2, format.FormatNEF,
-		format.FormatARW, format.FormatORF, format.FormatRW2,
+		format.FormatNEF, format.FormatARW,
+		format.FormatORF, format.FormatRW2,
 		format.FormatUnknown,
 	}
 	for _, f := range notWritable {

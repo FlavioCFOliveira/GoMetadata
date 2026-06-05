@@ -15,15 +15,19 @@
 //   - HEIF / HEIC (read + write)
 //   - AVIF (read + write)
 //   - WebP (read + write)
-//   - CR2 — Canon RAW v2, TIFF-based (read only)
+//   - CR2 — Canon RAW v2, TIFF-based (read + write; uses the same copy-and-relocate
+//     path as TIFF/DNG; Canon MakerNote blobs copied verbatim — blob-relative offsets
+//     are move-safe; validated against real Canon EOS 350D corpus file)
 //   - CR3 — Canon RAW v3, ISOBMFF-based (read + write; cr3.Inject relocates stco/co64 chunk-offset tables after moov rebuild)
-//   - NEF — Nikon RAW, TIFF-based (read only)
-//   - ARW — Sony RAW, TIFF-based (read only)
-//   - DNG — Adobe Digital Negative, TIFF-based (read only; write is gated
-//     pending bug #98: SubIFD out-of-line RATIONAL values are silently lost
-//     after write — XResolution/YResolution 300→undef on real corpus files)
-//   - ORF — Olympus RAW, TIFF-based (read only)
-//   - RW2 — Panasonic RAW, TIFF-based (read only)
+//   - NEF — Nikon RAW, TIFF-based (read only; write gated after task #95
+//     validation: SubIFD OOL RATIONAL corruption + PreviewIFD loss on real corpus)
+//   - ARW — Sony RAW, TIFF-based (read only; write gated after task #95
+//     validation: 52 Sony MakerNote tags lost + SR2Private IFD corruption on real corpus)
+//   - DNG — Adobe Digital Negative, TIFF-based (read + write; SubIFD relocation
+//     preserves all out-of-line RATIONAL/SRATIONAL values; validated against
+//     real Pentax QS1 DNG corpus file)
+//   - ORF — Olympus RAW, TIFF-based (read only; non-standard TIFF magic)
+//   - RW2 — Panasonic RAW, TIFF-based (read only; non-standard TIFF magic)
 //
 // # Out-of-scope formats
 //

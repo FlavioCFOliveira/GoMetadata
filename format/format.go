@@ -78,15 +78,40 @@ func (f FormatID) String() string {
 // absolute offset that pointed at or beyond the original moov end. This
 // relocation pass was implemented in task #91.
 //
-// The five remaining RAW variants (CR2, NEF, ARW, ORF, RW2) return false because
-// they require manufacturer-specific offset handling not yet implemented (task #95).
-// Write and WriteFile return ErrWriteNotSupported for those formats.
+// FormatCR2 returns true as of task #95. CR2 uses standard LE TIFF magic
+// (II*\0) and routes through the same writeTIFF copy-and-relocate path as
+// FormatTIFF/FormatDNG. MakerNote blobs are copied verbatim; per SPIKE #24
+// Canon MakerNotes use blob-relative (self-relative) offsets, so verbatim
+// copying is safe. Validated against a real Canon EOS 350D CR2 corpus file:
+// ImageDataHash IN==OUT, all MakerNote/SubIFD tags preserved.
+//
+// FormatNEF and FormatARW return false (task #95 empirical validation failed,
+// 2026-06-05). Real-corpus tests revealed:
+//
+//	NEF: SubIFD OOL RATIONAL values corrupted (XResolution/YResolution 72→1),
+//	     PreviewIFD lost, ImageDataHash mismatch (5.6 MB → 4.9 MB output).
+//	ARW: 52 Sony MakerNote tags lost, SR2Private IFD corruption.
+//
+// These formats require deeper SubIFD/MakerNote handling before un-gating.
+//
+// FormatORF and FormatRW2 return false. They use non-standard magic bytes
+// (ORF: IIRS; RW2: IIU\0) and require format-specific outer-framing work
+// before the TIFF relocator can process them safely. Write and WriteFile
+// return ErrWriteNotSupported for those formats.
 func SupportsWrite(f FormatID) bool {
 	switch f {
-	case FormatJPEG, FormatTIFF, FormatDNG, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3:
+	case FormatJPEG, FormatTIFF, FormatDNG, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3,
+		FormatCR2:
 		return true
-	case FormatCR2, FormatNEF, FormatARW, FormatORF, FormatRW2:
-		// Task #95: RAW write requires manufacturer-specific offset rebasing.
+	case FormatNEF, FormatARW:
+		// Task #95 empirical validation failed (2026-06-05): real-corpus tests
+		// found MakerNote data loss and SubIFD OOL value corruption.
+		// NEF: PreviewIFD corrupted, XResolution/YResolution 72→1, hash mismatch.
+		// ARW: 52 Sony MakerNote tags lost, SR2Private IFD corrupted.
+		return false
+	case FormatORF, FormatRW2:
+		// ORF/RW2 use non-standard TIFF magic and require format-specific
+		// outer-framing work before copy-and-relocate can apply.
 		return false
 	case FormatUnknown:
 		return false

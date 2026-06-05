@@ -81,11 +81,18 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	// Rebuilding the IFD block without relocating that image data corrupts the
 	// file.
 	//
-	// FormatTIFF and FormatDNG use a dedicated write path (writeTIFF) that keeps
-	// the ORIGINAL TIFF bytes as the relocation base and feeds the MODIFIED
-	// *exif.EXIF struct directly to the relocator. This avoids the
-	// ErrBlockOutOfBounds defect fixed in task #97 where encodeEXIF produced an
-	// IFD skeleton without image blocks.
+	// FormatTIFF, FormatDNG, and FormatCR2 use a dedicated write path
+	// (writeTIFF) that keeps the ORIGINAL TIFF bytes as the relocation base and
+	// feeds the MODIFIED *exif.EXIF struct directly to the relocator. This
+	// avoids the ErrBlockOutOfBounds defect fixed in task #97 where encodeEXIF
+	// produced an IFD skeleton without image blocks.
+	//
+	// CR2 uses standard LE TIFF magic (II*\0) and parses via exif.Parse.
+	// MakerNote blob is copied verbatim — per SPIKE #24, Canon MakerNotes use
+	// blob-relative (self-relative) offsets, so verbatim copying is safe.
+	// Validated against real.cr2 (Canon EOS 350D): ImageDataHash IN==OUT,
+	// all MakerNote tags preserved, only offset fields (PreviewImageStart,
+	// ThumbnailOffset, StripOffsets) changed as expected after relocation.
 	//
 	// FormatDNG re-enabled (bug #98 fixed): the SubIFD relocation path now
 	// preserves ALL out-of-line value areas (RATIONAL XResolution/YResolution,
@@ -93,14 +100,24 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	// Previously only strip/tile offset arrays were re-pointed; the fix extends
 	// the pointer-update to every OOL entry in the SubIFD.
 	//
-	// The five remaining RAW variants (CR2, NEF, ARW, ORF, RW2) remain gated
-	// because they require manufacturer-specific offset handling (task #95).
+	// FormatNEF and FormatARW remain gated (task #95 empirical validation,
+	// 2026-06-05): real-corpus tests revealed metadata loss —
+	//   NEF: SubIFD OOL RATIONAL (XResolution/YResolution) became 1/1, PreviewIFD
+	//        and NikonScanIFD corrupted, ImageDataHash mismatch (5.6 MB → 4.9 MB);
+	//   ARW: 52 Sony MakerNote tags lost, SR2Private IFD corruption, SubIFD
+	//        StripOffsets wrong (917504 → 50979).
+	// Both require deeper SubIFD/MakerNote investigation before un-gating.
+	//
+	// FormatORF and FormatRW2 remain gated: they use non-standard magic bytes
+	// (ORF: IIRS; RW2: IIU\0) that require format-specific handling before the
+	// TIFF relocator can process them (task #95 follow-up).
 	if isTIFFBased(fmtID) {
 		return ErrWriteNotSupported
 	}
-	// FormatTIFF and FormatDNG use a dedicated write path that avoids the
-	// skeleton-as-base defect fixed in task #97 (ErrBlockOutOfBounds on real files).
-	if fmtID == format.FormatTIFF || fmtID == format.FormatDNG {
+	// FormatTIFF, FormatDNG, and FormatCR2 use a dedicated write path that
+	// avoids the skeleton-as-base defect fixed in task #97.
+	if fmtID == format.FormatTIFF || fmtID == format.FormatDNG ||
+		fmtID == format.FormatCR2 {
 		return writeTIFF(r, w, m)
 	}
 
@@ -172,8 +189,8 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 	return nil
 }
 
-// writeTIFF handles metadata injection for TIFF-based containers (FormatTIFF
-// and FormatDNG).
+// writeTIFF handles metadata injection for standard-magic TIFF-based
+// containers: FormatTIFF, FormatDNG, and FormatCR2.
 //
 // The standard encodeMetadata/injectByFormat pipeline is not safe for
 // TIFF-based containers because encodeEXIF calls exif.Encode which produces
@@ -190,6 +207,10 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 //
 // IPTC and XMP are encoded the normal way and upserted into IFD0 by
 // tiff.InjectWithEXIF → relocateTIFFFromParsed step 2.
+//
+// CR2 uses standard LE TIFF magic (II*\0) and parses via exif.Parse.
+// MakerNote blob is copied verbatim — per SPIKE #24, Canon MakerNotes use
+// blob-relative (self-relative) offsets, so verbatim copying is safe.
 //
 // DNG write is enabled (bug #98 fixed). The SubIFD relocation path now
 // preserves ALL out-of-line value areas in each SubIFD (RATIONAL XResolution,
@@ -358,12 +379,22 @@ func wrapInject(err error) error {
 // now preserves all out-of-line value areas. DNG uses the same writeTIFF
 // path as FormatTIFF.
 //
-// The five remaining RAW variants (CR2, NEF, ARW, ORF, RW2) remain gated
-// until task #95 (manufacturer-specific offset handling) is complete.
+// FormatCR2 is NOT gated here (task #95): it uses standard LE TIFF magic
+// (II*\0) and routes through the same writeTIFF path as FormatTIFF/FormatDNG.
+// Real-corpus validation (Canon EOS 350D real.cr2) confirmed ImageDataHash
+// IN==OUT and all MakerNote/SubIFD tags preserved.
+//
+// FormatNEF and FormatARW remain gated (task #95 empirical validation failed):
+//
+//	NEF: SubIFD OOL RATIONAL corruption, PreviewIFD lost, ImageDataHash mismatch.
+//	ARW: 52 Sony MakerNote tags lost, SR2Private IFD corruption.
+//
+// FormatORF and FormatRW2 remain gated: they use non-standard magic bytes
+// (ORF: IIRS; RW2: IIU\0) that require format-specific handling before the
+// TIFF relocator can process them.
 func isTIFFBased(fmtID format.FormatID) bool {
 	switch fmtID {
-	case format.FormatCR2,
-		format.FormatNEF,
+	case format.FormatNEF,
 		format.FormatARW,
 		format.FormatORF,
 		format.FormatRW2:
