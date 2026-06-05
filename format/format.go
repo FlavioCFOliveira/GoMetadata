@@ -99,19 +99,32 @@ func (f FormatID) String() string {
 // position. Validated against a real Sony DSLR-A500 ARW corpus file:
 // ImageDataHash IN==OUT, all 52 MakerNote tags + SR2Private preserved.
 //
-// FormatORF and FormatRW2 return false. They use non-standard magic bytes
-// (ORF: IIRS; RW2: IIU\0) and require format-specific outer-framing work
-// before the TIFF relocator can process them safely. Write and WriteFile
-// return ErrWriteNotSupported for those formats.
+// FormatORF returns true as of task #104 (ORF write un-gated). Both IIRO and
+// IIRS magic variants are supported.
+//
+// FormatRW2 returns true as of task #104 (RW2 write un-gated). The
+// Panasonic 16-byte GUID header is preserved and all absolute IFD0 offsets
+// are rebased after GUID insertion.
 func SupportsWrite(f FormatID) bool {
 	switch f {
 	case FormatJPEG, FormatTIFF, FormatDNG, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3,
-		FormatCR2, FormatNEF, FormatARW:
+		FormatCR2, FormatNEF, FormatARW, FormatORF, FormatRW2:
+		// FormatORF returns true as of task #104. The ORF-specific write path
+		// (tiff.InjectWithEXIFORF) patches the non-standard IIRO/IIRS magic to
+		// standard TIFF before copy-and-relocate, and restores the original magic
+		// in the output.  Both IIRO (Olympus DSLRs) and IIRS (older compacts) are
+		// supported.  Validated against real corpus files: IIRO (Olympus E-M10) and
+		// IIRS (Olympus C5050Z), both with multi-strip raw data.
+		//
+		// FormatRW2 returns true as of task #104. The RW2-specific write path
+		// (tiff.InjectWithEXIFRW2) handles the Panasonic 16-byte device GUID header
+		// (bytes [8:24]) and rebases all absolute IFD0 offsets by +16 after GUID
+		// insertion.  RawDataOffset (0x0118) is registered as a standalone image
+		// block and its inline pointer is patched after encoding.  JpgFromRaw
+		// (0x002E) is preserved verbatim by exif.Encode (entry.Value carries the
+		// JPEG bytes; OOL offset is adjusted by +16 after GUID insertion).
+		// Validated against real corpus file: Panasonic DMC-GF1.rw2.
 		return true
-	case FormatORF, FormatRW2:
-		// ORF/RW2 use non-standard TIFF magic and require format-specific
-		// outer-framing work before copy-and-relocate can apply.
-		return false
 	case FormatUnknown:
 		return false
 	}

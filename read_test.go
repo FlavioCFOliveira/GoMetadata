@@ -164,11 +164,12 @@ func TestSupportsWrite(t *testing.T) {
 	// relocation validated against real Nikon D70 file (ImageDataHash IN==OUT).
 	// Task #103: ARW is now writable — Sony MakerNote absolute-offset rebase + SR2Private
 	// block preservation validated against real Sony DSLR-A500 file (ImageDataHash IN==OUT).
-	// ORF and RW2 remain read-only (non-standard magic; task #95 follow-up).
+	// Task #104: ORF and RW2 are now writable — ORF magic patching (IIRO/IIRS) and
+	// RW2 GUID preservation + offset rebasing validated against real corpus files.
 	writable := []format.FormatID{
 		format.FormatJPEG, format.FormatTIFF, format.FormatDNG, format.FormatPNG,
 		format.FormatHEIF, format.FormatWebP, format.FormatAVIF, format.FormatCR3,
-		format.FormatCR2, format.FormatNEF, format.FormatARW,
+		format.FormatCR2, format.FormatNEF, format.FormatARW, format.FormatORF, format.FormatRW2,
 	}
 	for _, f := range writable {
 		if !format.SupportsWrite(f) {
@@ -176,9 +177,8 @@ func TestSupportsWrite(t *testing.T) {
 		}
 	}
 
-	// ORF/RW2: non-standard magic; FormatUnknown: always false.
+	// Only FormatUnknown should return false.
 	notWritable := []format.FormatID{
-		format.FormatORF, format.FormatRW2,
 		format.FormatUnknown,
 	}
 	for _, f := range notWritable {

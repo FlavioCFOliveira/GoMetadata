@@ -108,9 +108,8 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	//        StripOffsets wrong (917504 → 50979).
 	// Both require deeper SubIFD/MakerNote investigation before un-gating.
 	//
-	// FormatORF and FormatRW2 remain gated: they use non-standard magic bytes
-	// (ORF: IIRS; RW2: IIU\0) that require format-specific handling before the
-	// TIFF relocator can process them (task #95 follow-up).
+	// All remaining TIFF-based gated formats (none currently — ORF and RW2
+	// were un-gated in task #104) return ErrWriteNotSupported.
 	if isTIFFBased(fmtID) {
 		return ErrWriteNotSupported
 	}
@@ -138,6 +137,29 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	// Un-gated in task #103 after real-corpus validation (Sony DSLR-A500.arw).
 	if fmtID == format.FormatARW {
 		return writeTIFFARW(r, w, m)
+	}
+
+	// FormatORF uses the ORF-specific write path that patches the non-standard
+	// Olympus magic bytes (IIRO or IIRS at bytes [2:4]) to standard TIFF magic
+	// before copy-and-relocate, and restores the original magic variant in the
+	// output.  Both IIRO (Olympus DSLRs, E-series, OM-D) and IIRS (older compacts)
+	// are supported.
+	// Un-gated in task #104 after real-corpus validation.
+	if fmtID == format.FormatORF {
+		return writeTIFFORF(r, w, m)
+	}
+
+	// FormatRW2 uses the RW2-specific write path that:
+	//   - Saves the 16-byte Panasonic device GUID at bytes [8:24].
+	//   - Patches the non-standard "IIU\x00" magic to standard TIFF magic.
+	//   - After copy-and-relocate: inserts the GUID back at position 8, updates the
+	//     IFD0 offset in the header from 8 to 24, and rebases all absolute IFD0 OOL
+	//     pointers by +16 for the GUID insertion.
+	//   - RawDataOffset (0x0118) is registered as a standalone imageBlock; its
+	//     inline val_or_off is patched with the new raw sensor data offset.
+	// Un-gated in task #104 after real-corpus validation.
+	if fmtID == format.FormatRW2 {
+		return writeTIFFRW2(r, w, m)
 	}
 
 	rawEXIF, rawIPTC, rawXMP, err := encodeMetadata(m, fmtID)
@@ -342,6 +364,152 @@ func writeTIFFARW(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 	return nil
 }
 
+// writeTIFFORF handles metadata injection for Olympus ORF files.
+//
+// ORF is TIFF-based but uses non-standard magic bytes at bytes [2:4]:
+//   - IIRO (0x52 0x4F, "RO") — used by Olympus DSLRs (E-series, OM-D line).
+//   - IIRS (0x52 0x53, "RS") — used by older Olympus compacts (C-series, SP-series).
+//
+// orf.Extract patches bytes [2:4] to 0x2A 0x00 when it returns rawEXIF, so
+// m.rawEXIF carries patched magic.  writeTIFFORF reads the original magic from r
+// and restores it into a working copy of m.rawEXIF before calling InjectWithEXIFORF.
+//
+// All other aspects (strip/tile relocation, SubIFD relocation, OOL RATIONAL
+// patching, etc.) use the standard copy-and-relocate algorithm unchanged,
+// because Olympus ORF IFD structure is fully standard TIFF after magic patching.
+// Olympus MakerNote uses blob-relative offsets (ExifTool Olympus.pm), so verbatim
+// MakerNote copying is safe.
+//
+// Un-gated in task #104 after real-corpus validation (Olympus E-M10 IIRO,
+// Olympus C5050Z IIRS): ImageDataHash IN==OUT, all metadata preserved.
+func writeTIFFORF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // conditional logic mirrors writeTIFF; splitting reduces clarity
+	// Recover the original ORF magic from r (bytes 0-3 of the file).
+	// m.rawEXIF carries patched magic (0x2A 0x00 at bytes [2:4]) because
+	// orf.Extract patches in-place before returning rawEXIF.
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("gometadata: orf seek for magic: %w", err)
+	}
+	var origMagicBuf [4]byte
+	if _, err := io.ReadFull(r, origMagicBuf[:]); err != nil {
+		return fmt.Errorf("gometadata: orf read magic: %w", err)
+	}
+
+	// Obtain the original ORF bytes for use as the image-data relocation base.
+	// Use m.rawEXIF when available (orf.Extract stores the full ORF stream there);
+	// fall back to a full read from r.
+	var originalBytes []byte
+	if m.rawEXIF != nil {
+		originalBytes = make([]byte, len(m.rawEXIF))
+		copy(originalBytes, m.rawEXIF)
+		// Restore the real ORF magic (m.rawEXIF has patched bytes [2:4] = 0x2A 0x00).
+		if len(originalBytes) >= 4 {
+			copy(originalBytes[0:4], origMagicBuf[:])
+		}
+	} else {
+		if _, err := r.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("gometadata: orf seek: %w", err)
+		}
+		var err error
+		originalBytes, err = io.ReadAll(r)
+		if err != nil {
+			return fmt.Errorf("gometadata: orf read: %w", err)
+		}
+	}
+
+	rawIPTC, err := encodeIPTC(m)
+	if err != nil {
+		return err
+	}
+	rawXMP, err := encodeXMP(m, format.FormatORF)
+	if err != nil {
+		return err
+	}
+
+	if rawIPTC == nil && rawXMP == nil && m.EXIF == nil {
+		if _, err := w.Write(originalBytes); err != nil {
+			return fmt.Errorf("gometadata: orf write passthrough: %w", err)
+		}
+		return nil
+	}
+
+	if err := tiff.InjectWithEXIFORF(originalBytes, m.EXIF, rawIPTC, rawXMP, w); err != nil {
+		return fmt.Errorf("gometadata: %w", err)
+	}
+	return nil
+}
+
+// writeTIFFRW2 handles metadata injection for Panasonic RW2 files.
+//
+// RW2 is TIFF-based but has two non-standard features:
+//
+//  1. Non-standard magic "IIU\x00" (0x49 0x49 0x55 0x00) at bytes [0:4].
+//     exif.Parse requires 0x002A; the RW2 write path patches bytes [2:4] before
+//     parsing and restores the original magic in the output.
+//
+//  2. 16-byte Panasonic device GUID at bytes [8:24].
+//     IFD0 is at offset 24 (not the standard 8). After tiff.InjectWithEXIFRW2
+//     (which produces IFD0 at offset 8 via exif.Encode) the GUID is re-inserted
+//     at position 8 and all absolute IFD0 OOL pointers are rebased by +16.
+//
+// rw2.Extract patches bytes [2:4] to 0x2A 0x00 when it returns rawEXIF, so
+// writeTIFFRW2 recovers the original magic from r and restores it before calling
+// InjectWithEXIFRW2.
+//
+// Un-gated in task #104 after real-corpus validation (Panasonic DMC-GF1):
+// ImageDataHash IN==OUT, JpgFromRaw (0x002E) and raw sensor data preserved.
+func writeTIFFRW2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // conditional logic mirrors writeTIFF; splitting reduces clarity
+	// Recover the original RW2 magic from r.
+	// m.rawEXIF carries patched magic (0x2A 0x00 at bytes [2:4]).
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("gometadata: rw2 seek for magic: %w", err)
+	}
+	var origMagicBuf [4]byte
+	if _, err := io.ReadFull(r, origMagicBuf[:]); err != nil {
+		return fmt.Errorf("gometadata: rw2 read magic: %w", err)
+	}
+
+	// Obtain the original RW2 bytes for use as the image-data relocation base.
+	var originalBytes []byte
+	if m.rawEXIF != nil {
+		originalBytes = make([]byte, len(m.rawEXIF))
+		copy(originalBytes, m.rawEXIF)
+		// Restore the real RW2 magic (m.rawEXIF has patched bytes [2:4] = 0x2A 0x00).
+		if len(originalBytes) >= 4 {
+			copy(originalBytes[0:4], origMagicBuf[:])
+		}
+	} else {
+		if _, err := r.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("gometadata: rw2 seek: %w", err)
+		}
+		var err error
+		originalBytes, err = io.ReadAll(r)
+		if err != nil {
+			return fmt.Errorf("gometadata: rw2 read: %w", err)
+		}
+	}
+
+	rawIPTC, err := encodeIPTC(m)
+	if err != nil {
+		return err
+	}
+	rawXMP, err := encodeXMP(m, format.FormatRW2)
+	if err != nil {
+		return err
+	}
+
+	if rawIPTC == nil && rawXMP == nil && m.EXIF == nil {
+		if _, err := w.Write(originalBytes); err != nil {
+			return fmt.Errorf("gometadata: rw2 write passthrough: %w", err)
+		}
+		return nil
+	}
+
+	if err := tiff.InjectWithEXIFRW2(originalBytes, m.EXIF, rawIPTC, rawXMP, w); err != nil {
+		return fmt.Errorf("gometadata: %w", err)
+	}
+	return nil
+}
+
 // encodeMetadata serialises each modified metadata segment. If a segment was
 // not modified (m.EXIF/IPTC/XMP is nil) the original raw bytes are passed
 // through unchanged. Returns the first encoding error encountered.
@@ -447,40 +615,19 @@ func wrapInject(err error) error {
 // isTIFFBased reports whether fmtID is a TIFF-based container format that
 // requires the write gate (ErrWriteNotSupported).
 //
-// FormatTIFF is NOT gated here: it has a dedicated write path (writeTIFF)
-// that is invoked before isTIFFBased is consulted. The writeTIFF path uses
-// tiff.InjectWithEXIF which feeds the ORIGINAL TIFF bytes as the relocation
-// base together with the MODIFIED *exif.EXIF struct (task #97 fix).
+// As of task #104, no formats are gated here; all supported TIFF-based formats
+// have dedicated write paths:
 //
-// FormatDNG is NOT gated here (bug #98 fixed): the SubIFD relocation path
-// now preserves all out-of-line value areas. DNG uses the same writeTIFF
-// path as FormatTIFF.
+//   - FormatTIFF / FormatDNG / FormatCR2: writeTIFF (standard copy-and-relocate).
+//   - FormatNEF: writeTIFFNEF (Nikon MakerNote blob extension + PreviewIFD).
+//   - FormatARW: writeTIFFARW (Sony MakerNote rebase + SR2Private relocation).
+//   - FormatORF: writeTIFFORF (ORF magic patching; IIRO and IIRS supported).
+//   - FormatRW2: writeTIFFRW2 (Panasonic GUID insertion + offset rebasing).
 //
-// FormatCR2 is NOT gated here (task #95): it uses standard LE TIFF magic
-// (II*\0) and routes through the same writeTIFF path as FormatTIFF/FormatDNG.
-// Real-corpus validation (Canon EOS 350D real.cr2) confirmed ImageDataHash
-// IN==OUT and all MakerNote/SubIFD tags preserved.
-//
-// FormatNEF is NOT gated here (task #102): the NEF-specific write path extends
-// the Nikon MakerNote blob, enumerates PreviewIFD, and patches MakerNote-relative
-// offsets post-encode.
-//
-// FormatARW is NOT gated here (task #103): the ARW-specific write path rebases
-// Sony MakerNote TIFF-absolute offsets and relocates the SR2Private block.
-// Real-corpus validation (Sony DSLR-A500) confirmed ImageDataHash IN==OUT and
-// all 52 MakerNote tags + SR2Private preserved.
-//
-// FormatORF and FormatRW2 remain gated: they use non-standard magic bytes
-// (ORF: IIRS; RW2: IIU\0) that require format-specific handling before the
-// TIFF relocator can process them.
-func isTIFFBased(fmtID format.FormatID) bool {
-	switch fmtID {
-	case format.FormatORF,
-		format.FormatRW2:
-		return true
-	default:
-		return false
-	}
+// This function is preserved as an extension point for future gating if a new
+// TIFF-based format is added before its write path is implemented.
+func isTIFFBased(_ format.FormatID) bool {
+	return false
 }
 
 // writeTIFFNEF handles metadata injection for Nikon NEF files.

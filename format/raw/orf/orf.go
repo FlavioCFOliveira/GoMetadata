@@ -1,6 +1,9 @@
 // Package orf implements metadata extraction for Olympus ORF files.
-// ORF uses a TIFF-like structure with an Olympus-specific byte order marker
-// "IIRO" instead of the standard "II\x2A\x00".
+// ORF uses a TIFF-like structure with an Olympus-specific byte order marker:
+//   - "IIRO" (0x49 0x49 0x52 0x4F): Olympus DSLRs (E-series, OM-D line).
+//   - "IIRS" (0x49 0x49 0x52 0x53): older Olympus compacts (C-series, SP-series).
+//
+// Both variants are structurally identical; only bytes [2:4] differ.
 package orf
 
 import (
@@ -12,13 +15,26 @@ import (
 	"github.com/FlavioCFOliveira/GoMetadata/format/tiff"
 )
 
-// orfMagic is the Olympus ORF byte order / magic marker (bytes 0-3).
-// Olympus replaces the standard TIFF magic (0x2A 0x00) with "RO" (0x52 0x4F).
-var orfMagic = []byte{0x49, 0x49, 0x52, 0x4F} //nolint:gochecknoglobals // package-level constant bytes
+// orfMagic is the IIRO variant of the Olympus ORF magic (the most common variant,
+// used by all Olympus DSLRs and OM-D series cameras).
+//
+// For detection purposes (including the IIRS compact variant), use isORFMagic.
+var orfMagic = []byte{0x49, 0x49, 0x52, 0x4F} //nolint:gochecknoglobals // package-level constant bytes; never mutated
+
+// isORFMagic reports whether data begins with a valid Olympus ORF magic.
+// Accepts both IIRO (byte[3]=0x4F) and IIRS (byte[3]=0x53).
+//
+// ExifTool Olympus.pm: ORFMagic = "IIRO" | "IIRS".
+func isORFMagic(data []byte) bool {
+	return len(data) >= 4 &&
+		data[0] == 0x49 && data[1] == 0x49 && data[2] == 0x52 &&
+		(data[3] == 0x4F || data[3] == 0x53)
+}
 
 // Extract reads metadata from an ORF file.
 // The ORF magic bytes are patched to standard TIFF before extraction so
 // that the TIFF IFD traversal code can be reused.
+// Both IIRO and IIRS magic variants are accepted.
 func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if _, err = r.Seek(0, io.SeekStart); err != nil {
 		return nil, nil, nil, fmt.Errorf("orf: seek: %w", err)
@@ -27,7 +43,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("orf: read: %w", err)
 	}
-	if !bytes.HasPrefix(data, orfMagic) {
+	if !isORFMagic(data) {
 		return nil, nil, nil, ErrInvalidMagic
 	}
 
@@ -50,16 +66,16 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 }
 
 // Inject writes a modified ORF stream to w by delegating to the TIFF writer.
-// ORF magic bytes are patched to standard TIFF LE before injection and
-// restored in the output so the file remains a valid ORF.
+// ORF magic bytes (IIRO or IIRS) are patched to standard TIFF LE before
+// injection and restored in the output so the file remains a valid ORF.
 //
 // WARNING — image-data corruption risk: ORF is TIFF-based. Writing metadata
 // into an ORF file re-encodes the IFD block (via tiff.Inject → exif.Encode)
 // without relocating StripOffsets, TileOffsets, or SubIFD image-data pointers.
 // Those offsets become invalid after re-encoding, corrupting the image. Do NOT
 // call Inject directly on files from a user-facing write path; use
-// gometadata.Write instead, which gates ORF behind ErrWriteNotSupported until
-// full structural relocation is implemented (roadmap Option A, epic #33).
+// gometadata.Write instead, which routes ORF through tiff.InjectWithEXIFORF
+// (the copy-and-relocate path that correctly rebases all image-data offsets).
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("orf: seek: %w", err)
@@ -68,9 +84,13 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	if err != nil {
 		return fmt.Errorf("orf: read: %w", err)
 	}
-	if !bytes.HasPrefix(data, orfMagic) {
+	if !isORFMagic(data) {
 		return ErrInvalidMagic
 	}
+
+	// Save the original magic variant (IIRO or IIRS) for restoration in the output.
+	origMagic2 := data[2] // 0x52 ('R') — same in both variants
+	origMagic3 := data[3] // 0x4F ('O') for IIRO or 0x53 ('S') for IIRS
 
 	// Patch bytes 2-3 to standard TIFF LE magic so tiff.Inject works.
 	// data is exclusively owned (returned by io.ReadAll), so in-place mutation
@@ -88,9 +108,9 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	if len(out) < 4 {
 		return ErrOutputTooShort
 	}
-	// Restore ORF magic ("IIRO") in the output.
-	out[2] = orfMagic[2]
-	out[3] = orfMagic[3]
+	// Restore the original ORF magic variant in the output.
+	out[2] = origMagic2
+	out[3] = origMagic3
 
 	_, err = w.Write(out)
 	if err != nil {

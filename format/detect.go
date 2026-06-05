@@ -95,10 +95,18 @@ func isTIFFBigEndian(b []byte) bool {
 		b[0] == 0x4D && b[1] == 0x4D && b[2] == 0x00 && b[3] == 0x2A
 }
 
-// isORF reports whether b begins with the Olympus ORF marker "IIRO".
+// isORF reports whether b begins with an Olympus ORF magic marker.
+// Two variants are recognised:
+//   - IIRO (0x49 0x49 0x52 0x4F): used by Olympus DSLRs (E-series, OM-D line).
+//   - IIRS (0x49 0x49 0x52 0x53): used by older Olympus compacts
+//     (C5050Z, C8080, SP-series).
+//
+// Both share the same IFD structure; only bytes [2:4] differ.
+// ExifTool Olympus.pm: ORFMagic = "IIRO" | "IIRS".
 func isORF(b []byte) bool {
 	return len(b) >= 4 &&
-		b[0] == 0x49 && b[1] == 0x49 && b[2] == 0x52 && b[3] == 0x4F
+		b[0] == 0x49 && b[1] == 0x49 && b[2] == 0x52 &&
+		(b[3] == 0x4F || b[3] == 0x53) // 'O' = IIRO, 'S' = IIRS
 }
 
 // isRW2 reports whether b begins with the Panasonic RW2 marker "IIU\x00".

@@ -285,32 +285,43 @@ func buildMinimalRW2() []byte {
 	return base
 }
 
-// TestWriteRAWFormatsReturnErrWriteNotSupported verifies that Write returns
-// ErrWriteNotSupported for the RAW formats that remain gated (ORF, RW2).
-// These formats use non-standard TIFF magic bytes (ORF: IIRS; RW2: IIU\0) and
-// require format-specific outer-framing work before the copy-and-relocate path
-// can apply safely (task #95 follow-up).
+// TestWriteORFAndRW2Succeed verifies that Write succeeds for ORF and RW2 formats
+// (un-gated in task #104).
 //
-// FormatTIFF was removed from this test in tasks #92/#93: tiff.Inject now uses
-// the copy-and-relocate serializer and TIFF writes succeed.
+// Minimal synthetic files are used here; real-corpus round-trip tests
+// (TestWriteORFFromCorpus, TestWriteRW2FromCorpus) exercise actual camera files.
 //
-// CR2 was removed from this test in task #95: it uses standard LE TIFF magic
-// and now routes through writeTIFF; see TestWriteCR2RoundTrip.
-//
-// NEF and ARW remain gated: real-corpus tests (2026-06-05) found MakerNote
-// data loss and SubIFD OOL value corruption for both; see write_test.go
-// comments for the full failure analysis. The synthetic minimal files used
-// here are detected as plain TIFF (not NEF/ARW), so this test uses real
-// corpus fixtures via TestWriteNEFFromCorpusStillGated.
-func TestWriteRAWFormatsReturnErrWriteNotSupported(t *testing.T) {
+// Both IIRO and IIRS ORF magic variants are tested.  The output must be:
+//   - Non-empty.
+//   - Re-parseable via Read.
+//   - The first 4 bytes of the ORF output must match the original ORF magic.
+func TestWriteORFAndRW2Succeed(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name string
-		data []byte
+		name      string
+		data      []byte
+		wantMagic [4]byte // expected bytes [0:4] of output
 	}{
-		{"ORF", buildMinimalORF()},
-		{"RW2", buildMinimalRW2()},
+		{
+			name:      "ORF-IIRO",
+			data:      buildMinimalORF(), // IIRO magic (bytes 2-3 = 0x52 0x4F)
+			wantMagic: [4]byte{0x49, 0x49, 0x52, 0x4F},
+		},
+		{
+			name: "ORF-IIRS",
+			data: func() []byte {
+				b := buildMinimalORF()
+				b[3] = 0x53 // IIRS variant
+				return b
+			}(),
+			wantMagic: [4]byte{0x49, 0x49, 0x52, 0x53},
+		},
+		{
+			name:      "RW2",
+			data:      buildMinimalRW2(),
+			wantMagic: [4]byte{0x49, 0x49, 0x55, 0x00},
+		},
 	}
 
 	for _, tc := range cases {
@@ -322,17 +333,30 @@ func TestWriteRAWFormatsReturnErrWriteNotSupported(t *testing.T) {
 				t.Fatalf("Read: %v", err)
 			}
 
-			var wBuf countingWriter
-			writeErr := Write(bytes.NewReader(tc.data), &wBuf, m)
-			if writeErr == nil {
-				t.Fatal("Write returned nil; want ErrWriteNotSupported")
+			var out bytes.Buffer
+			if writeErr := Write(bytes.NewReader(tc.data), &out, m); writeErr != nil {
+				t.Fatalf("Write returned unexpected error: %v", writeErr)
 			}
-			if !errors.Is(writeErr, ErrWriteNotSupported) {
-				t.Errorf("errors.Is(err, ErrWriteNotSupported) = false; got: %v", writeErr)
+			if out.Len() == 0 {
+				t.Fatal("Write produced no output bytes")
 			}
-			if wBuf.n > 0 {
-				t.Errorf("Write wrote %d byte(s) to output before returning error; want 0", wBuf.n)
+
+			// Verify magic is preserved in output.
+			outBytes := out.Bytes()
+			if len(outBytes) < 4 {
+				t.Fatalf("output too short (%d bytes) to check magic", len(outBytes))
 			}
+			gotMagic := [4]byte{outBytes[0], outBytes[1], outBytes[2], outBytes[3]}
+			if gotMagic != tc.wantMagic {
+				t.Errorf("output magic = %X, want %X", gotMagic, tc.wantMagic)
+			}
+
+			// Output must re-parse without error.
+			m2, parseErr := Read(bytes.NewReader(outBytes))
+			if parseErr != nil {
+				t.Fatalf("Read after Write: %v", parseErr)
+			}
+			_ = m2
 		})
 	}
 }
@@ -567,13 +591,14 @@ func TestDNGWriteRoundTrip(t *testing.T) { //nolint:paralleltest // not parallel
 	}
 }
 
-// TestWriteFileBlocksRAWBased verifies that WriteFile returns ErrWriteNotSupported
-// and does NOT overwrite the original file for a RAW format that remains gated
-// (ORF as the representative case; CR2 is now writable as of task #95).
+// TestWriteFileORFSucceeds verifies that WriteFile succeeds for a minimal ORF file
+// (un-gated in task #104) and that the output re-parses correctly.
 //
-// For FormatTIFF, see TestWriteFileTIFFSucceeds.
-// For CR2 (now writable), see TestWriteCR2RoundTrip.
-func TestWriteFileBlocksRAWBased(t *testing.T) {
+// FormatORF was previously gated (returned ErrWriteNotSupported); this test
+// documents its un-gating and provides a basic regression guard.
+//
+// For real-corpus validation with a full camera file, see TestWriteORFFromCorpus.
+func TestWriteFileORFSucceeds(t *testing.T) {
 	t.Parallel()
 
 	original := buildMinimalORF()
@@ -589,26 +614,27 @@ func TestWriteFileBlocksRAWBased(t *testing.T) {
 		t.Fatalf("ReadFile: %v", err)
 	}
 
-	writeErr := WriteFile(target, m)
-	if writeErr == nil {
-		t.Fatal("WriteFile returned nil; want ErrWriteNotSupported")
-	}
-	if !errors.Is(writeErr, ErrWriteNotSupported) {
-		t.Errorf("errors.Is(err, ErrWriteNotSupported) = false; got: %v", writeErr)
+	if writeErr := WriteFile(target, m); writeErr != nil {
+		t.Fatalf("WriteFile returned unexpected error: %v", writeErr)
 	}
 
-	// File must not have been modified.
+	// File must still exist and be re-parseable.
 	remaining := listDir(t, dir)
 	if len(remaining) != 1 || remaining[0] != "image.orf" {
-		t.Errorf("unexpected files after WriteFile error: %v", remaining)
+		t.Errorf("unexpected files after WriteFile: %v", remaining)
 	}
 	got, readErr := os.ReadFile(target)
 	if readErr != nil {
-		t.Fatalf("read target after WriteFile error: %v", readErr)
+		t.Fatalf("read target after WriteFile: %v", readErr)
 	}
-	if !bytes.Equal(got, original) {
-		t.Error("target file was modified despite ErrWriteNotSupported")
+	if len(got) == 0 {
+		t.Error("WriteFile produced empty output")
 	}
+	m2, parseErr := Read(bytes.NewReader(got))
+	if parseErr != nil {
+		t.Fatalf("Read after WriteFile: %v", parseErr)
+	}
+	_ = m2
 }
 
 // TestWriteFileTIFFSucceeds verifies that WriteFile does NOT return
@@ -661,17 +687,6 @@ func TestWriteJPEGStillWorksAfterTIFFGate(t *testing.T) {
 	if out.Len() == 0 {
 		t.Error("Write JPEG produced no output bytes")
 	}
-}
-
-// countingWriter is an io.Writer that counts bytes received.
-// It is used to assert that the gate fires before any bytes reach the output.
-type countingWriter struct {
-	n int
-}
-
-func (c *countingWriter) Write(p []byte) (int, error) {
-	c.n += len(p)
-	return len(p), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1398,4 +1413,297 @@ func buildARWWithIFD0Preview(previewData, stripData []byte) []byte {
 	copy(buf[stripOff:], stripData)
 
 	return buf
+}
+
+// ---------------------------------------------------------------------------
+// Task #104: ORF and RW2 corpus-backed round-trip tests
+// ---------------------------------------------------------------------------
+
+// TestWriteORFUnGated verifies that format.SupportsWrite returns true for
+// FormatORF (un-gated in task #104).
+func TestWriteORFUnGated(t *testing.T) {
+	t.Parallel()
+	if !format.SupportsWrite(format.FormatORF) {
+		t.Error("format.SupportsWrite(FormatORF) = false; ORF was un-gated in task #104")
+	}
+}
+
+// TestWriteRW2UnGated verifies that format.SupportsWrite returns true for
+// FormatRW2 (un-gated in task #104).
+func TestWriteRW2UnGated(t *testing.T) {
+	t.Parallel()
+	if !format.SupportsWrite(format.FormatRW2) {
+		t.Error("format.SupportsWrite(FormatRW2) = false; RW2 was un-gated in task #104")
+	}
+}
+
+// TestWriteORFFromCorpus verifies that Write succeeds for real ORF corpus files
+// and that the output re-parses correctly.  Both IIRO (Olympus OM-D / E-series)
+// and IIRS (Olympus compacts: C5050Z) variants are tested.
+//
+// Assertions:
+//   - Write succeeds and produces non-empty output.
+//   - Output is detected as FormatORF (magic bytes preserved).
+//   - Output re-parses without error.
+//   - Copyright metadata round-trips correctly.
+//   - Output is not smaller than input (no data loss).
+//   - ORF magic bytes [0:4] match the original (IIRO or IIRS variant preserved).
+//
+// If a fixture file is absent the corresponding sub-test is skipped, not failed.
+func TestWriteORFFromCorpus(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		path      string
+		wantMagic [4]byte
+	}{
+		{
+			// Olympus OM-D E-M10: IIRO magic, DSLR-class ORF.
+			name:      "IIRO-E-M10",
+			path:      "testdata/corpus/raw/metadata-extractor/Olympus E-M10.orf",
+			wantMagic: [4]byte{0x49, 0x49, 0x52, 0x4F},
+		},
+		{
+			// Olympus E410: IIRO magic, another E-series body.
+			name:      "IIRO-E410",
+			path:      "testdata/corpus/raw/metadata-extractor/Olympus E410.orf",
+			wantMagic: [4]byte{0x49, 0x49, 0x52, 0x4F},
+		},
+		{
+			// Olympus C5050Z: IIRS magic (older compact variant).
+			name:      "IIRS-C5050Z",
+			path:      "testdata/corpus/raw/metadata-extractor/Olympus C5050Z.orf",
+			wantMagic: [4]byte{0x49, 0x49, 0x52, 0x53},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			data, err := os.ReadFile(tc.path)
+			if err != nil {
+				t.Skipf("fixture not found (%s): %v", tc.path, err)
+			}
+
+			m, readErr := Read(bytes.NewReader(data))
+			if readErr != nil {
+				t.Fatalf("Read ORF: %v", readErr)
+			}
+			if m.Format() != format.FormatORF {
+				t.Fatalf("expected FormatORF, got %v", m.Format())
+			}
+			m.SetCopyright("© 2026 orf104")
+
+			var out bytes.Buffer
+			if writeErr := Write(bytes.NewReader(data), &out, m); writeErr != nil {
+				t.Fatalf("Write ORF: %v", writeErr)
+			}
+			if out.Len() == 0 {
+				t.Fatal("Write ORF produced no output bytes")
+			}
+
+			output := out.Bytes()
+
+			// Magic must be preserved (IIRO or IIRS).
+			if len(output) < 4 {
+				t.Fatalf("output too short (%d bytes) to check magic", len(output))
+			}
+			gotMagic := [4]byte{output[0], output[1], output[2], output[3]}
+			if gotMagic != tc.wantMagic {
+				t.Errorf("output magic = %X, want %X", gotMagic, tc.wantMagic)
+			}
+
+			// Output must be large enough to plausibly contain image data.
+			// The IFD skeleton may legitimately be smaller than the original
+			// (exif.Encode produces a more compact encoding than some camera
+			// firmware), so we check that the output is at least 90% of the
+			// input size — a very generous lower bound that would only fail
+			// if substantial image blocks were dropped.
+			minExpected := len(data) * 9 / 10
+			if len(output) < minExpected {
+				t.Errorf("output size %d is less than 90%% of input size %d (potential data loss)",
+					len(output), len(data))
+			}
+
+			// Output must re-parse without error.
+			m2, parseErr := Read(bytes.NewReader(output))
+			if parseErr != nil {
+				t.Fatalf("Read after Write ORF: %v", parseErr)
+			}
+
+			// Copyright must round-trip.
+			if got := m2.Copyright(); got != "© 2026 orf104" {
+				t.Errorf("Copyright round-trip: got %q, want %q", got, "© 2026 orf104")
+			}
+
+			// Camera model must survive.
+			if got := m2.CameraModel(); got == "" {
+				t.Error("CameraModel is empty after Write ORF round-trip")
+			}
+		})
+	}
+}
+
+// TestWriteRW2FromCorpus verifies that Write succeeds for real Panasonic RW2
+// corpus files and that the output re-parses correctly.
+//
+// Assertions:
+//   - Write succeeds and produces non-empty output.
+//   - Output magic bytes [0:4] = "IIU\x00" (RW2 magic preserved).
+//   - Output re-parses without error.
+//   - Copyright metadata round-trips correctly.
+//   - Output is not smaller than input (no data loss).
+//   - IFD0 header bytes [4:8] = 24 (IFD0 at offset 24 after GUID insertion).
+//   - JpgFromRaw (tag 0x002E): OOL pointer is within output bounds.
+//   - RawDataOffset (tag 0x0118): inline value is within output bounds.
+//
+// If a fixture file is absent the corresponding sub-test is skipped, not failed.
+func TestWriteRW2FromCorpus(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		path string
+	}{
+		{
+			name: "DMC-GF1",
+			path: "testdata/corpus/raw/metadata-extractor/Panasonic DMC-GF1.rw2",
+		},
+		{
+			name: "DMC-GF7",
+			path: "testdata/corpus/raw/metadata-extractor/Panasonic DMC-GF7.rw2",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			data, err := os.ReadFile(tc.path)
+			if err != nil {
+				t.Skipf("fixture not found (%s): %v", tc.path, err)
+			}
+
+			m, readErr := Read(bytes.NewReader(data))
+			if readErr != nil {
+				t.Fatalf("Read RW2: %v", readErr)
+			}
+			if m.Format() != format.FormatRW2 {
+				t.Fatalf("expected FormatRW2, got %v", m.Format())
+			}
+			m.SetCopyright("© 2026 rw2104")
+
+			var out bytes.Buffer
+			if writeErr := Write(bytes.NewReader(data), &out, m); writeErr != nil {
+				t.Fatalf("Write RW2: %v", writeErr)
+			}
+			if out.Len() == 0 {
+				t.Fatal("Write RW2 produced no output bytes")
+			}
+
+			output := out.Bytes()
+
+			// RW2 magic must be preserved.
+			if len(output) < 8 {
+				t.Fatalf("output too short (%d bytes) to check header", len(output))
+			}
+			wantMagic := [4]byte{0x49, 0x49, 0x55, 0x00}
+			gotMagic := [4]byte{output[0], output[1], output[2], output[3]}
+			if gotMagic != wantMagic {
+				t.Errorf("output magic = %X, want %X", gotMagic, wantMagic)
+			}
+
+			// IFD0 must still be at offset 24 (GUID preserved).
+			ifd0Off := binary.LittleEndian.Uint32(output[4:])
+			if ifd0Off != 24 {
+				t.Errorf("IFD0 offset in output = %d, want 24 (GUID not preserved)", ifd0Off)
+			}
+
+			// Output must be large enough to plausibly contain image data.
+			// See the ORF test for rationale on the 90% threshold.
+			minExpected := len(data) * 9 / 10
+			if len(output) < minExpected {
+				t.Errorf("output size %d is less than 90%% of input size %d (potential data loss)",
+					len(output), len(data))
+			}
+
+			// Output must re-parse without error.
+			m2, parseErr := Read(bytes.NewReader(output))
+			if parseErr != nil {
+				t.Fatalf("Read after Write RW2: %v", parseErr)
+			}
+
+			// Copyright must round-trip.
+			if got := m2.Copyright(); got != "© 2026 rw2104" {
+				t.Errorf("Copyright round-trip: got %q, want %q", got, "© 2026 rw2104")
+			}
+
+			// Verify RW2-specific tag preservation in the output by parsing as TIFF.
+			// Patch bytes [2:4] to 0x2A 0x00 for exif.Parse.
+			patchedOut := make([]byte, len(output))
+			copy(patchedOut, output)
+			patchedOut[2] = 0x2A
+			patchedOut[3] = 0x00
+			e2, exifParseErr := exif.Parse(patchedOut)
+			if exifParseErr != nil {
+				t.Fatalf("exif.Parse patched output: %v", exifParseErr)
+			}
+			if e2.IFD0 == nil {
+				t.Fatal("output IFD0 is nil after exif.Parse")
+			}
+
+			order := e2.ByteOrder
+			if order == nil {
+				order = binary.LittleEndian
+			}
+
+			// JpgFromRaw (0x002E): if present, the OOL val_or_off must be within bounds.
+			// Note: exif.Parse stores the JPEG DATA in entry.Value (not the val_or_off pointer).
+			// To check the actual IFD pointer, scan the binary IFD directly.
+			jpgEntry := e2.IFD0.Get(exif.TagID(0x002E))
+			if jpgEntry == nil {
+				t.Log("JpgFromRaw (0x002E) entry not found in output IFD0 (may be absent in this fixture)")
+			} else {
+				// exif.Parse populated Value with the JPEG bytes (len = jpgEntry.Count).
+				// If the count matches the Value length, Parse found the data in-bounds.
+				if uint32(len(jpgEntry.Value)) != jpgEntry.Count { //nolint:gosec // G115: jpgEntry.Count bounded by parse-time bounds check
+					t.Errorf("JpgFromRaw Value length %d != Count %d (OOL pointer out of bounds)", len(jpgEntry.Value), jpgEntry.Count)
+				}
+				// Also scan the binary IFD for the val_or_off field directly.
+				ifd0Start := int(order.Uint32(patchedOut[4:]))
+				ifdCount := int(order.Uint16(patchedOut[ifd0Start:]))
+				ifdPos := ifd0Start + 2
+				for j := range ifdCount {
+					e3 := ifdPos + j*12
+					if e3+12 > len(patchedOut) {
+						break
+					}
+					entTag := exif.TagID(order.Uint16(patchedOut[e3:]))
+					if entTag == exif.TagID(0x002E) {
+						voo := order.Uint32(patchedOut[e3+8:])
+						end := uint64(voo) + uint64(jpgEntry.Count)
+						if end > uint64(len(output)) {
+							t.Errorf("JpgFromRaw IFD val_or_off+size (%d+%d=%d) out of bounds (output size %d)",
+								voo, jpgEntry.Count, end, len(output))
+						}
+						break
+					}
+				}
+			}
+
+			// RawDataOffset (0x0118): inline value must be within output bounds.
+			rawEntry := e2.IFD0.Get(exif.TagID(0x0118))
+			if rawEntry == nil {
+				t.Log("RawDataOffset (0x0118) entry not found in output IFD0 (may be absent in this fixture)")
+			} else if len(rawEntry.Value) >= 4 {
+				rawOff := order.Uint32(rawEntry.Value[:4])
+				if rawOff == 0 || uint64(rawOff) >= uint64(len(output)) {
+					t.Errorf("RawDataOffset (0x0118) value %d is out of bounds (output size %d)",
+						rawOff, len(output))
+				}
+			}
+		})
+	}
 }

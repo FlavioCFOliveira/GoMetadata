@@ -223,6 +223,70 @@ func InjectWithEXIFARW(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, r
 	return nil
 }
 
+// InjectWithEXIFORF is the ORF-specific variant of InjectWithEXIF.
+//
+// It patches the non-standard Olympus ORF magic bytes (IIRO "0x49 0x49 0x52 0x4F"
+// or IIRS "0x49 0x49 0x52 0x53") to standard TIFF magic before relocation, and
+// restores the original magic in the output.
+//
+// originalBytes must carry a valid ORF magic at bytes [0:4]; the caller
+// (writeTIFFORF in write.go) is responsible for restoring the real magic
+// into m.rawEXIF before calling this function, since orf.Extract patches
+// bytes [2:4] to 0x2A 0x00.
+//
+// This is the entry point used by gometadata.Write for FormatORF.
+// See relocate_orf.go for the full algorithm description.
+func InjectWithEXIFORF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+	// Pass-through: no metadata changes requested and no EXIF edits.
+	if modifiedEXIF == nil && rawIPTC == nil && rawXMP == nil {
+		if _, err := w.Write(originalBytes); err != nil {
+			return fmt.Errorf("tiff: write: %w", err)
+		}
+		return nil
+	}
+
+	updated, err := relocateTIFFAsORF(originalBytes, modifiedEXIF, rawIPTC, rawXMP)
+	if err != nil {
+		return err
+	}
+	if _, err = w.Write(updated); err != nil {
+		return fmt.Errorf("tiff: write updated: %w", err)
+	}
+	return nil
+}
+
+// InjectWithEXIFRW2 is the RW2-specific variant of InjectWithEXIF.
+//
+// It handles two Panasonic RW2 non-standard features before relocation:
+//   - Non-standard "IIU\x00" magic (patched to 0x2A 0x00 for exif.Parse).
+//   - 16-byte device GUID at bytes [8:24] (GUID is saved and re-inserted post-encode;
+//     all absolute offsets in IFD0 are rebased by +16 after the GUID insertion).
+//
+// originalBytes must carry the valid RW2 magic "IIU\x00" at bytes [0:4]; the
+// caller (writeTIFFRW2 in write.go) is responsible for restoring the real magic
+// since rw2.Extract patches bytes [2:4] to 0x2A 0x00.
+//
+// This is the entry point used by gometadata.Write for FormatRW2.
+// See relocate_rw2.go for the full algorithm description.
+func InjectWithEXIFRW2(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+	// Pass-through: no metadata changes requested and no EXIF edits.
+	if modifiedEXIF == nil && rawIPTC == nil && rawXMP == nil {
+		if _, err := w.Write(originalBytes); err != nil {
+			return fmt.Errorf("tiff: write: %w", err)
+		}
+		return nil
+	}
+
+	updated, err := relocateTIFFAsRW2(originalBytes, modifiedEXIF, rawIPTC, rawXMP)
+	if err != nil {
+		return err
+	}
+	if _, err = w.Write(updated); err != nil {
+		return fmt.Errorf("tiff: write updated: %w", err)
+	}
+	return nil
+}
+
 // upsertIFD0Entry adds or replaces an entry in ifd for the given tag while
 // maintaining the sorted-by-tag invariant required by IFD.Get (binary search).
 //

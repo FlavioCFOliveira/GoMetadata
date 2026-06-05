@@ -316,7 +316,9 @@ func TestRefineTIFFVariant(t *testing.T) {
 // Validated against a real Sony DSLR-A500 ARW: ImageDataHash IN==OUT, all 52
 // MakerNote tags + SR2Private preserved.
 //
-// FormatORF and FormatRW2 remain read-only: non-standard TIFF magic.
+// Task #104: FormatORF and FormatRW2 are now writable. ORF uses the ORF-specific
+// write path (magic patching for IIRO/IIRS). RW2 uses the RW2-specific write path
+// (GUID preservation + offset rebasing). Both validated against real corpus files.
 //
 // CR3 returns true as of task #91: cr3.Inject now implements stco/co64 offset
 // relocation, walking every trak/stbl/{stco,co64} table inside the rebuilt
@@ -324,11 +326,11 @@ func TestRefineTIFFVariant(t *testing.T) {
 func TestSupportsWrite(t *testing.T) {
 	t.Parallel()
 
-	// Task #103: ARW is now writable — Sony MakerNote offset rebase + SR2Private
-	// block relocation validated against real Sony DSLR-A500 corpus file.
+	// Task #104: ORF and RW2 are now writable — ORF IIRO/IIRS magic patching and
+	// RW2 GUID insertion + offset rebasing validated against real corpus files.
 	writable := []FormatID{
 		FormatJPEG, FormatTIFF, FormatDNG, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3,
-		FormatCR2, FormatNEF, FormatARW,
+		FormatCR2, FormatNEF, FormatARW, FormatORF, FormatRW2,
 	}
 	for _, f := range writable {
 		if !SupportsWrite(f) {
@@ -336,9 +338,8 @@ func TestSupportsWrite(t *testing.T) {
 		}
 	}
 
-	// ORF/RW2: non-standard magic, not yet supported.
+	// Only FormatUnknown and out-of-range IDs should return false.
 	notWritable := []FormatID{
-		FormatORF, FormatRW2,
 		FormatUnknown,
 	}
 	for _, f := range notWritable {
