@@ -12,8 +12,10 @@ import (
 const magicLen = 12
 
 // tiffScanSize is the number of bytes read for TIFF-variant refinement.
-// 8 (TIFF header) + 2 (IFD count) + 64×12 (IFD entries) + 256 (Make value) = 1034 bytes.
-const tiffScanSize = 1034
+// Classic TIFF:  8 (header) + 2 (IFD count) + 64×12 (IFD entries) + 256 (Make value) = 1034 bytes.
+// BigTIFF:      16 (header) + 8 (IFD count) + 64×20 (IFD entries) + 256 (Make value) = 1560 bytes.
+// We use the larger value so the same pool buffer covers both cases.
+const tiffScanSize = 1560
 
 // tiffScanPool recycles the scan buffer used by refineTIFFVariant so that the
 // 1 KiB allocation is amortised to zero after the first call.
@@ -82,17 +84,37 @@ func isHEIFFamily(b []byte) bool {
 }
 
 // isTIFFLittleEndian reports whether b begins with the TIFF little-endian
-// byte-order mark "II" followed by magic value 0x002A.
+// byte-order mark "II" followed by classic TIFF magic value 0x002A.
+// BigTIFF (magic 0x002B) is handled separately by isBigTIFFLittleEndian.
 func isTIFFLittleEndian(b []byte) bool {
 	return len(b) >= 4 &&
 		b[0] == 0x49 && b[1] == 0x49 && b[2] == 0x2A && b[3] == 0x00
 }
 
 // isTIFFBigEndian reports whether b begins with the TIFF big-endian
-// byte-order mark "MM" followed by magic value 0x002A.
+// byte-order mark "MM" followed by classic TIFF magic value 0x002A.
+// BigTIFF (magic 0x002B) is handled separately by isBigTIFFBigEndian.
 func isTIFFBigEndian(b []byte) bool {
 	return len(b) >= 4 &&
 		b[0] == 0x4D && b[1] == 0x4D && b[2] == 0x00 && b[3] == 0x2A
+}
+
+// isBigTIFFLittleEndian reports whether b begins with the BigTIFF little-endian
+// byte-order mark "II" followed by BigTIFF magic value 0x002B.
+// BigTIFF spec (Aware Systems / libtiff) §2: magic = 43 (0x002B).
+// Layout: 'I'(49) 'I'(49) 0x2B 0x00.
+func isBigTIFFLittleEndian(b []byte) bool {
+	return len(b) >= 4 &&
+		b[0] == 0x49 && b[1] == 0x49 && b[2] == 0x2B && b[3] == 0x00
+}
+
+// isBigTIFFBigEndian reports whether b begins with the BigTIFF big-endian
+// byte-order mark "MM" followed by BigTIFF magic value 0x002B.
+// BigTIFF spec (Aware Systems / libtiff) §2: magic = 43 (0x002B).
+// Layout: 'M'(4D) 'M'(4D) 0x00 0x2B.
+func isBigTIFFBigEndian(b []byte) bool {
+	return len(b) >= 4 &&
+		b[0] == 0x4D && b[1] == 0x4D && b[2] == 0x00 && b[3] == 0x2B
 }
 
 // isORF reports whether b begins with an Olympus ORF magic marker.
@@ -120,6 +142,8 @@ func isRW2(b []byte) bool {
 // --------------------------------------------------------------------------
 
 // detectMagic identifies the format from magic bytes alone.
+//
+//nolint:cyclop,gocyclo // format-dispatch switch: adding new formats necessarily increases complexity
 func detectMagic(b []byte) FormatID {
 	if len(b) < 2 {
 		return FormatUnknown
@@ -141,6 +165,14 @@ func detectMagic(b []byte) FormatID {
 	// NEF/ARW/DNG require IFD inspection via refineTIFFVariant.
 	if isTIFFLittleEndian(b) || isTIFFBigEndian(b) {
 		return detectTIFFVariant(b)
+	}
+	// BigTIFF magic (LE or BE). BigTIFF spec (Aware Systems / libtiff) §2: magic
+	// value 0x002B replaces 0x002A in classic TIFF. tiff.Extract handles both
+	// classic and BigTIFF, so we return FormatTIFF here; Detect will call
+	// refineTIFFVariant which reads the magic from the file and auto-selects the
+	// correct IFD layout (BigTIFF-aware walk vs classic walk).
+	if isBigTIFFLittleEndian(b) || isBigTIFFBigEndian(b) {
+		return FormatTIFF
 	}
 	if isORF(b) {
 		return FormatORF
@@ -194,8 +226,9 @@ func detectTIFFVariant(b []byte) FormatID {
 // IFD helpers for TIFF-variant refinement.
 // --------------------------------------------------------------------------
 
-// findMakeTagInIFD iterates over count IFD0 entries starting at pos in data,
-// looking for TagDNGVersion (0xC612) and TagMake (0x010F).
+// findMakeTagInIFD iterates over count classic-TIFF IFD0 entries (12 bytes
+// each) starting at pos in data, looking for TagDNGVersion (0xC612) and
+// TagMake (0x010F).
 //
 // If TagDNGVersion is found the file is definitely DNG (Adobe DNG Spec §6):
 // isDNG is set to true and makeRaw is nil.
@@ -245,6 +278,61 @@ func findMakeTagInIFD(data []byte, order binary.ByteOrder, count, pos int) (make
 	return makeRaw, false
 }
 
+// findMakeTagInIFDBigTIFF iterates over count BigTIFF IFD0 entries (20 bytes
+// each) starting at pos in data, looking for TagDNGVersion (0xC612) and
+// TagMake (0x010F).
+//
+// BigTIFF IFD entry layout (BigTIFF spec §2):
+//
+//	bytes  0-1:  tag  (uint16)
+//	bytes  2-3:  type (uint16)
+//	bytes  4-11: count (uint64)
+//	bytes 12-19: value-or-offset (uint64); inline when typeSz*count <= 8
+//
+// If TagDNGVersion is found the file is DNG (Adobe DNG Spec §6).
+// Otherwise makeRaw carries the raw ASCII Make bytes (may be nil).
+func findMakeTagInIFDBigTIFF(data []byte, order binary.ByteOrder, count, pos int) (makeRaw []byte, isDNG bool) {
+	for i := 0; i < count; i++ { //nolint:intrange,modernize // binary parser: loop variable is a byte-slice offset multiplier
+		e := pos + i*20
+		if e+20 > len(data) {
+			break
+		}
+		tag := order.Uint16(data[e:])
+		typ := order.Uint16(data[e+2:])
+		cnt := order.Uint64(data[e+4:])
+
+		switch tag {
+		case 0xC612: // TagDNGVersion — present only in DNG files (Adobe DNG Spec §6).
+			return nil, true
+
+		case 0x010F: // TagMake — ASCII string (TIFF §8, type 2 = TypeASCII).
+			if typ != 2 { // TypeASCII
+				break
+			}
+			total := cnt // ASCII: 1 byte per character
+			if total == 0 {
+				break
+			}
+			// BigTIFF spec §2: inline threshold is 8 bytes.
+			if total <= 8 {
+				// Inline: value is in bytes [e+12 : e+12+total].
+				// e+20 ≤ len(data) is already verified above; total ≤ 8 ensures
+				// e+12+total ≤ e+20 ≤ len(data).
+				makeRaw = data[e+12 : e+12+int(total)]
+			} else {
+				// Out-of-line: bytes [e+12:e+20] hold a uint64 file offset.
+				off := order.Uint64(data[e+12:])
+				end := off + total
+				if off > uint64(len(data)) || total > uint64(len(data))-off {
+					break
+				}
+				makeRaw = data[off:end]
+			}
+		}
+	}
+	return makeRaw, false
+}
+
 // mapMakeToFormat maps trimmed Make bytes to the appropriate RAW FormatID.
 // Returns FormatNEF for Nikon, FormatARW for Sony, and FormatTIFF for all
 // other values (including nil/empty, which means no Make tag was found).
@@ -266,21 +354,27 @@ func mapMakeToFormat(makeBytes []byte) FormatID {
 
 // parseTIFFScanHeader reads up to tiffScanSize bytes from r (which must be
 // positioned at file offset 0) and returns the byte order, the IFD0 entry
-// count, the byte position of the first IFD0 entry, the raw data slice, the
-// pool pointer (caller must return it via tiffScanPool.Put), and whether
-// parsing succeeded. On failure the pool buffer is returned automatically and
-// the returned bp is nil.
-func parseTIFFScanHeader(r io.ReadSeeker) (order binary.ByteOrder, count, pos int, data []byte, bp *[]byte, ok bool) {
+// count, the byte position of the first IFD0 entry, the raw data slice,
+// whether the file is BigTIFF, the pool pointer (caller must return it via
+// tiffScanPool.Put), and whether parsing succeeded. On failure the pool buffer
+// is returned automatically and the returned bp is nil.
+//
+// Supports both classic TIFF (8-byte header, uint16 entry count, uint32 IFD
+// offset) and BigTIFF (16-byte header, uint64 entry count, uint64 IFD offset).
+// BigTIFF spec (Aware Systems / libtiff) §2.
+//
+//nolint:cyclop // BigTIFF vs classic dual-path header parsing; complexity is intrinsic to the two-format dispatch
+func parseTIFFScanHeader(r io.ReadSeeker) (order binary.ByteOrder, count, pos int, data []byte, bigTIFF bool, bp *[]byte, ok bool) {
 	bp = tiffScanPool.Get().(*[]byte) //nolint:forcetypeassert,revive // tiffScanPool.New always stores *[]byte; pool invariant
 	data = *bp
 	n, _ := io.ReadFull(r, data)
 	if n < 10 {
 		tiffScanPool.Put(bp)
-		return nil, 0, 0, nil, nil, false
+		return nil, 0, 0, nil, false, nil, false
 	}
 	data = data[:n]
 
-	// Parse byte order from the TIFF header (TIFF §2).
+	// Parse byte order from the TIFF/BigTIFF header (TIFF §2; BigTIFF spec §2).
 	switch {
 	case data[0] == 'I' && data[1] == 'I':
 		order = binary.LittleEndian
@@ -288,30 +382,90 @@ func parseTIFFScanHeader(r io.ReadSeeker) (order binary.ByteOrder, count, pos in
 		order = binary.BigEndian
 	default:
 		tiffScanPool.Put(bp)
-		return nil, 0, 0, nil, nil, false
+		return nil, 0, 0, nil, false, nil, false
 	}
 
-	ifd0Off := order.Uint32(data[4:])
+	// BigTIFF spec §2: magic value 0x002B (43) distinguishes BigTIFF from
+	// classic TIFF (magic 0x002A = 42). The header layout differs:
+	//   Classic:  magic(2) + ifd0Off32(4) at bytes [2:8]
+	//   BigTIFF:  magic(2) + offsetBytesize(2) + constant(2) + ifd0Off64(8) at bytes [2:16]
+	magic := order.Uint16(data[2:])
+	bigTIFF = magic == 0x002B
+
+	if bigTIFF {
+		count, pos, ok = parseBigTIFFIFD0(data, order, n)
+		if !ok {
+			tiffScanPool.Put(bp)
+			return nil, 0, 0, nil, false, nil, false
+		}
+	} else {
+		count, pos, ok = parseClassicTIFFIFD0(data, order)
+		if !ok {
+			tiffScanPool.Put(bp)
+			return nil, 0, 0, nil, false, nil, false
+		}
+	}
+
+	return order, count, pos, data, bigTIFF, bp, true
+}
+
+// parseBigTIFFIFD0 extracts the IFD0 entry count and first-entry position from
+// a BigTIFF scan buffer. Returns ok=false if the header or IFD is malformed.
+//
+// BigTIFF spec §2: 16-byte header; IFD0 offset is uint64 at bytes [8:16].
+func parseBigTIFFIFD0(data []byte, order binary.ByteOrder, n int) (count, pos int, ok bool) {
+	// BigTIFF header requires at least 16 bytes.
+	if n < 16 {
+		return 0, 0, false
+	}
+	// bytes [4:6]: offsetBytesize must be 8 (BigTIFF spec §2).
+	if order.Uint16(data[4:]) != 8 {
+		return 0, 0, false
+	}
+	// IFD0 offset is a uint64 at bytes [8:16].
+	ifd0Off := order.Uint64(data[8:])
+
+	// Guard: IFD0 offset + 8-byte count field must fit in data.
+	if ifd0Off > uint64(len(data)) || uint64(len(data))-ifd0Off < 8 {
+		return 0, 0, false
+	}
+
+	// BigTIFF IFD entry count is uint64; cap at 512 for the refiner
+	// (same sanity limit as classic TIFF).
+	rawCount := order.Uint64(data[ifd0Off:])
+	if rawCount > 512 {
+		return 0, 0, false
+	}
+	// ifd0Off ≤ uint64(len(data))-8 ≤ tiffScanSize-8 = 1552, so ifd0Off+8
+	// fits in int on any platform. The +8 offset points past the count field.
+	return int(rawCount), int(ifd0Off) + 8, true //nolint:gosec // G115: ifd0Off ≤ tiffScanSize (1560) — safe int cast
+}
+
+// parseClassicTIFFIFD0 extracts the IFD0 entry count and first-entry position
+// from a classic TIFF scan buffer. Returns ok=false if the header is malformed.
+//
+// Classic TIFF §2: IFD0 offset is uint32 at bytes [4:8].
+func parseClassicTIFFIFD0(data []byte, order binary.ByteOrder) (count, pos int, ok bool) {
+	ifd0Off32 := order.Uint32(data[4:])
 	// Use uint64 arithmetic to avoid int truncation on 32-bit platforms
 	// (GOARCH=386/arm): int(uint32 >= 2^31) is negative, which would cause the
-	// guard to pass while the subsequent slice panics. Performing the comparison
-	// in uint64 is safe on all platforms (task #74).
-	if uint64(ifd0Off)+2 > uint64(len(data)) {
-		tiffScanPool.Put(bp)
-		return nil, 0, 0, nil, nil, false
+	// guard to pass while the subsequent slice panics. (task #74)
+	if uint64(ifd0Off32)+2 > uint64(len(data)) {
+		return 0, 0, false
 	}
 
-	count = int(order.Uint16(data[ifd0Off:]))
-	if count > 512 {
-		tiffScanPool.Put(bp)
-		return nil, 0, 0, nil, nil, false
+	entryCount := int(order.Uint16(data[ifd0Off32:]))
+	if entryCount > 512 {
+		return 0, 0, false
 	}
-	pos = int(ifd0Off) + 2
-	return order, count, pos, data, bp, true
+	// ifd0Off32 ≤ len(data)-2 ≤ tiffScanSize, so +2 fits in int on all platforms.
+	return entryCount, int(ifd0Off32) + 2, true
 }
 
 // refineTIFFVariant reads IFD0 from r to distinguish DNG, NEF, and ARW from
-// a generic TIFF file. r must be positioned at the start of the file.
+// a generic TIFF file. Handles both classic TIFF (magic 0x002A) and BigTIFF
+// (magic 0x002B); the magic is re-read from the file so no information is lost.
+// r must be positioned at the start of the file.
 // Returns FormatTIFF when the variant cannot be determined.
 func refineTIFFVariant(r io.ReadSeeker) FormatID {
 	// Seek to start — Detect may have left the reader after the initial read.
@@ -319,12 +473,22 @@ func refineTIFFVariant(r io.ReadSeeker) FormatID {
 		return FormatTIFF
 	}
 
-	order, count, pos, data, bp, ok := parseTIFFScanHeader(r)
+	order, count, pos, data, bigTIFF, bp, ok := parseTIFFScanHeader(r)
 	if !ok {
 		return FormatTIFF
 	}
 
-	makeRaw, isDNG := findMakeTagInIFD(data, order, count, pos)
+	var makeRaw []byte
+	var isDNG bool
+	if bigTIFF {
+		// BigTIFF spec §2: 20-byte IFD entries with uint64 count and uint64
+		// value-or-offset fields. Use the BigTIFF-aware tag scanner.
+		makeRaw, isDNG = findMakeTagInIFDBigTIFF(data, order, count, pos)
+	} else {
+		// Classic TIFF §2: 12-byte IFD entries.
+		makeRaw, isDNG = findMakeTagInIFD(data, order, count, pos)
+	}
+
 	// mapMakeToFormat must be called before tiffScanPool.Put(bp): makeRaw is a
 	// subslice of the pool buffer (*bp). Putting bp back before reading makeRaw
 	// would allow another goroutine to overwrite the buffer concurrently.

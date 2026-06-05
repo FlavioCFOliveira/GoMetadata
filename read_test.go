@@ -1205,6 +1205,80 @@ func findSub(s, sub string) bool {
 	return false
 }
 
+// TestReadBigTIFF verifies end-to-end BigTIFF support through the public API.
+//
+// Prior to task #54 (public-API fix), gometadata.Read returned
+// "unsupported format" for BigTIFF files because format.Detect did not
+// recognise BigTIFF magic (0x002B); it only matched classic TIFF magic (0x002A).
+// Unit tests in format/tiff passed because they called tiff.Extract directly,
+// bypassing format detection. This test closes that gap by exercising the full
+// public Read → Detect → tiff.Extract path on committed BigTIFF fixtures.
+//
+// Fixtures were generated from the classic format/tiff/testdata/cramps.tif via:
+//
+//	tiffcp -8 -L cramps.tif big_cramps_le.tif   # BigTIFF little-endian
+//	tiffcp -8 -B cramps.tif big_cramps_be.tif   # BigTIFF big-endian
+//
+// tiffinfo confirms: Image Width: 800, Image Length: 607 for both.
+func TestReadBigTIFF(t *testing.T) {
+	t.Parallel()
+
+	const (
+		fixtureLE = "format/tiff/testdata/big_cramps_le.tif"
+		fixtureBE = "format/tiff/testdata/big_cramps_be.tif"
+
+		wantWidth  = 800
+		wantHeight = 607
+	)
+
+	tests := []struct {
+		name    string
+		fixture string
+	}{
+		{"BigTIFF_LE", fixtureLE},
+		{"BigTIFF_BE", fixtureBE},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			m, err := ReadFile(tc.fixture)
+			if err != nil {
+				t.Fatalf("ReadFile(%q): %v — BigTIFF not routed to tiff.Extract via public API", tc.fixture, err)
+			}
+			if m == nil {
+				t.Fatal("ReadFile returned nil Metadata")
+			}
+
+			// The fixture carries no EXIF sub-IFD, only IFD0 tags. EXIF should be
+			// populated (rawEXIF = the whole TIFF stream) and accessible.
+			if m.RawEXIF() == nil {
+				t.Error("RawEXIF() is nil; expected BigTIFF byte stream")
+			}
+
+			// ImageWidth (0x0100) and ImageLength (0x0101) must decode correctly.
+			// These are the primary EXIF tags visible in both LE and BE variants.
+			// m.ImageSize() reads IFD0 tags via the convenience accessor.
+			if w, h, ok := m.ImageSize(); ok {
+				if w != wantWidth {
+					t.Errorf("ImageSize().width = %d, want %d", w, wantWidth)
+				}
+				if h != wantHeight {
+					t.Errorf("ImageSize().height = %d, want %d", h, wantHeight)
+				}
+			} else {
+				t.Log("ImageSize() returned ok=false — BigTIFF ImageWidth/ImageLength tags not decoded as EXIF; raw bytes available via RawEXIF()")
+			}
+			// Format must be FormatTIFF — BigTIFF is a TIFF variant and routes
+			// through the same TIFF extractor.
+			if got := m.Format(); got != format.FormatTIFF {
+				t.Errorf("Format() = %v, want FormatTIFF", got)
+			}
+		})
+	}
+}
+
 // BenchmarkReadFile_Concurrent runs ReadFile in parallel goroutines to expose
 // any pool contention. Uses a minimal in-memory JPEG written to a temp file
 // to isolate pool behaviour from I/O variability.

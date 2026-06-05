@@ -354,6 +354,55 @@ func TestSupportsWrite(t *testing.T) {
 	}
 }
 
+// TestDetectBigTIFF verifies that Detect recognises BigTIFF magic (0x002B) for
+// both byte orders and returns FormatTIFF (BigTIFF routes to tiff.Extract,
+// which handles both classic and BigTIFF internally).
+//
+// BigTIFF spec (Aware Systems / libtiff) §2: magic = 43 (0x002B).
+// Task #54: prior to this fix, only classic magic 0x002A was recognised.
+func TestDetectBigTIFF(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		magic []byte
+	}{
+		{
+			// BigTIFF little-endian: "II" + 0x2B 0x00 + offsetBytesize(2) + constant(2) + ifd0Off(8)
+			name: "BigTIFF_LE",
+			magic: []byte{
+				0x49, 0x49, 0x2B, 0x00, // "II" + magic 0x002B (LE)
+				0x08, 0x00, // offsetBytesize = 8 (LE)
+				0x00, 0x00, // constant = 0
+				0x10, 0x00, 0x00, 0x00, // IFD0 offset = 16 (LE uint64 low 32)
+			},
+		},
+		{
+			// BigTIFF big-endian: "MM" + 0x00 0x2B + offsetBytesize(2) + constant(2) + ifd0Off(8)
+			name: "BigTIFF_BE",
+			magic: []byte{
+				0x4D, 0x4D, 0x00, 0x2B, // "MM" + magic 0x002B (BE)
+				0x00, 0x08, // offsetBytesize = 8 (BE)
+				0x00, 0x00, // constant = 0
+				0x00, 0x00, 0x00, 0x00, // IFD0 offset = 16 (BE uint64 high 32)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := Detect(bytes.NewReader(tc.magic))
+			if err != nil {
+				t.Fatalf("Detect(%s) error = %v", tc.name, err)
+			}
+			if got != FormatTIFF {
+				t.Errorf("Detect(%s) = %v, want FormatTIFF", tc.name, got)
+			}
+		})
+	}
+}
+
 // TestDetectSeekAfterRefinement verifies that Detect leaves the reader at
 // position 0 even after TIFF-variant refinement reads additional bytes.
 func TestDetectSeekAfterRefinement(t *testing.T) {
