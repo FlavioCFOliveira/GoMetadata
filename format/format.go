@@ -64,14 +64,10 @@ func (f FormatID) String() string {
 // (strips, tiles, main-image JPEG) and appends it at a fresh absolute offset,
 // preserving pixel data byte-identically.
 //
-// FormatDNG returns true as of task #94. The copy-and-relocate serializer now
-// recursively follows SubIFDs (tag 0x014A), enumerates their strip/tile blocks,
-// and relocates both the SubIFD structures and the image blocks they reference.
-// This covers the canonical DNG layout: IFD0 holds a thumbnail with its own
-// strips; one or more SubIFDs carry the full-resolution image data. Multi-SubIFD
-// and tiled SubIFD structures are supported. DNG write has been validated with
-// a synthetic DNG-like fixture (task #94 acceptance test). Validation against a
-// real DNG corpus is recommended before relying on this in production.
+// FormatDNG returns false (task #101 re-gate). Real-corpus testing found that
+// the SubIFD relocation path silently loses out-of-line RATIONAL values
+// (e.g. XResolution/YResolution 300→undef). DNG write is disabled as a
+// fail-safe until bug #98 is resolved.
 //
 // CR3 returns true. CR3 uses an ISOBMFF container; cr3.Inject rebuilds the
 // Canon UUID box with the new CMTx payloads and then walks every
@@ -84,8 +80,11 @@ func (f FormatID) String() string {
 // Write and WriteFile return ErrWriteNotSupported for those formats.
 func SupportsWrite(f FormatID) bool {
 	switch f {
-	case FormatJPEG, FormatTIFF, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3, FormatDNG:
+	case FormatJPEG, FormatTIFF, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3:
 		return true
+	case FormatDNG:
+		// Task #101 re-gate: SubIFD out-of-line RATIONAL value loss (bug #98).
+		return false
 	case FormatCR2, FormatNEF, FormatARW, FormatORF, FormatRW2:
 		// Task #95: RAW write requires manufacturer-specific offset rebasing.
 		return false

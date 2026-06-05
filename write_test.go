@@ -380,10 +380,10 @@ func TestWriteTIFFSucceeds(t *testing.T) {
 // magic and is only distinguished by IFD tag inspection, so a synthetic minimal
 // file would be detected as plain TIFF.
 //
-// DNG was removed from this test in task #94: FormatDNG is now fully writable
-// via the copy-and-relocate SubIFD relocation path. The DNG round-trip is
-// covered by TestDNGWriteReadRoundTrip (synthetic DNG-like fixture) and by
-// TestSubIFDRelocateSingleSubIFDStrip / TestSubIFDExactByteAtOffset.
+// Task #101 (re-gate DNG): DNG is back in this test asserting ErrWriteNotSupported.
+// Real-corpus testing found that SubIFD out-of-line RATIONAL values (e.g.
+// XResolution/YResolution) are silently lost after write (bug #98). DNG write
+// is disabled as a fail-safe until bug #98 is resolved.
 func TestWriteTIFFBasedFormatsFromCorpus(t *testing.T) {
 	t.Parallel()
 
@@ -392,6 +392,8 @@ func TestWriteTIFFBasedFormatsFromCorpus(t *testing.T) {
 		path string
 	}{
 		{"NEF", "testdata/corpus/raw/exiftool/Nikon.nef"},
+		// DNG re-gated (task #101): real-corpus SubIFD RATIONAL value loss (bug #98).
+		{"DNG", "testdata/corpus/raw/exiftool/Pentax.dng"},
 	}
 
 	for _, tc := range cases {
@@ -428,43 +430,28 @@ func TestWriteTIFFBasedFormatsFromCorpus(t *testing.T) {
 	}
 }
 
-// TestDNGWriteReadRoundTrip is the gometadata.Write → Read round-trip test for
-// FormatDNG (task #94 acceptance criterion (e)).
+// TestDNGWriteGate verifies that gometadata.Write returns ErrWriteNotSupported
+// for a DNG file (task #101 re-gate, pending bug #98 SubIFD value-loss fix).
 //
-// It builds a synthetic DNG-like TIFF stream (IFD0 thumbnail strip + SubIFD0
-// full-res strip, tag 0x014A, plus DNGVersion 0xC612 for format detection),
-// calls gometadata.Write to inject modified XMP (EXIF unchanged so rawEXIF
-// passes through as the full TIFF base), then reads back and verifies:
-//   - format.SupportsWrite(FormatDNG) = true
-//   - Write returns no error (not ErrWriteNotSupported)
-//   - the output re-parses via Read
-//   - the IFD0 thumbnail and SubIFD0 full-res strip blocks are byte-identical
-//
-// The test also exercises WriteFile to confirm the file-level API works.
-//
-// EXIF is NOT modified in this test; only XMP is injected. This is intentional:
-// when EXIF is modified, encodeEXIF returns exif.Encode(m.EXIF) — a minimal
-// TIFF buffer without image data — which breaks the copy-and-relocate base.
-// TIFF/DNG EXIF modification via gometadata.Write requires the caller to either
-// (a) not modify EXIF, or (b) use tiff.Inject directly with the full file as base.
-// This is a known limitation and is documented here. The sub-IFD block integrity
-// is proven separately in format/tiff/relocate_subifd_test.go.
-//
-// This test uses a synthetic DNG-like fixture (no real-corpus dependency).
-// Validation against a real DNG corpus is recommended before release.
-func TestDNGWriteReadRoundTrip(t *testing.T) { //nolint:paralleltest // not parallel: uses t.TempDir for file I/O
+// The test builds a synthetic DNG-like TIFF stream (IFD0 thumbnail strip +
+// SubIFD0 full-res strip, tag 0x014A, plus DNGVersion 0xC612 for format
+// detection) and confirms:
+//   - format.Detect correctly classifies the file as FormatDNG
+//   - format.SupportsWrite(FormatDNG) = false
+//   - Write returns ErrWriteNotSupported (errors.Is match)
+//   - Write produces no output bytes before returning the error
+//   - WriteFile returns ErrWriteNotSupported and does NOT modify the source file
+func TestDNGWriteGate(t *testing.T) { //nolint:paralleltest // not parallel: uses t.TempDir for file I/O
 	// Build a minimal DNG-like TIFF:
 	//   TIFF header (LE) + IFD0 (thumb strips + 0x014A SubIFDs + 0xC612 DNGVersion) +
 	//   SubIFD0 (full-res strips).
 	//   DNGVersion (0xC612) makes format.Detect classify this as FormatDNG.
 	order := binary.LittleEndian
 
-	thumbStrip := []byte("DNG-ROUNDTRIP-THUMB-STRIP-DATA-!")
-	fullStrip := []byte("DNG-ROUNDTRIP-FULLRES-STRIP-DATA")
+	thumbStrip := []byte("DNG-GATE-THUMB-STRIP-DATA-GUARD!")
+	fullStrip := []byte("DNG-GATE-FULLRES-STRIP-DATAGUARD")
 
-	// IFD0: 6 entries (sorted by tag) — ImageWidth, ImageLength, StripOffsets,
-	// StripByteCounts, SubIFDs(0x014A), DNGVersion(0xC612).
-	// SubIFD0: 4 entries.
+	// IFD0: 6 entries (sorted by tag).
 	nIFD0 := 6
 	nSubIFD0 := 4
 
@@ -526,9 +513,9 @@ func TestDNGWriteReadRoundTrip(t *testing.T) { //nolint:paralleltest // not para
 		t.Fatalf("format.Detect = %v, want FormatDNG", detectedFmt)
 	}
 
-	// (e) Verify SupportsWrite(FormatDNG) = true.
-	if !format.SupportsWrite(format.FormatDNG) {
-		t.Fatal("format.SupportsWrite(FormatDNG) = false, want true")
+	// Task #101: SupportsWrite(FormatDNG) must be false (fail-safe gate, bug #98).
+	if format.SupportsWrite(format.FormatDNG) {
+		t.Fatal("format.SupportsWrite(FormatDNG) = true, want false (re-gated by task #101)")
 	}
 
 	// Read the DNG file's metadata.
@@ -536,44 +523,24 @@ func TestDNGWriteReadRoundTrip(t *testing.T) { //nolint:paralleltest // not para
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
-
-	// Inject XMP only (do NOT modify EXIF: see doc comment above).
-	// Clear m.EXIF so that encodeEXIF returns m.rawEXIF (= the full original
-	// TIFF buffer including image data). This is the correct base for relocateTIFF.
-	// If m.EXIF is kept non-nil, encodeEXIF calls exif.Encode(m.EXIF) which
-	// produces a minimal TIFF without image data, causing ErrBlockOutOfBounds.
 	m.EXIF = nil
-	wantXMPCaption := "DNG round-trip XMP caption"
 	m.XMP = &xmp.XMP{Properties: make(map[string]map[string]string)}
-	m.XMP.SetCaption(wantXMPCaption)
+	m.XMP.SetCaption("DNG gate test")
 
-	var outBuf bytes.Buffer
+	// Write must return ErrWriteNotSupported and produce no output.
+	var outBuf countingWriter
 	writeErr := Write(bytes.NewReader(original), &outBuf, m)
-	if writeErr != nil {
-		t.Fatalf("Write returned error: %v", writeErr)
+	if writeErr == nil {
+		t.Fatal("Write returned nil; want ErrWriteNotSupported")
+	}
+	if !errors.Is(writeErr, ErrWriteNotSupported) {
+		t.Errorf("errors.Is(err, ErrWriteNotSupported) = false; got: %v", writeErr)
+	}
+	if outBuf.n > 0 {
+		t.Errorf("Write wrote %d byte(s) before returning error; want 0", outBuf.n)
 	}
 
-	output := outBuf.Bytes()
-	if len(output) == 0 {
-		t.Fatal("Write produced empty output")
-	}
-
-	// (d) Re-parse; output readable.
-	m2, err := Read(bytes.NewReader(output))
-	if err != nil {
-		t.Fatalf("Read after Write: %v", err)
-	}
-	_ = m2
-
-	// (a)/(c) IFD0 thumbnail and SubIFD0 full-res blocks must appear verbatim.
-	if !bytes.Contains(output, thumbStrip) {
-		t.Error("IFD0 thumbnail strip data not found verbatim in output (criterion a)")
-	}
-	if !bytes.Contains(output, fullStrip) {
-		t.Error("SubIFD0 full-res strip data not found verbatim in output (criterion c)")
-	}
-
-	// WriteFile round-trip.
+	// WriteFile must return ErrWriteNotSupported and leave the file unmodified.
 	dir := t.TempDir()
 	dngPath := filepath.Join(dir, "test.dng")
 	if err := os.WriteFile(dngPath, original, 0o644); err != nil { //nolint:gosec // G306: test helper
@@ -584,16 +551,24 @@ func TestDNGWriteReadRoundTrip(t *testing.T) { //nolint:paralleltest // not para
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
-	mf.EXIF = nil // clear to pass rawEXIF (full file) as base; see doc comment above
+	mf.EXIF = nil
 	mf.XMP = &xmp.XMP{Properties: make(map[string]map[string]string)}
-	mf.XMP.SetCaption("WriteFile DNG round-trip")
-	if wfErr := WriteFile(dngPath, mf); wfErr != nil {
-		t.Fatalf("WriteFile: %v", wfErr)
+	mf.XMP.SetCaption("DNG WriteFile gate test")
+	wfErr := WriteFile(dngPath, mf)
+	if wfErr == nil {
+		t.Fatal("WriteFile returned nil; want ErrWriteNotSupported")
+	}
+	if !errors.Is(wfErr, ErrWriteNotSupported) {
+		t.Errorf("WriteFile: errors.Is(err, ErrWriteNotSupported) = false; got: %v", wfErr)
 	}
 
-	// Verify the file can be read back after WriteFile.
-	if _, err := ReadFile(dngPath); err != nil {
-		t.Fatalf("ReadFile after WriteFile: %v", err)
+	// File must be unmodified.
+	got, readErr := os.ReadFile(dngPath)
+	if readErr != nil {
+		t.Fatalf("read target after WriteFile error: %v", readErr)
+	}
+	if !bytes.Equal(got, original) {
+		t.Error("DNG file was modified despite ErrWriteNotSupported")
 	}
 }
 

@@ -16,6 +16,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Changed
 
+- **DNG write re-gated (task #101, pending bug #98)** (`write.go`, `format/format.go`): `SupportsWrite(FormatDNG)` now returns `false` again and `Write`/`WriteFile` return `ErrWriteNotSupported` for DNG. Real-corpus testing (Pentax QS1.dng) found that the SubIFD relocation path silently loses out-of-line RATIONAL values: `SubIFD:XResolution` and `SubIFD:YResolution` go from 300 to `undef` after write. This is a fail-safe re-gate; DNG write will be re-enabled after bug #98 (SubIFD out-of-line value preservation) is fixed. TIFF write is unaffected and continues to work correctly.
+
 - **`format.SupportsWrite` for DNG** (`format/format.go`): `SupportsWrite(FormatDNG)` now returns `true` (was `false`). The SPIKE #6 write gate for `FormatDNG` in `write.go` has been removed; `isTIFFBased()` no longer includes `FormatDNG`. The five remaining RAW variants (CR2, NEF, ARW, ORF, RW2) remain gated until task #95 (manufacturer-specific offset rebasing).
 
 - **`format.SupportsWrite` for TIFF** (`format/format.go`): `SupportsWrite(FormatTIFF)` now returns `true` (was `false`). The SPIKE #6 write gate for `FormatTIFF` in `write.go` has been removed; `isTIFFBased()` no longer includes `FormatTIFF`. The five remaining RAW variants (CR2, NEF, ARW, ORF, RW2) remain gated until task #95 (manufacturer-specific offset rebasing).

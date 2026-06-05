@@ -32,16 +32,19 @@ func (e *UnsupportedFormatError) Error() string {
 }
 
 // ErrWriteNotSupported is returned by Write and WriteFile when the caller
-// attempts to write metadata into a TIFF-based RAW container that has not yet
-// been un-gated (CR2, NEF, ARW, ORF, RW2). These formats require
-// manufacturer-specific offset handling (task #95) that is not yet implemented.
+// attempts to write metadata into a container format that is not yet writable.
 //
-// TIFF and DNG write is fully supported via the copy-and-relocate serializer
-// (tasks #92/#93/#94). CR3 write is supported via ISOBMFF offset relocation
-// (task #91).
+// Gated formats:
+//   - DNG: write is disabled pending bug #98 (SubIFD out-of-line RATIONAL
+//     value loss — XResolution/YResolution silently become undef after write).
+//   - CR2, NEF, ARW, ORF, RW2: require manufacturer-specific offset handling
+//     (task #95) that is not yet implemented.
+//
+// TIFF write is fully supported via the copy-and-relocate serializer (tasks
+// #92/#93). CR3 write is supported via ISOBMFF offset relocation (task #91).
 //
 // Use errors.Is(err, ErrWriteNotSupported) to detect this condition.
-var ErrWriteNotSupported = errors.New("writing metadata into this RAW container is not yet supported: manufacturer-specific offset handling required (CR2/NEF/ARW/ORF/RW2)")
+var ErrWriteNotSupported = errors.New("writing metadata into this container is not yet supported: DNG (bug #98 SubIFD value loss), CR2/NEF/ARW/ORF/RW2 (task #95 manufacturer offset handling)")
 
 // TruncatedFileError is returned when the input ends unexpectedly before a
 // required structure could be read.

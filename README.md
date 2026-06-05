@@ -266,7 +266,7 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 |---|---|
 | Metadata standards | EXIF 3.0 (CIPA DC-008 / TIFF 6.0), IPTC IIM 4.2, XMP (ISO 16684-1) |
 | Read | Whichever of EXIF / IPTC / XMP the container carries, across all 13 formats (IPTC is only carried by JPEG and TIFF) |
-| Write | All three standards for JPEG, TIFF, PNG, WebP, HEIF, AVIF, CR3, and DNG; preserves unmodified metadata byte-for-byte. TIFF and DNG use a copy-and-relocate serializer that preserves image-data blocks (strips/tiles, including SubIFD full-res image data) at corrected offsets. CR2, NEF, ARW, ORF, and RW2 remain read-only — see the Supported formats table |
+| Write | All three standards for JPEG, TIFF, PNG, WebP, HEIF, AVIF, and CR3; preserves unmodified metadata byte-for-byte. TIFF uses a copy-and-relocate serializer that preserves image-data blocks (strips/tiles) at corrected offsets. DNG is temporarily read-only (bug #98). CR2, NEF, ARW, ORF, and RW2 remain read-only — see the Supported formats table |
 | Atomic writes | `WriteFile` uses temp file + rename — no partial writes |
 | Format detection | Magic bytes only; file extension is never consulted |
 | MakerNote (read) | Canon, Nikon, Sony, Olympus, Panasonic, Pentax, DJI, FujiFilm, Leica, Samsung, Sigma, Minolta, Casio |
@@ -293,13 +293,15 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 | Canon CR3 | .cr3 | Yes | Yes | Yes | No | Yes |
 | Nikon NEF | .nef | Yes | No¹ | Yes | No | Yes |
 | Sony ARW | .arw | Yes | No¹ | Yes | No | Yes |
-| Adobe DNG | .dng | Yes | Yes² | Yes | No | Yes |
+| Adobe DNG | .dng | Yes | No³ | Yes | No | Yes |
 | Olympus ORF | .orf | Yes | No¹ | Yes | No | Yes |
 | Panasonic RW2 | .rw2 | Yes | No¹ | Yes | No | Yes |
 
 > ¹ **RAW write partially read-only.** `Write` and `WriteFile` return `ErrWriteNotSupported` for CR2, NEF, ARW, ORF, and RW2. These formats require manufacturer-specific offset rebasing not yet implemented (task #95). Reading is fully supported for all five. Use `format.SupportsWrite(id)` to check programmatically.
 >
-> ² **TIFF and DNG write uses copy-and-relocate** (`format/tiff/relocate.go`). Image strips, tiles, non-thumbnail JPEG blocks, and SubIFD full-resolution image data are enumerated, copied verbatim to fresh absolute offsets in the output stream, and all offset entries are patched. DNG write covers the canonical DNG layout: IFD0 thumbnail + one or more SubIFDs (tag 0x014A) carrying full-resolution image data, including multi-SubIFD and tiled-SubIFD structures. Validation against a real DNG corpus is recommended before production use.
+> ² **TIFF write uses copy-and-relocate** (`format/tiff/relocate.go`). Image strips, tiles, and non-thumbnail JPEG blocks are enumerated, copied verbatim to fresh absolute offsets in the output stream, and all offset entries are patched.
+>
+> ³ **DNG write is temporarily disabled (bug #98).** Real-corpus testing found that SubIFD out-of-line RATIONAL values (e.g. `XResolution`/`YResolution`) are silently lost after write (value becomes `undef` in the output). `Write` and `WriteFile` return `ErrWriteNotSupported` for DNG until bug #98 (SubIFD value-loss) is resolved. Reading is fully supported.
 
 ## Performance
 
