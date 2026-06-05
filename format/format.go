@@ -62,25 +62,32 @@ func (f FormatID) String() string {
 // FormatTIFF returns true as of tasks #92/#93 (epic #33 Option A). The
 // format/tiff copy-and-relocate serializer enumerates every image-data block
 // (strips, tiles, main-image JPEG) and appends it at a fresh absolute offset,
-// preserving pixel data byte-identically. SubIFD (0x014A) recursion for DNG
-// multi-image layouts is deferred to task #94.
+// preserving pixel data byte-identically.
 //
-// The six RAW variants (CR2, NEF, ARW, DNG, ORF, RW2) return false because
-// they require SubIFD recursion and/or manufacturer-specific offset handling
-// that is not yet implemented (tasks #94/#95). Write and WriteFile return
-// ErrWriteNotSupported for those formats.
+// FormatDNG returns true as of task #94. The copy-and-relocate serializer now
+// recursively follows SubIFDs (tag 0x014A), enumerates their strip/tile blocks,
+// and relocates both the SubIFD structures and the image blocks they reference.
+// This covers the canonical DNG layout: IFD0 holds a thumbnail with its own
+// strips; one or more SubIFDs carry the full-resolution image data. Multi-SubIFD
+// and tiled SubIFD structures are supported. DNG write has been validated with
+// a synthetic DNG-like fixture (task #94 acceptance test). Validation against a
+// real DNG corpus is recommended before relying on this in production.
 //
 // CR3 returns true. CR3 uses an ISOBMFF container; cr3.Inject rebuilds the
 // Canon UUID box with the new CMTx payloads and then walks every
 // trak/stbl/{stco,co64} table inside the rebuilt moov, adding delta to each
 // absolute offset that pointed at or beyond the original moov end. This
 // relocation pass was implemented in task #91.
+//
+// The five remaining RAW variants (CR2, NEF, ARW, ORF, RW2) return false because
+// they require manufacturer-specific offset handling not yet implemented (task #95).
+// Write and WriteFile return ErrWriteNotSupported for those formats.
 func SupportsWrite(f FormatID) bool {
 	switch f {
-	case FormatJPEG, FormatTIFF, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3:
+	case FormatJPEG, FormatTIFF, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3, FormatDNG:
 		return true
-	case FormatCR2, FormatNEF, FormatARW, FormatDNG, FormatORF, FormatRW2:
-		// Tasks #94/#95: RAW write requires SubIFD recursion / manufacturer offset rebasing.
+	case FormatCR2, FormatNEF, FormatARW, FormatORF, FormatRW2:
+		// Task #95: RAW write requires manufacturer-specific offset rebasing.
 		return false
 	case FormatUnknown:
 		return false

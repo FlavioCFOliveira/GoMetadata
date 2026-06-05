@@ -65,7 +65,7 @@ do with format X" and mirrors the README *Supported formats* table and `format.S
 | `format` | container name — JPEG, TIFF, PNG, WebP, HEIF, AVIF, CR2, CR3, NEF, ARW, DNG, ORF, RW2 |
 | `extensions` | recognised extensions (detection is by magic bytes, never by extension) |
 | `read` | metadata read supported — `true` for all 13 |
-| `write` | metadata write supported — **equals `format.SupportsWrite`**: `true` for JPEG/PNG/WebP/HEIF/AVIF/CR3; `false` for the 7 TIFF-based (TIFF/CR2/NEF/ARW/DNG/ORF/RW2), which are read-only. CR3 write re-enabled in task #91 (stco/co64 offset relocation implemented in `cr3.Inject`); TIFF-based are gated by `ErrWriteNotSupported` (epic #33) |
+| `write` | metadata write supported — **equals `format.SupportsWrite`**: `true` for JPEG/PNG/WebP/HEIF/AVIF/CR3/TIFF/DNG; `false` for CR2/NEF/ARW/ORF/RW2 (gated by `ErrWriteNotSupported`, task #95). TIFF write: copy-and-relocate (tasks #92/#93). DNG write: SubIFD recursive relocation (task #94). CR3 write: stco/co64 relocation (task #91) |
 | `exif` / `iptc` / `xmp` | which metadata blocks the format carries on read (`iptc` only JPEG + TIFF) |
 | `container` | structural family: `JPEG` / `TIFF` / `TIFF-based` / `ISOBMFF` / `RIFF` / `PNG` |
 
@@ -74,9 +74,9 @@ edges to pre-existing nodes cannot be added incrementally); the `format` / `cont
 properties carry the linkage. Example queries:
 
 ```cypher
-MATCH (c:FormatCapability {write:true})              RETURN c.format            // writable formats (6: JPEG, PNG, WebP, HEIF, AVIF, CR3)
-MATCH (c:FormatCapability {iptc:true})               RETURN c.format            // carry IPTC (JPEG, TIFF)
-MATCH (c:FormatCapability {container:'TIFF-based'})  RETURN c.format, c.write   // the 7 read-only RAWs
+MATCH (c:FormatCapability {write:true})              RETURN c.format            // writable formats (8: JPEG, PNG, WebP, HEIF, AVIF, CR3, TIFF, DNG)
+MATCH (c:FormatCapability {iptc:true})               RETURN c.format            // carry IPTC (JPEG, TIFF, DNG)
+MATCH (c:FormatCapability {container:'TIFF-based'})  RETURN c.format, c.write   // TIFF-based formats (TIFF/DNG writable; CR2/NEF/ARW/ORF/RW2 read-only)
 ```
 
 Out-of-scope formats (CRW, RAF, MRW, IIQ, X3F, SRW, PEF, RWL — see `doc.go`) are intentionally

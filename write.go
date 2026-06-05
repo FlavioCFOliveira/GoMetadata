@@ -83,12 +83,16 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	//
 	// FormatTIFF is un-gated as of tasks #92/#93: tiff.Inject now uses the
 	// copy-and-relocate path which enumerates every image-data block and appends
-	// it at a corrected offset. See format/tiff/relocate.go for coverage details
-	// and deferred cases (SubIFD recursion, tasks #94/#95).
+	// it at a corrected offset.
 	//
-	// The six RAW variants (CR2, NEF, ARW, DNG, ORF, RW2) remain gated because
-	// they require additional SubIFD recursion work (task #94) and/or
-	// manufacturer-specific offset handling (task #95).
+	// FormatDNG is un-gated as of task #94: the copy-and-relocate path now
+	// recursively follows SubIFDs (tag 0x014A), enumerates their strip/tile
+	// blocks, and relocates them alongside the SubIFD structures. DNG stores its
+	// full-resolution image data in SubIFDs — this task implements that path.
+	// See format/tiff/relocate.go (enumerateSubIFDs, patchRawIFDOffsets) for details.
+	//
+	// The five remaining RAW variants (CR2, NEF, ARW, ORF, RW2) remain gated
+	// because they require manufacturer-specific offset handling (task #95).
 	if isTIFFBased(fmtID) {
 		return ErrWriteNotSupported
 	}
@@ -263,28 +267,25 @@ func wrapInject(err error) error {
 	return nil
 }
 
-// isTIFFBased reports whether fmtID is a TIFF-based container format.
-//
-// TIFF-based formats share the same structural problem for writes: image data
-// (strips, tiles, JPEG thumbnails) is addressed by absolute TIFF offsets that
-// become invalid when the IFD block is rebuilt without relocating that data.
-// See ErrWriteNotSupported and roadmap Option A (epic #33).
 // isTIFFBased reports whether fmtID is a TIFF-based container format that
-// still requires the write gate.
+// still requires the write gate (ErrWriteNotSupported).
 //
 // FormatTIFF was removed from this gate in tasks #92/#93 (epic #33): the
-// copy-and-relocate serializer in format/tiff/relocate.go now handles strip,
-// tile, and main-image JPEG offset relocation for plain TIFF files.
+// copy-and-relocate serializer handles strip, tile, and main-image JPEG
+// offset relocation for plain TIFF files.
 //
-// The six RAW variants remain gated until tasks #94/#95 are complete:
-//   - CR2, NEF, ARW, DNG, ORF, RW2 require SubIFD recursion and/or
-//     manufacturer-specific offset handling that is not yet implemented.
+// FormatDNG was removed from this gate in task #94: the copy-and-relocate
+// path now recursively follows SubIFDs (tag 0x014A) and relocates their
+// image blocks alongside the SubIFD structures, covering the canonical DNG
+// layout (IFD0 thumbnail + one or more SubIFDs containing full-res image).
+//
+// The five remaining RAW variants (CR2, NEF, ARW, ORF, RW2) remain gated
+// until task #95 (manufacturer-specific offset handling) is complete.
 func isTIFFBased(fmtID format.FormatID) bool {
 	switch fmtID {
 	case format.FormatCR2,
 		format.FormatNEF,
 		format.FormatARW,
-		format.FormatDNG,
 		format.FormatORF,
 		format.FormatRW2:
 		return true

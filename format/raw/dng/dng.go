@@ -21,13 +21,23 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 
 // Inject writes a modified DNG stream to w by delegating to the TIFF writer.
 //
-// WARNING — image-data corruption risk: DNG is TIFF-based. Writing metadata
-// into a DNG file re-encodes the IFD block (via tiff.Inject → exif.Encode)
-// without relocating StripOffsets, TileOffsets, or SubIFD image-data pointers.
-// Those offsets become invalid after re-encoding, corrupting the image. Do NOT
-// call Inject directly on files from a user-facing write path; use
-// gometadata.Write instead, which gates DNG behind ErrWriteNotSupported until
-// full structural relocation is implemented (roadmap Option A, epic #33).
+// DNG is TIFF-based (Adobe DNG Specification 1.7). The tiff.Inject path uses a
+// copy-and-relocate serializer that handles the canonical DNG layout: IFD0 holds
+// a thumbnail with its own strip/tile blocks; one or more SubIFDs (tag 0x014A)
+// carry the full-resolution image data with their own strip/tile blocks.
+//
+// The relocator:
+//   - Enumerates image blocks from IFD0 + IFD1 chain (strips, tiles, JPEG).
+//   - Recursively follows SubIFDs (0x014A) and enumerates their image blocks.
+//   - Re-encodes the IFD structure, appends all SubIFD raw bytes and image blocks
+//     at corrected absolute offsets, and patches all offset tags accordingly.
+//
+// This covers single-SubIFD, multi-SubIFD, and tiled-SubIFD DNG structures.
+// Validation against a real DNG corpus is recommended before relying on this
+// in production — the synthetic test fixture covers the canonical structure but
+// real cameras may have manufacturer-specific extensions.
+//
+// See format/tiff/relocate.go for implementation details (epic #33, task #94).
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
 	if err := tiff.Inject(r, w, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments); err != nil {
 		return fmt.Errorf("dng: %w", err)

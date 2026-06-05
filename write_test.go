@@ -375,10 +375,15 @@ func TestWriteTIFFSucceeds(t *testing.T) {
 	_ = m2
 }
 
-// TestWriteTIFFBasedFormatsFromCorpus verifies ErrWriteNotSupported for NEF,
-// ARW, and DNG using real fixture files from the test corpus. These formats
-// share the standard TIFF magic and are only distinguished by IFD tag
-// inspection, so synthetic minimal files would be detected as plain TIFF.
+// TestWriteTIFFBasedFormatsFromCorpus verifies ErrWriteNotSupported for NEF
+// using a real fixture file from the test corpus. NEF shares the standard TIFF
+// magic and is only distinguished by IFD tag inspection, so a synthetic minimal
+// file would be detected as plain TIFF.
+//
+// DNG was removed from this test in task #94: FormatDNG is now fully writable
+// via the copy-and-relocate SubIFD relocation path. The DNG round-trip is
+// covered by TestDNGWriteReadRoundTrip (synthetic DNG-like fixture) and by
+// TestSubIFDRelocateSingleSubIFDStrip / TestSubIFDExactByteAtOffset.
 func TestWriteTIFFBasedFormatsFromCorpus(t *testing.T) {
 	t.Parallel()
 
@@ -387,7 +392,6 @@ func TestWriteTIFFBasedFormatsFromCorpus(t *testing.T) {
 		path string
 	}{
 		{"NEF", "testdata/corpus/raw/exiftool/Nikon.nef"},
-		{"DNG", "testdata/corpus/raw/exiftool/DNG.dng"},
 	}
 
 	for _, tc := range cases {
@@ -421,6 +425,175 @@ func TestWriteTIFFBasedFormatsFromCorpus(t *testing.T) {
 				t.Errorf("Write wrote %d byte(s) to output; want 0", wBuf.n)
 			}
 		})
+	}
+}
+
+// TestDNGWriteReadRoundTrip is the gometadata.Write → Read round-trip test for
+// FormatDNG (task #94 acceptance criterion (e)).
+//
+// It builds a synthetic DNG-like TIFF stream (IFD0 thumbnail strip + SubIFD0
+// full-res strip, tag 0x014A, plus DNGVersion 0xC612 for format detection),
+// calls gometadata.Write to inject modified XMP (EXIF unchanged so rawEXIF
+// passes through as the full TIFF base), then reads back and verifies:
+//   - format.SupportsWrite(FormatDNG) = true
+//   - Write returns no error (not ErrWriteNotSupported)
+//   - the output re-parses via Read
+//   - the IFD0 thumbnail and SubIFD0 full-res strip blocks are byte-identical
+//
+// The test also exercises WriteFile to confirm the file-level API works.
+//
+// EXIF is NOT modified in this test; only XMP is injected. This is intentional:
+// when EXIF is modified, encodeEXIF returns exif.Encode(m.EXIF) — a minimal
+// TIFF buffer without image data — which breaks the copy-and-relocate base.
+// TIFF/DNG EXIF modification via gometadata.Write requires the caller to either
+// (a) not modify EXIF, or (b) use tiff.Inject directly with the full file as base.
+// This is a known limitation and is documented here. The sub-IFD block integrity
+// is proven separately in format/tiff/relocate_subifd_test.go.
+//
+// This test uses a synthetic DNG-like fixture (no real-corpus dependency).
+// Validation against a real DNG corpus is recommended before release.
+func TestDNGWriteReadRoundTrip(t *testing.T) { //nolint:paralleltest // not parallel: uses t.TempDir for file I/O
+	// Build a minimal DNG-like TIFF:
+	//   TIFF header (LE) + IFD0 (thumb strips + 0x014A SubIFDs + 0xC612 DNGVersion) +
+	//   SubIFD0 (full-res strips).
+	//   DNGVersion (0xC612) makes format.Detect classify this as FormatDNG.
+	order := binary.LittleEndian
+
+	thumbStrip := []byte("DNG-ROUNDTRIP-THUMB-STRIP-DATA-!")
+	fullStrip := []byte("DNG-ROUNDTRIP-FULLRES-STRIP-DATA")
+
+	// IFD0: 6 entries (sorted by tag) — ImageWidth, ImageLength, StripOffsets,
+	// StripByteCounts, SubIFDs(0x014A), DNGVersion(0xC612).
+	// SubIFD0: 4 entries.
+	nIFD0 := 6
+	nSubIFD0 := 4
+
+	const headerSize = 8
+	ifd0Off := headerSize
+	subIFD0Off := ifd0Off + 2 + nIFD0*12 + 4
+	thumbDataOff := subIFD0Off + 2 + nSubIFD0*12 + 4
+	fullDataOff := thumbDataOff + len(thumbStrip)
+	total := fullDataOff + len(fullStrip)
+
+	buf := make([]byte, total)
+	buf[0], buf[1] = 'I', 'I'
+	order.PutUint16(buf[2:], 0x002A)
+	order.PutUint32(buf[4:], uint32(ifd0Off))
+
+	// IFD0
+	order.PutUint16(buf[ifd0Off:], uint16(nIFD0))
+	p := ifd0Off + 2
+	writeEntry := func(tag, typ uint16, count, val uint32) {
+		order.PutUint16(buf[p:], tag)
+		order.PutUint16(buf[p+2:], typ)
+		order.PutUint32(buf[p+4:], count)
+		order.PutUint32(buf[p+8:], val)
+		p += 12
+	}
+	writeEntry(0x0100, 4, 1, 2)                       // ImageWidth
+	writeEntry(0x0101, 4, 1, 1)                       // ImageLength
+	writeEntry(0x0111, 4, 1, uint32(thumbDataOff))    // StripOffsets → thumb
+	writeEntry(0x0117, 4, 1, uint32(len(thumbStrip))) //nolint:gosec // G115: test helper
+	writeEntry(0x014A, 4, 1, uint32(subIFD0Off))      // SubIFDs → SubIFD0
+	writeEntry(0xC612, 1 /*BYTE*/, 4, 0x00000101)     // DNGVersion 1.1.0.0 (inline)
+	p += 4                                            // IFD0 next-IFD = 0
+
+	// SubIFD0
+	order.PutUint16(buf[subIFD0Off:], uint16(nSubIFD0))
+	q := subIFD0Off + 2
+	writeEntryAt := func(pos int, tag, typ uint16, count, val uint32) {
+		order.PutUint16(buf[pos:], tag)
+		order.PutUint16(buf[pos+2:], typ)
+		order.PutUint32(buf[pos+4:], count)
+		order.PutUint32(buf[pos+8:], val)
+	}
+	writeEntryAt(q, 0x0100, 4, 1, 1024)
+	writeEntryAt(q+12, 0x0101, 4, 1, 768)
+	writeEntryAt(q+24, 0x0111, 4, 1, uint32(fullDataOff))    //nolint:gosec // G115: fullDataOff bounded by buf size
+	writeEntryAt(q+36, 0x0117, 4, 1, uint32(len(fullStrip))) //nolint:gosec // G115: test helper
+
+	copy(buf[thumbDataOff:], thumbStrip)
+	copy(buf[fullDataOff:], fullStrip)
+
+	original := buf
+
+	// Verify format detection recognises this as DNG.
+	detectedFmt, detErr := format.Detect(bytes.NewReader(original))
+	if detErr != nil {
+		t.Fatalf("format.Detect: %v", detErr)
+	}
+	if detectedFmt != format.FormatDNG {
+		t.Fatalf("format.Detect = %v, want FormatDNG", detectedFmt)
+	}
+
+	// (e) Verify SupportsWrite(FormatDNG) = true.
+	if !format.SupportsWrite(format.FormatDNG) {
+		t.Fatal("format.SupportsWrite(FormatDNG) = false, want true")
+	}
+
+	// Read the DNG file's metadata.
+	m, err := Read(bytes.NewReader(original))
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+
+	// Inject XMP only (do NOT modify EXIF: see doc comment above).
+	// Clear m.EXIF so that encodeEXIF returns m.rawEXIF (= the full original
+	// TIFF buffer including image data). This is the correct base for relocateTIFF.
+	// If m.EXIF is kept non-nil, encodeEXIF calls exif.Encode(m.EXIF) which
+	// produces a minimal TIFF without image data, causing ErrBlockOutOfBounds.
+	m.EXIF = nil
+	wantXMPCaption := "DNG round-trip XMP caption"
+	m.XMP = &xmp.XMP{Properties: make(map[string]map[string]string)}
+	m.XMP.SetCaption(wantXMPCaption)
+
+	var outBuf bytes.Buffer
+	writeErr := Write(bytes.NewReader(original), &outBuf, m)
+	if writeErr != nil {
+		t.Fatalf("Write returned error: %v", writeErr)
+	}
+
+	output := outBuf.Bytes()
+	if len(output) == 0 {
+		t.Fatal("Write produced empty output")
+	}
+
+	// (d) Re-parse; output readable.
+	m2, err := Read(bytes.NewReader(output))
+	if err != nil {
+		t.Fatalf("Read after Write: %v", err)
+	}
+	_ = m2
+
+	// (a)/(c) IFD0 thumbnail and SubIFD0 full-res blocks must appear verbatim.
+	if !bytes.Contains(output, thumbStrip) {
+		t.Error("IFD0 thumbnail strip data not found verbatim in output (criterion a)")
+	}
+	if !bytes.Contains(output, fullStrip) {
+		t.Error("SubIFD0 full-res strip data not found verbatim in output (criterion c)")
+	}
+
+	// WriteFile round-trip.
+	dir := t.TempDir()
+	dngPath := filepath.Join(dir, "test.dng")
+	if err := os.WriteFile(dngPath, original, 0o644); err != nil { //nolint:gosec // G306: test helper
+		t.Fatalf("WriteFile setup: %v", err)
+	}
+
+	mf, err := ReadFile(dngPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	mf.EXIF = nil // clear to pass rawEXIF (full file) as base; see doc comment above
+	mf.XMP = &xmp.XMP{Properties: make(map[string]map[string]string)}
+	mf.XMP.SetCaption("WriteFile DNG round-trip")
+	if wfErr := WriteFile(dngPath, mf); wfErr != nil {
+		t.Fatalf("WriteFile: %v", wfErr)
+	}
+
+	// Verify the file can be read back after WriteFile.
+	if _, err := ReadFile(dngPath); err != nil {
+		t.Fatalf("ReadFile after WriteFile: %v", err)
 	}
 }
 

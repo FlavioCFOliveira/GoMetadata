@@ -202,6 +202,24 @@ func Encode(e *EXIF) ([]byte, error) {
 	return serialise(e)
 }
 
+// ParseIFDAt parses the IFD starting at offset within b using the given byte
+// order, and returns the parsed IFD, the next-IFD offset (0 if absent or end
+// of chain), and whether parsing succeeded.
+//
+// It is intended for callers (e.g. the TIFF copy-and-relocate layer) that need
+// to parse a single IFD at an arbitrary offset within a raw TIFF buffer,
+// without going through the full Parse → EXIF struct path.
+//
+// The returned IFD is a self-contained structure; it does not share backing
+// arrays with b for its Entries slice, though IFDEntry.Value fields may alias b
+// for out-of-line values (zero-copy parse). Callers that need the IFD to
+// outlive b should copy the Value fields they need.
+//
+// TIFF 6.0 §2: IFD layout — count(2) + entries(count×12) + nextIFD(4).
+func ParseIFDAt(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint32, bool) {
+	return parseSingleIFD(b, offset, order)
+}
+
 // CameraModel returns the value of IFD0 tag 0x0110 (Model, EXIF §4.6.4 Table 3).
 func (e *EXIF) CameraModel() string {
 	if e == nil {

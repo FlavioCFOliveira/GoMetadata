@@ -10,8 +10,7 @@
 //
 //   - JPEG (read + write)
 //   - TIFF (read + write; the copy-and-relocate serializer preserves image-data
-//     blocks byte-identically — strips, tiles, main-image JPEG; SubIFD-deep
-//     DNG layouts are deferred to task #94)
+//     blocks byte-identically — strips, tiles, main-image JPEG)
 //   - PNG (read + write)
 //   - HEIF / HEIC (read + write)
 //   - AVIF (read + write)
@@ -20,7 +19,10 @@
 //   - CR3 — Canon RAW v3, ISOBMFF-based (read + write; cr3.Inject relocates stco/co64 chunk-offset tables after moov rebuild)
 //   - NEF — Nikon RAW, TIFF-based (read only)
 //   - ARW — Sony RAW, TIFF-based (read only)
-//   - DNG — Adobe Digital Negative, TIFF-based (read only)
+//   - DNG — Adobe Digital Negative, TIFF-based (read + write; the
+//     copy-and-relocate serializer follows SubIFDs tag 0x014A recursively,
+//     covering IFD0-thumbnail + SubIFD full-res layouts; real DNG corpus
+//     validation recommended before production use)
 //   - ORF — Olympus RAW, TIFF-based (read only)
 //   - RW2 — Panasonic RAW, TIFF-based (read only)
 //

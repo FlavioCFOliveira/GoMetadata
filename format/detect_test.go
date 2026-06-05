@@ -297,8 +297,12 @@ func TestRefineTIFFVariant(t *testing.T) {
 // image-data blocks (strips, tiles, main-image JPEG) at corrected absolute
 // offsets, eliminating the SPIKE #6 corruption risk for plain TIFF files.
 //
-// The six RAW variants (CR2, NEF, ARW, DNG, ORF, RW2) remain read-only until
-// tasks #94/#95 (SubIFD recursion and manufacturer-specific offset rebasing).
+// Task #94: FormatDNG is now writable. The copy-and-relocate serializer
+// recursively follows SubIFDs (tag 0x014A) and relocates their image blocks
+// alongside the SubIFD structures, covering the canonical DNG layout.
+//
+// The five RAW variants (CR2, NEF, ARW, ORF, RW2) remain read-only until
+// task #95 (manufacturer-specific offset rebasing).
 //
 // CR3 returns true as of task #91: cr3.Inject now implements stco/co64 offset
 // relocation, walking every trak/stbl/{stco,co64} table inside the rebuilt
@@ -307,7 +311,7 @@ func TestSupportsWrite(t *testing.T) {
 	t.Parallel()
 
 	writable := []FormatID{
-		FormatJPEG, FormatTIFF, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3,
+		FormatJPEG, FormatTIFF, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3, FormatDNG,
 	}
 	for _, f := range writable {
 		if !SupportsWrite(f) {
@@ -316,7 +320,7 @@ func TestSupportsWrite(t *testing.T) {
 	}
 
 	notWritable := []FormatID{
-		FormatCR2, FormatNEF, FormatARW, FormatDNG, FormatORF, FormatRW2,
+		FormatCR2, FormatNEF, FormatARW, FormatORF, FormatRW2,
 		FormatUnknown,
 	}
 	for _, f := range notWritable {

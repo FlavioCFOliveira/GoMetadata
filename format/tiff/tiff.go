@@ -66,12 +66,13 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 //   - Image-data blocks (StripOffsets, TileOffsets, JPEGInterchangeFormat for
 //     non-thumbnail IFDs) are copied verbatim from the source and their offset
 //     entries are patched to the new positions.
+//   - SubIFDs (tag 0x014A) are recursively followed; their image blocks are
+//     enumerated and relocated alongside the SubIFD structure (task #94).
+//     This enables correct DNG write support (multi-SubIFD and tiled DNG).
 //   - IFD1 JPEG thumbnails are handled by exif.Encode's patchThumbnailEntries.
 //   - MakerNote blobs are copied verbatim (see relocate.go for safety note).
 //   - Unknown-type IFD entries retain their 4-byte field; out-of-line data
 //     referenced by unknown types is not copied (see exif.Encode docs).
-//   - SubIFD (tag 0x014A) recursion is deferred to task #94; SubIFD-referenced
-//     image data is not relocated by this implementation.
 //
 // If exif.Parse fails, Inject returns the parse error rather than silently
 // discarding the requested metadata.
