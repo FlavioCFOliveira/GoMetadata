@@ -170,10 +170,39 @@ type subIFDInfo struct {
 //
 // Two calls to exif.Encode are needed (steps 6 and 9). The IFD structure size
 // does not change between calls because only value bytes are updated.
-func relocateTIFF(base []byte, rawIPTC, rawXMP []byte) ([]byte, error) { //nolint:cyclop,gocyclo,funlen // complex by necessity: TIFF structural rewriting requires handling all image-block patterns in one function
+//
+// relocateTIFF is a thin wrapper that parses base first then delegates to
+// relocateTIFFFromParsed. Callers with a pre-parsed *exif.EXIF (e.g. the write
+// path where the struct was already parsed by Read and subsequently mutated by
+// Set* methods) should call relocateTIFFFromParsed directly to avoid the
+// redundant parse and to ensure IFD edits (copyright, GPS, etc.) are not lost.
+func relocateTIFF(base []byte, rawIPTC, rawXMP []byte) ([]byte, error) {
 	e, err := exif.Parse(base)
 	if err != nil {
 		return nil, fmt.Errorf("tiff: parse for relocation: %w", err)
+	}
+	return relocateTIFFFromParsed(base, e, rawIPTC, rawXMP)
+}
+
+// relocateTIFFFromParsed is the implementation of the TIFF copy-and-relocate
+// serializer. Unlike relocateTIFF it accepts a pre-parsed *exif.EXIF instead
+// of re-parsing base. This is critical for the write path:
+//
+//   - base must be the ORIGINAL TIFF bytes (image data at original offsets).
+//   - e must be the MODIFIED *exif.EXIF struct (EXIF tags already set by the
+//     caller, e.g. SetCopyright, SetGPS). Its StripOffsets/TileOffsets still
+//     point at the original offsets in base — which is correct, because we read
+//     image blocks from base and assign new offsets in the output.
+//
+// If e is nil, the function falls back to parsing base (same behaviour as
+// relocateTIFF).
+func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte) ([]byte, error) { //nolint:cyclop,gocyclo,funlen // complex by necessity: TIFF structural rewriting requires handling all image-block patterns in one function
+	if e == nil {
+		var err error
+		e, err = exif.Parse(base)
+		if err != nil {
+			return nil, fmt.Errorf("tiff: parse for relocation: %w", err)
+		}
 	}
 
 	order := e.ByteOrder
@@ -194,6 +223,9 @@ func relocateTIFF(base []byte, rawIPTC, rawXMP []byte) ([]byte, error) { //nolin
 	}
 
 	// Step 3: enumerate image blocks from the IFD chain.
+	// Image block offsets in e point into base (the original TIFF bytes), which
+	// is correct: we copy bytes from base[blk.srcOffset : blk.srcOffset+blk.size]
+	// in step 12 below.
 	blocks, enumerateErr := enumerateImageBlocks(base, e, order)
 	if enumerateErr != nil {
 		return nil, fmt.Errorf("tiff: enumerate image blocks: %w", enumerateErr)

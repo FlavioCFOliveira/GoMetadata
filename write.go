@@ -81,20 +81,21 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	// Rebuilding the IFD block without relocating that image data corrupts the
 	// file.
 	//
-	// FormatTIFF is un-gated as of tasks #92/#93: tiff.Inject now uses the
-	// copy-and-relocate path which enumerates every image-data block and appends
-	// it at a corrected offset.
-	//
-	// FormatDNG is un-gated as of task #94: the copy-and-relocate path now
-	// recursively follows SubIFDs (tag 0x014A), enumerates their strip/tile
-	// blocks, and relocates them alongside the SubIFD structures. DNG stores its
-	// full-resolution image data in SubIFDs — this task implements that path.
-	// See format/tiff/relocate.go (enumerateSubIFDs, patchRawIFDOffsets) for details.
+	// FormatTIFF and FormatDNG use a dedicated write path (writeTIFF) that keeps
+	// the ORIGINAL TIFF bytes as the relocation base and feeds the MODIFIED
+	// *exif.EXIF struct directly to the relocator. This avoids the ErrBlockOutOfBounds
+	// defect fixed in task #97 where encodeEXIF produced an IFD skeleton without
+	// image blocks, and the second defect where re-parsing base discarded EXIF edits.
 	//
 	// The five remaining RAW variants (CR2, NEF, ARW, ORF, RW2) remain gated
 	// because they require manufacturer-specific offset handling (task #95).
 	if isTIFFBased(fmtID) {
 		return ErrWriteNotSupported
+	}
+	// FormatTIFF and FormatDNG use a dedicated write path that avoids the
+	// skeleton-as-base defect fixed in task #97 (ErrBlockOutOfBounds on real files).
+	if fmtID == format.FormatTIFF || fmtID == format.FormatDNG {
+		return writeTIFF(r, w, m)
 	}
 
 	rawEXIF, rawIPTC, rawXMP, err := encodeMetadata(m, fmtID)
@@ -162,6 +163,72 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 		return fmt.Errorf("gometadata: rename temp file: %w", err)
 	}
 	renamed = true
+	return nil
+}
+
+// writeTIFF handles metadata injection for TIFF and DNG containers.
+//
+// The standard encodeMetadata/injectByFormat pipeline is not safe for
+// TIFF-based containers because encodeEXIF calls exif.Encode which produces
+// an IFD skeleton without image blocks. Passing that skeleton as the
+// relocation base causes ErrBlockOutOfBounds (task #97).
+//
+// writeTIFF separates the two concerns:
+//   - originalBytes: the ORIGINAL TIFF/DNG bytes, read from r (or from
+//     m.rawEXIF which tiff.Extract already populated). Used as the image-data
+//     source in tiff.InjectWithEXIF → relocateTIFFFromParsed step 12.
+//   - modifiedEXIF: m.EXIF as-is (already mutated by Set* calls). Its IFDs
+//     carry both the edited metadata AND the original image-block offsets
+//     (StripOffsets/TileOffsets still point at originalBytes positions).
+//
+// IPTC and XMP are encoded the normal way and upserted into IFD0 by
+// tiff.InjectWithEXIF → relocateTIFFFromParsed step 2.
+func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // conditional logic for originalBytes source + nil guards + three encode paths; splitting would reduce clarity
+	// Obtain the original TIFF bytes. tiff.Extract (called during Read) stores
+	// the entire TIFF stream in m.rawEXIF; use it when available to avoid a
+	// second full-file read.
+	var originalBytes []byte
+	if m.rawEXIF != nil {
+		originalBytes = m.rawEXIF
+	} else {
+		if _, err := r.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("gometadata: tiff seek: %w", err)
+		}
+		var err error
+		originalBytes, err = io.ReadAll(r)
+		if err != nil {
+			return fmt.Errorf("gometadata: tiff read: %w", err)
+		}
+	}
+
+	// Encode IPTC and XMP the normal way (nil → pass-through original bytes).
+	rawIPTC, err := encodeIPTC(m)
+	if err != nil {
+		return err
+	}
+	// FormatTIFF/FormatDNG are never JPEG, so the XMP wire-frame is never used;
+	// encodeXMP returns rawXMP directly for non-JPEG formats.
+	rawXMP, err := encodeXMP(m, format.FormatTIFF)
+	if err != nil {
+		return err
+	}
+
+	// If the caller did not modify IPTC or XMP AND did not modify EXIF either,
+	// perform a simple pass-through write — no relocation needed.
+	if rawIPTC == nil && rawXMP == nil && m.EXIF == nil {
+		if _, err := w.Write(originalBytes); err != nil {
+			return fmt.Errorf("gometadata: tiff write passthrough: %w", err)
+		}
+		return nil
+	}
+
+	// Delegate to tiff.InjectWithEXIF which calls relocateTIFFFromParsed with
+	// the original bytes as the image-data source and m.EXIF as the IFD model.
+	// m.EXIF may be nil (no EXIF modifications); InjectWithEXIF falls back to
+	// parsing originalBytes in that case, same behaviour as Inject.
+	if err := tiff.InjectWithEXIF(originalBytes, m.EXIF, rawIPTC, rawXMP, w); err != nil {
+		return fmt.Errorf("gometadata: %w", err)
+	}
 	return nil
 }
 
@@ -268,16 +335,13 @@ func wrapInject(err error) error {
 }
 
 // isTIFFBased reports whether fmtID is a TIFF-based container format that
-// still requires the write gate (ErrWriteNotSupported).
+// requires the write gate (ErrWriteNotSupported).
 //
-// FormatTIFF was removed from this gate in tasks #92/#93 (epic #33): the
-// copy-and-relocate serializer handles strip, tile, and main-image JPEG
-// offset relocation for plain TIFF files.
-//
-// FormatDNG was removed from this gate in task #94: the copy-and-relocate
-// path now recursively follows SubIFDs (tag 0x014A) and relocates their
-// image blocks alongside the SubIFD structures, covering the canonical DNG
-// layout (IFD0 thumbnail + one or more SubIFDs containing full-res image).
+// FormatTIFF and FormatDNG are NOT gated here: they have a dedicated write
+// path (writeTIFF) that is invoked before isTIFFBased is consulted. The
+// writeTIFF path uses tiff.InjectWithEXIF which feeds the ORIGINAL TIFF bytes
+// as the relocation base together with the MODIFIED *exif.EXIF struct (task
+// #97 fix).
 //
 // The five remaining RAW variants (CR2, NEF, ARW, ORF, RW2) remain gated
 // until task #95 (manufacturer-specific offset handling) is complete.

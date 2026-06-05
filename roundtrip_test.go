@@ -16,6 +16,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"hash/crc32"
+	"os"
+	"path/filepath"
 	"testing"
 
 	gometadata "github.com/FlavioCFOliveira/GoMetadata"
@@ -617,5 +619,61 @@ func TestRoundTripPreservesExistingEXIF(t *testing.T) {
 	// IPTC must also have survived.
 	if got := m2.Caption(); got != "preserve test" {
 		t.Errorf("Caption after IPTC-only write: got %q, want %q", got, "preserve test")
+	}
+}
+
+// TestRoundTripTIFF_RealFile_CrampsTIF is a regression test for task #97:
+// gometadata.Write to a real TIFF file must not fail with
+// "image block out of bounds" and the copyright must survive the round-trip.
+//
+// Fixture: format/tiff/testdata/cramps.tif (libtiff test suite, freely distributable).
+// The test is skipped when the fixture is absent (CI environments without the
+// testdata directory) to avoid false negatives.
+func TestRoundTripTIFF_RealFile_CrampsTIF(t *testing.T) {
+	t.Parallel()
+
+	fixturePath := filepath.Join("format", "tiff", "testdata", "cramps.tif")
+	original, err := os.ReadFile(fixturePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			t.Skipf("fixture %s not present; skipping real-file TIFF round-trip test", fixturePath)
+		}
+		t.Fatalf("read fixture: %v", err)
+	}
+
+	// Step 1: read metadata — populates m.EXIF and m.rawEXIF.
+	m, err := gometadata.Read(bytes.NewReader(original))
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+
+	// Step 2: set copyright — triggers the TIFF-specific write path via writeTIFF.
+	const wantCopyright = "© 2026 roundtrip-test"
+	m.SetCopyright(wantCopyright)
+
+	// Step 3: write — previously failed with "tiff: enumerate image blocks:
+	// image block out of bounds" (task #97) because encodeEXIF produced an
+	// IFD skeleton without image blocks as the relocation base.
+	var out bytes.Buffer
+	if err := gometadata.Write(bytes.NewReader(original), &out, m); err != nil {
+		t.Fatalf("Write (task #97 regression): %v", err)
+	}
+
+	result := out.Bytes()
+
+	// Step 4: re-read and assert copyright persisted.
+	m2, err := gometadata.Read(bytes.NewReader(result))
+	if err != nil {
+		t.Fatalf("Read after Write: %v", err)
+	}
+	if got := m2.Copyright(); got != wantCopyright {
+		t.Errorf("Copyright after round-trip: got %q, want %q", got, wantCopyright)
+	}
+
+	// Step 5: basic sanity — result must be non-trivially sized (not truncated).
+	// Precise per-strip comparison is covered by TestInjectWithEXIFRealFile_CrampsTIF
+	// in format/tiff/realfile_test.go.
+	if len(result) < len(original)/2 {
+		t.Errorf("result suspiciously small: original=%d result=%d", len(original), len(result))
 	}
 }

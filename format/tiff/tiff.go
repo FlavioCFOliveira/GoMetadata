@@ -76,6 +76,12 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 //
 // If exif.Parse fails, Inject returns the parse error rather than silently
 // discarding the requested metadata.
+//
+// Note: the rawEXIF parameter is used as the base TIFF bytes for relocation.
+// When rawEXIF was produced by exif.Encode (an IFD skeleton without image
+// blocks), image block enumeration will fail with ErrBlockOutOfBounds. Callers
+// that hold the original TIFF bytes AND a modified *exif.EXIF struct (e.g. the
+// gometadata.Write path) must use InjectWithEXIF instead.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ bool) error {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("tiff: seek: %w", err)
@@ -104,6 +110,51 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ boo
 	// Copy-and-relocate path: rebuild IFD structure with upserted metadata and
 	// appended image-data blocks at corrected offsets (epic #33, tasks #92/#93).
 	updated, err := relocateTIFF(base, rawIPTC, rawXMP)
+	if err != nil {
+		return err
+	}
+	if _, err = w.Write(updated); err != nil {
+		return fmt.Errorf("tiff: write updated: %w", err)
+	}
+	return nil
+}
+
+// InjectWithEXIF writes a modified TIFF stream to w using the ORIGINAL TIFF
+// bytes for image-data relocation and a pre-built (already-mutated) *exif.EXIF
+// struct for the IFD content.
+//
+// This is the correct entry point for the gometadata.Write path on TIFF-based
+// containers. The standard Inject function receives rawEXIF from encodeEXIF,
+// which calls exif.Encode and produces an IFD skeleton that lacks image blocks.
+// Feeding that skeleton to the relocator causes ErrBlockOutOfBounds because the
+// skeleton is shorter than the original strip/tile offsets stored in the IFD.
+//
+// InjectWithEXIF avoids this by separating concerns:
+//   - originalBytes: the ORIGINAL TIFF file bytes (all image blocks at original
+//     absolute offsets). Used only as the source for copying image data in
+//     relocateTIFFFromParsed step 12.
+//   - modifiedEXIF: the *exif.EXIF struct produced by exif.Parse(originalBytes)
+//     and subsequently mutated by the caller (SetCopyright, SetGPS, etc.).
+//     Its IFDs carry both the edited metadata AND the original image-block offsets
+//     (StripOffsets/TileOffsets still point at originalBytes positions).
+//   - rawIPTC, rawXMP: freshly encoded IPTC/XMP payloads to upsert into IFD0
+//     (may be nil if unchanged).
+//
+// If modifiedEXIF is nil, InjectWithEXIF falls back to parsing originalBytes
+// (same behaviour as Inject).
+//
+// fix(tiff): task #97 — real-file TIFF/DNG write produced ErrBlockOutOfBounds
+// because encodeEXIF fed an IFD skeleton as the relocate base.
+func InjectWithEXIF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+	// Pass-through: no metadata changes requested and no EXIF edits.
+	if modifiedEXIF == nil && rawIPTC == nil && rawXMP == nil {
+		if _, err := w.Write(originalBytes); err != nil {
+			return fmt.Errorf("tiff: write: %w", err)
+		}
+		return nil
+	}
+
+	updated, err := relocateTIFFFromParsed(originalBytes, modifiedEXIF, rawIPTC, rawXMP)
 	if err != nil {
 		return err
 	}
