@@ -5,7 +5,7 @@ metadata:
   type: project
 ---
 
-ARW write is fully un-gated as of task #103 (commit to be created after lint pass).
+ARW write is fully un-gated as of task #103 (commit 652eda0). A subsequent regression (IFD0 preview dropped) was fixed in commit 0ef9ce6.
 
 **Why:** Sony DSLR-A500.arw write was silently losing all 52 MakerNote OOL entries and corrupting SR2Private because Sony uses TIFF-absolute (not blob-relative) MakerNote offsets, and the SR2Private IFD block holds an encrypted SR2SubIFD blob with 3 levels of absolute-offset pointers.
 
