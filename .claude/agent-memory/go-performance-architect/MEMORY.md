@@ -31,4 +31,4 @@
 - [IFD0 + SubIFD ThumbnailData must be cleared before block enumeration](feedback_subifd_thumbnail_data_clear.md) — IFD0 and SubIFDs with 0x0201/0x0202 get ThumbnailData set; clear IFD0.ThumbnailData in all relocation entry points or preview JPEG is dropped (ARW task #103 regression)
 - [IPTC/XMP TIFF tag types: TypeLong/TypeByte not TypeUndefined](feedback_iptc_xmp_tiff_types.md) — 0x83BB=TypeLong (padded+trimmed), 0x02BC=TypeByte; writeIFD pads OOL gap; extractTagValues TrimRight for IPTC
 - [TIFF 6.0 §2 word-alignment: writeIFD + ifdTotalSize cooperation](feedback_tiff_word_align.md) — ifdTotalSize always returns even; writeIFD inserts inter-value + trailing 0x00 pads; SubIFD raw blocks also aligned (task #99)
-- [BigTIFF read support (task #54, commits 803070e + 8f5752d)](project_bigtiff_read.md) — extractBigTIFF in tiff.go + detect.go routing fix; TestReadBigTIFF exercises gometadata.ReadFile end-to-end
+- [BigTIFF read support (task #54, commits 803070e + 8f5752d + 941c3d1)](project_bigtiff_read.md) — exif.Parse BigTIFF-aware (941c3d1); parameterised IFD traversal; all EXIF tags decoded; 0 lint issues
