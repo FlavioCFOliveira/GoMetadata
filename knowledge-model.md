@@ -263,6 +263,67 @@ MakerNote dispatch and is entry-reachable via the `exif` package.
 
 ---
 
+## Update — Sprints 20–22: TIFF/RAW write epic complete + BigTIFF read (2026-06-05)
+
+Commits `652eda0`, `0ef9ce6`, `2c6c9a0`, `e52dd8f`, `be69f07`, `803070e`, `8f5752d`,
+`941c3d1` (all 2026-06-05). This closed the last open backlog and **completed epic `#33`**
+(structural TIFF/RAW write, Option A) plus added **BigTIFF read**.
+
+**`FormatCapability` matrix — now ALL 13 formats `read=true write=true`** (mirrors
+`format.SupportsWrite`). The four previously read-only TIFF-based formats were un-gated and
+their `write` + `writeNote` + provenance bumped to HEAD:
+
+| Format | Task | Write mechanism (writeNote) |
+|---|---|---|
+| `NEF` | #102 | Nikon private IFDs (PreviewIFD/NikonScanIFD) + SubIFD relocation; validated real Nikon D70 |
+| `ARW` | #103 | Sony SR2Private(0xC634) decrypt+rebase, MakerNote absolute-offset rebase, IFD0 preview JPEG relocation; validated real Sony DSLR-A500 |
+| `ORF` | #104 | non-standard magic IIRS/IIRO + OLYMP MakerNote absolute-offset rebase; validated real Olympus C5050Z |
+| `RW2` | #104 | non-standard magic IIU0 + 16-byte GUID header offset-shift + recursive IFD rebase; validated real Panasonic DMC-LX7 |
+
+`TIFF`/`DNG` writeNotes updated (real-corpus validated #96; conventional XMP/IPTC tag types
+#100; word-aligned offsets #99; BigTIFF read #54). The **B2 write gate** (`isTIFFBased` /
+`ErrWriteNotSupported` for TIFF-based) was fully eliminated (#105).
+
+**New `Commit` nodes (8)** and **new `Feature` nodes (6)** — the Features use the
+property-linkage compromise (`commit_introduced`/`commit_fixed`/`package` properties, no
+edge — engine constraint #2):
+
+| Feature `name` | domain | commits |
+|---|---|---|
+| `feat:tiff:bigtiff_read` | container | introduced `803070e`, fixed `941c3d1` |
+| `feat:raw:arw_write` | container | introduced `652eda0`, fixed `0ef9ce6` |
+| `feat:raw:orf_rw2_write` | container | introduced `2c6c9a0`, fixed `e52dd8f` |
+| `feat:tiff:conventional_tag_types` | container | `652eda0` |
+| `feat:tiff:word_aligned_offsets` | container | `652eda0` |
+| `feat:write:b2_gate_eliminated` | api | `be69f07` |
+
+**BigTIFF read (`#54`)**: `exif.Parse` is now BigTIFF-aware — magic `0x002B`, 16-byte
+header, 8-byte (uint64) IFD entry counts/offsets, 20-byte entries, 8-byte inline threshold,
+types `LONG8(16)`/`SLONG8(17)`/`IFD8(18)`, parameterised 32/64-bit IFD traversal in
+`exif/ifd.go`; `format.Detect` routes BigTIFF; classic path unchanged (153 ns/op, 4 allocs).
+New files: `exif/bigtiff_test.go`, `format/tiff/bigtiff_test.go`, fixtures
+`format/tiff/testdata/big_cramps_{le,be}.tif`. The Sprint-8 `feat:tiff:bigtiff_magic_gate`
+(reject-and-gate) is now superseded by full read support.
+
+**New write-relocation files** (in `format/tiff`, all `DEPENDS_ON exif`): `relocate_arw.go`,
+`relocate_orf.go`, `relocate_rw2.go` (joining the existing `relocate.go`, `relocate_nef.go`).
+
+### ⚠️ Known graph/file discrepancy (pre-existing, surfaced 2026-06-05)
+
+The graph holds **43 `Package` nodes** but the filesystem has **29** (21 production + 8
+example, per `go list ./...`). The 14 dead packages deleted by task #89
+(`exif/makernote` + 11 vendor subpkgs, `internal/bmff`, `internal/byteorder`) were removed
+from disk and documented as removed (above) but the corresponding graph nodes were **never
+actually deleted** — consistent with engine constraint #1 (targeted `DELETE` is WAL-risky and
+the engine tends to leave ghost records). They persist as fully-labelled `Package` nodes.
+Reconciliation requires a **full rebuild** (engine constraint #5), deliberately deferred to
+avoid WAL corruption on a healthy store. Until then, package queries must exclude the dead
+subtree, e.g. `MATCH (p:Package) WHERE NOT (p.name CONTAINS 'makernote' OR p.name IN
+['internal/bmff','internal/byteorder']) RETURN p.name`. `Commit` node count has likewise
+grown (58) as every tracked commit is now recorded.
+
+---
+
 ## ⚠️ Engine constraints — Groadmap `rmp graph` v1.6.0 (READ BEFORE MUTATING)
 
 Discovered empirically during bootstrap. Violating these corrupts the store:
@@ -279,7 +340,12 @@ Discovered empirically during bootstrap. Violating these corrupts the store:
    as one ~75 KB `CREATE` produced by the regenerator (kept at `/tmp/gen_kg.py` during the
    bootstrap session).
 4. **Guard rails**: `create` accepts only `CREATE`/`MERGE` (no `SET`; no pattern predicates in
-   `WHERE`); `update` only `SET`/`REMOVE`; `delete` only `DELETE`/`DETACH DELETE`.
+   `WHERE`); `update` only `SET`/`REMOVE`; `delete` only `DELETE`/`DETACH DELETE`. The
+   class validator is a **case-insensitive substring scan**, so a forbidden keyword appearing
+   inside a *property value* falsely trips it — e.g. a `create` whose `message`/`description`
+   contains the word "remove" is rejected (matches `REMOVE`). Reword string values to avoid
+   `set`/`remove`/`delete`/`match`/`return`/`where`/`detach` as substrings (confirmed
+   2026-06-05: "remove dead gate" → rejected; "drop dead gate" → accepted).
 5. **Full-rebuild recipe**: reset the WAL (`mv ~/.roadmaps/gometadata/graph/wal` aside so
    `rmp` recreates an empty store), run the mega-`CREATE`, then add the same-label
    `PART_OF`/`DEPENDS_ON` edges via `MATCH`+`MERGE`.
