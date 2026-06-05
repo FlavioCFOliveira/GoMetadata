@@ -998,6 +998,30 @@ func arwRelocateWithSR2(
 		upsertIFD0Entry(e.IFD0, exif.TagXMP, exif.TypeByte, rawXMP)
 	}
 
+	// Step 2.5: clear IFD0.ThumbnailData before block enumeration.
+	//
+	// exif.Parse sets IFD0.ThumbnailData when IFD0 contains both 0x0201
+	// (JPEGInterchangeFormat) and 0x0202 (JPEGInterchangeFormatLength), because
+	// extractJPEGThumbnail runs on every IFD, not just the IFD1 chain.  Sony ARW
+	// files store a large (~736 KB) preview JPEG in IFD0 via these two tags
+	// (PreviewImageStart / PreviewImageLength, TIFF-absolute offset).
+	//
+	// enumerateIFDBlocks skips the JPEG block when ThumbnailData != nil, because
+	// it assumes exif.Encode will handle it — but exif.Encode only processes
+	// ThumbnailData for IFD0.Next (the IFD1 chain), never for IFD0 itself.
+	// The result is that the 736 KB preview block is silently dropped.
+	//
+	// Fix: clear IFD0.ThumbnailData so that enumerateIFDBlocks enumerates the
+	// preview as a standard imageBlock (offset+size from base).  The 0x0201 and
+	// 0x0202 entries remain in IFD0.Entries and are handled by the standard
+	// removeImageOffsetEntries → insertPlaceholders → updatePlaceholders flow.
+	// exif.Encode is not affected because it never reads IFD0.ThumbnailData.
+	//
+	// EXIF §4.5.5 / TIFF 6.0 §8.1: JPEGInterchangeFormat (0x0201) in IFD0 (not
+	// IFD1) is a preview JPEG, not the IFD1 thumbnail; relocation must treat it
+	// as an opaque image block.
+	e.IFD0.ThumbnailData = nil
+
 	// Step 3: enumerate image blocks from the main IFD chain.
 	blocks, err := enumerateImageBlocks(base, e, order)
 	if err != nil {

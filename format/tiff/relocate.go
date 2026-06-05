@@ -225,6 +225,25 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte) (
 		upsertIFD0Entry(e.IFD0, exif.TagXMP, exif.TypeByte, rawXMP)
 	}
 
+	// Step 2.5: clear IFD0.ThumbnailData before block enumeration.
+	//
+	// exif.Parse sets IFD0.ThumbnailData when IFD0 has both 0x0201
+	// (JPEGInterchangeFormat) and 0x0202 (JPEGInterchangeFormatLength), because
+	// extractJPEGThumbnail runs on every parsed IFD, not just the IFD1 chain.
+	// Some camera formats (e.g. Sony ARW) store a large preview JPEG in IFD0 via
+	// these tags.  enumerateIFDBlocks skips JPEG blocks when ThumbnailData != nil,
+	// assuming exif.Encode handles them — but exif.Encode only processes
+	// ThumbnailData for the IFD1 chain (IFD0.Next), never for IFD0 itself.
+	// Clearing ThumbnailData from IFD0 forces the preview to be enumerated as a
+	// standard imageBlock and relocated correctly.  exif.Encode is unaffected
+	// because it never reads IFD0.ThumbnailData.
+	//
+	// EXIF §4.5.5 / TIFF 6.0 §8.1: JPEGInterchangeFormat (0x0201) in IFD0 is a
+	// preview JPEG (not the IFD1 thumbnail) and must be treated as an image block.
+	if e.IFD0 != nil {
+		e.IFD0.ThumbnailData = nil
+	}
+
 	// Step 3: enumerate image blocks from the IFD chain.
 	// Image block offsets in e point into base (the original TIFF bytes), which
 	// is correct: we copy bytes from base[blk.srcOffset : blk.srcOffset+blk.size]

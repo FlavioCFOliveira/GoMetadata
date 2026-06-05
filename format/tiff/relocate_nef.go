@@ -714,6 +714,18 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 		upsertIFD0Entry(e.IFD0, exif.TagXMP, exif.TypeByte, rawXMP)
 	}
 
+	// Step 2.5: clear IFD0.ThumbnailData before block enumeration.
+	//
+	// exif.Parse sets IFD0.ThumbnailData when IFD0 has both 0x0201 and 0x0202,
+	// because extractJPEGThumbnail runs on every IFD.  enumerateIFDBlocks skips
+	// JPEG blocks when ThumbnailData != nil, but exif.Encode only processes
+	// ThumbnailData for the IFD1 chain.  Clearing IFD0.ThumbnailData forces the
+	// IFD0 preview JPEG to be enumerated as a standard imageBlock.
+	// See relocate.go step 2.5 for the full rationale.
+	if e.IFD0 != nil {
+		e.IFD0.ThumbnailData = nil
+	}
+
 	// Step 3: enumerate image blocks from the main IFD chain.
 	mainIFDBlocks, err := enumerateImageBlocks(base, e, order)
 	if err != nil {

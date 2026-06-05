@@ -1056,6 +1056,8 @@ func TestWriteARWUnGated(t *testing.T) {
 //   - SR2Private (0xC634) block is extracted verbatim, appended at the new position,
 //     and its internal pointers are rebased (IFD + OOL + SR2SubIFD decrypt/re-encrypt).
 //   - ImageDataHash IN==OUT verified against real Sony DSLR-A500.arw corpus file.
+//   - IFD0 preview JPEG (PreviewImageStart 0x0201 / PreviewImageLength 0x0202) is
+//     preserved and its offset updated to the new location (task #103 regression fix).
 //
 // This test uses the metadata-extractor corpus fixture (Sony DSLR-A500.arw).
 // If the fixture is absent the test is skipped (not failed).
@@ -1063,13 +1065,16 @@ func TestWriteARWFromCorpus(t *testing.T) {
 	t.Parallel()
 
 	path := "testdata/corpus/raw/metadata-extractor/Sony DSLR-A500.arw"
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Skipf("fixture not found (%s): %v", path, err)
 	}
-	defer func() { _ = f.Close() }()
 
-	m, err := Read(f)
+	// Record IFD0 preview block from the ORIGINAL file before any write so we can
+	// verify byte-for-byte identity after the round-trip.
+	origPreviewBytes, origPreviewLen := extractIFD0PreviewBytes(t, data)
+
+	m, err := Read(bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("Read ARW: %v", err)
 	}
@@ -1078,20 +1083,18 @@ func TestWriteARWFromCorpus(t *testing.T) {
 	}
 	m.SetCopyright("© 2026 arw103")
 
-	if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
-		t.Fatalf("Seek ARW: %v", seekErr)
-	}
-
 	var out bytes.Buffer
-	if writeErr := Write(f, &out, m); writeErr != nil {
+	if writeErr := Write(bytes.NewReader(data), &out, m); writeErr != nil {
 		t.Fatalf("Write ARW: %v", writeErr)
 	}
 	if out.Len() == 0 {
 		t.Fatal("Write ARW produced no output bytes")
 	}
 
+	output := out.Bytes()
+
 	// Output must re-parse without error.
-	m2, parseErr := Read(bytes.NewReader(out.Bytes()))
+	m2, parseErr := Read(bytes.NewReader(output))
 	if parseErr != nil {
 		t.Fatalf("Read after Write ARW: %v", parseErr)
 	}
@@ -1101,4 +1104,298 @@ func TestWriteARWFromCorpus(t *testing.T) {
 	if got := m2.CameraModel(); got == "" {
 		t.Error("CameraModel is empty after Write ARW round-trip")
 	}
+
+	// --- IFD0 preview JPEG preservation (task #103 regression guard) -----------
+	// The Sony ARW IFD0 carries a large preview JPEG via tags 0x0201/0x0202.
+	// A previous defect in the ARW write path dropped this 736 KB block entirely,
+	// resulting in an output file ~736 KB smaller than the input.
+	// This check ensures the block survives the write and is byte-identical.
+	if origPreviewLen == 0 {
+		t.Log("IFD0 preview block not found in corpus fixture; skipping preview-preservation check")
+	} else {
+		outPreviewBytes, outPreviewLen := extractIFD0PreviewBytes(t, output)
+		if outPreviewLen == 0 {
+			t.Errorf("IFD0 preview block present in input (%d bytes) but ABSENT in output — preview was dropped", origPreviewLen)
+		} else {
+			if outPreviewLen != origPreviewLen {
+				t.Errorf("IFD0 preview length mismatch: input=%d output=%d", origPreviewLen, outPreviewLen)
+			}
+			// Verify the preview offset is in-bounds in the output.
+			e2, parseErr2 := exif.Parse(output)
+			if parseErr2 == nil && e2.IFD0 != nil {
+				pvOff := e2.IFD0.Get(exif.TagJPEGInterchangeFormat)
+				pvLen := e2.IFD0.Get(exif.TagJPEGInterchangeFormatLength)
+				if pvOff != nil && pvLen != nil && len(pvOff.Value) >= 4 && len(pvLen.Value) >= 4 {
+					order := e2.ByteOrder
+					if order == nil {
+						order = binary.LittleEndian
+					}
+					newOff := order.Uint32(pvOff.Value)
+					newLen := order.Uint32(pvLen.Value)
+					end := uint64(newOff) + uint64(newLen)
+					if end > uint64(len(output)) {
+						t.Errorf("IFD0 preview offset+length (%d+%d=%d) exceeds output size (%d)", newOff, newLen, end, len(output))
+					}
+				}
+			}
+			// Byte-identical check.
+			if origPreviewBytes != nil && outPreviewBytes != nil && !bytes.Equal(origPreviewBytes, outPreviewBytes) {
+				t.Error("IFD0 preview bytes differ between input and output — preview data was corrupted")
+			}
+		}
+	}
+}
+
+// extractIFD0PreviewBytes reads the IFD0 preview JPEG bytes from a TIFF stream
+// (the bytes pointed at by PreviewImageStart 0x0201 / PreviewImageLength 0x0202
+// in IFD0).  Returns (nil, 0) when the preview is absent or out of bounds.
+func extractIFD0PreviewBytes(t *testing.T, data []byte) ([]byte, uint32) {
+	t.Helper()
+	if len(data) < 8 {
+		return nil, 0
+	}
+	e, err := exif.Parse(data)
+	if err != nil || e.IFD0 == nil {
+		return nil, 0
+	}
+	order := e.ByteOrder
+	if order == nil {
+		order = binary.LittleEndian
+	}
+	pvOff := e.IFD0.Get(exif.TagJPEGInterchangeFormat)
+	pvLen := e.IFD0.Get(exif.TagJPEGInterchangeFormatLength)
+	if pvOff == nil || pvLen == nil || len(pvOff.Value) < 4 || len(pvLen.Value) < 4 {
+		return nil, 0
+	}
+	off := order.Uint32(pvOff.Value)
+	length := order.Uint32(pvLen.Value)
+	if length == 0 {
+		return nil, 0
+	}
+	end := uint64(off) + uint64(length)
+	if end > uint64(len(data)) {
+		return nil, 0
+	}
+	cp := make([]byte, length)
+	copy(cp, data[off:end])
+	return cp, length
+}
+
+// TestWriteARWIFD0PreviewPreservedSynthetic is a self-contained regression test
+// for the task #103 defect: the ARW write path was dropping the IFD0 preview JPEG
+// (PreviewImageStart 0x0201 / PreviewImageLength 0x0202 in IFD0).
+//
+// This test does NOT require the real Sony corpus file.  It builds a synthetic
+// ARW-like TIFF (standard TIFF magic + Sony MakerNote magic = FormatARW) that
+// carries a fake 512-byte preview JPEG in IFD0, performs a metadata write, and
+// asserts the preview block survives byte-for-byte.
+//
+// The synthetic fixture has IFD0 with:
+//   - StripOffsets (0x0111) + StripByteCounts (0x0117): 64-byte strip (RAW placeholder)
+//   - JPEGInterchangeFormat (0x0201) + JPEGInterchangeFormatLength (0x0202): 512-byte
+//     fake preview JPEG (prefixed with 0xFFD8 JPEG SOI marker)
+//   - ExifIFD (0x8769) → ExifIFD with MakerNote (0x927C) starting with "SONY DSC "
+//     so that format.Detect returns FormatARW
+func TestWriteARWIFD0PreviewPreservedSynthetic(t *testing.T) {
+	t.Parallel()
+
+	// Sentinel bytes used to verify byte-identical preservation.
+	stripData := []byte("ARW-PREVIEW-TEST-STRIP-DATA-GUARD!")
+	// A fake preview with a valid JPEG SOI marker at the start.
+	previewData := make([]byte, 512)
+	previewData[0] = 0xFF
+	previewData[1] = 0xD8 // JPEG SOI
+	for i := 2; i < len(previewData); i++ {
+		previewData[i] = byte(i & 0xFF) // distinguishable filler
+	}
+
+	original := buildARWWithIFD0Preview(previewData, stripData)
+
+	// Verify this synthetic file is detected as FormatARW.
+	detFmt, detErr := format.Detect(bytes.NewReader(original))
+	if detErr != nil {
+		t.Fatalf("format.Detect: %v", detErr)
+	}
+	if detFmt != format.FormatARW {
+		t.Fatalf("format.Detect = %v, want FormatARW (synthetic ARW marker not recognised)", detFmt)
+	}
+
+	// Read + write round-trip.
+	m, err := Read(bytes.NewReader(original))
+	if err != nil {
+		t.Fatalf("Read synthetic ARW: %v", err)
+	}
+	m.SetCopyright("© 2026 preview-guard")
+
+	var outBuf bytes.Buffer
+	if writeErr := Write(bytes.NewReader(original), &outBuf, m); writeErr != nil {
+		t.Fatalf("Write synthetic ARW: %v", writeErr)
+	}
+	output := outBuf.Bytes()
+	if len(output) == 0 {
+		t.Fatal("Write produced no output bytes")
+	}
+
+	// Strip data must be byte-identical.
+	if !bytes.Contains(output, stripData) {
+		t.Error("strip data not found verbatim in output")
+	}
+
+	// Preview block must survive.
+	if !bytes.Contains(output, previewData) {
+		t.Error("IFD0 preview data not found verbatim in output — preview was DROPPED")
+	}
+
+	// The output 0x0201 offset must point at a valid in-bounds range.
+	e2, parseErr := exif.Parse(output)
+	if parseErr != nil {
+		t.Fatalf("exif.Parse output: %v", parseErr)
+	}
+	if e2.IFD0 == nil {
+		t.Fatal("IFD0 nil in output")
+	}
+	order := e2.ByteOrder
+	if order == nil {
+		order = binary.LittleEndian
+	}
+	pvOff := e2.IFD0.Get(exif.TagJPEGInterchangeFormat)
+	pvLen := e2.IFD0.Get(exif.TagJPEGInterchangeFormatLength)
+	if pvOff == nil || pvLen == nil {
+		t.Fatal("0x0201/0x0202 entries missing from output IFD0")
+	}
+	if len(pvOff.Value) < 4 || len(pvLen.Value) < 4 {
+		t.Fatal("0x0201/0x0202 entries too short in output IFD0")
+	}
+	newOff := order.Uint32(pvOff.Value)
+	newLen := order.Uint32(pvLen.Value)
+	end := uint64(newOff) + uint64(newLen)
+	if end > uint64(len(output)) {
+		t.Errorf("0x0201 offset+length (%d+%d=%d) exceeds output size (%d)", newOff, newLen, end, len(output))
+	}
+	if newLen != uint32(len(previewData)) { //nolint:gosec // G115: len bounded by test fixture size
+		t.Errorf("0x0202 length: got %d, want %d", newLen, len(previewData))
+	}
+	// Byte-identical check at the new offset.
+	if !bytes.Equal(output[newOff:newOff+newLen], previewData) {
+		t.Error("preview bytes at new offset differ from original — preview data was corrupted")
+	}
+
+	// Copyright must round-trip.
+	m2, err2 := Read(bytes.NewReader(output))
+	if err2 != nil {
+		t.Fatalf("Read after Write: %v", err2)
+	}
+	if got := m2.Copyright(); got != "© 2026 preview-guard" {
+		t.Errorf("Copyright: got %q, want %q", got, "© 2026 preview-guard")
+	}
+}
+
+// buildARWWithIFD0Preview constructs a minimal TIFF stream that:
+//   - Is detected as FormatARW (Make tag = "SONY" in IFD0)
+//   - Has IFD0 with Make, StripOffsets, JPEGInterchangeFormat/Length, ExifIFD pointer
+//   - Has a preview JPEG (0x0201/0x0202) and a strip (image data) in IFD0
+//
+// format.Detect uses the IFD0 Make tag value to identify Sony ARW:
+// mapMakeToFormat("SONY") → FormatARW.
+//
+// Layout (little-endian, standard TIFF 0x002A magic):
+//
+//	[0-7]       TIFF header: "II" + 0x002A + ifd0Off
+//	[ifd0Off]   IFD0: 6 entries (Make, StripOffsets, StripByteCounts,
+//	                              JIF, JIFLen, ExifIFD pointer)
+//	[exifOff]   ExifIFD: 1 entry (MakerNote 0x927C)
+//	[makeOff]   OOL string area: "SONY\x00" (5 bytes)
+//	[mnOff]     MakerNote blob (> 4 bytes, OOL)
+//	[pvOff]     preview data (previewData)
+//	[stripOff]  strip data (stripData)
+func buildARWWithIFD0Preview(previewData, stripData []byte) []byte {
+	order := binary.LittleEndian
+
+	const headerSize = 8
+	const ifdEntrySize = 12
+
+	// IFD0: 6 entries (sorted by tag).
+	//   0x010F Make (ASCII "SONY\x00", 5 bytes → OOL since 5 > 4),
+	//   0x0111 StripOffsets, 0x0117 StripByteCounts,
+	//   0x0201 JPEGInterchangeFormat, 0x0202 JPEGInterchangeFormatLength,
+	//   0x8769 ExifIFDPointer.
+	const nIFD0 = 6
+	ifd0FixedSize := 2 + nIFD0*ifdEntrySize + 4 // count + entries + nextIFD
+
+	// ExifIFD: 1 entry (MakerNote 0x927C).
+	const nExif = 1
+	exifFixedSize := 2 + nExif*ifdEntrySize + 4
+
+	ifd0Off := headerSize
+	exifOff := ifd0Off + ifd0FixedSize
+
+	// OOL value area for IFD0: "SONY\x00" (5 bytes) — Make tag value.
+	makeStr := []byte("SONY\x00")
+	makeOff := exifOff + exifFixedSize
+
+	// MakerNote blob: any content > 4 bytes so it is placed OOL.
+	mnBlob := make([]byte, 32)
+	mnOff := makeOff + len(makeStr)
+	// Word-align mnOff.
+	if mnOff%2 != 0 {
+		mnOff++
+	}
+
+	pvOff := mnOff + len(mnBlob)
+	// Word-align preview start.
+	if pvOff%2 != 0 {
+		pvOff++
+	}
+
+	stripOff := pvOff + len(previewData)
+	// Word-align strip start.
+	if stripOff%2 != 0 {
+		stripOff++
+	}
+
+	totalLen := stripOff + len(stripData)
+
+	buf := make([]byte, totalLen)
+
+	// TIFF header.
+	buf[0], buf[1] = 'I', 'I'
+	order.PutUint16(buf[2:], 0x002A)
+	order.PutUint32(buf[4:], uint32(ifd0Off))
+
+	// IFD0 entries (sorted by tag).
+	p := ifd0Off
+	order.PutUint16(buf[p:], nIFD0)
+	p += 2
+
+	putEntry := func(tag, typ uint16, count, val uint32) {
+		order.PutUint16(buf[p:], tag)
+		order.PutUint16(buf[p+2:], typ)
+		order.PutUint32(buf[p+4:], count)
+		order.PutUint32(buf[p+8:], val)
+		p += ifdEntrySize
+	}
+
+	// 0x010F Make = "SONY\x00": TypeASCII=2, count=5, OOL (5 > 4).
+	putEntry(0x010F, 2, uint32(len(makeStr)), uint32(makeOff)) //nolint:gosec // G115: test helper
+	putEntry(0x0111, 4, 1, uint32(stripOff))                   //nolint:gosec // G115: test helper; StripOffsets
+	putEntry(0x0117, 4, 1, uint32(len(stripData)))             //nolint:gosec // G115: test helper; StripByteCounts
+	putEntry(0x0201, 4, 1, uint32(pvOff))                      //nolint:gosec // G115: test helper; JPEGInterchangeFormat
+	putEntry(0x0202, 4, 1, uint32(len(previewData)))           //nolint:gosec // G115: test helper; JPEGInterchangeFormatLength
+	putEntry(0x8769, 4, 1, uint32(exifOff))                    // ExifIFDPointer
+	order.PutUint32(buf[p:], 0)                                // IFD0 next-IFD = 0
+	p += 4
+
+	// ExifIFD: 1 entry — MakerNote (0x927C, TypeUndefined=7, count=32, OOL).
+	order.PutUint16(buf[p:], nExif)
+	p += 2
+	putEntry(0x927C, 7, uint32(len(mnBlob)), uint32(mnOff)) //nolint:gosec // G115: test helper
+	order.PutUint32(buf[p:], 0)                             // ExifIFD next-IFD = 0
+
+	// Copy data payloads.
+	copy(buf[makeOff:], makeStr)
+	copy(buf[mnOff:], mnBlob)
+	copy(buf[pvOff:], previewData)
+	copy(buf[stripOff:], stripData)
+
+	return buf
 }
