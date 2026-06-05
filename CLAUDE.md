@@ -94,3 +94,93 @@ The library is organised around three metadata formats, each with a dedicated pa
 - **Top-level entry point** — accepts `io.ReadSeeker` or file path, detects container format by magic bytes, extracts the relevant metadata segments, and dispatches to the format parsers. Returns a unified `Metadata` struct.
 
 Write operations follow the same dispatch path in reverse: serialise the modified metadata back into the correct container segment without touching image data.
+
+## Decision Policy
+
+You are NOT authorised to make decisions unilaterally. Whenever instructions are insufficient, unclear, not specific, not concrete, or contain contradictions or ambiguities, you MUST ALWAYS ask the user how to proceed. When asking, provide multiple options (a, b, c, …) and indicate your recommendation. When there are multiple clarification needs, present each question to the user sequentially, one at a time.
+
+---
+
+## Documentation Policy
+
+All project documentation must be written in English — correct, precise, grammatically and orthographically flawless. Use clear, simple, unambiguous technical language aimed at human readers. Documentation must be accurate and faithful to the code.
+
+---
+
+## Development Workflow
+
+Every development cycle must follow these steps in order:
+
+**Specify → Implement → Test → Document**
+
+---
+
+## Self-Contained Development Policy
+
+All development cycles must be self-contained. Never complete only part of a task — each development cycle must produce a working deliverable. When new requirements are discovered during a task, resolve them immediately within the same cycle (add new tasks and implement them as quickly as possible).
+
+All code and development must be **full-fledged** by default. Skipped tests (`t.Skip(...)`) are forbidden.
+
+Whenever pre-existing bugs are found, fix them immediately and continue the original task.
+
+---
+
+## Production-Oriented
+
+Every stage of the work cycle — analysis, planning, development, testing — must target **production-grade** output. Apply maximum knowledge and care to ensure every deliverable is ready for production use.
+
+---
+
+## Task Planning and Execution
+
+Use the `rmp` CLI (available on the system) for all planning and task coordination. Treat `rmp` as the single source of truth for planning and execution — no other mechanism may be used for this purpose.
+
+Use the **Knowledge Graph** to understand the project, its components, and how they relate, in order to identify the scope and impact of each task.
+
+### Planning
+
+Assess the proposed work and determine whether multiple development phases (sprints) are needed, each delivering a solid, well-defined deliverable.
+
+Every task must have a clear, objective definition of: goals, functional requirements, technical requirements, and acceptance criteria that confirm the task is complete. When a task is closed, include a brief summary of what was done.
+
+Phases are modelled as **sprints** in `rmp`. When multiple sprints are needed, first define all sprints and their scope, then populate each sprint with tasks — one sprint at a time — using `rmp` as the single source of truth throughout.
+
+Use the Knowledge Graph to identify high-value and foundational tasks, and to optimise the execution order.
+
+### Execution
+
+Task execution is the natural continuation of planning. Always use `rmp` to:
+
+1. Check whether any open task is already in progress and resume it if so.
+2. Identify the next task.
+3. Understand the task objective from its description, functional requirements, and technical requirements.
+4. Validate acceptance criteria before closing the task.
+5. Close the task with a brief summary of what was done.
+6. After closing the task, create a git commit following best practices that describes what was done.
+7. Update the Knowledge Graph.
+
+Sprints must always be executed sequentially. Tasks within a sprint may be parallelised when there is clear justification for doing so.
+
+---
+
+## Knowledge Graph
+
+Use the `rmp` graph features (Groadmap) to create, maintain, and query a knowledge graph of the project. The graph **MUST contain everything** that is useful to know about the project — examples: features, where they are specified, where they are implemented, which tests exist and what they test, components and their relationships, dependencies, the git commits in which each feature was specified, implemented, and tested, `rmp` tasks, component tasks, and any other information that may be useful to map.
+
+The graph **MUST always be updated** on every git commit, reflecting changes to graph objects, and identifying the commit hash and date of each update.
+
+**This graph is the absolute source of truth about the project.** Maintain it with rigorous focus so that, before reading files, you can consult the graph and know what you need.
+
+Create whatever nodes and edges make the most sense for the project and for your activity. Use the graph together with tasks and sprints to coordinate project work.
+
+---
+
+## Never Guess
+
+All interactions in the project must be based exclusively on knowledge you already have. Never attempt to guess expected answers. When available information is insufficient, search for answers on the internet from official or authoritative sources, papers, books, or domain experts to determine the best outcome.
+
+---
+
+## Measure to Decide
+
+Whenever it is necessary to evaluate performance, completeness, or correctness, always collect evidence from the project first. Decide empirically.
