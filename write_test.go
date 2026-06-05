@@ -264,7 +264,7 @@ func listDir(t *testing.T, dir string) []string {
 }
 
 // ---------------------------------------------------------------------------
-// SPIKE #6 / B2: TIFF-based write gate
+// TIFF-based format write tests (epic #33 Option A)
 // ---------------------------------------------------------------------------
 
 // buildMinimalORF returns a minimal ORF byte stream: standard TIFF LE bytes
@@ -668,10 +668,9 @@ func TestWriteFileTIFFSucceeds(t *testing.T) {
 	_ = m2
 }
 
-// TestWriteJPEGStillWorksAfterTIFFGate is a non-regression test ensuring
-// that the TIFF-based write gate does not affect JPEG, which must continue
-// to write successfully.
-func TestWriteJPEGStillWorksAfterTIFFGate(t *testing.T) {
+// TestWriteJPEGSucceeds is a non-regression test ensuring that JPEG writes
+// continue to succeed through the standard injectors path.
+func TestWriteJPEGSucceeds(t *testing.T) {
 	t.Parallel()
 
 	jpeg := buildMinimalJPEG(minimalTIFFPayload())

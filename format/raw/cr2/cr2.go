@@ -25,12 +25,12 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 // Inject writes a modified CR2 stream to w by delegating to the TIFF writer.
 //
 // WARNING — image-data corruption risk: CR2 is TIFF-based. Writing metadata
-// into a CR2 file re-encodes the IFD block (via tiff.Inject → exif.Encode)
-// without relocating StripOffsets, TileOffsets, or SubIFD image-data pointers.
-// Those offsets become invalid after re-encoding, corrupting the image. Do NOT
-// call Inject directly on files from a user-facing write path; use
-// gometadata.Write instead, which gates CR2 behind ErrWriteNotSupported until
-// full structural relocation is implemented (roadmap Option A, epic #33).
+// into a CR2 file via this function re-encodes the IFD block without relocating
+// StripOffsets, TileOffsets, or SubIFD image-data pointers. Those offsets
+// become invalid after re-encoding, corrupting the image. Do NOT call Inject
+// directly from a user-facing write path; use gometadata.Write instead, which
+// routes CR2 through the dedicated writeTIFF path (tiff.InjectWithEXIF) that
+// preserves all image-data blocks via copy-and-relocate.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
 	if err := tiff.Inject(r, w, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments); err != nil {
 		return fmt.Errorf("cr2: %w", err)

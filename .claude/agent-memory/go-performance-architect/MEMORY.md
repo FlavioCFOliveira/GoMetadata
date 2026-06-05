@@ -25,6 +25,7 @@
 - [DNG write re-enabled (bug #98 fixed, commit 9ff26ac)](project_dng_write_gated.md) — patchRawIFDOffsets now updates valOrOff for ALL OOL SubIFD entries; DNG write fully enabled
 - [CR2/NEF/ARW/ORF/RW2 write un-gated status (tasks #95,#102,#103,#104)](project_cr2_write_ungated.md) — all TIFF-based RAW formats now writable; isTIFFBased always false
 - [ORF and RW2 write un-gated (task #104, commit 2c6c9a0)](project_orf_rw2_write_ungated.md) — ORF magic-patch-and-restore; RW2 GUID insertion + offset rebasing + standalone RawDataOffset block
+- [ORF/RW2 write corruption fixed (task #104, commit e52dd8f)](project_orf_rw2_write_fixed.md) — OLYMP MakerNote file-absolute rebase + RW2 recursive IFD GUID shift for ALL sub-IFDs
 - [ARW write un-gated (task #103)](project_arw_write_ungated.md) — Sony MakerNote absolute-offset rebase + 3-level SR2SubIFD pointer rebase + PRNG-XOR decrypt/re-encrypt
 - [NEF write un-gated (task #102, commit 7d34aa5)](project_nef_write_ungated.md) — Nikon MakerNote blob extension + PreviewIFD relocation + SubIFD ThumbnailData clear fix; ImageDataHash IN==OUT
 - [IFD0 + SubIFD ThumbnailData must be cleared before block enumeration](feedback_subifd_thumbnail_data_clear.md) — IFD0 and SubIFDs with 0x0201/0x0202 get ThumbnailData set; clear IFD0.ThumbnailData in all relocation entry points or preview JPEG is dropped (ARW task #103 regression)

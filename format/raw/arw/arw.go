@@ -21,12 +21,12 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 // Inject writes a modified ARW stream to w by delegating to the TIFF writer.
 //
 // WARNING — image-data corruption risk: ARW is TIFF-based. Writing metadata
-// into an ARW file re-encodes the IFD block (via tiff.Inject → exif.Encode)
-// without relocating StripOffsets, TileOffsets, or SubIFD image-data pointers.
-// Those offsets become invalid after re-encoding, corrupting the image. Do NOT
-// call Inject directly on files from a user-facing write path; use
-// gometadata.Write instead, which gates ARW behind ErrWriteNotSupported until
-// full structural relocation is implemented (roadmap Option A, epic #33).
+// into an ARW file via this function re-encodes the IFD block without relocating
+// Sony MakerNote TIFF-absolute offsets or the SR2Private (0xC634) block. Those
+// offsets become invalid after re-encoding, corrupting the image. Do NOT call
+// Inject directly from a user-facing write path; use gometadata.Write instead,
+// which routes ARW through the dedicated writeTIFFARW path
+// (tiff.InjectWithEXIFARW) that handles all Sony-specific relocation.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
 	if err := tiff.Inject(r, w, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments); err != nil {
 		return fmt.Errorf("arw: %w", err)

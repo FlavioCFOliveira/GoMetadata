@@ -72,8 +72,10 @@ type writeConfig struct {
 //     ErrPreserveUnknownSegmentsNotSupported for that format, because those
 //     containers do not have an equivalent concept of "unknown optional segment"
 //     — every non-metadata chunk or box is required for correct decoding.
-//     TIFF-based formats (TIFF, CR2, NEF, ARW, DNG, ORF, RW2) are blocked by
-//     ErrWriteNotSupported before this option has any effect.
+//   - TIFF-based formats (TIFF, DNG, CR2, NEF, ARW, ORF, RW2): the dedicated
+//     write paths for these formats do not use the injectors map and therefore
+//     do not consult preserveUnknownSegments; image data is always preserved
+//     byte-identically via the copy-and-relocate algorithm.
 //
 // Default: true.
 func PreserveUnknownSegments(v bool) WriteOption {

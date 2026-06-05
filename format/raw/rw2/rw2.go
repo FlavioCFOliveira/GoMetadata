@@ -56,12 +56,12 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 // round-trip, but EXIF/IPTC/XMP metadata is correctly updated.
 //
 // WARNING — image-data corruption risk: RW2 is TIFF-based. Writing metadata
-// into an RW2 file re-encodes the IFD block (via tiff.Inject → exif.Encode)
-// without relocating StripOffsets, TileOffsets, or SubIFD image-data pointers.
+// into an RW2 file via this function re-encodes the IFD block without relocating
+// the Panasonic GUID header, RawDataOffset, or SubIFD image-data pointers.
 // Those offsets become invalid after re-encoding, corrupting the image. Do NOT
-// call Inject directly on files from a user-facing write path; use
-// gometadata.Write instead, which gates RW2 behind ErrWriteNotSupported until
-// full structural relocation is implemented (roadmap Option A, epic #33).
+// call Inject directly from a user-facing write path; use gometadata.Write
+// instead, which routes RW2 through the dedicated writeTIFFRW2 path
+// (tiff.InjectWithEXIFRW2) that handles GUID preservation and offset rebasing.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("rw2: seek: %w", err)

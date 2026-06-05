@@ -19,15 +19,20 @@
 //     path as TIFF/DNG; Canon MakerNote blobs copied verbatim — blob-relative offsets
 //     are move-safe; validated against real Canon EOS 350D corpus file)
 //   - CR3 — Canon RAW v3, ISOBMFF-based (read + write; cr3.Inject relocates stco/co64 chunk-offset tables after moov rebuild)
-//   - NEF — Nikon RAW, TIFF-based (read only; write gated after task #95
-//     validation: SubIFD OOL RATIONAL corruption + PreviewIFD loss on real corpus)
-//   - ARW — Sony RAW, TIFF-based (read only; write gated after task #95
-//     validation: 52 Sony MakerNote tags lost + SR2Private IFD corruption on real corpus)
+//   - NEF — Nikon RAW, TIFF-based (read + write; Nikon MakerNote blob extended
+//     to cover PreviewIFD and NikonScanIFD; validated against real Nikon D70 NEF)
+//   - ARW — Sony RAW, TIFF-based (read + write; Sony MakerNote TIFF-absolute
+//     offsets rebased; SR2Private block relocated verbatim; validated against
+//     real Sony DSLR-A500 ARW)
 //   - DNG — Adobe Digital Negative, TIFF-based (read + write; SubIFD relocation
 //     preserves all out-of-line RATIONAL/SRATIONAL values; validated against
 //     real Pentax QS1 DNG corpus file)
-//   - ORF — Olympus RAW, TIFF-based (read only; non-standard TIFF magic)
-//   - RW2 — Panasonic RAW, TIFF-based (read only; non-standard TIFF magic)
+//   - ORF — Olympus RAW, TIFF-based (read + write; non-standard IIRO/IIRS magic
+//     is patched before relocation and restored in output; validated against
+//     Olympus E-M10 IIRO and C5050Z IIRS corpus files)
+//   - RW2 — Panasonic RAW, TIFF-based (read + write; Panasonic 16-byte GUID
+//     header preserved; IFD0 offsets rebased after GUID insertion; validated
+//     against real Panasonic DMC-GF1 RW2)
 //
 // # Out-of-scope formats
 //

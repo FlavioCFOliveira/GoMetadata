@@ -29,7 +29,9 @@ import (
 // The preserveUnknownSegments bool is the last parameter: when false, each
 // injector either drops non-essential segments (JPEG) or returns
 // ErrPreserveUnknownSegmentsNotSupported (PNG, WebP, HEIF/AVIF, CR3).
-// TIFF-based formats are gated earlier by isTIFFBased and never reach this map.
+// TIFF-based formats are dispatched to dedicated write functions in Write()
+// before injectByFormat is reached; the entries below are never invoked by
+// the top-level Write path for those formats.
 //
 //nolint:gochecknoglobals // dispatch table: read-only after init, never mutated
 var injectors = map[format.FormatID]func(io.ReadSeeker, io.Writer, []byte, []byte, []byte, bool) error{
@@ -76,45 +78,16 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 		return &UnsupportedFormatError{}
 	}
 
-	// Epic #33 (SPIKE #6 Option A): TIFF-based containers store image data
-	// (strips, tiles, JPEG thumbnails) at absolute TIFF-stream offsets.
-	// Rebuilding the IFD block without relocating that image data corrupts the
-	// file.
+	// All TIFF-based containers use dedicated write paths that keep the ORIGINAL
+	// TIFF bytes as the image-data relocation base (epic #33 Option A).  Passing
+	// an exif.Encode-produced skeleton as the relocation base causes
+	// ErrBlockOutOfBounds because the skeleton carries no image blocks (task #97).
 	//
-	// FormatTIFF, FormatDNG, and FormatCR2 use a dedicated write path
-	// (writeTIFF) that keeps the ORIGINAL TIFF bytes as the relocation base and
-	// feeds the MODIFIED *exif.EXIF struct directly to the relocator. This
-	// avoids the ErrBlockOutOfBounds defect fixed in task #97 where encodeEXIF
-	// produced an IFD skeleton without image blocks.
-	//
-	// CR2 uses standard LE TIFF magic (II*\0) and parses via exif.Parse.
-	// MakerNote blob is copied verbatim — per SPIKE #24, Canon MakerNotes use
-	// blob-relative (self-relative) offsets, so verbatim copying is safe.
-	// Validated against real.cr2 (Canon EOS 350D): ImageDataHash IN==OUT,
-	// all MakerNote tags preserved, only offset fields (PreviewImageStart,
-	// ThumbnailOffset, StripOffsets) changed as expected after relocation.
-	//
-	// FormatDNG re-enabled (bug #98 fixed): the SubIFD relocation path now
-	// preserves ALL out-of-line value areas (RATIONAL XResolution/YResolution,
-	// etc.) by updating their valOrOff pointers to the new absolute positions.
-	// Previously only strip/tile offset arrays were re-pointed; the fix extends
-	// the pointer-update to every OOL entry in the SubIFD.
-	//
-	// FormatNEF and FormatARW remain gated (task #95 empirical validation,
-	// 2026-06-05): real-corpus tests revealed metadata loss —
-	//   NEF: SubIFD OOL RATIONAL (XResolution/YResolution) became 1/1, PreviewIFD
-	//        and NikonScanIFD corrupted, ImageDataHash mismatch (5.6 MB → 4.9 MB);
-	//   ARW: 52 Sony MakerNote tags lost, SR2Private IFD corruption, SubIFD
-	//        StripOffsets wrong (917504 → 50979).
-	// Both require deeper SubIFD/MakerNote investigation before un-gating.
-	//
-	// All remaining TIFF-based gated formats (none currently — ORF and RW2
-	// were un-gated in task #104) return ErrWriteNotSupported.
-	if isTIFFBased(fmtID) {
-		return ErrWriteNotSupported
-	}
-	// FormatTIFF, FormatDNG, and FormatCR2 use a dedicated write path that
-	// avoids the skeleton-as-base defect fixed in task #97.
+	// FormatTIFF, FormatDNG, FormatCR2: standard copy-and-relocate (writeTIFF).
+	// FormatNEF: Nikon MakerNote blob extension + PreviewIFD relocation (writeTIFFNEF, task #102).
+	// FormatARW: Sony MakerNote TIFF-absolute rebase + SR2Private block (writeTIFFARW, task #103).
+	// FormatORF: non-standard IIRO/IIRS magic patch-and-restore (writeTIFFORF, task #104).
+	// FormatRW2: Panasonic GUID insertion + IFD0 offset rebasing (writeTIFFRW2, task #104).
 	if fmtID == format.FormatTIFF || fmtID == format.FormatDNG ||
 		fmtID == format.FormatCR2 {
 		return writeTIFF(r, w, m)
@@ -594,8 +567,10 @@ func encodeXMP(m *Metadata, fmtID format.FormatID) ([]byte, error) {
 // injectByFormat dispatches to the correct container handler for segment injection.
 // preserveUnknownSegments is forwarded to the format-specific injector: JPEG
 // honours it by dropping unknown APPn segments when false; PNG, WebP, HEIF/AVIF,
-// and CR3 return ErrPreserveUnknownSegmentsNotSupported when false; TIFF-based
-// formats are gated before this function is ever reached.
+// and CR3 return ErrPreserveUnknownSegmentsNotSupported when false. TIFF-based
+// formats are dispatched by their dedicated write functions in Write() before
+// this function is ever reached; their entries in the injectors map are not
+// used by the top-level write path.
 func injectByFormat(r io.ReadSeeker, w io.Writer, fmtID format.FormatID, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
 	fn, ok := injectors[fmtID]
 	if !ok {
@@ -610,24 +585,6 @@ func wrapInject(err error) error {
 		return fmt.Errorf("gometadata: %w", err)
 	}
 	return nil
-}
-
-// isTIFFBased reports whether fmtID is a TIFF-based container format that
-// requires the write gate (ErrWriteNotSupported).
-//
-// As of task #104, no formats are gated here; all supported TIFF-based formats
-// have dedicated write paths:
-//
-//   - FormatTIFF / FormatDNG / FormatCR2: writeTIFF (standard copy-and-relocate).
-//   - FormatNEF: writeTIFFNEF (Nikon MakerNote blob extension + PreviewIFD).
-//   - FormatARW: writeTIFFARW (Sony MakerNote rebase + SR2Private relocation).
-//   - FormatORF: writeTIFFORF (ORF magic patching; IIRO and IIRS supported).
-//   - FormatRW2: writeTIFFRW2 (Panasonic GUID insertion + offset rebasing).
-//
-// This function is preserved as an extension point for future gating if a new
-// TIFF-based format is added before its write path is implemented.
-func isTIFFBased(_ format.FormatID) bool {
-	return false
 }
 
 // writeTIFFNEF handles metadata injection for Nikon NEF files.
