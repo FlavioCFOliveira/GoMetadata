@@ -160,12 +160,14 @@ func TestSupportsWrite(t *testing.T) {
 	// relocation is implemented in cr3.Inject; SupportsWrite(FormatCR3) returns true.
 	// Task #95: CR2 is now writable — standard LE TIFF magic, MakerNote verbatim copy
 	// validated against real Canon EOS 350D file (ImageDataHash IN==OUT, all tags kept).
-	// NEF and ARW remain gated: real-corpus tests found MakerNote/SubIFD data loss.
+	// Task #102: NEF is now writable — Nikon-specific MakerNote extension + PreviewIFD
+	// relocation validated against real Nikon D70 file (ImageDataHash IN==OUT).
+	// ARW remains gated: 52 Sony MakerNote tags lost, SR2Private IFD corrupted.
 	// ORF and RW2 remain read-only (non-standard magic; task #95 follow-up).
 	writable := []format.FormatID{
 		format.FormatJPEG, format.FormatTIFF, format.FormatDNG, format.FormatPNG,
 		format.FormatHEIF, format.FormatWebP, format.FormatAVIF, format.FormatCR3,
-		format.FormatCR2,
+		format.FormatCR2, format.FormatNEF,
 	}
 	for _, f := range writable {
 		if !format.SupportsWrite(f) {
@@ -173,9 +175,9 @@ func TestSupportsWrite(t *testing.T) {
 		}
 	}
 
-	// NEF/ARW: real-corpus validation failed (task #95); ORF/RW2: non-standard magic.
+	// ARW: real-corpus validation failed (task #95); ORF/RW2: non-standard magic.
 	notWritable := []format.FormatID{
-		format.FormatNEF, format.FormatARW,
+		format.FormatARW,
 		format.FormatORF, format.FormatRW2,
 		format.FormatUnknown,
 	}

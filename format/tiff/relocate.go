@@ -777,6 +777,24 @@ func enumerateSubIFDsAt( //nolint:cyclop,gocyclo // SubIFD recursion and cycle d
 			continue
 		}
 
+		// Clear ThumbnailData on the SubIFD before block enumeration.
+		//
+		// parseSingleIFD (via ParseIFDAt) sets IFD.ThumbnailData when it finds
+		// both tag 0x0201 (JPEGInterchangeFormat) and 0x0202 in the same IFD,
+		// because those tags normally indicate a JPEG thumbnail in IFD1.
+		// For SubIFDs (tag 0x014A), 0x0201/0x0202 hold the JpgFromRaw offset
+		// (Nikon NEF SubIFD[0]) or another JPEG image, NOT a thumbnail managed
+		// by exif.Encode.
+		//
+		// enumerateIFDBlocks → appendJPEGBlock skips the block when ThumbnailData
+		// is non-nil (assuming exif.Encode handles it).  That assumption is wrong
+		// for SubIFDs: exif.Encode never sees SubIFD IFDs — they are raw bytes.
+		// Clearing ThumbnailData forces appendJPEGBlock to enumerate the JPEG
+		// as a relocatable imageBlock.  The ThumbnailData bytes themselves are
+		// NOT needed for SubIFDs because the data lives in base[off:off+size]
+		// and is copied verbatim in step 12.
+		parsedIFD.ThumbnailData = nil
+
 		si := &subIFDInfo{
 			srcOffset: off,
 			ifd:       parsedIFD,
@@ -1028,15 +1046,22 @@ func patchRawIFDOffsets(rawBytes []byte, blocks []*imageBlock, srcOff, newSubIFD
 		total := uint64(elemSz) * uint64(entryCount) //nolint:gosec // G115: elemSz ≤ 8; entryCount is non-negative int
 		if total <= 4 {                              //nolint:nestif // inline path for strip/tile scalar entries; branching is inherent to TIFF §2 inline/OOL duality
 			// Inline value: no valOrOff pointer to update for non-image-data entries.
-			// Strip/tile offset tags with a single inline value are handled below.
+			// Strip/tile offset tags and JPEGInterchangeFormat with a single inline
+			// value are handled below.
+			//
+			// Tag 0x0201 (JPEGInterchangeFormat) in a SubIFD (not IFD1) represents a
+			// full-resolution JPEG image (e.g. Nikon NEF JpgFromRaw), not a thumbnail.
+			// It is always TypeLong, Count=1 (4 bytes = inline), so total==4 here.
 			isImageOffsetTag := entryTag == exif.TagStripOffsets || entryTag == exif.TagTileOffsets ||
-				entryTag == exif.TagStripByteCounts || entryTag == exif.TagTileByteCounts
+				entryTag == exif.TagStripByteCounts || entryTag == exif.TagTileByteCounts ||
+				entryTag == exif.TagJPEGInterchangeFormat || entryTag == exif.TagJPEGInterchangeFormatLength
 			if !isImageOffsetTag {
 				continue
 			}
 
-			// Single inline strip/tile offset or bytecount — patch the value in-place.
-			isByteCount := entryTag == exif.TagStripByteCounts || entryTag == exif.TagTileByteCounts
+			// Single inline strip/tile/JPEG offset or bytecount — patch in-place.
+			isByteCount := entryTag == exif.TagStripByteCounts || entryTag == exif.TagTileByteCounts ||
+				entryTag == exif.TagJPEGInterchangeFormatLength
 			offsetTag := entryTag
 			if isByteCount {
 				switch entryTag {
@@ -1044,6 +1069,8 @@ func patchRawIFDOffsets(rawBytes []byte, blocks []*imageBlock, srcOff, newSubIFD
 					offsetTag = exif.TagStripOffsets
 				case exif.TagTileByteCounts:
 					offsetTag = exif.TagTileOffsets
+				case exif.TagJPEGInterchangeFormatLength:
+					offsetTag = exif.TagJPEGInterchangeFormat
 				}
 			}
 			blk := blkMap[blockKey{offsetTag, 0}]

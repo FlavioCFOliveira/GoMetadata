@@ -55,7 +55,7 @@ var injectors = map[format.FormatID]func(io.ReadSeeker, io.Writer, []byte, []byt
 //
 // Write calls m.Validate before performing any I/O. A non-nil error from
 // Validate is returned unchanged so callers can inspect it with errors.Is.
-func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error {
+func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error { //nolint:cyclop,gocyclo // format dispatch requires per-format branches; adding NEF (#102) incremented complexity by 1; splitting would reduce clarity
 	// Validate structural consistency before any I/O. This covers nil IFD0,
 	// nil XMP.Properties, and unknown format, replacing the previous inline guard.
 	if err := m.Validate(); err != nil {
@@ -119,6 +119,14 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	if fmtID == format.FormatTIFF || fmtID == format.FormatDNG ||
 		fmtID == format.FormatCR2 {
 		return writeTIFF(r, w, m)
+	}
+
+	// FormatNEF uses the NEF-specific write path that extends the Nikon MakerNote
+	// blob to cover PreviewIFD/NikonScanIFD, enumerates the PreviewIFD image block,
+	// and patches the MakerNote-relative PreviewIFD offsets after relocation.
+	// Un-gated in task #102 after real-corpus validation.
+	if fmtID == format.FormatNEF {
+		return writeTIFFNEF(r, w, m)
 	}
 
 	rawEXIF, rawIPTC, rawXMP, err := encodeMetadata(m, fmtID)
@@ -394,12 +402,66 @@ func wrapInject(err error) error {
 // TIFF relocator can process them.
 func isTIFFBased(fmtID format.FormatID) bool {
 	switch fmtID {
-	case format.FormatNEF,
-		format.FormatARW,
+	case format.FormatARW,
 		format.FormatORF,
 		format.FormatRW2:
 		return true
 	default:
 		return false
 	}
+}
+
+// writeTIFFNEF handles metadata injection for Nikon NEF files.
+//
+// NEF is TIFF-based (MM\0* big-endian magic) but requires Nikon-specific
+// handling:
+//   - The Nikon Type-3 MakerNote (tag 0x927C) declares a 9705-byte blob but its
+//     internal TIFF references PreviewIFD and NikonScanIFD that live beyond the
+//     declared extent.  The MakerNote blob must be extended before encoding so
+//     those structures are preserved in the output.
+//   - PreviewIFD (MakerNote tag 0x0011) references a preview JPEG at a
+//     MakerNote-TIFF-relative offset.  That image block must be enumerated and
+//     relocated, and the offset patched in the MakerNote after encoding.
+//
+// The NEF-specific path (tiff.InjectWithEXIFNEF) handles both concerns.
+// All other aspects (SubIFD relocation, OOL RATIONAL patching, etc.) are
+// identical to the standard writeTIFF path.
+//
+// Validated against real.nef (Nikon D70): ImageDataHash IN==OUT, all metadata
+// including PreviewIFD and NikonScanIFD preserved, file size unchanged.
+func writeTIFFNEF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // conditional logic mirrors writeTIFF; splitting reduces clarity
+	var originalBytes []byte
+	if m.rawEXIF != nil {
+		originalBytes = m.rawEXIF
+	} else {
+		if _, err := r.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("gometadata: nef seek: %w", err)
+		}
+		var err error
+		originalBytes, err = io.ReadAll(r)
+		if err != nil {
+			return fmt.Errorf("gometadata: nef read: %w", err)
+		}
+	}
+
+	rawIPTC, err := encodeIPTC(m)
+	if err != nil {
+		return err
+	}
+	rawXMP, err := encodeXMP(m, format.FormatNEF)
+	if err != nil {
+		return err
+	}
+
+	if rawIPTC == nil && rawXMP == nil && m.EXIF == nil {
+		if _, err := w.Write(originalBytes); err != nil {
+			return fmt.Errorf("gometadata: nef write passthrough: %w", err)
+		}
+		return nil
+	}
+
+	if err := tiff.InjectWithEXIFNEF(originalBytes, m.EXIF, rawIPTC, rawXMP, w); err != nil {
+		return fmt.Errorf("gometadata: %w", err)
+	}
+	return nil
 }

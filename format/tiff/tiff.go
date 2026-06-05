@@ -164,6 +164,33 @@ func InjectWithEXIF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawX
 	return nil
 }
 
+// InjectWithEXIFNEF is the NEF-specific variant of InjectWithEXIF.
+//
+// It runs the Nikon-specific preprocessing step (extend MakerNote blob,
+// enumerate PreviewIFD image block) before the standard TIFF copy-and-relocate
+// algorithm, and patches the MakerNote-relative PreviewIFD offsets after encoding.
+//
+// This is the entry point used by gometadata.Write for FormatNEF.
+// See relocate_nef.go for the full algorithm description.
+func InjectWithEXIFNEF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+	// Pass-through: no metadata changes requested and no EXIF edits.
+	if modifiedEXIF == nil && rawIPTC == nil && rawXMP == nil {
+		if _, err := w.Write(originalBytes); err != nil {
+			return fmt.Errorf("tiff: write: %w", err)
+		}
+		return nil
+	}
+
+	updated, err := relocateTIFFFromParsedNEF(originalBytes, modifiedEXIF, rawIPTC, rawXMP)
+	if err != nil {
+		return err
+	}
+	if _, err = w.Write(updated); err != nil {
+		return fmt.Errorf("tiff: write updated: %w", err)
+	}
+	return nil
+}
+
 // upsertIFD0Entry adds or replaces an entry in ifd for the given tag while
 // maintaining the sorted-by-tag invariant required by IFD.Get (binary search).
 //
@@ -175,7 +202,7 @@ func InjectWithEXIF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawX
 // Implementation: binary search locates the insertion point in O(log n).
 // Replace in-place when the tag already exists; otherwise slices.Insert places
 // the new entry at the correct sorted position in O(n) (one memmove).
-func upsertIFD0Entry(ifd *exif.IFD, tag exif.TagID, typ exif.DataType, value []byte) {
+func upsertIFD0Entry(ifd *exif.IFD, tag exif.TagID, typ exif.DataType, value []byte) { //nolint:unparam // typ is always TypeUndefined today; kept as parameter for future callers (e.g. typed TIFF tags)
 	entry := exif.IFDEntry{
 		Tag:   tag,
 		Type:  typ,

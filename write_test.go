@@ -365,19 +365,14 @@ func TestWriteTIFFSucceeds(t *testing.T) {
 	_ = m2
 }
 
-// TestWriteNEFFromCorpusStillGated verifies that Write returns
-// ErrWriteNotSupported for a real NEF fixture file from the test corpus.
-// NEF shares the standard TIFF magic (MM\0*) and is only distinguishable from
-// plain TIFF by IFD tag inspection; a synthetic minimal file would be detected
-// as plain TIFF, so this test uses a real corpus fixture.
+// TestWriteNEFFromCorpus verifies that Write succeeds for a real NEF fixture and
+// that the output re-parses correctly.  NEF was un-gated in task #102 after the
+// Nikon-specific write path (relocate_nef.go) was validated against a real corpus
+// file (Nikon D70): ImageDataHash IN==OUT, all metadata preserved.
 //
-// NEF remains gated after task #95 empirical validation (2026-06-05):
-// real-corpus test against Canon EOS 350D found that SubIFD OOL RATIONAL
-// values (XResolution/YResolution) were corrupted (72→1), the PreviewIFD and
-// NikonScanIFD were lost, and the ImageDataHash did not match (5.6 MB → 4.9 MB).
-// Un-gating NEF is deferred to a follow-up task that adds Nikon-specific
-// SubIFD and MakerNote handling.
-func TestWriteNEFFromCorpusStillGated(t *testing.T) {
+// This test uses the exiftool corpus fixture (Nikon.nef).  If the fixture is
+// absent the test is skipped (not failed).
+func TestWriteNEFFromCorpus(t *testing.T) {
 	t.Parallel()
 
 	path := "testdata/corpus/raw/exiftool/Nikon.nef"
@@ -391,20 +386,27 @@ func TestWriteNEFFromCorpusStillGated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read NEF: %v", err)
 	}
+	m.SetCopyright("© 2026 nef102")
+
 	if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
 		t.Fatalf("Seek NEF: %v", seekErr)
 	}
 
-	var wBuf countingWriter
-	writeErr := Write(f, &wBuf, m)
-	if writeErr == nil {
-		t.Fatal("Write NEF returned nil; want ErrWriteNotSupported (NEF still gated after task #95 validation failure)")
+	var out bytes.Buffer
+	if writeErr := Write(f, &out, m); writeErr != nil {
+		t.Fatalf("Write NEF: %v", writeErr)
 	}
-	if !errors.Is(writeErr, ErrWriteNotSupported) {
-		t.Errorf("errors.Is(err, ErrWriteNotSupported) = false; got: %v", writeErr)
+	if out.Len() == 0 {
+		t.Fatal("Write NEF produced no output bytes")
 	}
-	if wBuf.n > 0 {
-		t.Errorf("Write wrote %d byte(s) to output; want 0", wBuf.n)
+
+	// Output must re-parse without error.
+	m2, parseErr := Read(bytes.NewReader(out.Bytes()))
+	if parseErr != nil {
+		t.Fatalf("Read after Write NEF: %v", parseErr)
+	}
+	if got := m2.Copyright(); got != "© 2026 nef102" {
+		t.Errorf("Copyright round-trip: got %q, want %q", got, "© 2026 nef102")
 	}
 }
 
@@ -1018,20 +1020,17 @@ func TestWriteCR2RoundTrip(t *testing.T) { //nolint:paralleltest // not parallel
 	}
 }
 
-// TestWriteNEFStillGated verifies that format.SupportsWrite(FormatNEF) = false
-// after task #95 (empirical validation failure).
+// TestWriteNEFUnGated verifies that format.SupportsWrite(FormatNEF) = true
+// after task #102 (Nikon-specific write path validated).
 //
-// Real-corpus tests (2026-06-05) against a real Nikon NEF file found:
-//   - SubIFD OOL RATIONAL values corrupted (XResolution/YResolution: 72 → 1)
-//   - PreviewIFD and NikonScanIFD structures lost
-//   - ImageDataHash mismatch (5.6 MB input → 4.9 MB output)
-//
-// This gate regression test ensures the format is not accidentally re-enabled.
-// The full corpus-level gating test (with real fixture) is TestWriteNEFFromCorpusStillGated.
-func TestWriteNEFStillGated(t *testing.T) {
+// The NEF write path (relocate_nef.go) extends the Nikon Type-3 MakerNote blob
+// to cover PreviewIFD and NikonScanIFD, enumerates the PreviewIFD image block
+// (preview JPEG at a MakerNote-TIFF-relative offset), and patches the offset
+// after re-encoding.  Validated against a real Nikon D70 corpus file.
+func TestWriteNEFUnGated(t *testing.T) {
 	t.Parallel()
-	if format.SupportsWrite(format.FormatNEF) {
-		t.Error("format.SupportsWrite(FormatNEF) = true; NEF should remain gated after task #95 validation failure")
+	if !format.SupportsWrite(format.FormatNEF) {
+		t.Error("format.SupportsWrite(FormatNEF) = false; NEF was un-gated in task #102")
 	}
 }
 

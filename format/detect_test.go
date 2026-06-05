@@ -305,8 +305,11 @@ func TestRefineTIFFVariant(t *testing.T) {
 // Task #95: FormatCR2 is now writable. CR2 uses standard LE TIFF magic (II*\0)
 // and routes through the same writeTIFF copy-and-relocate path as FormatTIFF/DNG.
 // Canon MakerNote blobs are copied verbatim (SPIKE #24: blob-relative offsets).
-// FormatNEF and FormatARW remain gated: real-corpus tests (2026-06-05) found
-// MakerNote data loss and SubIFD OOL value corruption for both.
+//
+// Task #102: FormatNEF is now writable. The NEF-specific write path extends the
+// Nikon Type-3 MakerNote blob to cover PreviewIFD and NikonScanIFD, enumerates
+// the PreviewIFD image block, and patches MakerNote-relative offsets after encoding.
+// FormatARW remains gated: 52 Sony MakerNote tags lost, SR2Private IFD corrupted.
 // FormatORF and FormatRW2 remain read-only: non-standard TIFF magic.
 //
 // CR3 returns true as of task #91: cr3.Inject now implements stco/co64 offset
@@ -315,14 +318,12 @@ func TestRefineTIFFVariant(t *testing.T) {
 func TestSupportsWrite(t *testing.T) {
 	t.Parallel()
 
-	// Task #95: CR2 is now writable — standard LE TIFF magic, MakerNote verbatim
-	// copy validated against real Canon EOS 350D corpus file.
-	// NEF and ARW remain gated: real-corpus tests (2026-06-05) found:
-	//   NEF: SubIFD OOL RATIONAL corruption, PreviewIFD lost, hash mismatch.
-	//   ARW: 52 Sony MakerNote tags lost, SR2Private IFD corrupted.
+	// Task #102: NEF is now writable — Nikon MakerNote blob extension + PreviewIFD
+	// relocation validated against real Nikon D70 corpus file (ImageDataHash IN==OUT).
+	// ARW remains gated: 52 Sony MakerNote tags lost, SR2Private IFD corrupted.
 	writable := []FormatID{
 		FormatJPEG, FormatTIFF, FormatDNG, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3,
-		FormatCR2,
+		FormatCR2, FormatNEF,
 	}
 	for _, f := range writable {
 		if !SupportsWrite(f) {
@@ -330,9 +331,9 @@ func TestSupportsWrite(t *testing.T) {
 		}
 	}
 
-	// NEF/ARW: real-corpus validation failed; ORF/RW2: non-standard magic.
+	// ARW: real-corpus validation failed; ORF/RW2: non-standard magic.
 	notWritable := []FormatID{
-		FormatNEF, FormatARW, FormatORF, FormatRW2,
+		FormatARW, FormatORF, FormatRW2,
 		FormatUnknown,
 	}
 	for _, f := range notWritable {

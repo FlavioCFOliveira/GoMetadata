@@ -85,14 +85,16 @@ func (f FormatID) String() string {
 // copying is safe. Validated against a real Canon EOS 350D CR2 corpus file:
 // ImageDataHash IN==OUT, all MakerNote/SubIFD tags preserved.
 //
-// FormatNEF and FormatARW return false (task #95 empirical validation failed,
-// 2026-06-05). Real-corpus tests revealed:
+// FormatNEF returns true as of task #102. The NEF-specific write path extends the
+// Nikon Type-3 MakerNote blob to cover PreviewIFD and NikonScanIFD (which live
+// beyond the declared byte count in the outer TIFF entry), enumerates the PreviewIFD
+// image block (preview JPEG referenced via a MakerNote-TIFF-relative offset), and
+// patches the MakerNote-relative 0x0201 offset after re-encoding. Validated against
+// a real Nikon D70 NEF corpus file: ImageDataHash IN==OUT, all metadata preserved.
 //
-//	NEF: SubIFD OOL RATIONAL values corrupted (XResolution/YResolution 72→1),
-//	     PreviewIFD lost, ImageDataHash mismatch (5.6 MB → 4.9 MB output).
-//	ARW: 52 Sony MakerNote tags lost, SR2Private IFD corruption.
-//
-// These formats require deeper SubIFD/MakerNote handling before un-gating.
+// FormatARW returns false (task #95 empirical validation failed, 2026-06-05).
+// Real-corpus tests revealed 52 Sony MakerNote tags lost and SR2Private IFD
+// corruption. ARW requires deeper Sony-specific SubIFD/MakerNote handling.
 //
 // FormatORF and FormatRW2 return false. They use non-standard magic bytes
 // (ORF: IIRS; RW2: IIU\0) and require format-specific outer-framing work
@@ -101,13 +103,11 @@ func (f FormatID) String() string {
 func SupportsWrite(f FormatID) bool {
 	switch f {
 	case FormatJPEG, FormatTIFF, FormatDNG, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3,
-		FormatCR2:
+		FormatCR2, FormatNEF:
 		return true
-	case FormatNEF, FormatARW:
+	case FormatARW:
 		// Task #95 empirical validation failed (2026-06-05): real-corpus tests
-		// found MakerNote data loss and SubIFD OOL value corruption.
-		// NEF: PreviewIFD corrupted, XResolution/YResolution 72→1, hash mismatch.
-		// ARW: 52 Sony MakerNote tags lost, SR2Private IFD corrupted.
+		// found 52 Sony MakerNote tags lost and SR2Private IFD corruption.
 		return false
 	case FormatORF, FormatRW2:
 		// ORF/RW2 use non-standard TIFF magic and require format-specific
