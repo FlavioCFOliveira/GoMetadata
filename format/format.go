@@ -64,21 +64,17 @@ func (f FormatID) String() string {
 // (roadmap Option A, epic #33). Write and WriteFile return
 // ErrWriteNotSupported for these formats.
 //
-// CR3 also returns false. Although CR3 uses an ISOBMFF container (not TIFF),
-// the trak/stbl chunk-offset tables (stco/co64) inside moov store absolute
-// file offsets into the mdat box(es). Replacing the CMT1 EXIF payload with
-// a re-encoded stream of a different size shifts mdat by delta bytes and
-// invalidates every stco/co64 entry, silently corrupting image and preview
-// data. Full CR3 write support requires a stco/co64 offset-relocation pass
-// that is deferred to a follow-up (see cr3.ErrWriteNotSupported). This
-// flag is consistent with the gate inside cr3.Inject.
+// CR3 returns true. CR3 uses an ISOBMFF container; cr3.Inject rebuilds the
+// Canon UUID box with the new CMTx payloads and then walks every
+// trak/stbl/{stco,co64} table inside the rebuilt moov, adding delta to each
+// absolute offset that pointed at or beyond the original moov end. This
+// relocation pass was implemented in task #91.
 func SupportsWrite(f FormatID) bool {
 	switch f {
-	case FormatJPEG, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP:
+	case FormatJPEG, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3:
 		return true
-	case FormatTIFF, FormatCR2, FormatCR3, FormatNEF, FormatARW, FormatDNG, FormatORF, FormatRW2:
+	case FormatTIFF, FormatCR2, FormatNEF, FormatARW, FormatDNG, FormatORF, FormatRW2:
 		// SPIKE #6: TIFF-based write is blocked until Option A is implemented.
-		// CR3: stco/co64 offset relocation not yet implemented (task #56 safe gate).
 		return false
 	case FormatUnknown:
 		return false

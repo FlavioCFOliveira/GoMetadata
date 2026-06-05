@@ -3,7 +3,6 @@ package cr3
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"testing"
 )
 
@@ -109,19 +108,9 @@ func TestExtractTruncatedNoPanic(t *testing.T) {
 	}
 }
 
-// TestInjectEXIFGate verifies that Inject returns ErrWriteNotSupported (not a
-// successful corrupting write) when rawEXIF is non-nil.
-//
-// Background: the old implementation performed the write, but silently
-// corrupted the mdat chunk-offset tables (stco/co64) whenever the re-encoded
-// CMT1 had a different size than the original. This test was previously named
-// TestInjectEXIFRoundTrip and asserted a successful write; it now asserts the
-// safe gate introduced by task #56 to prevent that corruption.
-//
-// Full CR3 write support (with stco/co64 offset relocation) is deferred; when
-// implemented, this test should be replaced with a true round-trip assertion
-// that also verifies stco/co64 correctness.
-func TestInjectEXIFGate(t *testing.T) {
+// TestInjectEXIFRoundTrip verifies that Inject correctly replaces CMT1 content
+// and that a subsequent Extract returns the new EXIF bytes.
+func TestInjectEXIFRoundTrip(t *testing.T) {
 	t.Parallel()
 	exif := minimalTIFF()
 	data := buildMinimalCR3(exif, nil)
@@ -129,42 +118,40 @@ func TestInjectEXIFGate(t *testing.T) {
 	newExif := append(exif, 0x00, 0x01, 0x02, 0x03) // different size than original
 
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader(data), &out, newExif, nil, nil, true)
-	if err == nil {
-		t.Fatal("Inject with non-nil rawEXIF: expected ErrWriteNotSupported, got nil")
+	if err := Inject(bytes.NewReader(data), &out, newExif, nil, nil, true); err != nil {
+		t.Fatalf("Inject with non-nil rawEXIF: unexpected error: %v", err)
 	}
-	if !errors.Is(err, ErrWriteNotSupported) {
-		t.Errorf("Inject error = %v; want errors.Is(err, ErrWriteNotSupported) == true", err)
+
+	rawEXIF, _, _, err := Extract(bytes.NewReader(out.Bytes()))
+	if err != nil {
+		t.Fatalf("Extract after Inject: %v", err)
 	}
-	if out.Len() != 0 {
-		t.Errorf("Inject produced %d output bytes; want 0 (no partial/corrupt output)", out.Len())
+	if !bytes.Equal(rawEXIF, newExif) {
+		t.Errorf("round-trip: rawEXIF mismatch: got %d bytes, want %d", len(rawEXIF), len(newExif))
 	}
 }
 
-// TestInjectXMPGate verifies that Inject returns ErrWriteNotSupported (not a
-// successful corrupting write) when rawXMP is non-nil.
-//
-// This test was previously named TestInjectXMPRoundTrip and asserted a
-// successful write. It now asserts the safe gate introduced by task #56.
-// The same stco/co64 corruption hazard applies regardless of which metadata
-// payload changes moov size.
-func TestInjectXMPGate(t *testing.T) {
+// TestInjectXMPRoundTrip verifies that Inject correctly replaces an existing
+// XMP  sub-box and that Extract returns the new XMP bytes.
+func TestInjectXMPRoundTrip(t *testing.T) {
 	t.Parallel()
 	exif := minimalTIFF()
-	data := buildMinimalCR3(exif, nil)
+	origXMP := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta><?xpacket end="w"?>`)
+	data := buildMinimalCR3(exif, origXMP)
 
-	xmp := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"></x:xmpmeta><?xpacket end="w"?>`)
+	newXMP := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"/></x:xmpmeta><?xpacket end="w"?>`)
 
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader(data), &out, nil, nil, xmp, true)
-	if err == nil {
-		t.Fatal("Inject with non-nil rawXMP: expected ErrWriteNotSupported, got nil")
+	if err := Inject(bytes.NewReader(data), &out, nil, nil, newXMP, true); err != nil {
+		t.Fatalf("Inject with non-nil rawXMP: unexpected error: %v", err)
 	}
-	if !errors.Is(err, ErrWriteNotSupported) {
-		t.Errorf("Inject error = %v; want errors.Is(err, ErrWriteNotSupported) == true", err)
+
+	_, _, rawXMP, err := Extract(bytes.NewReader(out.Bytes()))
+	if err != nil {
+		t.Fatalf("Extract after Inject: %v", err)
 	}
-	if out.Len() != 0 {
-		t.Errorf("Inject produced %d output bytes; want 0 (no partial/corrupt output)", out.Len())
+	if !bytes.Equal(rawXMP, newXMP) {
+		t.Errorf("round-trip XMP: mismatch: got %d bytes, want %d", len(rawXMP), len(newXMP))
 	}
 }
 
@@ -588,14 +575,10 @@ func TestRebuildUUIDContent(t *testing.T) {
 	})
 }
 
-// TestInjectAddsNewXMPWhenAbsentGate verifies that Inject returns
-// ErrWriteNotSupported (not a successful write) when rawXMP is provided but the
-// original CR3 file had no XMP  sub-box.
-//
-// This test was previously named TestInjectAddsNewXMPWhenAbsent and asserted a
-// successful write that appended an XMP  sub-box. It now asserts the safe gate
-// introduced by task #56: any non-nil payload is rejected before I/O.
-func TestInjectAddsNewXMPWhenAbsentGate(t *testing.T) {
+// TestInjectAddsNewXMPWhenAbsent verifies that Inject successfully appends an
+// XMP  sub-box when rawXMP is provided but the original CR3 file had none.
+// After the write, Extract must return the injected XMP bytes.
+func TestInjectAddsNewXMPWhenAbsent(t *testing.T) {
 	t.Parallel()
 	exif := minimalTIFF()
 	data := buildMinimalCR3(exif, nil) // no XMP
@@ -603,15 +586,16 @@ func TestInjectAddsNewXMPWhenAbsentGate(t *testing.T) {
 	xmp := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"/><?xpacket end="w"?>`)
 
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader(data), &out, nil, nil, xmp, true)
-	if err == nil {
-		t.Fatal("Inject with non-nil rawXMP: expected ErrWriteNotSupported, got nil")
+	if err := Inject(bytes.NewReader(data), &out, nil, nil, xmp, true); err != nil {
+		t.Fatalf("Inject with non-nil rawXMP (no existing XMP): unexpected error: %v", err)
 	}
-	if !errors.Is(err, ErrWriteNotSupported) {
-		t.Errorf("Inject error = %v; want errors.Is(err, ErrWriteNotSupported) == true", err)
+
+	_, _, rawXMP, err := Extract(bytes.NewReader(out.Bytes()))
+	if err != nil {
+		t.Fatalf("Extract after Inject: %v", err)
 	}
-	if out.Len() != 0 {
-		t.Errorf("Inject produced %d output bytes; want 0 (no partial/corrupt output)", out.Len())
+	if !bytes.Equal(rawXMP, xmp) {
+		t.Errorf("round-trip XMP (newly added): mismatch: got %d bytes, want %d", len(rawXMP), len(xmp))
 	}
 }
 
@@ -691,93 +675,34 @@ func TestExtractSmallSizeNoPanic(t *testing.T) {
 	})
 }
 
-// TestInjectLargerEXIFGate verifies that Inject returns ErrWriteNotSupported
-// when a larger rawEXIF is provided (size-changing write).
-//
-// This test was previously named TestInjectUUIDBoxSizeUpdated and verified that
-// moov box size was correctly updated after a larger EXIF was injected. It now
-// asserts the safe gate introduced by task #56. The name of the old test
-// describes exactly the corruption vector: the moov box size was updated, but
-// the stco/co64 tables inside it were not, silently breaking every mdat offset.
-//
-// When full CR3 write support with stco/co64 relocation is implemented, replace
-// this test with one that:
-//  1. Builds a CR3 with ftyp + moov{uuid{CMT1}} + co64(offset=O into mdat) + mdat,
-//  2. Calls Inject with a rawEXIF larger by delta bytes,
-//  3. Asserts the post-Inject co64 offset equals O+delta, and
-//  4. Asserts the bytes at that offset still match the original mdat sentinel.
-func TestInjectLargerEXIFGate(t *testing.T) {
+// TestInjectUUIDBoxSizeUpdated verifies that after injecting a larger EXIF
+// payload, the output moov box size is correctly updated (larger than original).
+func TestInjectUUIDBoxSizeUpdated(t *testing.T) {
 	t.Parallel()
 	exif := minimalTIFF()
 	data := buildMinimalCR3(exif, nil)
 
-	larger := make([]byte, len(exif)+100) // different size — would shift mdat
+	larger := make([]byte, len(exif)+100) // different size — larger than original
 	copy(larger, exif)
 
 	var out bytes.Buffer
-	err := Inject(bytes.NewReader(data), &out, larger, nil, nil, true)
-	if err == nil {
-		t.Fatal("Inject with larger rawEXIF: expected ErrWriteNotSupported, got nil")
-	}
-	if !errors.Is(err, ErrWriteNotSupported) {
-		t.Errorf("Inject error = %v; want errors.Is(err, ErrWriteNotSupported) == true", err)
-	}
-	if out.Len() != 0 {
-		t.Errorf("Inject (larger EXIF) produced %d output bytes; want 0 (no partial/corrupt output)", out.Len())
-	}
-}
-
-// TestInjectWriteGateNoCorruptOutput is the primary regression test for task #56.
-//
-// It asserts that Inject returns ErrWriteNotSupported AND produces exactly zero
-// output bytes for every combination of non-nil metadata payload. Before the
-// fix, Inject would silently produce a corrupt CR3 stream: the moov box was
-// rebuilt with the new CMT1, but the stco/co64 chunk-offset tables inside moov
-// still pointed at the pre-shift mdat offsets (off by delta = new_moov_size -
-// old_moov_size bytes), making all image/preview data unreadable.
-//
-// The test matrix covers:
-//   - Non-nil rawEXIF only
-//   - Non-nil rawXMP only
-//   - Non-nil rawIPTC only
-//   - All three non-nil simultaneously
-//
-// The nil/nil/nil (pass-through) case is covered by TestInjectNilPayloadsPassThrough.
-func TestInjectWriteGateNoCorruptOutput(t *testing.T) {
-	t.Parallel()
-
-	tiff := minimalTIFF()
-	xmp := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"/><?xpacket end="w"?>`)
-	iptcBytes := []byte{0x1C, 0x01, 0x5A, 0x00, 0x03, 'U', 'T', 'F'} // minimal IPTC 1:90
-
-	cases := []struct {
-		name    string
-		rawEXIF []byte
-		rawIPTC []byte
-		rawXMP  []byte
-	}{
-		{"non-nil EXIF only", tiff, nil, nil},
-		{"non-nil XMP only", nil, nil, xmp},
-		{"non-nil IPTC only", nil, iptcBytes, nil},
-		{"all three non-nil", tiff, iptcBytes, xmp},
+	if err := Inject(bytes.NewReader(data), &out, larger, nil, nil, true); err != nil {
+		t.Fatalf("Inject with larger rawEXIF: unexpected error: %v", err)
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			data := buildMinimalCR3(minimalTIFF(), nil)
-			var out bytes.Buffer
-			err := Inject(bytes.NewReader(data), &out, tc.rawEXIF, tc.rawIPTC, tc.rawXMP, true)
-			if err == nil {
-				t.Fatalf("Inject(%s): expected ErrWriteNotSupported, got nil", tc.name)
-			}
-			if !errors.Is(err, ErrWriteNotSupported) {
-				t.Errorf("Inject(%s) error = %v; want errors.Is(err, ErrWriteNotSupported) == true", tc.name, err)
-			}
-			if out.Len() != 0 {
-				t.Errorf("Inject(%s) produced %d output bytes; want 0 (no partial/corrupt output)", tc.name, out.Len())
-			}
-		})
+	outBytes := out.Bytes()
+	// The output must be larger than the input (moov grew).
+	if len(outBytes) <= len(data) {
+		t.Errorf("output size %d <= input size %d; expected output to be larger after bigger EXIF", len(outBytes), len(data))
+	}
+
+	// Extract must return the new EXIF.
+	rawEXIF, _, _, err := Extract(bytes.NewReader(outBytes))
+	if err != nil {
+		t.Fatalf("Extract after Inject: %v", err)
+	}
+	if !bytes.Equal(rawEXIF, larger) {
+		t.Errorf("round-trip: rawEXIF mismatch: got %d bytes, want %d", len(rawEXIF), len(larger))
 	}
 }
 
@@ -796,4 +721,452 @@ func TestInjectNilPayloadsPassThrough(t *testing.T) {
 	if !bytes.Equal(out.Bytes(), data) {
 		t.Errorf("Inject(nil,nil,nil): output differs from input (got %d bytes, want %d)", out.Len(), len(data))
 	}
+}
+
+// buildCR3WithOffsetTable constructs a synthetic CR3 stream designed to test
+// stco/co64 relocation. Layout:
+//
+//	ftyp (16 bytes)
+//	moov
+//	  trak
+//	    mdia
+//	      minf
+//	        stbl
+//	          <stco or co64 with one entry whose value = mdatOffset>
+//	  uuid (Canon UUID)
+//	    CMT1 (tiffData)
+//	mdat (mdatPayload)
+//
+// The chunk-offset entry is set to the absolute file offset of mdatPayload's
+// first byte so that the caller can verify relocation correctness.
+//
+// offsetBox is either "stco" (uint32 entries) or "co64" (uint64 entries).
+// Returns (fileBytes, mdatOffset) where mdatOffset is the absolute file offset
+// of the first byte of mdatPayload in fileBytes.
+func buildCR3WithOffsetTable(tiffData, mdatPayload []byte, offsetBox string) ([]byte, int) {
+	const ftypSize = 16
+
+	// Build the Canon UUID box (CMT1 only — no XMP).
+	cmt1Box := buildBox("CMT1", tiffData)
+	uuidBox := buildUUIDBox(canonUUID, cmt1Box)
+
+	// We need to know mdatOffset before building stco/co64, but mdatOffset
+	// depends on moov size, which depends on the offset-box content, which in
+	// turn references mdatOffset. Bootstrap: build with a placeholder 0, then
+	// patch. The offset-box size is fixed regardless of the offset value.
+	buildOffsetBox := func(offset uint64) []byte {
+		var payload []byte
+		switch offsetBox {
+		case "stco":
+			// FullBox: version(1) + flags(3) + entry_count(4) + offset(4) = 12 bytes payload.
+			payload = make([]byte, 12)
+			// version=0, flags=0 → first 4 bytes = 0.
+			binary.BigEndian.PutUint32(payload[4:], 1)              // entry_count = 1
+			binary.BigEndian.PutUint32(payload[8:], uint32(offset)) //nolint:gosec // G115: offset fits uint32 for test values
+		default: // "co64"
+			// FullBox: version(1) + flags(3) + entry_count(4) + offset(8) = 16 bytes payload.
+			payload = make([]byte, 16)
+			binary.BigEndian.PutUint32(payload[4:], 1) // entry_count = 1
+			binary.BigEndian.PutUint64(payload[8:], offset)
+		}
+		return buildBox(offsetBox, payload)
+	}
+
+	// Build the stbl → minf → mdia → trak chain with a placeholder offset.
+	stblBox := buildBox("stbl", buildOffsetBox(0))
+	minfBox := buildBox("minf", stblBox)
+	mdiaBox := buildBox("mdia", minfBox)
+	trakBox := buildBox("trak", mdiaBox)
+
+	// moov content = trak + uuid.
+	moovContent := append(trakBox, uuidBox...)
+	moovBox := buildBox("moov", moovContent)
+
+	// Compute mdatOffset: ftyp + moov.
+	mdatOffset := ftypSize + len(moovBox)
+
+	// Rebuild stbl with the correct mdat offset.
+	stblBoxFinal := buildBox("stbl", buildOffsetBox(uint64(mdatOffset)))
+	minfBoxFinal := buildBox("minf", stblBoxFinal)
+	mdiaBoxFinal := buildBox("mdia", minfBoxFinal)
+	trakBoxFinal := buildBox("trak", mdiaBoxFinal)
+
+	// Rebuild moov with the patched trak.
+	moovContentFinal := append(trakBoxFinal, uuidBox...)
+	moovBoxFinal := buildBox("moov", moovContentFinal)
+
+	// Verify mdatOffset is stable (no structural change from patching the offset value itself).
+	if ftypSize+len(moovBoxFinal) != mdatOffset {
+		// This would mean a circular dependency — the offset size changed the box size.
+		// That cannot happen: the offset value is inlined in a fixed-width field.
+		panic("buildCR3WithOffsetTable: mdat offset unstable after patch")
+	}
+
+	// Assemble: ftyp + moov + mdat.
+	ftyp := []byte{0, 0, 0, 16, 'f', 't', 'y', 'p', 'c', 'r', 'x', ' ', 0, 0, 0, 0}
+	mdatBox := buildBox("mdat", mdatPayload)
+
+	var out bytes.Buffer
+	out.Write(ftyp)
+	out.Write(moovBoxFinal)
+	out.Write(mdatBox)
+
+	return out.Bytes(), mdatOffset
+}
+
+// TestInjectPreservesMdatOffsets is the primary regression gate for task #91.
+//
+// It verifies that after Inject replaces CMT1 with a payload of a different
+// size, the stco/co64 chunk-offset entries in the output are correctly
+// relocated by delta (where delta = new_moov_size - old_moov_size), and that
+// the bytes at the relocated offset still match the original mdat sentinel.
+//
+// Sub-tests:
+//  1. co64 + delta>0 (larger EXIF — mdat shifts forward)
+//  2. co64 + delta<0 (smaller EXIF — mdat shifts backward)
+//  3. stco (32-bit offsets) + delta>0
+//  4. multi-trak: two traks each with their own co64; both must be relocated
+//
+// This test MUST fail on the pre-#91 code (which did no relocation) and MUST
+// pass after the offset-relocation pass is in place.
+func TestInjectPreservesMdatOffsets(t *testing.T) {
+	t.Parallel()
+
+	// mdatMarker is a recognisable byte pattern placed at the start of mdat payload.
+	// After relocation, the bytes at the new offset must still equal this sentinel.
+	mdatMarker := []byte{0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE}
+
+	// smallTIFF and largeTIFF are TIFF payloads of different sizes so that
+	// replacing one with the other produces a non-zero delta.
+	smallTIFF := minimalTIFF()                          // 14 bytes
+	largeTIFF := append(smallTIFF, make([]byte, 80)...) // 94 bytes → delta = +80 for CMT1 box payload
+
+	t.Run("co64 delta>0 (larger EXIF)", func(t *testing.T) {
+		t.Parallel()
+
+		// Build CR3 with smallTIFF (smaller CMT1) and a co64 offset table.
+		fileBytes, mdatOffset := buildCR3WithOffsetTable(smallTIFF, mdatMarker, "co64")
+
+		// Inject a larger EXIF — moov must grow, delta > 0.
+		var out bytes.Buffer
+		if err := Inject(bytes.NewReader(fileBytes), &out, largeTIFF, nil, nil, true); err != nil {
+			t.Fatalf("Inject: %v", err)
+		}
+		outBytes := out.Bytes()
+
+		// Compute the expected delta and relocated offset.
+		oldMoovSize := mdatOffset - 16 // ftyp is always 16 bytes
+		// Parse the actual new moov size from the output.
+		_, _, newMoovFound := findMoovRange(outBytes)
+		newMoovStart := 16
+		if newMoovFound {
+			// findMoovRange returns end; start is fixed at 16 for our fixture.
+			_ = newMoovFound
+		}
+		newMoovSize := newMoovStart // will recompute below
+		_ = newMoovSize
+		_ = oldMoovSize
+
+		newMoovStart2, newMoovEnd2, ok := findMoovRange(outBytes)
+		if !ok {
+			t.Fatal("no moov box in output")
+		}
+		actualDelta := (newMoovEnd2 - newMoovStart2) - (mdatOffset - 16)
+		expectedNewOffset := int64(mdatOffset) + int64(actualDelta)
+
+		// (a) Read the co64 entry from the output and verify it equals mdatOffset+delta.
+		// Pass moov content (skip 8-byte moov box header) to the scanner.
+		co64Val := readFirstOffsetFromMoov(t, outBytes[newMoovStart2+8:newMoovEnd2], "co64")
+		if co64Val != expectedNewOffset {
+			t.Errorf("co64 after inject = %d, want %d (orig=%d + delta=%d)",
+				co64Val, expectedNewOffset, mdatOffset, actualDelta)
+		}
+
+		// (b) Verify the bytes at the relocated offset still equal mdatMarker.
+		mdatPayloadOffset := int(expectedNewOffset) + 8 // skip mdat box header (8 bytes)
+		if mdatPayloadOffset+len(mdatMarker) > len(outBytes) {
+			t.Fatalf("relocated offset %d+8=%d out of bounds (file len=%d)", expectedNewOffset, mdatPayloadOffset, len(outBytes))
+		}
+		if !bytes.Equal(outBytes[mdatPayloadOffset:mdatPayloadOffset+len(mdatMarker)], mdatMarker) {
+			t.Errorf("mdat content at relocated offset %d: got %x, want %x",
+				mdatPayloadOffset, outBytes[mdatPayloadOffset:mdatPayloadOffset+len(mdatMarker)], mdatMarker)
+		}
+
+		// (c) Re-Extract returns the new EXIF.
+		rawEXIF, _, _, err := Extract(bytes.NewReader(outBytes))
+		if err != nil {
+			t.Fatalf("Extract after Inject: %v", err)
+		}
+		if !bytes.Equal(rawEXIF, largeTIFF) {
+			t.Errorf("Extract rawEXIF mismatch: got %d bytes, want %d", len(rawEXIF), len(largeTIFF))
+		}
+	})
+
+	t.Run("co64 delta<0 (smaller EXIF)", func(t *testing.T) {
+		t.Parallel()
+
+		// Build CR3 with largeTIFF (larger CMT1) and a co64 offset table.
+		fileBytes, mdatOffset := buildCR3WithOffsetTable(largeTIFF, mdatMarker, "co64")
+
+		// Inject a smaller EXIF — moov must shrink, delta < 0.
+		var out bytes.Buffer
+		if err := Inject(bytes.NewReader(fileBytes), &out, smallTIFF, nil, nil, true); err != nil {
+			t.Fatalf("Inject: %v", err)
+		}
+		outBytes := out.Bytes()
+
+		newMoovStart, newMoovEnd, ok := findMoovRange(outBytes)
+		if !ok {
+			t.Fatal("no moov box in output")
+		}
+		actualDelta := (newMoovEnd - newMoovStart) - (mdatOffset - 16)
+		if actualDelta >= 0 {
+			t.Errorf("expected delta < 0 (smaller EXIF), got delta=%d", actualDelta)
+		}
+		expectedNewOffset := int64(mdatOffset) + int64(actualDelta)
+
+		co64Val := readFirstOffsetFromMoov(t, outBytes[newMoovStart+8:newMoovEnd], "co64")
+		if co64Val != expectedNewOffset {
+			t.Errorf("co64 after inject = %d, want %d", co64Val, expectedNewOffset)
+		}
+
+		mdatPayloadOffset := int(expectedNewOffset) + 8
+		if mdatPayloadOffset+len(mdatMarker) > len(outBytes) {
+			t.Fatalf("relocated offset %d+8=%d out of bounds (file len=%d)", expectedNewOffset, mdatPayloadOffset, len(outBytes))
+		}
+		if !bytes.Equal(outBytes[mdatPayloadOffset:mdatPayloadOffset+len(mdatMarker)], mdatMarker) {
+			t.Errorf("mdat content at relocated offset %d: got %x, want %x",
+				mdatPayloadOffset, outBytes[mdatPayloadOffset:mdatPayloadOffset+len(mdatMarker)], mdatMarker)
+		}
+
+		rawEXIF, _, _, err := Extract(bytes.NewReader(outBytes))
+		if err != nil {
+			t.Fatalf("Extract after Inject: %v", err)
+		}
+		if !bytes.Equal(rawEXIF, smallTIFF) {
+			t.Errorf("Extract rawEXIF mismatch: got %d bytes, want %d", len(rawEXIF), len(smallTIFF))
+		}
+	})
+
+	t.Run("stco (32-bit offsets) delta>0", func(t *testing.T) {
+		t.Parallel()
+
+		fileBytes, mdatOffset := buildCR3WithOffsetTable(smallTIFF, mdatMarker, "stco")
+
+		var out bytes.Buffer
+		if err := Inject(bytes.NewReader(fileBytes), &out, largeTIFF, nil, nil, true); err != nil {
+			t.Fatalf("Inject: %v", err)
+		}
+		outBytes := out.Bytes()
+
+		newMoovStart, newMoovEnd, ok := findMoovRange(outBytes)
+		if !ok {
+			t.Fatal("no moov box in output")
+		}
+		actualDelta := (newMoovEnd - newMoovStart) - (mdatOffset - 16)
+		expectedNewOffset := int64(mdatOffset) + int64(actualDelta)
+
+		stcoVal := readFirstOffsetFromMoov(t, outBytes[newMoovStart+8:newMoovEnd], "stco")
+		if stcoVal != expectedNewOffset {
+			t.Errorf("stco after inject = %d, want %d (orig=%d + delta=%d)",
+				stcoVal, expectedNewOffset, mdatOffset, actualDelta)
+		}
+
+		mdatPayloadOffset := int(expectedNewOffset) + 8
+		if mdatPayloadOffset+len(mdatMarker) > len(outBytes) {
+			t.Fatalf("relocated offset %d+8=%d out of bounds (file len=%d)", expectedNewOffset, mdatPayloadOffset, len(outBytes))
+		}
+		if !bytes.Equal(outBytes[mdatPayloadOffset:mdatPayloadOffset+len(mdatMarker)], mdatMarker) {
+			t.Errorf("mdat content at relocated offset: got %x, want %x",
+				outBytes[mdatPayloadOffset:mdatPayloadOffset+len(mdatMarker)], mdatMarker)
+		}
+	})
+
+	t.Run("multi-trak both co64 relocated", func(t *testing.T) {
+		t.Parallel()
+		// Build two traks, each with a co64 pointing into two separate mdat boxes.
+		// Verify both are correctly relocated.
+
+		const ftypSize = 16
+		// Build mdat payloads with recognisable sentinel bytes at the front.
+		mdat1Payload := []byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+			0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+		mdat2Payload := []byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11,
+			0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+		marker1 := mdat1Payload[:8]
+		marker2 := mdat2Payload[:8]
+
+		// Build the Canon UUID box with smallTIFF.
+		cmt1Box := buildBox("CMT1", smallTIFF)
+		uuidBox := buildUUIDBox(canonUUID, cmt1Box)
+
+		buildTrakWithCo64 := func(offsetPlaceholder uint64) []byte {
+			payload := make([]byte, 16) // version(1)+flags(3)+count(4)+offset(8)
+			binary.BigEndian.PutUint32(payload[4:], 1)
+			binary.BigEndian.PutUint64(payload[8:], offsetPlaceholder)
+			co64Box := buildBox("co64", payload)
+			stblBox := buildBox("stbl", co64Box)
+			minfBox := buildBox("minf", stblBox)
+			mdiaBox := buildBox("mdia", minfBox)
+			return buildBox("trak", mdiaBox)
+		}
+
+		// Bootstrap: build with placeholder offsets to compute moov size.
+		trak1Placeholder := buildTrakWithCo64(0)
+		trak2Placeholder := buildTrakWithCo64(0)
+		moovContentPlaceholder := append(append(trak1Placeholder, trak2Placeholder...), uuidBox...)
+		moovPlaceholder := buildBox("moov", moovContentPlaceholder)
+
+		// Compute absolute offsets for both mdat boxes.
+		mdat1Start := ftypSize + len(moovPlaceholder) // mdat1 starts right after moov
+		mdat1Box := buildBox("mdat", mdat1Payload)
+		mdat2Start := mdat1Start + len(mdat1Box) // mdat2 follows mdat1
+
+		// Rebuild traks with correct offsets.
+		trak1 := buildTrakWithCo64(uint64(mdat1Start))
+		trak2 := buildTrakWithCo64(uint64(mdat2Start))
+		moovContent := append(append(trak1, trak2...), uuidBox...)
+		moovBox := buildBox("moov", moovContent)
+
+		// Verify offsets are stable (structure didn't change).
+		if ftypSize+len(moovBox) != mdat1Start {
+			t.Fatalf("multi-trak fixture: mdat1Start unstable: want %d, got %d",
+				mdat1Start, ftypSize+len(moovBox))
+		}
+
+		ftyp := []byte{0, 0, 0, 16, 'f', 't', 'y', 'p', 'c', 'r', 'x', ' ', 0, 0, 0, 0}
+		mdat2Box := buildBox("mdat", mdat2Payload)
+		var fileBuf bytes.Buffer
+		fileBuf.Write(ftyp)
+		fileBuf.Write(moovBox)
+		fileBuf.Write(mdat1Box)
+		fileBuf.Write(mdat2Box)
+		fileBytes := fileBuf.Bytes()
+
+		// Inject a larger EXIF to force delta > 0.
+		var out bytes.Buffer
+		if err := Inject(bytes.NewReader(fileBytes), &out, largeTIFF, nil, nil, true); err != nil {
+			t.Fatalf("Inject (multi-trak): %v", err)
+		}
+		outBytes := out.Bytes()
+
+		newMoovStart, newMoovEnd, ok := findMoovRange(outBytes)
+		if !ok {
+			t.Fatal("no moov box in output")
+		}
+		oldMoovSize := len(moovBox)
+		newMoovSize := newMoovEnd - newMoovStart
+		delta := int64(newMoovSize - oldMoovSize)
+		if delta <= 0 {
+			t.Fatalf("expected delta>0 (larger EXIF), got %d", delta)
+		}
+
+		expectedOffset1 := int64(mdat1Start) + delta
+		expectedOffset2 := int64(mdat2Start) + delta
+
+		// Read co64 entries from both traks in the rebuilt moov.
+		moovContent2 := outBytes[newMoovStart+8 : newMoovEnd]
+		offset1, offset2 := readTwoTrakOffsets(t, moovContent2, "co64")
+
+		if offset1 != expectedOffset1 {
+			t.Errorf("trak1 co64 = %d, want %d (orig=%d + delta=%d)", offset1, expectedOffset1, mdat1Start, delta)
+		}
+		if offset2 != expectedOffset2 {
+			t.Errorf("trak2 co64 = %d, want %d (orig=%d + delta=%d)", offset2, expectedOffset2, mdat2Start, delta)
+		}
+
+		// Verify mdat content is intact at the new offsets.
+		newMdat1PayloadOffset := int(expectedOffset1) + 8
+		newMdat2PayloadOffset := int(expectedOffset2) + 8
+
+		if newMdat1PayloadOffset+len(marker1) > len(outBytes) {
+			t.Fatalf("relocated mdat1 offset %d out of bounds", newMdat1PayloadOffset)
+		}
+		if !bytes.Equal(outBytes[newMdat1PayloadOffset:newMdat1PayloadOffset+len(marker1)], marker1) {
+			t.Errorf("mdat1 content: got %x, want %x",
+				outBytes[newMdat1PayloadOffset:newMdat1PayloadOffset+len(marker1)], marker1)
+		}
+
+		if newMdat2PayloadOffset+len(marker2) > len(outBytes) {
+			t.Fatalf("relocated mdat2 offset %d out of bounds", newMdat2PayloadOffset)
+		}
+		if !bytes.Equal(outBytes[newMdat2PayloadOffset:newMdat2PayloadOffset+len(marker2)], marker2) {
+			t.Errorf("mdat2 content: got %x, want %x",
+				outBytes[newMdat2PayloadOffset:newMdat2PayloadOffset+len(marker2)], marker2)
+		}
+	})
+}
+
+// readFirstOffsetFromMoov walks moovBytes (the moov content, NOT including
+// the moov box header) to find the first stco or co64 box and returns the
+// value of its first entry as int64.
+func readFirstOffsetFromMoov(t *testing.T, moovBytes []byte, boxType string) int64 {
+	t.Helper()
+	return readFirstOffsetInContainer(t, moovBytes, boxType)
+}
+
+func readFirstOffsetInContainer(t *testing.T, data []byte, boxType string) int64 {
+	t.Helper()
+	pos := 0
+	for pos+8 <= len(data) {
+		size, typ, headerLen, ok := parseCR3BoxHeader(data, pos)
+		if !ok {
+			break
+		}
+		contentOff := pos + int(headerLen) //nolint:gosec // G115: headerLen is 8 or 16
+		boxEnd := pos + int(size)          //nolint:gosec // G115: ISOBMFF box size bounded by file size
+		if typ == boxType {
+			// FullBox: version(1)+flags(3) = 4 bytes; entry_count at +4.
+			if contentOff+8 > len(data) {
+				t.Fatalf("readFirstOffsetInContainer: %s box too small", boxType)
+			}
+			entryStart := contentOff + 8
+			switch boxType {
+			case "stco":
+				if entryStart+4 > len(data) {
+					t.Fatalf("readFirstOffsetInContainer: stco entry out of bounds")
+				}
+				return int64(binary.BigEndian.Uint32(data[entryStart:]))
+			case "co64":
+				if entryStart+8 > len(data) {
+					t.Fatalf("readFirstOffsetInContainer: co64 entry out of bounds")
+				}
+				return int64(binary.BigEndian.Uint64(data[entryStart:])) //nolint:gosec // G115: test helper
+			}
+		}
+		// Recurse into container boxes.
+		switch typ {
+		case "trak", "mdia", "minf", "stbl":
+			if val := readFirstOffsetInContainer(t, data[contentOff:boxEnd], boxType); val != 0 {
+				return val
+			}
+		}
+		pos = boxEnd
+	}
+	return 0
+}
+
+// readTwoTrakOffsets reads the co64/stco first entry from each of the two
+// trak boxes in moovContent (the raw moov content bytes, without moov header).
+func readTwoTrakOffsets(t *testing.T, moovContent []byte, boxType string) (int64, int64) {
+	t.Helper()
+	var offsets []int64
+	pos := 0
+	for pos+8 <= len(moovContent) {
+		size, typ, headerLen, ok := parseCR3BoxHeader(moovContent, pos)
+		if !ok {
+			break
+		}
+		contentOff := pos + int(headerLen) //nolint:gosec // G115: headerLen is 8 or 16
+		boxEnd := pos + int(size)          //nolint:gosec // G115: ISOBMFF box size bounded by file size
+		if typ == "trak" {
+			val := readFirstOffsetInContainer(t, moovContent[contentOff:boxEnd], boxType)
+			offsets = append(offsets, val)
+		}
+		pos = boxEnd
+	}
+	if len(offsets) < 2 {
+		t.Fatalf("readTwoTrakOffsets: expected 2 trak boxes, found %d", len(offsets))
+	}
+	return offsets[0], offsets[1]
 }

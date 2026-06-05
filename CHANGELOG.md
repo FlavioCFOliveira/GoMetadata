@@ -6,17 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
-### Fixed
+### Added
 
-- **CR3 metadata write gate** (`format/raw/cr3/`): `cr3.Inject` — and therefore the public `Write`/`WriteFile` on CR3 files — previously performed a corrupting write when any metadata payload was non-nil. Replacing the CMT1 EXIF box with a re-encoded stream of a different size shifts the `mdat` box by delta bytes but leaves the `trak/stbl` chunk-offset tables (`stco`/`co64`) inside `moov` unchanged, so every absolute offset into `mdat` becomes stale by delta bytes. All image and preview chunks in the resulting file were unreadable by conformant CR3 decoders. The fix gates `cr3.Inject` before any I/O: it now returns the new `cr3.ErrWriteNotSupported` sentinel immediately when any payload is non-nil, producing zero output bytes. The pass-through path (all-nil payloads) remains safe and is unaffected.
+- **CR3 metadata write with `stco`/`co64` offset relocation** (`format/raw/cr3/`): `cr3.Inject` now fully supports CR3 metadata writes. After rebuilding the Canon UUID box with the new CMTx payloads, it computes `delta = len(newMoovBox) - len(oldMoovBox)` and walks every `trak → mdia → minf → stbl → {stco, co64}` table inside the rebuilt `moov`, adding `delta` to each chunk offset whose absolute file position points at or beyond the original `moov` end (`>= oldMoovEnd`). Offsets that reference data before `moov` (e.g., into `ftyp`) are left unchanged. `stco` overflow (relocated value > `MaxUint32`) returns `cr3.ErrStcoOverflow` rather than silently truncating. The pass-through path (all-nil payloads) remains unchanged. `format.SupportsWrite(FormatCR3)` now returns `true`.
 
 ### Changed
 
-- **`format.SupportsWrite` for CR3** (`format/format.go`): `SupportsWrite(FormatCR3)` now returns `false`, consistent with the `cr3.Inject` gate and with the seven TIFF-based read-only formats. The README, `doc.go`, and the knowledge-model capability matrix are updated to match.
-
-### Deferred
-
-- Full CR3 metadata write support (with `stco`/`co64` offset relocation) is tracked as a follow-up to roadmap epic #33. When implemented, `cr3.Inject` will be extended to walk every `trak/stbl/{stco,co64}` table inside the rebuilt `moov` and add `delta` to each absolute offset that points at or beyond the original `moov` end, and `SupportsWrite(FormatCR3)` will be flipped back to `true`.
+- **`format.SupportsWrite` for CR3** (`format/format.go`): `SupportsWrite(FormatCR3)` now returns `true`. The task #56 safe gate (`ErrWriteNotSupported`) inside `cr3.Inject` has been removed and replaced with the full stco/co64 relocation pass. README, `doc.go`, and the knowledge-model capability matrix are updated to match.
 
 ## [1.1.0] - 2026-06-03
 

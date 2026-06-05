@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 )
 
 // Canon UUID: {85C0B687-820F-11E0-8111-F4CE462B6A48} stored as raw bytes.
@@ -199,27 +200,206 @@ func rebuildUUIDContent(uuidContent, rawEXIF, rawXMP []byte) (newContent []byte,
 	return buf.Bytes(), hadXMP
 }
 
-// Inject returns ErrWriteNotSupported for any call that would modify metadata.
+// findMoovRange returns the start and end byte positions of the first moov box
+// in data. start is the index of the first byte of the box header; end is the
+// first byte after the box. Returns (0,0,false) if no moov box is found.
+func findMoovRange(data []byte) (start, end int, found bool) {
+	pos := 0
+	for pos+8 <= len(data) {
+		size, typ, _, ok := parseCR3BoxHeader(data, pos)
+		if !ok {
+			break
+		}
+		if typ == "moov" {
+			return pos, pos + int(size), true //nolint:gosec // G115: ISOBMFF box size bounded by file size
+		}
+		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
+	}
+	return 0, 0, false
+}
+
+// relocateChunkOffsets walks moovBytes in-place and adjusts every stco/co64
+// entry whose absolute file offset is >= oldMoovEnd by adding delta.
 //
-// CR3 is ISOBMFF-based. The Canon UUID box lives inside moov, which precedes
-// the mdat box(es) that hold the actual image and preview data. The trak/stbl
-// chunk-offset tables (stco/co64) inside moov store ABSOLUTE file offsets into
-// mdat. Replacing CMT1 with a re-encoded EXIF payload of a different size
-// changes the total length of moov by delta bytes and shifts every subsequent
-// byte in the file by that delta — but the stco/co64 tables would still point
-// at the pre-shift offsets, silently corrupting every image/preview chunk
-// reference. Patching those tables requires a full ISOBMFF offset-relocation
-// pass that is not yet implemented.
+// ISO 14496-12 §8.7.3 (ChunkOffsetBox / stco):
+//   - FullBox header: 4-byte size + "stco" + 1-byte version + 3-byte flags = 12 bytes total
+//   - entry_count: uint32 at offset 12
+//   - entries: entry_count × uint32 starting at offset 16
 //
-// This gate fires before any I/O so that no partial or corrupt output is
-// produced. Reading CR3 files is fully supported via Extract.
+// ISO 14496-12 §8.7.5 (ChunkLargeOffsetBox / co64):
+//   - FullBox header: 4-byte size + "co64" + 1-byte version + 3-byte flags = 12 bytes total
+//   - entry_count: uint32 at offset 12
+//   - entries: entry_count × uint64 starting at offset 16
 //
-// Full CR3 write support (with stco/co64 relocation) is tracked as a
-// follow-up to roadmap epic #33.
+// moovBytes is the complete rebuilt moov box (including its 8-byte header).
+// All stco/co64 boxes are patched in-place because moovBytes is freshly
+// allocated by buildBox — no aliasing with the original data.
+//
+// oldMoovEnd is the absolute end offset of the original moov box in the file
+// (= moovStart + original moov size). Any chunk offset >= oldMoovEnd points at
+// or beyond the region that was shifted by delta; those entries are incremented.
+// Offsets before moovStart (e.g., into ftyp) are unchanged.
+//
+// For stco: if the relocated value would exceed math.MaxUint32, the function
+// returns ErrStcoOverflow rather than silently truncating the offset.
+func relocateChunkOffsets(moovBytes []byte, oldMoovEnd int, delta int64) error {
+	if len(moovBytes) < 8 {
+		return nil
+	}
+	// moovBytes includes the 8-byte moov box header; pass the content slice.
+	return relocateInContainer(moovBytes[8:], int64(oldMoovEnd), delta)
+}
+
+// relocateInContainer recursively walks ISOBMFF boxes in the container content
+// slice (data). Only container box types that lead to stco/co64 are recursed
+// into: trak, mdia, minf, stbl. stco and co64 boxes are patched in-place.
+//
+// data must be exactly the content payload of the enclosing container box
+// (the header bytes must already have been stripped by the caller). This
+// ensures each recursion level only scans within its own box boundary.
+func relocateInContainer(data []byte, oldMoovEnd int64, delta int64) error {
+	pos := 0
+	for pos+8 <= len(data) {
+		size, typ, headerLen, ok := parseCR3BoxHeader(data, pos)
+		if !ok {
+			break
+		}
+		// content is the box payload (after the header bytes), strictly bounded.
+		content := data[pos+int(headerLen) : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by slice length
+
+		switch typ {
+		case "trak", "mdia", "minf", "stbl":
+			// Recurse into container boxes using the box payload slice only.
+			// This ensures the recursive scan is strictly bounded within this box.
+			if err := relocateInContainer(content, oldMoovEnd, delta); err != nil {
+				return err
+			}
+		case "stco":
+			// ISO 14496-12 §8.7.3: FullBox (version 1B + flags 3B) + entry_count (4B) + entries (N×4B).
+			// Pass content (the stco payload after the box header) for in-place patching.
+			if err := relocateStco(content, oldMoovEnd, delta); err != nil {
+				return err
+			}
+		case "co64":
+			// ISO 14496-12 §8.7.5: FullBox (version 1B + flags 3B) + entry_count (4B) + entries (N×8B).
+			if err := relocateCo64(content, oldMoovEnd, delta); err != nil {
+				return err
+			}
+		}
+
+		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by slice length
+	}
+	return nil
+}
+
+// relocateStco patches stco entries (uint32) in-place.
+// content is the stco box payload: version (1B) + flags (3B) + entry_count (4B) + entries (N×4B).
+// Entries >= oldMoovEnd are incremented by delta; overflow returns ErrStcoOverflow.
+func relocateStco(content []byte, oldMoovEnd int64, delta int64) error {
+	// FullBox: version (1B) + flags (3B) = 4 bytes; entry_count follows at offset 4.
+	if len(content) < 8 {
+		// Box too small to contain version/flags + entry_count — skip gracefully.
+		return nil
+	}
+	entryCount := binary.BigEndian.Uint32(content[4:])
+	entryStart := 8
+	// Guard: entry array must fit within content.
+	if int(entryCount) > (len(content)-entryStart)/4 {
+		return nil
+	}
+	for i := range int(entryCount) {
+		off := entryStart + i*4
+		orig := int64(binary.BigEndian.Uint32(content[off:]))
+		if orig >= oldMoovEnd {
+			relocated := orig + delta
+			if relocated < 0 || relocated > math.MaxUint32 {
+				return fmt.Errorf("cr3: stco offset %d + delta %d = %d: %w", orig, delta, relocated, ErrStcoOverflow)
+			}
+			binary.BigEndian.PutUint32(content[off:], uint32(relocated))
+		}
+	}
+	return nil
+}
+
+// relocateCo64 patches co64 entries (uint64) in-place.
+// content is the co64 box payload: version (1B) + flags (3B) + entry_count (4B) + entries (N×8B).
+// Entries >= oldMoovEnd are incremented by delta; since uint64 is large enough for
+// any file size, no overflow check is needed beyond sign safety.
+func relocateCo64(content []byte, oldMoovEnd int64, delta int64) error {
+	// FullBox: version (1B) + flags (3B) = 4 bytes; entry_count follows at offset 4.
+	if len(content) < 8 {
+		return nil
+	}
+	entryCount := binary.BigEndian.Uint32(content[4:])
+	entryStart := 8
+	// Guard: entry array must fit within content.
+	if int(entryCount) > (len(content)-entryStart)/8 {
+		return nil
+	}
+	for i := range int(entryCount) {
+		off := entryStart + i*8
+		orig := int64(binary.BigEndian.Uint64(content[off:])) //nolint:gosec // G115: uint64→int64 safe for file offsets < 2^63
+		if orig >= oldMoovEnd {
+			relocated := orig + delta
+			if relocated < 0 {
+				return fmt.Errorf("cr3: co64 offset %d + delta %d = %d underflows: %w", orig, delta, relocated, ErrStcoOverflow)
+			}
+			binary.BigEndian.PutUint64(content[off:], uint64(relocated))
+		}
+	}
+	return nil
+}
+
+// rebuildMoovContent replaces the Canon UUID box inside moovContent with a new
+// UUID box containing the rebuilt CMTx payloads. Returns the new moov content
+// slice. If no Canon UUID box is found, moovContent is returned unchanged.
+func rebuildMoovContent(moovContent, rawEXIF, rawXMP []byte) []byte {
+	uuidStart, uuidEnd, hasUUID := flatUUIDBoxRange(moovContent, canonUUID)
+	if !hasUUID {
+		return moovContent
+	}
+	// uuidData is the UUID payload: everything after the 8-byte header + 16-byte UUID.
+	const uuidHeaderLen = 8 + 16
+	uuidData := moovContent[uuidStart+uuidHeaderLen : uuidEnd]
+	newUUIDContent, hadXMP := rebuildUUIDContent(uuidData, rawEXIF, rawXMP)
+	// Append a new "XMP " sub-box if XMP was not already present but is now provided.
+	if !hadXMP && rawXMP != nil {
+		newUUIDContent = append(newUUIDContent, buildBox("XMP ", rawXMP)...)
+	}
+	newUUIDBox := buildUUIDBox(canonUUID, newUUIDContent)
+	// Rebuild moovContent: prefix + newUUIDBox + suffix.
+	capacity := len(moovContent) - (uuidEnd - uuidStart) + len(newUUIDBox)
+	newContent := make([]byte, 0, capacity)
+	newContent = append(newContent, moovContent[:uuidStart]...)
+	newContent = append(newContent, newUUIDBox...)
+	newContent = append(newContent, moovContent[uuidEnd:]...)
+	return newContent
+}
+
+// Inject reads the CR3 from r, replaces the Canon UUID sub-boxes with the
+// provided metadata payloads, relocates all trak/stbl stco/co64 chunk-offset
+// table entries to account for the change in moov size, and writes the result
+// to w.
+//
+// Offset relocation algorithm (ISO 14496-12 §8.7.3 / §8.7.5):
+//
+//  1. Parse the flat ISOBMFF box stream to locate moovStart and moovEnd.
+//  2. Rebuild the Canon UUID box and the enclosing moov box with the new CMTx
+//     payloads; compute delta = len(newMoovBox) - (moovEnd - moovStart).
+//  3. Walk every trak → mdia → minf → stbl → {stco, co64} box inside the
+//     rebuilt moov. For each chunk offset O:
+//     - If O >= oldMoovEnd: set O = O + delta  (the byte it references shifted).
+//     - If O < oldMoovEnd: leave unchanged    (points before the shifted region).
+//  4. stco entries are uint32; if O + delta > MaxUint32, return ErrStcoOverflow
+//     rather than truncate silently.
+//  5. Reassemble: data[:moovStart] + newMoovBox + data[moovEnd:].
 //
 // preserveUnknownSegments must be true; passing false returns
 // ErrPreserveUnknownSegmentsNotSupported because CR3 ISOBMFF boxes are
 // structurally mandatory and cannot be selectively stripped.
+//
+// If all payloads are nil the source is passed through unchanged (no moov
+// rebuild, no stco/co64 relocation needed).
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
 	// Reject PreserveUnknownSegments(false) for CR3: ISOBMFF boxes are
 	// structurally mandatory. There is no concept of "unknown optional segment"
@@ -228,26 +408,73 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 		return ErrPreserveUnknownSegmentsNotSupported
 	}
 
-	// SAFE GATE: reject any write that would change metadata.
-	// A nil rawEXIF, nil rawIPTC, and nil rawXMP means "preserve everything as-is"
-	// — that is a no-op pass-through and is always safe, so we allow it.
-	// Any non-nil payload would trigger a CMT1/XMP  replacement inside moov,
-	// shifting mdat and invalidating the stco/co64 tables. Block it immediately
-	// before performing any I/O so no corrupt output is produced.
-	if rawEXIF != nil || rawIPTC != nil || rawXMP != nil {
-		return ErrWriteNotSupported
-	}
-
-	// All payloads are nil: pass the source bytes through unchanged.
-	// moov size does not change, so stco/co64 tables remain valid.
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("cr3: seek: %w", err)
 	}
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return fmt.Errorf("cr3: read: %w", err)
+	data, readErr := io.ReadAll(r)
+	if readErr != nil {
+		return fmt.Errorf("cr3: read: %w", readErr)
 	}
-	if _, err = w.Write(data); err != nil {
+
+	// All payloads nil: pass through unchanged.
+	// moov size does not change, so stco/co64 tables remain valid.
+	if rawEXIF == nil && rawIPTC == nil && rawXMP == nil {
+		return writeAll(w, data)
+	}
+
+	// Locate the moov box in the flat file stream.
+	moovStart, moovEnd, found := findMoovRange(data)
+	if !found {
+		// No moov box — file is corrupt/incomplete. Pass through unchanged.
+		return writeAll(w, data)
+	}
+
+	out, err := injectIntoMoov(data, moovStart, moovEnd, rawEXIF, rawXMP)
+	if err != nil {
+		return err
+	}
+	return writeAll(w, out)
+}
+
+// injectIntoMoov rebuilds the moov box at data[moovStart:moovEnd] with the new
+// metadata payloads, relocates stco/co64 offsets, and returns the reassembled
+// file bytes. rawIPTC is intentionally ignored: CR3 does not carry IPTC.
+func injectIntoMoov(data []byte, moovStart, moovEnd int, rawEXIF, rawXMP []byte) ([]byte, error) {
+	// moovContent is the moov box payload (everything after the 8-byte header).
+	moovContent := data[moovStart+8 : moovEnd]
+	newMoovContent := rebuildMoovContent(moovContent, rawEXIF, rawXMP)
+	newMoovBox := buildBox("moov", newMoovContent)
+
+	// Compute the size delta between the new and old moov boxes.
+	// delta > 0: moov grew; mdat shifted forward.
+	// delta < 0: moov shrank; mdat shifted backward.
+	oldMoovSize := moovEnd - moovStart
+	delta := int64(len(newMoovBox)) - int64(oldMoovSize)
+
+	// Relocate stco/co64 offsets inside newMoovBox.
+	// We patch in-place because newMoovBox was just freshly allocated by buildBox.
+	// oldMoovEnd is the absolute file position where mdat begins.
+	if delta != 0 {
+		if err := relocateChunkOffsets(newMoovBox, moovEnd, delta); err != nil {
+			return nil, fmt.Errorf("cr3: stco/co64 offset relocation: %w", err)
+		}
+	}
+
+	// Reassemble: ftyp (and any pre-moov boxes) + relocated moov + mdat (verbatim).
+	// data[moovEnd:] contains mdat and any subsequent boxes; their bytes are intact,
+	// only their position in the file has shifted by delta — handled by the patched
+	// stco/co64 tables.
+	totalLen := len(data) - oldMoovSize + len(newMoovBox)
+	out := make([]byte, 0, totalLen)
+	out = append(out, data[:moovStart]...)
+	out = append(out, newMoovBox...)
+	out = append(out, data[moovEnd:]...)
+	return out, nil
+}
+
+// writeAll writes b to w, wrapping any error with the cr3 prefix.
+func writeAll(w io.Writer, b []byte) error {
+	if _, err := w.Write(b); err != nil {
 		return fmt.Errorf("cr3: write: %w", err)
 	}
 	return nil
