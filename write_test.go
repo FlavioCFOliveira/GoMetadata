@@ -300,25 +300,24 @@ func buildMinimalRW2() []byte {
 	return base
 }
 
-// TestWriteTIFFBasedFormatsReturnErrWriteNotSupported verifies that Write
-// returns ErrWriteNotSupported (and nothing else) for every TIFF-based
-// container format. The writer must receive no bytes — the gate must fire
-// before any I/O reaches the output.
+// TestWriteRAWFormatsReturnErrWriteNotSupported verifies that Write returns
+// ErrWriteNotSupported for the RAW formats that remain gated (CR2, ORF, RW2).
+// These formats require SubIFD recursion (task #94) and/or manufacturer-specific
+// offset handling (task #95) that is not yet implemented.
 //
-// Covered formats: TIFF, CR2, ORF, RW2. NEF, ARW, and DNG are covered by
-// TestWriteTIFFBasedFormatsFromCorpus which uses real fixture files (those
-// formats require IFD tag inspection to be distinguished from plain TIFF and
-// cannot be built synthetically without full IFD construction).
-func TestWriteTIFFBasedFormatsReturnErrWriteNotSupported(t *testing.T) {
+// FormatTIFF was removed from this test in tasks #92/#93: tiff.Inject now uses
+// the copy-and-relocate serializer and TIFF writes succeed.
+//
+// NEF, ARW, and DNG are covered by TestWriteTIFFBasedFormatsFromCorpus, which
+// uses real fixture files (those formats require IFD tag inspection to be
+// distinguished from plain TIFF and cannot be built synthetically).
+func TestWriteRAWFormatsReturnErrWriteNotSupported(t *testing.T) {
 	t.Parallel()
-
-	tiffPayload := minimalTIFFPayload()
 
 	cases := []struct {
 		name string
 		data []byte
 	}{
-		{"TIFF", tiffPayload},
 		{"CR2", buildMinimalCR2()},
 		{"ORF", buildMinimalORF()},
 		{"RW2", buildMinimalRW2()},
@@ -346,6 +345,34 @@ func TestWriteTIFFBasedFormatsReturnErrWriteNotSupported(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestWriteTIFFSucceeds verifies that Write no longer returns ErrWriteNotSupported
+// for a plain TIFF file (tasks #92/#93: copy-and-relocate serializer un-gates TIFF).
+// The output must be non-empty and re-parseable.
+func TestWriteTIFFSucceeds(t *testing.T) {
+	t.Parallel()
+
+	data := minimalTIFFPayload()
+	m, err := Read(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := Write(bytes.NewReader(data), &out, m); err != nil {
+		t.Fatalf("Write TIFF returned unexpected error: %v", err)
+	}
+	if out.Len() == 0 {
+		t.Error("Write TIFF produced no output bytes")
+	}
+
+	// Output must re-parse without error.
+	m2, err := Read(bytes.NewReader(out.Bytes()))
+	if err != nil {
+		t.Fatalf("Read after Write TIFF: %v", err)
+	}
+	_ = m2
 }
 
 // TestWriteTIFFBasedFormatsFromCorpus verifies ErrWriteNotSupported for NEF,
@@ -397,16 +424,18 @@ func TestWriteTIFFBasedFormatsFromCorpus(t *testing.T) {
 	}
 }
 
-// TestWriteFileBlocksTIFFBased verifies that WriteFile returns
-// ErrWriteNotSupported and does NOT overwrite the original file for a
-// TIFF-based container (using a minimal TIFF as the representative case).
-func TestWriteFileBlocksTIFFBased(t *testing.T) {
+// TestWriteFileBlocksRAWBased verifies that WriteFile returns ErrWriteNotSupported
+// and does NOT overwrite the original file for a RAW format that remains gated
+// (CR2 as the representative case).
+//
+// For FormatTIFF, see TestWriteFileTIFFSucceeds.
+func TestWriteFileBlocksRAWBased(t *testing.T) {
 	t.Parallel()
 
-	original := minimalTIFFPayload()
+	original := buildMinimalCR2()
 
 	dir := t.TempDir()
-	target := filepath.Join(dir, "image.tif")
+	target := filepath.Join(dir, "image.cr2")
 	if err := os.WriteFile(target, original, 0o644); err != nil { //nolint:gosec // G306: 0644 is the correct permission for an image file in a test
 		t.Fatalf("setup WriteFile: %v", err)
 	}
@@ -426,7 +455,7 @@ func TestWriteFileBlocksTIFFBased(t *testing.T) {
 
 	// File must not have been modified.
 	remaining := listDir(t, dir)
-	if len(remaining) != 1 || remaining[0] != "image.tif" {
+	if len(remaining) != 1 || remaining[0] != "image.cr2" {
 		t.Errorf("unexpected files after WriteFile error: %v", remaining)
 	}
 	got, readErr := os.ReadFile(target)
@@ -436,6 +465,37 @@ func TestWriteFileBlocksTIFFBased(t *testing.T) {
 	if !bytes.Equal(got, original) {
 		t.Error("target file was modified despite ErrWriteNotSupported")
 	}
+}
+
+// TestWriteFileTIFFSucceeds verifies that WriteFile does NOT return
+// ErrWriteNotSupported for a plain TIFF file (tasks #92/#93).
+// The output must re-parse cleanly.
+func TestWriteFileTIFFSucceeds(t *testing.T) {
+	t.Parallel()
+
+	original := minimalTIFFPayload()
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "image.tif")
+	if err := os.WriteFile(target, original, 0o644); err != nil { //nolint:gosec // G306: 0644 is the correct permission for an image file in a test
+		t.Fatalf("setup WriteFile: %v", err)
+	}
+
+	m, err := ReadFile(target)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	if err := WriteFile(target, m); err != nil {
+		t.Fatalf("WriteFile TIFF returned unexpected error: %v", err)
+	}
+
+	// Re-read the output to verify it parses cleanly.
+	m2, err := ReadFile(target)
+	if err != nil {
+		t.Fatalf("ReadFile after WriteFile TIFF: %v", err)
+	}
+	_ = m2
 }
 
 // TestWriteJPEGStillWorksAfterTIFFGate is a non-regression test ensuring

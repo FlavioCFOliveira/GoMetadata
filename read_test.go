@@ -151,12 +151,15 @@ func TestValidate(t *testing.T) {
 func TestSupportsWrite(t *testing.T) {
 	t.Parallel()
 
-	// SPIKE #6 / B2: TIFF-based formats are blocked until roadmap Option A
-	// (epic #33) is implemented. SupportsWrite must return false for them.
+	// Tasks #92/#93 (epic #33 Option A): FormatTIFF is writable as of this
+	// release. The copy-and-relocate serializer in format/tiff/relocate.go
+	// preserves image-data blocks at corrected offsets.
+	// The six RAW variants (CR2, NEF, ARW, DNG, ORF, RW2) remain read-only
+	// until tasks #94/#95 (SubIFD recursion and manufacturer offset rebasing).
 	// CR3 is writable as of task #91: stco/co64 offset relocation is implemented
 	// in cr3.Inject; SupportsWrite(FormatCR3) now returns true.
 	writable := []format.FormatID{
-		format.FormatJPEG, format.FormatPNG, format.FormatHEIF,
+		format.FormatJPEG, format.FormatTIFF, format.FormatPNG, format.FormatHEIF,
 		format.FormatWebP, format.FormatAVIF, format.FormatCR3,
 	}
 	for _, f := range writable {
@@ -166,7 +169,7 @@ func TestSupportsWrite(t *testing.T) {
 	}
 
 	notWritable := []format.FormatID{
-		format.FormatTIFF, format.FormatCR2, format.FormatNEF,
+		format.FormatCR2, format.FormatNEF,
 		format.FormatARW, format.FormatDNG, format.FormatORF, format.FormatRW2,
 		format.FormatUnknown,
 	}

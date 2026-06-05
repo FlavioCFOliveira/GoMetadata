@@ -266,7 +266,7 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 |---|---|
 | Metadata standards | EXIF 3.0 (CIPA DC-008 / TIFF 6.0), IPTC IIM 4.2, XMP (ISO 16684-1) |
 | Read | Whichever of EXIF / IPTC / XMP the container carries, across all 13 formats (IPTC is only carried by JPEG and TIFF) |
-| Write | All three standards for JPEG, PNG, WebP, HEIF, AVIF, and CR3; preserves unmodified metadata byte-for-byte. TIFF-based formats (TIFF, CR2, NEF, ARW, DNG, ORF, RW2) are read-only — see the Supported formats table |
+| Write | All three standards for JPEG, TIFF, PNG, WebP, HEIF, AVIF, and CR3; preserves unmodified metadata byte-for-byte. TIFF uses a copy-and-relocate serializer that preserves image-data blocks (strips/tiles) at corrected offsets. The six RAW variants (CR2, NEF, ARW, DNG, ORF, RW2) remain read-only — see the Supported formats table |
 | Atomic writes | `WriteFile` uses temp file + rename — no partial writes |
 | Format detection | Magic bytes only; file extension is never consulted |
 | MakerNote (read) | Canon, Nikon, Sony, Olympus, Panasonic, Pentax, DJI, FujiFilm, Leica, Samsung, Sigma, Minolta, Casio |
@@ -284,7 +284,7 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 | Format | Extension(s) | Read | Write | EXIF | IPTC | XMP |
 |---|---|:---:|:---:|:---:|:---:|:---:|
 | JPEG | .jpg, .jpeg | Yes | Yes | Yes | Yes | Yes |
-| TIFF | .tif, .tiff | Yes | No¹ | Yes | Yes | Yes |
+| TIFF | .tif, .tiff | Yes | Yes² | Yes | Yes | Yes |
 | PNG | .png | Yes | Yes | Yes | No | Yes |
 | WebP | .webp | Yes | Yes | Yes | No | Yes |
 | HEIF | .heif, .heic | Yes | Yes | Yes | No | Yes |
@@ -297,7 +297,9 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 | Olympus ORF | .orf | Yes | No¹ | Yes | No | Yes |
 | Panasonic RW2 | .rw2 | Yes | No¹ | Yes | No | Yes |
 
-> ¹ **TIFF-based containers are read-only.** `Write` and `WriteFile` return `ErrWriteNotSupported` for TIFF, CR2, NEF, ARW, DNG, ORF, and RW2. Writing into these formats requires relocating embedded image-data offsets (strip/tile pointers) — a structural rewrite tracked on the roadmap. Reading is fully supported for all seven. Use `format.SupportsWrite(id)` to check programmatically.
+> ¹ **RAW write is read-only.** `Write` and `WriteFile` return `ErrWriteNotSupported` for CR2, NEF, ARW, DNG, ORF, and RW2. Writing into these formats requires SubIFD recursion and manufacturer-specific offset rebasing not yet implemented (tasks #94/#95). Reading is fully supported for all six. Use `format.SupportsWrite(id)` to check programmatically.
+>
+> ² **TIFF write uses copy-and-relocate** (`format/tiff/relocate.go`). Image strips, tiles, and non-thumbnail JPEG blocks are enumerated, copied verbatim to a fresh offset in the output stream, and the corresponding IFD entries are patched. SubIFD (tag 0x014A) deep recursion for DNG multi-image layouts is deferred to task #94.
 
 ## Performance
 

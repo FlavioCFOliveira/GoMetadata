@@ -52,25 +52,29 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 }
 
 // Inject writes a modified TIFF stream to w, replacing the metadata tags.
-// When rawIPTC or rawXMP is non-nil, the TIFF is parsed and IFD0 is updated
-// with the new values before re-encoding (affects CR2, NEF, ARW, DNG via delegation).
 //
-// WARNING — image-data corruption risk: TIFF-based containers (TIFF, CR2, NEF,
-// ARW, DNG, ORF, RW2) store image data (strips, tiles, JPEG thumbnails) at
-// offsets that are absolute within the TIFF stream. This function re-encodes
-// the IFD block via exif.Encode without relocating that image data, which
-// invalidates those offsets and corrupts the image. Do NOT call Inject directly
-// on files from a user-facing write path; use gometadata.Write instead, which
-// gates TIFF-based formats behind ErrWriteNotSupported until full structural
-// relocation is implemented (roadmap Option A, epic #33).
+// When rawIPTC or rawXMP is non-nil, Inject uses the copy-and-relocate path
+// (relocateTIFF) to rebuild the IFD chain, upsert the new metadata payloads,
+// and append every image-data block (strips, tiles, main-image JPEG) at a
+// fresh absolute offset — preserving the pixel data byte-identically.
 //
-// Round-trip fidelity: all IFD entries whose TIFF type code is defined in
-// TIFF 6.0 §2 are faithfully preserved, including private tags with known
-// types. Entries using undefined/proprietary type codes retain their 4-byte
-// IFD field but any out-of-line data they referenced is not copied (see
-// exif.Encode documentation). If exif.Parse fails (e.g. because the caller
-// passed a non-standard TIFF variant that cannot be decoded), Inject returns
-// the parse error rather than silently discarding the requested metadata.
+// When both rawIPTC and rawXMP are nil, the base bytes are written verbatim
+// (pass-through path).
+//
+// Round-trip fidelity:
+//   - All IFD entries with known TIFF type codes are faithfully preserved.
+//   - Image-data blocks (StripOffsets, TileOffsets, JPEGInterchangeFormat for
+//     non-thumbnail IFDs) are copied verbatim from the source and their offset
+//     entries are patched to the new positions.
+//   - IFD1 JPEG thumbnails are handled by exif.Encode's patchThumbnailEntries.
+//   - MakerNote blobs are copied verbatim (see relocate.go for safety note).
+//   - Unknown-type IFD entries retain their 4-byte field; out-of-line data
+//     referenced by unknown types is not copied (see exif.Encode docs).
+//   - SubIFD (tag 0x014A) recursion is deferred to task #94; SubIFD-referenced
+//     image data is not relocated by this implementation.
+//
+// If exif.Parse fails, Inject returns the parse error rather than silently
+// discarding the requested metadata.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ bool) error {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("tiff: seek: %w", err)
@@ -88,7 +92,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ boo
 		}
 	}
 
-	// If no IPTC or XMP updates, write the base bytes directly.
+	// Pass-through: no metadata changes requested.
 	if rawIPTC == nil && rawXMP == nil {
 		if _, err := w.Write(base); err != nil {
 			return fmt.Errorf("tiff: write: %w", err)
@@ -96,7 +100,9 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ boo
 		return nil
 	}
 
-	updated, err := buildUpdatedTIFF(base, rawIPTC, rawXMP)
+	// Copy-and-relocate path: rebuild IFD structure with upserted metadata and
+	// appended image-data blocks at corrected offsets (epic #33, tasks #92/#93).
+	updated, err := relocateTIFF(base, rawIPTC, rawXMP)
 	if err != nil {
 		return err
 	}
@@ -104,30 +110,6 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ boo
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
-}
-
-// buildUpdatedTIFF parses base as a TIFF stream, upserts IPTC and XMP entries
-// in IFD0 for any non-nil payload, and re-encodes the result.
-// If parsing fails we cannot safely inject metadata; the error is returned so
-// the caller knows the update was not applied rather than silently losing it.
-func buildUpdatedTIFF(base []byte, rawIPTC, rawXMP []byte) ([]byte, error) {
-	e, err := exif.Parse(base)
-	if err != nil {
-		return nil, fmt.Errorf("tiff: parse for metadata injection: %w", err)
-	}
-
-	if rawIPTC != nil {
-		upsertIFD0Entry(e.IFD0, exif.TagIPTC, exif.TypeUndefined, rawIPTC)
-	}
-	if rawXMP != nil {
-		upsertIFD0Entry(e.IFD0, exif.TagXMP, exif.TypeUndefined, rawXMP)
-	}
-
-	updated, err := exif.Encode(e)
-	if err != nil {
-		return nil, fmt.Errorf("tiff: encode: %w", err)
-	}
-	return updated, nil
 }
 
 // upsertIFD0Entry adds or replaces an entry in ifd for the given tag while

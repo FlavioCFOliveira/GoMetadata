@@ -9,7 +9,9 @@
 // The following container formats are fully supported for metadata reading:
 //
 //   - JPEG (read + write)
-//   - TIFF (read only; write blocked pending image-data relocation — see SupportsWrite)
+//   - TIFF (read + write; the copy-and-relocate serializer preserves image-data
+//     blocks byte-identically — strips, tiles, main-image JPEG; SubIFD-deep
+//     DNG layouts are deferred to task #94)
 //   - PNG (read + write)
 //   - HEIF / HEIC (read + write)
 //   - AVIF (read + write)

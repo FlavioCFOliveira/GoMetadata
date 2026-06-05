@@ -8,9 +8,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Added
 
+- **TIFF copy-and-relocate metadata write** (`format/tiff/`, tasks #92/#93, epic #33): `tiff.Inject` now uses a new copy-and-relocate serializer (`format/tiff/relocate.go`) that enumerates every image-data block referenced by `StripOffsets` (0x0111), `TileOffsets` (0x0144), and `JPEGInterchangeFormat` (0x0201 non-thumbnail) across IFD0 and the IFD1 chain, appends each block at a fresh absolute offset in the rebuilt TIFF stream, and patches the offset entries accordingly. Both scalar (single-strip) and array (multi-strip, multi-tile, COUNT > 1) offset entries are handled. IFD1 JPEG thumbnails continue to be relocated by `exif.Encode`'s existing `patchThumbnailEntries` path. MakerNote blobs are copied verbatim (SPIKE #24: blob-relative offsets are move-safe). SubIFD (tag 0x014A) deep recursion for DNG multi-image layouts is deferred to task #94. New sentinel errors `tiff.ErrBlockOutOfBounds`, `tiff.ErrUnsupportedOffsetType`, `tiff.ErrTruncatedOffsetArray`, and `tiff.ErrUnsupportedElemSize` are exported for diagnostic use.
+
 - **CR3 metadata write with `stco`/`co64` offset relocation** (`format/raw/cr3/`): `cr3.Inject` now fully supports CR3 metadata writes. After rebuilding the Canon UUID box with the new CMTx payloads, it computes `delta = len(newMoovBox) - len(oldMoovBox)` and walks every `trak → mdia → minf → stbl → {stco, co64}` table inside the rebuilt `moov`, adding `delta` to each chunk offset whose absolute file position points at or beyond the original `moov` end (`>= oldMoovEnd`). Offsets that reference data before `moov` (e.g., into `ftyp`) are left unchanged. `stco` overflow (relocated value > `MaxUint32`) returns `cr3.ErrStcoOverflow` rather than silently truncating. The pass-through path (all-nil payloads) remains unchanged. `format.SupportsWrite(FormatCR3)` now returns `true`.
 
 ### Changed
+
+- **`format.SupportsWrite` for TIFF** (`format/format.go`): `SupportsWrite(FormatTIFF)` now returns `true` (was `false`). The SPIKE #6 write gate for `FormatTIFF` in `write.go` has been removed; `isTIFFBased()` no longer includes `FormatTIFF`. The six RAW variants (CR2, NEF, ARW, DNG, ORF, RW2) remain gated until tasks #94/#95 (SubIFD recursion and manufacturer offset rebasing).
 
 - **`format.SupportsWrite` for CR3** (`format/format.go`): `SupportsWrite(FormatCR3)` now returns `true`. The task #56 safe gate (`ErrWriteNotSupported`) inside `cr3.Inject` has been removed and replaced with the full stco/co64 relocation pass. README, `doc.go`, and the knowledge-model capability matrix are updated to match.
 

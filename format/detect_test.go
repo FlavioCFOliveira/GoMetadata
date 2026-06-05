@@ -292,9 +292,13 @@ func TestRefineTIFFVariant(t *testing.T) {
 // TestSupportsWrite exercises SupportsWrite for known writable, non-writable,
 // and unknown format IDs.
 //
-// SPIKE #6 / B2: TIFF-based formats (TIFF, CR2, NEF, ARW, DNG, ORF, RW2)
-// return false because metadata writes require image-data relocation that is
-// not yet implemented (roadmap Option A, epic #33).
+// Tasks #92/#93 (epic #33 Option A): FormatTIFF is writable as of this release.
+// The copy-and-relocate serializer in format/tiff/relocate.go preserves
+// image-data blocks (strips, tiles, main-image JPEG) at corrected absolute
+// offsets, eliminating the SPIKE #6 corruption risk for plain TIFF files.
+//
+// The six RAW variants (CR2, NEF, ARW, DNG, ORF, RW2) remain read-only until
+// tasks #94/#95 (SubIFD recursion and manufacturer-specific offset rebasing).
 //
 // CR3 returns true as of task #91: cr3.Inject now implements stco/co64 offset
 // relocation, walking every trak/stbl/{stco,co64} table inside the rebuilt
@@ -303,7 +307,7 @@ func TestSupportsWrite(t *testing.T) {
 	t.Parallel()
 
 	writable := []FormatID{
-		FormatJPEG, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3,
+		FormatJPEG, FormatTIFF, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3,
 	}
 	for _, f := range writable {
 		if !SupportsWrite(f) {
@@ -312,7 +316,7 @@ func TestSupportsWrite(t *testing.T) {
 	}
 
 	notWritable := []FormatID{
-		FormatTIFF, FormatCR2, FormatNEF, FormatARW, FormatDNG, FormatORF, FormatRW2,
+		FormatCR2, FormatNEF, FormatARW, FormatDNG, FormatORF, FormatRW2,
 		FormatUnknown,
 	}
 	for _, f := range notWritable {

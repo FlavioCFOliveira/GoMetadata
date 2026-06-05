@@ -76,20 +76,19 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 		return &UnsupportedFormatError{}
 	}
 
-	// SPIKE #6 / epic #33 (roadmap Option A): TIFF-based containers store image
-	// data (strips, tiles, JPEG thumbnails) at offsets that are relative to the
-	// start of the TIFF stream. Rebuilding the IFD block via exif.Encode without
-	// also relocating that image data corrupts the file. Until Option A (full
-	// structural rewrite) is implemented, block all writes to TIFF-based formats
-	// at this point — before encodeMetadata allocates anything — and return an
-	// explicit, actionable error.
+	// Epic #33 (SPIKE #6 Option A): TIFF-based containers store image data
+	// (strips, tiles, JPEG thumbnails) at absolute TIFF-stream offsets.
+	// Rebuilding the IFD block without relocating that image data corrupts the
+	// file.
 	//
-	// Formats covered: TIFF, CR2, NEF, ARW, DNG, ORF, RW2.
-	// NOT covered here: CR3 (ISOBMFF container, different write path, tracked
-	// separately).
+	// FormatTIFF is un-gated as of tasks #92/#93: tiff.Inject now uses the
+	// copy-and-relocate path which enumerates every image-data block and appends
+	// it at a corrected offset. See format/tiff/relocate.go for coverage details
+	// and deferred cases (SubIFD recursion, tasks #94/#95).
 	//
-	// To remove this gate when Option A ships: delete the isTIFFBased check and
-	// the ErrWriteNotSupported declaration in errors.go.
+	// The six RAW variants (CR2, NEF, ARW, DNG, ORF, RW2) remain gated because
+	// they require additional SubIFD recursion work (task #94) and/or
+	// manufacturer-specific offset handling (task #95).
 	if isTIFFBased(fmtID) {
 		return ErrWriteNotSupported
 	}
@@ -270,10 +269,19 @@ func wrapInject(err error) error {
 // (strips, tiles, JPEG thumbnails) is addressed by absolute TIFF offsets that
 // become invalid when the IFD block is rebuilt without relocating that data.
 // See ErrWriteNotSupported and roadmap Option A (epic #33).
+// isTIFFBased reports whether fmtID is a TIFF-based container format that
+// still requires the write gate.
+//
+// FormatTIFF was removed from this gate in tasks #92/#93 (epic #33): the
+// copy-and-relocate serializer in format/tiff/relocate.go now handles strip,
+// tile, and main-image JPEG offset relocation for plain TIFF files.
+//
+// The six RAW variants remain gated until tasks #94/#95 are complete:
+//   - CR2, NEF, ARW, DNG, ORF, RW2 require SubIFD recursion and/or
+//     manufacturer-specific offset handling that is not yet implemented.
 func isTIFFBased(fmtID format.FormatID) bool {
 	switch fmtID {
-	case format.FormatTIFF,
-		format.FormatCR2,
+	case format.FormatCR2,
 		format.FormatNEF,
 		format.FormatARW,
 		format.FormatDNG,

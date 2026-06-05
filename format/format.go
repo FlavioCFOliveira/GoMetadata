@@ -59,10 +59,16 @@ func (f FormatID) String() string {
 // SupportsWrite reports whether the library can inject metadata into files of
 // the given format without corrupting the image data.
 //
-// TIFF-based containers (TIFF, CR2, NEF, ARW, DNG, ORF, RW2) return false
-// because writing requires image-data relocation that is not yet implemented
-// (roadmap Option A, epic #33). Write and WriteFile return
-// ErrWriteNotSupported for these formats.
+// FormatTIFF returns true as of tasks #92/#93 (epic #33 Option A). The
+// format/tiff copy-and-relocate serializer enumerates every image-data block
+// (strips, tiles, main-image JPEG) and appends it at a fresh absolute offset,
+// preserving pixel data byte-identically. SubIFD (0x014A) recursion for DNG
+// multi-image layouts is deferred to task #94.
+//
+// The six RAW variants (CR2, NEF, ARW, DNG, ORF, RW2) return false because
+// they require SubIFD recursion and/or manufacturer-specific offset handling
+// that is not yet implemented (tasks #94/#95). Write and WriteFile return
+// ErrWriteNotSupported for those formats.
 //
 // CR3 returns true. CR3 uses an ISOBMFF container; cr3.Inject rebuilds the
 // Canon UUID box with the new CMTx payloads and then walks every
@@ -71,10 +77,10 @@ func (f FormatID) String() string {
 // relocation pass was implemented in task #91.
 func SupportsWrite(f FormatID) bool {
 	switch f {
-	case FormatJPEG, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3:
+	case FormatJPEG, FormatTIFF, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3:
 		return true
-	case FormatTIFF, FormatCR2, FormatNEF, FormatARW, FormatDNG, FormatORF, FormatRW2:
-		// SPIKE #6: TIFF-based write is blocked until Option A is implemented.
+	case FormatCR2, FormatNEF, FormatARW, FormatDNG, FormatORF, FormatRW2:
+		// Tasks #94/#95: RAW write requires SubIFD recursion / manufacturer offset rebasing.
 		return false
 	case FormatUnknown:
 		return false
