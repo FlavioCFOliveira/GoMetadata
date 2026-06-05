@@ -162,12 +162,13 @@ func TestSupportsWrite(t *testing.T) {
 	// validated against real Canon EOS 350D file (ImageDataHash IN==OUT, all tags kept).
 	// Task #102: NEF is now writable — Nikon-specific MakerNote extension + PreviewIFD
 	// relocation validated against real Nikon D70 file (ImageDataHash IN==OUT).
-	// ARW remains gated: 52 Sony MakerNote tags lost, SR2Private IFD corrupted.
+	// Task #103: ARW is now writable — Sony MakerNote absolute-offset rebase + SR2Private
+	// block preservation validated against real Sony DSLR-A500 file (ImageDataHash IN==OUT).
 	// ORF and RW2 remain read-only (non-standard magic; task #95 follow-up).
 	writable := []format.FormatID{
 		format.FormatJPEG, format.FormatTIFF, format.FormatDNG, format.FormatPNG,
 		format.FormatHEIF, format.FormatWebP, format.FormatAVIF, format.FormatCR3,
-		format.FormatCR2, format.FormatNEF,
+		format.FormatCR2, format.FormatNEF, format.FormatARW,
 	}
 	for _, f := range writable {
 		if !format.SupportsWrite(f) {
@@ -175,9 +176,8 @@ func TestSupportsWrite(t *testing.T) {
 		}
 	}
 
-	// ARW: real-corpus validation failed (task #95); ORF/RW2: non-standard magic.
+	// ORF/RW2: non-standard magic; FormatUnknown: always false.
 	notWritable := []format.FormatID{
-		format.FormatARW,
 		format.FormatORF, format.FormatRW2,
 		format.FormatUnknown,
 	}

@@ -101,7 +101,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	return nil
 }
 
-func extractTIFFTags(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawIPTC, rawXMP []byte) {
+func extractTIFFTags(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawIPTC, rawXMP []byte) { //nolint:gocyclo // IPTC trimming branch is inherent to TypeLong-vs-TypeUndefined handling; extracting a helper would reduce clarity
 	if int(ifd0Off)+2 > len(data) {
 		return nil, nil
 	}
@@ -133,7 +133,14 @@ func extractTIFFTags(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawIP
 		}
 		switch tag {
 		case 0x83BB:
-			rawIPTC = v
+			// TypeLong IPTC (ExifTool convention) may include trailing zero-byte
+			// padding to reach a 4-byte boundary.  Trim so callers receive the
+			// original unpadded IPTC content (IIM §1.6: only 0x1C is a valid
+			// dataset start; trailing zeros are safely ignored by the IIM scanner).
+			rawIPTC = bytes.TrimRight(v, "\x00")
+			if len(rawIPTC) == 0 {
+				rawIPTC = nil
+			}
 		case 0x02BC:
 			rawXMP = v
 		}

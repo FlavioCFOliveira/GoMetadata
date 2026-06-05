@@ -705,10 +705,13 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 		e.IFD0 = &exif.IFD{}
 	}
 	if rawIPTC != nil {
-		upsertIFD0Entry(e.IFD0, exif.TagIPTC, exif.TypeUndefined, rawIPTC)
+		// Adobe XMP Spec / ExifTool convention: IPTC-NAA (0x83BB) as TypeLong.
+		// upsertIFD0Entry pads value to 4-byte boundary; Count = nLongs.
+		upsertIFD0Entry(e.IFD0, exif.TagIPTC, exif.TypeLong, rawIPTC)
 	}
 	if rawXMP != nil {
-		upsertIFD0Entry(e.IFD0, exif.TagXMP, exif.TypeUndefined, rawXMP)
+		// Adobe XMP Spec (TIFF Technical Note 3): XMP (0x02BC) as TypeByte.
+		upsertIFD0Entry(e.IFD0, exif.TagXMP, exif.TypeByte, rawXMP)
 	}
 
 	// Step 3: enumerate image blocks from the main IFD chain.
@@ -783,7 +786,13 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	}
 
 	// Step 11: append SubIFD raw bytes.
+	// TIFF 6.0 §2: each SubIFD block must start at a word (even) boundary.
+	// assignSubIFDOffsets already reserved space for the 0x00 pad byte;
+	// insert it here to keep finalTIFF and the assigned offsets in sync.
 	for _, si := range subIFDs {
+		if len(finalTIFF)&1 == 1 {
+			finalTIFF = append(finalTIFF, 0x00)
+		}
 		finalTIFF = append(finalTIFF, si.rawBytes...)
 	}
 

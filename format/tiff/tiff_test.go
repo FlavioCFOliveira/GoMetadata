@@ -562,3 +562,155 @@ func TestExtractInvalidByteOrder(t *testing.T) {
 		t.Error("expected error for invalid byte-order, got nil")
 	}
 }
+
+// TestTagTypeIPTCAndXMPConventional is a regression test for task #100.
+//
+// IPTC tag 0x83BB must be emitted as TypeLong (not TypeUndefined) and XMP tag
+// 0x02BC must be emitted as TypeByte (not TypeUndefined).  Using UNDEFINED for
+// these tags causes exiftool -validate to report "Non-standard format (undef)".
+//
+// Spec:
+//   - Adobe XMP Specification Part 3 §1.1.3 (TIFF): XMP ApplicationNotes
+//     (0x02BC) is BYTE type.
+//   - ExifTool convention (widely adopted): IPTC-NAA (0x83BB) is LONG type
+//     with Count = ceil(len(rawIPTC)/4); IPTC byte blob padded to 4-byte boundary.
+//
+// The test exercises:
+//  1. 4-byte-aligned IPTC (no padding needed).
+//  2. Unaligned IPTC (5 bytes → padded to 8; Count=2; round-trip byte check).
+//  3. XMP TypeByte with correct Count.
+//  4. Extracted IPTC bytes match the original payload (padding does not corrupt).
+func TestTagTypeIPTCAndXMPConventional(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		rawIPTC      []byte
+		rawXMP       []byte
+		wantIPTCType exif.DataType
+		wantXMPType  exif.DataType
+	}{
+		{
+			// IPTC IIM record 2, dataset 80 (Headline), length 0, value empty.
+			// Use a non-zero byte in the 4th position so trailing-zero trim
+			// does not reduce the payload below 4 bytes.
+			name:         "aligned IPTC (4 bytes, no trailing zeros), TypeByte XMP",
+			rawIPTC:      []byte{0x1c, 0x02, 0x50, 0x01},
+			rawXMP:       []byte("<xmpmeta/>"),
+			wantIPTCType: exif.TypeLong,
+			wantXMPType:  exif.TypeByte,
+		},
+		{
+			name:         "unaligned IPTC (5 bytes padded to 8), TypeByte XMP",
+			rawIPTC:      []byte{0x1c, 0x02, 0x78, 0x00, 0x01},
+			rawXMP:       []byte("<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?><xmpmeta/><?xpacket end='r'?>"),
+			wantIPTCType: exif.TypeLong,
+			wantXMPType:  exif.TypeByte,
+		},
+		{
+			name:         "12-byte IPTC (3 LONGs), no XMP",
+			rawIPTC:      []byte{0x1c, 0x02, 0x78, 0x00, 0x07, 0x54, 0x65, 0x73, 0x74, 0x69, 0x6e, 0x67},
+			rawXMP:       nil,
+			wantIPTCType: exif.TypeLong,
+			wantXMPType:  0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Build a TIFF with UNDEFINED tags (legacy format) as the input.
+			base := buildMinimalTIFF(binary.LittleEndian, tc.rawIPTC, tc.rawXMP)
+
+			// Inject the same payloads — this triggers relocateTIFF which now
+			// uses TypeLong for IPTC and TypeByte for XMP.
+			var out bytes.Buffer
+			if err := Inject(bytes.NewReader(base), &out, base, tc.rawIPTC, tc.rawXMP, true); err != nil {
+				t.Fatalf("Inject: %v", err)
+			}
+
+			outBytes := out.Bytes()
+
+			// Parse the written EXIF stream and inspect IFD0 entry types.
+			parsed, err := exif.Parse(outBytes)
+			if err != nil {
+				t.Fatalf("exif.Parse on injected output: %v", err)
+			}
+			if parsed.IFD0 == nil {
+				t.Fatal("IFD0 is nil after inject")
+			}
+
+			// --- IPTC type check ---
+			if tc.rawIPTC != nil {
+				iptcEntry := parsed.IFD0.Get(exif.TagIPTC)
+				if iptcEntry == nil {
+					t.Fatal("IPTC tag 0x83BB not found in IFD0 after inject")
+				}
+				if iptcEntry.Type != tc.wantIPTCType {
+					t.Errorf("IPTC tag type = %d (%s), want %d (TypeLong)",
+						iptcEntry.Type, typeName(iptcEntry.Type), tc.wantIPTCType)
+				}
+				// Count must equal len(value)/4 (padded to 4-byte boundary).
+				wantCount := uint32((len(tc.rawIPTC) + 3) / 4) //nolint:gosec // G115: test helper
+				if iptcEntry.Count != wantCount {
+					t.Errorf("IPTC Count = %d, want %d", iptcEntry.Count, wantCount)
+				}
+				// The value area must begin with the original IPTC bytes.
+				if len(iptcEntry.Value) < len(tc.rawIPTC) {
+					t.Fatalf("IPTC value too short: %d < %d", len(iptcEntry.Value), len(tc.rawIPTC))
+				}
+				if !bytes.Equal(iptcEntry.Value[:len(tc.rawIPTC)], tc.rawIPTC) {
+					t.Errorf("IPTC value prefix mismatch:\n got  %x\n want %x",
+						iptcEntry.Value[:len(tc.rawIPTC)], tc.rawIPTC)
+				}
+			}
+
+			// --- XMP type check ---
+			if tc.rawXMP != nil {
+				xmpEntry := parsed.IFD0.Get(exif.TagXMP)
+				if xmpEntry == nil {
+					t.Fatal("XMP tag 0x02BC not found in IFD0 after inject")
+				}
+				if xmpEntry.Type != tc.wantXMPType {
+					t.Errorf("XMP tag type = %d (%s), want %d (TypeByte)",
+						xmpEntry.Type, typeName(xmpEntry.Type), tc.wantXMPType)
+				}
+				if uint32(len(tc.rawXMP)) != xmpEntry.Count { //nolint:gosec // G115: test helper
+					t.Errorf("XMP Count = %d, want %d", xmpEntry.Count, len(tc.rawXMP))
+				}
+				// Round-trip the raw bytes via extractTagValues.
+				_, gotXMP := extractTagValues(outBytes, 8, binary.LittleEndian)
+				if !bytes.Equal(gotXMP, tc.rawXMP) {
+					t.Errorf("XMP round-trip:\n got  %q\n want %q", gotXMP, tc.rawXMP)
+				}
+			}
+
+			// --- IPTC round-trip via extractTagValues ---
+			if tc.rawIPTC != nil {
+				gotIPTC, _ := extractTagValues(outBytes, 8, binary.LittleEndian)
+				if !bytes.Equal(gotIPTC, tc.rawIPTC) {
+					t.Errorf("IPTC round-trip:\n got  %x\n want %x", gotIPTC, tc.rawIPTC)
+				}
+			}
+		})
+	}
+}
+
+// typeName returns a human-readable name for a DataType for test diagnostics.
+func typeName(t exif.DataType) string {
+	switch t {
+	case exif.TypeByte:
+		return "TypeByte"
+	case exif.TypeASCII:
+		return "TypeASCII"
+	case exif.TypeShort:
+		return "TypeShort"
+	case exif.TypeLong:
+		return "TypeLong"
+	case exif.TypeUndefined:
+		return "TypeUndefined"
+	default:
+		return "unknown"
+	}
+}

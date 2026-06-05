@@ -23,4 +23,9 @@
 - [SubIFD relocation at raw-TIFF level](feedback_tiff_subifd_raw_level.md) — 0x014A SubIFD relocation must be raw-byte (not exif.Encode model); OOL array patching needs BOTH element values AND the valOrOff pointer updated
 - [TIFF/DNG write: EXIF must be nil for rawEXIF base to be the full file](feedback_tiff_exif_base_for_write.md) — Read() populates m.EXIF; set m.EXIF=nil before gometadata.Write to pass rawEXIF (full file) as relocateTIFF base when only IPTC/XMP changes
 - [DNG write re-enabled (bug #98 fixed, commit 9ff26ac)](project_dng_write_gated.md) — patchRawIFDOffsets now updates valOrOff for ALL OOL SubIFD entries; DNG write fully enabled
-- [CR2 write un-gated; NEF/ARW failure modes (task #95, commit 561f5d8)](project_cr2_write_ungated.md) — CR2 passes; NEF: SubIFD RATIONAL corruption + PreviewIFD loss; ARW: 52 Sony tags lost + SR2Private corruption
+- [CR2/NEF/ARW write un-gated status (tasks #95, #102, #103)](project_cr2_write_ungated.md) — CR2/NEF/ARW all writable; ORF/RW2 remain gated (non-standard TIFF magic)
+- [ARW write un-gated (task #103)](project_arw_write_ungated.md) — Sony MakerNote absolute-offset rebase + 3-level SR2SubIFD pointer rebase + PRNG-XOR decrypt/re-encrypt
+- [NEF write un-gated (task #102, commit 7d34aa5)](project_nef_write_ungated.md) — Nikon MakerNote blob extension + PreviewIFD relocation + SubIFD ThumbnailData clear fix; ImageDataHash IN==OUT
+- [SubIFD ThumbnailData must be cleared before block enumeration](feedback_subifd_thumbnail_data_clear.md) — SubIFDs with 0x0201/0x0202 have ThumbnailData set by parseSingleIFD; clear it before enumerateIFDBlocks or JPEG blocks are lost
+- [IPTC/XMP TIFF tag types: TypeLong/TypeByte not TypeUndefined](feedback_iptc_xmp_tiff_types.md) — 0x83BB=TypeLong (padded+trimmed), 0x02BC=TypeByte; writeIFD pads OOL gap; extractTagValues TrimRight for IPTC
+- [TIFF 6.0 §2 word-alignment: writeIFD + ifdTotalSize cooperation](feedback_tiff_word_align.md) — ifdTotalSize always returns even; writeIFD inserts inter-value + trailing 0x00 pads; SubIFD raw blocks also aligned (task #99)

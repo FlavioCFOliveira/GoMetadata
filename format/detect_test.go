@@ -309,7 +309,13 @@ func TestRefineTIFFVariant(t *testing.T) {
 // Task #102: FormatNEF is now writable. The NEF-specific write path extends the
 // Nikon Type-3 MakerNote blob to cover PreviewIFD and NikonScanIFD, enumerates
 // the PreviewIFD image block, and patches MakerNote-relative offsets after encoding.
-// FormatARW remains gated: 52 Sony MakerNote tags lost, SR2Private IFD corrupted.
+//
+// Task #103: FormatARW is now writable. The ARW-specific write path rebases all
+// Sony MakerNote TIFF-absolute OOL offsets and relocates the SR2Private (0xC634)
+// block (encrypted SR2SubIFD + IDC_IFD) with internal pointer rebasing.
+// Validated against a real Sony DSLR-A500 ARW: ImageDataHash IN==OUT, all 52
+// MakerNote tags + SR2Private preserved.
+//
 // FormatORF and FormatRW2 remain read-only: non-standard TIFF magic.
 //
 // CR3 returns true as of task #91: cr3.Inject now implements stco/co64 offset
@@ -318,12 +324,11 @@ func TestRefineTIFFVariant(t *testing.T) {
 func TestSupportsWrite(t *testing.T) {
 	t.Parallel()
 
-	// Task #102: NEF is now writable — Nikon MakerNote blob extension + PreviewIFD
-	// relocation validated against real Nikon D70 corpus file (ImageDataHash IN==OUT).
-	// ARW remains gated: 52 Sony MakerNote tags lost, SR2Private IFD corrupted.
+	// Task #103: ARW is now writable — Sony MakerNote offset rebase + SR2Private
+	// block relocation validated against real Sony DSLR-A500 corpus file.
 	writable := []FormatID{
 		FormatJPEG, FormatTIFF, FormatDNG, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3,
-		FormatCR2, FormatNEF,
+		FormatCR2, FormatNEF, FormatARW,
 	}
 	for _, f := range writable {
 		if !SupportsWrite(f) {
@@ -331,9 +336,9 @@ func TestSupportsWrite(t *testing.T) {
 		}
 	}
 
-	// ARW: real-corpus validation failed; ORF/RW2: non-standard magic.
+	// ORF/RW2: non-standard magic, not yet supported.
 	notWritable := []FormatID{
-		FormatARW, FormatORF, FormatRW2,
+		FormatORF, FormatRW2,
 		FormatUnknown,
 	}
 	for _, f := range notWritable {

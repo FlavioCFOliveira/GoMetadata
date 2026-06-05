@@ -129,6 +129,17 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 		return writeTIFFNEF(r, w, m)
 	}
 
+	// FormatARW uses the ARW-specific write path that:
+	//   - Rebases all Sony MakerNote OOL offsets (Sony uses TIFF-absolute offsets,
+	//     not blob-relative like Canon, so the 52 MakerNote tags are otherwise lost).
+	//   - Extracts the SR2Private (0xC634) block (37 kB encrypted blob + IDC_IFD),
+	//     appends it verbatim, rebases its internal TIFF-absolute pointers, and
+	//     patches the IFD0 tag to point to the new SR2 block position.
+	// Un-gated in task #103 after real-corpus validation (Sony DSLR-A500.arw).
+	if fmtID == format.FormatARW {
+		return writeTIFFARW(r, w, m)
+	}
+
 	rawEXIF, rawIPTC, rawXMP, err := encodeMetadata(m, fmtID)
 	if err != nil {
 		return err
@@ -273,6 +284,64 @@ func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclo
 	return nil
 }
 
+// writeTIFFARW handles metadata injection for Sony ARW files.
+//
+// ARW is TIFF-based (II\0* little-endian magic) but requires Sony-specific
+// handling:
+//   - The Sony MakerNote (tag 0x927C) is a plain TIFF IFD with TIFF-absolute
+//     offsets, unlike Canon (blob-relative) and Nikon (MakerNote-TIFF-relative).
+//     After relocation, all 34 OOL MakerNote entries would have stale offsets,
+//     causing the 52 MakerNote tags to be lost.  The ARW write path rebases
+//     all MakerNote OOL val_or_off fields by delta = new_blob_abs − old_blob_abs.
+//   - The SR2Private (0xC634) entry in IFD0 holds a TIFF-absolute offset (as
+//     4 inline bytes) to an SR2 IFD block.  That block (≈37 kB) contains the
+//     encrypted SR2SubIFD and an empty IDC_IFD.  It must be copied verbatim,
+//     appended to the output, and its internal TIFF-absolute pointers rebased.
+//     The 0xC634 inline value in IFD0 is patched post-encode.
+//
+// The ARW-specific path (tiff.InjectWithEXIFARW) handles both concerns.
+// All other aspects (SubIFD relocation, OOL RATIONAL patching, etc.) are
+// identical to the standard writeTIFF path.
+//
+// Validated against real.arw (Sony DSLR-A500, 13 MB): ImageDataHash IN==OUT,
+// all metadata including 52 MakerNote tags and SR2Private block preserved.
+func writeTIFFARW(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // conditional logic mirrors writeTIFF; splitting reduces clarity
+	var originalBytes []byte
+	if m.rawEXIF != nil {
+		originalBytes = m.rawEXIF
+	} else {
+		if _, err := r.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("gometadata: arw seek: %w", err)
+		}
+		var err error
+		originalBytes, err = io.ReadAll(r)
+		if err != nil {
+			return fmt.Errorf("gometadata: arw read: %w", err)
+		}
+	}
+
+	rawIPTC, err := encodeIPTC(m)
+	if err != nil {
+		return err
+	}
+	rawXMP, err := encodeXMP(m, format.FormatARW)
+	if err != nil {
+		return err
+	}
+
+	if rawIPTC == nil && rawXMP == nil && m.EXIF == nil {
+		if _, err := w.Write(originalBytes); err != nil {
+			return fmt.Errorf("gometadata: arw write passthrough: %w", err)
+		}
+		return nil
+	}
+
+	if err := tiff.InjectWithEXIFARW(originalBytes, m.EXIF, rawIPTC, rawXMP, w); err != nil {
+		return fmt.Errorf("gometadata: %w", err)
+	}
+	return nil
+}
+
 // encodeMetadata serialises each modified metadata segment. If a segment was
 // not modified (m.EXIF/IPTC/XMP is nil) the original raw bytes are passed
 // through unchanged. Returns the first encoding error encountered.
@@ -392,18 +461,21 @@ func wrapInject(err error) error {
 // Real-corpus validation (Canon EOS 350D real.cr2) confirmed ImageDataHash
 // IN==OUT and all MakerNote/SubIFD tags preserved.
 //
-// FormatNEF and FormatARW remain gated (task #95 empirical validation failed):
+// FormatNEF is NOT gated here (task #102): the NEF-specific write path extends
+// the Nikon MakerNote blob, enumerates PreviewIFD, and patches MakerNote-relative
+// offsets post-encode.
 //
-//	NEF: SubIFD OOL RATIONAL corruption, PreviewIFD lost, ImageDataHash mismatch.
-//	ARW: 52 Sony MakerNote tags lost, SR2Private IFD corruption.
+// FormatARW is NOT gated here (task #103): the ARW-specific write path rebases
+// Sony MakerNote TIFF-absolute offsets and relocates the SR2Private block.
+// Real-corpus validation (Sony DSLR-A500) confirmed ImageDataHash IN==OUT and
+// all 52 MakerNote tags + SR2Private preserved.
 //
 // FormatORF and FormatRW2 remain gated: they use non-standard magic bytes
 // (ORF: IIRS; RW2: IIU\0) that require format-specific handling before the
 // TIFF relocator can process them.
 func isTIFFBased(fmtID format.FormatID) bool {
 	switch fmtID {
-	case format.FormatARW,
-		format.FormatORF,
+	case format.FormatORF,
 		format.FormatRW2:
 		return true
 	default:

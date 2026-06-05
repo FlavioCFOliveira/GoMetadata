@@ -92,9 +92,12 @@ func (f FormatID) String() string {
 // patches the MakerNote-relative 0x0201 offset after re-encoding. Validated against
 // a real Nikon D70 NEF corpus file: ImageDataHash IN==OUT, all metadata preserved.
 //
-// FormatARW returns false (task #95 empirical validation failed, 2026-06-05).
-// Real-corpus tests revealed 52 Sony MakerNote tags lost and SR2Private IFD
-// corruption. ARW requires deeper Sony-specific SubIFD/MakerNote handling.
+// FormatARW returns true as of task #103. The ARW-specific write path rebases all
+// Sony MakerNote OOL offsets (Sony uses TIFF-absolute offsets, not blob-relative
+// like Canon), extracts the SR2Private (0xC634) block verbatim, appends it to the
+// output, and patches both the SR2 internal pointers and the IFD0 tag to the new
+// position. Validated against a real Sony DSLR-A500 ARW corpus file:
+// ImageDataHash IN==OUT, all 52 MakerNote tags + SR2Private preserved.
 //
 // FormatORF and FormatRW2 return false. They use non-standard magic bytes
 // (ORF: IIRS; RW2: IIU\0) and require format-specific outer-framing work
@@ -103,12 +106,8 @@ func (f FormatID) String() string {
 func SupportsWrite(f FormatID) bool {
 	switch f {
 	case FormatJPEG, FormatTIFF, FormatDNG, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3,
-		FormatCR2, FormatNEF:
+		FormatCR2, FormatNEF, FormatARW:
 		return true
-	case FormatARW:
-		// Task #95 empirical validation failed (2026-06-05): real-corpus tests
-		// found 52 Sony MakerNote tags lost and SR2Private IFD corruption.
-		return false
 	case FormatORF, FormatRW2:
 		// ORF/RW2 use non-standard TIFF magic and require format-specific
 		// outer-framing work before copy-and-relocate can apply.

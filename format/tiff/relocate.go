@@ -216,10 +216,13 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte) (
 		e.IFD0 = &exif.IFD{}
 	}
 	if rawIPTC != nil {
-		upsertIFD0Entry(e.IFD0, exif.TagIPTC, exif.TypeUndefined, rawIPTC)
+		// Adobe XMP Spec / ExifTool convention: IPTC-NAA (0x83BB) as TypeLong.
+		// upsertIFD0Entry pads value to 4-byte boundary; Count = nLongs.
+		upsertIFD0Entry(e.IFD0, exif.TagIPTC, exif.TypeLong, rawIPTC)
 	}
 	if rawXMP != nil {
-		upsertIFD0Entry(e.IFD0, exif.TagXMP, exif.TypeUndefined, rawXMP)
+		// Adobe XMP Spec (TIFF Technical Note 3): XMP (0x02BC) as TypeByte.
+		upsertIFD0Entry(e.IFD0, exif.TagXMP, exif.TypeByte, rawXMP)
 	}
 
 	// Step 3: enumerate image blocks from the IFD chain.
@@ -304,7 +307,13 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte) (
 
 	// Step 11: append each SubIFD's raw bytes (with already-patched image
 	// offsets from step 8b).
+	// TIFF 6.0 §2: each SubIFD block must start at a word (even) boundary.
+	// assignSubIFDOffsets already reserved space for the 0x00 pad byte;
+	// insert it here to keep finalTIFF and the assigned offsets in sync.
 	for _, si := range subIFDs {
+		if len(finalTIFF)&1 == 1 {
+			finalTIFF = append(finalTIFF, 0x00)
+		}
 		finalTIFF = append(finalTIFF, si.rawBytes...)
 	}
 
@@ -917,11 +926,21 @@ func extractRawIFD(base []byte, off uint32, order binary.ByteOrder) []byte { //n
 	return raw
 }
 
-// computeSubIFDsSize returns the total byte size of all SubIFD raw blocks,
-// which is needed to compute where image blocks will land after the SubIFDs.
+// computeSubIFDsSize returns the total byte size of all SubIFD raw blocks
+// including any inter-block word-alignment padding, which is needed to compute
+// where image blocks will land after the SubIFDs.
+//
+// TIFF 6.0 §2: "Each data item (field value) must begin on a word boundary."
+// Each SubIFD block (an IFD structure) is a data item and must start at an
+// even file offset. A 1-byte pad is counted before any block that would
+// otherwise start at an odd offset.
 func computeSubIFDsSize(subIFDs []*subIFDInfo) uint32 {
 	var total uint32
 	for _, si := range subIFDs {
+		// Word-align before this SubIFD block.
+		if total&1 == 1 {
+			total++ // alignment pad byte
+		}
 		total += uint32(len(si.rawBytes)) //nolint:gosec // G115: len bounded by source buffer size
 	}
 	return total
@@ -929,9 +948,19 @@ func computeSubIFDsSize(subIFDs []*subIFDInfo) uint32 {
 
 // assignSubIFDOffsets assigns new file offsets to each SubIFD, placing them
 // contiguously starting at ifdEnd (just after the main EXIF block).
+//
+// TIFF 6.0 §2: "Each data item (field value) must begin on a word boundary."
+// Each SubIFD block is a data item and must begin at an even file offset.
+// A single 0x00 alignment pad byte is counted (and later inserted by the
+// append loop in step 11) before any SubIFD that would otherwise start at an
+// odd offset.
 func assignSubIFDOffsets(subIFDs []*subIFDInfo, ifdEnd uint32) {
 	cur := ifdEnd
 	for _, si := range subIFDs {
+		// Word-align: skip to even offset before placing this SubIFD block.
+		if cur&1 == 1 {
+			cur++ // account for the alignment pad byte inserted in step 11
+		}
 		si.newOffset = cur
 		sz := uint32(len(si.rawBytes)) //nolint:gosec // G115: len bounded by source buffer size
 		if sz > math.MaxUint32-cur {

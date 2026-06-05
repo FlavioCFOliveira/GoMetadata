@@ -8,4 +8,4 @@ When SetCaption (or any setter) auto-creates new components (IPTC, XMP) for a fi
 
 **Why:** Task #88 AUTO-CREATE policy means `SetCaption` on a JPEG with only EXIF now also creates IPTC and XMP, adding ~2479 bytes to `11-tests.jpg` (236594 → 239073 bytes).
 
-**How to apply:** Whenever a policy change causes convenience setters to write more data to a file, re-measure the expected output size with a small go run snippet and update the `// Output:` comment in the affected example. Always run `go test -race ./...` before committing to catch stale example output sizes.
+**How to apply:** Whenever a policy change or layout fix causes the encoded output to grow or shrink, re-measure the expected output size with a small go run snippet and update the `// Output:` comment in the affected example. Always run `go test -race ./...` before committing to catch stale example output sizes. As of task #99 (TIFF word-alignment), the size grew from 239073 to 239074 bytes (one padding byte added to word-align IPTC after odd-length XMP).

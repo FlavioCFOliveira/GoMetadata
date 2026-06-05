@@ -1034,18 +1034,71 @@ func TestWriteNEFUnGated(t *testing.T) {
 	}
 }
 
-// TestWriteARWStillGated verifies that format.SupportsWrite(FormatARW) = false
-// after task #95 (empirical validation failure).
+// TestWriteARWUnGated verifies that format.SupportsWrite(FormatARW) = true
+// after task #103 (Sony ARW-specific write path implemented and validated).
 //
-// Real-corpus tests (2026-06-05) against a real Sony ARW file found:
-//   - 52 Sony MakerNote tags lost
-//   - SR2Private IFD structure corrupted
-//   - SubIFD StripOffsets wrong (917504 → 50979)
-//
-// This gate regression test ensures the format is not accidentally re-enabled.
-func TestWriteARWStillGated(t *testing.T) {
+// The ARW write path (relocate_arw.go) rebases all Sony MakerNote TIFF-absolute
+// OOL offsets and relocates the SR2Private (0xC634) block (encrypted SR2SubIFD
+// + IDC_IFD) with internal pointer rebasing. Validated against a real Sony
+// DSLR-A500 ARW corpus file: ImageDataHash IN==OUT, all 52 MakerNote tags and
+// SR2Private block preserved.
+func TestWriteARWUnGated(t *testing.T) {
 	t.Parallel()
-	if format.SupportsWrite(format.FormatARW) {
-		t.Error("format.SupportsWrite(FormatARW) = true; ARW should remain gated after task #95 validation failure")
+	if !format.SupportsWrite(format.FormatARW) {
+		t.Error("format.SupportsWrite(FormatARW) = false; ARW was un-gated in task #103")
+	}
+}
+
+// TestWriteARWFromCorpus verifies that Write succeeds for a real Sony ARW fixture and
+// that the output re-parses correctly.  ARW was un-gated in task #103 after the
+// Sony-specific write path (relocate_arw.go) was validated:
+//   - Sony MakerNote OOL offsets are rebased (Sony uses TIFF-absolute offsets).
+//   - SR2Private (0xC634) block is extracted verbatim, appended at the new position,
+//     and its internal pointers are rebased (IFD + OOL + SR2SubIFD decrypt/re-encrypt).
+//   - ImageDataHash IN==OUT verified against real Sony DSLR-A500.arw corpus file.
+//
+// This test uses the metadata-extractor corpus fixture (Sony DSLR-A500.arw).
+// If the fixture is absent the test is skipped (not failed).
+func TestWriteARWFromCorpus(t *testing.T) {
+	t.Parallel()
+
+	path := "testdata/corpus/raw/metadata-extractor/Sony DSLR-A500.arw"
+	f, err := os.Open(path)
+	if err != nil {
+		t.Skipf("fixture not found (%s): %v", path, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	m, err := Read(f)
+	if err != nil {
+		t.Fatalf("Read ARW: %v", err)
+	}
+	if m.Format() != format.FormatARW {
+		t.Fatalf("expected FormatARW, got %v", m.Format())
+	}
+	m.SetCopyright("© 2026 arw103")
+
+	if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
+		t.Fatalf("Seek ARW: %v", seekErr)
+	}
+
+	var out bytes.Buffer
+	if writeErr := Write(f, &out, m); writeErr != nil {
+		t.Fatalf("Write ARW: %v", writeErr)
+	}
+	if out.Len() == 0 {
+		t.Fatal("Write ARW produced no output bytes")
+	}
+
+	// Output must re-parse without error.
+	m2, parseErr := Read(bytes.NewReader(out.Bytes()))
+	if parseErr != nil {
+		t.Fatalf("Read after Write ARW: %v", parseErr)
+	}
+	if got := m2.Copyright(); got != "© 2026 arw103" {
+		t.Errorf("Copyright round-trip: got %q, want %q", got, "© 2026 arw103")
+	}
+	if got := m2.CameraModel(); got == "" {
+		t.Error("CameraModel is empty after Write ARW round-trip")
 	}
 }

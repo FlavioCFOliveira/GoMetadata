@@ -1,17 +1,18 @@
 ---
 name: project_cr2_write_ungated
-description: CR2 write un-gated (task #95, commit 561f5d8); NEF and ARW remain gated with specific failure modes documented
-type: project
+description: CR2/NEF/ARW write un-gated status — task #95 (CR2), #102 (NEF), #103 (ARW); ORF/RW2 remain gated
+metadata:
+  type: project
 ---
 
 CR2 write is un-gated as of task #95 (commit 561f5d8). CR2 uses standard LE TIFF magic and routes through `writeTIFF` + `relocateTIFFFromParsed`.
 
 **Why:** Canon MakerNotes use blob-relative (self-relative) offsets — verbatim blob copy is safe. Validated against real Canon EOS 350D (7.4 MB CR2): ImageDataHash IN==OUT, all MakerNote tags preserved.
 
-NEF remains gated: SubIFD OOL RATIONAL corruption (XResolution/YResolution: 72→1), PreviewIFD/NikonScanIFD lost, ImageDataHash mismatch (5.6 MB → 4.9 MB).
+NEF write is un-gated as of task #102 (commit 7d34aa5). See [[project-nef-write-ungated]].
 
-ARW remains gated: 52 Sony MakerNote tags lost, SR2Private IFD corrupted, SubIFD StripOffsets wrong (917504 → 50979).
+ARW write is un-gated as of task #103. See [[project-arw-write-ungated]].
 
 ORF/RW2 remain gated: non-standard TIFF magic (IIRS, IIU\0).
 
-**How to apply:** When asked to un-gate NEF or ARW, the failures are at the SubIFD / MakerNote level — the outer TIFF relocation works, but Nikon and Sony have additional IFD structures (PreviewIFD, SR2Private) and OOL values inside SubIFDs that are not correctly relocated. A deeper format-specific investigation is needed before these can be un-gated.
+**How to apply:** ORF/RW2 require format-specific outer-framing work before the TIFF relocator can process them. All other TIFF-based RAW formats (CR2, NEF, ARW, DNG) are now writable.

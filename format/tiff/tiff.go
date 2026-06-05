@@ -4,6 +4,7 @@
 package tiff
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -191,6 +192,37 @@ func InjectWithEXIFNEF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, r
 	return nil
 }
 
+// InjectWithEXIFARW is the ARW-specific variant of InjectWithEXIF.
+//
+// It runs the Sony-specific preprocessing step (extract SR2Private block and
+// MakerNote info) before the standard TIFF copy-and-relocate algorithm, and
+// patches the following in the output after encoding:
+//   - Sony MakerNote (0x927C) OOL offsets are rebased (Sony uses TIFF-absolute
+//     offsets, unlike Canon which uses blob-relative).
+//   - SR2Private (0xC634) inline 4-byte value is updated to point to the new SR2
+//     block position; SR2 internal pointers are rebased.
+//
+// This is the entry point used by gometadata.Write for FormatARW.
+// See relocate_arw.go for the full algorithm description.
+func InjectWithEXIFARW(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+	// Pass-through: no metadata changes requested and no EXIF edits.
+	if modifiedEXIF == nil && rawIPTC == nil && rawXMP == nil {
+		if _, err := w.Write(originalBytes); err != nil {
+			return fmt.Errorf("tiff: write: %w", err)
+		}
+		return nil
+	}
+
+	updated, err := relocateTIFFFromParsedARW(originalBytes, modifiedEXIF, rawIPTC, rawXMP)
+	if err != nil {
+		return err
+	}
+	if _, err = w.Write(updated); err != nil {
+		return fmt.Errorf("tiff: write updated: %w", err)
+	}
+	return nil
+}
+
 // upsertIFD0Entry adds or replaces an entry in ifd for the given tag while
 // maintaining the sorted-by-tag invariant required by IFD.Get (binary search).
 //
@@ -199,14 +231,31 @@ func InjectWithEXIFNEF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, r
 // binary search to misidentify present tags as absent, producing duplicate
 // entries in the re-encoded output.
 //
+// For TypeLong (element size = 4 bytes), value is padded to the next 4-byte
+// boundary with zero bytes and Count is set to len(paddedValue)/4. IPTC data
+// is stored as TypeLong per Adobe XMP Spec and ExifTool convention; padding
+// with zero bytes is safe because the IPTC parser scans for 0x1C tag markers
+// and silently skips all other byte values (IIM §1.6).
+//
+// For all other types (e.g. TypeByte for XMP), Count equals len(value).
+//
 // Implementation: binary search locates the insertion point in O(log n).
 // Replace in-place when the tag already exists; otherwise slices.Insert places
 // the new entry at the correct sorted position in O(n) (one memmove).
-func upsertIFD0Entry(ifd *exif.IFD, tag exif.TagID, typ exif.DataType, value []byte) { //nolint:unparam // typ is always TypeUndefined today; kept as parameter for future callers (e.g. typed TIFF tags)
+func upsertIFD0Entry(ifd *exif.IFD, tag exif.TagID, typ exif.DataType, value []byte) {
+	count := uint32(len(value)) //nolint:gosec // G115: IFD value length bounded by input
+	if typ == exif.TypeLong {
+		// TIFF 6.0 §2: Count = number of uint32 elements.
+		// Round up to the next 4-byte boundary; writeIFD zero-fills the gap in
+		// the value area.  The original (unpadded) bytes are kept in Value so
+		// that the read-back via extractTagValues returns the unpadded bytes
+		// after the caller trims the value to the IFD-declared byte length.
+		count = uint32((len(value) + 3) / 4) //nolint:gosec // G115: IFD value length bounded by input
+	}
 	entry := exif.IFDEntry{
 		Tag:   tag,
 		Type:  typ,
-		Count: uint32(len(value)), //nolint:gosec // G115: IFD value length bounded by input
+		Count: count,
 		Value: value,
 	}
 
@@ -248,7 +297,7 @@ func byteOrder(b []byte) (binary.ByteOrder, error) {
 
 // extractTagValues scans IFD0 for IPTC (0x83BB) and XMP (0x02BC) tags
 // and returns their raw byte values.
-func extractTagValues(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawIPTC, rawXMP []byte) {
+func extractTagValues(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawIPTC, rawXMP []byte) { //nolint:gocyclo // IPTC trimming branch is inherent to TypeLong-vs-TypeUndefined handling; extracting a helper would reduce clarity
 	if int(ifd0Off)+2 > len(data) {
 		return nil, nil
 	}
@@ -283,7 +332,20 @@ func extractTagValues(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawI
 
 		switch tag {
 		case 0x83BB: // IPTC-NAA
-			rawIPTC = v
+			// When stored as TypeLong (the conventional encoding per ExifTool /
+			// Adobe XMP Spec), the value area is padded to a 4-byte boundary
+			// with zero bytes.  Strip those trailing zeros so callers always
+			// receive the original unpadded IPTC content.
+			//
+			// This is safe because IPTC IIM content is self-framing: every
+			// dataset begins with the tag marker 0x1C (IIM §1.6). Trailing zero
+			// bytes are never a valid dataset prefix and are silently skipped by
+			// the IIM scanner.  TypeUndefined / TypeByte encodings carry no
+			// padding; trimming trailing zeros is harmless for those too.
+			rawIPTC = bytes.TrimRight(v, "\x00")
+			if len(rawIPTC) == 0 {
+				rawIPTC = nil
+			}
 		case 0x02BC: // XMP
 			rawXMP = v
 		}
