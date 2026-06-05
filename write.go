@@ -81,23 +81,26 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	// Rebuilding the IFD block without relocating that image data corrupts the
 	// file.
 	//
-	// FormatTIFF uses a dedicated write path (writeTIFF) that keeps the ORIGINAL
-	// TIFF bytes as the relocation base and feeds the MODIFIED *exif.EXIF struct
-	// directly to the relocator. This avoids the ErrBlockOutOfBounds defect fixed
-	// in task #97 where encodeEXIF produced an IFD skeleton without image blocks.
+	// FormatTIFF and FormatDNG use a dedicated write path (writeTIFF) that keeps
+	// the ORIGINAL TIFF bytes as the relocation base and feeds the MODIFIED
+	// *exif.EXIF struct directly to the relocator. This avoids the
+	// ErrBlockOutOfBounds defect fixed in task #97 where encodeEXIF produced an
+	// IFD skeleton without image blocks.
 	//
-	// FormatDNG is gated by isTIFFBased (task #101 re-gate): real-corpus testing
-	// found that SubIFD out-of-line RATIONAL values are silently lost after write
-	// (bug #98). DNG is treated as read-only until #98 is fixed.
+	// FormatDNG re-enabled (bug #98 fixed): the SubIFD relocation path now
+	// preserves ALL out-of-line value areas (RATIONAL XResolution/YResolution,
+	// etc.) by updating their valOrOff pointers to the new absolute positions.
+	// Previously only strip/tile offset arrays were re-pointed; the fix extends
+	// the pointer-update to every OOL entry in the SubIFD.
 	//
 	// The five remaining RAW variants (CR2, NEF, ARW, ORF, RW2) remain gated
 	// because they require manufacturer-specific offset handling (task #95).
 	if isTIFFBased(fmtID) {
 		return ErrWriteNotSupported
 	}
-	// FormatTIFF uses a dedicated write path that avoids the skeleton-as-base
-	// defect fixed in task #97 (ErrBlockOutOfBounds on real files).
-	if fmtID == format.FormatTIFF {
+	// FormatTIFF and FormatDNG use a dedicated write path that avoids the
+	// skeleton-as-base defect fixed in task #97 (ErrBlockOutOfBounds on real files).
+	if fmtID == format.FormatTIFF || fmtID == format.FormatDNG {
 		return writeTIFF(r, w, m)
 	}
 
@@ -169,7 +172,8 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 	return nil
 }
 
-// writeTIFF handles metadata injection for TIFF containers.
+// writeTIFF handles metadata injection for TIFF-based containers (FormatTIFF
+// and FormatDNG).
 //
 // The standard encodeMetadata/injectByFormat pipeline is not safe for
 // TIFF-based containers because encodeEXIF calls exif.Encode which produces
@@ -187,8 +191,10 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 // IPTC and XMP are encoded the normal way and upserted into IFD0 by
 // tiff.InjectWithEXIF → relocateTIFFFromParsed step 2.
 //
-// DNG write is NOT routed through this function (task #101 re-gate): DNG is
-// gated by isTIFFBased and returns ErrWriteNotSupported pending bug #98 fix.
+// DNG write is enabled (bug #98 fixed). The SubIFD relocation path now
+// preserves ALL out-of-line value areas in each SubIFD (RATIONAL XResolution,
+// YResolution, etc.) by updating their valOrOff pointers to the new absolute
+// positions. The fix is in patchRawIFDOffsets (format/tiff/relocate.go).
 func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // conditional logic for originalBytes source + nil guards + three encode paths; splitting would reduce clarity
 	// Obtain the original TIFF bytes. tiff.Extract (called during Read) stores
 	// the entire TIFF stream in m.rawEXIF; use it when available to avoid a
@@ -348,17 +354,15 @@ func wrapInject(err error) error {
 // tiff.InjectWithEXIF which feeds the ORIGINAL TIFF bytes as the relocation
 // base together with the MODIFIED *exif.EXIF struct (task #97 fix).
 //
-// FormatDNG IS gated here (task #101, re-gate): real-corpus testing showed
-// that the SubIFD relocation path silently loses out-of-line RATIONAL values
-// (e.g. XResolution/YResolution 300→undef) when writing a DNG. See bug #98.
-// DNG write is disabled as a fail-safe until #98 is resolved.
+// FormatDNG is NOT gated here (bug #98 fixed): the SubIFD relocation path
+// now preserves all out-of-line value areas. DNG uses the same writeTIFF
+// path as FormatTIFF.
 //
 // The five remaining RAW variants (CR2, NEF, ARW, ORF, RW2) remain gated
 // until task #95 (manufacturer-specific offset handling) is complete.
 func isTIFFBased(fmtID format.FormatID) bool {
 	switch fmtID {
-	case format.FormatDNG,
-		format.FormatCR2,
+	case format.FormatCR2,
 		format.FormatNEF,
 		format.FormatARW,
 		format.FormatORF,

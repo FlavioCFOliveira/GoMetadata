@@ -959,26 +959,39 @@ func patchSubIFDImageOffsets(subIFDs []*subIFDInfo, blocks []*imageBlock, order 
 	}
 }
 
-// patchRawIFDOffsets patches strip/tile offset entries in the raw SubIFD bytes.
+// patchRawIFDOffsets patches all IFD entries in the raw SubIFD bytes that hold
+// out-of-line value areas, updating their value-or-offset pointer fields to
+// reflect the new absolute position of those value areas in the output.
 //
 // The raw SubIFD block (rawBytes) is a verbatim copy of the original file's IFD
 // block starting at srcOff. Entry offset fields reference original file positions.
-// This function rewrites those fields to the new positions stored in blocks.
 //
 // newSubIFDOff is the absolute position at which rawBytes will be written in the
 // output buffer. It is used to compute the new absolute file position of any
-// out-of-line value arrays that live within rawBytes.
+// out-of-line value areas that live within rawBytes.
 //
-// For TypeLong (4 bytes per value):
-//   - Count=1 and total size == 4: value is inline in bytes 8-11 of the entry.
-//     Overwrite bytes 8-11 with the new offset/count.
-//   - Count>1 and total size > 4: bytes 8-11 hold an absolute file offset to
-//     the value array. In rawBytes the array is at (valFileOff - srcOff).
-//     Two writes are needed:
-//     (a) Update each array element to the new offset/count value.
-//     (b) Update the entry's value-or-offset field (bytes 8-11) to
-//     newSubIFDOff + relOff, which is where the array will live in the output.
-func patchRawIFDOffsets(rawBytes []byte, blocks []*imageBlock, srcOff, newSubIFDOff uint32, order binary.ByteOrder) { //nolint:cyclop,gocyclo,funlen // patch loop requires multiple tag-specific branches; inline/OOL branching is inherent to the algorithm
+// Two classes of OOL entries are handled:
+//
+// (1) Strip/tile image-data offset and bytecount tags (0x0111/0x0117/0x0144/0x0145):
+//   - Total size > 4 (out-of-line array): update each array element with the
+//     new image-block offset/size, AND update the entry's valOrOff field to
+//     newSubIFDOff + relOff.
+//   - Total size ≤ 4 (inline scalar): overwrite the valOrOff field directly.
+//
+// (2) ALL other OOL entries (RATIONAL, SRATIONAL, DOUBLE, long ASCII, etc.):
+//   - Bug #98: value bytes ARE captured verbatim in rawBytes by extractRawIFD,
+//     but the entry's valOrOff pointer still holds the OLD absolute file offset.
+//     After rawBytes is appended at newSubIFDOff the pointer is stale, causing
+//     readers to follow it into garbage (XResolution/YResolution → "undef").
+//   - Fix: rewrite the valOrOff field to newSubIFDOff + relOff, where relOff is
+//     (origFileOff − srcOff), the position of the value area within rawBytes.
+//     The value bytes themselves are already correct — only the pointer changes.
+//
+// Spec references:
+//   - TIFF 6.0 §2: IFD entry layout — tag(2)+type(2)+count(4)+valOrOff(4).
+//     valOrOff holds the value inline when total byte size ≤ 4; otherwise it is
+//     a file-absolute offset to the value area.
+func patchRawIFDOffsets(rawBytes []byte, blocks []*imageBlock, srcOff, newSubIFDOff uint32, order binary.ByteOrder) { //nolint:cyclop,gocyclo,funlen // patch loop requires multiple tag-specific branches; inline/OOL branching is inherent to the spec
 	if len(rawBytes) < 6 {
 		return
 	}
@@ -1004,29 +1017,82 @@ func patchRawIFDOffsets(rawBytes []byte, blocks []*imageBlock, srcOff, newSubIFD
 			break
 		}
 		entryTag := exif.TagID(order.Uint16(rawBytes[e:]))
-		// Only patch offset and bytecount tags.
-		if entryTag != exif.TagStripOffsets && entryTag != exif.TagTileOffsets &&
-			entryTag != exif.TagStripByteCounts && entryTag != exif.TagTileByteCounts {
-			continue
-		}
-
 		entryType := order.Uint16(rawBytes[e+2:])
 		entryCount := int(order.Uint32(rawBytes[e+4:]))
+
 		elemSz := int(typeSize(entryType))
 		if elemSz == 0 || entryCount == 0 {
 			continue
 		}
 
-		// elemSz is 2 or 4 (validated above); entryCount is int parsed from uint32.
-		// The cast to uint64 is safe: int→uint64 cannot truncate on any 64-bit platform,
-		// and elemSz is always 2 or 4 so the product fits in uint64.
-		total := uint64(elemSz) * uint64(entryCount) //nolint:gosec // G115: elemSz in {2,4}; entryCount is non-negative int
+		total := uint64(elemSz) * uint64(entryCount) //nolint:gosec // G115: elemSz ≤ 8; entryCount is non-negative int
+		if total <= 4 {                              //nolint:nestif // inline path for strip/tile scalar entries; branching is inherent to TIFF §2 inline/OOL duality
+			// Inline value: no valOrOff pointer to update for non-image-data entries.
+			// Strip/tile offset tags with a single inline value are handled below.
+			isImageOffsetTag := entryTag == exif.TagStripOffsets || entryTag == exif.TagTileOffsets ||
+				entryTag == exif.TagStripByteCounts || entryTag == exif.TagTileByteCounts
+			if !isImageOffsetTag {
+				continue
+			}
 
-		// Determine whether this is an offset tag or a bytecount tag.
-		// Bytecount entries (0x0117/0x0145) are patched with blk.size.
+			// Single inline strip/tile offset or bytecount — patch the value in-place.
+			isByteCount := entryTag == exif.TagStripByteCounts || entryTag == exif.TagTileByteCounts
+			offsetTag := entryTag
+			if isByteCount {
+				switch entryTag {
+				case exif.TagStripByteCounts:
+					offsetTag = exif.TagStripOffsets
+				case exif.TagTileByteCounts:
+					offsetTag = exif.TagTileOffsets
+				}
+			}
+			blk := blkMap[blockKey{offsetTag, 0}]
+			if blk == nil {
+				continue
+			}
+			if isByteCount {
+				order.PutUint32(rawBytes[e+8:], blk.size)
+			} else {
+				order.PutUint32(rawBytes[e+8:], blk.newOffset)
+			}
+			continue
+		}
+
+		// Out-of-line value: rawBytes[e+8:e+12] is a file-absolute pointer to
+		// the value area. The value bytes are already captured verbatim in rawBytes
+		// by extractRawIFD. We must update the pointer to the new absolute position.
+		//
+		// TIFF 6.0 §2: valOrOff = absolute file offset when total byte size > 4.
+		origFileOff := order.Uint32(rawBytes[e+8:])
+		if uint64(origFileOff) < uint64(srcOff) {
+			// Value area precedes the SubIFD start — not captured in rawBytes. Skip.
+			continue
+		}
+		relOff := int(origFileOff - srcOff) // relative offset of value area within rawBytes
+		if relOff < 0 || relOff+entryCount*elemSz > len(rawBytes) {
+			continue // out of rawBytes bounds — skip
+		}
+
+		// Update the valOrOff pointer to the new absolute position of the value area.
+		// Task #98 regression: RATIONAL/SRATIONAL/DOUBLE/long-ASCII/etc. entries
+		// had their value bytes preserved verbatim in rawBytes but their valOrOff
+		// pointers left pointing at the old file position → "undef" on read.
+		newArrAbsOff := newSubIFDOff + uint32(relOff) //nolint:gosec // G115: relOff bounded by rawBytes size
+		order.PutUint32(rawBytes[e+8:], newArrAbsOff)
+
+		// For strip/tile image-data offset and bytecount tags, additionally update
+		// each array element with the new image-block offset/size assigned by
+		// assignNewOffsets.
+		isImageOffsetTag := entryTag == exif.TagStripOffsets || entryTag == exif.TagTileOffsets ||
+			entryTag == exif.TagStripByteCounts || entryTag == exif.TagTileByteCounts
+		if !isImageOffsetTag {
+			// Non-image-data OOL entry: valOrOff pointer already updated above.
+			// The value bytes are verbatim-correct; no element-level patching needed.
+			continue
+		}
+
+		// elemSz is 2 or 4 for strip/tile tags; validated by typeSize above.
 		isByteCount := entryTag == exif.TagStripByteCounts || entryTag == exif.TagTileByteCounts
-
-		// Look up blocks by the OFFSET tag (both offset and bytecount share the same block records).
 		offsetTag := entryTag
 		if isByteCount {
 			switch entryTag {
@@ -1037,62 +1103,26 @@ func patchRawIFDOffsets(rawBytes []byte, blocks []*imageBlock, srcOff, newSubIFD
 			}
 		}
 
-		if total <= 4 { //nolint:nestif // inline/OOL branching for TIFF value encoding; complexity is inherent to the spec
-			// Single-element inline value (Count=1, TypeLong or TypeShort with Count=1,2).
-			// The value-or-offset field holds the value directly.
-			blk := blkMap[blockKey{offsetTag, 0}]
+		for j := range entryCount {
+			blk := blkMap[blockKey{offsetTag, j}]
 			if blk == nil {
 				continue
 			}
-			if isByteCount {
-				order.PutUint32(rawBytes[e+8:], blk.size)
-			} else {
-				order.PutUint32(rawBytes[e+8:], blk.newOffset)
-			}
-		} else {
-			// Multi-element out-of-line value array.
-			//
-			// rawBytes[e+8:e+12] currently holds the original file offset to the
-			// value array (as written in the original TIFF).
-			// We need to:
-			//   (a) Update each array element with the new image-block offset/size.
-			//   (b) Update the entry's valOrOff field to the new absolute position
-			//       of the value array in the output (= newSubIFDOff + relOff).
-			origFileOff := order.Uint32(rawBytes[e+8:])
-			if uint64(origFileOff) < uint64(srcOff) {
-				continue // value array precedes SubIFD start — invalid
-			}
-			relOff := int(origFileOff - srcOff) // offset of array within rawBytes
-			if relOff+entryCount*elemSz > len(rawBytes) {
-				continue // array out of rawBytes bounds
-			}
-
-			// (b) Update valOrOff to the new absolute position of this array in output.
-			newArrAbsOff := newSubIFDOff + uint32(relOff) //nolint:gosec // G115: relOff bounded by rawBytes size
-			order.PutUint32(rawBytes[e+8:], newArrAbsOff)
-
-			// (a) Update each array element.
-			for j := range entryCount {
-				blk := blkMap[blockKey{offsetTag, j}]
-				if blk == nil {
-					continue
+			valPos := relOff + j*elemSz
+			switch elemSz {
+			case 4:
+				if isByteCount {
+					order.PutUint32(rawBytes[valPos:], blk.size)
+				} else {
+					order.PutUint32(rawBytes[valPos:], blk.newOffset)
 				}
-				valPos := relOff + j*elemSz
-				switch elemSz {
-				case 4:
-					if isByteCount {
-						order.PutUint32(rawBytes[valPos:], blk.size)
-					} else {
-						order.PutUint32(rawBytes[valPos:], blk.newOffset)
-					}
-				case 2:
-					// TypeShort: new value must fit in uint16.
-					// The guard ensures the value fits; the cast is safe.
-					if isByteCount && blk.size <= 0xFFFF {
-						order.PutUint16(rawBytes[valPos:], uint16(blk.size))
-					} else if !isByteCount && blk.newOffset <= 0xFFFF {
-						order.PutUint16(rawBytes[valPos:], uint16(blk.newOffset))
-					}
+			case 2:
+				// TypeShort: new value must fit in uint16.
+				// The guard ensures the value fits; the cast is safe.
+				if isByteCount && blk.size <= 0xFFFF {
+					order.PutUint16(rawBytes[valPos:], uint16(blk.size))
+				} else if !isByteCount && blk.newOffset <= 0xFFFF {
+					order.PutUint16(rawBytes[valPos:], uint16(blk.newOffset))
 				}
 			}
 		}

@@ -153,16 +153,16 @@ func TestSupportsWrite(t *testing.T) {
 
 	// Tasks #92/#93 (epic #33 Option A): FormatTIFF is writable via the
 	// copy-and-relocate serializer in format/tiff/relocate.go.
-	// Task #101 (re-gate DNG): FormatDNG is no longer writable — real-corpus
-	// testing found that SubIFD out-of-line RATIONAL values are silently lost
-	// after write (bug #98). DNG is read-only until bug #98 is resolved.
-	// CR3 is writable as of task #91: stco/co64 offset relocation is implemented
-	// in cr3.Inject; SupportsWrite(FormatCR3) now returns true.
+	// Task #98 (SubIFD OOL value fix): FormatDNG is now writable — the SubIFD
+	// relocation path preserves ALL out-of-line value areas (RATIONAL
+	// XResolution/YResolution, etc.) by updating their valOrOff pointers to the
+	// new absolute positions. CR3 is writable as of task #91: stco/co64 offset
+	// relocation is implemented in cr3.Inject; SupportsWrite(FormatCR3) returns true.
 	// The five RAW variants (CR2, NEF, ARW, ORF, RW2) remain read-only until
 	// task #95 (manufacturer-specific offset rebasing).
 	writable := []format.FormatID{
-		format.FormatJPEG, format.FormatTIFF, format.FormatPNG, format.FormatHEIF,
-		format.FormatWebP, format.FormatAVIF, format.FormatCR3,
+		format.FormatJPEG, format.FormatTIFF, format.FormatDNG, format.FormatPNG,
+		format.FormatHEIF, format.FormatWebP, format.FormatAVIF, format.FormatCR3,
 	}
 	for _, f := range writable {
 		if !format.SupportsWrite(f) {
@@ -170,9 +170,8 @@ func TestSupportsWrite(t *testing.T) {
 		}
 	}
 
-	// FormatDNG is re-gated (task #101): SubIFD out-of-line value loss (bug #98).
+	// The five RAW variants remain read-only until task #95.
 	notWritable := []format.FormatID{
-		format.FormatDNG,
 		format.FormatCR2, format.FormatNEF,
 		format.FormatARW, format.FormatORF, format.FormatRW2,
 		format.FormatUnknown,

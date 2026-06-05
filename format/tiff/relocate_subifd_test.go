@@ -1008,6 +1008,282 @@ func TestSubIFDFailBeforePassAfter(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Test (SubIFD-7): SubIFD out-of-line RATIONAL values survive relocation (bug #98)
+// ---------------------------------------------------------------------------
+
+// buildDNGLikeWithRationalSubIFD builds a synthetic DNG-like TIFF where the
+// SubIFD contains out-of-line RATIONAL values (XResolution 0x011A, YResolution
+// 0x011B) in addition to strip image data. This is the canonical DNG real-world
+// pattern that exposed bug #98 (Pentax QS1.dng).
+//
+// Structure:
+//
+//	TIFF header (LE)
+//	IFD0:
+//	  ImageWidth, ImageLength, StripOffsets→thumbStrip, StripByteCounts, SubIFDs→SubIFD0
+//	SubIFD0:
+//	  ImageWidth, ImageLength,
+//	  XResolution (0x011A, TypeRATIONAL, count=1) — OOL: 8 bytes, value = numer/denom
+//	  YResolution (0x011B, TypeRATIONAL, count=1) — OOL: 8 bytes, value = numer/denom
+//	  StripOffsets (0x0111), StripByteCounts (0x0117)
+//	RationalArea (XRes 8 bytes + YRes 8 bytes = 16 bytes)
+//	thumbStrip bytes
+//	fullStrip bytes
+//
+// TIFF 6.0 §2: RATIONAL = two LONGs (numerator/denominator), each 4 bytes =
+// 8 bytes total. Since 8 > 4, the value is stored out-of-line; the entry's
+// valOrOff field points to the 8-byte value area.
+//
+// Spec reference: TIFF 6.0 §8: XResolution tag 0x011A, YResolution tag 0x011B,
+// both TypeRATIONAL (type code 5), Count=1.
+func buildDNGLikeWithRationalSubIFD(thumbStrip, fullStrip []byte, xResDenom, yResDenom uint32) []byte {
+	order := binary.LittleEndian
+
+	// IFD0: 5 entries (ImageWidth, ImageLength, StripOffsets, StripByteCounts, SubIFDs).
+	nIFD0 := 5
+
+	// SubIFD0: 6 entries sorted by tag:
+	//   0x0100 ImageWidth
+	//   0x0101 ImageLength
+	//   0x011A XResolution  (TypeRATIONAL=5, Count=1, OOL)
+	//   0x011B YResolution  (TypeRATIONAL=5, Count=1, OOL)
+	//   0x0111 StripOffsets  (TypeLong, Count=1, inline)
+	//   0x0117 StripByteCounts (TypeLong, Count=1, inline)
+	// NOTE: entries must be sorted ascending by tag for TIFF compliance.
+	// Sorted order: 0x0100, 0x0101, 0x0111, 0x0117, 0x011A, 0x011B
+	nSubIFD0 := 6
+
+	// Layout:
+	//   [0..7]        TIFF header
+	//   [8..]         IFD0: 2 + 5×12 + 4 = 70 bytes @ 8
+	//   [78..]        SubIFD0: 2 + 6×12 + 4 = 78 bytes @ 78
+	//   [156..]       XResolution value area: 8 bytes (numerator=300, denominator=xResDenom)
+	//   [164..]       YResolution value area: 8 bytes (numerator=300, denominator=yResDenom)
+	//   [172..]       thumbStrip
+	//   [172+ts..]    fullStrip
+	const headerSize = 8
+	ifd0Off := headerSize
+	subIFD0Off := ifd0Off + 2 + nIFD0*12 + 4         // 78
+	xResValueOff := subIFD0Off + 2 + nSubIFD0*12 + 4 // 156
+	yResValueOff := xResValueOff + 8                 // 164
+	thumbOff := yResValueOff + 8                     // 172
+	fullOff := thumbOff + len(thumbStrip)
+	total := fullOff + len(fullStrip)
+
+	buf := make([]byte, total)
+	buf[0], buf[1] = 'I', 'I'
+	order.PutUint16(buf[2:], 0x002A)
+	order.PutUint32(buf[4:], uint32(ifd0Off))
+
+	// --- IFD0 ---
+	order.PutUint16(buf[ifd0Off:], uint16(nIFD0))
+	p := ifd0Off + 2
+	writeEntry := func(tag, typ uint16, count, val uint32) { //nolint:unparam // typ is always 4 for IFD0; kept as param for clarity
+		order.PutUint16(buf[p:], tag)
+		order.PutUint16(buf[p+2:], typ)
+		order.PutUint32(buf[p+4:], count)
+		order.PutUint32(buf[p+8:], val)
+		p += 12
+	}
+	writeEntry(0x0100, 4, 1, 4) // ImageWidth
+	writeEntry(0x0101, 4, 1, 1) // ImageLength
+	writeEntry(0x0111, 4, 1, uint32(thumbOff))
+	writeEntry(0x0117, 4, 1, uint32(len(thumbStrip))) //nolint:gosec // G115: len always non-negative
+	writeEntry(0x014A, 4, 1, uint32(subIFD0Off))
+	p += 4 // IFD0 next-IFD = 0
+
+	// --- SubIFD0 ---
+	// Entries sorted ascending by tag: 0x0100, 0x0101, 0x0111, 0x0117, 0x011A, 0x011B
+	order.PutUint16(buf[subIFD0Off:], uint16(nSubIFD0))
+	q := subIFD0Off + 2
+	writeEntryAt := func(pos int, tag, typ uint16, count, val uint32) { //nolint:unparam // count always 1 for scalar entries in this fixture
+		order.PutUint16(buf[pos:], tag)
+		order.PutUint16(buf[pos+2:], typ)
+		order.PutUint32(buf[pos+4:], count)
+		order.PutUint32(buf[pos+8:], val)
+	}
+	// TIFF type 4 = LONG (4 bytes), type 5 = RATIONAL (8 bytes).
+	writeEntryAt(q, 0x0100, 4, 1, 1024)                      // ImageWidth
+	writeEntryAt(q+12, 0x0101, 4, 1, 768)                    // ImageLength
+	writeEntryAt(q+24, 0x0111, 4, 1, uint32(fullOff))        //nolint:gosec // G115: fullOff bounded by buf
+	writeEntryAt(q+36, 0x0117, 4, 1, uint32(len(fullStrip))) //nolint:gosec // G115: len always non-negative
+	// XResolution: TypeRATIONAL (5), Count=1, OOL → xResValueOff
+	writeEntryAt(q+48, 0x011A, 5, 1, uint32(xResValueOff))
+	// YResolution: TypeRATIONAL (5), Count=1, OOL → yResValueOff
+	writeEntryAt(q+60, 0x011B, 5, 1, uint32(yResValueOff))
+	// SubIFD0 next-IFD = 0 (already zero)
+
+	// --- RATIONAL value areas ---
+	// XResolution = 300/xResDenom
+	order.PutUint32(buf[xResValueOff:], 300)
+	order.PutUint32(buf[xResValueOff+4:], xResDenom)
+	// YResolution = 300/yResDenom
+	order.PutUint32(buf[yResValueOff:], 300)
+	order.PutUint32(buf[yResValueOff+4:], yResDenom)
+
+	// --- Image data ---
+	copy(buf[thumbOff:], thumbStrip)
+	copy(buf[fullOff:], fullStrip)
+
+	return buf
+}
+
+// TestSubIFDRationalValuesPreservedOnRelocation is the regression test for
+// task #98 (SubIFD OOL value fix): out-of-line RATIONAL values (XResolution,
+// YResolution) were silently lost after DNG write because patchRawIFDOffsets
+// only updated the valOrOff pointer for strip/tile image-data tags, leaving
+// RATIONAL and other OOL entries pointing at stale original-file offsets.
+//
+// After the fix, patchRawIFDOffsets updates the valOrOff field for EVERY OOL
+// entry in the SubIFD — not just strip/tile offset arrays — so RATIONAL, SRATIONAL,
+// DOUBLE, long ASCII, and similar entries round-trip correctly.
+//
+// Test structure:
+//  1. Build a synthetic DNG-like TIFF with a SubIFD that carries:
+//     - XResolution = 300/1 (RATIONAL, OOL, 8 bytes)
+//     - YResolution = 300/1 (RATIONAL, OOL, 8 bytes)
+//     - StripOffsets / StripByteCounts (image block)
+//  2. Inject IPTC+XMP (forces the copy-and-relocate path).
+//  3. Re-parse the output and verify:
+//     (a) SubIFD XResolution == 300/1 (not undef, not stale).
+//     (b) SubIFD YResolution == 300/1 (not undef, not stale).
+//     (c) Image block bytes are verbatim-identical.
+//     (d) IFD0 thumbnail block bytes are verbatim-identical.
+func TestSubIFDRationalValuesPreservedOnRelocation(t *testing.T) {
+	t.Parallel()
+
+	thumbStrip := []byte("THUMB-BUG98-RATIONAL-REGRESSION-TEST-DATA!")
+	fullStrip := []byte("FULLRES-BUG98-RATIONAL-REGRESSION-FULL-IMAGE-DATA")
+
+	// XResolution = 300/1, YResolution = 300/1 (typical DPI setting for DNGs).
+	const xResDenom uint32 = 1
+	const yResDenom uint32 = 1
+
+	original := buildDNGLikeWithRationalSubIFD(thumbStrip, fullStrip, xResDenom, yResDenom)
+
+	newIPTC := []byte("iptc-bug98-regression-rational-subifd")
+	newXMP := []byte("<xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF/></xmpmeta>")
+
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(original), &out, original, newIPTC, newXMP, true); err != nil {
+		t.Fatalf("Inject (bug #98 regression): %v", err)
+	}
+
+	output := out.Bytes()
+
+	// (d) Re-parse and verify injected metadata round-trips.
+	_, gotIPTC, gotXMP, err := Extract(bytes.NewReader(output))
+	if err != nil {
+		t.Fatalf("Extract after bug-#98 Inject: %v", err)
+	}
+	if !bytes.Equal(gotIPTC, newIPTC) {
+		t.Errorf("IPTC: got %q, want %q", gotIPTC, newIPTC)
+	}
+	if !bytes.Equal(gotXMP, newXMP) {
+		t.Errorf("XMP: got %q, want %q", gotXMP, newXMP)
+	}
+
+	// Structural check: IFD0 thumbnail + SubIFD image block both byte-identical.
+	if !bytes.Contains(output, thumbStrip) {
+		t.Error("bug #98: thumbnail strip data not found verbatim in output")
+	}
+	if !bytes.Contains(output, fullStrip) {
+		t.Error("bug #98: full-res strip data not found verbatim in output")
+	}
+	assertSubIFDsRelocated(t, original, output)
+
+	// THE KEY ASSERTIONS (a)+(b): RATIONAL XResolution and YResolution must
+	// survive relocation with their original numerator/denominator values.
+	//
+	// Parse the SubIFD from the output and verify the RATIONAL entries directly.
+	var order binary.ByteOrder = binary.LittleEndian
+	if len(output) >= 2 && output[0] == 'M' && output[1] == 'M' {
+		order = binary.BigEndian
+	}
+
+	ifd0Off := int(order.Uint32(output[4:]))
+	if ifd0Off+2 > len(output) {
+		t.Fatalf("bug #98: ifd0Off %d out of bounds", ifd0Off)
+	}
+	ifd0Count := int(order.Uint16(output[ifd0Off:]))
+
+	var subIFD0Off uint32
+	for i := range ifd0Count {
+		e := ifd0Off + 2 + i*12
+		if e+12 > len(output) {
+			break
+		}
+		if order.Uint16(output[e:]) == 0x014A {
+			subIFD0Off = order.Uint32(output[e+8:])
+			break
+		}
+	}
+	if subIFD0Off == 0 {
+		t.Fatal("bug #98: 0x014A SubIFDs tag not found in output IFD0")
+	}
+
+	parsedSubIFD, _, ok := exif.ParseIFDAt(output, subIFD0Off, order)
+	if !ok || parsedSubIFD == nil {
+		t.Fatalf("bug #98: ParseIFDAt at SubIFD offset %d failed on output", subIFD0Off)
+	}
+
+	// (a) Verify XResolution (0x011A).
+	xResEntry := parsedSubIFD.Get(exif.TagXResolution)
+	if xResEntry == nil {
+		t.Error("bug #98: SubIFD XResolution (0x011A) is nil in output — RATIONAL value was lost")
+	} else {
+		// TypeRATIONAL = 8 bytes: numerator (4 bytes) + denominator (4 bytes).
+		if len(xResEntry.Value) < 8 {
+			t.Errorf("bug #98: SubIFD XResolution value too short: %d bytes (want 8)", len(xResEntry.Value))
+		} else {
+			numer := order.Uint32(xResEntry.Value[0:])
+			denom := order.Uint32(xResEntry.Value[4:])
+			if numer != 300 || denom != xResDenom {
+				t.Errorf("bug #98: SubIFD XResolution = %d/%d, want 300/%d (value corrupted after relocation)",
+					numer, denom, xResDenom)
+			}
+		}
+	}
+
+	// (b) Verify YResolution (0x011B).
+	yResEntry := parsedSubIFD.Get(exif.TagYResolution)
+	if yResEntry == nil {
+		t.Error("bug #98: SubIFD YResolution (0x011B) is nil in output — RATIONAL value was lost")
+	} else {
+		if len(yResEntry.Value) < 8 {
+			t.Errorf("bug #98: SubIFD YResolution value too short: %d bytes (want 8)", len(yResEntry.Value))
+		} else {
+			numer := order.Uint32(yResEntry.Value[0:])
+			denom := order.Uint32(yResEntry.Value[4:])
+			if numer != 300 || denom != yResDenom {
+				t.Errorf("bug #98: SubIFD YResolution = %d/%d, want 300/%d (value corrupted after relocation)",
+					numer, denom, yResDenom)
+			}
+		}
+	}
+
+	// (c) The full-res strip bytes must be at exactly the right offset in the output.
+	subSOff := parsedSubIFD.Get(exif.TagStripOffsets)
+	subSCnt := parsedSubIFD.Get(exif.TagStripByteCounts)
+	if subSOff == nil || subSCnt == nil {
+		t.Fatal("bug #98: SubIFD StripOffsets/StripByteCounts missing in output")
+	}
+	elemSz := int(typeSize(uint16(subSOff.Type)))
+	cntSz := int(typeSize(uint16(subSCnt.Type)))
+	if elemSz > 0 && cntSz > 0 && len(subSOff.Value) >= elemSz && len(subSCnt.Value) >= cntSz {
+		newFullOff, _ := readUint(subSOff.Value, elemSz, order)
+		newFullCnt, _ := readUint(subSCnt.Value, cntSz, order)
+		end := uint64(newFullOff) + uint64(newFullCnt)
+		if end > uint64(len(output)) {
+			t.Fatalf("bug #98: SubIFD full-res block %d+%d exceeds output len %d", newFullOff, newFullCnt, len(output))
+		}
+		if !bytes.Equal(output[newFullOff:end], fullStrip) {
+			t.Errorf("bug #98: SubIFD full-res strip bytes differ at new offset %d", newFullOff)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Benchmark
 // ---------------------------------------------------------------------------
 

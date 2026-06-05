@@ -297,10 +297,10 @@ func TestRefineTIFFVariant(t *testing.T) {
 // image-data blocks (strips, tiles, main-image JPEG) at corrected absolute
 // offsets, eliminating the SPIKE #6 corruption risk for plain TIFF files.
 //
-// Task #101 (re-gate DNG): FormatDNG is no longer writable. Real-corpus
-// testing found that SubIFD out-of-line RATIONAL values (e.g.
-// XResolution/YResolution) are silently lost after write (bug #98). DNG
-// write is disabled as a fail-safe until bug #98 is resolved.
+// Task #98 (SubIFD OOL value fix): FormatDNG is now writable. The SubIFD
+// relocation path preserves ALL out-of-line value areas (RATIONAL
+// XResolution/YResolution, etc.) by updating their valOrOff pointers to the
+// new absolute positions after relocation.
 //
 // The five RAW variants (CR2, NEF, ARW, ORF, RW2) remain read-only until
 // task #95 (manufacturer-specific offset rebasing).
@@ -312,7 +312,7 @@ func TestSupportsWrite(t *testing.T) {
 	t.Parallel()
 
 	writable := []FormatID{
-		FormatJPEG, FormatTIFF, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3,
+		FormatJPEG, FormatTIFF, FormatDNG, FormatPNG, FormatHEIF, FormatAVIF, FormatWebP, FormatCR3,
 	}
 	for _, f := range writable {
 		if !SupportsWrite(f) {
@@ -320,9 +320,8 @@ func TestSupportsWrite(t *testing.T) {
 		}
 	}
 
-	// FormatDNG is re-gated (task #101): SubIFD out-of-line value loss (bug #98).
+	// The five RAW variants remain read-only until task #95.
 	notWritable := []FormatID{
-		FormatDNG,
 		FormatCR2, FormatNEF, FormatARW, FormatORF, FormatRW2,
 		FormatUnknown,
 	}
