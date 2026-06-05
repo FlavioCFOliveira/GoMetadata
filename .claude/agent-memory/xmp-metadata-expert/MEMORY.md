@@ -1,3 +1,3 @@
 # Memory Index
 
-- [XMP/IPTC Spec Audit — 2026-04-03](project_xmp_iptc_audit.md) — XMP 7/10, IPTC 7.5/10; specific gaps identified in struct serialization, array-of-structs parsing, IRB write, charset handling
+- [XMP/IPTC Spec Audit — re-audit 2026-06-04](project_xmp_iptc_audit.md) — 6 original fixes verified; appendUTF8Rune FIXED; new: unsafe.String aliasing (HIGH), numeric-charref overflow (MEDIUM), unknown-NS prefix collision (MEDIUM), Alt x-default selection (MEDIUM)

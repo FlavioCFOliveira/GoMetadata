@@ -1,61 +1,110 @@
 ---
-name: XMP/IPTC Spec Audit — 2026-04-03
-description: Detailed spec compliance audit of xmp/ and iptc/ packages; scores and specific defects documented
+name: XMP/IPTC Spec Audit — 2026-04-03 (updated 2026-06-01, re-audit 2026-06-01)
+description: Full re-audit of xmp/ and format/jpeg/ after hardening round; all 6 original fixes verified; residual issues catalogued
 type: project
 ---
 
-Audit conducted against XMP ISO 16684-1 and IPTC IIM 4.2.
+Re-audit conducted 2026-06-01 against ISO 16684-1, Adobe XMP Spec Parts 1-3.
 
-## XMP Score: 7/10
+## XMP Score: 9/10 (up from 7/10)
 
-### Confirmed correct
-- Packet scanning: `<?xpacket begin=` + `<?xpacket end=` markers; no premature `?>` termination
-- BOM embedded as attribute value in `begin=` field
-- `id="W5M0MpCehiHzreSzNTczkc9d"` magic ID present
-- `rdf:Alt/Seq/Bag` with `rdf:li` accumulation
-- `xml:lang` on `rdf:li` stored as `lang|value`; x-default stored without prefix
-- `rdf:parseType="Resource"` → struct handling
-- `rdf:resource` shorthand attribute
-- Inline attribute shorthand on `rdf:Description`
-- All core namespaces correct (xmp, xmpRights, xmpMM, dc, photoshop, exif, tiff, aux, Iptc4xmpCore, Iptc4xmpExt)
-- `xml.EscapeText` used for all character data in write
-- 2 KB whitespace padding + `<?xpacket end="w"?>`
-- Deterministic output via sort
+All 6 originally-flagged defects are FIXED. No new BLOCKER found.
 
-### Defects / Gaps
-1. **No UTF-16 packet support** — XMP §7.2 allows UTF-16/UTF-32; `bytes.Index` on UTF-8 literals fails
-2. **`begin=` attribute value not validated** — accepts malformed PIs
-3. **Array-of-structs not parsed** — `rdf:li` containing nested `rdf:Description` (e.g., xmpMM:History) silently dropped
-4. **`xml:lang` not namespace-qualified** in rdf:li scanning (minor)
-5. **Struct fields cross-namespace key attribution** — stored under field NS not parent NS
-6. **Struct properties not serialized correctly** — `propLocal.fieldLocal` emitted as dotted XML element name (invalid)
-7. **`collectionType` incomplete** — xmpMM:History/Ingredients should be Seq, not Bag
-8. **Missing type-support namespaces**: stEvt, stRef, stDim, stVer, xmpBJ, xmpTPg, xmpDM, xmpG, xmpGImg
-9. **`rdf:about` not validated** — spec requires consistent subject URI across all rdf:Description blocks
+### Fix verification summary
 
-## IPTC Score: 7.5/10
+1. **ExtendedXMP APP1 identifier** — FIXED. `identXMPNote` at jpeg.go:49 is
+   `"http://ns.adobe.com/xmp/extension/\x00"` (35 bytes + NUL). Correct per
+   Adobe XMP Spec Part 3 §1.1.4. Wire-frame round-trip implemented via
+   `encodeXMPWire` / `decodeXMPWire`; `rawXMPWire` plumbed through
+   `ExtractWithWire`, `metadata.go`, and `Inject`.
 
-### Confirmed correct
-- Tag marker 0x1C scanning
-- 5-byte header: marker + record + dataset + 2-byte size
-- Standard 2-byte length (big-endian)
-- Extended length: `0x80 | nBytes` in high byte; subsequent nBytes carry actual length
-- IRB: 8BIM marker, resource ID, Pascal string name + even-padding, 4-byte size, data even-padding
-- Resource ID 0x0404 for IPTC-NAA
-- UTF-8 declaration: ESC % G (0x1B 0x25 0x47) in 1:90
-- ISO-8859-1 fallback via golang.org/x/text charmap
-- UTF-8 declaration re-emitted on encode when originally present
-- Dataset registry: good coverage of photographic datasets (5, 25, 55, 60, 80, 105, 116, 120, etc.)
+2. **Struct and array-of-struct serialization** — FIXED. `classifyProps` +
+   `writeStructProperty` + `writeStructInListProperty` in write.go correctly
+   emit `rdf:parseType="Resource"` wrappers. No dots in element names.
+   Round-trip test `TestStructInArrayRoundTrip` passes.
 
-### Defects / Gaps
-1. **Destructive IRB write** — buildIRB emits only 0x0404; all other resource blocks (ICC, thumbnail, XMP, etc.) discarded
-2. **Multi-segment APP13 not supported** — large IPTC can span multiple APP13 segments; only first parsed
-3. **No auto UTF-8 declaration on write** — SetCaption/SetCopyright with non-ASCII values written without 1:90 dataset injection
-4. **`isUTF8Declaration` len==3 too strict** — some tools append NUL padding; HasPrefix would be more robust
-5. **No ISO 2022 charset diversity** — non-UTF-8, non-Latin-1 declared charsets (e.g., Shift-JIS) produce garbled output
-6. **Malformed data silently truncates** — break on integrity failure drops all subsequent datasets without error
-7. **Missing IIM datasets**: 2:22, 2:26-2:31, 2:35-2:38, 2:42, 2:45-2:47, 2:75 (agency workflow fields)
-8. **Missing convenience accessors**: ObjectName (2:05), DateCreated (2:55), Headline (2:105), City/ProvinceState/CountryName
+3. **storeProperty first-wins** — FIXED. `storeProperty` in rdf.go:1219-1228
+   guards with `if x.Properties[ns][local] != ""` before write.
+   `onCharDataSimple` and `onCharDataStructField` have matching guards.
 
-**Why:** Research-only audit for library gap assessment.
-**How to apply:** Use these findings to prioritize remediation work; P0 is struct serialization (XMP) and destructive IRB write (IPTC).
+4. **Namespace scope push/pop** — FIXED. `nsDepth [101]nsDepthEntry` stack
+   and `popNSScope()` in `onEndElement` correctly restore `nsCount`.
+   `TestNamespaceScopePopping` with 40 sibling blocks passes.
+
+5. **UTF-16/UTF-32 BOM decode** — FIXED. `xmp/encoding.go` implements
+   `detectEncoding`, `toUTF8`, `decodeUTF32`, `appendUTF8Rune`,
+   `normaliseToUTF8`. Called from both `Parse` and `Scan`.
+
+6. **CDATA sections** — FIXED. `isCDATA`, `parseCDATA`, `collectTextContent`
+   in rdf.go handle interleaved CDATA. Character data delivered without entity
+   expansion (correct per XML 1.0 §2.7).
+
+7. **Depth underflow guard** — FIXED. `onEndElement` opens with
+   `if p.depth <= 0 { return }` at rdf.go:192-194.
+
+### Residual defects
+
+#### MAJOR
+- **appendUTF8Rune: no code-point range validation** — encoding.go:150-174.
+  Code points > U+10FFFF and surrogate pairs U+D800–U+DFFF are silently emitted
+  as multi-byte sequences. The `default` branch in the switch covers cp > 0xFFFF
+  without bounding to 0x10FFFF, producing up to 4 bytes for cp up to 2^32-1.
+  Crafted UTF-32 LE/BE input can inject ill-formed UTF-8 sequences into the
+  parse buffer, causing downstream string/XML corruption. Should guard:
+  `if cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) { continue/replace }`.
+
+#### MINOR (unchanged from April, not yet fixed)
+- **`collectionType` incomplete** — xmpMM:History, xmpMM:Ingredients default to
+  rdf:Bag instead of rdf:Seq. namespace.go:30-40.
+- **Unknown namespace fallback prefix collision** — all unknown namespaces get
+  prefix "ns"; two unknown namespaces in same document → invalid XML.
+- **Missing type-support namespaces in prefixMap** — stEvt, stRef, stDim,
+  stVer, xmpBJ, xmpTPg, xmpDM, xmpG, xmpGImg.
+- **`xml:lang` without namespace check** — `onStartListItem` checks
+  `a.loc == "lang"` without verifying `a.ns` is `""` or
+  `"http://www.w3.org/XML/1998/namespace"`. Could match a custom attribute
+  named "lang" in a non-xml namespace.
+- **ExtendedXMP reassembly is string-search-based** — `reassembleExtendedXMP`
+  uses `bytes.LastIndex` for `</rdf:RDF>`. Correct for well-formed docs but
+  fragile if that literal appears in a text node.
+
+#### NIT (unchanged)
+- **`rdf:about` not validated** across multiple rdf:Description blocks.
+- **`begin=` attribute value not validated** (empty string accepted alongside
+  the correct UTF-8 BOM sentinel).
+- **NSxmpNote naming** — correctly two separate strings but confusingly named.
+
+**Why:** Research audit for library hardening QA.
+**How to apply:** Items below are the new findings from 2026-06-04 re-audit.
+
+## New findings 2026-06-04
+
+#### HIGH
+- **`unsafe.String` parse-buffer aliasing** — `unescapeXML` (rdf.go:1044) uses
+  `unsafe.String(unsafe.SliceData(b), len(b))` for the no-entity fast path.
+  The returned string aliases the caller's `[]byte`. If the caller modifies
+  their byte slice after `Parse` returns, stored property strings are silently
+  corrupted. Caller-owned reusable buffers (e.g. sync.Pool) trigger this.
+
+#### MEDIUM
+- **`parseHex`/`parseDec` no overflow check** — Both functions accumulate into
+  a `rune` (int32) without bounding to ≤ U+10FFFF. Long inputs like
+  `&#2147483648;` or `&#x80000000;` overflow the rune and pass a negative
+  or wrong code point to `bld.WriteRune`. WriteRune emits U+FFFD for negatives,
+  which is functionally safe but spec-wrong (XML §4.1).
+
+- **Multiple unknown-NS prefix collision on Encode** — `prefixOf` returns `"ns"`
+  for every unrecognised namespace URI (namespace.go:83). When two unknown
+  namespaces are present, `Encode` emits two `<rdf:Description xmlns:ns="...">` blocks
+  with the same prefix but different URIs, producing invalid XML. `Parse(Encode(x))`
+  then incorrectly maps both blocks to the same namespace.
+
+- **`rdf:Alt` x-default selection** — `firstValue` returns the first item in
+  the joined string; if `x-default` is not the first item (producer order varies),
+  `Caption()`/`Copyright()` return a language-tagged value instead of the
+  canonical x-default. XMP §C.2.5/P1-H requires x-default as fallback.
+
+#### NIT (updated, appendUTF8Rune fix confirmed present)
+- appendUTF8Rune: code-point validation now present (decodeUTF32 guards before
+  calling appendUTF8Rune). Previously flagged MAJOR is now FIXED as of the
+  current codebase (confirmed 2026-06-04: lines 167-169 in encoding.go).

@@ -5,3 +5,22 @@
 - [Example output trailing spaces](feedback_example_output.md) — Go 1.26 does NOT strip trailing whitespace in example output; fmt.Println with empty string args fails // Output: comparisons
 - [intrange + modernize nolint for binary parsers](feedback_intrange_nolint.md) — Loops using i*12 offset need //nolint:intrange,modernize; min builtin shadowed in fuzz_test.go affects test builds
 - [sync.Pool buffer subslice race](feedback_pool_buffer_race.md) — Never Put a pool buffer before all reads of subslices derived from it are complete; exposed by t.Parallel() in detect.go and heif.go
+- [gosec G306/G302 + wrapcheck nolint placement](feedback_gosec_test_permissions.md) — nolint directive must be on the offending statement line; on assignment+return pattern only the return line counts
+- [XMP parser leniency — failure triggers](feedback_xmp_parser_lenient.md) — xmp.Parse only fails on ErrEmptyInput or ErrXMLNestingDepth (102 nested tags); generic malformed XML is silently ignored
+- [XMP property key encoding conventions](project_xmp_data_model.md) — "parent.field" for structs, "parent[N].field" for array-of-structs; serialiser must emit rdf:parseType="Resource"
+- [nolint cyclop vs gocyclo](feedback_nolint_cyclop_vs_gocyclo.md) — cyclop and gocyclo are separate linters; must list both when both fire or get "unused directive" error
+- [nolint:intrange on range N loops](feedback_nolint_intrange_range2.md) — `for i := range N` already satisfies intrange; adding nolint:intrange on such loops causes nolintlint to fire
+- [copyloopvar in Go 1.22+ — no tc:=tc needed](feedback_copyloopvar_go122.md) — loop variable copies inside for-range are redundant in Go 1.22+; the copyloopvar linter flags them
+- [gosec G115 inconsistent nolint in test helpers](feedback_gosec_g115_inconsistent.md) — G115 fires on uint32(len(x)) / uint32(intFromLen) but not uint32(const); add nolint only where gosec actually fires
+- [nolint placement: only the exact offending line](feedback_nolint_placement_on_line.md) — Adding nolint on a line that gosec doesn't fire on causes nolintlint "unused directive"; always verify the exact line first
+- [Encode must not mutate receiver — FINDING-002](feedback_encode_no_receiver_mutation.md) — Serialise-only functions must never append/write to the input struct; concurrent callers race on shared slice headers
+- [FuzzJPEGExtract must not assert XMP content](feedback_fuzz_xmp_content_assertion.md) — JPEG layer extracts rawXMP bytes verbatim; XMP structure assertions belong in the xmp package, not format/jpeg fuzz tests
+- [godox linter: avoid BUG/TODO/FIXME in comments AND string literals](feedback_godox_in_strings.md) — godox fires on BUG/TODO/FIXME even inside t.Errorf strings, not just comments; use "task #N regression:" phrasing instead
+- [ExampleWrite output size stale after auto-create policy](feedback_example_output_size.md) — SetCaption auto-creates IPTC+XMP for EXIF-only JPEG; re-measure and update `// Output:` hardcoded byte counts
+- [testing.AllocsPerRun panics in parallel tests](feedback_allocs_per_run_no_parallel.md) — Do not call t.Parallel() in tests using AllocsPerRun; add //nolint:paralleltest on the function line
+- [ISOBMFF recursive walker must use bounded slices](feedback_relocate_isobmff_recursion.md) — Pass data[content:boxEnd] to recursive calls, never the full parent buffer with a start offset; otherwise sibling boxes get processed multiple times
+- [TIFF two-pass encode pattern for copy-and-relocate](feedback_tiff_two_pass_encode.md) — Insert placeholder entries (TypeLong, Count=N, zero bytes), encode to get ifdEnd, update bytes in-place, encode again; Count must be N elements not N×4 bytes
+- [SubIFD relocation at raw-TIFF level](feedback_tiff_subifd_raw_level.md) — 0x014A SubIFD relocation must be raw-byte (not exif.Encode model); OOL array patching needs BOTH element values AND the valOrOff pointer updated
+- [TIFF/DNG write: EXIF must be nil for rawEXIF base to be the full file](feedback_tiff_exif_base_for_write.md) — Read() populates m.EXIF; set m.EXIF=nil before gometadata.Write to pass rawEXIF (full file) as relocateTIFF base when only IPTC/XMP changes
+- [DNG write re-enabled (bug #98 fixed, commit 9ff26ac)](project_dng_write_gated.md) — patchRawIFDOffsets now updates valOrOff for ALL OOL SubIFD entries; DNG write fully enabled
+- [CR2 write un-gated; NEF/ARW failure modes (task #95, commit 561f5d8)](project_cr2_write_ungated.md) — CR2 passes; NEF: SubIFD RATIONAL corruption + PreviewIFD loss; ARW: 52 Sony tags lost + SR2Private corruption
