@@ -10,10 +10,7 @@ package cr2
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"testing"
-
-	"github.com/FlavioCFOliveira/GoMetadata/format/tiff"
 )
 
 // buildCR2WithIPTCAndXMP constructs a minimal CR2 file carrying IPTC (0x83BB)
@@ -119,8 +116,9 @@ func TestCR2TruncatedMidWay(t *testing.T) {
 	}
 }
 
-// TestCR2BigTIFFReturnsError verifies that a BigTIFF input is rejected.
-func TestCR2BigTIFFReturnsError(t *testing.T) {
+// TestCR2BigTIFFSucceeds verifies that a BigTIFF input (magic 0x002B) is now
+// accepted by CR2.Extract (task #54: BigTIFF read support added to tiff.Extract).
+func TestCR2BigTIFFSucceeds(t *testing.T) {
 	t.Parallel()
 	bigTIFF := make([]byte, 16)
 	bigTIFF[0], bigTIFF[1] = 'I', 'I'
@@ -129,11 +127,11 @@ func TestCR2BigTIFFReturnsError(t *testing.T) {
 	binary.LittleEndian.PutUint16(bigTIFF[6:], 0)
 	binary.LittleEndian.PutUint64(bigTIFF[8:], 16)
 
-	_, _, _, err := Extract(bytes.NewReader(bigTIFF))
-	if err == nil {
-		t.Error("Extract BigTIFF: expected error, got nil")
+	rawEXIF, _, _, err := Extract(bytes.NewReader(bigTIFF))
+	if err != nil {
+		t.Errorf("Extract BigTIFF: unexpected error: %v", err)
 	}
-	if !errors.Is(err, tiff.ErrUnsupportedMagic) {
-		t.Errorf("expected errors.Is(err, tiff.ErrUnsupportedMagic); got %v", err)
+	if rawEXIF == nil {
+		t.Error("Extract BigTIFF: rawEXIF is nil")
 	}
 }

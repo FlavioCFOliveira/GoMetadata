@@ -9,10 +9,7 @@ package arw
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"testing"
-
-	"github.com/FlavioCFOliveira/GoMetadata/format/tiff"
 )
 
 // buildARWWithIPTCAndXMP constructs a minimal ARW/TIFF byte stream carrying
@@ -119,9 +116,11 @@ func TestARWTruncatedMidWay(t *testing.T) {
 	}
 }
 
-// TestARWBigTIFFReturnsError verifies that a BigTIFF input (magic 0x002B)
-// is rejected gracefully by ARW.Extract (via tiff.Extract's magic check).
-func TestARWBigTIFFReturnsError(t *testing.T) {
+// TestARWBigTIFFSucceeds verifies that a BigTIFF input (magic 0x002B) is now
+// accepted by ARW.Extract (task #54: BigTIFF read support added to tiff.Extract).
+// The minimal 16-byte BigTIFF has IFD0 at offset 16 == EOF, so rawIPTC/rawXMP
+// are nil, but rawEXIF is non-nil and no error is returned.
+func TestARWBigTIFFSucceeds(t *testing.T) {
 	t.Parallel()
 	bigTIFF := make([]byte, 16)
 	bigTIFF[0], bigTIFF[1] = 'I', 'I'
@@ -130,12 +129,11 @@ func TestARWBigTIFFReturnsError(t *testing.T) {
 	binary.LittleEndian.PutUint16(bigTIFF[6:], 0)
 	binary.LittleEndian.PutUint64(bigTIFF[8:], 16)
 
-	_, _, _, err := Extract(bytes.NewReader(bigTIFF))
-	if err == nil {
-		t.Error("Extract BigTIFF: expected error, got nil")
+	rawEXIF, _, _, err := Extract(bytes.NewReader(bigTIFF))
+	if err != nil {
+		t.Errorf("Extract BigTIFF: unexpected error: %v", err)
 	}
-	// The wrapped error must include ErrUnsupportedMagic from the tiff package.
-	if !errors.Is(err, tiff.ErrUnsupportedMagic) {
-		t.Errorf("expected errors.Is(err, tiff.ErrUnsupportedMagic); got %v", err)
+	if rawEXIF == nil {
+		t.Error("Extract BigTIFF: rawEXIF is nil")
 	}
 }

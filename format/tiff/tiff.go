@@ -35,21 +35,29 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	}
 
 	// TIFF 6.0 §2: magic number is 42 (0x002A) for classic TIFF.
-	// BigTIFF uses 43 (0x002B) and has a fundamentally different header layout
-	// (8-byte IFD offsets, 16-byte header). Reject BigTIFF explicitly so that
-	// the caller gets an actionable error rather than a silently misparsed result.
+	// BigTIFF spec (Aware Systems / libtiff) §2: magic 43 (0x002B) for BigTIFF,
+	// which uses a 16-byte header with 8-byte IFD offsets.
 	magic := order.Uint16(data[2:])
-	if magic != 0x002A {
-		return nil, nil, nil, fmt.Errorf("tiff: unsupported magic 0x%04X (classic TIFF 0x002A required; BigTIFF 0x002B is not supported): %w",
+	switch magic {
+	case 0x002A:
+		// Classic TIFF: 8-byte header, 32-bit IFD offsets, 12-byte entries.
+		// The whole TIFF data IS the EXIF payload (TIFF §2).
+		rawEXIF = data
+		ifd0Off := order.Uint32(data[4:])
+		rawIPTC, rawXMP = extractTagValues(data, ifd0Off, order)
+		return rawEXIF, rawIPTC, rawXMP, nil
+
+	case 0x002B:
+		// BigTIFF: 16-byte header, 64-bit IFD offsets, 20-byte entries.
+		// BigTIFF spec §2: bytes [4:6] = offset bytesize (must be 8),
+		// bytes [6:8] = constant 0, bytes [8:16] = IFD0 offset (uint64).
+		rawEXIF, rawIPTC, rawXMP, err = extractBigTIFF(data, order)
+		return rawEXIF, rawIPTC, rawXMP, err
+
+	default:
+		return nil, nil, nil, fmt.Errorf("tiff: unsupported magic 0x%04X (expected 0x002A classic TIFF or 0x002B BigTIFF): %w",
 			magic, ErrUnsupportedMagic)
 	}
-
-	// The whole TIFF data IS the EXIF payload (TIFF §2).
-	rawEXIF = data
-
-	ifd0Off := order.Uint32(data[4:])
-	rawIPTC, rawXMP = extractTagValues(data, ifd0Off, order)
-	return rawEXIF, rawIPTC, rawXMP, nil
 }
 
 // Inject writes a modified TIFF stream to w, replacing the metadata tags.
@@ -430,4 +438,186 @@ func typeSize(t uint16) uint32 {
 		return 8
 	}
 	return 0
+}
+
+// typeSizeBigTIFF returns the byte size of a single value for a BigTIFF type.
+// It extends typeSize with the three BigTIFF-only 64-bit types:
+//
+//	LONG8  (16) = uint64, 8 bytes — BigTIFF spec §3.3
+//	SLONG8 (17) = int64,  8 bytes — BigTIFF spec §3.3
+//	IFD8   (18) = uint64 IFD offset, 8 bytes — BigTIFF spec §3.3
+//
+// These types are only valid inside a BigTIFF container; classic TIFF parsers
+// must reject them.  Returns 0 for any unknown type code (same sentinel as
+// typeSize) to allow the caller to skip unrecognised entries gracefully.
+func typeSizeBigTIFF(t uint16) uint64 {
+	switch t {
+	case 1, 2, 6, 7: // BYTE, ASCII, SBYTE, UNDEFINED
+		return 1
+	case 3, 8: // SHORT, SSHORT
+		return 2
+	case 4, 9, 11: // LONG, SLONG, FLOAT
+		return 4
+	case 5, 10, 12: // RATIONAL, SRATIONAL, DOUBLE
+		return 8
+	case 16, 17, 18: // LONG8, SLONG8, IFD8 — BigTIFF spec §3.3
+		return 8
+	}
+	return 0 // unknown type: caller skips the entry
+}
+
+// bigTIFFMinHeaderLen is the minimum length of a valid BigTIFF header.
+// BigTIFF spec §2: 16 bytes = 2 (order) + 2 (magic) + 2 (offset-bytesize) +
+// 2 (constant) + 8 (IFD0 offset).
+const bigTIFFMinHeaderLen = 16
+
+// bigTIFFOffsetBytesize is the only valid value for bytes [4:6] of the
+// BigTIFF header.  Any other value means the file is invalid or uses a future
+// variant not handled here.  BigTIFF spec §2.
+const bigTIFFOffsetBytesize = 8
+
+// bigTIFFMaxIFDEntries caps the entry count read from a single BigTIFF IFD to
+// prevent DoS via a crafted count that would exhaust memory.  Real BigTIFF
+// files never approach this — it is purely a safety bound.
+//
+// Classic TIFF uses uint16 (max 65535) for entry count; BigTIFF uses uint64.
+// We apply the same 65535 cap here: if an IFD claims more entries than a
+// classic TIFF header can even hold, the file is either corrupt or malicious.
+const bigTIFFMaxIFDEntries = 65535
+
+// extractBigTIFF parses the BigTIFF header, validates the offset-bytesize
+// field, then scans IFD0 for IPTC (0x83BB) and XMP (0x02BC) payloads.
+//
+// BigTIFF spec §2 (Aware Systems / libtiff):
+//
+//	bytes  0-1: byte order marker ("II" or "MM")
+//	bytes  2-3: magic = 43 (0x002B)
+//	bytes  4-5: bytesize-of-offsets — MUST equal 8; reject any other value
+//	bytes  6-7: constant = 0 — SHOULD equal 0 (reserved/padding)
+//	bytes  8-15: IFD0 offset (uint64, in file byte order)
+//
+// Anti-DoS invariants carried over from the classic path:
+//   - IFD entry count is capped at bigTIFFMaxIFDEntries.
+//   - Every uint64 arithmetic step that could overflow is guarded before
+//     the multiplication/addition is performed.
+//   - All slice accesses are bounds-checked against len(data).
+//   - No memory is allocated proportional to claimed counts until the
+//     bounds are verified.
+func extractBigTIFF(data []byte, order binary.ByteOrder) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+	// Minimum 16-byte header required.
+	if len(data) < bigTIFFMinHeaderLen {
+		return nil, nil, nil, ErrFileTooShort
+	}
+
+	// BigTIFF spec §2: bytes [4:6] must be 8.
+	offsetBytesize := order.Uint16(data[4:])
+	if offsetBytesize != bigTIFFOffsetBytesize {
+		return nil, nil, nil, fmt.Errorf("tiff: BigTIFF offset bytesize = %d, must be 8: %w",
+			offsetBytesize, ErrUnsupportedMagic)
+	}
+	// bytes [6:7] should be 0 (reserved). We warn-and-continue rather than
+	// reject, to handle any future minor variants that set this field.
+	// (BigTIFF spec §2: "constant 0x0000"; validation is advisory.)
+
+	// IFD0 offset is a uint64 at bytes [8:16].
+	ifd0Off := order.Uint64(data[8:])
+
+	// The whole data IS the EXIF payload (BigTIFF is itself a TIFF container).
+	rawEXIF = data
+	rawIPTC, rawXMP = extractTagValuesBigTIFF(data, ifd0Off, order)
+	return rawEXIF, rawIPTC, rawXMP, nil
+}
+
+// extractTagValuesBigTIFF scans a single BigTIFF IFD at ifd0Off within data
+// for IPTC (0x83BB) and XMP (0x02BC) tags and returns their raw byte values.
+//
+// BigTIFF IFD layout (BigTIFF spec §2):
+//
+//	bytes 0-7:   entry count (uint64)
+//	per entry (20 bytes each):
+//	  bytes 0-1:   tag (uint16)
+//	  bytes 2-3:   type (uint16)
+//	  bytes 4-11:  count (uint64)
+//	  bytes 12-19: value-or-offset (uint64)
+//	    — inline when typeSizeBigTIFF(type)*count <= 8
+//	    — otherwise: 64-bit file offset to the value data
+//	after entries:
+//	  bytes 0-7:   next-IFD offset (uint64); 0 = end of chain
+//
+// Anti-DoS: entry count is capped at bigTIFFMaxIFDEntries; every arithmetic
+// step that could overflow uint64 is checked before the operation.
+func extractTagValuesBigTIFF(data []byte, ifd0Off uint64, order binary.ByteOrder) (rawIPTC, rawXMP []byte) { //nolint:cyclop,gocyclo // BigTIFF IFD scan mirrors extractTagValues but with 8-byte fields; splitting reduces clarity
+	// Guard: IFD offset + 8-byte count field must fit in data.
+	if ifd0Off > uint64(len(data)) || uint64(len(data))-ifd0Off < 8 {
+		return nil, nil
+	}
+
+	count := order.Uint64(data[ifd0Off:])
+	// Cap the entry count to prevent DoS via huge count values.
+	count = min(count, bigTIFFMaxIFDEntries)
+
+	// Each BigTIFF entry is 20 bytes; validate the total entry area fits.
+	// Use uint64 arithmetic; check for overflow before multiplication.
+	const bigTIFFEntrySize = 20
+	if count > (uint64(len(data))-ifd0Off-8)/bigTIFFEntrySize {
+		// Entry list is truncated — clamp to what fits.
+		count = (uint64(len(data)) - ifd0Off - 8) / bigTIFFEntrySize
+	}
+
+	pos := ifd0Off + 8 // first entry starts after the 8-byte count field
+
+	for i := uint64(0); i < count; i++ { //nolint:intrange // BigTIFF parser: loop variable is a byte-slice offset multiplier
+		e := pos + i*bigTIFFEntrySize
+		// Safety: each entry is 20 bytes; confirmed by count clamping above.
+		if e+bigTIFFEntrySize > uint64(len(data)) {
+			break
+		}
+
+		tag := order.Uint16(data[e:])
+		typ := order.Uint16(data[e+2:])
+		cnt := order.Uint64(data[e+4:])
+
+		// Skip entries with unknown types — we cannot compute a valid value size.
+		sz := typeSizeBigTIFF(typ)
+		if sz == 0 {
+			continue
+		}
+
+		// Guard against count*sz overflow before multiplying.
+		// sz <= 8 and cnt is uint64; if cnt > MaxUint64/sz the product wraps.
+		// Equivalent condition: cnt > maxUint64/sz.
+		const maxUint64 = ^uint64(0)
+		if sz != 0 && cnt > maxUint64/sz {
+			continue // would overflow: entry is corrupt/malicious
+		}
+		total := sz * cnt
+
+		var v []byte
+		// BigTIFF spec §2: inline threshold is 8 bytes (vs 4 in classic TIFF).
+		if total <= 8 {
+			// Value fits in the 8-byte value-or-offset field (bytes e+12 to e+20).
+			v = data[e+12 : e+12+total]
+		} else {
+			// Value is out-of-line; bytes [e+12:e+20] hold a uint64 file offset.
+			off := order.Uint64(data[e+12:])
+			// Guard: off + total must not overflow and must be within data.
+			if off > uint64(len(data)) || total > uint64(len(data))-off {
+				continue // out-of-bounds: skip entry
+			}
+			v = data[off : off+total]
+		}
+
+		switch tag {
+		case 0x83BB: // IPTC-NAA
+			// Strip trailing zero bytes (padding for TypeLong encoding).
+			// Same trimming logic as in extractTagValues for the classic path.
+			rawIPTC = bytes.TrimRight(v, "\x00")
+			if len(rawIPTC) == 0 {
+				rawIPTC = nil
+			}
+		case 0x02BC: // XMP
+			rawXMP = v
+		}
+	}
+	return rawIPTC, rawXMP
 }

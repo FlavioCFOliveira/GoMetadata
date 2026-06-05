@@ -28,10 +28,10 @@ func FuzzTIFFExtract(f *testing.F) {
 	// Seed 4: truncated header (4 bytes — valid byte-order mark, no IFD offset).
 	f.Add([]byte{'I', 'I', 0x2A, 0x00})
 
-	// Seed 5: BigTIFF LE header (magic 0x002B).
+	// Seed 5: BigTIFF LE header (magic 0x002B) — task #54: BigTIFF is now supported.
 	// BigTIFF spec §2: magic 0x002B, 16-byte header with 8-byte IFD offset.
-	// The library does not support BigTIFF; this seed exercises the graceful
-	// error path without panicking.
+	// This seed exercises the BigTIFF parse path; IFD0 offset = 16 (past buffer,
+	// so IFD scan returns zero entries — but rawEXIF is non-nil and no panic).
 	bigTIFFLE := make([]byte, 16)
 	bigTIFFLE[0], bigTIFFLE[1] = 'I', 'I'
 	binary.LittleEndian.PutUint16(bigTIFFLE[2:], 0x002B)
@@ -113,6 +113,72 @@ func FuzzTIFFExtract(f *testing.F) {
 		f.Add(buf)
 	}
 
+	// Seed 14: BigTIFF BE (task #54) — exercises the BE BigTIFF code path.
+	{
+		buf := make([]byte, 16)
+		buf[0], buf[1] = 'M', 'M'
+		binary.BigEndian.PutUint16(buf[2:], 0x002B)
+		binary.BigEndian.PutUint16(buf[4:], 8)
+		binary.BigEndian.PutUint16(buf[6:], 0)
+		binary.BigEndian.PutUint64(buf[8:], 16)
+		f.Add(buf)
+	}
+
+	// Seed 15: BigTIFF LE with bad offset-bytesize (not 8) — must return error.
+	// BigTIFF spec §2: bytesize-of-offsets must be 8; any other value is invalid.
+	{
+		buf := make([]byte, 16)
+		buf[0], buf[1] = 'I', 'I'
+		binary.LittleEndian.PutUint16(buf[2:], 0x002B)
+		binary.LittleEndian.PutUint16(buf[4:], 4) // invalid: not 8
+		binary.LittleEndian.PutUint16(buf[6:], 0)
+		binary.LittleEndian.PutUint64(buf[8:], 16)
+		f.Add(buf)
+	}
+
+	// Seed 16: BigTIFF LE with huge IFD entry count (near MaxUint64).
+	// The DoS guard must clamp count before iterating.
+	{
+		buf := make([]byte, 32)
+		buf[0], buf[1] = 'I', 'I'
+		binary.LittleEndian.PutUint16(buf[2:], 0x002B)
+		binary.LittleEndian.PutUint16(buf[4:], 8)
+		binary.LittleEndian.PutUint16(buf[6:], 0)
+		binary.LittleEndian.PutUint64(buf[8:], 16)          // IFD0 at 16
+		binary.LittleEndian.PutUint64(buf[16:], ^uint64(0)) // count = MaxUint64
+		f.Add(buf)
+	}
+
+	// Seed 17: BigTIFF LE with IPTC entry having count that would overflow uint64
+	// (count * typeSize overflows). The overflow guard must skip the entry.
+	{
+		buf := make([]byte, 52)
+		buf[0], buf[1] = 'I', 'I'
+		binary.LittleEndian.PutUint16(buf[2:], 0x002B)
+		binary.LittleEndian.PutUint16(buf[4:], 8)
+		binary.LittleEndian.PutUint16(buf[6:], 0)
+		binary.LittleEndian.PutUint64(buf[8:], 16)
+		binary.LittleEndian.PutUint64(buf[16:], 1) // 1 entry
+		// IPTC tag, RATIONAL (sz=8), count = MaxUint64/8+1 → overflow.
+		binary.LittleEndian.PutUint16(buf[24:], 0x83BB)
+		binary.LittleEndian.PutUint16(buf[26:], 5) // RATIONAL
+		binary.LittleEndian.PutUint64(buf[28:], ^uint64(0)/8+1)
+		binary.LittleEndian.PutUint64(buf[36:], 0)
+		f.Add(buf)
+	}
+
+	// Seed 18: BigTIFF LE with IFD0 offset pointing past EOF.
+	// extractBigTIFF must return rawEXIF without panicking.
+	{
+		buf := make([]byte, 16)
+		buf[0], buf[1] = 'I', 'I'
+		binary.LittleEndian.PutUint16(buf[2:], 0x002B)
+		binary.LittleEndian.PutUint16(buf[4:], 8)
+		binary.LittleEndian.PutUint16(buf[6:], 0)
+		binary.LittleEndian.PutUint64(buf[8:], ^uint64(0)) // offset = MaxUint64
+		f.Add(buf)
+	}
+
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic regardless of input.
 		_, _, _, _ = Extract(bytes.NewReader(data))
@@ -169,8 +235,9 @@ func FuzzTIFFInject(f *testing.F) {
 		[]byte("<xmpmeta inject='1'/>"),
 	))
 
-	// Seed 7: BigTIFF LE — exercises the ErrUnsupportedMagic rejection path
-	// (magic 0x002B) inside Inject → buildUpdatedTIFF → exif.Parse.
+	// Seed 7: BigTIFF LE — exercises the BigTIFF parse path in Extract (task #54).
+	// Note: Inject still rejects BigTIFF (write is not supported) because
+	// exif.Parse only handles classic TIFF magic 0x002A.
 	bigTIFFLE := make([]byte, 16)
 	bigTIFFLE[0], bigTIFFLE[1] = 'I', 'I'
 	binary.LittleEndian.PutUint16(bigTIFFLE[2:], 0x002B) // BigTIFF magic

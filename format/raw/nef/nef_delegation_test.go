@@ -10,10 +10,7 @@ package nef
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"testing"
-
-	"github.com/FlavioCFOliveira/GoMetadata/format/tiff"
 )
 
 // buildNEFWithIPTCAndXMP constructs a minimal NEF/TIFF stream (LE or BE) with
@@ -150,8 +147,9 @@ func TestNEFTruncatedBigEndianMidWay(t *testing.T) {
 	}
 }
 
-// TestNEFBigTIFFReturnsError verifies that a BigTIFF input is rejected.
-func TestNEFBigTIFFReturnsError(t *testing.T) {
+// TestNEFBigTIFFSucceeds verifies that a BigTIFF input (magic 0x002B) is now
+// accepted by NEF.Extract (task #54: BigTIFF read support added to tiff.Extract).
+func TestNEFBigTIFFSucceeds(t *testing.T) {
 	t.Parallel()
 	bigTIFF := make([]byte, 16)
 	bigTIFF[0], bigTIFF[1] = 'I', 'I'
@@ -160,11 +158,11 @@ func TestNEFBigTIFFReturnsError(t *testing.T) {
 	binary.LittleEndian.PutUint16(bigTIFF[6:], 0)
 	binary.LittleEndian.PutUint64(bigTIFF[8:], 16)
 
-	_, _, _, err := Extract(bytes.NewReader(bigTIFF))
-	if err == nil {
-		t.Error("Extract BigTIFF: expected error, got nil")
+	rawEXIF, _, _, err := Extract(bytes.NewReader(bigTIFF))
+	if err != nil {
+		t.Errorf("Extract BigTIFF: unexpected error: %v", err)
 	}
-	if !errors.Is(err, tiff.ErrUnsupportedMagic) {
-		t.Errorf("expected errors.Is(err, tiff.ErrUnsupportedMagic); got %v", err)
+	if rawEXIF == nil {
+		t.Error("Extract BigTIFF: rawEXIF is nil")
 	}
 }

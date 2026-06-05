@@ -10,10 +10,7 @@ package dng
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"testing"
-
-	"github.com/FlavioCFOliveira/GoMetadata/format/tiff"
 )
 
 // buildDNGWithIPTCAndXMP constructs a minimal DNG/TIFF stream with IPTC and
@@ -150,8 +147,10 @@ func TestDNGTruncatedMidWay(t *testing.T) {
 	}
 }
 
-// TestDNGBigTIFFReturnsError verifies that a BigTIFF input is rejected.
-func TestDNGBigTIFFReturnsError(t *testing.T) {
+// TestDNGBigTIFFSucceeds verifies that a BigTIFF input (magic 0x002B) is now
+// accepted by DNG.Extract (task #54: BigTIFF read support added to tiff.Extract).
+// DNG BigTIFF is a valid DNG variant; the TIFF path handles both classic and BigTIFF.
+func TestDNGBigTIFFSucceeds(t *testing.T) {
 	t.Parallel()
 	bigTIFF := make([]byte, 16)
 	bigTIFF[0], bigTIFF[1] = 'I', 'I'
@@ -160,11 +159,11 @@ func TestDNGBigTIFFReturnsError(t *testing.T) {
 	binary.LittleEndian.PutUint16(bigTIFF[6:], 0)
 	binary.LittleEndian.PutUint64(bigTIFF[8:], 16)
 
-	_, _, _, err := Extract(bytes.NewReader(bigTIFF))
-	if err == nil {
-		t.Error("Extract BigTIFF: expected error, got nil")
+	rawEXIF, _, _, err := Extract(bytes.NewReader(bigTIFF))
+	if err != nil {
+		t.Errorf("Extract BigTIFF: unexpected error: %v", err)
 	}
-	if !errors.Is(err, tiff.ErrUnsupportedMagic) {
-		t.Errorf("expected errors.Is(err, tiff.ErrUnsupportedMagic); got %v", err)
+	if rawEXIF == nil {
+		t.Error("Extract BigTIFF: rawEXIF is nil")
 	}
 }

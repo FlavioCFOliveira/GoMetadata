@@ -1,15 +1,15 @@
 package tiff
 
-// tiff_hardening_test.go — comprehensive tests for task #48:
-// BigTIFF graceful handling, multi-page IFD chains, DoS guards, SubIFD
-// delegation, truncated-input safety, and CR3 routing confirmation.
+// tiff_hardening_test.go — comprehensive tests for task #48 and task #54:
+// BigTIFF read support, multi-page IFD chains, DoS guards, SubIFD delegation,
+// truncated-input safety, and CR3 routing confirmation.
 //
 // Spec references:
 //   - TIFF 6.0 §2: header layout (bytes 0-7), byte order, magic 0x002A,
 //     IFD chain (next-IFD pointer at end of each IFD), entry count, 12-byte entries.
-//   - BigTIFF spec (Joris Van Damme / Apertura), §2: magic 0x002B, 8-byte offsets,
-//     16-byte header.  The current library does NOT support BigTIFF; it must return
-//     an error without panicking.
+//   - BigTIFF spec (Aware Systems / libtiff) §2: magic 0x002B, 16-byte header,
+//     8-byte IFD offsets, 20-byte IFD entries, 8-byte inline threshold.
+//     BigTIFF is now fully supported (task #54); Extract must succeed.
 //   - TIFF 6.0 §7: IFD entries sorted by tag ascending; next-IFD pointer = 0 ends chain.
 
 import (
@@ -226,34 +226,42 @@ func buildTIFFWithSubIFD(iptcData, xmpInSubIFD []byte) []byte {
 // Functional tests: F
 // --------------------------------------------------------------------------
 
-// TestExtractBigTIFFLEReturnsError verifies that a BigTIFF file (magic 0x002B,
-// LE) causes Extract to return an error without panicking.
+// TestExtractBigTIFFLESucceeds verifies that a minimal BigTIFF LE file
+// (magic 0x002B) parses without error and returns non-nil rawEXIF.
 //
-// BigTIFF spec §2: magic value 0x002B distinguishes BigTIFF from classic TIFF
-// (0x002A). The current library does not implement BigTIFF; it must fail
-// gracefully rather than silently misparse or panic.
-func TestExtractBigTIFFLEReturnsError(t *testing.T) {
+// BigTIFF spec §2: magic 0x002B, 16-byte header, 8-byte IFD offset.
+// Task #54: BigTIFF read is now fully supported.
+func TestExtractBigTIFFLESucceeds(t *testing.T) {
 	t.Parallel()
 	data := buildBigTIFFLE()
-	_, _, _, err := Extract(bytes.NewReader(data))
-	if err == nil {
-		t.Error("Extract BigTIFF LE: expected error (BigTIFF not supported), got nil")
+	rawEXIF, _, _, err := Extract(bytes.NewReader(data))
+	if err != nil {
+		t.Errorf("Extract BigTIFF LE: unexpected error: %v", err)
+	}
+	if rawEXIF == nil {
+		t.Error("Extract BigTIFF LE: rawEXIF is nil")
 	}
 }
 
-// TestExtractBigTIFFBEReturnsError verifies that a BigTIFF file (magic 0x002B,
-// BE) also returns an error without panicking.
-func TestExtractBigTIFFBEReturnsError(t *testing.T) {
+// TestExtractBigTIFFBESucceeds verifies that a minimal BigTIFF BE file
+// (magic 0x002B, big-endian "MM") parses without error and returns non-nil rawEXIF.
+//
+// BigTIFF spec §2: magic 0x002B, byte order "MM" for big-endian.
+// Task #54: BigTIFF read is now fully supported.
+func TestExtractBigTIFFBESucceeds(t *testing.T) {
 	t.Parallel()
 	buf := make([]byte, 16)
 	buf[0], buf[1] = 'M', 'M'
 	binary.BigEndian.PutUint16(buf[2:], 0x002B) // BigTIFF magic BE
-	binary.BigEndian.PutUint16(buf[4:], 8)
-	binary.BigEndian.PutUint16(buf[6:], 0)
-	binary.BigEndian.PutUint64(buf[8:], 16)
-	_, _, _, err := Extract(bytes.NewReader(buf))
-	if err == nil {
-		t.Error("Extract BigTIFF BE: expected error (BigTIFF not supported), got nil")
+	binary.BigEndian.PutUint16(buf[4:], 8)      // offset bytesize = 8
+	binary.BigEndian.PutUint16(buf[6:], 0)      // constant = 0
+	binary.BigEndian.PutUint64(buf[8:], 16)     // IFD0 offset (points past buf)
+	rawEXIF, _, _, err := Extract(bytes.NewReader(buf))
+	if err != nil {
+		t.Errorf("Extract BigTIFF BE: unexpected error: %v", err)
+	}
+	if rawEXIF == nil {
+		t.Error("Extract BigTIFF BE: rawEXIF is nil")
 	}
 }
 
