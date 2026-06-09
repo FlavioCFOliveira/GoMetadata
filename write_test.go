@@ -1706,3 +1706,272 @@ func TestWriteRW2FromCorpus(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Gate tests for audit findings #108, #109, #139
+// ---------------------------------------------------------------------------
+
+// TestWrite_CrossFormatMismatchRejected is the gate for finding #108.
+//
+// Write must return ErrFormatMismatch (and write nothing) when:
+//   - the *Metadata was sourced from a TIFF-based container (A), and
+//   - the io.ReadSeeker carries a DIFFERENT TIFF-based container (B).
+//
+// The guard is scoped to TIFF-based targets because those write paths
+// (writeTIFF, writeTIFFNEF, writeTIFFARW, etc.) use m.rawEXIF as the binary
+// relocation base for all image-data blocks. Sourcing it from format A while
+// writing to format B silently discards all image data of the format-B file.
+//
+// Non-TIFF cross-format writes (e.g. JPEG→PNG, JPEG→WebP) are legitimate and
+// must continue to work: those paths re-encode metadata from scratch via
+// encodeMetadata/injectByFormat and never use m.rawEXIF as a relocation base.
+//
+// Positive controls:
+//   - Same-format TIFF→TIFF must succeed.
+//   - JPEG→PNG cross-format must still succeed (not blocked by the guard).
+func TestWrite_CrossFormatMismatchRejected(t *testing.T) {
+	t.Parallel()
+
+	// --- Negative case: read a JPEG, write against a TIFF reader ---------------
+	// The dangerous cross-format write: JPEG metadata (m.rawEXIF from JPEG) used
+	// as the relocation base for a TIFF-family write would discard the TIFF image.
+	jpegData := buildMinimalJPEG(minimalTIFFPayload())
+	mJPEG, err := Read(bytes.NewReader(jpegData))
+	if err != nil {
+		t.Fatalf("Read JPEG: %v", err)
+	}
+	mJPEG.SetCopyright("x")
+
+	tiffData := minimalTIFFPayload()
+	var out bytes.Buffer
+	writeErr := Write(bytes.NewReader(tiffData), &out, mJPEG)
+	if writeErr == nil {
+		t.Fatal("#108 gate FAIL: Write(TIFF reader, JPEG metadata) returned nil error — cross-format mismatch not detected")
+	}
+	if !errors.Is(writeErr, ErrFormatMismatch) {
+		t.Errorf("#108 gate FAIL: got error %v (%T), want errors.Is(err, ErrFormatMismatch)", writeErr, writeErr)
+	}
+	if out.Len() != 0 {
+		t.Errorf("#108 gate FAIL: Write wrote %d bytes despite returning ErrFormatMismatch; expected 0", out.Len())
+	}
+
+	// --- Positive control A: same-format TIFF→TIFF must still succeed ----------
+	mTIFF, err2 := Read(bytes.NewReader(tiffData))
+	if err2 != nil {
+		t.Fatalf("Read TIFF (positive control A): %v", err2)
+	}
+	const wantCopyright = "© 2026 #108 gate"
+	mTIFF.SetCopyright(wantCopyright)
+
+	var outTIFF bytes.Buffer
+	if writeErr2 := Write(bytes.NewReader(tiffData), &outTIFF, mTIFF); writeErr2 != nil {
+		t.Fatalf("#108 positive control A: same-format TIFF→TIFF Write returned error: %v", writeErr2)
+	}
+	if outTIFF.Len() == 0 {
+		t.Fatal("#108 positive control A: TIFF→TIFF Write produced no output")
+	}
+	m2, readErr := Read(bytes.NewReader(outTIFF.Bytes()))
+	if readErr != nil {
+		t.Fatalf("#108 positive control A: Read after Write: %v", readErr)
+	}
+	if got := m2.Copyright(); got != wantCopyright {
+		t.Errorf("#108 positive control A: Copyright round-trip: got %q, want %q", got, wantCopyright)
+	}
+
+	// --- Positive control B: JPEG→PNG must NOT be blocked by the guard ---------
+	// Cross-format transcoding (JPEG metadata → PNG container) is a legitimate
+	// use-case: png.Inject re-encodes from scratch and never touches m.rawEXIF.
+	mJPEG2, err3 := Read(bytes.NewReader(jpegData))
+	if err3 != nil {
+		t.Fatalf("Read JPEG (positive control B): %v", err3)
+	}
+	pngData := buildMinimalPNG()
+	var outPNG bytes.Buffer
+	if writeErr3 := Write(bytes.NewReader(pngData), &outPNG, mJPEG2); writeErr3 != nil {
+		t.Fatalf("#108 positive control B: JPEG→PNG cross-format Write returned unexpected error: %v", writeErr3)
+	}
+	if outPNG.Len() == 0 {
+		t.Fatal("#108 positive control B: JPEG→PNG cross-format Write produced no output")
+	}
+}
+
+// TestWriteTwicePreservesMetadata is the gate for finding #109.
+//
+// Writing the same *Metadata twice must produce byte-identical output both
+// times: IFD0 entry count, thumbnail bytes, and ImageDataHash must all match.
+//
+// Before the fix, the second Write on a TIFF *Metadata would fail with
+// ErrBlockOutOfBounds or silently produce wrong output because
+// relocateTIFFFromParsed permanently mutated m.EXIF (removed strip/tile entries,
+// cleared ThumbnailData, appended IPTC/XMP entries without deduplication).
+func TestWriteTwicePreservesMetadata(t *testing.T) {
+	t.Parallel()
+
+	type subcase struct {
+		name      string
+		buildData func() []byte
+	}
+
+	subcases := []subcase{
+		{
+			// Plain TIFF with a strip — exercises the writeTIFF path.
+			name: "TIFF",
+			buildData: func() []byte {
+				strip := []byte("WRITE-TWICE-STRIP-DATA-GUARD-109!")
+				return buildTIFFWithStrip(binary.LittleEndian, false, strip, false)
+			},
+		},
+		{
+			// NEF-like (big-endian TIFF) — exercises the writeTIFFNEF path.
+			name: "NEF",
+			buildData: func() []byte {
+				strip := []byte("WRITE-TWICE-NEF-STRIP-DATA-GUARD!")
+				return buildTIFFWithStrip(binary.BigEndian, true, strip, false)
+			},
+		},
+		{
+			// ARW-like synthetic (TIFF LE + SONY make tag) — exercises writeTIFFARW.
+			// We patch bytes [0:4] to standard TIFF and set Make=SONY so that
+			// format.Detect returns FormatARW (format/detect.go mapMakeToFormat).
+			name: "ARW",
+			buildData: func() []byte {
+				stripData := []byte("WRITE-TWICE-ARW-STRIP-DATA-109!")
+				previewData := make([]byte, 64)
+				previewData[0], previewData[1] = 0xFF, 0xD8
+				return buildARWWithIFD0Preview(previewData, stripData)
+			},
+		},
+	}
+
+	for _, tc := range subcases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			data := tc.buildData()
+
+			m, err := Read(bytes.NewReader(data))
+			if err != nil {
+				t.Fatalf("Read %s: %v", tc.name, err)
+			}
+			m.SetCopyright("© 2026 twice-" + tc.name)
+
+			// Record the IFD0 entry count before any Write so we can detect mutations.
+			var entryCountBefore int
+			if m.EXIF != nil && m.EXIF.IFD0 != nil {
+				entryCountBefore = len(m.EXIF.IFD0.Entries)
+			}
+			// Record ThumbnailData before any Write.
+			var thumbBefore []byte
+			if m.EXIF != nil && m.EXIF.IFD0 != nil && m.EXIF.IFD0.ThumbnailData != nil {
+				thumbBefore = bytes.Clone(m.EXIF.IFD0.ThumbnailData)
+			}
+
+			// First Write.
+			var out1 bytes.Buffer
+			if err := Write(bytes.NewReader(data), &out1, m); err != nil {
+				t.Fatalf("%s Write #1: %v", tc.name, err)
+			}
+
+			// Verify m.EXIF.IFD0 was NOT mutated by Write #1.
+			if m.EXIF != nil && m.EXIF.IFD0 != nil {
+				if got := len(m.EXIF.IFD0.Entries); got != entryCountBefore {
+					t.Errorf("%s #109: IFD0 entry count changed after Write #1: %d → %d (mutation!)",
+						tc.name, entryCountBefore, got)
+				}
+				if thumbBefore != nil && m.EXIF.IFD0.ThumbnailData == nil {
+					t.Errorf("%s #109: IFD0.ThumbnailData was non-nil before Write #1 but is nil after (mutation!)", tc.name)
+				}
+			}
+
+			// Second Write — same *Metadata, same reader.
+			var out2 bytes.Buffer
+			if err := Write(bytes.NewReader(data), &out2, m); err != nil {
+				t.Fatalf("%s Write #2: %v", tc.name, err)
+			}
+
+			// Both outputs must be byte-identical.
+			b1, b2 := out1.Bytes(), out2.Bytes()
+			if len(b1) != len(b2) {
+				t.Errorf("%s #109: output sizes differ: Write#1=%d Write#2=%d", tc.name, len(b1), len(b2))
+			} else if !bytes.Equal(b1, b2) {
+				// Find first differing byte for diagnostics.
+				for i := range b1 {
+					if b1[i] != b2[i] {
+						t.Errorf("%s #109: outputs differ at byte %d: Write#1[%d]=0x%02x Write#2[%d]=0x%02x",
+							tc.name, i, i, b1[i], i, b2[i])
+						break
+					}
+				}
+			}
+
+			// IFD0 entry count must be unchanged after both writes.
+			if m.EXIF != nil && m.EXIF.IFD0 != nil {
+				if got := len(m.EXIF.IFD0.Entries); got != entryCountBefore {
+					t.Errorf("%s #109: IFD0 entry count changed after both Writes: %d → %d", tc.name, entryCountBefore, got)
+				}
+			}
+		})
+	}
+}
+
+// TestRawEXIFIsIndependent is the gate for finding #139.
+//
+// Mutating the slice returned by RawEXIF() must not affect parsed IFD0 values
+// or the image-data output of a subsequent Write call.
+//
+// Before the fix, RawEXIF() returned the internal m.rawEXIF slice directly.
+// For TIFF-based formats, that slice shares its backing array with every
+// parsed IFDEntry.Value (zero-copy parse), so a mutation corrupted all parsed
+// tags simultaneously and also corrupted the relocation base for Write.
+func TestRawEXIFIsIndependent(t *testing.T) {
+	t.Parallel()
+
+	tiffData := buildTIFFWithStrip(binary.LittleEndian, false,
+		[]byte("RAWEXIF-INDEPENDENT-STRIP-DATA!"), false)
+
+	m, err := Read(bytes.NewReader(tiffData))
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+
+	// Capture a baseline: Write #1 before any mutation.
+	var baseline bytes.Buffer
+	if writeErr := Write(bytes.NewReader(tiffData), &baseline, m); writeErr != nil {
+		t.Fatalf("Write baseline: %v", writeErr)
+	}
+	baselineBytes := baseline.Bytes()
+
+	// Capture IFD0 values before mutation for comparison.
+	var ifd0EntryCountBefore int
+	if m.EXIF != nil && m.EXIF.IFD0 != nil {
+		ifd0EntryCountBefore = len(m.EXIF.IFD0.Entries)
+	}
+
+	// Obtain raw and corrupt every byte.
+	raw := m.RawEXIF()
+	if len(raw) == 0 {
+		t.Skip("RawEXIF() returned empty slice — nothing to mutate")
+	}
+	for i := range raw {
+		raw[i] ^= 0xFF
+	}
+
+	// After mutation: IFD0 entry count must be unchanged (internal state not affected).
+	if m.EXIF != nil && m.EXIF.IFD0 != nil {
+		if got := len(m.EXIF.IFD0.Entries); got != ifd0EntryCountBefore {
+			t.Errorf("#139 FAIL: IFD0 entry count changed after RawEXIF() mutation: %d → %d", ifd0EntryCountBefore, got)
+		}
+	}
+
+	// Write #2 after mutation must produce the same output as Write #1.
+	var afterMutation bytes.Buffer
+	if writeErr := Write(bytes.NewReader(tiffData), &afterMutation, m); writeErr != nil {
+		t.Fatalf("#139 Write after RawEXIF mutation: %v", writeErr)
+	}
+	afterBytes := afterMutation.Bytes()
+
+	if !bytes.Equal(baselineBytes, afterBytes) {
+		t.Errorf("#139 FAIL: Write output differs after RawEXIF() mutation\n  baseline  len=%d\n  after-mut len=%d",
+			len(baselineBytes), len(afterBytes))
+	}
+}

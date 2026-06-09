@@ -42,6 +42,19 @@ func (e *UnsupportedFormatError) Error() string {
 // Use errors.Is(err, ErrWriteNotSupported) to detect this condition.
 var ErrWriteNotSupported = errors.New("writing metadata into this container is not yet supported")
 
+// ErrFormatMismatch is returned by Write when the Metadata value was read from
+// a container of a different format than the one detected from r.
+//
+// Example: reading a JPEG into m and then calling Write(tiffReader, w, m)
+// would mix JPEG-origin metadata (including rawEXIF sourced from the JPEG) with
+// a TIFF image body, silently discarding the TIFF's image data.
+//
+// When m.Format() is FormatUnknown the check is skipped; a dedicated task
+// handles that case separately.
+//
+// Use errors.Is(err, ErrFormatMismatch) to detect this condition.
+var ErrFormatMismatch = errors.New("gometadata: metadata was read from a different container format than the write target")
+
 // TruncatedFileError is returned when the input ends unexpectedly before a
 // required structure could be read.
 // Alias of internal/metaerr.TruncatedFileError; all sub-packages use the same type.

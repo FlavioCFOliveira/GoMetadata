@@ -1,6 +1,7 @@
 package gometadata
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -76,6 +77,33 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	}
 	if fmtID == format.FormatUnknown {
 		return &UnsupportedFormatError{}
+	}
+
+	// Guard: reject cross-format writes when the write target is a TIFF-based
+	// container and m was sourced from a different format.
+	//
+	// #108: the TIFF-family write paths (writeTIFF, writeTIFFNEF, writeTIFFARW,
+	// writeTIFFCR2, writeTIFFORF, writeTIFFRW2) use m.rawEXIF as the relocation
+	// base — the source of all image-data blocks. When m was read from a JPEG,
+	// m.rawEXIF holds the JPEG EXIF blob (typically ~KBs); using it as the base
+	// for a TIFF write silently discards the TIFF's image data and produces a
+	// corrupt output indistinguishable from a valid write (err==nil).
+	//
+	// Non-TIFF targets (JPEG, PNG, WebP, HEIF/AVIF, CR3) are safe: their inject
+	// paths re-encode metadata from scratch via encodeMetadata and never use
+	// m.rawEXIF as a binary relocation base. Cross-format transcoding from (e.g.)
+	// a JPEG source to PNG/WebP is a legitimate use-case and is preserved.
+	//
+	// FormatUnknown is excluded: m may have been constructed via NewMetadata or
+	// assembled without reading an existing file.
+	//
+	// Note: this guard fires before any I/O on w is attempted, so no partial
+	// output is ever written to the caller's io.Writer.
+	if isTIFFBasedFormat(fmtID) {
+		if mFmt := format.FormatID(m.format); mFmt != format.FormatUnknown && mFmt != fmtID {
+			return fmt.Errorf("gometadata: cannot write %s metadata into a %s container: %w",
+				mFmt, fmtID, ErrFormatMismatch)
+		}
 	}
 
 	// All TIFF-based containers use dedicated write paths that keep the ORIGINAL
@@ -238,9 +266,13 @@ func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclo
 	// Obtain the original TIFF bytes. tiff.Extract (called during Read) stores
 	// the entire TIFF stream in m.rawEXIF; use it when available to avoid a
 	// second full-file read.
+	//
+	// #139: use a defensive copy of m.rawEXIF so that caller mutations of the
+	// slice returned by RawEXIF() do not affect the relocation base. This is
+	// consistent with writeTIFFORF/writeTIFFRW2 which already copy m.rawEXIF.
 	var originalBytes []byte
 	if m.rawEXIF != nil {
-		originalBytes = m.rawEXIF
+		originalBytes = bytes.Clone(m.rawEXIF)
 	} else {
 		if _, err := r.Seek(0, io.SeekStart); err != nil {
 			return fmt.Errorf("gometadata: tiff seek: %w", err)
@@ -277,7 +309,14 @@ func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclo
 	// the original bytes as the image-data source and m.EXIF as the IFD model.
 	// m.EXIF may be nil (no EXIF modifications); InjectWithEXIF falls back to
 	// parsing originalBytes in that case, same behaviour as Inject.
-	if err := tiff.InjectWithEXIF(originalBytes, m.EXIF, rawIPTC, rawXMP, w); err != nil {
+	//
+	// #109: pass a deep clone of m.EXIF so that relocateTIFFFromParsed's
+	// structural mutations (ThumbnailData clear, Entries slice rewrite for
+	// strip/tile placeholders, IPTC/XMP upsert) do not permanently alter the
+	// caller's *Metadata.  A second Write call on the same *Metadata would
+	// otherwise see a corrupted IFD0 (missing strip offsets, cleared thumbnail,
+	// altered entry count) and produce wrong output or an ErrBlockOutOfBounds.
+	if err := tiff.InjectWithEXIF(originalBytes, cloneEXIF(m.EXIF), rawIPTC, rawXMP, w); err != nil {
 		return fmt.Errorf("gometadata: %w", err)
 	}
 	return nil
@@ -296,9 +335,10 @@ func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclo
 // containers.md §8(e): "CR2: preserve CR 02 00 at offset 8."
 // Validated against real Canon EOS 350D/70D/7D corpus files.
 func writeTIFFCR2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // mirrors writeTIFF; CR2-specific marker-restore call; splitting reduces clarity
+	// #139: defensive copy of m.rawEXIF (consistent with writeTIFF, writeTIFFORF, writeTIFFRW2).
 	var originalBytes []byte
 	if m.rawEXIF != nil {
-		originalBytes = m.rawEXIF
+		originalBytes = bytes.Clone(m.rawEXIF)
 	} else {
 		if _, err := r.Seek(0, io.SeekStart); err != nil {
 			return fmt.Errorf("gometadata: cr2 seek: %w", err)
@@ -326,7 +366,8 @@ func writeTIFFCR2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 		return nil
 	}
 
-	if err := tiff.InjectWithEXIFCR2(originalBytes, m.EXIF, rawIPTC, rawXMP, w); err != nil {
+	// #109: pass a deep clone of m.EXIF (see writeTIFF for rationale).
+	if err := tiff.InjectWithEXIFCR2(originalBytes, cloneEXIF(m.EXIF), rawIPTC, rawXMP, w); err != nil {
 		return fmt.Errorf("gometadata: %w", err)
 	}
 	return nil
@@ -354,9 +395,10 @@ func writeTIFFCR2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 // Validated against real.arw (Sony DSLR-A500, 13 MB): ImageDataHash IN==OUT,
 // all metadata including 52 MakerNote tags and SR2Private block preserved.
 func writeTIFFARW(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // conditional logic mirrors writeTIFF; splitting reduces clarity
+	// #139: defensive copy of m.rawEXIF (consistent with writeTIFF, writeTIFFORF, writeTIFFRW2).
 	var originalBytes []byte
 	if m.rawEXIF != nil {
-		originalBytes = m.rawEXIF
+		originalBytes = bytes.Clone(m.rawEXIF)
 	} else {
 		if _, err := r.Seek(0, io.SeekStart); err != nil {
 			return fmt.Errorf("gometadata: arw seek: %w", err)
@@ -384,7 +426,8 @@ func writeTIFFARW(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 		return nil
 	}
 
-	if err := tiff.InjectWithEXIFARW(originalBytes, m.EXIF, rawIPTC, rawXMP, w); err != nil {
+	// #109: pass a deep clone of m.EXIF (see writeTIFF for rationale).
+	if err := tiff.InjectWithEXIFARW(originalBytes, cloneEXIF(m.EXIF), rawIPTC, rawXMP, w); err != nil {
 		return fmt.Errorf("gometadata: %w", err)
 	}
 	return nil
@@ -640,6 +683,89 @@ func wrapInject(err error) error {
 	return nil
 }
 
+// isTIFFBasedFormat reports whether fmtID is a TIFF-based container format.
+//
+// TIFF-based formats route through writeTIFF / writeTIFFNEF / writeTIFFARW /
+// writeTIFFCR2 / writeTIFFORF / writeTIFFRW2, all of which use m.rawEXIF as
+// the relocation base (the byte source for image-data blocks).  Non-TIFF
+// formats use encodeMetadata + injectByFormat, which re-encode metadata from
+// scratch and never touch m.rawEXIF.
+func isTIFFBasedFormat(f format.FormatID) bool {
+	switch f { //nolint:exhaustive // deliberate membership test; all other FormatIDs are non-TIFF
+	case format.FormatTIFF, format.FormatDNG, format.FormatCR2,
+		format.FormatNEF, format.FormatARW, format.FormatORF, format.FormatRW2:
+		return true
+	}
+	return false
+}
+
+// cloneEXIF returns a deep clone of e that is safe to pass to relocateTIFFFromParsed
+// (and its NEF/ARW/CR2 variants) without mutating the caller's *Metadata.
+//
+// #109: relocateTIFFFromParsed permanently mutates the *exif.EXIF it receives:
+//   - e.IFD0.ThumbnailData is set to nil (step 2.5).
+//   - e.IFD0.Entries (and entries in other IFDs) are modified by
+//     removeImageOffsetEntries (in-place slice trimming) and
+//     insertPlaceholders/upsertIFDEntryWithCount (in-place append).
+//   - upsertIFD0Entry appends IPTC/XMP entries to e.IFD0.Entries.
+//
+// A second Write call on the same *Metadata after an un-cloned first Write
+// would see a corrupted IFD0 (strip offsets removed, ThumbnailData nil, IPTC
+// entry duplicated) and fail with ErrBlockOutOfBounds or produce wrong output.
+//
+// Clone strategy:
+//   - Each IFD's Entries slice is copied into a new slice so that appends and
+//     removals performed by the relocator do not affect the original.
+//   - IFDEntry.Value byte slices are NOT copied: the relocator never mutates
+//     value bytes in-place; it only replaces whole Entries elements.
+//   - ThumbnailData is copied (bytes.Clone) so the nil assignment in step 2.5
+//     does not clear the original IFD's cached thumbnail.
+//   - The IFD chain (IFD.Next) is cloned recursively because removeImageOffsetEntries
+//     can reach any IFD in the chain via enumerateImageBlocks.
+//   - EXIF sub-IFDs (ExifIFD, GPSIFD, InteropIFD, MakerNoteIFD) are cloned
+//     because upsertIFDEntryWithCount is called on IFDs owned by mainBlocks,
+//     which may include the EXIF sub-IFD chain.
+//   - MakerNote bytes are NOT copied: verbatim-copy semantics are unchanged
+//     (the blob is never mutated, only its IFD-offset entry is rewritten).
+//
+// nil input → nil output (safe for callers that pass m.EXIF when m.EXIF is nil).
+func cloneEXIF(e *exif.EXIF) *exif.EXIF {
+	if e == nil {
+		return nil
+	}
+	out := &exif.EXIF{
+		ByteOrder:       e.ByteOrder,
+		IFD0:            cloneIFD(e.IFD0),
+		ExifIFD:         cloneIFD(e.ExifIFD),
+		GPSIFD:          cloneIFD(e.GPSIFD),
+		InteropIFD:      cloneIFD(e.InteropIFD),
+		MakerNote:       e.MakerNote, // verbatim share — never mutated in-place
+		MakerNoteIFD:    cloneIFD(e.MakerNoteIFD),
+		MakerNoteOffset: e.MakerNoteOffset,
+	}
+	return out
+}
+
+// cloneIFD returns a shallow-entry-slice clone of ifd: a new *IFD value whose
+// Entries slice is an independent copy (so appends/removes don't affect src),
+// and whose ThumbnailData is a defensive copy (so the nil-clear in step 2.5 of
+// relocateTIFFFromParsed does not clear the original's cached thumbnail bytes).
+//
+// The Next chain is cloned recursively. IFDEntry.Value byte slices are shared
+// (not copied) because the relocator never mutates value bytes in-place.
+func cloneIFD(ifd *exif.IFD) *exif.IFD {
+	if ifd == nil {
+		return nil
+	}
+	entries := make([]exif.IFDEntry, len(ifd.Entries))
+	copy(entries, ifd.Entries)
+	return &exif.IFD{
+		Entries:       entries,
+		Next:          cloneIFD(ifd.Next),
+		ThumbnailData: bytes.Clone(ifd.ThumbnailData),
+	}
+}
+
 // writeTIFFNEF handles metadata injection for Nikon NEF files.
 //
 // NEF is TIFF-based (MM\0* big-endian magic) but requires Nikon-specific
@@ -659,9 +785,10 @@ func wrapInject(err error) error {
 // Validated against real.nef (Nikon D70): ImageDataHash IN==OUT, all metadata
 // including PreviewIFD and NikonScanIFD preserved, file size unchanged.
 func writeTIFFNEF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // conditional logic mirrors writeTIFF; splitting reduces clarity
+	// #139: defensive copy of m.rawEXIF (consistent with writeTIFF, writeTIFFORF, writeTIFFRW2).
 	var originalBytes []byte
 	if m.rawEXIF != nil {
-		originalBytes = m.rawEXIF
+		originalBytes = bytes.Clone(m.rawEXIF)
 	} else {
 		if _, err := r.Seek(0, io.SeekStart); err != nil {
 			return fmt.Errorf("gometadata: nef seek: %w", err)
@@ -689,7 +816,8 @@ func writeTIFFNEF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 		return nil
 	}
 
-	if err := tiff.InjectWithEXIFNEF(originalBytes, m.EXIF, rawIPTC, rawXMP, w); err != nil {
+	// #109: pass a deep clone of m.EXIF (see writeTIFF for rationale).
+	if err := tiff.InjectWithEXIFNEF(originalBytes, cloneEXIF(m.EXIF), rawIPTC, rawXMP, w); err != nil {
 		return fmt.Errorf("gometadata: %w", err)
 	}
 	return nil

@@ -1,6 +1,7 @@
 package gometadata
 
 import (
+	"bytes"
 	"encoding/binary"
 	"time"
 
@@ -80,16 +81,26 @@ type Metadata struct {
 // Format returns the detected container format ID of the image.
 func (m *Metadata) Format() format.FormatID { return format.FormatID(m.format) }
 
-// RawEXIF returns the raw EXIF segment bytes as read from the container.
-func (m *Metadata) RawEXIF() []byte { return m.rawEXIF }
+// RawEXIF returns a copy of the raw EXIF segment bytes as read from the container.
+//
+// #139: returns bytes.Clone(m.rawEXIF) so that caller mutations of the returned
+// slice cannot corrupt the internal relocation base used by subsequent Write calls.
+// The raw EXIF bytes in TIFF-based formats share their backing array with every
+// parsed IFDEntry.Value; an in-place mutation by the caller would silently corrupt
+// all parsed EXIF values AND the image-data source used during write relocation.
+func (m *Metadata) RawEXIF() []byte { return bytes.Clone(m.rawEXIF) }
 
-// RawIPTC returns the raw IPTC IIM segment bytes as read from the container.
-func (m *Metadata) RawIPTC() []byte { return m.rawIPTC }
+// RawIPTC returns a copy of the raw IPTC IIM segment bytes as read from the container.
+//
+// #139: returns bytes.Clone(m.rawIPTC) for the same defensive-copy rationale as RawEXIF.
+func (m *Metadata) RawIPTC() []byte { return bytes.Clone(m.rawIPTC) }
 
-// RawXMP returns the raw XMP packet bytes as read from the container.
+// RawXMP returns a copy of the raw XMP packet bytes as read from the container.
 // When the image carried extended XMP, RawXMP returns the fully reassembled
 // (merged) packet so callers always receive a single, self-contained document.
-func (m *Metadata) RawXMP() []byte { return m.rawXMP }
+//
+// #139: returns bytes.Clone(m.rawXMP) for the same defensive-copy rationale as RawEXIF.
+func (m *Metadata) RawXMP() []byte { return bytes.Clone(m.rawXMP) }
 
 // iptcTrustElevated reports whether IPTC should take read priority over XMP
 // for fields where both are present and carry different values.
