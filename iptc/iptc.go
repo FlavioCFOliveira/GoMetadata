@@ -108,6 +108,15 @@ func storeDataset(i *IPTC, record, dataset uint8, value []byte, utf8 *bool, coun
 		*utf8 = isUTF8Declaration(value)
 		return true
 	}
+	// Record-version datasets (1:00, 2:00) are structural markers that IIM §1.6.1
+	// and §2.2.1 mandate as the first dataset in their respective records. They
+	// carry a uint16 version number (= 4 for IIM 4.x) and carry no application
+	// data. We do not store them in Records[] so that callers indexing Records[2]
+	// by position see only application datasets (Caption, Copyright, Keywords…).
+	// Encode re-emits them automatically (IIM-REC-01/IIM-REC-02, task #153).
+	if dataset == 0 && (record == 1 || record == 2) {
+		return true
+	}
 	// Cap total Dataset struct allocations to bound per-struct memory overhead.
 	// Each zero-length dataset (5 bytes on wire) allocates ~67 bytes in memory:
 	// 13× amplification that the byte-aggregate cap (maxIPTCTotalBytes) misses
@@ -290,7 +299,7 @@ var encBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }} //nolin
 // misinterpret multi-byte UTF-8 sequences (mojibake). The injected declaration
 // also updates the internal UTF-8 flag so that an immediate Parse of the result
 // returns the correct strings (round-trip correctness).
-func Encode(i *IPTC) ([]byte, error) {
+func Encode(i *IPTC) ([]byte, error) { //nolint:gocyclo,cyclop // complexity is inherent: UTF-8 auto-declaration, record-version injection, extended-length encoding all require distinct branches
 	buf := encBufPool.Get().(*bytes.Buffer) //nolint:forcetypeassert,revive // encBufPool.New always stores *bytes.Buffer; pool invariant
 	buf.Reset()
 
@@ -302,6 +311,13 @@ func Encode(i *IPTC) ([]byte, error) {
 	// *IPTC (no declaration) must produce a stream that round-trips correctly.
 	emitUTF8Decl := i.isUTF8() || i.needsUTF8Declaration()
 	if emitUTF8Decl {
+		// IIM-REC-01 / IIM §1.6.1: when Record 1 is present, 1:00
+		// EnvelopeRecordVersion MUST be the first dataset, value = uint16 BE 4.
+		// We emit 1:90 (CodedCharacterSet) which is the only Record-1 dataset
+		// this library writes. 1:00 must precede it in the stream.
+		// Emit it unconditionally here to satisfy IIM-REC-01 whenever R1 is written.
+		buf.Write([]byte{0x1C, 0x01, 0x00, 0x00, 0x02, 0x00, 0x04})
+
 		// Record 1, Dataset 90: coded character set = UTF-8 (ESC % G).
 		// IIM §1.5.1: ESC % G (0x1B 0x25 0x47) is the ISO 2022 designation for UTF-8.
 		//
@@ -320,7 +336,36 @@ func Encode(i *IPTC) ([]byte, error) {
 
 	// Write records in order for deterministic output.
 	for record := uint8(1); record <= 9; record++ {
-		for _, ds := range i.Records[record] {
+		datasets := i.Records[record]
+		if len(datasets) == 0 {
+			continue
+		}
+
+		// IIM-REC-02 / IIM §2.2.1: when Record 2 is present, 2:00
+		// ApplicationRecordVersion MUST be the first dataset, value = uint16 BE 4.
+		// Emit it automatically unless the caller already stored a 2:00 entry.
+		// Same logic applies to Record 1 (IIM-REC-01 / IIM §1.6.1): 1:00 must be
+		// present when Record 1 is emitted; however Record 1 is only written when
+		// the user explicitly stored datasets there, and the 1:90 declaration above
+		// already covers the most common Record-1 case. Emit 1:00 here for
+		// completeness whenever Record 1 datasets are present.
+		if record == 1 || record == 2 {
+			// Check whether a version dataset (ds number 0) is already present.
+			hasVersion := false
+			for idx := range datasets {
+				if datasets[idx].DataSet == 0 {
+					hasVersion = true
+					break
+				}
+			}
+			if !hasVersion {
+				// Emit the mandatory record-version dataset first.
+				// IIM §2.2.1 (Record 2) / §1.6.1 (Record 1): value = big-endian uint16 = 4.
+				buf.Write([]byte{0x1C, record, 0x00, 0x00, 0x02, 0x00, 0x04})
+			}
+		}
+
+		for _, ds := range datasets {
 			buf.WriteByte(0x1C)
 			buf.WriteByte(ds.Record)
 			buf.WriteByte(ds.DataSet)

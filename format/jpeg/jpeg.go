@@ -319,7 +319,10 @@ func readSOI(soi []byte) error {
 // SOS/EOI or read failure, collecting EXIF, IPTC, XMP, and extended-XMP
 // payloads. It returns the reassembled XMP (for callers) and a wire-frame
 // encoding (for lossless passthrough writes when extended XMP is present).
-func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte) (rawEXIF, rawIPTC []byte, xmp xmpResult) {
+//
+// iptcDigest is a 16-byte MD5 slice when the IRB contained a 0x0425 resource,
+// or nil when absent. MWG §3.3.1.
+func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte) (rawEXIF, rawIPTC, iptcDigest []byte, xmp xmpResult) {
 	// extended collects chunks from extended XMP APP1 segments, keyed by GUID.
 	// Adobe XMP Specification Part 3 §1.1.4.
 	// Lazily initialised: most JPEGs do not contain extended XMP, so we avoid
@@ -331,6 +334,17 @@ func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte) (rawEXIF, raw
 	var extSizes map[string]uint64
 	var extTruncated bool
 	var mainXMP []byte
+
+	// IRB-APP13-09 / ROBUST-15 (iptc.md §2.4, §5): multiple APP13 "Photoshop 3.0"
+	// segments must be concatenated, not overwritten. The spec states that when a
+	// JPEG carries more than one APP13 segment all Photoshop payloads are
+	// concatenated in order to form a single logical IRB. This allows IPTC data
+	// split across segments (e.g. by legacy tools that split large APP13 payloads
+	// at the 65533-byte limit) to be discovered correctly.
+	//
+	// We accumulate raw Photoshop payloads here; the 0x0404 IRB search runs once
+	// over the concatenated bytes after all segments have been collected.
+	var app13Payloads [][]byte
 
 	for {
 		marker, data, rerr := readSegment(r, scratchPtr)
@@ -346,18 +360,104 @@ func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte) (rawEXIF, raw
 				data, rawEXIF, mainXMP, extended, extSizes, extTruncated,
 			)
 		case markerAPP13:
-			if iptc := processAPP13Segment(data); iptc != nil {
-				rawIPTC = iptc
+			// Accumulate each Photoshop APP13 payload (after stripping the header);
+			// do NOT search for IPTC yet — the 0x0404 block might be in a later
+			// segment (IRB-APP13-09).
+			if bytes.HasPrefix(data, identPS) {
+				// Copy the IRB portion (data aliases scratch).
+				irb := data[len(identPS):]
+				if len(irb) > 0 {
+					app13Payloads = append(app13Payloads, bytes.Clone(irb))
+				}
 			}
 		case markerSOS, markerEOI:
 			// SOS/EOI: no more metadata segments follow.
 			_ = extTruncated // truncation is currently informational; callers get partial XMP
-			return rawEXIF, rawIPTC, buildXMPResult(mainXMP, extended)
+			rawIPTC, iptcDigest = extractIPTCAndDigestFromIRBPayloads(app13Payloads)
+			return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, extended)
 		}
 	}
 
 	_ = extTruncated // truncation is currently informational; callers get partial XMP
-	return rawEXIF, rawIPTC, buildXMPResult(mainXMP, extended)
+	rawIPTC, iptcDigest = extractIPTCAndDigestFromIRBPayloads(app13Payloads)
+	return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, extended)
+}
+
+// parseIRBForIPTCAndDigest scans a single contiguous Photoshop IRB byte block
+// and returns both the 0x0404 IPTC-NAA data and the 0x0425 IPTC-Digest data.
+// Either return value may be nil when the corresponding resource is absent.
+//
+// MWG §3.3.1: the 0x0425 resource carries the 16-byte MD5 of the raw 0x0404
+// IIM stream at the time XMP was last written.
+func parseIRBForIPTCAndDigest(b []byte) (iptcData, digestData []byte) {
+	pos := 0
+	for pos < len(b) {
+		resourceID, data, newPos, ok := parseIRBEntry(b, pos)
+		if !ok {
+			if newPos == pos {
+				pos++
+				continue
+			}
+			break
+		}
+		switch resourceID {
+		case 0x0404:
+			iptcData = data
+		case 0x0425:
+			// MWG §3.3.1: 0x0425 payload is exactly 16 bytes (MD5 digest).
+			// Tolerate malformed blocks: copy only if exactly 16 bytes.
+			if len(data) == 16 {
+				digestData = data
+			}
+		}
+		pos = newPos
+		// Apply even-padding to data block (Adobe IRB spec §"Image Resources").
+		if len(data)%2 != 0 {
+			pos++
+		}
+	}
+	return iptcData, digestData
+}
+
+// extractIPTCAndDigestFromIRBPayloads searches the concatenated Photoshop IRB
+// payloads for resource 0x0404 (IPTC-NAA IIM) and resource 0x0425 (IPTC
+// Digest) and returns both. Either return value may be nil when absent.
+//
+// IRB-APP13-09: all APP13 Photoshop 3.0 payloads are treated as a single
+// logical IRB stream; both resources may appear in any segment.
+// MWG §3.3.1: the digest enables IPTC/XMP precedence reconciliation.
+func extractIPTCAndDigestFromIRBPayloads(payloads [][]byte) (rawIPTC, iptcDigest []byte) {
+	if len(payloads) == 0 {
+		return nil, nil
+	}
+	// Fast path: single segment (the common case) — no concatenation needed.
+	if len(payloads) == 1 {
+		iptcData, digestData := parseIRBForIPTCAndDigest(payloads[0])
+		if iptcData != nil {
+			iptcData = bytes.Clone(iptcData)
+		}
+		if digestData != nil {
+			digestData = bytes.Clone(digestData)
+		}
+		return iptcData, digestData
+	}
+	// Slow path: concatenate all payloads and search the combined stream.
+	var totalLen int
+	for _, p := range payloads {
+		totalLen += len(p)
+	}
+	combined := make([]byte, 0, totalLen)
+	for _, p := range payloads {
+		combined = append(combined, p...)
+	}
+	iptcData, digestData := parseIRBForIPTCAndDigest(combined)
+	if iptcData != nil {
+		iptcData = bytes.Clone(iptcData)
+	}
+	if digestData != nil {
+		digestData = bytes.Clone(digestData)
+	}
+	return iptcData, digestData
 }
 
 // Extract reads the JPEG marker stream from r and returns the raw payloads.
@@ -371,7 +471,7 @@ func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte) (rawEXIF, raw
 //	When the JPEG carries extended XMP, rawXMP is the reassembled
 //	(merged) XMP document. Use ExtractWithWire for lossless passthrough.
 func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
-	rawEXIF, rawIPTC, xmpRes, err := extractFull(r)
+	rawEXIF, rawIPTC, _, xmpRes, err := extractFullInternal(r)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -389,17 +489,32 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 // Callers outside the format/jpeg package should use Extract unless they need
 // the wire-frame for passthrough writes.
 func ExtractWithWire(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP, rawXMPWire []byte, err error) {
-	rawEXIF, rawIPTC, xmpRes, err := extractFull(r)
+	rawEXIF, rawIPTC, _, xmpRes, err := extractFullInternal(r)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
 	return rawEXIF, rawIPTC, xmpRes.rawXMP, xmpRes.rawXMPWire, nil
 }
 
-// extractFull is the shared implementation of Extract and ExtractWithWire.
-func extractFull(r io.ReadSeeker) (rawEXIF, rawIPTC []byte, xmp xmpResult, err error) {
+// ExtractFull reads the JPEG marker stream and returns raw payloads, the
+// optional IPTC digest from Photoshop resource 0x0425, and the optional XMP
+// wire-frame. iptcDigest is a 16-byte slice when present, nil when absent.
+//
+// MWG Guidelines v2.0 §3.3.1: the caller should compare the digest to
+// iptc.Digest(rawIPTC) to determine whether IPTC or XMP has read priority.
+// Use Extract for callers that do not need the digest or the wire-frame.
+func ExtractFull(r io.ReadSeeker) (rawEXIF, rawIPTC, iptcDigest, rawXMP, rawXMPWire []byte, err error) {
+	rawEXIF, rawIPTC, iptcDigest, xmpRes, err := extractFullInternal(r)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	return rawEXIF, rawIPTC, iptcDigest, xmpRes.rawXMP, xmpRes.rawXMPWire, nil
+}
+
+// extractFullInternal is the shared implementation of Extract, ExtractWithWire, and ExtractFull.
+func extractFullInternal(r io.ReadSeeker) (rawEXIF, rawIPTC, iptcDigest []byte, xmp xmpResult, err error) {
 	if _, err = r.Seek(0, io.SeekStart); err != nil {
-		return nil, nil, xmpResult{}, fmt.Errorf("jpeg: seek: %w", err)
+		return nil, nil, nil, xmpResult{}, fmt.Errorf("jpeg: seek: %w", err)
 	}
 
 	// Obtain a pooled scratch buffer first so the SOI read can reuse it,
@@ -411,14 +526,14 @@ func extractFull(r io.ReadSeeker) (rawEXIF, rawIPTC []byte, xmp xmpResult, err e
 	// Read and verify SOI using the pooled scratch buffer.
 	soi := (*scratchPtr)[:2]
 	if _, err = io.ReadFull(r, soi); err != nil {
-		return nil, nil, xmpResult{}, fmt.Errorf("jpeg: read SOI: %w", err)
+		return nil, nil, nil, xmpResult{}, fmt.Errorf("jpeg: read SOI: %w", err)
 	}
 	if err := readSOI(soi); err != nil {
-		return nil, nil, xmpResult{}, err
+		return nil, nil, nil, xmpResult{}, err
 	}
 
-	rawEXIF, rawIPTC, xmp = scanMetadataSegmentsWithWire(r, scratchPtr)
-	return rawEXIF, rawIPTC, xmp, nil
+	rawEXIF, rawIPTC, iptcDigest, xmp = scanMetadataSegmentsWithWire(r, scratchPtr)
+	return rawEXIF, rawIPTC, iptcDigest, xmp, nil
 }
 
 // writeEXIFSegment writes the EXIF APP1 segment to w.

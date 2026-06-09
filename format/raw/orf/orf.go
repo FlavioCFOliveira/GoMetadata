@@ -151,19 +151,36 @@ func extractTIFFTags(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawIP
 		}
 		switch tag {
 		case 0x83BB:
-			// TypeLong IPTC (ExifTool convention) may include trailing zero-byte
-			// padding to reach a 4-byte boundary.  Trim so callers receive the
-			// original unpadded IPTC content (IIM §1.6: only 0x1C is a valid
-			// dataset start; trailing zeros are safely ignored by the IIM scanner).
-			rawIPTC = bytes.TrimRight(v, "\x00")
-			if len(rawIPTC) == 0 {
-				rawIPTC = nil
+			// ROBUST-16 (iptc.md §5): strip TypeLong structural padding only;
+			// TypeByte/Undefined payloads are returned as-is. See
+			// format/tiff.extractTagValues for the full rationale. Task #153.
+			if len(v) > 0 {
+				if typ == 4 { // TypeLong: trim structural alignment padding
+					rawIPTC = trimIPTCLongPadding(v)
+				} else {
+					rawIPTC = v // TypeByte / TypeUndefined: no trim (ROBUST-16)
+				}
+				if len(rawIPTC) == 0 {
+					rawIPTC = nil
+				}
 			}
 		case 0x02BC:
 			rawXMP = v
 		}
 	}
 	return rawIPTC, rawXMP
+}
+
+// trimIPTCLongPadding trims trailing 0x00 alignment bytes from a TypeLong IPTC
+// payload. TIFF 6.0 §2: TypeLong values are padded to the next 4-byte boundary;
+// those padding bytes are not IPTC data. ROBUST-16: only called for TypeLong;
+// TypeByte/Undefined payloads are never trimmed.
+func trimIPTCLongPadding(v []byte) []byte {
+	end := len(v)
+	for end > 0 && v[end-1] == 0x00 {
+		end--
+	}
+	return v[:end]
 }
 
 func typeSize(t uint16) uint32 {

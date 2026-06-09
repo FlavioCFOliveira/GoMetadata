@@ -2,10 +2,24 @@ package iptc
 
 // Well-known Record 1 (Envelope Record) dataset numbers (IIM §1.5).
 const (
+	// DS1EnvelopeRecordVersion is dataset 1:00 — the mandatory Envelope Record
+	// Version field. IIM §1.6.1 requires it to be the first dataset of Record 1
+	// when Record 1 is present; its value is a big-endian uint16 = 4.
+	DS1EnvelopeRecordVersion uint8 = 0
+
 	// DS1CodedCharacterSet is dataset 1:90, which declares the character
 	// encoding used in Record 2 text fields. The value ESC % G signals UTF-8
 	// per IIM §1.5.1. This dataset belongs to Record 1, not Record 2.
 	DS1CodedCharacterSet uint8 = 90
+)
+
+// Well-known Record 2 mandatory dataset numbers (IIM §2.2.1).
+const (
+	// DS2ApplicationRecordVersion is dataset 2:00 — the mandatory Application
+	// Record Version field. IIM §2.2.1 requires it to be the first dataset of
+	// Record 2; its value is a big-endian uint16 = 4. Encode emits this as the
+	// very first Record-2 dataset (IIM-REC-02, task #153).
+	DS2ApplicationRecordVersion uint8 = 0
 )
 
 // Well-known Record 2 (Application Record) dataset numbers (IIM §2.2).

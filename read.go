@@ -68,7 +68,9 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 	// Extract raw metadata segments from the container.
 	// For JPEG, rawXMPWire carries the original main+extended segmentation for
 	// lossless passthrough writes when the XMP is not modified.
-	rawEXIF, rawIPTC, rawXMP, rawXMPWire, err := extractByFormat(r, fmtID)
+	// rawIPTCDigest carries the 16-byte MD5 from Photoshop resource 0x0425 when
+	// present (JPEG only; nil for all other formats). MWG §3.3.1.
+	rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, err := extractByFormat(r, fmtID)
 	if err != nil {
 		return nil, err
 	}
@@ -79,6 +81,10 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 		rawIPTC:    rawIPTC,
 		rawXMP:     rawXMP,
 		rawXMPWire: rawXMPWire,
+		// rawIPTCDigest is populated only for JPEG (the only format whose IRB
+		// carries a Photoshop 0x0425 digest resource). TIFF stores IPTC in tag
+		// 0x83BB without an IRB wrapper, so no digest applies there.
+		rawIPTCDigest: rawIPTCDigest,
 	}
 
 	if err := parseParsedMetadata(m, rawEXIF, rawIPTC, rawXMP, cfg); err != nil {
@@ -182,23 +188,24 @@ func ReadFile(path string, opts ...ReadOption) (*Metadata, error) {
 }
 
 // extractByFormat dispatches to the correct container handler for raw segment
-// extraction. For JPEG it calls ExtractWithWire so that extended XMP can be
-// reproduced byte-stably on unmodified round-trip writes.
-func extractByFormat(r io.ReadSeeker, fmtID format.FormatID) (rawEXIF, rawIPTC, rawXMP, rawXMPWire []byte, err error) {
+// extraction. For JPEG it calls ExtractFull so that both extended XMP
+// (byte-stable passthrough) and the Photoshop 0x0425 IPTC digest are surfaced.
+// MWG §3.3.1: the digest is used by iptcTrustElevated() in metadata.go.
+func extractByFormat(r io.ReadSeeker, fmtID format.FormatID) (rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire []byte, err error) {
 	if fmtID == format.FormatJPEG {
-		rawEXIF, rawIPTC, rawXMP, rawXMPWire, err = jpeg.ExtractWithWire(r)
+		rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, err = jpeg.ExtractFull(r)
 		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("gometadata: %w", err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("gometadata: %w", err)
 		}
-		return rawEXIF, rawIPTC, rawXMP, rawXMPWire, nil
+		return rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, nil
 	}
 	fn, ok := extractors[fmtID]
 	if !ok {
-		return nil, nil, nil, nil, &UnsupportedFormatError{}
+		return nil, nil, nil, nil, nil, &UnsupportedFormatError{}
 	}
 	rawEXIF, rawIPTC, rawXMP, err = fn(r)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("gometadata: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("gometadata: %w", err)
 	}
-	return rawEXIF, rawIPTC, rawXMP, nil, nil
+	return rawEXIF, rawIPTC, nil, rawXMP, nil, nil
 }

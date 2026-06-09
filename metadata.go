@@ -52,6 +52,17 @@ type Metadata struct {
 	rawIPTC []byte
 	rawXMP  []byte
 
+	// rawIPTCDigest is the 16-byte MD5 value stored in Photoshop resource
+	// 0x0425 ("IPTC Digest") inside the APP13 IRB, or nil when absent.
+	// MWG Guidelines v2.0 §3.3.1: the digest is used at read time to determine
+	// whether IPTC or XMP takes precedence for conflicting descriptive fields.
+	//
+	// nil  → digest resource absent; default XMP-over-IPTC priority applies.
+	// 16 B = all-zero → "unknown" sentinel; IPTC trust is elevated.
+	// 16 B, non-zero  → compare to MD5(rawIPTC); match → XMP priority;
+	//                   mismatch → IPTC trust is elevated.
+	rawIPTCDigest []byte
+
 	// rawXMPWire is non-nil when the image carried extended XMP (Adobe XMP
 	// Specification Part 3 §1.1.4) and the XMP was not modified by the caller.
 	// It holds the internal wire-frame encoding produced by jpeg.ExtractWithWire:
@@ -79,6 +90,32 @@ func (m *Metadata) RawIPTC() []byte { return m.rawIPTC }
 // When the image carried extended XMP, RawXMP returns the fully reassembled
 // (merged) packet so callers always receive a single, self-contained document.
 func (m *Metadata) RawXMP() []byte { return m.rawXMP }
+
+// iptcTrustElevated reports whether IPTC should take read priority over XMP
+// for fields where both are present and carry different values.
+//
+// MWG Guidelines v2.0 §3.3.1: the Photoshop resource 0x0425 stores an MD5
+// digest of the raw 0x0404 IIM block at the time XMP was last written. If the
+// digest matches the current IIM block, XMP was written after the last IPTC
+// edit, so XMP remains authoritative (the default MWG-01 priority). If the
+// digest mismatches, or if the stored digest is the all-zero "unknown"
+// sentinel, IPTC may have been edited independently of XMP, so IPTC trust is
+// elevated for conflicting fields.
+//
+// When rawIPTCDigest is nil (the resource was absent), the default XMP-over-
+// IPTC priority (MWG-01) is preserved unchanged.
+func (m *Metadata) iptcTrustElevated() bool {
+	if len(m.rawIPTCDigest) != 16 {
+		// No digest resource in the IRB — use default MWG-01 (XMP priority).
+		return false
+	}
+	var stored [16]byte
+	copy(stored[:], m.rawIPTCDigest)
+	// DigestMatch handles the all-zero sentinel case (returns unknown=true).
+	match, unknown := iptc.DigestMatch(m.rawIPTC, stored)
+	// Elevate IPTC when: all-zero sentinel OR computed hash ≠ stored hash.
+	return unknown || !match
+}
 
 // Validate checks that m is in a consistent state suitable for writing.
 // It returns a descriptive error when an obvious inconsistency is detected
@@ -127,8 +164,29 @@ func (m *Metadata) GPS() (float64, float64, bool) {
 }
 
 // Copyright returns the copyright notice.
-// Source priority: XMP > IPTC > EXIF.
+// Source priority: XMP > IPTC > EXIF (MWG-01).
+// Exception — MWG §3.3.1 (MWG-02): when the Photoshop 0x0425 IPTC digest
+// mismatches (or is the all-zero sentinel), IPTC trust is elevated and the
+// priority for conflicting values becomes IPTC > XMP > EXIF.
+//
+//nolint:cyclop,gocyclo,nestif // MWG-02 digest-conditional branching is inherent; splitting would obscure the priority logic
 func (m *Metadata) Copyright() string {
+	if m.iptcTrustElevated() {
+		if m.IPTC != nil {
+			if v := m.IPTC.Copyright(); v != "" {
+				return v
+			}
+		}
+		if m.XMP != nil {
+			if v := m.XMP.Copyright(); v != "" {
+				return v
+			}
+		}
+		if m.EXIF != nil {
+			return m.EXIF.Copyright()
+		}
+		return ""
+	}
 	if m.XMP != nil {
 		if v := m.XMP.Copyright(); v != "" {
 			return v
@@ -146,8 +204,28 @@ func (m *Metadata) Copyright() string {
 }
 
 // Caption returns the image description / caption.
-// Source priority: XMP > IPTC > EXIF.
+// Source priority: XMP > IPTC > EXIF (MWG-01).
+// Exception — MWG §3.3.1 (MWG-02): IPTC digest mismatch elevates IPTC trust
+// so the priority becomes IPTC > XMP > EXIF for conflicting values.
+//
+//nolint:cyclop,gocyclo,nestif // MWG-02 digest-conditional branching is inherent; splitting would obscure the priority logic
 func (m *Metadata) Caption() string {
+	if m.iptcTrustElevated() {
+		if m.IPTC != nil {
+			if v := m.IPTC.Caption(); v != "" {
+				return v
+			}
+		}
+		if m.XMP != nil {
+			if v := m.XMP.Caption(); v != "" {
+				return v
+			}
+		}
+		if m.EXIF != nil {
+			return m.EXIF.Caption()
+		}
+		return ""
+	}
 	if m.XMP != nil {
 		if v := m.XMP.Caption(); v != "" {
 			return v
@@ -328,8 +406,21 @@ func (m *Metadata) ImageSize() (width, height uint32, ok bool) {
 }
 
 // Keywords returns the subject keywords.
-// Source priority: XMP > IPTC.
+// Source priority: XMP > IPTC (MWG-01 / MWG-07).
+// Exception — MWG §3.3.1 (MWG-02): IPTC digest mismatch elevates IPTC trust
+// so the priority becomes IPTC > XMP for conflicting values.
 func (m *Metadata) Keywords() []string {
+	if m.iptcTrustElevated() {
+		if m.IPTC != nil {
+			if kw := m.IPTC.Keywords(); len(kw) > 0 {
+				return kw
+			}
+		}
+		if m.XMP != nil {
+			return m.XMP.Keywords()
+		}
+		return nil
+	}
 	if m.XMP != nil {
 		if kw := m.XMP.Keywords(); len(kw) > 0 {
 			return kw
@@ -512,8 +603,28 @@ func (m *Metadata) MeteringMode() (uint16, bool) {
 }
 
 // Creator returns the author / creator name.
-// Source priority: XMP > IPTC > EXIF.
+// Source priority: XMP > IPTC > EXIF (MWG-01 / MWG-04).
+// Exception — MWG §3.3.1 (MWG-02): IPTC digest mismatch elevates IPTC trust
+// so the priority becomes IPTC > XMP > EXIF for conflicting values.
+//
+//nolint:cyclop,gocyclo,nestif // MWG-02 digest-conditional branching is inherent; splitting would obscure the priority logic
 func (m *Metadata) Creator() string {
+	if m.iptcTrustElevated() {
+		if m.IPTC != nil {
+			if v := m.IPTC.Creator(); v != "" {
+				return v
+			}
+		}
+		if m.XMP != nil {
+			if v := m.XMP.Creator(); v != "" {
+				return v
+			}
+		}
+		if m.EXIF != nil {
+			return m.EXIF.Creator()
+		}
+		return ""
+	}
 	if m.XMP != nil {
 		if v := m.XMP.Creator(); v != "" {
 			return v

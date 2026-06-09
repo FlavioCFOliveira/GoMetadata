@@ -4,7 +4,6 @@
 package tiff
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -404,25 +403,49 @@ func extractTagValues(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawI
 
 		switch tag {
 		case 0x83BB: // IPTC-NAA
-			// When stored as TypeLong (the conventional encoding per ExifTool /
-			// Adobe XMP Spec), the value area is padded to a 4-byte boundary
-			// with zero bytes.  Strip those trailing zeros so callers always
-			// receive the original unpadded IPTC content.
+			// ROBUST-16 (iptc.md §5): strip trailing 0x00 bytes ONLY for TypeLong
+			// (typ == 4) because TypeLong IPTC is padded to a 4-byte boundary by
+			// the writer (TIFF 6.0 §2: Count = number of uint32 elements). Those
+			// padding bytes are structural artefacts, not IPTC data.
 			//
-			// This is safe because IPTC IIM content is self-framing: every
-			// dataset begins with the tag marker 0x1C (IIM §1.6). Trailing zero
-			// bytes are never a valid dataset prefix and are silently skipped by
-			// the IIM scanner.  TypeUndefined / TypeByte encodings carry no
-			// padding; trimming trailing zeros is harmless for those too.
-			rawIPTC = bytes.TrimRight(v, "\x00")
-			if len(rawIPTC) == 0 {
-				rawIPTC = nil
+			// For TypeByte (1) and TypeUndefined (7) do NOT strip: a valid IPTC
+			// payload may legitimately end in 0x00 (e.g. a NUL-terminated text
+			// field value). bytes.TrimRight on those types silently corrupted
+			// payloads whose last dataset value ended with 0x00 (task #153).
+			//
+			// The IIM scanner naturally skips non-0x1C bytes (IIM §1.6), so any
+			// residual TypeLong padding bytes are harmless after trimming only
+			// the known structural zeros.
+			if len(v) > 0 {
+				if typ == 4 { // TypeLong: trim structural alignment padding
+					rawIPTC = trimIPTCLongPadding(v)
+				} else {
+					rawIPTC = v // TypeByte / TypeUndefined: no trim (ROBUST-16)
+				}
+				if len(rawIPTC) == 0 {
+					rawIPTC = nil
+				}
 			}
 		case 0x02BC: // XMP
 			rawXMP = v
 		}
 	}
 	return rawIPTC, rawXMP
+}
+
+// trimIPTCLongPadding trims trailing 0x00 alignment-padding bytes from an IPTC
+// payload stored as TypeLong. TypeLong pads the value to the next 4-byte
+// boundary; those trailing zeros are never valid IIM dataset prefixes (0x1C)
+// and are safe to remove. This function is ONLY called for TypeLong (typ == 4);
+// TypeByte and TypeUndefined payloads are not trimmed (ROBUST-16, task #153).
+func trimIPTCLongPadding(v []byte) []byte {
+	// Walk backwards from the end of v, stripping zero bytes until we hit a
+	// non-zero byte or exhaust the slice.
+	end := len(v)
+	for end > 0 && v[end-1] == 0x00 {
+		end--
+	}
+	return v[:end]
 }
 
 // typeSize returns the byte size of a single value for the given TIFF type.
@@ -609,11 +632,18 @@ func extractTagValuesBigTIFF(data []byte, ifd0Off uint64, order binary.ByteOrder
 
 		switch tag {
 		case 0x83BB: // IPTC-NAA
-			// Strip trailing zero bytes (padding for TypeLong encoding).
-			// Same trimming logic as in extractTagValues for the classic path.
-			rawIPTC = bytes.TrimRight(v, "\x00")
-			if len(rawIPTC) == 0 {
-				rawIPTC = nil
+			// ROBUST-16 (iptc.md §5): type-aware trimming — only TypeLong (4)
+			// gets structural-padding trimmed; TypeByte/Undefined are returned
+			// as-is. Same logic as the classic-TIFF path. Task #153.
+			if len(v) > 0 {
+				if typ == 4 { // TypeLong: trim structural alignment padding
+					rawIPTC = trimIPTCLongPadding(v)
+				} else {
+					rawIPTC = v // TypeByte / TypeUndefined: no trim (ROBUST-16)
+				}
+				if len(rawIPTC) == 0 {
+					rawIPTC = nil
+				}
 			}
 		case 0x02BC: // XMP
 			rawXMP = v
