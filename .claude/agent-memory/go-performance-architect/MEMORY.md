@@ -40,3 +40,8 @@
 - [PNG conformance battery (task #157)](project_png_conformance_battery.md) — 40 top-level tests, 2 spec violations fixed: handleXMPChunk first-wins (PNG-04) + length boundary test
 - [WebP conformance battery (task #158)](project_webp_conformance_battery.md) — 44 top-level tests; 0 violations; covers §3(b)-(f) RIFF/VP8X/flags/padding/round-trip/robustness/corpus
 - [HEIF/AVIF conformance battery (tasks #159,#160)](project_heif_avif_conformance_battery.md) — 10 BMFF+36 HEIF+24 AVIF tests; CRITICAL infe OOB audit #106 confirmed safe; empty-file fix in heif.go; 0 lint issues; fuzzers clean
+- [CR3 conformance battery (task #163)](project_cr3_conformance_battery.md) — 53 new tests: BMFF-box/ftyp/uuid, CR3 CMT1-4/XMP/IPTC, write/round-trip/robustness; 0 violations; 0 lint issues
+- [DNG conformance battery (task #161)](project_dng_conformance_battery.md) — 37 tests: §7 detect/IFD0/metadata/BigTIFF/write/robust; 0 violations; 0 lint issues
+- [ARW conformance battery (task #165)](project_arw_conformance_battery.md) — ARW-detect/SR2Private/makernote/IFD0/write/robust/corpus; 0 violations; uses arw.Inject not InjectWithEXIFARW
+- [CR2 conformance battery (task #162)](project_cr2_conformance_battery.md) — CR marker insert+rebase fix in InjectWithEXIFCR2; IFD0 at 16 not 8; 0 violations; 0 lint issues
+- [CR2 write: insert-marker-and-shift pattern](feedback_cr2_marker_insertion_pattern.md) — never overwrite IFD0 with proprietary marker; insert at position 8 + rebase all offsets by delta
