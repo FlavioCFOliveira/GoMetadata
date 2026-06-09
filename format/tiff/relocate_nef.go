@@ -607,7 +607,7 @@ func patchNikonPreviewInFinalTIFF(finalTIFF []byte, info *nikonPreviewInfo, orde
 
 // scanIFDForTagValOrOff scans the IFD at ifdStart in buf for the first entry with
 // the given tag and returns the uint32 in its val-or-off field.
-func scanIFDForTagValOrOff(buf []byte, ifdStart int, tag uint16, order binary.ByteOrder) (uint32, bool) {
+func scanIFDForTagValOrOff(buf []byte, ifdStart int, tag uint16, order binary.ByteOrder) (uint32, bool) { //nolint:unparam // tag is generic: TagExifIFDPointer used by all callers now; kept parameterised for future callers
 	if ifdStart+2 > len(buf) {
 		return 0, false
 	}
@@ -629,7 +629,7 @@ func scanIFDForTagValOrOff(buf []byte, ifdStart int, tag uint16, order binary.By
 // given tag whose value is out-of-line (total size > 4).  Returns the blob-absolute
 // offset (the value stored in the val-or-off field) and true when found.
 // Returns (0, false) for inline values or missing tags.
-func findOOLEntryOffset(buf []byte, ifdStart int, tag uint16, order binary.ByteOrder) (int, bool) {
+func findOOLEntryOffset(buf []byte, ifdStart int, tag uint16, order binary.ByteOrder) (int, bool) { //nolint:unparam // tag is generic: TagMakerNote used by all callers now; kept parameterised for future callers
 	if ifdStart+2 > len(buf) {
 		return 0, false
 	}

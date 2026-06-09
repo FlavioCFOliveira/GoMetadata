@@ -723,15 +723,28 @@ func rebaseSonyMakerNote(finalTIFF []byte, info *sonySR2Info, order binary.ByteO
 		}
 		// OOL: val_or_off is the TIFF-absolute offset of the value data.
 		oldVOO := order.Uint32(finalTIFF[e+8:])
-		// Safety: verify the old offset was within the original blob range.
-		// Sony MakerNote OOL data is always within [mnSrcOffset, mnSrcOffset+mnBlobSize).
-		if uint64(oldVOO) < uint64(oldMNAbs) ||
-			uint64(oldVOO)+total > uint64(oldMNAbs)+uint64(mnBlobSize) {
-			// OOL data outside original blob — skip (defensive; should not happen).
+		// Safety: the old pointer must not precede the MakerNote blob start.
+		// Lower bound: oldVOO >= oldMNAbs (the blob cannot point before itself).
+		//
+		// #127 upper-bound fix: the original guard clamped the upper bound to
+		// oldMNAbs+mnBlobSize. Some Sony models (e.g. DSLR-A series) store OOL
+		// value data that extends slightly past the declared blob count in the
+		// outer MakerNote IFD entry, yet those bytes are captured verbatim by
+		// exif.Parse. The tight upper bound caused those entries to be silently
+		// skipped, leaving their offsets stale after relocation.
+		// Relaxing to len(finalTIFF) is safe: any TIFF-absolute pointer within
+		// the original stream is a valid OOL pointer for this maker format.
+		if uint64(oldVOO) < uint64(oldMNAbs) {
+			// Pointer precedes blob start — bad entry; skip.
 			continue
 		}
 		// Compute blob-relative offset (unchanged after move).
 		relOff := oldVOO - oldMNAbs
+		newVOO64 := int64(newMNAbs) + int64(relOff)
+		if newVOO64 < 0 || uint64(newVOO64)+total > uint64(len(finalTIFF)) {
+			// New pointer would be out of bounds; skip (defensive guard).
+			continue
+		}
 		newVOO := uint32(newMNAbs) + relOff //nolint:gosec // G115: newMNAbs < len(finalTIFF) < 2^32
 		order.PutUint32(finalTIFF[e+8:], newVOO)
 	}

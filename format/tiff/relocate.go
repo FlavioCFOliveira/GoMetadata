@@ -286,6 +286,11 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte) (
 		if encErr != nil {
 			return nil, fmt.Errorf("tiff: encode (no image blocks): %w", encErr)
 		}
+		// Still apply MakerNote OOL rebasing even on the short-circuit path.
+		// exif.Encode may have moved the MakerNote blob to a different absolute
+		// offset within the re-encoded IFD section.
+		// #127: MakerNote OOL offset rebasing incomplete on write.
+		rebaseGenericMakerNote(out, e, order)
 		return out, nil
 	}
 
@@ -336,6 +341,23 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte) (
 	if finalErr != nil {
 		return nil, fmt.Errorf("tiff: encode final: %w", finalErr)
 	}
+
+	// Step 9.5: rebase OOL MakerNote pointers for makers that store TIFF-absolute
+	// val_or_off fields (Sony plain-IFD, Olympus OLYMP-type).
+	//
+	// exif.Encode copies the MakerNote blob verbatim. When the blob moves to a
+	// different absolute position in the new TIFF stream, any TIFF-absolute OOL
+	// pointer inside the MakerNote IFD becomes stale. rebaseGenericMakerNote
+	// detects the maker convention from the blob prefix and patches all OOL
+	// val_or_off fields in-place. Blob-relative makers (Canon, Panasonic, Nikon
+	// Type-3, Olympus OLYMPUS-type, Pentax) are no-ops in that function.
+	//
+	// Note: ARW-path Sony rebasing is performed later by rebaseSonyMakerNote in
+	// the ARW-specific relocator (relocate_arw.go Step 9.5). This step handles
+	// the standard TIFF path only.
+	//
+	// #127: MakerNote OOL offset rebasing incomplete on write.
+	rebaseGenericMakerNote(finalTIFF, e, order)
 
 	// Step 10: patch the 0x014A SubIFDs pointer array in finalTIFF.
 	// exif.Encode treats 0x014A as a plain TypeLong value (the old offset
