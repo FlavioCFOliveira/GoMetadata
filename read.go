@@ -43,8 +43,19 @@ var extractors = map[format.FormatID]func(io.ReadSeeker) ([]byte, []byte, []byte
 
 // Read reads all metadata from r.
 // The format is detected automatically from magic bytes; r must support
-// seeking (io.ReadSeeker). A nil error means at least one metadata type
-// was successfully parsed; individual fields may still be nil.
+// seeking (io.ReadSeeker).
+//
+// A nil error means the container format was recognised and its metadata
+// segments were successfully extracted. The individual EXIF, IPTC, and XMP
+// fields on the returned Metadata may still be nil — this happens when the
+// container carries no metadata, or when a segment was present but failed to
+// parse in best-effort mode (the default). Check ParseWarnings for partial-
+// failure details; ParseWarnings is nil when all present segments parsed
+// without error and is non-nil when at least one parse warning was recorded.
+//
+// To distinguish "parsed successfully" from "no metadata in file", inspect
+// m.EXIF, m.IPTC, and m.XMP directly — a nil value means that type was absent
+// (or failed to parse in best-effort mode).
 func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 	cfg := &readConfig{}
 	for _, o := range opts {

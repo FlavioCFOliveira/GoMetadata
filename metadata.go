@@ -3,6 +3,7 @@ package gometadata
 import (
 	"bytes"
 	"encoding/binary"
+	"sync"
 	"time"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
@@ -17,6 +18,14 @@ import (
 // nil and the format supports it (task #88 AUTO-CREATE policy). Alternatively,
 // assign m.EXIF, m.IPTC, or m.XMP directly before passing m to Write or
 // WriteFile.
+//
+// FormatUnknown contract: when fmtID is FormatUnknown, the returned Metadata
+// is valid for inspection but not for writing. Calling Set* on an Unknown-
+// format Metadata is a documented no-op — no component is auto-created and
+// the value is not stored, because the library cannot determine which metadata
+// types the container supports. Write will return UnsupportedFormatError.
+// If you intend to write metadata to a new file, always pass a concrete
+// format ID.
 func NewMetadata(fmtID format.FormatID) *Metadata {
 	return &Metadata{format: uint8(fmtID)}
 }
@@ -30,7 +39,26 @@ func NewMetadata(fmtID format.FormatID) *Metadata {
 //   - Camera data (model, make, lens, settings): EXIF wins.
 //   - Descriptive and rights data (caption, copyright, keywords): XMP wins,
 //     falling back to IPTC, then EXIF.
+//
+// Concurrency contract:
+//
+//	Concurrent Set* calls on the same *Metadata are safe — they are
+//	serialised by an internal mutex.
+//	Concurrent Get* / Read calls on the same *Metadata (with no concurrent
+//	Set* in flight) are also safe — getters are read-only.
+//	Concurrent Set* and Get* / Write on the same *Metadata without external
+//	synchronisation may see partially-updated state; callers that mix reads
+//	and writes concurrently must provide their own synchronisation.
+//
+// Copy semantics:
+//
+//	Metadata contains a sync.Mutex and must not be copied by value after
+//	first use. Always pass and store *Metadata (pointer), never Metadata.
 type Metadata struct {
+	// mu serialises concurrent Set* calls (finding #128).
+	// Must not be copied after first use — always use *Metadata.
+	mu sync.Mutex
+
 	EXIF *exif.EXIF
 	IPTC *iptc.IPTC
 	XMP  *xmp.XMP
@@ -664,16 +692,26 @@ func (m *Metadata) Creator() string {
 // Format capabilities (derived from format.SupportsWrite and the injector
 // dispatch table in write.go):
 //
-//	JPEG     → EXIF ✓  IPTC ✓  XMP ✓
-//	PNG      → EXIF ✓  IPTC ✗  XMP ✓
-//	WebP     → EXIF ✓  IPTC ✗  XMP ✓
-//	HEIF     → EXIF ✓  IPTC ✗  XMP ✓
-//	AVIF     → EXIF ✓  IPTC ✗  XMP ✓
-//	TIFF-based / CR3 / Unknown → write not supported; no auto-create.
+//	JPEG                        → EXIF ✓  IPTC ✓  XMP ✓
+//	TIFF                        → EXIF ✓  IPTC ✓  XMP ✓
+//	DNG / CR2 / NEF / ARW /     → EXIF ✓  IPTC ✓  XMP ✓
+//	  ORF / RW2 (TIFF-based RAW)
+//	PNG                         → EXIF ✓  IPTC ✗  XMP ✓
+//	WebP                        → EXIF ✓  IPTC ✗  XMP ✓
+//	HEIF / AVIF                 → EXIF ✓  IPTC ✗  XMP ✓
+//	CR3                         → EXIF ✓  IPTC ✗  XMP ✓
+//	Unknown                     → auto-create disabled; Set* is a no-op.
 //
-// Callers that set m.format = FormatUnknown via NewMetadata(FormatUnknown)
-// or that read an unsupported container will never auto-create a component;
-// the Write call will fail with UnsupportedFormatError as before.
+// IPTC pathway for TIFF-based formats: the write path embeds IPTC as IFD0
+// tag 0x83BB (IPTC-NAA, TypeLong). All TIFF-derived formats route through
+// relocate.go / relocate_*.go which upsert this tag on write.
+//
+// CR3 does NOT carry IPTC: CR3 uses an ISO BMFF container whose CMT1–CMT4
+// UUID boxes carry only EXIF and XMP; there is no IPTC pathway.
+//
+// Callers that pass FormatUnknown to NewMetadata will never get a component
+// auto-created; every Set* on such a Metadata is a documented no-op and the
+// Write call will fail with UnsupportedFormatError.
 // ---------------------------------------------------------------------------
 
 // canCarryEXIF reports whether the detected format can carry an EXIF segment
@@ -683,11 +721,32 @@ func (m *Metadata) canCarryEXIF() bool {
 }
 
 // canCarryIPTC reports whether the detected format can carry an IPTC segment
-// on write. Only JPEG supports IPTC (via the APP13 / Photoshop IRB envelope);
-// all other writable formats (PNG, WebP, HEIF, AVIF) have no IPTC pathway.
+// on write.
+//
+// IPTC is supported by JPEG (APP13 / Photoshop IRB envelope) and by all
+// TIFF-derived formats: TIFF, DNG, CR2, NEF, ARW, ORF, and RW2. The
+// TIFF-based write path embeds IPTC as IFD0 tag 0x83BB (IPTC-NAA).
+//
+// Formats without an IPTC pathway: PNG, WebP, HEIF, AVIF, and CR3 (ISO BMFF
+// — the CMT UUID boxes carry only EXIF and XMP).
+// FormatUnknown also returns false.
+//
+// Finding #110: prior to this fix, only JPEG and TIFF returned true, causing
+// DNG/CR2/NEF/ARW/ORF/RW2 to silently drop IPTC on Set* calls.
 func (m *Metadata) canCarryIPTC() bool {
-	return format.FormatID(m.format) == format.FormatJPEG ||
-		format.FormatID(m.format) == format.FormatTIFF
+	switch format.FormatID(m.format) {
+	case format.FormatJPEG,
+		format.FormatTIFF,
+		format.FormatDNG,
+		format.FormatCR2,
+		format.FormatNEF,
+		format.FormatARW,
+		format.FormatORF,
+		format.FormatRW2:
+		return true
+	default:
+		return false
+	}
 }
 
 // canCarryXMP reports whether the detected format can carry an XMP packet
@@ -733,22 +792,31 @@ func (m *Metadata) ensureXMP() {
 }
 
 // ---------------------------------------------------------------------------
-// Write setters — AUTO-CREATE policy (task #88).
+// Write setters — AUTO-CREATE policy (task #88) + mutex guard (finding #128).
 //
-// Each setter now calls the appropriate ensure* helpers before writing. When
-// the relevant component was nil but the format supports it, the component is
-// constructed in-place so the value is persisted on the next Write call.
-// Components that the format cannot carry (e.g. IPTC for PNG) are never
-// constructed, and the setter silently skips writing to that component —
-// consistent with the previous behaviour for format-incompatible metadata.
+// Each setter holds m.mu for its entire body (covering ensure* AND the
+// sub-struct mutation). This makes concurrent Set* calls safe.
+//
+// ensure* helpers are called while the lock is held; they are unexported and
+// non-recursive — they must never acquire m.mu themselves.
+//
+// Components that the format cannot carry (e.g. IPTC for PNG, CR3) are never
+// constructed, and the setter silently skips writing to that component.
+// For FormatUnknown, no component is ever created — see NewMetadata for the
+// documented contract.
 //
 // Setter signatures are unchanged (void) — this is a non-breaking change.
 // ---------------------------------------------------------------------------
 
 // SetCaption writes s to all metadata components that can carry a caption
 // (EXIF, IPTC, XMP). If a component is nil but the detected format supports
-// it, the component is auto-created before writing.
+// it, the component is auto-created before writing. Concurrent calls are safe.
+//
+// For FormatUnknown this is a documented no-op — no component is auto-created
+// and no value is stored (see NewMetadata for the full contract).
 func (m *Metadata) SetCaption(s string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.ensureEXIF()
 	m.ensureIPTC()
 	m.ensureXMP()
@@ -765,8 +833,10 @@ func (m *Metadata) SetCaption(s string) {
 
 // SetCopyright writes s to all metadata components that can carry a copyright
 // notice (EXIF, IPTC, XMP). Components are auto-created when nil and the
-// format supports them.
+// format supports them. Concurrent calls are safe.
 func (m *Metadata) SetCopyright(s string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.ensureEXIF()
 	m.ensureIPTC()
 	m.ensureXMP()
@@ -783,8 +853,10 @@ func (m *Metadata) SetCopyright(s string) {
 
 // SetCreator writes s to all metadata components that can carry a creator
 // (EXIF, IPTC, XMP). Components are auto-created when nil and the format
-// supports them.
+// supports them. Concurrent calls are safe.
 func (m *Metadata) SetCreator(s string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.ensureEXIF()
 	m.ensureIPTC()
 	m.ensureXMP()
@@ -800,8 +872,10 @@ func (m *Metadata) SetCreator(s string) {
 }
 
 // SetCameraModel writes s to EXIF and XMP. Components are auto-created when
-// nil and the format supports them.
+// nil and the format supports them. Concurrent calls are safe.
 func (m *Metadata) SetCameraModel(s string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.ensureEXIF()
 	m.ensureXMP()
 	if m.EXIF != nil {
@@ -814,7 +888,10 @@ func (m *Metadata) SetCameraModel(s string) {
 
 // SetGPS writes the WGS-84 decimal-degree coordinates to EXIF and XMP.
 // Components are auto-created when nil and the format supports them.
+// Concurrent calls are safe.
 func (m *Metadata) SetGPS(lat, lon float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.ensureEXIF()
 	m.ensureXMP()
 	if m.EXIF != nil {
@@ -827,8 +904,11 @@ func (m *Metadata) SetGPS(lat, lon float64) {
 
 // SetKeywords writes kws to IPTC and XMP. Components are auto-created when nil
 // and the format supports them. For formats that cannot carry IPTC (PNG, WebP,
-// HEIF, AVIF), only XMP is populated so the keywords are not silently dropped.
+// HEIF, AVIF, CR3), only XMP is populated so the keywords are not silently
+// dropped. Concurrent calls are safe.
 func (m *Metadata) SetKeywords(kws []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.ensureIPTC()
 	m.ensureXMP()
 	if m.IPTC != nil {
@@ -840,8 +920,10 @@ func (m *Metadata) SetKeywords(kws []string) {
 }
 
 // SetLensModel writes s to EXIF and XMP. Components are auto-created when nil
-// and the format supports them.
+// and the format supports them. Concurrent calls are safe.
 func (m *Metadata) SetLensModel(s string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.ensureEXIF()
 	m.ensureXMP()
 	if m.EXIF != nil {
@@ -853,8 +935,10 @@ func (m *Metadata) SetLensModel(s string) {
 }
 
 // SetMake writes s to EXIF. EXIF is auto-created when nil and the format
-// supports it.
+// supports it. Concurrent calls are safe.
 func (m *Metadata) SetMake(s string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetMake(s)
@@ -862,8 +946,10 @@ func (m *Metadata) SetMake(s string) {
 }
 
 // SetDateTimeOriginal writes t to EXIF and XMP. Components are auto-created
-// when nil and the format supports them.
+// when nil and the format supports them. Concurrent calls are safe.
 func (m *Metadata) SetDateTimeOriginal(t time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.ensureEXIF()
 	m.ensureXMP()
 	if m.EXIF != nil {
@@ -875,8 +961,10 @@ func (m *Metadata) SetDateTimeOriginal(t time.Time) {
 }
 
 // SetExposureTime writes the rational exposure time to EXIF. EXIF is
-// auto-created when nil and the format supports it.
+// auto-created when nil and the format supports it. Concurrent calls are safe.
 func (m *Metadata) SetExposureTime(num, den uint32) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetExposureTime(num, den)
@@ -884,8 +972,10 @@ func (m *Metadata) SetExposureTime(num, den uint32) {
 }
 
 // SetFNumber writes the F-number to EXIF. EXIF is auto-created when nil and
-// the format supports it.
+// the format supports it. Concurrent calls are safe.
 func (m *Metadata) SetFNumber(f float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetFNumber(f)
@@ -893,8 +983,10 @@ func (m *Metadata) SetFNumber(f float64) {
 }
 
 // SetISO writes the ISO speed rating to EXIF. EXIF is auto-created when nil
-// and the format supports it.
+// and the format supports it. Concurrent calls are safe.
 func (m *Metadata) SetISO(iso uint) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetISO(iso)
@@ -902,8 +994,10 @@ func (m *Metadata) SetISO(iso uint) {
 }
 
 // SetFocalLength writes the focal length in millimetres to EXIF. EXIF is
-// auto-created when nil and the format supports it.
+// auto-created when nil and the format supports it. Concurrent calls are safe.
 func (m *Metadata) SetFocalLength(mm float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetFocalLength(mm)
@@ -911,8 +1005,10 @@ func (m *Metadata) SetFocalLength(mm float64) {
 }
 
 // SetOrientation writes the orientation tag to EXIF. EXIF is auto-created
-// when nil and the format supports it.
+// when nil and the format supports it. Concurrent calls are safe.
 func (m *Metadata) SetOrientation(v uint16) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetOrientation(v)
@@ -920,8 +1016,10 @@ func (m *Metadata) SetOrientation(v uint16) {
 }
 
 // SetImageSize writes the pixel dimensions to EXIF. EXIF is auto-created when
-// nil and the format supports it.
+// nil and the format supports it. Concurrent calls are safe.
 func (m *Metadata) SetImageSize(width, height uint32) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetImageSize(width, height)
