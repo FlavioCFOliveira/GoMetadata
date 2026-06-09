@@ -172,6 +172,226 @@ func InjectWithEXIF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawX
 	return nil
 }
 
+// InjectWithEXIFCR2 is the CR2-specific variant of InjectWithEXIF.
+//
+// Canon CR2 files carry a proprietary 4-byte marker immediately after the
+// standard 8-byte TIFF header, at bytes 8–11:
+//
+//	bytes 8–9:   0x43 0x52 ('C','R') — Canon CR2 signature
+//	bytes 10–11: 0x02 0x00           — CR2 version (2.0)
+//
+// This is followed by IFD0, which therefore begins at offset 16 (not 8) in
+// a well-formed CR2 file (Canon CR2 spec §3.1).
+//
+// The standard relocateTIFFFromParsed rebuilds the TIFF via exif.Encode, which
+// always produces a standard 8-byte header with IFD0 at offset 8. This places
+// IFD0 directly at the CR marker position, making the output unparseable: the
+// first 2 bytes of IFD0 (the entry count) are interpreted as 0x4352 = 17235
+// in big-endian or 0x5243 = 21059 in little-endian, causing exif.Parse to
+// report "IFD at offset 8 could not be parsed".
+//
+// The fix inserts 8 bytes at position 8 (4 CR-marker bytes + 4 zero-pad bytes)
+// and rebases all IFD absolute offsets by +8, so the standard 8-byte TIFF
+// header is extended to a 16-byte CR2 header and IFD0 is at offset 16.
+// This mirrors the insertRW2GUIDAndShiftOffsets approach (inserting 16 bytes
+// for the RW2 GUID at position 8), but with delta=8 for the CR2 marker.
+//
+// Canon CR2 spec §3.1: bytes 8–9 identify the file as CR2; bytes 10–11 carry
+// the version. IFD0 starts at offset 16. These bytes MUST be preserved
+// verbatim on every write cycle so that standard CR2 readers and ExifTool
+// continue to recognise the format.
+//
+// containers.md §8(e): "CR2: preserve CR 02 00 at offset 8; IFD0 at offset 16."
+//
+// This is the entry point used by gometadata.Write for FormatCR2.
+func InjectWithEXIFCR2(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+	// Pass-through: no metadata changes requested and no EXIF edits.
+	if modifiedEXIF == nil && rawIPTC == nil && rawXMP == nil {
+		if _, err := w.Write(originalBytes); err != nil {
+			return fmt.Errorf("tiff: write: %w", err)
+		}
+		return nil
+	}
+
+	updated, err := relocateTIFFFromParsed(originalBytes, modifiedEXIF, rawIPTC, rawXMP)
+	if err != nil {
+		return err
+	}
+
+	// Insert CR2 marker at position 8 and rebase all IFD offsets by +8.
+	//
+	// exif.Encode always places IFD0 at offset 8 (hardcoded in writeTIFFHeader:
+	// headerSize = 8). After inserting 8 bytes at position 8, IFD0 moves to
+	// offset 16, which is the canonical CR2 IFD0 position.
+	//
+	// Canon CR2 spec §3.1: TIFF header (8 bytes) + CR marker (4 bytes) + zero-pad
+	// (4 bytes) = 16-byte total header; IFD0 immediately follows at offset 16.
+	result, insertErr := insertCR2MarkerAndShiftOffsets(updated, originalBytes)
+	if insertErr != nil {
+		return insertErr
+	}
+
+	if _, err = w.Write(result); err != nil {
+		return fmt.Errorf("tiff: write updated: %w", err)
+	}
+	return nil
+}
+
+// cr2MarkerLen is the length of the Canon CR2 proprietary header extension
+// inserted at byte position 8 of the TIFF stream.
+// Canon CR2 spec §3.1: 4-byte marker ('C','R',0x02,0x00) + 4-byte zero-pad = 8 bytes.
+const cr2MarkerLen = 8
+
+// cr2IFD0Offset is the canonical IFD0 offset in a well-formed CR2 file.
+// Canon CR2 spec §3.1: standard 8-byte TIFF header + 8-byte CR2 marker = 16.
+const cr2IFD0Offset = 16
+
+// insertCR2MarkerAndShiftOffsets inserts the 8-byte CR2 marker at byte
+// position 8 of finalTIFF, updates the IFD0 offset in the TIFF header from
+// 8 to 16, and rebases all IFD absolute offsets by +8.
+//
+// The CR2 marker bytes are read from originalBytes[8:12] (the original file's
+// CR2 marker: 0x43,0x52,0x02,0x00); bytes [12:16] are zeroed.
+//
+// The original TIFF header at [0:4] (byte-order + magic) is preserved.
+//
+// Algorithm:
+//
+//  1. Build output: hdr[0:8] + marker[0:8] + finalTIFF[8:].
+//  2. Update header bytes [4:8] → 16 (new IFD0 offset).
+//  3. Walk IFD0 (at offset 16) and all sub-IFDs, shifting every OOL val_or_off
+//     and every inline sub-IFD pointer by +cr2MarkerLen (+8).
+//
+// This mirrors insertRW2GUIDAndShiftOffsets (delta=16 for RW2 GUID) but uses
+// delta=8 for the 8-byte CR2 marker extension.
+//
+// Canon CR2 spec §3.1 / TIFF 6.0 §2 / containers.md §8(e).
+func insertCR2MarkerAndShiftOffsets(finalTIFF, originalBytes []byte) ([]byte, error) {
+	if len(finalTIFF) < 8 {
+		return nil, fmt.Errorf("%w (%d bytes)", ErrCR2OutputTooShort, len(finalTIFF))
+	}
+
+	order, orderErr := byteOrder(finalTIFF)
+	if orderErr != nil {
+		return nil, fmt.Errorf("tiff: CR2 insert marker: %w", orderErr)
+	}
+
+	// Build 8-byte CR2 marker: bytes [8:12] from original + 4 zero bytes [12:16].
+	// Canon CR2 spec §3.1: 0x43 'C', 0x52 'R', 0x02 version, 0x00 version minor.
+	var marker [cr2MarkerLen]byte
+	if len(originalBytes) >= 12 {
+		copy(marker[0:4], originalBytes[8:12]) // CR2 signature + version
+		// marker[4:8] remain zero (reserved, per Canon CR2 spec §3.1)
+	} else {
+		// Fallback: synthesise canonical marker when original is too short.
+		marker[0] = 0x43 // 'C'
+		marker[1] = 0x52 // 'R'
+		marker[2] = 0x02 // version 2
+		marker[3] = 0x00 // version minor 0
+	}
+
+	// Step 1: assemble output with marker inserted at position 8.
+	//
+	//   [0:8]   original TIFF header slot (II/MM + 0x2A 0x00 + IFD0_off=8 → 16)
+	//   [8:16]  CR2 marker (4-byte CR signature + 4 zero bytes)
+	//   [16:]   finalTIFF[8:] (IFD block + image data)
+	out := make([]byte, len(finalTIFF)+cr2MarkerLen)
+	copy(out[0:8], finalTIFF[0:8])            // preserve BOM + magic
+	copy(out[8:8+cr2MarkerLen], marker[:])    // insert CR2 marker
+	copy(out[8+cr2MarkerLen:], finalTIFF[8:]) // IFD block + image data
+
+	// Step 2: update IFD0 offset in TIFF header from 8 to 16.
+	// TIFF 6.0 §2: bytes [4:8] = IFD0 offset. exif.Encode wrote 8; we write 16.
+	order.PutUint32(out[4:], uint32(cr2IFD0Offset)) // 16
+
+	// Step 3: rebase all IFD absolute offsets by +cr2MarkerLen (+8).
+	// IFD0 is now at position 16 in the output.
+	ifd0Start := cr2IFD0Offset
+	if ifd0Start+2 > len(out) {
+		return nil, fmt.Errorf("%w (offset=%d, len=%d)", ErrCR2IFD0OutOfBounds, ifd0Start, len(out))
+	}
+	rebaseAllIFDsAfterCR2Marker(out, ifd0Start, order)
+
+	return out, nil
+}
+
+// rebaseAllIFDsAfterCR2Marker walks the IFD at ifdStart in out and shifts all
+// TIFF-absolute file offsets by +cr2MarkerLen (+8) to account for the 8-byte
+// CR2 marker inserted at file position 8.
+//
+// For each IFD entry:
+//   - OOL entries (type×count > 4): shift val_or_off by +cr2MarkerLen.
+//   - Inline sub-IFD pointer tags (0x8769 ExifIFD, 0x8825 GPS, 0xA005 Interop):
+//     shift the inline value by +cr2MarkerLen AND recursively rebase the sub-IFD.
+//
+// Guards: only offsets ≥ 8 (the insertion point) are shifted, which covers all
+// offsets produced by exif.Encode (which starts placing values at offset 8+).
+//
+// TIFF 6.0 §2: IFD entries are 12 bytes: tag(2)+type(2)+count(4)+val_or_off(4).
+// EXIF §4.6.3: sub-IFD pointer tags are TypeLong, Count=1, total=4 ≤ 4 → inline.
+//
+//nolint:cyclop,gocyclo // recursive IFD walk with OOL/inline/pointer dispatch mirrors rebaseAllIFDsAfterGUID; inherent TIFF §2 complexity
+func rebaseAllIFDsAfterCR2Marker(out []byte, ifdStart int, order binary.ByteOrder) {
+	if ifdStart+2 > len(out) {
+		return
+	}
+	ifdCount := int(order.Uint16(out[ifdStart:]))
+	ifdPos := ifdStart + 2
+
+	for i := range ifdCount {
+		e := ifdPos + i*12
+		if e+12 > len(out) {
+			break
+		}
+		entryTag := exif.TagID(order.Uint16(out[e:]))
+		entryType := order.Uint16(out[e+2:])
+		entryCount := order.Uint32(out[e+4:])
+
+		elemSz := typeSize(entryType)
+		if elemSz == 0 || entryCount == 0 {
+			continue
+		}
+		total := uint64(elemSz) * uint64(entryCount)
+
+		if total > 4 {
+			// OOL entry: val_or_off is a TIFF-absolute pointer to the value area.
+			// After CR2 marker insertion every such offset shifts by +cr2MarkerLen.
+			// TIFF 6.0 §2: all offsets are measured from byte 0 of the TIFF stream.
+			oldVOO := order.Uint32(out[e+8:])
+			// Only rebase offsets at or beyond the insertion point (8).
+			// exif.Encode never places values at offsets < 8.
+			const insertionPoint = 8
+			if oldVOO >= insertionPoint {
+				order.PutUint32(out[e+8:], oldVOO+uint32(cr2MarkerLen))
+			}
+			continue
+		}
+
+		// Inline entry (total ≤ 4): only sub-IFD pointer tags carry absolute file
+		// offsets that need rebasing.
+		//
+		// EXIF §4.6.3: 0x8769 (ExifIFD), 0x8825 (GPS IFD), 0xA005 (InteropIFD)
+		// are TypeLong, Count=1, total=4 ≤ 4 → stored inline. Their val_or_off
+		// VALUE is an absolute file offset to the sub-IFD structure.
+		switch entryTag {
+		case exif.TagExifIFDPointer, exif.TagGPSIFDPointer, exif.TagInteropIFDPointer:
+			// Rebase sub-IFD pointer and recursively rebase the sub-IFD.
+			oldVal := order.Uint32(out[e+8:])
+			const insertionPoint = 8
+			if oldVal < insertionPoint {
+				continue // guard: implausibly small offset (shouldn't happen)
+			}
+			newVal := oldVal + uint32(cr2MarkerLen)
+			order.PutUint32(out[e+8:], newVal)
+			// Recurse into the sub-IFD at its new position in out.
+			subIFDStart := int(newVal)
+			if subIFDStart+2 <= len(out) {
+				rebaseAllIFDsAfterCR2Marker(out, subIFDStart, order)
+			}
+		}
+	}
+}
+
 // InjectWithEXIFNEF is the NEF-specific variant of InjectWithEXIF.
 //
 // It runs the Nikon-specific preprocessing step (extend MakerNote blob,

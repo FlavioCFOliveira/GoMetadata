@@ -83,14 +83,18 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	// an exif.Encode-produced skeleton as the relocation base causes
 	// ErrBlockOutOfBounds because the skeleton carries no image blocks (task #97).
 	//
-	// FormatTIFF, FormatDNG, FormatCR2: standard copy-and-relocate (writeTIFF).
+	// FormatTIFF, FormatDNG: standard copy-and-relocate (writeTIFF).
+	// FormatCR2: same relocation base, but bytes 8–11 (Canon "CR\02\00" marker)
+	//   must be restored after encoding — InjectWithEXIFCR2 handles this.
 	// FormatNEF: Nikon MakerNote blob extension + PreviewIFD relocation (writeTIFFNEF, task #102).
 	// FormatARW: Sony MakerNote TIFF-absolute rebase + SR2Private block (writeTIFFARW, task #103).
 	// FormatORF: non-standard IIRO/IIRS magic patch-and-restore (writeTIFFORF, task #104).
 	// FormatRW2: Panasonic GUID insertion + IFD0 offset rebasing (writeTIFFRW2, task #104).
-	if fmtID == format.FormatTIFF || fmtID == format.FormatDNG ||
-		fmtID == format.FormatCR2 {
+	if fmtID == format.FormatTIFF || fmtID == format.FormatDNG {
 		return writeTIFF(r, w, m)
+	}
+	if fmtID == format.FormatCR2 {
+		return writeTIFFCR2(r, w, m)
 	}
 
 	// FormatNEF uses the NEF-specific write path that extends the Nikon MakerNote
@@ -274,6 +278,55 @@ func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclo
 	// m.EXIF may be nil (no EXIF modifications); InjectWithEXIF falls back to
 	// parsing originalBytes in that case, same behaviour as Inject.
 	if err := tiff.InjectWithEXIF(originalBytes, m.EXIF, rawIPTC, rawXMP, w); err != nil {
+		return fmt.Errorf("gometadata: %w", err)
+	}
+	return nil
+}
+
+// writeTIFFCR2 handles metadata injection for Canon CR2 files.
+//
+// CR2 uses standard TIFF LE magic (II*\0) and the standard copy-and-relocate
+// path, but bytes 8–11 of the TIFF header carry the proprietary Canon CR2 marker:
+//   - bytes 8–9:   0x43 0x52 ('C','R') — Canon CR2 spec §3.1
+//   - bytes 10–11: 0x02 0x00           — CR2 version 2.0
+//
+// exif.Encode rebuilds the TIFF with IFD0 at offset 8, overwriting those bytes.
+// tiff.InjectWithEXIFCR2 restores them from the original file after relocation.
+//
+// containers.md §8(e): "CR2: preserve CR 02 00 at offset 8."
+// Validated against real Canon EOS 350D/70D/7D corpus files.
+func writeTIFFCR2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // mirrors writeTIFF; CR2-specific marker-restore call; splitting reduces clarity
+	var originalBytes []byte
+	if m.rawEXIF != nil {
+		originalBytes = m.rawEXIF
+	} else {
+		if _, err := r.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("gometadata: cr2 seek: %w", err)
+		}
+		var err error
+		originalBytes, err = io.ReadAll(r)
+		if err != nil {
+			return fmt.Errorf("gometadata: cr2 read: %w", err)
+		}
+	}
+
+	rawIPTC, err := encodeIPTC(m)
+	if err != nil {
+		return err
+	}
+	rawXMP, err := encodeXMP(m, format.FormatCR2)
+	if err != nil {
+		return err
+	}
+
+	if rawIPTC == nil && rawXMP == nil && m.EXIF == nil {
+		if _, err := w.Write(originalBytes); err != nil {
+			return fmt.Errorf("gometadata: cr2 write passthrough: %w", err)
+		}
+		return nil
+	}
+
+	if err := tiff.InjectWithEXIFCR2(originalBytes, m.EXIF, rawIPTC, rawXMP, w); err != nil {
 		return fmt.Errorf("gometadata: %w", err)
 	}
 	return nil
