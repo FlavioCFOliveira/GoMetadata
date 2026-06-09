@@ -66,6 +66,15 @@ func parseCR3BoxHeader(data []byte, pos int) (size uint64, typ string, headerLen
 // CMT1 contains IFD0 (TIFF header + entries); CMT2 contains the Exif IFD that
 // IFD0's ExifIFD pointer (tag 0x8769) addresses. Both are merged into rawEXIF
 // so that exif.Parse receives a contiguous buffer covering both IFDs.
+//
+// If the moov/UUID structure is present but no CMT1 sub-box is found, Extract
+// returns (nil, nil, rawXMP, ErrNoCMT1Box). rawXMP is still populated when a
+// "XMP " sub-box exists, so callers can use XMP even when EXIF is absent.
+//
+// # audit finding #138
+//
+// ErrNoCMT1Box lets callers distinguish "no EXIF" from a broken container parse.
+// lclevy canon_cr3: CMT1 carries IFD0; its absence means no EXIF is present.
 func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if _, err = r.Seek(0, io.SeekStart); err != nil {
 		return nil, nil, nil, fmt.Errorf("cr3: seek: %w", err)
@@ -86,12 +95,21 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		cmt1 := findBox(moovData, "CMT1", 0)
 		cmt2 := findBox(moovData, "CMT2", 0)
 		rawXMP = findBox(moovData, "XMP ", 0)
+		// audit #138: surface missing CMT1 as a sentinel error so callers can
+		// distinguish no-EXIF from a broken container.
+		if cmt1 == nil {
+			return nil, nil, rawXMP, ErrNoCMT1Box
+		}
 		return mergeCMT(cmt1, cmt2), nil, rawXMP, nil
 	}
 
 	cmt1 := findBox(uuidData, "CMT1", 0)
 	cmt2 := findBox(uuidData, "CMT2", 0)
 	rawXMP = findBox(uuidData, "XMP ", 0)
+	// audit #138: surface missing CMT1 as a sentinel error.
+	if cmt1 == nil {
+		return nil, nil, rawXMP, ErrNoCMT1Box
+	}
 	return mergeCMT(cmt1, cmt2), nil, rawXMP, nil
 }
 
@@ -170,8 +188,16 @@ func findExifIFDOffset(buf []byte, ifd0Off uint32, order binary.ByteOrder) uint3
 // reconstructs the content with CMT1 replaced by rawEXIF (if non-nil) and
 // "XMP " replaced by rawXMP (if non-nil). Other sub-boxes are copied unchanged.
 // hadXMP reports whether an "XMP " sub-box was present in the original content.
+//
+// audit #175: if rawEXIF is non-nil and no CMT1 sub-box exists in the original
+// content, a new CMT1 box is appended after the loop. This mirrors the XMP
+// add-if-absent pattern in rebuildMoovContent and ensures that writing EXIF to a
+// UUID box that only carries CMT2/CMT3/CMT4 does not silently discard rawEXIF.
+//
+// lclevy canon_cr3: CMT1 is the mandatory IFD0 TIFF stream inside the Canon UUID.
 func rebuildUUIDContent(uuidContent, rawEXIF, rawXMP []byte) (newContent []byte, hadXMP bool) {
 	var buf bytes.Buffer
+	var hadCMT1 bool
 	pos := 0
 	for pos+8 <= len(uuidContent) {
 		size, typ, _, ok := parseCR3BoxHeader(uuidContent, pos)
@@ -180,6 +206,7 @@ func rebuildUUIDContent(uuidContent, rawEXIF, rawXMP []byte) (newContent []byte,
 		}
 		switch typ {
 		case "CMT1":
+			hadCMT1 = true
 			if rawEXIF != nil {
 				buf.Write(buildBox("CMT1", rawEXIF))
 			} else {
@@ -196,6 +223,12 @@ func rebuildUUIDContent(uuidContent, rawEXIF, rawXMP []byte) (newContent []byte,
 			buf.Write(uuidContent[pos : pos+int(size)]) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 		}
 		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
+	}
+	// audit #175: insert a new CMT1 sub-box when rawEXIF is provided but the
+	// original UUID content had no CMT1. Without this, Inject silently discards
+	// rawEXIF for CR3 files whose UUID box carries only CMT2/CMT3/CMT4.
+	if rawEXIF != nil && !hadCMT1 {
+		buf.Write(buildBox("CMT1", rawEXIF))
 	}
 	return buf.Bytes(), hadXMP
 }
@@ -247,7 +280,8 @@ func relocateChunkOffsets(moovBytes []byte, oldMoovEnd int, delta int64) error {
 		return nil
 	}
 	// moovBytes includes the 8-byte moov box header; pass the content slice.
-	return relocateInContainer(moovBytes[8:], int64(oldMoovEnd), delta)
+	// audit #191: start at depth=0; cap recursion at 32 levels (mirrors findBox).
+	return relocateInContainer(moovBytes[8:], int64(oldMoovEnd), delta, 0)
 }
 
 // relocateInContainer recursively walks ISOBMFF boxes in the container content
@@ -257,7 +291,18 @@ func relocateChunkOffsets(moovBytes []byte, oldMoovEnd int, delta int64) error {
 // data must be exactly the content payload of the enclosing container box
 // (the header bytes must already have been stripped by the caller). This
 // ensures each recursion level only scans within its own box boundary.
-func relocateInContainer(data []byte, oldMoovEnd int64, delta int64) error {
+//
+// depth is the current recursion depth. audit #191: the guard `depth > 32`
+// mirrors the cap used by findBox — providing defence-in-depth against crafted
+// ISOBMFF structures with pathological nesting. Valid CR3 files never reach
+// this limit; the guard is purely protective.
+// ISO 14496-12 §4.2: box hierarchy is structurally bounded by box sizes.
+func relocateInContainer(data []byte, oldMoovEnd int64, delta int64, depth int) error {
+	// audit #191: cap recursion at 32 levels to mirror findBox and prevent
+	// stack exhaustion on adversarially crafted ISOBMFF containers.
+	if depth > 32 {
+		return nil
+	}
 	pos := 0
 	for pos+8 <= len(data) {
 		size, typ, headerLen, ok := parseCR3BoxHeader(data, pos)
@@ -271,7 +316,7 @@ func relocateInContainer(data []byte, oldMoovEnd int64, delta int64) error {
 		case "trak", "mdia", "minf", "stbl":
 			// Recurse into container boxes using the box payload slice only.
 			// This ensures the recursive scan is strictly bounded within this box.
-			if err := relocateInContainer(content, oldMoovEnd, delta); err != nil {
+			if err := relocateInContainer(content, oldMoovEnd, delta, depth+1); err != nil {
 				return err
 			}
 		case "stco":

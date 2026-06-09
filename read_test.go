@@ -13,6 +13,7 @@ import (
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
 	"github.com/FlavioCFOliveira/GoMetadata/format"
+	"github.com/FlavioCFOliveira/GoMetadata/format/raw/cr3"
 	"github.com/FlavioCFOliveira/GoMetadata/iptc"
 	"github.com/FlavioCFOliveira/GoMetadata/xmp"
 )
@@ -1359,4 +1360,88 @@ func BenchmarkReadFile_Concurrent(b *testing.B) {
 			_, _ = ReadFile(tmp)
 		}
 	})
+}
+
+// TestCR3ReadNoCMT1ParseWarning is the gate for audit finding #138 at the
+// gometadata.Read level.
+//
+// When a CR3 file has a valid ISOBMFF structure but no CMT1 sub-box, Extract
+// returns ErrNoCMT1Box. Read must:
+//   - NOT return a fatal error (the file is readable; other metadata is present)
+//   - return a non-nil *Metadata
+//   - record a ParseWarning with Segment="EXIF" that wraps ErrNoCMT1Box
+//   - still populate m.XMP when an "XMP " sub-box is present
+//
+// audit #138: cr3.ErrNoCMT1Box treated as ParseWarning, not fatal error.
+func TestCR3ReadNoCMT1ParseWarning(t *testing.T) {
+	t.Parallel()
+
+	// Build a raw CR3 byte stream: ftyp + moov(uuid(CMT2+XMP ), no CMT1).
+	// Helpers are inlined to avoid importing the cr3 package directly.
+	buildBox := func(typ string, content []byte) []byte {
+		sz := 8 + len(content)
+		b := make([]byte, sz)
+		binary.BigEndian.PutUint32(b[0:], uint32(sz)) //nolint:gosec // G115: sz = 8+len(content), non-negative, bounded by allocation
+		copy(b[4:8], typ)
+		copy(b[8:], content)
+		return b
+	}
+	buildUUIDBox := func(uuid, content []byte) []byte {
+		sz := 8 + 16 + len(content)
+		b := make([]byte, sz)
+		binary.BigEndian.PutUint32(b[0:], uint32(sz)) //nolint:gosec // G115: sz = 24+len(content), non-negative, bounded by allocation
+		copy(b[4:8], "uuid")
+		copy(b[8:24], uuid)
+		copy(b[24:], content)
+		return b
+	}
+	canonUUID := []byte{
+		0x85, 0xC0, 0xB6, 0x87, 0x82, 0x0F, 0x11, 0xE0,
+		0x81, 0x11, 0xF4, 0xCE, 0x46, 0x2B, 0x6A, 0x48,
+	}
+	xmpPacket := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"/><?xpacket end="w"?>`)
+
+	// UUID content: CMT2 (no CMT1) + XMP.
+	cmt2Box := buildBox("CMT2", bytes.Repeat([]byte{0x22}, 16))
+	xmpBox := buildBox("XMP ", xmpPacket)
+	uuidContent := append(cmt2Box, xmpBox...)
+	uuidBox := buildUUIDBox(canonUUID, uuidContent)
+	moovBox := buildBox("moov", uuidBox)
+
+	var data bytes.Buffer
+	data.Write([]byte{0, 0, 0, 16, 'f', 't', 'y', 'p', 'c', 'r', 'x', ' ', 0, 0, 0, 0})
+	data.Write(moovBox)
+
+	m, err := Read(bytes.NewReader(data.Bytes()))
+	if err != nil {
+		t.Fatalf("TestCR3ReadNoCMT1ParseWarning: Read returned fatal error: %v; want non-fatal with ParseWarning", err)
+	}
+	if m == nil {
+		t.Fatal("TestCR3ReadNoCMT1ParseWarning: Read returned nil Metadata; want *Metadata with ParseWarning")
+	}
+
+	// ParseWarnings must contain exactly one entry for EXIF that wraps ErrNoCMT1Box.
+	if len(m.ParseWarnings) == 0 {
+		t.Fatal("TestCR3ReadNoCMT1ParseWarning: ParseWarnings is empty; want ErrNoCMT1Box warning")
+	}
+	found := false
+	for _, w := range m.ParseWarnings {
+		if w.Segment == "EXIF" && errors.Is(w.Err, cr3.ErrNoCMT1Box) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("TestCR3ReadNoCMT1ParseWarning: ParseWarnings has no EXIF/ErrNoCMT1Box entry; got %v", m.ParseWarnings)
+	}
+
+	// m.EXIF must be nil (no CMT1 → no EXIF data).
+	if m.EXIF != nil {
+		t.Errorf("TestCR3ReadNoCMT1ParseWarning: m.EXIF = non-nil; want nil when CMT1 absent")
+	}
+
+	// m.XMP must be populated from the "XMP " sub-box.
+	if m.XMP == nil {
+		t.Error("TestCR3ReadNoCMT1ParseWarning: m.XMP is nil; XMP sub-box was present and should have been parsed")
+	}
 }

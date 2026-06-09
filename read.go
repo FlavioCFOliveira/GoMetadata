@@ -1,6 +1,7 @@
 package gometadata
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -82,7 +83,8 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 	// rawIPTCDigest carries the 16-byte MD5 from Photoshop resource 0x0425 when
 	// present (JPEG only; nil for all other formats). MWG §3.3.1.
 	// xmpTruncated is set when extended XMP was capped or had invalid layout (#134).
-	rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, err := extractByFormat(r, fmtID)
+	// noCMT1Box is set when a CR3 file has no CMT1 sub-box (audit #138).
+	rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, noCMT1Box, err := extractByFormat(r, fmtID)
 	if err != nil {
 		return nil, err
 	}
@@ -106,6 +108,18 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 		m.ParseWarnings = append(m.ParseWarnings, &ParseSegmentError{
 			Segment: "XMP",
 			Err:     jpeg.ErrExtendedXMPTruncated,
+		})
+	}
+
+	// audit #138: when a CR3 file has a valid moov/UUID structure but no CMT1
+	// sub-box, Extract returns ErrNoCMT1Box. Treat this as a non-fatal condition
+	// so callers still receive XMP and other metadata from the file. The missing
+	// CMT1 is surfaced as a ParseWarning rather than aborting the whole read.
+	// rawEXIF is nil; rawXMP is populated if an "XMP " sub-box was found.
+	if noCMT1Box {
+		m.ParseWarnings = append(m.ParseWarnings, &ParseSegmentError{
+			Segment: "EXIF",
+			Err:     cr3.ErrNoCMT1Box,
 		})
 	}
 
@@ -231,21 +245,32 @@ func ReadFile(path string, opts ...ReadOption) (*Metadata, error) {
 // xmpTruncated is true when the JPEG extended XMP was capped or had invalid
 // chunk layout (#134). The caller converts it to a ParseWarning so it is
 // visible in Metadata.ParseWarnings without aborting parsing.
-func extractByFormat(r io.ReadSeeker, fmtID format.FormatID) (rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire []byte, xmpTruncated bool, err error) {
+//
+// noCMT1Box is true when a CR3 file has a valid moov/UUID structure but no
+// CMT1 sub-box (audit #138). rawEXIF is nil; rawXMP is still returned when
+// an "XMP " sub-box was present. The caller converts it to a ParseWarning.
+func extractByFormat(r io.ReadSeeker, fmtID format.FormatID) (rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire []byte, xmpTruncated, noCMT1Box bool, err error) {
 	if fmtID == format.FormatJPEG {
 		rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, err = jpeg.ExtractFull(r)
 		if err != nil {
-			return nil, nil, nil, nil, nil, false, fmt.Errorf("gometadata: %w", err)
+			return nil, nil, nil, nil, nil, false, false, fmt.Errorf("gometadata: %w", err)
 		}
-		return rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, nil
+		return rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, false, nil
 	}
 	fn, ok := extractors[fmtID]
 	if !ok {
-		return nil, nil, nil, nil, nil, false, &UnsupportedFormatError{}
+		return nil, nil, nil, nil, nil, false, false, &UnsupportedFormatError{}
 	}
 	rawEXIF, rawIPTC, rawXMP, err = fn(r)
 	if err != nil {
-		return nil, nil, nil, nil, nil, false, fmt.Errorf("gometadata: %w", err)
+		// audit #138: cr3.ErrNoCMT1Box is a non-fatal partial-success: the
+		// moov/UUID structure is valid but CMT1 is absent. rawXMP is still
+		// populated when an "XMP " sub-box exists. Surface as ParseWarning
+		// rather than aborting; return noCMT1Box=true so Read records the warning.
+		if errors.Is(err, cr3.ErrNoCMT1Box) {
+			return nil, rawIPTC, nil, rawXMP, nil, false, true, nil
+		}
+		return nil, nil, nil, nil, nil, false, false, fmt.Errorf("gometadata: %w", err)
 	}
-	return rawEXIF, rawIPTC, nil, rawXMP, nil, false, nil
+	return rawEXIF, rawIPTC, nil, rawXMP, nil, false, false, nil
 }

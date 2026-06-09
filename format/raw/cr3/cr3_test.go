@@ -3,6 +3,7 @@ package cr3
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"testing"
 )
 
@@ -626,9 +627,10 @@ func TestExtractSmallSizeNoPanic(t *testing.T) {
 		binary.BigEndian.PutUint32(buf[0:], 8)
 		copy(buf[4:], "moov")
 		_, _, _, err := Extract(bytes.NewReader(buf))
-		// moov is found but has no sub-boxes → no CMT1 → nil rawEXIF, no panic.
-		if err != nil {
-			t.Errorf("Extract: unexpected error for size==headerLen: %v", err)
+		// moov is found but has no sub-boxes → no CMT1 → ErrNoCMT1Box (audit #138).
+		// Must not panic regardless of err value.
+		if err != nil && !errors.Is(err, ErrNoCMT1Box) {
+			t.Errorf("Extract: unexpected error for size==headerLen: %v (want nil or ErrNoCMT1Box)", err)
 		}
 	})
 
@@ -1169,4 +1171,162 @@ func readTwoTrakOffsets(t *testing.T, moovContent []byte, boxType string) (int64
 		t.Fatalf("readTwoTrakOffsets: expected 2 trak boxes, found %d", len(offsets))
 	}
 	return offsets[0], offsets[1]
+}
+
+// ---------------------------------------------------------------------------
+// Gate tests for audit findings #138, #175, #191
+// ---------------------------------------------------------------------------
+
+// TestCR3InjectAddsCMT1WhenAbsent is the gate for audit finding #175.
+//
+// Before the fix, rebuildUUIDContent only replaced an existing CMT1. When the
+// Canon UUID box contained only CMT2/CMT3/CMT4 and no CMT1, Inject with a
+// non-nil rawEXIF silently discarded it. After the fix, a new CMT1 box is
+// appended when rawEXIF is non-nil and no CMT1 sub-box was present.
+//
+// audit #175: rebuildUUIDContent must insert CMT1 when rawEXIF is provided
+// and the original UUID content has no CMT1 sub-box.
+// lclevy canon_cr3: CMT1 is the mandatory IFD0 TIFF stream in the Canon UUID.
+func TestCR3InjectAddsCMT1WhenAbsent(t *testing.T) {
+	t.Parallel()
+
+	// Build a CR3 whose Canon UUID box has only a CMT2 sub-box (no CMT1).
+	// This simulates a file whose UUID is missing the IFD0 box.
+	cmt2Payload := bytes.Repeat([]byte{0xAB}, 32)
+	cmt2Box := buildBox("CMT2", cmt2Payload)
+	uuidBox := buildUUIDBox(canonUUID, cmt2Box)
+	moovBox := buildBox("moov", uuidBox)
+	data := append([]byte{0, 0, 0, 16, 'f', 't', 'y', 'p', 'c', 'r', 'x', ' ', 0, 0, 0, 0}, moovBox...)
+
+	// Confirm the baseline: Extract returns ErrNoCMT1Box before injection.
+	_, _, _, extractErr := Extract(bytes.NewReader(data))
+	if !errors.Is(extractErr, ErrNoCMT1Box) {
+		t.Fatalf("TestCR3InjectAddsCMT1WhenAbsent: baseline Extract expected ErrNoCMT1Box, got %v", extractErr)
+	}
+
+	// Inject a non-nil rawEXIF. With the fix, a CMT1 sub-box must be created.
+	newEXIF := minimalTIFF()
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(data), &out, newEXIF, nil, nil, true); err != nil {
+		t.Fatalf("Inject with non-nil rawEXIF (no existing CMT1): unexpected error: %v", err)
+	}
+
+	// Extract from the output: rawEXIF must now be present and match newEXIF.
+	rawEXIF, _, _, err := Extract(bytes.NewReader(out.Bytes()))
+	if err != nil {
+		t.Fatalf("Extract after Inject: unexpected error: %v", err)
+	}
+	if rawEXIF == nil {
+		t.Fatal("Extract after Inject: rawEXIF is nil; CMT1 was not inserted by rebuildUUIDContent")
+	}
+	if !bytes.Equal(rawEXIF, newEXIF) {
+		t.Errorf("Extract after Inject: rawEXIF mismatch: got %d bytes, want %d bytes",
+			len(rawEXIF), len(newEXIF))
+	}
+}
+
+// TestCR3NoCMT1ReturnsError is the gate for audit finding #138.
+//
+// Before the fix, Extract returned (nil, nil, nil, nil) when CMT1 was absent —
+// callers could not distinguish "no EXIF" from a broken structure. After the
+// fix, Extract returns ErrNoCMT1Box so callers can diagnose and decide whether
+// to proceed with XMP-only data.
+//
+// audit #138: ErrNoCMT1Box is returned when CMT1 is absent after both the
+// UUID-box search and the moov fallback search.
+// lclevy canon_cr3: CMT1 carries IFD0 (TIFF header + IFD entries).
+func TestCR3NoCMT1ReturnsError(t *testing.T) {
+	t.Parallel()
+
+	xmpBytes := []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"/><?xpacket end="w"?>`)
+
+	t.Run("UUID path: CMT2 and XMP only, no CMT1", func(t *testing.T) {
+		t.Parallel()
+		// Canon UUID has CMT2 + XMP but no CMT1.
+		data := buildCR3WithCMT(
+			buildBox("CMT2", bytes.Repeat([]byte{0x22}, 16)),
+			buildBox("XMP ", xmpBytes),
+		)
+		rawEXIF, _, rawXMP, err := Extract(bytes.NewReader(data))
+		if !errors.Is(err, ErrNoCMT1Box) {
+			t.Errorf("Extract: got err=%v, want errors.Is(err, ErrNoCMT1Box)", err)
+		}
+		if rawEXIF != nil {
+			t.Errorf("Extract: rawEXIF = %d bytes, want nil when CMT1 absent", len(rawEXIF))
+		}
+		// XMP must still be returned even when err=ErrNoCMT1Box.
+		if !bytes.Equal(rawXMP, xmpBytes) {
+			t.Errorf("Extract: rawXMP mismatch when CMT1 absent (got %d bytes, want %d)",
+				len(rawXMP), len(xmpBytes))
+		}
+	})
+
+	t.Run("fallback path: moov with no CMT1 and no UUID", func(t *testing.T) {
+		t.Parallel()
+		// moov has no UUID and no CMT1 (only CMT2).
+		cmt2Box := buildBox("CMT2", bytes.Repeat([]byte{0x33}, 12))
+		moovBox := buildBox("moov", cmt2Box)
+		data := append([]byte{0, 0, 0, 16, 'f', 't', 'y', 'p', 'c', 'r', 'x', ' ', 0, 0, 0, 0}, moovBox...)
+
+		rawEXIF, _, _, err := Extract(bytes.NewReader(data))
+		if !errors.Is(err, ErrNoCMT1Box) {
+			t.Errorf("Extract fallback: got err=%v, want errors.Is(err, ErrNoCMT1Box)", err)
+		}
+		if rawEXIF != nil {
+			t.Errorf("Extract fallback: rawEXIF = %d bytes, want nil when CMT1 absent", len(rawEXIF))
+		}
+	})
+}
+
+// TestCR3RelocateInContainerDepthGuard is the gate for audit finding #191.
+//
+// Before the fix, relocateInContainer had no explicit depth guard. The function
+// is in practice bounded by slice shrinkage, but lacked defence-in-depth against
+// crafted ISOBMFF structures. After the fix, `depth > 32` returns nil
+// immediately, mirroring the cap in findBox.
+//
+// The test builds a 50-level-deep nested container chain (trak → mdia → minf →
+// stbl repeated) and feeds it to Inject. Inject must return cleanly without
+// stack overflow.
+//
+// audit #191: ISO 14496-12 §4.2 box hierarchy — depth cap as defence-in-depth.
+func TestCR3RelocateInContainerDepthGuard(t *testing.T) {
+	t.Parallel()
+
+	// Build a deeply nested ISOBMFF container: 50 levels of trak/mdia alternation,
+	// with a stco leaf at the innermost level.
+	const nestingDepth = 50
+
+	// Innermost box: a stco with one entry pointing to offset 0.
+	stcoPayload := make([]byte, 12) // version(1)+flags(3)+count(4)+offset(4)
+	binary.BigEndian.PutUint32(stcoPayload[4:], 1)
+	binary.BigEndian.PutUint32(stcoPayload[8:], 0)
+	inner := buildBox("stco", stcoPayload)
+
+	// Wrap recursively: alternate trak/mdia wrapping to build 50 levels.
+	containerTypes := []string{"stbl", "minf", "mdia", "trak"}
+	for i := range nestingDepth {
+		typ := containerTypes[i%len(containerTypes)]
+		inner = buildBox(typ, inner)
+	}
+
+	// Build a Canon UUID with a CMT1.
+	uuidBox := buildUUIDBox(canonUUID, buildBox("CMT1", minimalTIFF()))
+
+	// moov content: deeply-nested trak chain + UUID.
+	moovContent := append(inner, uuidBox...)
+	moovBox := buildBox("moov", moovContent)
+	data := append([]byte{0, 0, 0, 16, 'f', 't', 'y', 'p', 'c', 'r', 'x', ' ', 0, 0, 0, 0}, moovBox...)
+
+	// Inject with a new EXIF payload. Must return without stack overflow or panic.
+	// The depth guard clips the recursion at 32 and the stco is left unpatched
+	// (which is correct — the stco was already pointing into pre-moov space).
+	var out bytes.Buffer
+	newEXIF := make([]byte, len(minimalTIFF())+8)
+	copy(newEXIF, minimalTIFF())
+	err := Inject(bytes.NewReader(data), &out, newEXIF, nil, nil, true)
+	// Any result (nil error or ErrStcoOverflow) is acceptable; no crash is the requirement.
+	if err != nil && !errors.Is(err, ErrStcoOverflow) {
+		t.Errorf("Inject on deeply-nested container returned unexpected error: %v", err)
+	}
 }

@@ -563,18 +563,21 @@ func TestCR3CMT1NoPrefix(t *testing.T) {
 	}
 }
 
-// TestCR3CMT1MissingReturnsNilEXIF verifies that when CMT1 is absent from the
-// Canon UUID box, Extract returns nil rawEXIF (not an error).
-// The BMFF structure is intact; only the metadata box is missing.
-// containers.md §8(f): "missing CMT* boxes".
-func TestCR3CMT1MissingReturnsNilEXIF(t *testing.T) {
-	// CR3-robust-missing-CMT1: containers.md §8(f) — missing CMT1 → nil rawEXIF, no error.
+// TestCR3CMT1MissingReturnsErrNoCMT1Box verifies that when CMT1 is absent from
+// the Canon UUID box, Extract returns ErrNoCMT1Box and nil rawEXIF.
+// The BMFF structure is intact; only the mandatory metadata box is missing.
+//
+// audit #138: ErrNoCMT1Box distinguishes "no EXIF metadata" from a broken
+// container parse, letting callers decide whether to proceed with XMP-only data.
+// lclevy canon_cr3: CMT1 is the IFD0 TIFF stream; its absence means no EXIF.
+func TestCR3CMT1MissingReturnsErrNoCMT1Box(t *testing.T) {
+	// CR3-robust-missing-CMT1: audit #138 — missing CMT1 → ErrNoCMT1Box + nil rawEXIF.
 	t.Parallel()
 	// Build a UUID box with CMT3 only (no CMT1).
 	data := buildCR3WithCMT(buildBox("CMT3", []byte("makernote-data")))
 	rawEXIF, _, _, err := Extract(bytes.NewReader(data))
-	if err != nil {
-		t.Fatalf("CR3-robust-missing-CMT1: unexpected error: %v", err)
+	if !errors.Is(err, ErrNoCMT1Box) {
+		t.Errorf("CR3-robust-missing-CMT1: got err=%v, want ErrNoCMT1Box", err)
 	}
 	if rawEXIF != nil {
 		t.Errorf("CR3-robust-missing-CMT1: rawEXIF = %d bytes, want nil when CMT1 absent",

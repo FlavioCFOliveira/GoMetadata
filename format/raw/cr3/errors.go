@@ -5,6 +5,22 @@ import "errors"
 // ErrNoMoovBox is returned when the CR3 container does not contain a moov box.
 var ErrNoMoovBox = errors.New("cr3: no moov box found")
 
+// ErrNoCMT1Box is returned by Extract when the moov/UUID structure is present
+// but no CMT1 sub-box is found — neither inside the Canon UUID box nor via the
+// flat fallback search. This distinguishes "no EXIF metadata" from a structurally
+// broken container.
+//
+// lclevy canon_cr3: CMT1 carries IFD0 (the mandatory TIFF header + IFD entries).
+// Its absence means the file has no extractable EXIF.
+//
+// Extract returns a non-nil error so that callers can distinguish the
+// no-CMT1 case from a successful parse. rawXMP and rawIPTC are still returned
+// (non-nil) when those sub-boxes are present, allowing other metadata to be used.
+//
+// The top-level gometadata.Read converts ErrNoCMT1Box to a ParseWarning rather
+// than a fatal error, so that XMP and other metadata remain accessible.
+var ErrNoCMT1Box = errors.New("cr3: CMT1 sub-box absent; no EXIF data in this CR3 file")
+
 // ErrWriteNotSupported was returned by Inject when CR3 writes were blocked
 // (task #56 safe gate). As of task #91, CR3 writes with stco/co64 relocation
 // are fully supported. This sentinel is preserved for compatibility — it is no
