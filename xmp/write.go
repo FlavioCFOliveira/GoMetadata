@@ -128,6 +128,11 @@ func serialise(x *XMP) ([]byte, error) { //nolint:gocyclo,cyclop // complexity i
 			writeStructInListProperty(buf, prefix, ns, parent, props, localList)
 		}
 
+		// #151: localListPool.Put MUST follow the last use of localList (i.e.
+		// after all three classify loops above). Putting the pointer back to the
+		// pool before the loops complete would allow another goroutine to receive
+		// and overwrite the backing slice while this call is still iterating it.
+		// The current placement (after writeStructInListProperty) is correct.
 		localListPool.Put(localListPtr)
 		buf.WriteString("  </rdf:Description>\n")
 	}

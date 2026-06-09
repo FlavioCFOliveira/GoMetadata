@@ -81,7 +81,8 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 	// lossless passthrough writes when the XMP is not modified.
 	// rawIPTCDigest carries the 16-byte MD5 from Photoshop resource 0x0425 when
 	// present (JPEG only; nil for all other formats). MWG §3.3.1.
-	rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, err := extractByFormat(r, fmtID)
+	// xmpTruncated is set when extended XMP was capped or had invalid layout (#134).
+	rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, err := extractByFormat(r, fmtID)
 	if err != nil {
 		return nil, err
 	}
@@ -96,6 +97,16 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 		// carries a Photoshop 0x0425 digest resource). TIFF stores IPTC in tag
 		// 0x83BB without an IRB wrapper, so no digest applies there.
 		rawIPTCDigest: rawIPTCDigest,
+	}
+
+	// #134: surface extended XMP truncation as a ParseWarning so the caller
+	// can inspect it without aborting parsing. rawXMP still contains the main
+	// (standard) XMP packet, which may be fully usable.
+	if xmpTruncated {
+		m.ParseWarnings = append(m.ParseWarnings, &ParseSegmentError{
+			Segment: "XMP",
+			Err:     jpeg.ErrExtendedXMPTruncated,
+		})
 	}
 
 	if err := parseParsedMetadata(m, rawEXIF, rawIPTC, rawXMP, cfg); err != nil {
@@ -202,21 +213,25 @@ func ReadFile(path string, opts ...ReadOption) (*Metadata, error) {
 // extraction. For JPEG it calls ExtractFull so that both extended XMP
 // (byte-stable passthrough) and the Photoshop 0x0425 IPTC digest are surfaced.
 // MWG §3.3.1: the digest is used by iptcTrustElevated() in metadata.go.
-func extractByFormat(r io.ReadSeeker, fmtID format.FormatID) (rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire []byte, err error) {
+//
+// xmpTruncated is true when the JPEG extended XMP was capped or had invalid
+// chunk layout (#134). The caller converts it to a ParseWarning so it is
+// visible in Metadata.ParseWarnings without aborting parsing.
+func extractByFormat(r io.ReadSeeker, fmtID format.FormatID) (rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire []byte, xmpTruncated bool, err error) {
 	if fmtID == format.FormatJPEG {
-		rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, err = jpeg.ExtractFull(r)
+		rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, err = jpeg.ExtractFull(r)
 		if err != nil {
-			return nil, nil, nil, nil, nil, fmt.Errorf("gometadata: %w", err)
+			return nil, nil, nil, nil, nil, false, fmt.Errorf("gometadata: %w", err)
 		}
-		return rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, nil
+		return rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, nil
 	}
 	fn, ok := extractors[fmtID]
 	if !ok {
-		return nil, nil, nil, nil, nil, &UnsupportedFormatError{}
+		return nil, nil, nil, nil, nil, false, &UnsupportedFormatError{}
 	}
 	rawEXIF, rawIPTC, rawXMP, err = fn(r)
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("gometadata: %w", err)
+		return nil, nil, nil, nil, nil, false, fmt.Errorf("gometadata: %w", err)
 	}
-	return rawEXIF, rawIPTC, nil, rawXMP, nil, nil
+	return rawEXIF, rawIPTC, nil, rawXMP, nil, false, nil
 }

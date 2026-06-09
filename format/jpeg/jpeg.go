@@ -19,8 +19,10 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
+	xmppkg "github.com/FlavioCFOliveira/GoMetadata/xmp"
 )
 
 // JPEG marker bytes (ISO/IEC 10918-1, Annex B).
@@ -157,9 +159,21 @@ func appendExtendedXMPChunk(
 	body []byte,
 	extended map[string][]extChunk,
 	extSizes map[string]uint64,
+	extFullLens map[string]uint64,
 	extTruncated bool,
-) (map[string][]extChunk, map[string]uint64, bool) {
-	guid := string(body[:32])
+) (map[string][]extChunk, map[string]uint64, map[string]uint64, bool) {
+	rawGUID := body[:32]
+	// #135: validate that the GUID is exactly 32 hex characters and canonicalise to
+	// uppercase before keying the map. Adobe XMP Specification Part 3 §1.1.4 defines
+	// the GUID as a 32-character uppercase hex string; real-world writers may emit
+	// lowercase. A case mismatch between the main packet's HasExtendedXMP attribute
+	// and the chunk GUID would silently discard all extended properties without this
+	// normalisation.
+	if !isAllHex(rawGUID) {
+		// GUID contains non-hex characters — discard this chunk silently.
+		return extended, extSizes, extFullLens, extTruncated
+	}
+	guid := strings.ToUpper(string(rawGUID))
 	// fullLen is the wire-declared total size for this GUID's assembled payload.
 	fullLen := uint64(binary.BigEndian.Uint32(body[32:36]))
 	offset := binary.BigEndian.Uint32(body[36:40])
@@ -171,6 +185,9 @@ func appendExtendedXMPChunk(
 	}
 	if extSizes == nil {
 		extSizes = make(map[string]uint64)
+	}
+	if extFullLens == nil {
+		extFullLens = make(map[string]uint64)
 	}
 
 	// First-seen check: validate the declared total against the cap and enforce
@@ -184,19 +201,23 @@ func appendExtendedXMPChunk(
 	if _, seen := extSizes[guid]; !seen {
 		if len(extSizes) >= maxExtendedXMPGUIDs {
 			// Too many distinct GUIDs: stop accumulating and mark truncated.
-			return extended, extSizes, true // extTruncated
+			return extended, extSizes, extFullLens, true // extTruncated
 		}
 		if fullLen > maxExtendedXMPTotal {
-			return extended, extSizes, true // extTruncated
+			return extended, extSizes, extFullLens, true // extTruncated
 		}
 		extSizes[guid] = 0 // mark as seen with zero bytes accumulated
+		// #122: record the wire-declared total size so buildXMPResult can validate
+		// that the assembled chunks cover exactly fullLen bytes with no gaps or
+		// overlaps. Adobe XMP Specification Part 3 §1.1.4.
+		extFullLens[guid] = fullLen
 	}
 
 	// Per-chunk running total check: drop this chunk if it would exceed the cap.
 	accumulated := extSizes[guid]
 	chunkSize := uint64(len(chunkData))
 	if accumulated+chunkSize > maxExtendedXMPTotal {
-		return extended, extSizes, true // extTruncated
+		return extended, extSizes, extFullLens, true // extTruncated
 	}
 
 	// Copy chunk data: body aliases scratch and must outlive this loop.
@@ -205,23 +226,25 @@ func appendExtendedXMPChunk(
 		offset: offset,
 		data:   bytes.Clone(chunkData),
 	})
-	return extended, extSizes, extTruncated
+	return extended, extSizes, extFullLens, extTruncated
 }
 
 // processAPP1Segment dispatches an APP1 segment payload to the appropriate
 // metadata bucket (EXIF, standard XMP, or extended XMP).
 //
 // It returns updated values for rawEXIF, rawXMP, the extended chunk map,
-// the per-GUID accumulated byte counter map, and the extTruncated flag.
-// Pass-through values are returned unchanged when the segment does not apply.
+// the per-GUID accumulated byte counter map, the per-GUID declared total map,
+// and the extTruncated flag. Pass-through values are returned unchanged when
+// the segment does not apply.
 //
 // Extended XMP DoS mitigation is delegated to appendExtendedXMPChunk (#40).
 func processAPP1Segment(
 	data, rawEXIF, rawXMP []byte,
 	extended map[string][]extChunk,
 	extSizes map[string]uint64,
+	extFullLens map[string]uint64,
 	extTruncated bool,
-) ([]byte, []byte, map[string][]extChunk, map[string]uint64, bool) {
+) ([]byte, []byte, map[string][]extChunk, map[string]uint64, map[string]uint64, bool) {
 	switch {
 	case bytes.HasPrefix(data, identExif):
 		// EXIF payload begins after the 6-byte "Exif\x00\x00" header.
@@ -253,11 +276,11 @@ func processAPP1Segment(
 		// Extended XMP chunk: GUID (32 bytes) + fullLength (4 bytes) +
 		// offset (4 bytes) + chunk data. Adobe XMP Spec Part 3 §1.1.4.
 		if body := data[len(identXMPNote):]; len(body) >= 40 {
-			extended, extSizes, extTruncated = appendExtendedXMPChunk(body, extended, extSizes, extTruncated)
+			extended, extSizes, extFullLens, extTruncated = appendExtendedXMPChunk(body, extended, extSizes, extFullLens, extTruncated)
 		}
 	}
 
-	return rawEXIF, rawXMP, extended, extSizes, extTruncated
+	return rawEXIF, rawXMP, extended, extSizes, extFullLens, extTruncated
 }
 
 // processAPP13Segment checks a segment payload for the Photoshop IRB prefix and,
@@ -278,42 +301,78 @@ func processAPP13Segment(data []byte) []byte {
 // xmpResult bundles the two forms of XMP returned by scanMetadataSegmentsWithWire.
 // rawXMP is the user-visible reassembled form; rawXMPWire is the internal
 // wire-frame encoding (non-nil only when extended XMP was present).
+// truncated is set when extended XMP chunks were dropped due to size cap or
+// structural invalidity; callers may convert this to a ParseWarning. (#134).
 type xmpResult struct {
 	rawXMP     []byte // reassembled, user-visible
 	rawXMPWire []byte // wire-frame for lossless passthrough writes (may be nil)
+	truncated  bool   // #134: extended XMP was capped or structurally invalid
 }
 
 // buildXMPResult constructs an xmpResult from the raw main packet and any
 // extended chunks collected during segment scanning.
 //
 // When extended is nil or empty: rawXMP = main, rawXMPWire = nil.
-// When extended chunks are present: rawXMP = reassembled(main, ext),
+// When extended chunks are present and valid: rawXMP = reassembled(main, ext),
 // rawXMPWire = encodeXMPWire(main, assembledExt).
-func buildXMPResult(rawXMP []byte, extended map[string][]extChunk) xmpResult {
+//
+// extTruncated is forwarded to the returned xmpResult.truncated field.
+// extFullLens carries the wire-declared total size per GUID for validation (#122).
+func buildXMPResult(rawXMP []byte, extended map[string][]extChunk, extFullLens map[string]uint64, extTruncated bool) xmpResult {
 	if rawXMP == nil || len(extended) == 0 {
-		return xmpResult{rawXMP: rawXMP}
+		return xmpResult{rawXMP: rawXMP, truncated: extTruncated}
 	}
 
 	guid, found := extractGUIDFromMain(rawXMP)
 	if !found {
-		return xmpResult{rawXMP: rawXMP}
+		return xmpResult{rawXMP: rawXMP, truncated: extTruncated}
 	}
+
+	// #135: canonicalize the GUID from the main packet to uppercase so it
+	// matches the normalised keys stored by appendExtendedXMPChunk.
+	// Adobe XMP Specification Part 3 §1.1.4: GUID is 32 uppercase hex chars.
+	guid = strings.ToUpper(guid)
+
 	chunks, ok := extended[guid]
 	if !ok || len(chunks) == 0 {
-		return xmpResult{rawXMP: rawXMP}
+		return xmpResult{rawXMP: rawXMP, truncated: extTruncated}
 	}
 
-	extBytes := mergeExtendedChunks(chunks)
+	// #122: validate chunk layout before assembling. Adobe XMP Specification
+	// Part 3 §1.1.4: chunks must cover [0, fullLen) contiguously with no gaps,
+	// overlaps, or duplicated offsets. On any violation degrade gracefully to
+	// the main (standard) XMP packet and mark truncated.
+	declaredTotal, hasDeclared := extFullLens[guid]
+	extBytes, valid := mergeExtendedChunksValidated(chunks, declaredTotal, hasDeclared)
+	if !valid {
+		// Chunk layout is corrupt; return main packet only and signal truncation.
+		return xmpResult{rawXMP: rawXMP, truncated: true}
+	}
 
-	// Build wire-frame BEFORE modifying the extended chunks map, so that the
-	// original raw bytes are preserved verbatim for passthrough writes.
+	// Build wire-frame BEFORE any reassembly, so that the original raw bytes
+	// are preserved verbatim for passthrough writes.
 	wire := encodeXMPWire(rawXMP, extBytes)
 
-	// Now reassemble the user-visible form.
-	extMap := map[string][]extChunk{guid: {{offset: 0, data: extBytes}}}
-	reassembled := reassembleExtendedXMP(rawXMP, extMap)
+	// #123: Use xmp.Parse to merge the extended document into the main packet
+	// in a prefix-agnostic way. The extended XMP document is a full XMP packet
+	// that may bind the RDF namespace to any prefix (e.g. R:, RDF:); a literal
+	// string search for "<rdf:Description" would silently drop all properties
+	// when a non-canonical prefix is used. Parsing both packets and merging
+	// Properties maps handles all namespace prefix assignments correctly.
+	// Adobe XMP Specification Part 3 §1.1.4: the assembler must merge the
+	// extended properties into the main XMP packet.
+	//
+	// Fall back to the byte-splice reassembler when xmp.Parse fails on either
+	// packet (e.g. deeply malformed XML), so that the common "rdf:" prefix case
+	// is always served.
+	reassembled := reassembleExtendedXMPByParse(rawXMP, extBytes)
+	if reassembled == nil {
+		// xmp.Parse fallback: use the old byte-splice method.
+		extMap := map[string][]extChunk{guid: {{offset: 0, data: extBytes}}}
+		reassembled = reassembleExtendedXMP(rawXMP, extMap)
+	}
 
-	return xmpResult{rawXMP: reassembled, rawXMPWire: wire}
+	return xmpResult{rawXMP: reassembled, rawXMPWire: wire, truncated: extTruncated}
 }
 
 // readSOI reads and validates the 2-byte JPEG SOI marker from soi.
@@ -340,9 +399,11 @@ func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte) (rawEXIF, raw
 	// the map allocation on the fast path.
 	//
 	// extSizes tracks accumulated byte totals per GUID for the #40 DoS cap.
-	// extTruncated is set true when any GUID's payload was capped.
+	// extFullLens stores the wire-declared total size per GUID for #122 validation.
+	// extTruncated is set true when any GUID's payload was capped or invalid.
 	var extended map[string][]extChunk
 	var extSizes map[string]uint64
+	var extFullLens map[string]uint64
 	var extTruncated bool
 	var mainXMP []byte
 
@@ -367,8 +428,8 @@ func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte) (rawEXIF, raw
 
 		switch marker {
 		case markerAPP1:
-			rawEXIF, mainXMP, extended, extSizes, extTruncated = processAPP1Segment(
-				data, rawEXIF, mainXMP, extended, extSizes, extTruncated,
+			rawEXIF, mainXMP, extended, extSizes, extFullLens, extTruncated = processAPP1Segment(
+				data, rawEXIF, mainXMP, extended, extSizes, extFullLens, extTruncated,
 			)
 		case markerAPP13:
 			// Accumulate each Photoshop APP13 payload (after stripping the header);
@@ -383,15 +444,13 @@ func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte) (rawEXIF, raw
 			}
 		case markerSOS, markerEOI:
 			// SOS/EOI: no more metadata segments follow.
-			_ = extTruncated // truncation is currently informational; callers get partial XMP
 			rawIPTC, iptcDigest = extractIPTCAndDigestFromIRBPayloads(app13Payloads)
-			return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, extended)
+			return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, extended, extFullLens, extTruncated)
 		}
 	}
 
-	_ = extTruncated // truncation is currently informational; callers get partial XMP
 	rawIPTC, iptcDigest = extractIPTCAndDigestFromIRBPayloads(app13Payloads)
-	return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, extended)
+	return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, extended, extFullLens, extTruncated)
 }
 
 // parseIRBForIPTCAndDigest scans a single contiguous Photoshop IRB byte block
@@ -508,18 +567,25 @@ func ExtractWithWire(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP, rawXMPWire []by
 }
 
 // ExtractFull reads the JPEG marker stream and returns raw payloads, the
-// optional IPTC digest from Photoshop resource 0x0425, and the optional XMP
-// wire-frame. iptcDigest is a 16-byte slice when present, nil when absent.
+// optional IPTC digest from Photoshop resource 0x0425, the optional XMP
+// wire-frame, and whether the extended XMP was truncated.
+//
+// iptcDigest is a 16-byte slice when present, nil when absent.
+// xmpTruncated is true when the assembled extended XMP payload was capped at
+// maxExtendedXMPTotal (16 MiB) or had structurally invalid chunk layout (#134).
+// When xmpTruncated is true rawXMP contains the main (standard) XMP packet only;
+// callers that surface warnings should record ErrExtendedXMPTruncated.
 //
 // MWG Guidelines v2.0 §3.3.1: the caller should compare the digest to
 // iptc.Digest(rawIPTC) to determine whether IPTC or XMP has read priority.
-// Use Extract for callers that do not need the digest or the wire-frame.
-func ExtractFull(r io.ReadSeeker) (rawEXIF, rawIPTC, iptcDigest, rawXMP, rawXMPWire []byte, err error) {
+// Use Extract for callers that do not need the digest, the wire-frame, or the
+// truncation flag.
+func ExtractFull(r io.ReadSeeker) (rawEXIF, rawIPTC, iptcDigest, rawXMP, rawXMPWire []byte, xmpTruncated bool, err error) {
 	rawEXIF, rawIPTC, iptcDigest, xmpRes, err := extractFullInternal(r)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, false, err
 	}
-	return rawEXIF, rawIPTC, iptcDigest, xmpRes.rawXMP, xmpRes.rawXMPWire, nil
+	return rawEXIF, rawIPTC, iptcDigest, xmpRes.rawXMP, xmpRes.rawXMPWire, xmpRes.truncated, nil
 }
 
 // extractFullInternal is the shared implementation of Extract, ExtractWithWire, and ExtractFull.
@@ -678,6 +744,23 @@ func writeExtendedChunks(w io.Writer, guidBytes, ext []byte) error {
 	return nil
 }
 
+// writeIPTCSegmentRaw writes a pre-built IRB byte slice as an APP13 segment.
+// The irb parameter is the complete IRB payload (without the "Photoshop 3.0\x00"
+// header); the function prepends identPS and emits the segment.
+// Used by writeNewMetadataSegments when rawIPTC is nil but sibling resources
+// must be preserved (#174).
+func writeIPTCSegmentRaw(w io.Writer, irb []byte) error {
+	if len(identPS)+len(irb)+2 > 65535 {
+		return fmt.Errorf("jpeg: IRB sibling payload %d bytes exceeds APP13 segment limit: %w", len(irb), ErrIPTCPayloadTooLarge)
+	}
+	iptcBuf := iobuf.Get(len(identPS) + len(irb))
+	copy(*iptcBuf, identPS)
+	copy((*iptcBuf)[len(identPS):], irb)
+	writeErr := writeSegment(w, markerAPP13, *iptcBuf)
+	iobuf.Put(iptcBuf)
+	return writeErr
+}
+
 // writeIPTCSegment wraps the IPTC IIM stream in a Photoshop IRB block and
 // writes it as an APP13 segment. APP13 length field is 16-bit; EXIF §4.5.6.
 //
@@ -709,15 +792,24 @@ func writeIPTCSegment(w io.Writer, rawIPTC, origIRB []byte) error {
 // block wrapping newIPTCData. All other 8BIM blocks are appended verbatim in
 // their original order and with their original padding.
 //
-// If origIRB contains no 0x0404 block the new block is appended at the end.
-// If origIRB is malformed (parseIRBEntry fails before a replacement position is
-// found), the function falls back to buildIRB(newIPTCData) to ensure the
+// When newIPTCData is nil the 0x0404 block is removed rather than replaced.
+// All sibling resources are preserved in both cases. This behaviour is
+// required by #174: a nil rawIPTC to Inject must strip only the IPTC data
+// while keeping Photoshop siblings such as the 0x0425 digest resource.
+//
+// If origIRB contains no 0x0404 block and newIPTCData is non-nil, the new
+// block is appended at the end. If origIRB is malformed and newIPTCData is
+// non-nil, the function falls back to buildIRB(newIPTCData) to ensure the
 // essential IPTC data is never lost.
 //
 // EXIF §4.5.6: each 8BIM block is 4 ('8BIM') + 2 (ID) + pascal-name + 4 (size)
 // + data [+ 1 padding if data size is odd].
 func spliceIPTCIntoIRB(origIRB, newIPTCData []byte) []byte {
-	newBlock := buildIRB(newIPTCData) // the replacement 0x0404 block
+	// When newIPTCData is nil the 0x0404 block is removed; no replacement is built.
+	var newBlock []byte
+	if newIPTCData != nil {
+		newBlock = buildIRB(newIPTCData) // the replacement 0x0404 block
+	}
 
 	// Pre-allocate a conservative capacity. The result is at most
 	// len(origIRB) + len(newBlock) (old 0x0404 replaced, not just appended).
@@ -762,8 +854,10 @@ func spliceIPTCIntoIRB(origIRB, newIPTCData []byte) []byte {
 		pos = blockEnd
 	}
 
-	if !replaced {
-		// No 0x0404 block was found in the original IRB: append the new one.
+	if !replaced && newBlock != nil {
+		// No 0x0404 block was found in the original IRB and we have a replacement:
+		// append the new one at the end. When newIPTCData is nil (remove-only mode)
+		// there is nothing to append; we just return the siblings-only result.
 		out = append(out, newBlock...)
 	}
 	return out
@@ -777,6 +871,12 @@ func spliceIPTCIntoIRB(origIRB, newIPTCData []byte) []byte {
 // 3.0\x00" header) from the source JPEG, or nil if the source had no APP13.
 // When non-nil it is used by writeIPTCSegment to preserve sibling 8BIM
 // resources while replacing only the 0x0404 block.
+//
+// #174: when rawIPTC is nil but origIRB is non-nil, the 0x0404 block is
+// removed while all sibling 8BIM resources are preserved. The resulting APP13
+// segment is only written when the stripped IRB is non-empty (i.e. when the
+// original APP13 contained resources other than 0x0404). If the stripped IRB
+// is empty (0x0404 was the only resource) no APP13 segment is emitted.
 func writeNewMetadataSegments(w io.Writer, rawEXIF, rawIPTC, rawXMP, origIRB []byte) error {
 	if rawEXIF != nil {
 		if err := writeEXIFSegment(w, rawEXIF); err != nil {
@@ -788,10 +888,35 @@ func writeNewMetadataSegments(w io.Writer, rawEXIF, rawIPTC, rawXMP, origIRB []b
 			return err
 		}
 	}
+	if err := writeIPTCOrSiblings(w, rawIPTC, origIRB); err != nil {
+		return err
+	}
+	return nil
+}
+
+// writeIPTCOrSiblings handles the IPTC / Photoshop-sibling write decision.
+//
+//   - rawIPTC non-nil  → write APP13 with rawIPTC spliced into origIRB (or bare).
+//   - rawIPTC nil, origIRB non-nil → strip 0x0404, write APP13 with remaining siblings.
+//   - rawIPTC nil, origIRB nil  → no APP13 emitted.
+//
+// This helper exists solely to satisfy the nestif linter; the logic matches
+// the comment in writeNewMetadataSegments (#174).
+func writeIPTCOrSiblings(w io.Writer, rawIPTC, origIRB []byte) error {
 	if rawIPTC != nil {
-		if err := writeIPTCSegment(w, rawIPTC, origIRB); err != nil {
-			return err
-		}
+		return writeIPTCSegment(w, rawIPTC, origIRB)
+	}
+	if origIRB == nil {
+		return nil
+	}
+	// rawIPTC is nil but the source had Photoshop siblings: strip only 0x0404
+	// and preserve the rest. spliceIPTCIntoIRB with nil newIPTCData removes
+	// the 0x0404 block and returns the remaining sibling blocks verbatim.
+	// Adobe Photoshop IRB spec §"Image Resources": all non-IPTC resources must
+	// survive a nil-IPTC write (#174).
+	stripped := spliceIPTCIntoIRB(origIRB, nil)
+	if len(stripped) > 0 {
+		return writeIPTCSegmentRaw(w, stripped)
 	}
 	return nil
 }
@@ -901,40 +1026,62 @@ func copyNonMetadataSegments(r io.Reader, w io.Writer, scratch *[]byte, preserve
 	}
 }
 
-// extractOriginalIRB performs a pre-scan of the JPEG in r to locate the first
-// Photoshop APP13 segment and return a copy of its IRB bytes (the content after
-// the "Photoshop 3.0\x00" header). Returns nil when no APP13 is present or the
-// segment does not carry the Photoshop prefix.
+// extractOriginalIRB performs a pre-scan of the JPEG in r to locate ALL
+// Photoshop APP13 segments and returns the concatenated IRB bytes (the content
+// after each "Photoshop 3.0\x00" header). Returns nil when no APP13 is present
+// or no segment carries the Photoshop prefix.
+//
+// Adobe Photoshop IRB specification / IPTC IRB-APP13-09: when a JPEG carries
+// more than one APP13 Photoshop segment, all payloads are concatenated in order
+// to form a single logical IRB. This function mirrors the read-path
+// app13Payloads accumulation in scanMetadataSegmentsWithWire so that sibling
+// 8BIM resources split across multiple APP13 segments are all preserved when
+// Inject rewrites the file (#174).
 //
 // The caller is responsible for seeking r back to the desired position after
 // this call. scratch is used as an internal read buffer and must not be nil.
-func extractOriginalIRB(r io.ReadSeeker, scratch *[]byte) []byte {
+func extractOriginalIRB(r io.ReadSeeker, scratch *[]byte) []byte { //nolint:cyclop,gocyclo // multi-APP13 accumulation requires the extra branches; complexity is essential not accidental
 	// Seek past the SOI (already validated by the caller — 2 bytes).
 	if _, err := r.Seek(2, io.SeekStart); err != nil {
 		return nil
 	}
+	// #174: accumulate payloads from ALL Photoshop APP13 segments, not just
+	// the first. The logical IRB is the concatenation of all APP13 payloads.
+	var payloads [][]byte
 	for {
 		marker, data, err := readSegment(r, scratch)
 		if err != nil {
-			return nil
+			break
 		}
 		switch marker {
 		case markerAPP13:
 			if bytes.HasPrefix(data, identPS) {
-				// Copy the IRB bytes (data[len(identPS):]) so they survive
-				// beyond the next readSegment call that would overwrite scratch.
 				irb := data[len(identPS):]
-				if len(irb) == 0 {
-					return nil
+				if len(irb) > 0 {
+					payloads = append(payloads, bytes.Clone(irb))
 				}
-				out := make([]byte, len(irb))
-				copy(out, irb)
-				return out
 			}
 		case markerSOS, markerEOI:
-			return nil
+			goto done
 		}
 	}
+done:
+	if len(payloads) == 0 {
+		return nil
+	}
+	if len(payloads) == 1 {
+		return payloads[0]
+	}
+	// Concatenate all payloads into one logical IRB.
+	var total int
+	for _, p := range payloads {
+		total += len(p)
+	}
+	combined := make([]byte, 0, total)
+	for _, p := range payloads {
+		combined = append(combined, p...)
+	}
+	return combined
 }
 
 // Inject reads the JPEG marker stream from r, replaces the relevant APP
@@ -956,8 +1103,10 @@ func extractOriginalIRB(r io.ReadSeeker, scratch *[]byte) []byte {
 // When the source JPEG carries a Photoshop APP13 segment that contains 8BIM
 // resources in addition to the 0x0404 IPTC block (e.g. IPTC digest 0x0425,
 // thumbnail 0x040C, ICC clipping path 0x040F), Inject preserves all sibling
-// resources verbatim and only replaces the 0x0404 block with rawIPTC. When the
-// source has no APP13, or when rawIPTC is nil, the behaviour is unchanged.
+// resources verbatim and only replaces the 0x0404 block with rawIPTC. When
+// rawIPTC is nil and the source has a Photoshop APP13, the 0x0404 block is
+// removed while all other 8BIM sibling resources are preserved (#174). When the
+// source has no APP13 at all, no APP13 is emitted in the output.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("jpeg: seek: %w", err)
@@ -967,12 +1116,14 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	// sibling resources are preserved when we write the new APP13 below.
 	// We use a pooled buffer for this scan only; it is returned before the
 	// second seek so that the main copy loop can reuse its own buffer cleanly.
-	var origIRB []byte
-	if rawIPTC != nil {
-		preScratch := iobuf.Get(4096)
-		origIRB = extractOriginalIRB(r, preScratch)
-		iobuf.Put(preScratch)
-	}
+	//
+	// #174: always extract origIRB regardless of rawIPTC, so that a nil rawIPTC
+	// can still strip 0x0404 while preserving sibling resources (e.g. 0x0425
+	// IPTC digest). Without this pre-scan the nil-IPTC path drops the whole
+	// APP13, destroying all Photoshop siblings.
+	preScratch := iobuf.Get(4096)
+	origIRB := extractOriginalIRB(r, preScratch)
+	iobuf.Put(preScratch)
 
 	// Seek back to the start for the main copy pass.
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
@@ -1187,6 +1338,14 @@ func parseIRB(b []byte) []byte {
 		// Apply even-padding to data block (EXIF §4.5.6).
 		if len(data)%2 != 0 {
 			pos++
+			// #151: clamp pos so a single non-IPTC block with odd-length data and no
+			// trailing pad byte does not advance pos past len(b). The for-guard
+			// (pos < len(b)) already prevents an out-of-bounds read, but leaving pos
+			// one beyond len(b) is semantically incorrect and mirrors the identical
+			// clamp in spliceIPTCIntoIRB. Adobe Photoshop IRB spec §"Image Resources".
+			if pos > len(b) {
+				pos = len(b)
+			}
 		}
 	}
 	return nil
@@ -1333,8 +1492,22 @@ func extractGUIDFromMain(main []byte) (guid string, ok bool) {
 	return string(rest[:32]), true
 }
 
+// isAllHex reports whether b consists entirely of ASCII hex digits (0-9, a-f, A-F).
+// Used to validate the 32-character GUID in extended XMP APP1 segments.
+// Adobe XMP Specification Part 3 §1.1.4: GUID is a 32-character uppercase hex string.
+func isAllHex(b []byte) bool {
+	for _, c := range b {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
 // mergeExtendedChunks sorts chunks by their byte offset and concatenates their
 // data fields into a single contiguous extended XMP byte slice.
+// This function does NOT validate chunk layout; use mergeExtendedChunksValidated
+// when the declared total size is known.
 func mergeExtendedChunks(chunks []extChunk) []byte {
 	sort.Slice(chunks, func(i, j int) bool {
 		return chunks[i].offset < chunks[j].offset
@@ -1349,6 +1522,112 @@ func mergeExtendedChunks(chunks []extChunk) []byte {
 		extBytes = append(extBytes, c.data...)
 	}
 	return extBytes
+}
+
+// mergeExtendedChunksValidated sorts chunks by offset, validates that they form
+// a contiguous, non-overlapping sequence starting at offset 0 and covering
+// exactly declaredTotal bytes (when hasDeclaredTotal is true), and returns the
+// assembled bytes and a validity flag.
+//
+// Validation rules (Adobe XMP Specification Part 3 §1.1.4, #122):
+//   - First chunk must have offset == 0.
+//   - Each subsequent chunk must start exactly where the previous one ended
+//     (chunk[i].offset == chunk[i-1].offset + len(chunk[i-1].data)).
+//   - When hasDeclaredTotal is true, the assembled length must equal declaredTotal.
+//
+// On any violation, returns (nil, false): buildXMPResult must degrade to the
+// main packet only rather than returning corrupted or doubled reassembled bytes.
+func mergeExtendedChunksValidated(chunks []extChunk, declaredTotal uint64, hasDeclaredTotal bool) ([]byte, bool) {
+	if len(chunks) == 0 {
+		return nil, false
+	}
+	sort.Slice(chunks, func(i, j int) bool {
+		return chunks[i].offset < chunks[j].offset
+	})
+
+	// First chunk must start at offset 0.
+	if chunks[0].offset != 0 {
+		return nil, false
+	}
+
+	// Each subsequent chunk must be contiguous with the previous one.
+	var totalLen int
+	for i, c := range chunks {
+		if i > 0 {
+			expectedOffset := chunks[i-1].offset + uint32(len(chunks[i-1].data)) //nolint:gosec // G115: chunk offset/size bounded by maxExtendedXMPTotal (16 MiB)
+			if c.offset != expectedOffset {
+				// Gap or overlap detected: reject the assembled payload.
+				return nil, false
+			}
+		}
+		totalLen += len(c.data)
+	}
+
+	// When the wire-declared total is known, assembled length must match exactly.
+	// Adobe XMP Specification Part 3 §1.1.4: fullLength is the total size of the
+	// extended XMP document; every byte must be accounted for.
+	if hasDeclaredTotal && uint64(totalLen) != declaredTotal {
+		return nil, false
+	}
+
+	extBytes := make([]byte, 0, totalLen)
+	for _, c := range chunks {
+		extBytes = append(extBytes, c.data...)
+	}
+	return extBytes, true
+}
+
+// reassembleExtendedXMPByParse merges the extended XMP document into the main
+// XMP packet using xmp.Parse for prefix-agnostic property extraction.
+//
+// Adobe XMP Specification Part 3 §1.1.4: after assembling the extended payload
+// the reader must merge its properties into the main packet. The extended packet
+// is a full XMP document that may use any namespace prefix binding (not
+// necessarily "rdf:"); a literal string search for "<rdf:Description" fails
+// silently when a non-canonical prefix is used. This function parses both
+// documents with xmp.Parse and merges the Properties maps, which is correct
+// regardless of prefix assignment. (#123)
+//
+// Merge policy: properties already present in main are not overwritten (main
+// wins on conflict), consistent with Adobe XMP Specification Part 3 §1.1.4
+// which states that the extended packet extends rather than replaces the main.
+//
+// Returns nil when either packet fails to parse OR when the extended packet
+// yields no properties after parsing. The latter case means extBytes is not a
+// proper full-XMP packet (e.g. it is a raw RDF fragment); the caller must fall
+// back to the byte-splice reassembler, which handles such fragments correctly.
+func reassembleExtendedXMPByParse(mainBytes, extBytes []byte) []byte {
+	mainXMP, err := xmppkg.Parse(mainBytes)
+	if err != nil {
+		return nil
+	}
+	extXMP, err := xmppkg.Parse(extBytes)
+	if err != nil {
+		return nil
+	}
+	// If the extended packet parsed but carries no properties, it is most likely
+	// not a proper full XMP document (e.g. a raw rdf:Description fragment that
+	// xmp.Parse accepted without error due to its lenient parser). Signal the
+	// caller to use the byte-splice fallback, which handles RDF fragments.
+	if len(extXMP.Properties) == 0 {
+		return nil
+	}
+
+	// Merge: add extended properties that are absent from the main packet.
+	// main wins on conflict (Adobe XMP Spec Part 3 §1.1.4).
+	for ns, props := range extXMP.Properties {
+		for local, val := range props {
+			if mainXMP.Get(ns, local) == "" {
+				mainXMP.Set(ns, local, val)
+			}
+		}
+	}
+
+	encoded, err := xmppkg.Encode(mainXMP)
+	if err != nil {
+		return nil
+	}
+	return encoded
 }
 
 // reassembleExtendedXMP merges extended XMP chunks into the main XMP packet
