@@ -35,3 +35,6 @@
 - [traverse() offset=0 bug — Canon/Sony/DJI/Samsung/Casio/Leica Type 0](feedback_traverse_offset_zero.md) — `for cur != 0` guard skips offset=0 IFDs; fix uses `first bool` flag; commit 2d3866e
 - [XMP conformance battery (task #154, commit 2d3866e)](project_xmp_conformance_battery.md) — 67 rules all passing; U+001E dual-use as delimiter; ROB-10 C0 filter; ROB-11/NS-03 uniquePrefixFor
 - [MWG-02 IPTC digest reconciliation (task #168)](project_mwg02_iptc_digest.md) — digest-aware precedence in Caption/Copyright/Creator/Keywords; ExtractFull surfaces iptcDigest; iptcTrustElevated() in metadata.go
+- [JPEG conformance battery (task #155)](project_jpeg_conformance_battery.md) — 26 §1 assertions; bug fixed in processAPP1Segment (first-wins for EXIF+XMP)
+- [TIFF+BigTIFF conformance battery (task #156)](project_tiff_conformance_battery.md) — 51 sub-tests; 0 violations; covers S-01..S-17, R-01..R-13, TIFF-01..03, ROBUST-16, corpus+BigTIFF files
+- [PNG conformance battery (task #157)](project_png_conformance_battery.md) — 40 top-level tests, 2 spec violations fixed: handleXMPChunk first-wins (PNG-04) + length boundary test
