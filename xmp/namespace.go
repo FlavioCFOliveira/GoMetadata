@@ -1,5 +1,7 @@
 package xmp
 
+import "strconv"
+
 // Well-known XMP namespace URIs and their conventional prefixes
 // (XMP Part 1 §B, Adobe XMP Specification Appendix A).
 const (
@@ -74,11 +76,29 @@ var prefixMap = map[string]string{ //nolint:gochecknoglobals // read-only namesp
 	NSxmpNote:   "xmpNote",
 }
 
-// prefixOf returns the conventional namespace prefix for a URI.
-// Falls back to "ns" for unknown namespaces.
-func prefixOf(uri string) string {
+// uniquePrefixFor returns a prefix for uri that is not already in used.
+// For well-known URIs the canonical prefix is returned (it must already be in
+// used from the pre-population step in serialise, so no collision is possible).
+// For unknown URIs a generated prefix nsN (ns0, ns1, …) is assigned, where N is
+// the current value of counter.  The chosen prefix is registered in used before
+// returning so subsequent calls with a different unknown URI get a distinct value.
+//
+// NS-03 / XMP Part 1 §6 / XML Namespaces: the serialiser MUST NOT bind two
+// distinct namespace URIs to the same XML prefix within a single document.
+func uniquePrefixFor(uri string, used map[string]struct{}, counter *int) string {
 	if p, ok := prefixMap[uri]; ok {
+		// Canonical prefix — already pre-registered in used; return as-is.
 		return p
 	}
-	return "ns"
+	// Generate ns0, ns1, … until we find one that is not in use.
+	// In practice a document with more than a handful of unknown namespaces is
+	// extremely rare; the loop terminates in O(1) almost always.
+	for {
+		p := "ns" + strconv.Itoa(*counter)
+		*counter++
+		if _, taken := used[p]; !taken {
+			used[p] = struct{}{}
+			return p
+		}
+	}
 }

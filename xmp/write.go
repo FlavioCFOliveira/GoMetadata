@@ -32,7 +32,7 @@ var localListPool = sync.Pool{New: func() any { s := make([]string, 0, 16); retu
 // serialise encodes x to a padded XMP packet.
 // The packet uses UTF-8 encoding and a read/write <?xpacket?> wrapper
 // with 2 KB of whitespace padding per XMP §7.3 (in-place editing support).
-func serialise(x *XMP) ([]byte, error) {
+func serialise(x *XMP) ([]byte, error) { //nolint:gocyclo,cyclop // complexity is inherent: XMP serialiser must handle structs, arrays, bags, sequences, and all scalar types with distinct XML representations
 	buf := encBufPool.Get().(*bytes.Buffer) //nolint:forcetypeassert,revive // encBufPool.New always stores *bytes.Buffer; pool invariant
 	buf.Reset()
 
@@ -62,9 +62,24 @@ func serialise(x *XMP) ([]byte, error) {
 	*nsListPtr = nsList
 	defer nsListPool.Put(nsListPtr)
 
+	// NS-03 / XMP Part 1 §6 / XML Namespaces: the writer MUST NOT bind two
+	// distinct URIs to the same prefix.  Well-known URIs have fixed canonical
+	// prefixes (prefixMap).  Unknown URIs fall back to generated prefixes
+	// ns0, ns1, … using a per-call counter so sibling unknown namespaces always
+	// get distinct prefixes regardless of insertion order.
+	usedPrefixes := make(map[string]struct{}, len(nsList))
+	// Pre-populate with all well-known prefixes that will be used in this packet,
+	// so generated ns0/ns1/… never accidentally collide with a canonical prefix.
+	for _, ns := range nsList {
+		if p, ok := prefixMap[ns]; ok {
+			usedPrefixes[p] = struct{}{}
+		}
+	}
+	unknownNSCounter := 0
+
 	for _, ns := range nsList {
 		props := x.Properties[ns]
-		prefix := prefixOf(ns)
+		prefix := uniquePrefixFor(ns, usedPrefixes, &unknownNSCounter)
 		buf.WriteString("  <rdf:Description rdf:about=\"\" xmlns:")
 		buf.WriteString(prefix)
 		buf.WriteString("=\"")
@@ -395,24 +410,74 @@ func collectStructInListIndices(parent string, localList []string) []int {
 // writeXMLEscaped writes s to buf with XML character escaping, operating
 // directly on the string to avoid the []byte(s) conversion that
 // encoding/xml.EscapeText requires.  Handles the five predefined XML
-// entities plus the CR character (XML 1.0 §2.2 and §4.6).
-func writeXMLEscaped(buf *bytes.Buffer, s string) {
+// entities, the CR character, and the XML 1.0 §2.2 forbidden C0 control
+// characters (ROB-10 / VT-08 / XMP conformance).
+//
+// XML 1.0 §2.2 forbidden code points that MUST NOT appear in any serialised
+// XML document: U+0000–U+0008, U+000B, U+000C, U+000E–U+001F, U+FFFE, U+FFFF.
+// These are replaced with U+FFFD (REPLACEMENT CHARACTER, UTF-8: EF BF BD) per
+// Unicode §5.22 "Best Practice for U+FFFD Substitution".  The three-byte UTF-8
+// sequence is written directly so that no additional rune-decode round-trip is
+// needed on the hot serialisation path.
+//
+// Note: the forbidden-character check operates on individual bytes of the UTF-8
+// encoding.  The multi-byte sequences for U+FFFE (EF BF BE) and U+FFFF (EF BF
+// BF) share the leading byte 0xEF with many legitimate CJK characters, so they
+// are detected by a three-byte lookahead rather than a single-byte switch.
+func writeXMLEscaped(buf *bytes.Buffer, s string) { //nolint:cyclop,gocyclo // XML 1.0 §2.2 C0 range + multi-byte U+FFFE/FFFF detection requires this branching; refactoring would obscure the spec logic
 	last := 0
-	for i := range len(s) {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
 		var esc string
-		switch s[i] {
-		case '&':
-			esc = "&amp;"
-		case '<':
-			esc = "&lt;"
-		case '>':
-			esc = "&gt;"
-		case '"':
-			esc = "&#34;"
-		case '\'':
-			esc = "&#39;"
-		case '\r':
+		switch {
+		// ── XML 1.0 §2.2 forbidden C0 control characters ───────────────
+		// U+0000–U+0008 (NUL through BS): forbidden in XML 1.0.
+		// ROB-10 / VT-08: replace with U+FFFD rather than emitting invalid XML.
+		case c <= 0x08:
+			buf.WriteString(s[last:i])
+			buf.WriteString("\xef\xbf\xbd") // U+FFFD UTF-8
+			last = i + 1
+			continue
+		// U+0009 (TAB): legal XML whitespace — fall through to default.
+		// U+000A (LF): legal XML whitespace — fall through to default.
+		// U+000B (VT): forbidden.
+		// U+000C (FF): forbidden.
+		case c == 0x0B || c == 0x0C:
+			buf.WriteString(s[last:i])
+			buf.WriteString("\xef\xbf\xbd") // U+FFFD UTF-8
+			last = i + 1
+			continue
+		// U+000D (CR): legal but must be escaped as &#xD; per XML normalisation.
+		case c == '\r':
 			esc = "&#xD;"
+		// U+000E–U+001F: forbidden (except TAB/LF/CR already handled above).
+		case c >= 0x0E && c <= 0x1F:
+			buf.WriteString(s[last:i])
+			buf.WriteString("\xef\xbf\xbd") // U+FFFD UTF-8
+			last = i + 1
+			continue
+		// ── Standard XML entity escapes ─────────────────────────────────
+		case c == '&':
+			esc = "&amp;"
+		case c == '<':
+			esc = "&lt;"
+		case c == '>':
+			esc = "&gt;"
+		case c == '"':
+			esc = "&#34;"
+		case c == '\'':
+			esc = "&#39;"
+		// ── U+FFFE (EF BF BE) and U+FFFF (EF BF BF): forbidden ─────────
+		// These are three-byte UTF-8 sequences sharing 0xEF as the leading byte.
+		// Detect by three-byte lookahead; only fire for the exact forbidden pairs.
+		// All other 0xEF-led sequences (e.g. CJK, Specials) are legal and pass through.
+		case c == 0xEF && i+2 < len(s) && s[i+1] == 0xBF && (s[i+2] == 0xBE || s[i+2] == 0xBF):
+			// Consume the entire 3-byte sequence and replace with U+FFFD.
+			buf.WriteString(s[last:i])
+			buf.WriteString("\xef\xbf\xbd") // U+FFFD UTF-8
+			i += 2                          // skip the two continuation bytes (loop i++ handles the third)
+			last = i + 1
+			continue
 		default:
 			continue
 		}
