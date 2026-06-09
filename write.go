@@ -734,14 +734,15 @@ func cloneEXIF(e *exif.EXIF) *exif.EXIF {
 		return nil
 	}
 	out := &exif.EXIF{
-		ByteOrder:       e.ByteOrder,
-		IFD0:            cloneIFD(e.IFD0),
-		ExifIFD:         cloneIFD(e.ExifIFD),
-		GPSIFD:          cloneIFD(e.GPSIFD),
-		InteropIFD:      cloneIFD(e.InteropIFD),
-		MakerNote:       e.MakerNote, // verbatim share — never mutated in-place
-		MakerNoteIFD:    cloneIFD(e.MakerNoteIFD),
-		MakerNoteOffset: e.MakerNoteOffset,
+		ByteOrder:         e.ByteOrder,
+		IFD0:              cloneIFD(e.IFD0),
+		ExifIFD:           cloneIFD(e.ExifIFD),
+		GPSIFD:            cloneIFD(e.GPSIFD),
+		InteropIFD:        cloneIFD(e.InteropIFD),
+		MakerNote:         e.MakerNote, // verbatim share — never mutated in-place
+		MakerNoteIFD:      cloneIFD(e.MakerNoteIFD),
+		MakerNoteOffset:   e.MakerNoteOffset,
+		MakerNoteOffset64: e.MakerNoteOffset64,
 	}
 	return out
 }

@@ -21,22 +21,32 @@ import (
 // MakerNoteOffset is the absolute TIFF-stream byte offset at which the raw
 // MakerNote value begins in the original parsed buffer.  It is zero when
 // MakerNote is nil or when the ExifIFD was not parsed from a byte stream (e.g.
-// a freshly constructed EXIF with no MakerNote).
+// a freshly constructed EXIF with no MakerNote).  For classic TIFF files this
+// field holds the full offset (which fits in uint32).  For BigTIFF files where
+// the MakerNote resides above 4 GiB, MakerNoteOffset is truncated — use
+// MakerNoteOffset64 instead, which always holds the full 64-bit value.
 //
-// This field is informational: callers can use it to detect whether Encode has
-// moved the MakerNote to a different position.  Manufacturers that store
+// MakerNoteOffset64 is the 64-bit counterpart: it is set for both classic TIFF
+// and BigTIFF and is never truncated.  New callers should prefer MakerNoteOffset64.
+// Existing callers that target classic TIFF (NEF, ARW, ORF — all of which have
+// 32-bit file offsets) may safely continue using MakerNoteOffset.
+//
+// These fields are informational: callers can use them to detect whether Encode
+// has moved the MakerNote to a different position.  Manufacturers that store
 // MakerNote-internal offsets relative to the parent TIFF start (e.g. certain
 // Nikon bodies) will produce stale internal offsets if the MakerNote moves;
 // full offset rebasing is not yet implemented.  EXIF §4.6.5, tag 0x927C.
+// BigTIFF spec §2 (Aware Systems / libtiff); fix for audit finding #142.
 type EXIF struct {
-	ByteOrder       binary.ByteOrder
-	IFD0            *IFD
-	ExifIFD         *IFD
-	GPSIFD          *IFD
-	InteropIFD      *IFD
-	MakerNote       []byte // raw MakerNote bytes
-	MakerNoteIFD    *IFD   // parsed MakerNote IFD; nil when parsing is unsupported for this make
-	MakerNoteOffset uint32 // absolute TIFF-stream offset of the raw MakerNote value; 0 when absent
+	ByteOrder         binary.ByteOrder
+	IFD0              *IFD
+	ExifIFD           *IFD
+	GPSIFD            *IFD
+	InteropIFD        *IFD
+	MakerNote         []byte // raw MakerNote bytes
+	MakerNoteIFD      *IFD   // parsed MakerNote IFD; nil when parsing is unsupported for this make
+	MakerNoteOffset   uint32 // absolute TIFF-stream offset of the raw MakerNote value; 0 when absent; truncated for BigTIFF >4GiB
+	MakerNoteOffset64 uint64 // 64-bit counterpart of MakerNoteOffset; never truncated; preferred for new callers
 }
 
 // ParseOption configures a Parse call.
@@ -76,22 +86,23 @@ func parseByteOrder(b []byte) (binary.ByteOrder, error) {
 // parseExifSubIFDs traverses the ExifIFD sub-tree rooted at the
 // TagExifIFDPointer entry in ifd0.  It returns the ExifIFD, the raw MakerNote
 // bytes (always retained for round-trip writes), the MakerNote's TIFF-relative
-// byte offset (zero if absent), the parsed MakerNoteIFD (nil when
-// cfg.skipMakerNote is set or the make is unrecognised), and the InteropIFD.
+// byte offset as both uint32 and uint64 (zero if absent), the parsed
+// MakerNoteIFD (nil when cfg.skipMakerNote is set or the make is unrecognised),
+// and the InteropIFD.
 // All fields are nil/empty when the corresponding pointer tag is absent or the
 // sub-IFD cannot be traversed — errors are silently discarded to match the
 // original Parse behaviour (corrupt sub-IFDs must not abort the whole parse).
 //
 // EXIF §4.6.3: ExifIFD pointer is tag 0x8769; InteropIFD pointer is tag 0xA005.
 // EXIF §4.6.5: MakerNote is tag 0x927C.
-func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseConfig) (exifIFD *IFD, makerNote []byte, makerNoteOffset uint32, makerNoteIFD *IFD, interopIFD *IFD) {
+func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseConfig) (exifIFD *IFD, makerNote []byte, makerNoteOffset uint32, makerNoteOffset64 uint64, makerNoteIFD *IFD, interopIFD *IFD) {
 	ptr := ifd0.Get(TagExifIFDPointer)
 	if ptr == nil || len(ptr.Value) < 4 {
-		return nil, nil, 0, nil, nil
+		return nil, nil, 0, 0, nil, nil
 	}
 	sub, err := traverse(b, order.Uint32(ptr.Value), order)
 	if err != nil {
-		return nil, nil, 0, nil, nil
+		return nil, nil, 0, 0, nil, nil
 	}
 	exifIFD = sub
 
@@ -99,11 +110,13 @@ func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseCon
 	// IFD parsing is skipped when SkipMakerNote() is requested.
 	if mn := sub.Get(TagMakerNote); mn != nil {
 		makerNote = mn.Value
-		// rawOffset is non-zero when the MakerNote value is out-of-line (total
-		// size > 4 bytes, which is always true for any real MakerNote payload).
-		// It records the TIFF-stream offset so EXIF.MakerNoteOffset can expose
-		// the original position for movement-detection by callers.
-		makerNoteOffset = mn.rawOffset
+		// rawOffset (uint64) is non-zero when the MakerNote value is out-of-line
+		// (total size > 4 bytes, always true for real MakerNote payloads).
+		// It records the TIFF-stream offset so EXIF.MakerNoteOffset /
+		// MakerNoteOffset64 can expose the original position for movement-
+		// detection by callers.  Classic TIFF rawOffset fits in uint32.
+		makerNoteOffset64 = mn.rawOffset
+		makerNoteOffset = uint32(mn.rawOffset) //nolint:gosec // G115: classic TIFF offsets always fit uint32
 		if !cfg.skipMakerNote {
 			if makeEntry := ifd0.Get(TagMake); makeEntry != nil {
 				makerNoteIFD = parseMakerNoteIFD(mn.Value, makeEntry.String(), order)
@@ -117,7 +130,7 @@ func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseCon
 			interopIFD = isub
 		}
 	}
-	return exifIFD, makerNote, makerNoteOffset, makerNoteIFD, interopIFD
+	return exifIFD, makerNote, makerNoteOffset, makerNoteOffset64, makerNoteIFD, interopIFD
 }
 
 // parseGPSSubIFD traverses the GPS IFD rooted at the TagGPSIFDPointer entry
@@ -141,19 +154,21 @@ func parseGPSSubIFD(b []byte, ifd0 *IFD, order binary.ByteOrder) *IFD {
 // It is functionally equivalent to parseExifSubIFDs but uses the BigTIFF IFD
 // traversal path and readBigTIFFSubIFDOffset to read 64-bit pointer values.
 //
-// BigTIFF spec §2: sub-IFD pointer entries use TypeLong (32-bit) or
-// TypeLong8/TypeIFD8 (64-bit) for their offset value.
+// BigTIFF spec §2: sub-IFD pointer entries use TypeShort (16-bit), TypeLong
+// (32-bit), TypeLong8 (64-bit), or TypeIFD8 (64-bit) for their offset value.
 // EXIF §4.6.3: ExifIFD pointer is tag 0x8769; InteropIFD pointer is tag 0xA005.
 // EXIF §4.6.5: MakerNote is tag 0x927C.
-func parseExifSubIFDsBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseConfig) (exifIFD *IFD, makerNote []byte, makerNoteOffset uint32, makerNoteIFD *IFD, interopIFD *IFD) { //nolint:gocyclo,cyclop // BigTIFF ExifIFD traversal mirrors parseExifSubIFDs structure; complexity is inherent in the sub-IFD dispatch chain
+// Audit finding #142: MakerNoteOffset64 is populated from the full uint64 rawOffset
+// so that MakerNote positions above 4 GiB are reported without truncation.
+func parseExifSubIFDsBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseConfig) (exifIFD *IFD, makerNote []byte, makerNoteOffset uint32, makerNoteOffset64 uint64, makerNoteIFD *IFD, interopIFD *IFD) { //nolint:gocyclo,cyclop // BigTIFF ExifIFD traversal mirrors parseExifSubIFDs structure; complexity is inherent in the sub-IFD dispatch chain
 	ptr := ifd0.Get(TagExifIFDPointer)
 	off, ok := readBigTIFFSubIFDOffset(ptr)
 	if !ok || off == 0 {
-		return nil, nil, 0, nil, nil
+		return nil, nil, 0, 0, nil, nil
 	}
 	sub, err := traverseBigTIFF(b, off, order)
 	if err != nil {
-		return nil, nil, 0, nil, nil
+		return nil, nil, 0, 0, nil, nil
 	}
 	exifIFD = sub
 
@@ -162,9 +177,15 @@ func parseExifSubIFDsBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *p
 	// (vendor offsets inside the MakerNote are TIFF-absolute in classic TIFF
 	// and may be meaningless in a BigTIFF context). BigTIFF spec §2 note:
 	// MakerNote parsing out-of-scope for BigTIFF; do not crash, just skip IFD parse.
+	//
+	// #142: mn.rawOffset is now uint64 (no longer truncated in parseIFDEntryBigTIFF).
+	// Populate MakerNoteOffset64 from the full value; MakerNoteOffset receives the
+	// lower 32 bits for backward compatibility with existing callers that target
+	// classic TIFF RAW formats (NEF, ARW, ORF — all ≤ 4 GiB).
 	if mn := sub.Get(TagMakerNote); mn != nil {
 		makerNote = mn.Value
-		makerNoteOffset = mn.rawOffset
+		makerNoteOffset64 = mn.rawOffset
+		makerNoteOffset = uint32(mn.rawOffset & 0xFFFF_FFFF) // backward compat: lower 32 bits only; callers needing full offset use MakerNoteOffset64
 		if !cfg.skipMakerNote {
 			if makeEntry := ifd0.Get(TagMake); makeEntry != nil {
 				// parseMakerNoteIFD uses the classic-TIFF traversal internally; for
@@ -184,7 +205,7 @@ func parseExifSubIFDsBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *p
 			}
 		}
 	}
-	return exifIFD, makerNote, makerNoteOffset, makerNoteIFD, interopIFD
+	return exifIFD, makerNote, makerNoteOffset, makerNoteOffset64, makerNoteIFD, interopIFD
 }
 
 // parseGPSSubIFDBigTIFF traverses the GPS IFD for BigTIFF files.
@@ -250,7 +271,7 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) {
 			return nil, ferr
 		}
 		e.IFD0 = ifd0
-		e.ExifIFD, e.MakerNote, e.MakerNoteOffset, e.MakerNoteIFD, e.InteropIFD = parseExifSubIFDs(b, ifd0, order, &cfg)
+		e.ExifIFD, e.MakerNote, e.MakerNoteOffset, e.MakerNoteOffset64, e.MakerNoteIFD, e.InteropIFD = parseExifSubIFDs(b, ifd0, order, &cfg)
 		e.GPSIFD = parseGPSSubIFD(b, ifd0, order)
 		return e, nil
 
@@ -278,7 +299,7 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) {
 			return nil, ferr
 		}
 		e.IFD0 = ifd0
-		e.ExifIFD, e.MakerNote, e.MakerNoteOffset, e.MakerNoteIFD, e.InteropIFD = parseExifSubIFDsBigTIFF(b, ifd0, order, &cfg)
+		e.ExifIFD, e.MakerNote, e.MakerNoteOffset, e.MakerNoteOffset64, e.MakerNoteIFD, e.InteropIFD = parseExifSubIFDsBigTIFF(b, ifd0, order, &cfg)
 		e.GPSIFD = parseGPSSubIFDBigTIFF(b, ifd0, order)
 		return e, nil
 

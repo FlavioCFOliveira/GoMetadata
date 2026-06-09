@@ -54,11 +54,13 @@ type IFDEntry struct {
 	// the original buffer (zero-copy).
 	Value     []byte
 	byteOrder binary.ByteOrder
-	// rawOffset is the TIFF-stream offset stored in the 4-byte value-or-offset
-	// field when the value is out-of-line (totalSize > 4).  Zero for inline
-	// values.  Used by parseExifSubIFDs to record MakerNoteOffset without
-	// resorting to unsafe pointer arithmetic.
-	rawOffset uint32
+	// rawOffset is the TIFF-stream offset stored in the value-or-offset field
+	// when the value is out-of-line (totalSize > 4 for classic TIFF, > 8 for
+	// BigTIFF).  Zero for inline values.  Stored as uint64 to preserve BigTIFF
+	// offsets above 4 GiB without truncation; classic TIFF offsets fit in the
+	// lower 32 bits.  Used by parseExifSubIFDs/parseExifSubIFDsBigTIFF to
+	// record MakerNoteOffset/MakerNoteOffset64 without unsafe pointer arithmetic.
+	rawOffset uint64
 }
 
 // parseIFDEntry decodes a single 12-byte IFD entry starting at byte offset e
@@ -107,7 +109,7 @@ func parseIFDEntry(b []byte, e int, order binary.ByteOrder) (IFDEntry, bool) {
 			Count:     cnt,
 			Value:     value,
 			byteOrder: order,
-			rawOffset: valOff, // TIFF §2: offset to value data; used by MakerNoteOffset
+			rawOffset: uint64(valOff), // TIFF §2: offset to value data; used by MakerNoteOffset
 		}, true
 	default:
 		// Value is inline, left-justified in the 4-byte field (TIFF §2).
@@ -180,19 +182,60 @@ func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint
 // Returns nil when either tag is absent, malformed, or the indicated byte range
 // falls outside b.  The returned slice is an independent copy so the IFD is not
 // tied to the original parse buffer.
-func extractJPEGThumbnail(b []byte, ifd *IFD, order binary.ByteOrder) []byte {
+//
+// BigTIFF awareness (#141): JPEGInterchangeFormat may carry a TypeLong8 (8-byte)
+// offset in BigTIFF files.  When Value is 8 bytes we read the full uint64 offset
+// via order.Uint64 so that thumbnails above 4 GiB are located correctly.  Classic
+// TIFF (TypeLong, 4-byte offset) continues to use order.Uint32.  The length tag
+// (0x0202) likewise accepts TypeLong8 — real BigTIFF thumbnail sizes will always
+// fit in a uint32, but we read 64-bit and range-check before narrowing.
+// BigTIFF spec §2 (Aware Systems / libtiff); EXIF §4.5.5.
+func extractJPEGThumbnail(b []byte, ifd *IFD, order binary.ByteOrder) []byte { //nolint:gocyclo,cyclop // BigTIFF-aware type dispatch for TypeLong8/TypeLong offset and length; branches are inherent in the two-type handling
 	jifEntry := ifd.Get(TagJPEGInterchangeFormat)
-	if jifEntry == nil || len(jifEntry.Value) < 4 {
+	if jifEntry == nil {
 		return nil
 	}
 	jifLenEntry := ifd.Get(TagJPEGInterchangeFormatLength)
-	if jifLenEntry == nil || len(jifLenEntry.Value) < 4 {
+	if jifLenEntry == nil {
 		return nil
 	}
-	jifOff := order.Uint32(jifEntry.Value)
-	jifLen := order.Uint32(jifLenEntry.Value)
-	end := uint64(jifOff) + uint64(jifLen)
-	if jifLen == 0 || end > uint64(len(b)) {
+
+	// Read the offset: TypeLong8 (BigTIFF) = 8 bytes; TypeLong (classic) = 4 bytes.
+	// BigTIFF spec §2: JPEGInterchangeFormat may be stored as TypeLong8 in BigTIFF
+	// containers.  Callers must read 8 bytes for TypeLong8 or the high 32 bits are lost.
+	var jifOff uint64
+	switch {
+	case jifEntry.Type == TypeLong8 && len(jifEntry.Value) >= 8:
+		jifOff = order.Uint64(jifEntry.Value)
+	case len(jifEntry.Value) >= 4:
+		jifOff = uint64(order.Uint32(jifEntry.Value))
+	default:
+		return nil
+	}
+
+	// Read the length using the same type-aware logic.
+	var jifLen64 uint64
+	switch {
+	case jifLenEntry.Type == TypeLong8 && len(jifLenEntry.Value) >= 8:
+		jifLen64 = order.Uint64(jifLenEntry.Value)
+	case len(jifLenEntry.Value) >= 4:
+		jifLen64 = uint64(order.Uint32(jifLenEntry.Value))
+	default:
+		return nil
+	}
+
+	if jifLen64 == 0 || jifLen64 > uint64(len(b)) {
+		return nil
+	}
+	// Narrow length to uint32: thumbnail byte counts that do not fit in uint32
+	// are degenerate; reject rather than wrap.
+	if jifLen64 > 1<<32-1 {
+		return nil
+	}
+	jifLen := uint32(jifLen64) // jifLen64 ≤ 2^32-1 verified by the guard above
+
+	end := jifOff + uint64(jifLen)
+	if end > uint64(len(b)) {
 		return nil
 	}
 	// Copy: the IFD must be independent of the original parse buffer so that
@@ -391,7 +434,7 @@ func parseIFDEntryBigTIFF(b []byte, e int, order binary.ByteOrder) (IFDEntry, bo
 		Count:     uint32(cnt), // safe: cnt ≤ maxBigTIFFCount (2^30) < MaxUint32
 		Value:     b[valOff : valOff+totalSize],
 		byteOrder: order,
-		rawOffset: uint32(valOff & 0xFFFFFFFF), // truncation intentional: BigTIFF offsets may exceed uint32; rawOffset is diagnostic-only
+		rawOffset: valOff, // BigTIFF spec §2: full 64-bit offset preserved; used by MakerNoteOffset64 (#142)
 	}, true
 }
 
@@ -499,8 +542,14 @@ func traverseBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IFD, err
 }
 
 // readBigTIFFSubIFDOffset reads a sub-IFD pointer value from an IFDEntry,
-// handling both the classic 32-bit (TypeLong=4) and BigTIFF 64-bit
-// (TypeLong8=16, TypeIFD8=18) pointer representations.
+// handling TypeShort (16-bit), TypeLong (32-bit), and the BigTIFF 64-bit types
+// (TypeLong8=16, TypeIFD8=18).
+//
+// While EXIF §4.6.3 specifies TypeLong for ExifIFD/GPS/InteropIFD pointer tags,
+// some BigTIFF writers produce TypeShort pointer entries when the target IFD fits
+// in a 16-bit offset (e.g. small experimental files). Accepting TypeShort here
+// ensures those files are parsed correctly rather than silently losing the sub-IFD.
+// BigTIFF spec §2 (Aware Systems / libtiff) does not forbid SHORT pointer values.
 //
 // tiffcp / libtiff write sub-IFD pointers as TypeLong (4-byte) even in BigTIFF
 // files for many tags; some newer writers use TypeIFD8 (18). Both are valid.
@@ -512,7 +561,18 @@ func readBigTIFFSubIFDOffset(e *IFDEntry) (uint64, bool) {
 	if e == nil {
 		return 0, false
 	}
-	switch e.Type { //nolint:exhaustive // only TypeLong/TypeLong8/TypeIFD8 are valid sub-IFD pointer types; all others fall through to (0,false)
+	switch e.Type { //nolint:exhaustive // TypeShort/TypeLong/TypeLong8/TypeIFD8 are the only meaningful sub-IFD pointer types; all others fall through to (0,false)
+	case TypeShort:
+		// TypeShort (2 bytes): some BigTIFF writers store pointer values as SHORT
+		// when the target IFD offset fits in 16 bits.  BigTIFF inline threshold
+		// is 8 bytes so SHORT entries are always stored inline in the entry field.
+		// #143: without this case, ExifIFD/GPS IFD pointers stored as TypeShort
+		// were silently ignored, leaving ExifIFD and GPSIFD nil.
+		// BigTIFF spec §2; EXIF §4.6.3.
+		if len(e.Value) < 2 {
+			return 0, false
+		}
+		return uint64(e.byteOrder.Uint16(e.Value)), true
 	case TypeLong:
 		// TypeLong (4 bytes): used by tiffcp / libtiff even in BigTIFF containers.
 		if len(e.Value) < 4 {
