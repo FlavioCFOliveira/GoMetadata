@@ -229,14 +229,25 @@ func processAPP1Segment(
 		// mark + 2-byte magic number + 4-byte IFD0 offset). A shorter residual is
 		// structurally corrupt and must not be returned as rawEXIF — callers rely on
 		// the invariant that rawEXIF is nil or >= 8 bytes.
-		if payload := data[len(identExif):]; len(payload) >= 8 {
-			// Copy: data aliases scratch and must survive the next readSegment call.
-			rawEXIF = bytes.Clone(payload)
+		//
+		// §1(f) first-wins policy: when multiple APP1 segments carry an Exif\x00\x00
+		// prefix, only the first valid one is used. Subsequent EXIF APP1 segments are
+		// ignored. ITU-T T.81 + containers.md §1(f): "multiple Exif\0\0 (use first)".
+		if rawEXIF == nil {
+			if payload := data[len(identExif):]; len(payload) >= 8 {
+				// Copy: data aliases scratch and must survive the next readSegment call.
+				rawEXIF = bytes.Clone(payload)
+			}
 		}
 
 	case bytes.HasPrefix(data, identXMP):
-		// Copy: same reason as rawEXIF.
-		rawXMP = bytes.Clone(data[len(identXMP):])
+		// §1(f) first-wins: only the first valid standard XMP APP1 is used.
+		// Adobe XMP Specification Part 3 §1.1.3: a JPEG contains at most one
+		// standard XMP packet; additional standard APP1 segments are non-conforming.
+		if rawXMP == nil {
+			// Copy: same reason as rawEXIF.
+			rawXMP = bytes.Clone(data[len(identXMP):])
+		}
 
 	case bytes.HasPrefix(data, identXMPNote):
 		// Extended XMP chunk: GUID (32 bytes) + fullLength (4 bytes) +
