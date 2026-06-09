@@ -95,9 +95,19 @@ func isNikonType3(b []byte) bool {
 		b[3] == 'o' && b[4] == 'n' && b[5] == 0x00
 }
 
+// nikonType3TIFFHeaderMaxSearch is the maximum byte offset within a Nikon
+// Type-3 MakerNote blob at which the embedded TIFF header ("II"/"MM" BOM)
+// may begin. The documented layout places it at offset 8 (after the 6-byte
+// magic prefix and 2-byte version), but some camera models (e.g. Nikon D70
+// with version 0x0200) insert 2 padding bytes before the TIFF header,
+// placing it at offset 10 instead.
+//
+// ExifTool Nikon.pm: D70 firmware quirk — TIFF header at blob[10].
+const nikonType3TIFFHeaderMaxSearch = 16
+
 // parseNikonType3 parses a Nikon Type-3 MakerNote (modern DSLRs and Coolpix).
 //
-// Layout (ExifTool Nikon.pm):
+// Layout (ExifTool Nikon.pm, standard version 0x0210):
 //
 //	[0..5]   "Nikon\0"    magic
 //	[6..7]   version      2 bytes (e.g. 0x02 0x10)
@@ -105,28 +115,55 @@ func isNikonType3(b []byte) bool {
 //	[10..11] TIFF magic   0x002A (LE) or 0x2A00 (BE)
 //	[12..15] IFD offset   relative to the embedded TIFF base at b[8]
 //
-// All value offsets within the embedded IFD are relative to b[8].
+// D70 variant (version 0x0200): 2 extra padding bytes at [8..9], so the
+// embedded TIFF header starts at offset 10.
+//
+// All value offsets within the embedded IFD are relative to the embedded
+// TIFF header start position (b[tiffStart]). The function scans forward from
+// offset 6 to nikonType3TIFFHeaderMaxSearch to locate the actual header.
+//
+// R-08 (exif-tiff conformance): internal offsets must be rebased relative to
+// the embedded TIFF header start, not the outer TIFF base.
+//
+//nolint:cyclop,gocyclo // TIFF BOM scan with two byte-order branches; inherent to binary detection
 func parseNikonType3(b []byte, _ binary.ByteOrder) *IFD {
-	// The embedded TIFF header starts at offset 8.
-	const tiffStart = 8
-	tiff := b[tiffStart:]
+	// Scan for the embedded TIFF header starting from offset 6 (right after
+	// the 6-byte "Nikon\x00" prefix). This handles both offset 8 (standard)
+	// and offset 10 (Nikon D70 version 0x0200 with 2-byte padding).
+	//
+	// ExifTool Nikon.pm: D70 firmware quirk; findNikonMNTIFFHeader in
+	// format/tiff/relocate_nef.go uses the same scanning strategy for writes.
+	end := min(nikonType3TIFFHeaderMaxSearch, len(b)-8) // need ≥ 8 bytes for a valid TIFF header
 
-	if len(tiff) < 8 {
-		return nil
-	}
-
+	tiffStart := -1
 	var order binary.ByteOrder
-	switch {
-	case tiff[0] == 'I' && tiff[1] == 'I':
-		order = binary.LittleEndian
-	case tiff[0] == 'M' && tiff[1] == 'M':
-		order = binary.BigEndian
-	default:
-		return nil
+	for off := 6; off <= end; off++ {
+		if off+8 > len(b) {
+			break
+		}
+		switch {
+		case b[off] == 'I' && b[off+1] == 'I':
+			if binary.LittleEndian.Uint16(b[off+2:]) == 0x002A {
+				tiffStart = off
+				order = binary.LittleEndian
+			}
+		case b[off] == 'M' && b[off+1] == 'M':
+			if binary.BigEndian.Uint16(b[off+2:]) == 0x002A {
+				tiffStart = off
+				order = binary.BigEndian
+			}
+		}
+		if tiffStart >= 0 {
+			break
+		}
 	}
 
-	magic := order.Uint16(tiff[2:])
-	if magic != 0x002A {
+	if tiffStart < 0 {
+		return nil // no valid embedded TIFF header found
+	}
+
+	tiff := b[tiffStart:]
+	if len(tiff) < 8 {
 		return nil
 	}
 
