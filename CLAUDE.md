@@ -33,13 +33,43 @@ Every feature must be covered by tests that **prove correctness**, not just exer
 - Race-condition tests with `-race` for all concurrent code
 - A test that fails is a bug in the library, never a bug in the test
 
-### 4. Strict specification compliance
-All parsers and writers must comply with the relevant standards:
-- EXIF: CIPA DC-008 / JEITA CP-3451 (EXIF 2.x and 3.0) and TIFF 6.0
-- IPTC: IPTC IIM 4.2 and IPTC Core/Extension (XMP mapping)
-- XMP: ISO 16684-1/2 and Adobe XMP Specification Parts 1–3
+### 4. Strict specification compliance — 100% conformance is a hard requirement
 
-When a real-world file deviates from the spec (manufacturer non-compliance), the library must handle it without crashing, and must document the deviation. Spec-derived decisions in code must be annotated with a comment citing the standard, section, and page.
+**GoMetadata MUST achieve 100% conformance with the official specification of every metadata
+format and every container format it supports.** This is a non-negotiable, measurable
+requirement, not an aspiration. Every format MUST be covered by an exhaustive, spec-clause-driven
+conformance test battery that proves correctness against the standard — coverage of code paths is
+not sufficient; the tests must prove the library obeys the specification.
+
+The normative-requirements checklists that define this contract live in
+[`docs/conformance/`](docs/conformance/) (one per spec family). Every checklist rule has a stable
+ID (e.g. `S-08`, `IIM-BIN-05`, `JPEG-04`, `ROB-03`) that is used verbatim as the corresponding Go
+sub-test name, so a failing test points directly at the violated specification clause.
+
+**Authoritative specifications (the compliance targets):**
+
+| Format | Official specification(s) |
+|---|---|
+| EXIF | CIPA DC-008 (Exif 3.0, 2023/2024) / DC-X008 (Exif 2.32, 2019) / JEITA CP-3451 |
+| TIFF | Adobe TIFF Revision 6.0 (1992); BigTIFF (Aware Systems / libtiff) |
+| IPTC IIM | IPTC-NAA Information Interchange Model 4.2 (2014) |
+| IPTC Core/Ext | IPTC Photo Metadata Standard 2025.1 (Core 1.5 / Extension 1.9) |
+| XMP | ISO 16684-1:2019 + ISO 16684-2:2014; Adobe XMP Specification Parts 1–3; MWG Guidelines v2.0 |
+| JPEG / JFIF | ITU-T T.81 \| ISO/IEC 10918-1; ITU-T T.871 \| ISO/IEC 10918-5 |
+| PNG | W3C PNG Specification 3rd Edition (Rec. 2025-06-24) \| ISO/IEC 15948:2004 |
+| WebP | IETF RFC 9649 (2024) + Google WebP Container Specification (RIFF) |
+| ISO BMFF | ISO/IEC 14496-12 |
+| HEIF / HEIC | ISO/IEC 23008-12 |
+| AVIF | AOM "AV1 Image File Format" v1.2.0 (on HEIF + MIAF ISO/IEC 23000-22) |
+| DNG | Adobe Digital Negative Specification 1.7.1.0 (2023) |
+| TIFF/EP RAW (NEF, ARW, CR2, ORF, RW2) | ISO 12234-2:2001 (TIFF/EP); reverse-engineered refs: ExifTool, LibRaw, lclevy |
+| CR3 | Canon CR3 (ISO BMFF / `crx`); reverse-engineered ref: lclevy canon_cr3 |
+| Container date strings | RFC 3339 (XMP date subset of ISO 8601) |
+
+When a real-world file deviates from the spec (manufacturer non-compliance), the library must
+handle it without crashing, must degrade gracefully, and must document the deviation. Spec-derived
+decisions in code must be annotated with a comment citing the standard, section, and page (the
+checklists in `docs/conformance/` provide the citations).
 
 ### 6. User-oriented API
 The public API must be the simplest possible interface over the internal complexity. A user must be able to read or write metadata in a handful of lines, without knowing anything about IFDs, RDF, APP13, or byte order. Complexity is internal; the surface is clean.
