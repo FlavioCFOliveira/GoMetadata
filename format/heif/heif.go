@@ -47,6 +47,11 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	n, rerr := io.ReadFull(r, hdr[:headerWindow])
 	if rerr != nil && !errors.Is(rerr, io.ErrUnexpectedEOF) {
 		iobuf.Put(hdrPtr)
+		// io.EOF means the file is empty (n==0): no metadata, no error.
+		// ISO 14496-12 §4: an empty or too-short file simply carries no boxes.
+		if errors.Is(rerr, io.EOF) {
+			return nil, nil, nil, nil
+		}
 		return nil, nil, nil, fmt.Errorf("heif: read: %w", rerr)
 	}
 	hdr = hdr[:n]
