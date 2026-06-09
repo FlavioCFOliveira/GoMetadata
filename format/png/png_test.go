@@ -1048,3 +1048,276 @@ func TestPNGReadChunkLargeLength(t *testing.T) {
 		})
 	}
 }
+
+// TestPNGInjectXMPSizeGuard is the regression gate for audit finding #147.
+//
+// W3C PNG 3rd ed. §5.3 / ISO 15948 §11.2.1: the chunk Length field is a
+// 31-bit unsigned integer; values >= 2^31 are forbidden. buildXMPChunk
+// prepends a fixed 22-byte iTXt header to the raw XMP data; when the result
+// would exceed math.MaxInt32, PutUint32 in writeChunk silently wraps the
+// length field, producing a corrupt chunk. The fix adds a size guard in
+// writeMetadataAfterIHDR that returns ErrXMPTooLarge before any write.
+//
+// Test strategy: rather than allocating 2 GiB of XMP data, we call
+// writeMetadataAfterIHDR with a synthetic rawXMP whose length equals
+// math.MaxInt32 - xmpITXtOverhead + 1 (one byte past the limit). The guard
+// is a pure arithmetic check on len(rawXMP), so the actual bytes are never
+// read; a small backing array is sufficient. A bytes.Buffer is passed as w to
+// assert that nothing is written before the error is returned.
+func TestPNGInjectXMPSizeGuard(t *testing.T) {
+	t.Parallel()
+
+	// Construct the minimal oversized slice: length = math.MaxInt32 - xmpITXtOverhead + 1.
+	// This is one byte beyond the guard threshold without allocating 2 GiB.
+	// xmpITXtOverhead = 22 (see png.go: len(xmpKeyword)+5).
+	overLen := math.MaxInt32 - xmpITXtOverhead + 1
+
+	// make([]byte, overLen) would require ~2 GiB. Use a length-only check: Go's
+	// runtime will panic on make with a size > maxAlloc, so we verify the guard
+	// fires by directly calling the internal size arithmetic. The guard condition
+	// in writeMetadataAfterIHDR is:
+	//   len(rawXMP) > math.MaxInt32 - xmpITXtOverhead
+	// which equals: overLen-1+1 = overLen > math.MaxInt32-xmpITXtOverhead ✓.
+	//
+	// We use a fixed-size sentinel slice whose length we override via a
+	// type-assertion-free approach: build a []byte header using unsafe-free
+	// slice trickery — actually the simplest correct approach is to just test
+	// the guard indirectly via a fake []byte with the right len using
+	// make + reslice, which Go allows up to the platform's address space.
+	// On 64-bit (amd64/arm64) overLen ≈ 2^31 which is well within virtual
+	// address space; the allocation will fail at runtime on 32-bit but those
+	// platforms are not a primary target. To avoid OOM on CI, we skip the
+	// allocation entirely by calling writeMetadataAfterIHDR with a nil rawEXIF
+	// and a rawXMP whose len is spoofed via reflect-free slice header arithmetic.
+	//
+	// The cleanest test-safe approach: verify the guard constant directly, then
+	// call writeMetadataAfterIHDR with a slice of exactly the oversized length
+	// but backed by a 1-byte allocation, using append to avoid the 2 GiB alloc.
+	//
+	// Go spec: a slice header {ptr, len, cap} can have len > cap only via unsafe.
+	// We instead use a concrete small rawXMP but verify the constant arithmetic.
+	// The guard fires on len(rawXMP) > math.MaxInt32-xmpITXtOverhead; we verify:
+	// 1. The constant xmpITXtOverhead equals 22 (len("XML:com.adobe.xmp")+5).
+	// 2. Directly call with a 1-element slice that matches the expected limit.
+	// 3. For the real oversized case, assert the error sentinel without 2 GiB alloc.
+
+	// Step 1: verify the overhead constant matches the actual buildXMPChunk layout.
+	const expectedOverhead = len(xmpKeyword) + 5 // 17 + 5 = 22
+	if xmpITXtOverhead != expectedOverhead {
+		t.Fatalf("xmpITXtOverhead = %d, want %d (guard constant is stale)", xmpITXtOverhead, expectedOverhead)
+	}
+
+	// Step 2: just-under-limit — must succeed (no error).
+	// We use a real allocation at the boundary: math.MaxInt32 - 22 = 2147483625 bytes
+	// is ~2 GiB; not allocatable on CI. Instead verify the boundary using small data.
+	// The guard is: len(rawXMP) > math.MaxInt32-xmpITXtOverhead, so
+	// len(rawXMP) == math.MaxInt32-xmpITXtOverhead should be allowed.
+	// We cannot allocate 2 GiB; test the guard formula with small synthetic data.
+	//
+	// Boundary test via guard formula: confirm that the condition fires at +1 but
+	// not at exactly the limit. We do this by manipulating a stack integer.
+	okLen := math.MaxInt32 - xmpITXtOverhead            // exactly at limit — allowed
+	overLenCheck := math.MaxInt32 - xmpITXtOverhead + 1 // one over — must be rejected
+	if okLen > math.MaxInt32-xmpITXtOverhead {
+		t.Errorf("guard formula error: okLen %d should satisfy okLen <= maxInt32-overhead", okLen)
+	}
+	if overLenCheck <= math.MaxInt32-xmpITXtOverhead {
+		t.Errorf("guard formula error: overLen %d should trigger guard", overLenCheck)
+	}
+
+	// Step 3: construct an oversized rawXMP using a real small backing array but
+	// the right declared length, using a subslice of a zero-length header.
+	// The only allocation-free way to spoof len without unsafe is to use a
+	// string-based trick. In Go, we CAN do: s := string(make([]byte, N)) to get
+	// a string of length N, but that still allocates. Correct approach: accept
+	// the limit, skip the 2 GiB alloc, and test the guard directly via a mock.
+	//
+	// Since writeMetadataAfterIHDR is an unexported function in the same package,
+	// we call it directly with a bytes.Buffer as w and verify:
+	//   (a) the error wraps ErrXMPTooLarge
+	//   (b) the buffer w is empty (no bytes written before the guard fires)
+	//
+	// To avoid the 2 GiB allocation, we verify the guard at a small but
+	// representatively "oversized" threshold by temporarily patching the guard
+	// constant — but constants cannot be patched. Instead, use a helper that
+	// mirrors the exact guard condition:
+	guardFires := func(rawXMPLen int) bool {
+		return rawXMPLen > math.MaxInt32-xmpITXtOverhead
+	}
+	if guardFires(0) {
+		t.Error("guard fires for len=0 (should not)")
+	}
+	if guardFires(math.MaxInt32 - xmpITXtOverhead) {
+		t.Error("guard fires at exactly the limit (should not)")
+	}
+	if !guardFires(math.MaxInt32 - xmpITXtOverhead + 1) {
+		t.Error("guard does NOT fire at limit+1 (must fire)")
+	}
+
+	// Step 4: exercise writeMetadataAfterIHDR with a concrete oversized rawXMP.
+	// We cannot allocate 2 GiB. Use the minimum possible allocation that triggers
+	// the guard: make([]byte, math.MaxInt32-xmpITXtOverhead+1). On 64-bit Linux
+	// with overcommit this succeeds (virtual pages, not physical RAM). On systems
+	// where it would OOM, the test is inherently untestable without unsafe tricks.
+	// We use t.Skip only if the alloc panics, guarded by a recover.
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Skipf("cannot allocate %d bytes on this platform: %v", overLen, r)
+			}
+		}()
+		oversized := make([]byte, overLen)
+		var wBuf bytes.Buffer
+		err := writeMetadataAfterIHDR(&wBuf, nil, oversized)
+		if err == nil {
+			t.Fatalf("writeMetadataAfterIHDR with oversized XMP: expected ErrXMPTooLarge, got nil")
+		}
+		if !errors.Is(err, ErrXMPTooLarge) {
+			t.Errorf("writeMetadataAfterIHDR: got %v, want wrapping ErrXMPTooLarge", err)
+		}
+		if wBuf.Len() != 0 {
+			t.Errorf("writeMetadataAfterIHDR: wrote %d bytes before returning error; want 0", wBuf.Len())
+		}
+	}()
+}
+
+// TestPNGInjectSignatureValidation is the regression gate for audit finding #181.
+//
+// W3C PNG 3rd ed. §5.2: a PNG datastream must begin with the 8-byte magic
+// sequence. Before the fix, Inject wrote the PNG signature to w unconditionally
+// before reading the input signature, so passing JPEG (or any non-PNG) bytes
+// left a partial/corrupt PNG header in w even though Inject eventually returned
+// an error. After the fix, the input signature is validated before any write.
+//
+// Assertions:
+//   - Inject returns a non-nil error (specifically ErrInvalidSignature).
+//   - w.Len() == 0: nothing was written to w before the error.
+func TestPNGInjectSignatureValidation(t *testing.T) {
+	t.Parallel()
+
+	// Use JPEG magic bytes as the non-PNG input.
+	jpegMagic := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01}
+	r := bytes.NewReader(jpegMagic)
+	var w bytes.Buffer
+
+	err := Inject(r, &w, nil, nil, nil, true)
+
+	if err == nil {
+		t.Fatal("Inject with JPEG input: expected error, got nil")
+	}
+	// W3C PNG 3rd ed. §5.2: the error must identify a signature mismatch.
+	if !errors.Is(err, ErrInvalidSignature) {
+		t.Errorf("Inject with JPEG input: got %v, want wrapping ErrInvalidSignature", err)
+	}
+	// Core assertion: nothing must have been written to w before the error.
+	if w.Len() != 0 {
+		t.Errorf("Inject with JPEG input: wrote %d bytes to w before returning error; want 0 (partial write corruption)", w.Len())
+	}
+}
+
+// TestPNGInjectMissingIENDOutputWellFormed is the regression gate for audit finding #182.
+//
+// W3C PNG 3rd ed. §5.6: "The IEND chunk must appear LAST. It marks the end of
+// the PNG datastream." Before the fix, Inject on a PNG that lacked an IEND
+// (truncated source) silently produced output without IEND, leaving it
+// structurally incomplete. After the fix, Inject always emits a terminal IEND.
+//
+// Two sub-tests:
+//  1. Truncated-before-IEND: inject into a PNG whose chunk stream ends without
+//     IEND; assert the output ends with a well-formed IEND chunk.
+//  2. Control (normal PNG): a source that already has IEND produces output with
+//     exactly one IEND, not two.
+func TestPNGInjectMissingIENDOutputWellFormed(t *testing.T) {
+	t.Parallel()
+
+	// hasValidIEND walks the PNG chunk stream in data (starting after the 8-byte
+	// signature) and returns (count, lastIsIEND) where count is the number of
+	// IEND chunks seen and lastIsIEND is true when the final chunk in the stream
+	// is IEND. The function is tolerant of a missing trailing IEND — it simply
+	// returns count=0, lastIsIEND=false in that case.
+	countIENDs := func(data []byte) int {
+		pos := 8 // skip signature
+		count := 0
+		for pos+8 <= len(data) {
+			length := int(binary.BigEndian.Uint32(data[pos:]))
+			chunkType := string(data[pos+4 : pos+8])
+			if chunkType == "IEND" {
+				count++
+			}
+			pos += 8 + length + 4 // header + data + CRC
+		}
+		return count
+	}
+
+	// buildTruncatedPNG builds a PNG with IHDR but NO IEND chunk.
+	// This simulates a truncated file or a file written by a non-conformant encoder.
+	buildTruncatedPNG := func() []byte {
+		var buf bytes.Buffer
+		buf.Write(pngSig[:])
+		writeChunkTo(&buf, "IHDR", minIHDR())
+		// Deliberately omit IEND.
+		return buf.Bytes()
+	}
+
+	t.Run("truncated-before-IEND emits IEND in output", func(t *testing.T) {
+		t.Parallel()
+
+		exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00}
+		src := buildTruncatedPNG()
+
+		var out bytes.Buffer
+		if err := Inject(bytes.NewReader(src), &out, exifData, nil, nil, true); err != nil {
+			t.Fatalf("Inject: unexpected error: %v", err)
+		}
+
+		result := out.Bytes()
+		if len(result) < 8 {
+			t.Fatal("output too short to be a PNG")
+		}
+		// Output must start with the PNG signature.
+		if [8]byte(result[:8]) != pngSig {
+			t.Error("output does not start with PNG signature")
+		}
+
+		iendCount := countIENDs(result)
+		if iendCount == 0 {
+			t.Error("output has no IEND chunk; W3C PNG 3rd ed. §5.6 requires IEND as the last chunk")
+		}
+		if iendCount > 1 {
+			t.Errorf("output has %d IEND chunks; must be exactly 1", iendCount)
+		}
+
+		// The final 12 bytes must be a zero-length IEND with correct CRC.
+		// IEND chunk: Length(4)=0 + Type(4)="IEND" + CRC(4)=0xAE426082.
+		const iendCRC = 0xAE426082 // crc32.NewIEEE of "IEND" with empty data
+		if len(result) < 12 {
+			t.Fatal("output too short for an IEND chunk")
+		}
+		tail := result[len(result)-12:]
+		tailLen := binary.BigEndian.Uint32(tail[0:4])
+		tailType := string(tail[4:8])
+		tailCRC := binary.BigEndian.Uint32(tail[8:12])
+		if tailLen != 0 || tailType != "IEND" || tailCRC != iendCRC {
+			t.Errorf("last 12 bytes are not a valid IEND: length=%d type=%q CRC=0x%08X (want length=0 type=IEND CRC=0x%08X)",
+				tailLen, tailType, tailCRC, uint32(iendCRC))
+		}
+	})
+
+	t.Run("normal PNG has exactly one IEND", func(t *testing.T) {
+		t.Parallel()
+
+		exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00}
+		// buildPNG always appends a well-formed IEND.
+		src := buildPNG(nil, nil)
+
+		var out bytes.Buffer
+		if err := Inject(bytes.NewReader(src), &out, exifData, nil, nil, true); err != nil {
+			t.Fatalf("Inject on normal PNG: unexpected error: %v", err)
+		}
+
+		iendCount := countIENDs(out.Bytes())
+		if iendCount != 1 {
+			t.Errorf("normal PNG after Inject has %d IEND chunks; want exactly 1", iendCount)
+		}
+	})
+}

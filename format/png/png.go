@@ -277,14 +277,23 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 		return fmt.Errorf("png: seek: %w", err)
 	}
 
-	// Write PNG signature.
-	if _, err := w.Write(pngSig[:]); err != nil {
-		return fmt.Errorf("png: write signature: %w", err)
-	}
-	// Skip signature in r (stack-allocated; avoids the make([]byte,8) heap alloc).
+	// Validate input signature BEFORE writing anything to w.
+	// W3C PNG 3rd ed. §5.2: the first 8 bytes must be the PNG magic sequence.
+	// Reading and checking the signature first ensures that w remains empty if
+	// the input is not a PNG (e.g. a JPEG passed by mistake); writing the PNG
+	// signature unconditionally and then returning an error would leave a
+	// partial/corrupt byte sequence in w.
 	var sig [8]byte
 	if _, err := io.ReadFull(r, sig[:]); err != nil {
 		return fmt.Errorf("png: read signature: %w", err)
+	}
+	if sig != pngSig {
+		return ErrInvalidSignature
+	}
+
+	// Input is a valid PNG; write the signature to w.
+	if _, err := w.Write(pngSig[:]); err != nil {
+		return fmt.Errorf("png: write signature: %w", err)
 	}
 
 	for {
@@ -296,24 +305,56 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 				break
 			}
 			if errors.Is(err, errPNGDone) {
+				// Source PNG had an IEND chunk; it has already been written by
+				// injectChunk → writeInjectChunk. Return immediately so we do not
+				// write a second IEND (W3C PNG 3rd ed. §5.6: IEND is unique).
 				return nil
 			}
 			return err
 		}
 	}
-	return nil
+
+	// The source PNG ended without an IEND chunk (truncated or malformed input).
+	// W3C PNG 3rd ed. §5.6: "The IEND chunk must appear LAST. It marks the end
+	// of the PNG datastream." Write a synthetic IEND so the output is always a
+	// structurally complete PNG regardless of whether the source was well-formed.
+	return writeChunk(w, "IEND", nil)
 }
+
+// xmpITXtOverhead is the fixed byte count prepended to the XMP data by
+// buildXMPChunk: keyword(17) + NUL(1) + compFlag(1) + compMethod(1) +
+// langNUL(1) + transKwNUL(1) = 22 bytes. The PNG chunk Length field covers
+// the iTXt data payload (type + data header + XMP text), not the 4-byte chunk
+// type or 4-byte CRC trailer (W3C PNG 3rd ed. §5.3).
+const xmpITXtOverhead = len(xmpKeyword) + 5 // 17 + 5 = 22
 
 // writeMetadataAfterIHDR writes the eXIf chunk (if rawEXIF is non-nil) and
 // the iTXt XMP chunk (if rawXMP is non-nil) to w. Both chunks are placed
 // immediately after IHDR per the PNG metadata extension specification.
+//
+// Size guards (W3C PNG 3rd ed. §5.3 / ISO 15948 §11.2.1): the PNG chunk
+// Length field is a 31-bit unsigned integer; values >= 2^31 are forbidden.
+// If either payload would exceed this limit the function returns ErrXMPTooLarge
+// (for XMP) or ErrChunkTooLarge (for EXIF) without writing any bytes.
 func writeMetadataAfterIHDR(w io.Writer, rawEXIF, rawXMP []byte) error {
 	if rawEXIF != nil {
+		// PNG §5.3: chunk Length must be ≤ 2^31−1.
+		if len(rawEXIF) > math.MaxInt32 {
+			return fmt.Errorf("png: EXIF payload (%d bytes) exceeds PNG chunk limit of 2^31-1: %w",
+				len(rawEXIF), ErrChunkTooLarge)
+		}
 		if err := writeChunk(w, "eXIf", rawEXIF); err != nil {
 			return err
 		}
 	}
 	if rawXMP != nil {
+		// W3C PNG 3rd ed. §5.3: chunk Length field is 31-bit unsigned.
+		// The iTXt payload = xmpITXtOverhead + len(rawXMP); guard against overflow
+		// before PutUint32 silently truncates a value ≥ 2^31.
+		if len(rawXMP) > math.MaxInt32-xmpITXtOverhead {
+			return fmt.Errorf("png: XMP payload (%d bytes) would produce iTXt chunk length > 2^31-1: %w",
+				len(rawXMP), ErrXMPTooLarge)
+		}
 		xmpChunk := buildXMPChunk(rawXMP)
 		if err := writeChunk(w, "iTXt", xmpChunk); err != nil {
 			return err

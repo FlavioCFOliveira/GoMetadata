@@ -44,3 +44,13 @@ var ErrCorruptXMP = errors.New("png: corrupt or invalid XMP data")
 //
 // Use PreserveUnknownSegments(true) (the default) when writing to PNG.
 var ErrPreserveUnknownSegmentsNotSupported = errors.New("png: PreserveUnknownSegments(false) is not supported for PNG; all non-metadata chunks must be preserved")
+
+// ErrXMPTooLarge is returned by Inject when the serialised iTXt chunk payload
+// (keyword header + XMP data) would exceed 2^31−1 bytes.
+//
+// The PNG specification (W3C PNG 3rd ed. §5.3 / ISO 15948 §11.2.1) defines
+// the chunk Length field as a 31-bit unsigned integer: values 0x00000000 through
+// 0x7FFFFFFF are valid; 0x80000000 and above are explicitly forbidden. Writing a
+// length field that overflows this range would silently corrupt the chunk header.
+// Inject returns this error instead of emitting a corrupt chunk.
+var ErrXMPTooLarge = errors.New("png: XMP payload too large for a single PNG chunk (limit 2^31-1 bytes)")
