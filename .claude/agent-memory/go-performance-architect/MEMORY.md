@@ -32,3 +32,6 @@
 - [IPTC/XMP TIFF tag types: TypeLong/TypeByte not TypeUndefined](feedback_iptc_xmp_tiff_types.md) — 0x83BB=TypeLong (padded+trimmed), 0x02BC=TypeByte; writeIFD pads OOL gap; extractTagValues TrimRight for IPTC
 - [TIFF 6.0 §2 word-alignment: writeIFD + ifdTotalSize cooperation](feedback_tiff_word_align.md) — ifdTotalSize always returns even; writeIFD inserts inter-value + trailing 0x00 pads; SubIFD raw blocks also aligned (task #99)
 - [BigTIFF read support (task #54, commits 803070e + 8f5752d + 941c3d1)](project_bigtiff_read.md) — exif.Parse BigTIFF-aware (941c3d1); parameterised IFD traversal; all EXIF tags decoded; 0 lint issues
+- [traverse() offset=0 bug — Canon/Sony/DJI/Samsung/Casio/Leica Type 0](feedback_traverse_offset_zero.md) — `for cur != 0` guard skips offset=0 IFDs; fix uses `first bool` flag; commit 2d3866e
+- [XMP conformance battery (task #154, commit 2d3866e)](project_xmp_conformance_battery.md) — 67 rules all passing; U+001E dual-use as delimiter; ROB-10 C0 filter; ROB-11/NS-03 uniquePrefixFor
+- [MWG-02 IPTC digest reconciliation (task #168)](project_mwg02_iptc_digest.md) — digest-aware precedence in Caption/Copyright/Creator/Keywords; ExtractFull surfaces iptcDigest; iptcTrustElevated() in metadata.go

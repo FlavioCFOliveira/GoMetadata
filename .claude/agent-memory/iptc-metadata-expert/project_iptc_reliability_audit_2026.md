@@ -1,30 +1,40 @@
 ---
 name: project-iptc-reliability-audit-2026
-description: Reliability fragility audit of GoMetadata IPTC subsystem, 2026-06-04 — decode-cache race, SetKeywords UTF-8 flag gap, Pascal-string truncation
+description: Reliability fragility audit of GoMetadata IPTC subsystem, 2026-06-04 and 2026-06-09 — findings from both rounds
 metadata:
   type: project
 ---
 
-## Reliability Audit 2026-06-04
+## Reliability Audit 2026-06-04 (prior round — now fixed)
 
 Full read-only audit of iptc/iptc.go, iptc/dataset.go, iptc/encoding.go, format/jpeg/jpeg.go with all IPTC tests.
 
 **Why:** go-performance-architect requested IPTC-specific reliability fragility audit for the structured output pipeline.
 
-### FINDING A (HIGH): Decode-cache data race on concurrent reads
+All four findings from the 2026-06-04 round are confirmed fixed in the codebase as of 2026-06-09:
+- FINDING A (HIGH): Decode-cache data race — fixed by task #60 (eager pre-decode in Parse)
+- FINDING B (MEDIUM): SetKeywords UTF-8 flag — fixed by task #63
+- FINDING C (MEDIUM): Stale cache on UTF-8 upgrade — moot after task #60 (no lazy cache), confirmed by task #78 pinning test
+- FINDING D (MEDIUM): skipPascalString OOB — fixed with bounds check added to skipPascalString
 
-`(*Dataset).stringValue()` in iptc/encoding.go:42-48 writes `d.decoded` and `d.decodedValue` fields without any synchronization. Two goroutines calling `Keywords()`, `Caption()`, `AllCreators()`, or `firstRecord2()` concurrently on the same `*IPTC` will race on those fields — detected by `go test -race`. The FINDING-002 fix for `Encode` only addressed the `Records[0]` write race; the accessor read-path cache-fill race is untouched. No test covers concurrent `Keywords()` calls.
+## Reliability Audit 2026-06-09 (current round — new findings)
 
-### FINDING B (MEDIUM): SetKeywords does not update UTF-8 in-memory flag
+Second read-only audit of the same files plus format/tiff/tiff.go after all prior fixes landed.
 
-`SetKeywords` (iptc/iptc.go:438-455) does not call `hasHighBytes` on added keywords or set `Records[0]`. `AddKeyword` does (iptc/iptc.go:427-430). The gap means: after calling `SetKeywords(["αβγ"])` on a fresh *IPTC, `isUTF8()` returns false. A subsequent `Keywords()` call will decode via ISO-8859-1, producing mojibake. This is only harmless at encode time because `needsUTF8Declaration()` scans all records.
+### FINDING 1 (MEDIUM): parseIRB padding-byte advance unguarded — can advance pos beyond len(b) by 1
 
-### FINDING C (MEDIUM): decode-cache stale after UTF-8 flag upgrade via AddKeyword/AddCreator
+`parseIRB` (jpeg.go:1060-1063): after a successful non-0x0404 block is found and `pos = newPos`, if `len(data)%2 != 0` the code does `pos++` without checking whether `pos` is still within bounds. This cannot cause an OOB *read* (the for-loop guard `pos < len(b)` prevents the next iteration from reading), but it can produce `pos == len(b)+1` on exit — a logically correct loop but an off-by-one exit state. The actual bug is in `spliceIPTCIntoIRB` where the same `blockEnd` computation (jpeg.go:619-621) IS bounded by `if blockEnd > len(origIRB)`. So the main `parseIRB` call is safe; the fragility is documented for anyone who reuses the pattern.
 
-If a caller first reads `Caption()` on a non-UTF-8-declared stream (cache fills with ISO-8859-1 decode), then calls `AddKeyword("αβγ")` (which sets the UTF-8 flag on Records[0]), then reads `Caption()` again — the old decoded value is returned unchanged because the Caption's decode cache was filled on first read and never invalidated by the UTF-8 flag upgrade. The value in `Dataset.Value` did not change but the intended interpretation did.
+### FINDING 2 (MEDIUM): TIFF IPTC tag 0x83BB — TypeByte/TypeUndefined trailing-zero trimming removes valid IPTC content
 
-### FINDING D (MEDIUM): skipPascalString silent truncation drops all IRB blocks that follow a long Pascal-name
+`extractTagValues` (tiff.go:416-418): `bytes.TrimRight(v, "\x00")` removes ALL trailing zero bytes. For TypeLong-encoded IPTC this is correct (zero padding). But for TypeByte or TypeUndefined encodings, a valid IPTC IIM dataset whose value genuinely ends in 0x00 (e.g. a NUL-terminated string per IIM convention, or an urgency field value 0x00) will have its content silently truncated. This is LOW severity in practice (most real IPTC-in-TIFF uses TypeLong) but is a spec compliance gap.
 
-`skipPascalString` (jpeg.go:770-781) only guards the initial read of the length byte (`if pos >= len(b)`), then blindly advances `pos += nameLen` without checking whether the name bytes fit in the buffer. It returns `(pos, true)` even when `pos > len(b)`. The caller `parseIRBEntry` subsequently detects this via `if pos+4 > len(b)` and returns `(pos+1, false)`. In `parseIRB`, this matches the "structural failure" branch (newPos != pos), causing an immediate `break`. All 8BIM entries that follow a block with an overly-long Pascal name string are silently discarded. In a crafted or corrupted IRB stream where the 0x0404 IPTC block appears after such an entry, IPTC data is silently lost.
+### FINDING 3 (LOW): No mandatory Record 2 version dataset (2:00) on write
 
-**How to apply:** Any future IPTC changes should reference these findings. The decode-cache race (FINDING A) is the most likely to surface under production concurrent loads.
+`Encode` (iptc.go:293) does not emit dataset 2:00 (Record Version, IIM §2.2.1, mandatory 2-byte value = 4 for IIM 4.x). Real-world senders must include this. Absence is tolerated by all known readers but violates IIM §2.2.1 mandatory field requirement.
+
+### FINDING 4 (LOW): Multiple APP13 segments — only the last one wins silently
+
+`scanMetadataSegmentsWithWire` (jpeg.go:349): if a JPEG contains multiple APP13 segments with the Photoshop 3.0 prefix (non-standard but observed from some batch processors), each call to `processAPP13Segment` overwrites `rawIPTC`. The last segment wins silently. No `Truncated`-equivalent flag is set on the metadata struct. Low severity because the scenario is rare and the last-wins policy is consistent with ExifTool's behaviour, but it is not documented.
+
+**How to apply:** Reference these findings in future IPTC work. FINDING 2 (TypeByte/TypeUndefined trim) is the most actionable new finding.
