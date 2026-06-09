@@ -38,3 +38,5 @@
 - [JPEG conformance battery (task #155)](project_jpeg_conformance_battery.md) — 26 §1 assertions; bug fixed in processAPP1Segment (first-wins for EXIF+XMP)
 - [TIFF+BigTIFF conformance battery (task #156)](project_tiff_conformance_battery.md) — 51 sub-tests; 0 violations; covers S-01..S-17, R-01..R-13, TIFF-01..03, ROBUST-16, corpus+BigTIFF files
 - [PNG conformance battery (task #157)](project_png_conformance_battery.md) — 40 top-level tests, 2 spec violations fixed: handleXMPChunk first-wins (PNG-04) + length boundary test
+- [WebP conformance battery (task #158)](project_webp_conformance_battery.md) — 44 top-level tests; 0 violations; covers §3(b)-(f) RIFF/VP8X/flags/padding/round-trip/robustness/corpus
+- [HEIF/AVIF conformance battery (tasks #159,#160)](project_heif_avif_conformance_battery.md) — 10 BMFF+36 HEIF+24 AVIF tests; CRITICAL infe OOB audit #106 confirmed safe; empty-file fix in heif.go; 0 lint issues; fuzzers clean
