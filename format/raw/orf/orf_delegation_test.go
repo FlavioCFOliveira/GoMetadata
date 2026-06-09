@@ -77,10 +77,11 @@ func TestORFDelegationIPTCAndXMP(t *testing.T) {
 	}
 }
 
-// TestORFExtractPatchesStandardMagic verifies that orf.Extract patches bytes
-// 2-3 to standard TIFF magic (0x2A 0x00) in the returned rawEXIF.
-// This ensures the downstream EXIF parser receives a standard TIFF stream.
-func TestORFExtractPatchesStandardMagic(t *testing.T) {
+// TestORFExtractPreservesOriginalMagic verifies that orf.Extract returns rawEXIF
+// with the ORIGINAL ORF magic bytes intact (#117 fix).
+// The TIFF IFD traversal operates on an internal working copy; the rawEXIF
+// returned to the caller is always unpatched so it can be written back to disk.
+func TestORFExtractPreservesOriginalMagic(t *testing.T) {
 	t.Parallel()
 	data := buildORFWithIPTCAndXMP(
 		[]byte("iptc-patch-test-long-enough"),
@@ -93,10 +94,11 @@ func TestORFExtractPatchesStandardMagic(t *testing.T) {
 	if len(rawEXIF) < 4 {
 		t.Fatal("rawEXIF too short")
 	}
-	// Bytes 2-3 of rawEXIF must be standard TIFF magic (0x2A 0x00), not ORF magic.
-	if rawEXIF[2] != 0x2A || rawEXIF[3] != 0x00 {
-		t.Errorf("rawEXIF bytes[2:4] = %02x %02x, want 0x2a 0x00 (standard TIFF magic)",
-			rawEXIF[2], rawEXIF[3])
+	// Bytes 2-3 of rawEXIF must retain the original ORF magic ("RO" for IIRO),
+	// NOT the patched TIFF magic (0x2A 0x00). Writing rawEXIF to disk must yield
+	// a valid ORF file. (#117 fix)
+	if rawEXIF[2] == 0x2A && rawEXIF[3] == 0x00 {
+		t.Errorf("#117 regression: rawEXIF bytes[2:4] = 2a 00 (patched TIFF magic); want original ORF magic")
 	}
 }
 

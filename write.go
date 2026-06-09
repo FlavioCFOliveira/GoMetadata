@@ -535,9 +535,10 @@ func writeTIFFARW(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 //   - IIRO (0x52 0x4F, "RO") — used by Olympus DSLRs (E-series, OM-D line).
 //   - IIRS (0x52 0x53, "RS") — used by older Olympus compacts (C-series, SP-series).
 //
-// orf.Extract patches bytes [2:4] to 0x2A 0x00 when it returns rawEXIF, so
-// m.rawEXIF carries patched magic.  writeTIFFORF reads the original magic from r
-// and restores it into a working copy of m.rawEXIF before calling InjectWithEXIFORF.
+// #117 fix: orf.Extract now returns rawEXIF with the ORIGINAL magic preserved.
+// writeTIFFORF reads the original magic from r (which is authoritative) and
+// stores it into the working copy of m.rawEXIF so InjectWithEXIFORF can patch
+// to standard TIFF magic for the relocation pass and restore the ORF magic after.
 //
 // All other aspects (strip/tile relocation, SubIFD relocation, OOL RATIONAL
 // patching, etc.) use the standard copy-and-relocate algorithm unchanged,
@@ -616,9 +617,10 @@ func writeTIFFORF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 //     (which produces IFD0 at offset 8 via exif.Encode) the GUID is re-inserted
 //     at position 8 and all absolute IFD0 OOL pointers are rebased by +16.
 //
-// rw2.Extract patches bytes [2:4] to 0x2A 0x00 when it returns rawEXIF, so
-// writeTIFFRW2 recovers the original magic from r and restores it before calling
-// InjectWithEXIFRW2.
+// #117 fix: rw2.Extract now returns rawEXIF with the ORIGINAL magic preserved.
+// writeTIFFRW2 reads the original magic from r (which is authoritative) and
+// stores it into the working copy of m.rawEXIF so InjectWithEXIFRW2 can patch
+// to standard TIFF magic for the relocation pass and restore the RW2 magic after.
 //
 // Un-gated in task #104 after real-corpus validation (Panasonic DMC-GF1):
 // ImageDataHash IN==OUT, JpgFromRaw (0x002E) and raw sensor data preserved.
@@ -710,11 +712,21 @@ func encodeEXIF(m *Metadata) ([]byte, error) {
 
 // encodeIPTC returns the IPTC bytes to write: freshly encoded when m.IPTC is
 // non-nil, or the original raw bytes when the caller did not modify IPTC.
+//
+// #190 fix: a zero-length result from iptc.Encode (which occurs when m.IPTC is
+// a non-nil but structurally empty *iptc.IPTC with no datasets) is normalised to
+// nil. This prevents downstream upsert logic from writing a zero-length 0x83BB
+// tag into the TIFF IFD when the caller merely set m.IPTC = new(iptc.IPTC)
+// without adding any datasets. Nil signals "no IPTC to write"; a non-nil empty
+// slice is an encoding artifact that must not be stored as a tag value.
 func encodeIPTC(m *Metadata) ([]byte, error) {
 	if m.IPTC != nil {
 		raw, err := iptc.Encode(m.IPTC)
 		if err != nil {
 			return nil, fmt.Errorf("gometadata: encode IPTC: %w", err)
+		}
+		if len(raw) == 0 {
+			return nil, nil // normalise empty encoding to nil (no IPTC to write)
 		}
 		return raw, nil
 	}

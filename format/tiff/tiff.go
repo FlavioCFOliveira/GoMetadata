@@ -152,7 +152,10 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ boo
 	}
 
 	// Pass-through: no metadata changes requested.
-	if rawIPTC == nil && rawXMP == nil {
+	// #190 fix: treat zero-length slices the same as nil — an empty rawIPTC or
+	// rawXMP must not trigger the copy-and-relocate path or write a zero-length
+	// tag. encodeIPTC normalises empty→nil, but guard here for any direct callers.
+	if len(rawIPTC) == 0 && len(rawXMP) == 0 {
 		if _, err := w.Write(base); err != nil {
 			return fmt.Errorf("tiff: write: %w", err)
 		}

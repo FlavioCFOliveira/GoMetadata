@@ -43,14 +43,41 @@ import (
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
 )
 
+// patchNonStandardMagicForParse returns a copy of rawEXIF with bytes [2:4]
+// patched to standard TIFF LE magic (0x2A 0x00) when the input carries a
+// known non-standard magic that exif.Parse rejects.
+//
+// #117 fix: ORF rawEXIF has "IIRO"/"IIRS" magic; RW2 rawEXIF has "IIU\x00".
+// exif.Parse requires 0x002A (classic TIFF) or 0x002B (BigTIFF). Patching the
+// magic allows test helpers to call exif.Parse on an ORF/RW2 rawEXIF slice
+// without patching the caller's buffer in-place.
+func patchNonStandardMagicForParse(rawEXIF []byte) []byte {
+	if len(rawEXIF) < 4 || rawEXIF[0] != 0x49 || rawEXIF[1] != 0x49 {
+		return rawEXIF // not a LE variant with non-standard magic; return as-is
+	}
+	b2, b3 := rawEXIF[2], rawEXIF[3]
+	needsPatch := (b2 == 0x52 && (b3 == 0x4F || b3 == 0x53)) || // ORF: IIRO/IIRS
+		(b2 == 0x55 && b3 == 0x00) // RW2: IIU\x00
+	if !needsPatch {
+		return rawEXIF
+	}
+	patched := make([]byte, len(rawEXIF))
+	copy(patched, rawEXIF)
+	patched[2] = 0x2A
+	patched[3] = 0x00
+	return patched
+}
+
 // countExifIFDEntries returns the total number of IFD entries across all
 // parsed IFDs (IFD0, ExifIFD, GPSIFD) for a given raw EXIF stream.
 // Returns 0 if parse fails or rawEXIF is nil.
+//
+// #117: ORF/RW2 rawEXIF may have non-standard magic; patch before parsing.
 func countExifIFDEntries(rawEXIF []byte) int {
 	if len(rawEXIF) == 0 {
 		return 0
 	}
-	e, err := exif.Parse(rawEXIF)
+	e, err := exif.Parse(patchNonStandardMagicForParse(rawEXIF))
 	if err != nil || e == nil {
 		return 0
 	}
@@ -69,11 +96,13 @@ func countExifIFDEntries(rawEXIF []byte) int {
 
 // hasOLYMPMakerNote reports whether rawEXIF contains an OLYMP-type MakerNote
 // (the blob begins with the 6-byte ASCII string "OLYMP\x00").
+//
+// #117: ORF rawEXIF may have non-standard magic; patch before parsing.
 func hasOLYMPMakerNote(rawEXIF []byte) bool {
 	if len(rawEXIF) == 0 {
 		return false
 	}
-	e, err := exif.Parse(rawEXIF)
+	e, err := exif.Parse(patchNonStandardMagicForParse(rawEXIF))
 	if err != nil || e == nil || e.ExifIFD == nil {
 		return false
 	}

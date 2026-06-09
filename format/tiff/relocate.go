@@ -225,13 +225,18 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte) (
 		// Should not happen for a parseable TIFF, but guard defensively.
 		e.IFD0 = &exif.IFD{}
 	}
-	if rawIPTC != nil {
+	// #190 fix: guard on len>0 rather than !=nil. A non-nil but zero-length
+	// rawIPTC slice (empty encoding artifact) must not produce a zero-length
+	// 0x83BB tag. encodeIPTC already normalises empty→nil, but this guard
+	// provides belt-and-suspenders safety for any caller that bypasses encodeIPTC.
+	if len(rawIPTC) > 0 {
 		// Adobe XMP Spec / ExifTool convention: IPTC-NAA (0x83BB) as TypeLong.
 		// upsertIFD0Entry pads value to 4-byte boundary; Count = nLongs.
 		upsertIFD0Entry(e.IFD0, exif.TagIPTC, exif.TypeLong, rawIPTC)
 	}
-	if rawXMP != nil {
+	if len(rawXMP) > 0 {
 		// Adobe XMP Spec (TIFF Technical Note 3): XMP (0x02BC) as TypeByte.
+		// #190 fix: same belt-and-suspenders guard for consistency.
 		upsertIFD0Entry(e.IFD0, exif.TagXMP, exif.TypeByte, rawXMP)
 	}
 

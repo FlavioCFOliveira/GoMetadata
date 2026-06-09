@@ -166,6 +166,38 @@ func parseParsedMetadata(m *Metadata, rawEXIF, rawIPTC, rawXMP []byte, cfg *read
 	return applyOrWarn(m, parseXMP(m, rawXMP, cfg), cfg.strict)
 }
 
+// patchRawEXIFForParse returns a copy of raw with bytes[2:4] patched to
+// standard TIFF LE magic (0x2A 0x00) when the input carries a known
+// non-standard RAW-format magic that exif.Parse would reject.
+//
+// #117 fix: ORF/RW2 Extract functions return rawEXIF with the ORIGINAL magic
+// so callers can write the bytes back unmodified. exif.Parse requires the
+// standard TIFF magic (TIFF 6.0 §2). This helper patches only the transient
+// parse copy; m.rawEXIF is never modified.
+//
+// Known non-standard magics (both little-endian, bytes[0:2] = "II"):
+//   - ORF IIRO: bytes[2:4] = 0x52 0x4F ('R', 'O') — Olympus DSLR / OM-D
+//   - ORF IIRS: bytes[2:4] = 0x52 0x53 ('R', 'S') — Olympus compact
+//   - RW2:      bytes[2:4] = 0x55 0x00             — Panasonic RAW
+//
+// ExifTool Olympus.pm / Panasonic RW2: patch bytes[2:4] for IFD traversal.
+func patchRawEXIFForParse(raw []byte) []byte {
+	if len(raw) < 4 || raw[0] != 0x49 || raw[1] != 0x49 {
+		return raw // big-endian or standard magic: no patch needed
+	}
+	b2, b3 := raw[2], raw[3]
+	needsPatch := (b2 == 0x52 && (b3 == 0x4F || b3 == 0x53)) || // ORF IIRO/IIRS
+		(b2 == 0x55 && b3 == 0x00) // RW2 IIU\x00
+	if !needsPatch {
+		return raw
+	}
+	patched := make([]byte, len(raw))
+	copy(patched, raw)
+	patched[2] = 0x2A
+	patched[3] = 0x00
+	return patched
+}
+
 // parseEXIF attempts to parse rawEXIF into m.EXIF when raw is non-nil and not lazy.
 // Returns a *ParseSegmentError on parse failure, nil on success or skip.
 //
@@ -173,6 +205,9 @@ func parseParsedMetadata(m *Metadata, rawEXIF, rawIPTC, rawXMP []byte, cfg *read
 // #126/#129/#130/#131/#132) are appended to m.ParseWarnings as individual
 // *ParseSegmentError entries so that callers can inspect them at the top-level
 // Metadata API without aborting parsing.
+//
+// #117: ORF/RW2 rawEXIF carries the original non-standard magic. patchRawEXIFForParse
+// provides a standard-magic copy for exif.Parse without modifying m.rawEXIF.
 func parseEXIF(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
 	if raw == nil || cfg.lazyEXIF {
 		return nil
@@ -181,7 +216,7 @@ func parseEXIF(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
 	if cfg.skipMakerNote {
 		opts = []exif.ParseOption{exif.SkipMakerNote()}
 	}
-	e, err := exif.Parse(raw, opts...)
+	e, err := exif.Parse(patchRawEXIFForParse(raw), opts...)
 	if err != nil {
 		return &ParseSegmentError{Segment: "EXIF", Err: err}
 	}

@@ -925,11 +925,15 @@ func buildTIFFWithStrip(order binary.ByteOrder, bigEndian bool, stripData []byte
 	order.PutUint16(buf[2:], 0x002A)
 	order.PutUint32(buf[4:], uint32(ifd0Off)) // ifd0Off is either 8 or 16; fits uint32
 
-	// Canon CR2 marker at bytes 8–9 (Canon CR2 spec §3.1).
-	// Bytes 8–9 are in the TIFF header "reserved" area when IFD0 > 8.
+	// Canon CR2 marker at bytes 8–11 (Canon CR2 spec §3.1).
+	// Bytes 8–9 = "CR", byte 10 = major version (0x02), byte 11 = minor (0x00).
+	// The #136 fix requires byte[10]==0x02 to distinguish CR2 from a plain TIFF
+	// whose first-IFD entry tag happens to begin with 0x43 0x52 ('C','R').
 	if canonMarker {
 		buf[8] = 'C'
 		buf[9] = 'R'
+		buf[10] = 0x02 // CR2 major version — Canon CR2 spec §3.1
+		buf[11] = 0x00 // CR2 minor version
 	}
 
 	// IFD0

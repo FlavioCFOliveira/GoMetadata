@@ -269,10 +269,18 @@ func detectHEIFBrand(b []byte) FormatID { //nolint:cyclop,gocyclo // brand detec
 // from generic TIFF by inspecting magic bytes.
 // Falls back to FormatTIFF for unrecognised variants.
 func detectTIFFVariant(b []byte) FormatID {
-	// CR2: Canon stores a "CR" marker at bytes 8–9 of the TIFF header reserved
-	// area (CR2 specification §3.1). This is the only variant distinguishable
-	// from magic bytes alone without IFD parsing.
-	if len(b) >= 10 && b[8] == 0x43 && b[9] == 0x52 {
+	// CR2: Canon stores a proprietary marker at bytes 8–11 of the TIFF header:
+	//   bytes [8:9]  = 0x43 0x52 ("CR") — Canon RAW identifier
+	//   byte  [10]   = 0x02             — CR2 major version (always 2)
+	//   byte  [11]   = 0x00             — CR2 minor version
+	//
+	// Canon CR2 Specification §3.1: the "CR" ASCII tag at offset 8 plus the
+	// version byte at offset 10 (must be 2) uniquely identify a CR2 file.
+	//
+	// #136 fix: check byte[10]==0x02 to prevent a generic TIFF whose first IFD
+	// entry tag happens to be 0x5243 (bytes [8:10]="CR" in little-endian) from
+	// being misclassified as FormatCR2. Real CR2 files always have version=2.
+	if len(b) >= 11 && b[8] == 0x43 && b[9] == 0x52 && b[10] == 0x02 {
 		return FormatCR2
 	}
 	// DNG, NEF, and ARW share the standard TIFF magic — refineTIFFVariant()

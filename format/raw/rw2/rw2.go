@@ -16,7 +16,12 @@ import (
 var rw2Magic = []byte{0x49, 0x49, 0x55, 0x00} //nolint:gochecknoglobals // package-level constant bytes
 
 // Extract reads metadata from an RW2 file.
-// The RW2 magic bytes are patched to standard TIFF LE before extraction.
+// The TIFF parser operates on a working copy of the data with bytes [2:4]
+// patched to standard TIFF LE magic (0x2A 0x00) so that the shared IFD
+// traversal code can be reused. The returned rawEXIF contains the ORIGINAL
+// unmodified bytes so that RawEXIF() round-trips correctly and writing
+// rawEXIF back to disk produces a valid RW2 file.
+//
 // Note: RW2 uses non-standard IFD encoding; some entries may not decode correctly.
 func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if _, err = r.Seek(0, io.SeekStart); err != nil {
@@ -30,22 +35,28 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, ErrInvalidMagic
 	}
 
-	// Patch bytes 2-3 to standard TIFF LE magic.
-	// data is exclusively owned (returned by io.ReadAll), so in-place mutation
-	// is safe and avoids a full-file copy (RAW files can be tens of MB).
-	data[2] = 0x2A
-	data[3] = 0x00
+	// #117 fix: rawEXIF must carry the ORIGINAL bytes so that callers can
+	// round-trip the file correctly (writing rawEXIF to disk produces a valid
+	// RW2, not a standard TIFF). Operate on a separate working copy for TIFF
+	// parsing so the original bytes are never mutated.
+	//
+	// RW2 magic: bytes [0:2]="II", bytes [2:4]=0x55 0x00 ("U\x00").
+	// TIFF parser requires bytes [2:4]=0x2A 0x00 (TIFF 6.0 §2, magic = 42).
+	tiffData := make([]byte, len(data))
+	copy(tiffData, data)
+	tiffData[2] = 0x2A
+	tiffData[3] = 0x00
 
-	if len(data) < 8 {
-		return data, nil, nil, nil
+	rawEXIF = data // original bytes, magic preserved
+
+	if len(tiffData) < 8 {
+		return rawEXIF, nil, nil, nil
 	}
 
 	order := binary.LittleEndian
-	rawEXIF = data
-
-	ifd0Off := order.Uint32(data[4:])
+	ifd0Off := order.Uint32(tiffData[4:])
 	// Best-effort extraction; RW2 IFD encoding may differ from standard TIFF.
-	rawIPTC, rawXMP = extractTIFFTags(data, ifd0Off, order)
+	rawIPTC, rawXMP = extractTIFFTags(tiffData, ifd0Off, order)
 	return rawEXIF, rawIPTC, rawXMP, nil
 }
 

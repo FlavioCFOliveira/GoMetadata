@@ -32,11 +32,13 @@ func TestExtractReturnsRawEXIF(t *testing.T) {
 		t.Fatalf("Extract: %v", err)
 	}
 	if rawEXIF == nil {
-		t.Error("rawEXIF is nil, want non-nil patched TIFF payload")
+		t.Error("rawEXIF is nil, want non-nil original ORF payload")
 	}
-	// The returned rawEXIF should have standard TIFF magic (patched), not ORF magic.
-	if len(rawEXIF) >= 4 && rawEXIF[2] == orfMagic[2] && rawEXIF[3] == orfMagic[3] {
-		t.Error("rawEXIF still has ORF magic bytes; expected standard TIFF magic 0x2A 0x00")
+	// #117 fix: rawEXIF must carry the ORIGINAL ORF magic bytes so that writing
+	// rawEXIF back to disk produces a valid ORF file (not a patched TIFF).
+	if len(rawEXIF) >= 4 && (rawEXIF[2] != orfMagic[2] || rawEXIF[3] != orfMagic[3]) {
+		t.Errorf("rawEXIF has wrong bytes[2:4]: got %02X %02X, want %02X %02X (original ORF magic)",
+			rawEXIF[2], rawEXIF[3], orfMagic[2], orfMagic[3])
 	}
 	if rawIPTC != nil {
 		t.Errorf("rawIPTC = %v, want nil (no IPTC tag in minimal ORF)", rawIPTC)
@@ -252,7 +254,7 @@ func TestExtractOutOfBoundsIFDOffset(t *testing.T) {
 		t.Fatalf("Extract with out-of-bounds IFD offset: unexpected error: %v", err)
 	}
 	if rawEXIF == nil {
-		t.Error("rawEXIF should still be non-nil (the patched TIFF bytes)")
+		t.Error("rawEXIF should still be non-nil (the original ORF bytes)")
 	}
 	// IPTC and XMP must be nil since no valid IFD entries could be parsed.
 	if rawIPTC != nil {
@@ -328,7 +330,7 @@ func TestExtractTIFFTagsOOBValueOffset(t *testing.T) {
 
 // TestExtractTooShortReturnsMagicOnly verifies that when an ORF file is valid
 // (has correct magic) but too short to contain a full TIFF header (< 8 bytes),
-// Extract returns the patched bytes as rawEXIF with no IPTC/XMP.
+// Extract returns the original bytes as rawEXIF with no IPTC/XMP.
 func TestExtractTooShortReturnsMagicOnly(t *testing.T) {
 	t.Parallel()
 	// Build a 6-byte ORF: 4-byte magic + 2 bytes — valid magic but too short for IFD.
@@ -342,10 +344,65 @@ func TestExtractTooShortReturnsMagicOnly(t *testing.T) {
 	if rawEXIF == nil {
 		t.Error("rawEXIF should be non-nil even for short ORF")
 	}
+	// #117: rawEXIF must carry original ORF magic even for short files.
+	if len(rawEXIF) >= 4 && (rawEXIF[2] != orfMagic[2] || rawEXIF[3] != orfMagic[3]) {
+		t.Errorf("rawEXIF[2:4] = %02X %02X, want %02X %02X (original ORF magic)",
+			rawEXIF[2], rawEXIF[3], orfMagic[2], orfMagic[3])
+	}
 	if rawIPTC != nil {
 		t.Errorf("rawIPTC = %v, want nil for short ORF", rawIPTC)
 	}
 	if rawXMP != nil {
 		t.Errorf("rawXMP = %v, want nil for short ORF", rawXMP)
 	}
+}
+
+// TestORFRawEXIFPreservesOriginalMagic is the regression gate for #117.
+// Extract must return rawEXIF with the ORIGINAL ORF magic bytes intact.
+// Callers that write rawEXIF back to disk must get a valid ORF, not a
+// patched TIFF with 0x2A 0x00 at bytes [2:4].
+func TestORFRawEXIFPreservesOriginalMagic(t *testing.T) {
+	t.Parallel()
+
+	// IIRO variant (Olympus DSLRs, E-series, OM-D).
+	t.Run("IIRO", func(t *testing.T) {
+		t.Parallel()
+		iiro := make([]byte, 14)
+		copy(iiro[:4], []byte{0x49, 0x49, 0x52, 0x4F}) // "IIRO"
+		binary.LittleEndian.PutUint32(iiro[4:], 8)
+
+		rawEXIF, _, _, err := Extract(bytes.NewReader(iiro))
+		if err != nil {
+			t.Fatalf("Extract IIRO: %v", err)
+		}
+		if len(rawEXIF) < 4 {
+			t.Fatalf("rawEXIF too short: %d", len(rawEXIF))
+		}
+		// Gate: original "RO" magic must be preserved, NOT patched to 0x2A 0x00.
+		if rawEXIF[2] != 0x52 || rawEXIF[3] != 0x4F {
+			t.Errorf("#117 regression: rawEXIF[2:4] = %02X %02X, want 52 4F (original IIRO magic)",
+				rawEXIF[2], rawEXIF[3])
+		}
+	})
+
+	// IIRS variant (older Olympus compacts, C-series, SP-series).
+	t.Run("IIRS", func(t *testing.T) {
+		t.Parallel()
+		iirs := make([]byte, 14)
+		copy(iirs[:4], []byte{0x49, 0x49, 0x52, 0x53}) // "IIRS"
+		binary.LittleEndian.PutUint32(iirs[4:], 8)
+
+		rawEXIF, _, _, err := Extract(bytes.NewReader(iirs))
+		if err != nil {
+			t.Fatalf("Extract IIRS: %v", err)
+		}
+		if len(rawEXIF) < 4 {
+			t.Fatalf("rawEXIF too short: %d", len(rawEXIF))
+		}
+		// Gate: original "RS" magic must be preserved, NOT patched to 0x2A 0x00.
+		if rawEXIF[2] != 0x52 || rawEXIF[3] != 0x53 {
+			t.Errorf("#117 regression: rawEXIF[2:4] = %02X %02X, want 52 53 (original IIRS magic)",
+				rawEXIF[2], rawEXIF[3])
+		}
+	})
 }

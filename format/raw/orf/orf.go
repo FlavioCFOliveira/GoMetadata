@@ -32,8 +32,11 @@ func isORFMagic(data []byte) bool {
 }
 
 // Extract reads metadata from an ORF file.
-// The ORF magic bytes are patched to standard TIFF before extraction so
-// that the TIFF IFD traversal code can be reused.
+// The TIFF parser operates on a working copy of the data with bytes [2:4]
+// patched to standard TIFF LE magic (0x2A 0x00) so that the shared IFD
+// traversal code can be reused. The returned rawEXIF contains the ORIGINAL
+// unmodified bytes so that RawEXIF() round-trips correctly and writing
+// rawEXIF back to disk produces a valid ORF file.
 // Both IIRO and IIRS magic variants are accepted.
 func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if _, err = r.Seek(0, io.SeekStart); err != nil {
@@ -47,21 +50,28 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, ErrInvalidMagic
 	}
 
-	// Patch bytes 2-3 to standard TIFF LE magic so the TIFF parser works.
-	// data is exclusively owned (returned by io.ReadAll), so in-place mutation
-	// is safe and avoids a full-file copy (RAW files can be tens of MB).
-	data[2] = 0x2A
-	data[3] = 0x00
+	// #117 fix: rawEXIF must carry the ORIGINAL bytes so that callers can
+	// round-trip the file correctly (writing rawEXIF to disk produces a valid
+	// ORF, not a standard TIFF). Operate on a separate working copy for TIFF
+	// parsing so the original bytes are never mutated.
+	//
+	// ORF magic: bytes [0:2]="II", bytes [2:4]="RO" (IIRO) or "RS" (IIRS).
+	// TIFF parser requires bytes [2:4]=0x2A 0x00 (TIFF 6.0 §2, magic = 42).
+	// ExifTool Olympus.pm: patch bytes[2:4] to 0x2A 0x00 for IFD traversal.
+	tiffData := make([]byte, len(data))
+	copy(tiffData, data)
+	tiffData[2] = 0x2A
+	tiffData[3] = 0x00
 
-	if len(data) < 8 {
-		return data, nil, nil, nil
+	rawEXIF = data // original bytes, magic preserved
+
+	if len(tiffData) < 8 {
+		return rawEXIF, nil, nil, nil
 	}
 
 	order := binary.LittleEndian
-	rawEXIF = data
-
-	ifd0Off := order.Uint32(data[4:])
-	rawIPTC, rawXMP = extractTIFFTags(data, ifd0Off, order)
+	ifd0Off := order.Uint32(tiffData[4:])
+	rawIPTC, rawXMP = extractTIFFTags(tiffData, ifd0Off, order)
 	return rawEXIF, rawIPTC, rawXMP, nil
 }
 

@@ -32,11 +32,13 @@ func TestExtractReturnsRawEXIF(t *testing.T) {
 		t.Fatalf("Extract: %v", err)
 	}
 	if rawEXIF == nil {
-		t.Error("rawEXIF is nil, want non-nil patched TIFF payload")
+		t.Error("rawEXIF is nil, want non-nil original RW2 payload")
 	}
-	// The returned rawEXIF should have standard TIFF magic (patched), not RW2 magic.
-	if len(rawEXIF) >= 4 && rawEXIF[2] == rw2Magic[2] && rawEXIF[3] == rw2Magic[3] {
-		t.Error("rawEXIF still has RW2 magic bytes; expected standard TIFF magic 0x2A 0x00")
+	// #117 fix: rawEXIF must carry the ORIGINAL RW2 magic bytes so that writing
+	// rawEXIF back to disk produces a valid RW2 file (not a patched TIFF).
+	if len(rawEXIF) >= 4 && (rawEXIF[2] != rw2Magic[2] || rawEXIF[3] != rw2Magic[3]) {
+		t.Errorf("rawEXIF has wrong bytes[2:4]: got %02X %02X, want %02X %02X (original RW2 magic)",
+			rawEXIF[2], rawEXIF[3], rw2Magic[2], rw2Magic[3])
 	}
 	if rawIPTC != nil {
 		t.Errorf("rawIPTC = %v, want nil (no IPTC tag in minimal RW2)", rawIPTC)
@@ -243,7 +245,7 @@ func TestExtractOutOfBoundsIFDOffset(t *testing.T) {
 		t.Fatalf("Extract with out-of-bounds IFD offset: unexpected error: %v", err)
 	}
 	if rawEXIF == nil {
-		t.Error("rawEXIF should still be non-nil (the patched TIFF bytes)")
+		t.Error("rawEXIF should still be non-nil (the original RW2 bytes)")
 	}
 	if rawIPTC != nil {
 		t.Errorf("rawIPTC = %v, want nil", rawIPTC)
@@ -421,7 +423,7 @@ func TestExtractTIFFTagsOOBValueOffset(t *testing.T) {
 
 // TestExtractTooShortReturnsMagicOnly verifies that when an RW2 file is valid
 // (has correct magic) but too short to contain a full TIFF header (< 8 bytes),
-// Extract returns the patched bytes as rawEXIF with no IPTC/XMP.
+// Extract returns the original bytes as rawEXIF with no IPTC/XMP.
 func TestExtractTooShortReturnsMagicOnly(t *testing.T) {
 	t.Parallel()
 	// Build a 6-byte RW2: 4-byte magic + 2 bytes — valid magic but too short for IFD.
@@ -435,10 +437,39 @@ func TestExtractTooShortReturnsMagicOnly(t *testing.T) {
 	if rawEXIF == nil {
 		t.Error("rawEXIF should be non-nil even for short RW2")
 	}
+	// #117: rawEXIF must carry original RW2 magic even for short files.
+	if len(rawEXIF) >= 4 && (rawEXIF[2] != rw2Magic[2] || rawEXIF[3] != rw2Magic[3]) {
+		t.Errorf("rawEXIF[2:4] = %02X %02X, want %02X %02X (original RW2 magic)",
+			rawEXIF[2], rawEXIF[3], rw2Magic[2], rw2Magic[3])
+	}
 	if rawIPTC != nil {
 		t.Errorf("rawIPTC = %v, want nil for short RW2", rawIPTC)
 	}
 	if rawXMP != nil {
 		t.Errorf("rawXMP = %v, want nil for short RW2", rawXMP)
+	}
+}
+
+// TestRW2RawEXIFPreservesOriginalMagic is the regression gate for #117.
+// Extract must return rawEXIF with the ORIGINAL RW2 magic bytes intact.
+// Callers that write rawEXIF back to disk must get a valid RW2, not a
+// patched TIFF with 0x2A 0x00 at bytes [2:4].
+func TestRW2RawEXIFPreservesOriginalMagic(t *testing.T) {
+	t.Parallel()
+
+	data := buildRW2()
+
+	rawEXIF, _, _, err := Extract(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if len(rawEXIF) < 4 {
+		t.Fatalf("rawEXIF too short: %d", len(rawEXIF))
+	}
+	// Gate: original "U\x00" magic must be preserved, NOT patched to 0x2A 0x00.
+	// RW2 magic: bytes[2]=0x55 ('U'), bytes[3]=0x00.
+	if rawEXIF[2] != 0x55 || rawEXIF[3] != 0x00 {
+		t.Errorf("#117 regression: rawEXIF[2:4] = %02X %02X, want 55 00 (original RW2 magic)",
+			rawEXIF[2], rawEXIF[3])
 	}
 }

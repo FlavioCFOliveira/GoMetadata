@@ -1,6 +1,6 @@
 package tiff
 
-// bug111_116_118_149_test.go — gate tests for four audit findings fixed in this commit.
+// bug111_116_118_149_test.go — gate tests for audit findings fixed in this file.
 //
 //	#111 [HIGH]  RW2 write: IFD0 nextIFD pointer NOT rebased after GUID insertion
 //	             → TestRW2RoundTripThumbnailOffset
@@ -10,6 +10,8 @@ package tiff
 //	             → TestTIFFInjectRejectsWireFrameXMP
 //	#149 [LOW]   tiff.Inject with nil rawIPTC silently deletes existing IPTC
 //	             → TestTIFFInjectXMPOnlyPreservesIPTC (documents semantics + verifies Write path)
+//	#190 [LOW]   TIFF Inject: empty non-nil rawIPTC upserts zero-length 0x83BB tag
+//	             → TestTIFFInjectEmptyIPTCNoZeroLengthTag
 
 import (
 	"bytes"
@@ -707,4 +709,84 @@ func TestTIFFWritePathPreservesIPTCOnXMPOnlyUpdate(t *testing.T) {
 	if !bytes.Equal(outIPTC, rawIPTC) {
 		t.Errorf("IPTC changed in Write path:\n got  %x\n want %x", outIPTC, rawIPTC)
 	}
+}
+
+// TestTIFFInjectEmptyIPTCNoZeroLengthTag is the regression gate for finding #190.
+//
+// When Inject or InjectWithEXIF is called with a zero-length (empty) rawIPTC,
+// the output must NOT contain a 0x83BB tag at all. Upsert logic using !=nil
+// guards would previously write a zero-length TypeLong entry when rawIPTC was
+// a non-nil empty slice. The fix in relocateTIFFFromParsed uses len>0 instead.
+//
+// Additionally, if the source TIFF already had IPTC content, passing a nil
+// rawIPTC (the "preserve" signal) must not delete it — this is the existing
+// task #149 contract and must be preserved by the #190 fix.
+func TestTIFFInjectEmptyIPTCNoZeroLengthTag(t *testing.T) {
+	t.Parallel()
+
+	// Case 1: source TIFF has no IPTC; pass an explicitly empty (non-nil) rawIPTC.
+	// Output must NOT contain a 0x83BB tag.
+	t.Run("no-existing-iptc-empty-inject", func(t *testing.T) {
+		t.Parallel()
+		tiffData := buildMinimalTIFF(binary.LittleEndian, nil, nil)
+
+		// Passing a non-nil but zero-length rawIPTC: the fix prevents upsert.
+		emptyIPTC := make([]byte, 0) // non-nil, zero-length
+		var out bytes.Buffer
+		if err := Inject(bytes.NewReader(tiffData), &out, nil, emptyIPTC, nil, true); err != nil {
+			t.Fatalf("Inject with empty IPTC: %v", err)
+		}
+		_, outIPTC, _, err := Extract(bytes.NewReader(out.Bytes()))
+		if err != nil {
+			t.Fatalf("Extract output: %v", err)
+		}
+		if outIPTC != nil {
+			t.Errorf("#190 regression: output has IPTC tag 0x83BB with len=%d; empty rawIPTC must not create a tag",
+				len(outIPTC))
+		}
+	})
+
+	// Case 2: source TIFF already has IPTC; pass nil rawIPTC (preserve-existing signal).
+	// Output must retain the original IPTC unchanged (#149 contract).
+	t.Run("existing-iptc-nil-inject-preserves", func(t *testing.T) {
+		t.Parallel()
+		origIPTC := []byte("\x1c\x02\x78\x00\x07finding190")
+		tiffData := buildMinimalTIFF(binary.LittleEndian, origIPTC, nil)
+
+		// nil rawIPTC = preserve existing IPTC (task #149 semantics).
+		var out bytes.Buffer
+		if err := Inject(bytes.NewReader(tiffData), &out, nil, nil, nil, true); err != nil {
+			t.Fatalf("Inject nil IPTC on IPTC-bearing TIFF: %v", err)
+		}
+		_, outIPTC, _, err := Extract(bytes.NewReader(out.Bytes()))
+		if err != nil {
+			t.Fatalf("Extract output: %v", err)
+		}
+		// nil rawIPTC ≠ empty rawIPTC: nil means "pass through", so existing IPTC
+		// must survive. This is the #149 invariant.
+		if outIPTC == nil {
+			t.Error("#149/#190 regression: nil rawIPTC deleted existing IPTC tag")
+		}
+	})
+
+	// Case 3: call InjectWithEXIF directly with an empty rawIPTC.
+	// relocateTIFFFromParsed's len>0 guard must prevent the zero-length upsert.
+	t.Run("relocate-empty-rawIPTC-no-tag", func(t *testing.T) {
+		t.Parallel()
+		tiffData := buildMinimalTIFF(binary.LittleEndian, nil, nil)
+
+		emptyIPTC := []byte{} // non-nil, zero-length — the #190 trigger
+		var out bytes.Buffer
+		if err := InjectWithEXIF(tiffData, nil, emptyIPTC, nil, &out); err != nil {
+			t.Fatalf("InjectWithEXIF with empty IPTC: %v", err)
+		}
+		_, outIPTC, _, err := Extract(bytes.NewReader(out.Bytes()))
+		if err != nil {
+			t.Fatalf("Extract output: %v", err)
+		}
+		if outIPTC != nil {
+			t.Errorf("#190 regression: relocate wrote IPTC tag len=%d for empty rawIPTC; must be absent",
+				len(outIPTC))
+		}
+	})
 }

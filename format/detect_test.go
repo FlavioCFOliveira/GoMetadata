@@ -699,6 +699,62 @@ func TestDetectOutOfScopeFormats(t *testing.T) {
 	}
 }
 
+// TestCR2DetectionRequiresValidation is the regression gate for finding #136.
+//
+// Prior to the fix, detectTIFFVariant returned FormatCR2 for any TIFF where
+// bytes [8:10] happened to be 0x43 0x52 ("CR"), regardless of the version byte
+// at offset 10. A generic little-endian TIFF whose first-IFD tag encodes as
+// 0x43 0x52 in the IFD count field (bytes [8:9]) would be misclassified as CR2.
+//
+// Canon CR2 Specification §3.1: bytes[8:9]="CR", byte[10]=0x02 (major version).
+// The fix requires byte[10]==0x02 before accepting FormatCR2.
+func TestCR2DetectionRequiresValidation(t *testing.T) {
+	t.Parallel()
+
+	// (a) Classic TIFF LE with bytes[8:10]=="CR" but version byte[10]=0x00.
+	// This must NOT be detected as CR2 — it is a generic TIFF.
+	t.Run("fake-CR-bytes-no-version", func(t *testing.T) {
+		t.Parallel()
+		// 12-byte TIFF header: II + 0x2A 0x00 + IFD0_at_8 | bytes[8:10]="CR", [10]=0x00
+		buf := []byte{
+			0x49, 0x49, // "II" LE byte-order marker
+			0x2A, 0x00, // classic TIFF magic = 42 (0x002A LE)
+			0x08, 0x00, 0x00, 0x00, // IFD0 at offset 8
+			0x43, 0x52, // "CR" at bytes [8:9]
+			0x00, 0x00, // version = 0x00, NOT 0x02 — not a real CR2
+		}
+		got, err := Detect(bytes.NewReader(buf))
+		if err != nil {
+			t.Fatalf("Detect: %v", err)
+		}
+		// Must return FormatTIFF (after IFD scan fallback), NOT FormatCR2.
+		if got == FormatCR2 {
+			t.Errorf("#136 regression: Detect = FormatCR2, want FormatTIFF (fake CR bytes with version=0x00)")
+		}
+	})
+
+	// (b) Valid CR2 header: bytes[8:9]=="CR", byte[10]=0x02, byte[11]=0x00.
+	// This MUST be detected as CR2.
+	t.Run("valid-CR2-version-2", func(t *testing.T) {
+		t.Parallel()
+		// 12-byte CR2 header: II + 0x2A 0x00 + IFD0_at_8 | "CR" + version 2
+		buf := []byte{
+			0x49, 0x49, // "II" LE
+			0x2A, 0x00, // TIFF magic
+			0x08, 0x00, 0x00, 0x00, // IFD0 at offset 8
+			0x43, 0x52, // "CR" — Canon CR2 identifier
+			0x02, 0x00, // version 2.0 — canonical CR2 marker
+		}
+		got, err := Detect(bytes.NewReader(buf))
+		if err != nil {
+			t.Fatalf("Detect: %v", err)
+		}
+		if got != FormatCR2 {
+			t.Errorf("#136 regression: Detect = %v, want FormatCR2 for valid CR2 header", got)
+		}
+	})
+}
+
 // TestDetectTIFFHighIFD0Offset is the 32-bit-safe regression test for task #74.
 //
 // parseTIFFScanHeader reads IFD0 offset as a uint32 and historically used

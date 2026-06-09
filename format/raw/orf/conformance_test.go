@@ -241,22 +241,28 @@ func TestConformance_ORF_magic_common_prefix(t *testing.T) {
 	}
 }
 
-// TestConformance_ORF_magic_patch_on_extract verifies that Extract patches
-// bytes[2:3] of the returned rawEXIF from ORF magic to standard TIFF magic
-// (0x2A 0x00) so that downstream EXIF parsers can process the TIFF stream.
+// TestConformance_ORF_original_magic_in_rawEXIF verifies that Extract returns
+// the ORIGINAL ORF magic bytes in rawEXIF (not the patched TIFF magic).
 //
-// containers.md §8(e): ORF/RW2: restore original magic on write; by implication,
-// Extract patches to standard TIFF LE magic for the TIFF traversal path.
-// ExifTool Olympus.pm: patch bytes[2:4] to 0x2A 0x00 before walking the IFD.
-func TestConformance_ORF_magic_patch_on_extract(t *testing.T) {
+// #117 fix: the TIFF IFD traversal operates on an internal working copy with
+// bytes[2:4] patched to 0x2A 0x00. The rawEXIF returned to the caller carries
+// the original bytes so that RawEXIF() round-trips correctly and writing
+// rawEXIF back to disk produces a valid ORF file.
+//
+// containers.md §8(e): ORF/RW2: rawEXIF must preserve the original magic so
+// callers can detect the format from rawEXIF without re-reading the file.
+// ExifTool Olympus.pm: IFD walk uses patched copy; original bytes are preserved.
+func TestConformance_ORF_original_magic_in_rawEXIF(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name  string
-		magic []byte
+		name   string
+		magic  []byte
+		wantB2 byte
+		wantB3 byte
 	}{
-		{"IIRO", orfMagic},
-		{"IIRS", iirsMagic},
+		{"IIRO", orfMagic, 0x52, 0x4F},  // 'R', 'O'
+		{"IIRS", iirsMagic, 0x52, 0x53}, // 'R', 'S'
 	}
 
 	for _, tc := range cases {
@@ -265,20 +271,19 @@ func TestConformance_ORF_magic_patch_on_extract(t *testing.T) {
 			data := buildORFVariant(tc.magic)
 			rawEXIF, _, _, err := Extract(bytes.NewReader(data))
 			if err != nil {
-				t.Fatalf("ORF-magic-patch-on-extract [%s]: Extract: %v", tc.name, err)
+				t.Fatalf("ORF-original-magic-in-rawEXIF [%s]: Extract: %v", tc.name, err)
 			}
 			if len(rawEXIF) < 4 {
-				t.Fatalf("ORF-magic-patch-on-extract [%s]: rawEXIF too short (%d)", tc.name, len(rawEXIF))
+				t.Fatalf("ORF-original-magic-in-rawEXIF [%s]: rawEXIF too short (%d)", tc.name, len(rawEXIF))
 			}
-			// Bytes [2:4] of rawEXIF must be standard TIFF LE magic.
-			// TIFF 6.0 §2: magic word = 42 (0x002A); LE encoding = 0x2A 0x00.
-			if rawEXIF[2] != 0x2A || rawEXIF[3] != 0x00 {
-				t.Errorf("ORF-magic-patch-on-extract [%s]: rawEXIF[2:4] = %02x %02x, want 0x2A 0x00",
-					tc.name, rawEXIF[2], rawEXIF[3])
+			// rawEXIF must carry the original ORF magic, not the patched 0x2A 0x00.
+			if rawEXIF[2] != tc.wantB2 || rawEXIF[3] != tc.wantB3 {
+				t.Errorf("ORF-original-magic-in-rawEXIF [%s]: rawEXIF[2:4] = %02x %02x, want %02x %02x (original magic)",
+					tc.name, rawEXIF[2], rawEXIF[3], tc.wantB2, tc.wantB3)
 			}
-			// The original input bytes[0:2] "II" must be preserved.
+			// The "II" byte-order marker at bytes [0:2] must be preserved.
 			if rawEXIF[0] != 0x49 || rawEXIF[1] != 0x49 {
-				t.Errorf("ORF-magic-patch-on-extract [%s]: rawEXIF[0:2] = %02x %02x, want 0x49 0x49 (II)",
+				t.Errorf("ORF-original-magic-in-rawEXIF [%s]: rawEXIF[0:2] = %02x %02x, want 0x49 0x49 (II)",
 					tc.name, rawEXIF[0], rawEXIF[1])
 			}
 		})

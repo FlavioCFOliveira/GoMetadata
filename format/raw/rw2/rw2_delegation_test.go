@@ -75,9 +75,11 @@ func TestRW2DelegationIPTCAndXMP(t *testing.T) {
 	}
 }
 
-// TestRW2ExtractPatchesStandardMagic verifies that rw2.Extract patches bytes
-// 2-3 to standard TIFF magic (0x2A 0x00) in the returned rawEXIF.
-func TestRW2ExtractPatchesStandardMagic(t *testing.T) {
+// TestRW2ExtractPreservesOriginalMagic verifies that rw2.Extract returns rawEXIF
+// with the ORIGINAL RW2 magic bytes intact (#117 fix).
+// The TIFF IFD traversal operates on an internal working copy; the rawEXIF
+// returned to the caller is always unpatched so it can be written back to disk.
+func TestRW2ExtractPreservesOriginalMagic(t *testing.T) {
 	t.Parallel()
 	data := buildRW2WithIPTCAndXMP(
 		[]byte("iptc-patch-test-long-enough"),
@@ -90,10 +92,11 @@ func TestRW2ExtractPatchesStandardMagic(t *testing.T) {
 	if len(rawEXIF) < 4 {
 		t.Fatal("rawEXIF too short")
 	}
-	// Bytes 2-3 of rawEXIF must be standard TIFF magic (0x2A 0x00).
-	if rawEXIF[2] != 0x2A || rawEXIF[3] != 0x00 {
-		t.Errorf("rawEXIF bytes[2:4] = %02x %02x, want 0x2a 0x00",
-			rawEXIF[2], rawEXIF[3])
+	// Bytes 2-3 of rawEXIF must retain the original RW2 magic (0x55 0x00),
+	// NOT the patched TIFF magic (0x2A 0x00). Writing rawEXIF to disk must yield
+	// a valid RW2 file. (#117 fix)
+	if rawEXIF[2] == 0x2A && rawEXIF[3] == 0x00 {
+		t.Errorf("#117 regression: rawEXIF bytes[2:4] = 2a 00 (patched TIFF magic); want original RW2 magic 55 00")
 	}
 }
 

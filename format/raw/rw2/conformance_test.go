@@ -72,26 +72,30 @@ func TestConformance_RW2_magic_IIU_0x0055(t *testing.T) {
 	}
 }
 
-// TestConformance_RW2_magic_patched_for_TIFF_parse verifies that Extract patches
-// bytes [2:4] from 0x55 0x00 to 0x2A 0x00 in the returned rawEXIF so that
-// downstream TIFF/EXIF parsers can process it.
+// TestConformance_RW2_original_magic_in_rawEXIF verifies that Extract returns
+// the ORIGINAL RW2 magic bytes in rawEXIF (not the patched TIFF magic).
 //
-// containers.md §8: "patch to 2A 00 for the walk, restore on write."
-// TIFF 6.0 §2: magic must be 0x002A for classic TIFF.
-func TestConformance_RW2_magic_patched_for_TIFF_parse(t *testing.T) {
+// #117 fix: the TIFF IFD traversal operates on an internal working copy with
+// bytes[2:4] patched to 0x2A 0x00. The rawEXIF returned to the caller carries
+// the original bytes so that RawEXIF() round-trips correctly and writing
+// rawEXIF back to disk produces a valid RW2 file.
+//
+// containers.md §8: rawEXIF must preserve the original RW2 magic so callers
+// can detect the format from rawEXIF without re-reading the file.
+func TestConformance_RW2_original_magic_in_rawEXIF(t *testing.T) {
 	t.Parallel()
 
 	data := buildRW2()
 	rawEXIF, _, _, err := Extract(bytes.NewReader(data))
 	if err != nil {
-		t.Fatalf("RW2-magic-patched-for-TIFF-parse: Extract: %v", err)
+		t.Fatalf("RW2-original-magic-in-rawEXIF: Extract: %v", err)
 	}
 	if len(rawEXIF) < 4 {
-		t.Fatal("RW2-magic-patched-for-TIFF-parse: rawEXIF too short")
+		t.Fatal("RW2-original-magic-in-rawEXIF: rawEXIF too short")
 	}
-	// bytes[2:4] of rawEXIF must be standard TIFF magic 0x2A 0x00.
-	if rawEXIF[2] != 0x2A || rawEXIF[3] != 0x00 {
-		t.Errorf("RW2-magic-patched-for-TIFF-parse: bytes[2:4] = %02x %02x, want 2A 00 (TIFF 6.0 §2)",
+	// rawEXIF must carry the original RW2 magic (0x55 0x00), not the patched 0x2A 0x00.
+	if rawEXIF[2] != 0x55 || rawEXIF[3] != 0x00 {
+		t.Errorf("RW2-original-magic-in-rawEXIF: bytes[2:4] = %02x %02x, want 55 00 (original RW2 magic)",
 			rawEXIF[2], rawEXIF[3])
 	}
 }
@@ -709,7 +713,7 @@ func TestConformance_RW2_robust_truncated_at_magic(t *testing.T) {
 		t.Fatalf("RW2-robust-truncated-at-magic: unexpected error: %v", err)
 	}
 	if rawEXIF == nil {
-		t.Error("RW2-robust-truncated-at-magic: rawEXIF should be non-nil (patched magic bytes)")
+		t.Error("RW2-robust-truncated-at-magic: rawEXIF should be non-nil (original magic bytes)")
 	}
 	if rawIPTC != nil {
 		t.Errorf("RW2-robust-truncated-at-magic: rawIPTC = %v, want nil", rawIPTC)
@@ -901,7 +905,7 @@ func TestConformance_RW2_robust_passthrough_no_metadata_change(t *testing.T) {
 
 // TestConformance_RW2_corpus_parity verifies that Extract does not panic or
 // return unexpected errors on every .rw2 corpus file, and that each output
-// carries standard TIFF magic in rawEXIF (indicating the patch was applied).
+// carries the original RW2 magic in rawEXIF (#117 fix).
 //
 // containers.md §8: corpus parity over format/raw/rw2.
 // Corpus files: testdata/corpus/raw/**/*.rw2 — filtered by extension.
@@ -942,12 +946,13 @@ func TestConformance_RW2_corpus_parity(t *testing.T) {
 					filepath.Base(p))
 				return
 			}
-			// Verify that the magic-patch was applied: bytes[2:4] of rawEXIF must
-			// be standard TIFF 0x2A 0x00 (not the original 0x55 0x00).
+			// #117 fix: rawEXIF must carry the ORIGINAL RW2 magic (0x55 0x00),
+			// not the patched TIFF magic (0x2A 0x00). The IFD walk operates
+			// internally on a copy; the returned rawEXIF is always unpatched.
 			if len(rawEXIF) >= 4 {
-				if rawEXIF[2] == 0x55 && rawEXIF[3] == 0x00 {
-					t.Errorf("RW2-corpus-parity: Extract(%s): rawEXIF still has RW2 magic bytes[2:4]=55 00; patch not applied",
-						filepath.Base(p))
+				if rawEXIF[2] != 0x55 || rawEXIF[3] != 0x00 {
+					t.Errorf("RW2-corpus-parity: Extract(%s): rawEXIF bytes[2:4]=%02x %02x, want 55 00 (original RW2 magic, #117)",
+						filepath.Base(p), rawEXIF[2], rawEXIF[3])
 				}
 			}
 		})
