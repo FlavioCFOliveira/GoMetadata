@@ -218,12 +218,27 @@ func (p *rdfParser) onStartStructField(ns string, tagLocal []byte) {
 
 // onStartProperty handles a direct child element of a top-level rdf:Description
 // that begins a new property.
-// Compliance: XMP Part 1 §C.2.4.
-func (p *rdfParser) onStartProperty(ns string, tagLocal []byte) {
+// Compliance: XMP Part 1 §C.2.4, XMP Part 1 §C.2.5.
+//
+// #173 / XMP Part 1 §C.2.5: rdf:resource on a property element is the
+// "simple value shorthand" form — <ns:Prop rdf:resource="…"/> — equivalent to
+// an rdf:Description with rdf:resource.  applyAttrShorthands cannot handle this
+// because it runs before onStartProperty sets propDepth; by the time the depth
+// guard (p.propDepth > 0 && p.depth == p.propDepth) would pass, the property
+// element has already been dispatched.  We scan attrs here, after establishing
+// the property context, so the resource is captured correctly.
+func (p *rdfParser) onStartProperty(ns string, tagLocal []byte, attrs []xmpAttr) {
 	p.propNS = ns
 	p.propLocal = string(tagLocal) // string() here: stored as map key
 	p.propDepth = p.depth
-	// rdf:resource shorthand and rdf:parseType="Resource" already handled in onStartElement.
+	// XMP Part 1 §C.2.5: rdf:resource on the property element itself is a
+	// simple-value shorthand; store it immediately now that propDepth is set.
+	for _, a := range attrs {
+		if a.ns == NSrdf && a.loc == "resource" {
+			storeProperty(p.x, p.propNS, p.propLocal, a.val)
+			break
+		}
+	}
 }
 
 // onStartCollection handles rdf:Alt, rdf:Seq, and rdf:Bag container elements
@@ -253,13 +268,14 @@ func (p *rdfParser) onStartListItem(attrs []xmpAttr) {
 	p.liLang = ""
 	p.liItemDepth = p.depth
 	for _, a := range attrs {
-		// XML Namespaces §6.1: xml:lang is in the XML namespace
-		// (http://www.w3.org/XML/1998/namespace). The 'xml' prefix is pre-bound
-		// and may resolve to either the empty string or the canonical URI
-		// depending on whether the document declares it explicitly. Reject any
-		// 'lang' attribute from a foreign namespace (e.g. ex:lang) to prevent
-		// contamination of the stored value with a bogus lang prefix.
-		if a.loc == "lang" && (a.ns == "" || a.ns == "http://www.w3.org/XML/1998/namespace") {
+		// XML Namespaces §6.1: only xml:lang — i.e. a 'lang' attribute whose
+		// namespace URI is the canonical XML namespace — carries language
+		// information.  A bare unqualified lang="" attribute (a.ns=="") is NOT
+		// xml:lang; accepting it would corrupt values by prepending a bogus lang
+		// tag (finding #180).  The 'xml' prefix is permanently pre-bound to
+		// "http://www.w3.org/XML/1998/namespace" by the XML specification and
+		// does not require an explicit xmlns:xml declaration.
+		if a.loc == "lang" && a.ns == "http://www.w3.org/XML/1998/namespace" {
 			p.liLang = a.val
 			break
 		}
@@ -335,7 +351,7 @@ func (p *rdfParser) onStartElement(ns string, tagLocal []byte, attrs []xmpAttr) 
 
 	// ── Property element: direct child of top-level rdf:Description ───
 	case p.atProperty():
-		p.onStartProperty(ns, tagLocal)
+		p.onStartProperty(ns, tagLocal, attrs)
 
 	// ── Collection container: rdf:Alt / Seq / Bag ────────────────────
 	case p.atCollection():
@@ -763,6 +779,16 @@ func collectTextContent(b []byte, pos int) (newPos int, text string) { //nolint:
 	return pos, bld.String()
 }
 
+// XMLNamespaceURI is the canonical URI for the XML namespace, permanently
+// pre-bound to the "xml" prefix per XML Namespaces §3 ("The 'xml' prefix is
+// by definition bound to the namespace name http://www.w3.org/XML/1998/namespace").
+// Using a package-level constant avoids re-allocating the string on every parseRDF call.
+const XMLNamespaceURI = "http://www.w3.org/XML/1998/namespace"
+
+// xmlPrefixBytes holds the 3-byte "xml" prefix as a package-level []byte.
+// Pre-allocated to avoid a heap allocation inside parseRDF on every call.
+var xmlPrefixBytes = []byte("xml") //nolint:gochecknoglobals // immutable sentinel; avoids per-call allocation
+
 // parseRDF walks the RDF graph rooted at the x:xmpmeta element and populates
 // the Properties map in x. It handles rdf:Alt, rdf:Seq, and rdf:Bag
 // collections by joining their rdf:li values with U+001E (record separator).
@@ -778,6 +804,17 @@ func collectTextContent(b []byte, pos int) (newPos int, text string) { //nolint:
 // Compliance: ISO 16684-1:2019 §7, Adobe XMP Specification Part 1 §C.
 func parseRDF(b []byte, x *XMP) error { //nolint:cyclop,gocyclo // main XML dispatch loop has inherent branching (CDATA, PI, comment, end-tag, start-tag); each branch is a single XML construct
 	p := rdfParser{x: x}
+
+	// XML Namespaces §3: the 'xml' prefix is permanently pre-bound to
+	// "http://www.w3.org/XML/1998/namespace" and must not be overridden.
+	// Pre-populate it as entry 0 so resolveNS returns the correct URI for
+	// attributes like xml:lang and xml:space without requiring an explicit
+	// xmlns:xml declaration in the document.
+	// This also enables finding #180's fix: onStartListItem now accepts only
+	// a.ns==XMLNamespaceURI (not the empty string), and the pre-population
+	// ensures real xml:lang resolves to that URI rather than "".
+	p.nsTable[0] = nsEntry{prefix: xmlPrefixBytes, uri: XMLNamespaceURI}
+	p.nsCount = 1
 
 	// Pooled list accumulator for rdf:li values.
 	p.liVals = liPool.Get().(*[]string) //nolint:forcetypeassert,revive // liPool.New always stores *[]string; pool invariant
@@ -881,9 +918,14 @@ func scanName(b []byte, pos int) (prefix, local []byte, end int) {
 
 // isNameTerminator reports whether c is a byte that terminates an XML name
 // token in the context of attribute/tag parsing.
+//
+// XML 1.0 §2.3 (NameStartChar, NameChar): '<' is not a legal XML name character.
+// Including it as a name terminator prevents a crafted document from smuggling
+// '<' into a stored local name, which would allow XML injection when that name
+// is later emitted unescaped in Encode (#171).
 func isNameTerminator(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
-		c == '>' || c == '/' || c == '='
+		c == '>' || c == '/' || c == '=' || c == '<'
 }
 
 // advancePastEquals skips optional whitespace at b[pos], then expects '=' and
@@ -924,14 +966,20 @@ func parseSingleAttr(b []byte, pos int) (attrPrefix, attrLocal []byte, val strin
 //
 // #15: nsTable is [64]nsEntry and out is [32]xmpAttr (up from 32 and 16)
 // to handle legitimate complex documents without silent data loss.
-func scanAttrs(b []byte, pos int, nsTable *[64]nsEntry, nsCount int, out *[32]xmpAttr) (newNsCount, nAttrs, newPos int) {
+func scanAttrs(b []byte, pos int, nsTable *[64]nsEntry, nsCount int, out *[32]xmpAttr) (newNsCount, nAttrs, newPos int) { //nolint:cyclop,gocyclo // attribute scanning loop inherently branches on >/<//=, whitespace, and the classifyAndStoreAttr dispatch; refactoring would obscure the XML grammar
 	nAttrs = 0
-	for pos < len(b) && b[pos] != '>' && b[pos] != '/' {
+	// XML 1.0 §3.1: the attribute list ends at '>' (tag end) or '/' (self-close).
+	// Also stop at '<': a '<' inside a tag is illegal (XML 1.0 §2.4) and would
+	// cause parseSingleAttr to return without advancing pos, producing an infinite
+	// loop.  Stopping here is safe — the malformed tag will be silently dropped by
+	// the parser's lenient design (#171 defence-in-depth: isNameTerminator also
+	// rejects '<' in name scanning, so this guard handles the outer loop boundary).
+	for pos < len(b) && b[pos] != '>' && b[pos] != '/' && b[pos] != '<' {
 		// Skip whitespace between attributes.
 		for pos < len(b) && isASCIISpace(b[pos]) {
 			pos++
 		}
-		if pos >= len(b) || b[pos] == '>' || b[pos] == '/' {
+		if pos >= len(b) || b[pos] == '>' || b[pos] == '/' || b[pos] == '<' {
 			break
 		}
 

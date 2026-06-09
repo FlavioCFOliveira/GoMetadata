@@ -83,7 +83,13 @@ func serialise(x *XMP) ([]byte, error) { //nolint:gocyclo,cyclop // complexity i
 		buf.WriteString("  <rdf:Description rdf:about=\"\" xmlns:")
 		buf.WriteString(prefix)
 		buf.WriteString("=\"")
-		buf.WriteString(ns)
+		// #170 / XML 1.0 §3.1 / ISO 16684-1 §7: the namespace URI is written as
+		// an XML attribute value and MUST be XML-escaped.  An unescaped URI can
+		// contain '"', '<', or '&' (e.g., a URI decoded from &quot; while parsing
+		// untrusted XMP), which would break the attribute boundary and inject
+		// arbitrary XML.  writeXMLEscaped handles all five XML entities plus C0
+		// control chars, making the value safe for attribute context.
+		writeXMLEscaped(buf, ns)
 		buf.WriteString("\">\n")
 
 		// Sort property names for deterministic output.
@@ -142,17 +148,20 @@ func serialise(x *XMP) ([]byte, error) { //nolint:gocyclo,cyclop // complexity i
 
 // writeSimpleProperty writes a single-valued XMP property element to buf.
 // Produces: <prefix:local>val</prefix:local>\n with XML escaping applied to val.
+//
+// #171 / XML 1.0 §2.3: local is emitted as an XML element tag name and must be
+// a legal NCName.  writeXMLName strips any byte that would inject XML structure.
 func writeSimpleProperty(buf *bytes.Buffer, prefix, local, val string) {
 	buf.WriteString("   <")
 	buf.WriteString(prefix)
 	buf.WriteByte(':')
-	buf.WriteString(local)
+	writeXMLName(buf, local)
 	buf.WriteByte('>')
 	writeXMLEscaped(buf, val)
 	buf.WriteString("</")
 	buf.WriteString(prefix)
 	buf.WriteByte(':')
-	buf.WriteString(local)
+	writeXMLName(buf, local)
 	buf.WriteString(">\n")
 }
 
@@ -160,12 +169,15 @@ func writeSimpleProperty(buf *bytes.Buffer, prefix, local, val string) {
 // val is a '\x1e'-delimited list of values. The RDF collection type (Alt, Seq,
 // or Bag) is determined by collectionType(ns, local) per ISO 16684-1 §7.5.
 // For Alt collections, items may carry an xml:lang prefix encoded as "lang|value".
+//
+// #171 / XML 1.0 §2.3: local is emitted as an XML element tag name; writeXMLName
+// strips illegal NCName bytes to prevent XML injection.
 func writeMultiValuedProperty(buf *bytes.Buffer, prefix, ns, local, val string) {
 	ctype := collectionType(ns, local)
 	buf.WriteString("   <")
 	buf.WriteString(prefix)
 	buf.WriteByte(':')
-	buf.WriteString(local)
+	writeXMLName(buf, local)
 	buf.WriteString(">\n    <rdf:")
 	buf.WriteString(ctype)
 	buf.WriteString(">\n")
@@ -208,7 +220,7 @@ func writeMultiValuedProperty(buf *bytes.Buffer, prefix, ns, local, val string) 
 	buf.WriteString(">\n   </")
 	buf.WriteString(prefix)
 	buf.WriteByte(':')
-	buf.WriteString(local)
+	writeXMLName(buf, local)
 	buf.WriteString(">\n")
 }
 
@@ -276,11 +288,13 @@ func parseStructKey(local string) (parent, field string, isListStruct, isStruct 
 // an explicit rdf:Description child. The parseType shorthand is more compact and
 // is the canonical form emitted by Adobe tools. Element names must be valid XML
 // names (no dots), so "parent.field" keys must be split and nested.
+// #171 / XML 1.0 §2.3: parent and field are emitted as XML element tag names;
+// writeXMLName strips illegal NCName bytes to prevent XML injection.
 func writeStructProperty(buf *bytes.Buffer, prefix, parent string, props map[string]string, localList []string) {
 	buf.WriteString("   <")
 	buf.WriteString(prefix)
 	buf.WriteByte(':')
-	buf.WriteString(parent)
+	writeXMLName(buf, parent)
 	buf.WriteString(" rdf:parseType=\"Resource\">\n")
 	for _, local := range localList {
 		p, field, isListStruct, isStruct := parseStructKey(local)
@@ -290,19 +304,19 @@ func writeStructProperty(buf *bytes.Buffer, prefix, parent string, props map[str
 		buf.WriteString("    <")
 		buf.WriteString(prefix)
 		buf.WriteByte(':')
-		buf.WriteString(field)
+		writeXMLName(buf, field)
 		buf.WriteByte('>')
 		writeXMLEscaped(buf, props[local])
 		buf.WriteString("</")
 		buf.WriteString(prefix)
 		buf.WriteByte(':')
-		buf.WriteString(field)
+		writeXMLName(buf, field)
 		buf.WriteString(">\n")
 	}
 	buf.WriteString("   </")
 	buf.WriteString(prefix)
 	buf.WriteByte(':')
-	buf.WriteString(parent)
+	writeXMLName(buf, parent)
 	buf.WriteString(">\n")
 }
 
@@ -335,7 +349,9 @@ func writeStructInListProperty(buf *bytes.Buffer, prefix, ns, parent string, pro
 	buf.WriteString("   <")
 	buf.WriteString(prefix)
 	buf.WriteByte(':')
-	buf.WriteString(parent)
+	// #171 / XML 1.0 §2.3: parent and field are XML element tag names; writeXMLName
+	// strips illegal NCName bytes to prevent XML injection.
+	writeXMLName(buf, parent)
 	buf.WriteString(">\n    <rdf:")
 	buf.WriteString(ctype)
 	buf.WriteString(">\n")
@@ -353,13 +369,13 @@ func writeStructInListProperty(buf *bytes.Buffer, prefix, ns, parent string, pro
 			buf.WriteString("      <")
 			buf.WriteString(prefix)
 			buf.WriteByte(':')
-			buf.WriteString(field)
+			writeXMLName(buf, field)
 			buf.WriteByte('>')
 			writeXMLEscaped(buf, props[local])
 			buf.WriteString("</")
 			buf.WriteString(prefix)
 			buf.WriteByte(':')
-			buf.WriteString(field)
+			writeXMLName(buf, field)
 			buf.WriteString(">\n")
 		}
 		buf.WriteString("     </rdf:li>\n")
@@ -370,7 +386,7 @@ func writeStructInListProperty(buf *bytes.Buffer, prefix, ns, parent string, pro
 	buf.WriteString(">\n   </")
 	buf.WriteString(prefix)
 	buf.WriteByte(':')
-	buf.WriteString(parent)
+	writeXMLName(buf, parent)
 	buf.WriteString(">\n")
 }
 
@@ -405,6 +421,52 @@ func collectStructInListIndices(parent string, localList []string) []int {
 		result = append(result, idx)
 	}
 	return result
+}
+
+// writeXMLName writes a local name or field name to buf, stripping any byte
+// that would make the resulting token an illegal XML NCName or that could
+// inject XML structure.  This is the defence-in-depth guard for finding #171.
+//
+// XML 1.0 §2.3 / XML Namespaces §3 (NCName): a local name must not contain
+// '<', '>', '&', '"', '\”, '/', '=', whitespace, or ':' (colon is the
+// namespace separator and is already absent from stored local names; we strip
+// it defensively).  Characters that pass isNameTerminator in the parser are
+// already excluded at parse time (#171 fix in rdf.go); this writer-side check
+// closes the second injection vector: a caller who calls Set() with a crafted
+// key bypassing the parser.
+//
+// Design: rather than replacing illegal bytes with a placeholder (which could
+// silently round-trip incorrect data), we strip them entirely.  An empty result
+// is possible only for a completely illegal name; in that case the element tag
+// would be "<prefix:>" which is itself invalid — callers using the public API
+// (Set/Get) cannot reach this state without intentionally supplying an illegal
+// key.  The stripping is purely defensive against adversarial direct struct
+// manipulation.
+func writeXMLName(buf *bytes.Buffer, name string) { //nolint:cyclop,gocyclo // illegal-byte check for XML NCName requires branching on each forbidden byte class; refactoring would obscure the security-critical logic
+	// Fast path: no illegal bytes — write the string as-is.
+	// illegal bytes: C0 controls, space, tab, LF, CR, '<', '>', '&', '"', '\'', '/', '=', ':'
+	legal := true
+	for i := range len(name) {
+		c := name[i]
+		if c <= 0x1F || c == '<' || c == '>' || c == '&' || c == '"' || c == '\'' ||
+			c == '/' || c == '=' || c == ':' {
+			legal = false
+			break
+		}
+	}
+	if legal {
+		buf.WriteString(name)
+		return
+	}
+	// Slow path: strip illegal bytes.
+	for i := range len(name) {
+		c := name[i]
+		if c <= 0x1F || c == '<' || c == '>' || c == '&' || c == '"' || c == '\'' ||
+			c == '/' || c == '=' || c == ':' {
+			continue
+		}
+		buf.WriteByte(c)
+	}
 }
 
 // writeXMLEscaped writes s to buf with XML character escaping, operating

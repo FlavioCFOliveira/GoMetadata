@@ -8,6 +8,7 @@ package xmp
 
 import (
 	"bytes"
+	"encoding/xml"
 	"errors"
 	"strings"
 	"testing"
@@ -1454,5 +1455,330 @@ func TestXmlLangRealNamespaceAccepted(t *testing.T) {
 	}
 	if got := x.Caption(); got != "My caption" {
 		t.Errorf("Caption() = %q, want %q — real xml:lang was not captured", got, "My caption")
+	}
+}
+
+// ── Reliability finding gate tests (#170, #171, #112, #113, #173, #180) ────────
+
+// TestNamespaceURIInjectionBlockedRoundTrip is the GATE test for finding #170.
+//
+// A namespace URI containing a double-quote (decoded from &quot; while parsing
+// untrusted XMP) previously closed the xmlns attribute early and injected XML.
+// After the fix, writeXMLEscaped is applied to the URI value so the resulting
+// attribute is valid XML and no injection occurs.
+//
+// XML 1.0 §3.1 / ISO 16684-1 §7: attribute values must have their special
+// characters escaped before emission.
+func TestNamespaceURIInjectionBlockedRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	// Craft XMP whose namespace URI, after entity-decoding, contains a
+	// double-quote, '>', and XML comment opener — the exact characters that
+	// would inject XML if the URI were written raw into an attribute value.
+	raw := `<?xpacket begin="" uid="abc"?>` +
+		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<rdf:Description rdf:about="" xmlns:evil="http://a.com/&quot;><fake/><!--">` +
+		`<evil:prop>value</evil:prop>` +
+		`</rdf:Description>` +
+		`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`
+
+	x1, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse crafted XMP: %v", err)
+	}
+
+	enc, err := Encode(x1)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	encStr := string(enc)
+
+	// The injected element must not appear in the encoded output.
+	if strings.Contains(encStr, "<fake/>") {
+		t.Error("#170 REGRESSION: encoded output contains injected <fake/> element — NS URI was not escaped")
+	}
+	if strings.Contains(encStr, "<!--") {
+		t.Error("#170 REGRESSION: encoded output contains injected comment opener <!-- — NS URI was not escaped")
+	}
+
+	// The encoded output must be valid XML (xml.Unmarshal is a convenient check).
+	var v any
+	if xmlErr := xml.Unmarshal(enc, &v); xmlErr != nil {
+		t.Errorf("#170 REGRESSION: Encode produced malformed XML: %v", xmlErr)
+	}
+
+	// The property must round-trip: parse → encode → parse gives the same value.
+	injectedNS := `http://a.com/"><fake/><!--`
+	x2, err := Parse(enc)
+	if err != nil {
+		t.Fatalf("#170: re-parse of encoded output: %v", err)
+	}
+	if got := x2.Get(injectedNS, "prop"); got != "value" {
+		t.Errorf("#170: round-trip Get(injectedNS, prop) = %q, want %q", got, "value")
+	}
+}
+
+// TestLocalNameInjectionBlockedFromParseEncodeChain is the GATE test for finding #171.
+//
+// Two injection vectors are tested:
+//  1. Parse-then-encode: a '<' in an element local name is stripped by
+//     isNameTerminator so the parser never stores it; the name is truncated at '<'.
+//  2. Direct-Set-then-encode: Set() with a key containing '<' is sanitised by
+//     writeXMLName before emission, so the encoded XML contains no injected element.
+//
+// XML 1.0 §2.3: '<' is not a legal NCName character.
+func TestLocalNameInjectionBlockedFromParseEncodeChain(t *testing.T) {
+	t.Parallel()
+
+	t.Run("via-parse", func(t *testing.T) {
+		t.Parallel()
+		// Build XMP whose property element local name contains '<'. The parser
+		// must truncate the name at '<' so the injected suffix is never stored.
+		raw := `<?xpacket begin="" uid="abc"?>` +
+			`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+			`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+			`<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">` +
+			`<dc:title` + `<inject/>` + `>value</dc:title>` +
+			`</rdf:Description>` +
+			`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`
+		x, err := Parse([]byte(raw))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		enc, err := Encode(x)
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		if strings.Contains(string(enc), "<inject/>") {
+			t.Error("#171/via-parse REGRESSION: encoded output contains injected <inject/> element")
+		}
+		var v any
+		if xmlErr := xml.Unmarshal(enc, &v); xmlErr != nil {
+			t.Errorf("#171/via-parse REGRESSION: Encode produced malformed XML: %v", xmlErr)
+		}
+	})
+
+	t.Run("via-set", func(t *testing.T) {
+		t.Parallel()
+		// Directly insert a key with '<' via the Properties map (bypassing the parser).
+		// writeXMLName must strip the illegal byte before emitting the element tag.
+		x := &XMP{Properties: map[string]map[string]string{
+			NSxmpMM: {
+				// Key contains '<' which, if emitted raw, would inject XML structure.
+				"History</xmpMM:History><inject>.action": "saved",
+			},
+		}}
+		enc, err := Encode(x)
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		if strings.Contains(string(enc), "<inject>") {
+			t.Error("#171/via-set REGRESSION: encoded output contains injected <inject> element")
+		}
+		var v any
+		if xmlErr := xml.Unmarshal(enc, &v); xmlErr != nil {
+			t.Errorf("#171/via-set REGRESSION: Encode produced malformed XML: %v", xmlErr)
+		}
+	})
+}
+
+// TestEncodeUniqueNamespacePrefixes is the GATE test for finding #112.
+//
+// Two distinct unknown-namespace URIs must be assigned distinct generated
+// prefixes (ns0, ns1, …) by uniquePrefixFor, never the same prefix "ns".
+// Assigning the same prefix to two distinct URIs produces invalid XML and
+// round-trip corruption.
+//
+// XMP Part 1 §6 / XML Namespaces §3: MUST NOT bind two distinct URIs to the
+// same prefix within a single document.
+//
+// ALREADY-FIXED (uniquePrefixFor generates ns0/ns1/…); this test is the
+// regression GATE that prevents the bug from being re-introduced.
+func TestEncodeUniqueNamespacePrefixes(t *testing.T) {
+	t.Parallel()
+
+	x := &XMP{Properties: map[string]map[string]string{
+		"http://unknown1.example/": {"alpha": "foo"},
+		"http://unknown2.example/": {"beta": "baz"},
+	}}
+	enc, err := Encode(x)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	encStr := string(enc)
+
+	// The two URIs must each have their own distinct prefix binding.
+	// The old broken behaviour produced two xmlns:ns="..." (duplicate prefix).
+	if strings.Count(encStr, `xmlns:ns="`) > 0 {
+		t.Error("#112 REGRESSION: encoded output contains xmlns:ns= — two distinct URIs share the plain 'ns' prefix")
+	}
+
+	// The encoded output must be well-formed XML.
+	var v any
+	if xmlErr := xml.Unmarshal(enc, &v); xmlErr != nil {
+		t.Errorf("#112 REGRESSION: Encode produced malformed XML: %v", xmlErr)
+	}
+
+	// Both properties must round-trip without conflation.
+	x2, err := Parse(enc)
+	if err != nil {
+		t.Fatalf("#112: re-parse: %v", err)
+	}
+	if got := x2.Get("http://unknown1.example/", "alpha"); got != "foo" {
+		t.Errorf("#112: unknown1/alpha = %q, want %q", got, "foo")
+	}
+	if got := x2.Get("http://unknown2.example/", "beta"); got != "baz" {
+		t.Errorf("#112: unknown2/beta = %q, want %q", got, "baz")
+	}
+}
+
+// TestWriteXMLEscapedDropsC0 is the GATE test for finding #113.
+//
+// A property value containing a C0 control character (e.g. U+0001 SOH) must
+// not produce raw control bytes in the encoded XML.  The control byte must be
+// replaced with U+FFFD so the output is valid XML 1.0.
+//
+// XML 1.0 §2.2: U+0001–U+0008 are forbidden code points; U+FFFD substitution
+// per Unicode §5.22 "Best Practice for U+FFFD Substitution".
+//
+// ALREADY-FIXED (writeXMLEscaped already handles C0 range); this test is the
+// regression GATE.
+func TestWriteXMLEscapedDropsC0(t *testing.T) {
+	t.Parallel()
+
+	x := &XMP{Properties: map[string]map[string]string{
+		NStiff: {"Model": "Cam\x01Name"}, // U+0001 SOH: forbidden in XML 1.0
+	}}
+	enc, err := Encode(x)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	// Raw 0x01 must not appear in the encoded output.
+	for i, b := range enc {
+		if b == 0x01 {
+			t.Errorf("#113 REGRESSION: encoded output contains raw 0x01 at byte offset %d", i)
+			break
+		}
+	}
+
+	// The encoded output must be valid XML (xml.Unmarshal rejects raw C0 bytes).
+	var v any
+	if xmlErr := xml.Unmarshal(enc, &v); xmlErr != nil {
+		t.Errorf("#113 REGRESSION: Encode produced malformed XML: %v", xmlErr)
+	}
+
+	// The stored value must survive the encode step (control char stripped,
+	// surrounding text preserved).
+	x2, err := Parse(enc)
+	if err != nil {
+		t.Fatalf("#113: re-parse: %v", err)
+	}
+	got := x2.Get(NStiff, "Model")
+	// The C0 byte is removed or replaced; surrounding "Cam" and "Name" must be present.
+	if !strings.Contains(got, "Cam") || !strings.Contains(got, "Name") {
+		t.Errorf("#113: after round-trip, surrounding text lost; got %q", got)
+	}
+	// The raw control char must not be in the stored value.
+	if strings.ContainsRune(got, 0x01) {
+		t.Errorf("#113 REGRESSION: stored value after round-trip contains raw 0x01")
+	}
+}
+
+// TestRDFResourceAttributeParsed is the GATE test for finding #173.
+//
+// <xmpMM:DerivedFrom rdf:resource="xmp.did:TEST123"/> is the canonical
+// "resource reference shorthand" from XMP Part 1 §C.2.5.  Before the fix,
+// applyAttrShorthands ran before onStartProperty set propDepth, so the guard
+// (p.propDepth > 0 && p.depth == p.propDepth) was always false and the resource
+// value was silently dropped.  The fix handles rdf:resource inside
+// onStartProperty, after propDepth is established.
+func TestRDFResourceAttributeParsed(t *testing.T) {
+	t.Parallel()
+
+	raw := `<?xpacket begin="" uid="abc"?>` +
+		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<rdf:Description rdf:about="" xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/">` +
+		`<xmpMM:DerivedFrom rdf:resource="xmp.did:TEST123"/>` +
+		`</rdf:Description>` +
+		`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`
+
+	x, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	got := x.Get(NSxmpMM, "DerivedFrom")
+	if got != "xmp.did:TEST123" {
+		t.Errorf("#173 GATE: Get(NSxmpMM, DerivedFrom) = %q, want %q", got, "xmp.did:TEST123")
+	}
+}
+
+// TestRDFResourceAttributeParsedRoundTrip verifies that a rdf:resource value
+// on a property element survives a full parse → encode → parse round-trip.
+func TestRDFResourceAttributeParsedRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	raw := `<?xpacket begin="" uid="abc"?>` +
+		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<rdf:Description rdf:about="" xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/">` +
+		`<xmpMM:DerivedFrom rdf:resource="xmp.did:ROUNDTRIP"/>` +
+		`</rdf:Description>` +
+		`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`
+
+	x1, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	enc, err := Encode(x1)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	x2, err := Parse(enc)
+	if err != nil {
+		t.Fatalf("Parse round-trip: %v", err)
+	}
+	got := x2.Get(NSxmpMM, "DerivedFrom")
+	if got != "xmp.did:ROUNDTRIP" {
+		t.Errorf("#173 round-trip: Get(NSxmpMM, DerivedFrom) = %q, want %q", got, "xmp.did:ROUNDTRIP")
+	}
+}
+
+// TestBareUnqualifiedLangNotCapturedAsXmlLang is the GATE test for finding #180.
+//
+// A bare unqualified lang attribute (no namespace prefix, so a.ns=="") on an
+// rdf:li element must NOT be treated as xml:lang.  Per XML Namespaces §6.1,
+// only an attribute whose resolved namespace URI is
+// "http://www.w3.org/XML/1998/namespace" is xml:lang.
+//
+// Before the fix, the guard was (a.ns=="" || a.ns==XMLnamespace), which accepted
+// the bare attribute and prepended a spurious "en|" to the keyword value.
+func TestBareUnqualifiedLangNotCapturedAsXmlLang(t *testing.T) {
+	t.Parallel()
+
+	raw := `<?xpacket begin="" uid="abc"?>` +
+		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">` +
+		`<dc:subject>` +
+		`<rdf:Bag>` +
+		`<rdf:li lang="en">keyword</rdf:li>` +
+		`</rdf:Bag>` +
+		`</dc:subject>` +
+		`</rdf:Description>` +
+		`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`
+
+	x, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	kws := x.Keywords()
+	if len(kws) != 1 {
+		t.Fatalf("#180 GATE: Keywords() = %v (len %d), want exactly [\"keyword\"]", kws, len(kws))
+	}
+	if kws[0] != "keyword" {
+		t.Errorf("#180 GATE: Keywords()[0] = %q, want %q — bare lang= was captured as xml:lang", kws[0], "keyword")
 	}
 }
