@@ -13,6 +13,31 @@ import (
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
 )
 
+// xmpWireFrameMagic is the 8-byte sentinel that identifies a JPEG extended-XMP
+// wire-frame payload produced by jpeg.ExtractWithWire. This internal encoding
+// MUST NOT be passed to any TIFF Inject entry point: it is only understood by
+// jpeg.Inject and would produce a corrupt tag 0x02BC if written verbatim.
+//
+// Task #70 regression: JPEG extended-XMP wire-frame leak to non-JPEG containers.
+// Task #118 regression: TIFF inject paths were missing this guard (PNG/WebP/HEIF had it).
+//
+// Value: 0x00 'X' 'M' 'P' 'E' 'X' 'T' 0x00 — same as jpeg.xmpWireMagic.
+// xmpWireFrameMagic mirrors the constant in format/jpeg, format/png, format/webp, and format/heif.
+var xmpWireFrameMagic = [8]byte{0x00, 'X', 'M', 'P', 'E', 'X', 'T', 0x00} //nolint:gochecknoglobals // package-level constant bytes; never mutated
+
+// rejectWireFrameXMP returns ErrCorruptXMP when rawXMP begins with the JPEG
+// extended-XMP wire-frame magic (xmpWireFrameMagic). All TIFF Inject entry
+// points call this guard before proceeding.
+//
+// Task #118 regression: defence-in-depth mirror of the identical guard in
+// png.Inject, webp.Inject, and heif.Inject (task #70).
+func rejectWireFrameXMP(rawXMP []byte) error {
+	if len(rawXMP) >= 8 && [8]byte(rawXMP[:8]) == xmpWireFrameMagic {
+		return fmt.Errorf("tiff: rawXMP contains an internal JPEG wire-frame encoding that cannot be stored in a TIFF container: %w", ErrCorruptXMP)
+	}
+	return nil
+}
+
 // Extract reads metadata payloads from a TIFF container.
 // rawEXIF is the entire TIFF byte stream (TIFF itself is the EXIF container).
 // rawIPTC and rawXMP are read from the respective IFD0 tags.
@@ -70,6 +95,15 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 // When both rawIPTC and rawXMP are nil, the base bytes are written verbatim
 // (pass-through path).
 //
+// Nil-means-delete semantics (footgun warning — task #149 regression):
+//
+//	A nil rawIPTC value means "remove the IPTC tag from the output". When
+//	only XMP is being updated (rawXMP != nil, rawIPTC == nil) and the source
+//	TIFF carries existing IPTC data, that IPTC data will be silently dropped
+//	from the output. To preserve existing IPTC, pass the original rawIPTC
+//	bytes from a prior tiff.Extract call. The top-level gometadata.Write path
+//	handles this automatically by passing m.rawIPTC through encodeIPTC.
+//
 // Round-trip fidelity:
 //   - All IFD entries with known TIFF type codes are faithfully preserved.
 //   - Image-data blocks (StripOffsets, TileOffsets, JPEGInterchangeFormat for
@@ -92,6 +126,15 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 // that hold the original TIFF bytes AND a modified *exif.EXIF struct (e.g. the
 // gometadata.Write path) must use InjectWithEXIF instead.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ bool) error {
+	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads before
+	// proceeding. The wire-frame encoding (magic 0x00XMPEXT\x00) is specific to
+	// JPEG APP1 and cannot be stored in TIFF tag 0x02BC. Writing it verbatim
+	// produces a corrupt XMP blob. Mirror of the identical guard in png.Inject,
+	// webp.Inject, and heif.Inject (task #70).
+	if err := rejectWireFrameXMP(rawXMP); err != nil {
+		return err
+	}
+
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("tiff: seek: %w", err)
 	}
@@ -118,6 +161,11 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ boo
 
 	// Copy-and-relocate path: rebuild IFD structure with upserted metadata and
 	// appended image-data blocks at corrected offsets (epic #33, tasks #92/#93).
+	//
+	// Task #149 regression: nil rawIPTC causes the 0x83BB IPTC tag to be omitted
+	// from the rebuilt IFD (upsertIFD0Entry is only called when the value is
+	// non-nil). Callers that only want to update XMP must pass the original
+	// rawIPTC (from tiff.Extract) to avoid silently deleting IPTC.
 	updated, err := relocateTIFF(base, rawIPTC, rawXMP)
 	if err != nil {
 		return err
@@ -155,6 +203,11 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ boo
 // fix(tiff): task #97 — real-file TIFF/DNG write produced ErrBlockOutOfBounds
 // because encodeEXIF fed an IFD skeleton as the relocate base.
 func InjectWithEXIF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads.
+	if err := rejectWireFrameXMP(rawXMP); err != nil {
+		return err
+	}
+
 	// Pass-through: no metadata changes requested and no EXIF edits.
 	if modifiedEXIF == nil && rawIPTC == nil && rawXMP == nil {
 		if _, err := w.Write(originalBytes); err != nil {
@@ -206,6 +259,11 @@ func InjectWithEXIF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawX
 //
 // This is the entry point used by gometadata.Write for FormatCR2.
 func InjectWithEXIFCR2(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads.
+	if err := rejectWireFrameXMP(rawXMP); err != nil {
+		return err
+	}
+
 	// Pass-through: no metadata changes requested and no EXIF edits.
 	if modifiedEXIF == nil && rawIPTC == nil && rawXMP == nil {
 		if _, err := w.Write(originalBytes); err != nil {
@@ -426,6 +484,11 @@ func rebaseAllIFDsAfterCR2Marker(out []byte, ifdStart int, order binary.ByteOrde
 // This is the entry point used by gometadata.Write for FormatNEF.
 // See relocate_nef.go for the full algorithm description.
 func InjectWithEXIFNEF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads.
+	if err := rejectWireFrameXMP(rawXMP); err != nil {
+		return err
+	}
+
 	// Pass-through: no metadata changes requested and no EXIF edits.
 	if modifiedEXIF == nil && rawIPTC == nil && rawXMP == nil {
 		if _, err := w.Write(originalBytes); err != nil {
@@ -457,6 +520,11 @@ func InjectWithEXIFNEF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, r
 // This is the entry point used by gometadata.Write for FormatARW.
 // See relocate_arw.go for the full algorithm description.
 func InjectWithEXIFARW(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads.
+	if err := rejectWireFrameXMP(rawXMP); err != nil {
+		return err
+	}
+
 	// Pass-through: no metadata changes requested and no EXIF edits.
 	if modifiedEXIF == nil && rawIPTC == nil && rawXMP == nil {
 		if _, err := w.Write(originalBytes); err != nil {
@@ -489,6 +557,11 @@ func InjectWithEXIFARW(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, r
 // This is the entry point used by gometadata.Write for FormatORF.
 // See relocate_orf.go for the full algorithm description.
 func InjectWithEXIFORF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads.
+	if err := rejectWireFrameXMP(rawXMP); err != nil {
+		return err
+	}
+
 	// Pass-through: no metadata changes requested and no EXIF edits.
 	if modifiedEXIF == nil && rawIPTC == nil && rawXMP == nil {
 		if _, err := w.Write(originalBytes); err != nil {
@@ -521,6 +594,11 @@ func InjectWithEXIFORF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, r
 // This is the entry point used by gometadata.Write for FormatRW2.
 // See relocate_rw2.go for the full algorithm description.
 func InjectWithEXIFRW2(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads.
+	if err := rejectWireFrameXMP(rawXMP); err != nil {
+		return err
+	}
+
 	// Pass-through: no metadata changes requested and no EXIF edits.
 	if modifiedEXIF == nil && rawIPTC == nil && rawXMP == nil {
 		if _, err := w.Write(originalBytes); err != nil {

@@ -499,6 +499,12 @@ func insertRW2GUIDAndShiftOffsets(
 //     value by +16 AND recursively rebase the pointed-to sub-IFD.
 //   - Tag 0x0118 (RawDataOffset): shift the inline value by +16.
 //
+// After the entry loop:
+//   - The 4-byte nextIFD pointer (at ifdStart+2+ifdCount*12) is shifted by +16
+//     when non-zero and the recursive IFD chain is followed.
+//     Task #111 regression: previously the nextIFD pointer was not rebased,
+//     making IFD1 (thumbnail IFD) unreachable in the output RW2 file.
+//
 // depth limits recursion to maxSubIFDDepth (8) levels:
 //   - #172: a crafted RW2 chaining those pointers forward drives recursion to
 //     ~bufferSize/delta (≈16 B per level for RW2) levels, causing a runtime
@@ -509,10 +515,12 @@ func insertRW2GUIDAndShiftOffsets(
 //     (pointing at the TIFF header), corrupting the file. Skip such entries.
 //
 // TIFF 6.0 §2: IFD entries are 12 bytes: tag(2)+type(2)+count(4)+val_or_off(4).
+// TIFF 6.0 §2: the next-IFD pointer is a 4-byte uint32 immediately following the
+// last entry. A value of 0 terminates the chain.
 // EXIF §4.6.3: sub-IFD pointers (0x8769, 0x8825, 0xA005) are TypeLong, Count=1,
 // total=4 ≤ 4, stored inline with the val_or_off field holding the sub-IFD offset.
 //
-//nolint:cyclop,gocyclo // recursive IFD walk with OOL/inline/pointer dispatch is inherent to the TIFF §2 format
+//nolint:cyclop,gocyclo // recursive IFD walk with OOL/inline/pointer/nextIFD dispatch is inherent to the TIFF §2 format
 func rebaseAllIFDsAfterGUID(out []byte, ifdStart int, rawDataBlock *imageBlock, order binary.ByteOrder, depth int) {
 	// #172: depth guard — a crafted RW2 can chain sub-IFD pointers far enough to
 	// exhaust the Go stack (~1 MB default). Cap at maxSubIFDDepth to match the
@@ -602,5 +610,41 @@ func rebaseAllIFDsAfterGUID(out []byte, ifdStart int, rawDataBlock *imageBlock, 
 				}
 			}
 		}
+	}
+
+	// Task #111 regression: rebase the nextIFD pointer (4 bytes after the last entry).
+	//
+	// TIFF 6.0 §2: the IFD layout is:
+	//   [ifdStart]       2-byte entry count
+	//   [ifdStart+2 .. ifdStart+2+ifdCount*12-1]   entries (12 bytes each)
+	//   [ifdStart+2+ifdCount*12 .. +3]              nextIFD pointer (4-byte uint32)
+	//
+	// exif.Encode sets the nextIFD pointer to the absolute position of IFD1 within
+	// the pre-GUID TIFF stream (IFD0 base = 8). After the 16-byte GUID is inserted
+	// at offset 8, IFD1 shifts by +rw2GUIDLen, making the stored pointer stale.
+	// Not rebasing this pointer causes IFD1 (which carries the thumbnail) to be
+	// unreachable from IFD0 in the output file.
+	nextIFDPos := ifdPos + ifdCount*12
+	if nextIFDPos+4 > len(out) {
+		return
+	}
+	nextIFD := order.Uint32(out[nextIFDPos:])
+	if nextIFD == 0 {
+		return // no IFD chain
+	}
+	if nextIFD < rw2GUIDOffset {
+		return // guard: implausibly small offset (should not appear in exif.Encode output)
+	}
+	// #176: guard against uint32 overflow for the nextIFD pointer.
+	if nextIFD > math.MaxUint32-uint32(rw2GUIDLen) {
+		return // would wrap: leave unchanged to avoid corruption
+	}
+	newNextIFD := nextIFD + uint32(rw2GUIDLen)
+	order.PutUint32(out[nextIFDPos:], newNextIFD)
+	// Recurse into the next IFD so its OOL pointers are also rebased.
+	// #172: pass depth+1 to enforce the recursion depth cap.
+	nextIFDStart := int(newNextIFD)
+	if nextIFDStart+2 <= len(out) {
+		rebaseAllIFDsAfterGUID(out, nextIFDStart, nil, order, depth+1)
 	}
 }

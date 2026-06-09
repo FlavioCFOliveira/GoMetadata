@@ -39,3 +39,26 @@ var ErrOffsetOverflow = errors.New("tiff: imageStart offset overflows uint32 (fi
 // 0xFFFFFFFF is used as an overflow sentinel internally and must never appear in
 // a written output file.
 var ErrImageBlockOverflow = errors.New("tiff: image block offset overflows uint32 (cumulative image data exceeds 4 GiB)")
+
+// ErrCorruptXMP is returned when the rawXMP bytes passed to any TIFF Inject
+// entry point are an internal JPEG extended-XMP wire-frame payload rather than
+// a valid XMP packet. The wire-frame encoding (magic 0x00 'X' 'M' 'P' 'E' 'X'
+// 'T' 0x00) is specific to JPEG containers and cannot be stored in TIFF tag
+// 0x02BC. Callers that forward rawXMP from jpeg.ExtractWithWire to a TIFF
+// injector must use the reassembled rawXMP (not rawXMPWire).
+//
+// Task #118 regression: the JPEG wire-frame guard was added to PNG, WebP, and
+// HEIF inject paths; TIFF inject paths were not covered. This error is the
+// TIFF equivalent. Mirrors format/png.ErrCorruptXMP, format/webp.ErrCorruptXMP,
+// and format/heif.ErrCorruptXMP.
+var ErrCorruptXMP = errors.New("tiff: corrupt or invalid XMP data")
+
+// ErrSubIFDCountMismatch is returned by patchSubIFDPointers when the number of
+// subIFDInfo values passed does not match the 0x014A entry count in the
+// re-encoded TIFF stream. The function patches as many slots as possible
+// (min(declared, actual)) and returns this error so the caller can detect the
+// discrepancy rather than silently writing a partially-patched SubIFD array.
+//
+// Task #116 regression: the mismatch previously passed silently; now it surfaces
+// as an explicit error so callers can log or propagate it.
+var ErrSubIFDCountMismatch = errors.New("tiff: 0x014A SubIFDs count mismatch between declared entry and subIFD slice")

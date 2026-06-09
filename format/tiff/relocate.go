@@ -1062,7 +1062,7 @@ func patchSubIFDImageOffsets(subIFDs []*subIFDInfo, blocks []*imageBlock, order 
 //   - Total size ≤ 4 (inline scalar): overwrite the valOrOff field directly.
 //
 // (2) ALL other OOL entries (RATIONAL, SRATIONAL, DOUBLE, long ASCII, etc.):
-//   - Bug #98: value bytes ARE captured verbatim in rawBytes by extractRawIFD,
+//   - Task #98 fix: value bytes ARE captured verbatim in rawBytes by extractRawIFD,
 //     but the entry's valOrOff pointer still holds the OLD absolute file offset.
 //     After rawBytes is appended at newSubIFDOff the pointer is stale, causing
 //     readers to follow it into garbage (XResolution/YResolution → "undef").
@@ -1254,32 +1254,47 @@ func patchSubIFDPointers(finalTIFF []byte, subIFDs []*subIFDInfo, order binary.B
 		}
 
 		// Found the 0x014A entry.
-		entryCount := int(order.Uint32(finalTIFF[e+4:]))
-		if entryCount != len(subIFDs) {
-			// Count mismatch: subIFDs and the 0x014A entry disagree. This
-			// should not happen unless exif.Encode truncated or dropped entries.
-			// Patch as many as we can to avoid writing stale offsets.
-			if entryCount > len(subIFDs) {
-				entryCount = len(subIFDs)
-			}
+		declaredCount := int(order.Uint32(finalTIFF[e+4:]))
+		actualCount := len(subIFDs)
+
+		// Task #116 regression: bound the write loop by min(declaredCount, actualCount) to
+		// prevent either:
+		//   (a) writing beyond the allocated pointer array in finalTIFF
+		//       (declaredCount > actualCount would index subIFDs[j] OOB), or
+		//   (b) writing beyond the allocated pointer array in finalTIFF
+		//       when actualCount > declaredCount (the slot at j=declaredCount is
+		//       not allocated in the re-encoded IFD and writing it corrupts the
+		//       subsequent IFD or value area).
+		//
+		// Return ErrSubIFDCountMismatch when the counts differ so callers can
+		// log or propagate the discrepancy rather than relying on silent patching.
+		//
+		// TIFF Extension §F: 0x014A holds exactly as many LONG elements as there
+		// are SubIFDs; exif.Encode preserves the original Count faithfully.
+		patchCount := min(declaredCount, actualCount)
+		var mismatchErr error
+		if declaredCount != actualCount {
+			mismatchErr = fmt.Errorf("%w (declared=%d actual=%d)", ErrSubIFDCountMismatch, declaredCount, actualCount)
 		}
 
-		total := uint64(4) * uint64(entryCount) // TypeLong, each 4 bytes
-		if total <= 4 && entryCount == 1 {
+		total := uint64(4) * uint64(patchCount) //nolint:gosec // G115: patchCount = min(declared,actual), both bounded by IFD entry count ≤ 65535
+		if total <= 4 && patchCount == 1 {
 			// Single SubIFD: inline value in bytes 8-11.
 			order.PutUint32(finalTIFF[e+8:], subIFDs[0].newOffset)
-		} else {
+		} else if patchCount > 0 {
 			// Multiple SubIFDs: bytes 8-11 are an offset to the value array.
 			arrOff := int(order.Uint32(finalTIFF[e+8:]))
-			if arrOff+entryCount*4 > len(finalTIFF) {
+			if arrOff+patchCount*4 > len(finalTIFF) {
 				return fmt.Errorf("%w (offset=%d, len=%d)", ErrSubIFDPointerArrayOOB,
 					arrOff, len(finalTIFF))
 			}
-			for j := range entryCount {
+			for j := range patchCount {
 				order.PutUint32(finalTIFF[arrOff+j*4:], subIFDs[j].newOffset)
 			}
 		}
-		return nil
+		// Return mismatch error after patching so that the partial write is visible
+		// but the caller knows the SubIFD array was not fully consistent.
+		return mismatchErr
 	}
 	// 0x014A entry not found in IFD0 of the re-encoded output. This can happen
 	// when exif.Encode drops entries it doesn't understand (unknown types).
