@@ -27,6 +27,16 @@ func serialise(e *EXIF) ([]byte, error) {
 		return nil, ErrNilEXIF
 	}
 
+	// BigTIFF spec §2; audit finding #107: refuse to re-encode a BigTIFF-sourced
+	// EXIF as classic TIFF (magic 0x002A, 32-bit offsets). Doing so would silently
+	// truncate every 64-bit IFD offset to 32 bits, corrupting any file whose
+	// structures are positioned above 4 GiB. Return a clear, actionable error
+	// before emitting any bytes so the caller can surface it rather than write
+	// corrupt output.
+	if e.BigTIFF {
+		return nil, ErrBigTIFFEncodeNotSupported
+	}
+
 	order := e.ByteOrder
 	// Task #59: e.ByteOrder is a nil interface value when the caller constructs
 	// an EXIF struct without setting ByteOrder (zero value for interface). Every

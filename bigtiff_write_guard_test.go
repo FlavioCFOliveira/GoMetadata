@@ -1,0 +1,183 @@
+package gometadata
+
+// bigtiff_write_guard_test.go — gate tests for audit finding #107.
+//
+// Spec references:
+//   - BigTIFF spec (Aware Systems / libtiff) §2: magic 0x002B, 16-byte header,
+//     8-byte IFD offsets, 64-bit counts; offset bytesize = 8.
+//   - TIFF 6.0 §2: magic 0x002A, 8-byte header, 32-bit IFD offsets.
+//
+// Gate tests:
+//   TestBigTIFFWriteReturnsError     — gometadata.Write on BigTIFF: ErrWriteNotSupported, zero bytes.
+//   TestBigTIFFWriteClassicPositive  — gometadata.Write on classic TIFF still succeeds (regression guard).
+//
+// These tests confirm the FIX for audit finding #107:
+//   BEFORE: Write silently emitted a classic TIFF (0x002A) for BigTIFF input,
+//           truncating all 64-bit offsets to 32 bits — silent corruption.
+//   AFTER:  Write returns ErrWriteNotSupported and writes zero bytes.
+
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"testing"
+)
+
+// buildBigTIFFForWriteGuardTest constructs a minimal BigTIFF byte stream for
+// use in write-guard tests.  Two variants are provided:
+//
+//   - withLong8=true:  includes a TypeLong8 (type 16) entry — the canonical
+//     BigTIFF-specific type used for large StripOffsets.
+//   - withLong8=false: uses only standard TIFF types with small values;
+//     proves the guard fires on magic alone, not on type codes.
+//
+// BigTIFF spec §2: magic 0x002B, 16-byte header, 8-byte offsets.
+func buildBigTIFFForWriteGuardTest(withLong8 bool) []byte {
+	order := binary.LittleEndian
+	const (
+		hdrSize     = 16
+		countSize   = 8
+		entrySize   = 20
+		nextPtrSize = 8
+		nEntries    = 1
+	)
+	ifdBlockSize := countSize + nEntries*entrySize + nextPtrSize
+	ifdOff := uint64(hdrSize)
+	dataOff := ifdOff + uint64(ifdBlockSize)
+
+	// dataSz: bytes of OOL value data.
+	// For withLong8: one uint64 strip offset (8 bytes).
+	// For !withLong8: "CameraNN\x00" = 9 bytes > 8 (BigTIFF inline threshold),
+	// so the value is out-of-line. This exercises standard-type OOL entries.
+	var dataSz int
+	if withLong8 {
+		dataSz = 8
+	} else {
+		dataSz = 9
+	}
+
+	buf := make([]byte, int(dataOff)+dataSz)
+	buf[0], buf[1] = 'I', 'I'
+	order.PutUint16(buf[2:], 0x002B) // BigTIFF magic — audit finding #107
+	order.PutUint16(buf[4:], 8)
+	order.PutUint16(buf[6:], 0)
+	order.PutUint64(buf[8:], ifdOff)
+
+	ifdPos := int(ifdOff)
+	order.PutUint64(buf[ifdPos:], nEntries)
+	ifdPos += 8
+
+	if withLong8 {
+		// StripOffsets (0x0111), TypeLong8 (16), count=1, OOL value.
+		// BigTIFF spec §3.3: LONG8 = uint64, 8 bytes per element.
+		order.PutUint16(buf[ifdPos:], 0x0111)
+		order.PutUint16(buf[ifdPos+2:], 16) // TypeLong8
+		order.PutUint64(buf[ifdPos+4:], 1)
+		order.PutUint64(buf[ifdPos+12:], dataOff)
+		order.PutUint64(buf[int(dataOff):], 0x0000_0001_0000_0000) // offset > 4 GiB
+	} else {
+		// Make (0x010F), TypeASCII, count=9, OOL (9 > 8 BigTIFF inline threshold).
+		// This exercises the guard for a BigTIFF with only standard type codes.
+		const payload = "CameraNN\x00"
+		order.PutUint16(buf[ifdPos:], 0x010F)
+		order.PutUint16(buf[ifdPos+2:], 2) // TypeASCII
+		order.PutUint64(buf[ifdPos+4:], uint64(len(payload)))
+		order.PutUint64(buf[ifdPos+12:], dataOff)
+		copy(buf[int(dataOff):], payload)
+	}
+	return buf
+}
+
+// TestBigTIFFWriteReturnsError is the top-level gate for audit finding #107.
+//
+// Before the fix: gometadata.Write on a BigTIFF source silently emitted a
+// classic TIFF (magic 0x002A) without error, truncating all 64-bit offsets.
+//
+// After the fix: gometadata.Write returns ErrWriteNotSupported and writes zero
+// bytes to the output writer when the source is BigTIFF (magic 0x002B).
+//
+// Two sub-cases cover both variants described in the task:
+//
+//	(a) BigTIFF with a TypeLong8 entry — canonical large-file BigTIFF.
+//	(b) BigTIFF with only small/standard-type entries — proves the guard fires
+//	    on the 0x002B magic regardless of actual offset magnitude.
+//
+// BigTIFF spec §2; audit finding #107.
+func TestBigTIFFWriteReturnsError(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		withLong8 bool
+	}{
+		{"with_TypeLong8_entry", true},
+		{"small_offsets_only", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			data := buildBigTIFFForWriteGuardTest(tc.withLong8)
+
+			// Read must succeed — BigTIFF read is fully supported.
+			m, readErr := Read(bytes.NewReader(data))
+			if readErr != nil {
+				t.Fatalf("Read BigTIFF: unexpected error: %v", readErr)
+			}
+
+			// Write must return ErrWriteNotSupported and produce zero bytes.
+			// BigTIFF spec §2; audit finding #107: write is not yet supported.
+			var out bytes.Buffer
+			writeErr := Write(bytes.NewReader(data), &out, m)
+			if writeErr == nil {
+				t.Errorf("Write BigTIFF: expected error, got nil (wrote %d bytes)", out.Len())
+				return
+			}
+			if !errors.Is(writeErr, ErrWriteNotSupported) {
+				t.Errorf("Write BigTIFF: error does not wrap ErrWriteNotSupported: %v", writeErr)
+			}
+			if out.Len() != 0 {
+				t.Errorf("Write BigTIFF: wrote %d bytes on error, want 0", out.Len())
+			}
+		})
+	}
+}
+
+// TestBigTIFFWriteClassicPositive verifies that the BigTIFF write guard does
+// NOT prevent writes for classic TIFF sources (magic 0x002A).
+//
+// This is the regression guard: the BigTIFF guard must not accidentally
+// block valid classic TIFF writes.
+//
+// TIFF 6.0 §2; audit finding #107 (regression guard).
+func TestBigTIFFWriteClassicPositive(t *testing.T) {
+	t.Parallel()
+
+	data := minimalTIFFPayload() // classic TIFF, magic 0x002A
+
+	// Verify it is indeed classic TIFF.
+	if len(data) < 4 || binary.LittleEndian.Uint16(data[2:]) != 0x002A {
+		t.Fatalf("test invariant: minimalTIFFPayload magic = 0x%04X, want 0x002A",
+			binary.LittleEndian.Uint16(data[2:]))
+	}
+
+	m, readErr := Read(bytes.NewReader(data))
+	if readErr != nil {
+		t.Fatalf("Read classic TIFF: %v", readErr)
+	}
+
+	var out bytes.Buffer
+	writeErr := Write(bytes.NewReader(data), &out, m)
+	if writeErr != nil {
+		t.Errorf("Write classic TIFF: unexpected error (BigTIFF guard must not fire for 0x002A): %v", writeErr)
+	}
+	if out.Len() == 0 {
+		t.Error("Write classic TIFF: produced no output bytes")
+	}
+
+	// Output must carry classic TIFF magic (not BigTIFF).
+	if out.Len() >= 4 && binary.LittleEndian.Uint16(out.Bytes()[2:]) != 0x002A {
+		t.Errorf("Write classic TIFF: output magic = 0x%04X, want 0x002A",
+			binary.LittleEndian.Uint16(out.Bytes()[2:]))
+	}
+}

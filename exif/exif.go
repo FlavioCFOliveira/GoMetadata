@@ -37,6 +37,13 @@ import (
 // Nikon bodies) will produce stale internal offsets if the MakerNote moves;
 // full offset rebasing is not yet implemented.  EXIF §4.6.5, tag 0x927C.
 // BigTIFF spec §2 (Aware Systems / libtiff); fix for audit finding #142.
+//
+// BigTIFF is true when the EXIF was parsed from a BigTIFF source (magic 0x002B,
+// 64-bit IFD offsets). When BigTIFF is true, Encode returns
+// ErrBigTIFFEncodeNotSupported without emitting any bytes: downgrading a BigTIFF
+// source to classic TIFF (32-bit offsets) would silently truncate every 64-bit
+// offset and corrupt any file whose structures reside above 4 GiB.
+// BigTIFF spec §2; audit finding #107.
 type EXIF struct {
 	ByteOrder         binary.ByteOrder
 	IFD0              *IFD
@@ -47,6 +54,11 @@ type EXIF struct {
 	MakerNoteIFD      *IFD   // parsed MakerNote IFD; nil when parsing is unsupported for this make
 	MakerNoteOffset   uint32 // absolute TIFF-stream offset of the raw MakerNote value; 0 when absent; truncated for BigTIFF >4GiB
 	MakerNoteOffset64 uint64 // 64-bit counterpart of MakerNoteOffset; never truncated; preferred for new callers
+	// BigTIFF is set to true by Parse when the source magic is 0x002B (BigTIFF).
+	// Encode returns ErrBigTIFFEncodeNotSupported for BigTIFF sources to prevent
+	// silent 0x002A downgrade which would truncate all 64-bit offsets to 32 bits.
+	// BigTIFF spec §2 (Aware Systems / libtiff); audit finding #107.
+	BigTIFF bool
 }
 
 // ParseOption configures a Parse call.
@@ -293,7 +305,10 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) {
 		// bytes [8:16] = IFD0 offset (uint64).
 		ifd0Off := order.Uint64(b[8:])
 
-		e := &EXIF{ByteOrder: order}
+		// BigTIFF spec §2; audit finding #107: mark the provenance so Encode can
+		// reject re-encoding this EXIF as classic TIFF (which would truncate all
+		// 64-bit offsets to 32 bits and silently corrupt the output).
+		e := &EXIF{ByteOrder: order, BigTIFF: true}
 		ifd0, ferr := traverseBigTIFF(b, ifd0Off, order)
 		if ferr != nil {
 			return nil, ferr

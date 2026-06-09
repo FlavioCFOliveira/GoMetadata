@@ -2,6 +2,7 @@ package gometadata
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -262,7 +263,47 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 // preserves ALL out-of-line value areas in each SubIFD (RATIONAL XResolution,
 // YResolution, etc.) by updating their valOrOff pointers to the new absolute
 // positions. The fix is in patchRawIFDOffsets (format/tiff/relocate.go).
+// isBigTIFFSource reports whether the raw EXIF bytes or the parsed EXIF struct
+// indicate a BigTIFF source (magic 0x002B at bytes [2:4] in the appropriate
+// byte order). It is used as a fast-fail guard at the top of every TIFF write
+// path so that BigTIFF sources return ErrWriteNotSupported before any I/O.
+//
+// The check is in two layers:
+//  1. m.EXIF.BigTIFF — set by exif.Parse for BigTIFF sources; authoritative
+//     when a parsed EXIF is present.
+//  2. raw bytes — used as a fallback when m.EXIF is nil (pure IPTC/XMP change
+//     with no EXIF edits); checks bytes [0:4] for the BigTIFF magic 0x002B.
+//
+// BigTIFF spec §2 (Aware Systems / libtiff); audit finding #107.
+func isBigTIFFSource(raw []byte, e *exif.EXIF) bool {
+	if e != nil && e.BigTIFF {
+		return true
+	}
+	// raw bytes: validate minimum length and determine byte order before reading magic.
+	if len(raw) < 4 {
+		return false
+	}
+	// TIFF 6.0 §2: byte order marker "II" (LE) or "MM" (BE) at bytes [0:2].
+	// BigTIFF spec §2: magic 0x002B at bytes [2:4] (same position as classic TIFF).
+	switch {
+	case raw[0] == 'I' && raw[1] == 'I':
+		return binary.LittleEndian.Uint16(raw[2:]) == 0x002B
+	case raw[0] == 'M' && raw[1] == 'M':
+		return binary.BigEndian.Uint16(raw[2:]) == 0x002B
+	}
+	return false
+}
+
 func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // conditional logic for originalBytes source + nil guards + three encode paths; splitting would reduce clarity
+	// BigTIFF guard: reject BigTIFF sources before any I/O.
+	// exif.Encode would return ErrBigTIFFEncodeNotSupported deep inside the
+	// relocator, after partial work. Surface it here as ErrWriteNotSupported
+	// so the caller sees a clear, actionable error and zero bytes are written.
+	// BigTIFF spec §2; audit finding #107.
+	if isBigTIFFSource(m.rawEXIF, m.EXIF) {
+		return fmt.Errorf("gometadata: writing metadata into a BigTIFF container is not yet supported (BigTIFF write requires a native 64-bit encoder): %w", ErrWriteNotSupported)
+	}
+
 	// Obtain the original TIFF bytes. tiff.Extract (called during Read) stores
 	// the entire TIFF stream in m.rawEXIF; use it when available to avoid a
 	// second full-file read.
@@ -743,6 +784,10 @@ func cloneEXIF(e *exif.EXIF) *exif.EXIF {
 		MakerNoteIFD:      cloneIFD(e.MakerNoteIFD),
 		MakerNoteOffset:   e.MakerNoteOffset,
 		MakerNoteOffset64: e.MakerNoteOffset64,
+		// BigTIFF provenance must be preserved so the Encode guard fires even
+		// when the clone (not the original) is passed to relocateTIFFFromParsed.
+		// BigTIFF spec §2; audit finding #107.
+		BigTIFF: e.BigTIFF,
 	}
 	return out
 }
