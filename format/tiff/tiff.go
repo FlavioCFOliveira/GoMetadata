@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"slices"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
@@ -310,7 +311,7 @@ func insertCR2MarkerAndShiftOffsets(finalTIFF, originalBytes []byte) ([]byte, er
 	if ifd0Start+2 > len(out) {
 		return nil, fmt.Errorf("%w (offset=%d, len=%d)", ErrCR2IFD0OutOfBounds, ifd0Start, len(out))
 	}
-	rebaseAllIFDsAfterCR2Marker(out, ifd0Start, order)
+	rebaseAllIFDsAfterCR2Marker(out, ifd0Start, order, 0)
 
 	return out, nil
 }
@@ -324,14 +325,28 @@ func insertCR2MarkerAndShiftOffsets(finalTIFF, originalBytes []byte) ([]byte, er
 //   - Inline sub-IFD pointer tags (0x8769 ExifIFD, 0x8825 GPS, 0xA005 Interop):
 //     shift the inline value by +cr2MarkerLen AND recursively rebase the sub-IFD.
 //
-// Guards: only offsets ≥ 8 (the insertion point) are shifted, which covers all
-// offsets produced by exif.Encode (which starts placing values at offset 8+).
+// Guards:
+//   - depth limits recursion to maxSubIFDDepth (8) levels so a crafted CR2 that
+//     chains sub-IFD pointers in a deep cycle cannot cause a stack overflow.
+//     #172: unbounded recursive IFD walker depth guard.
+//   - OOL offsets near math.MaxUint32 are left unchanged when adding cr2MarkerLen
+//     would wrap to zero, preventing pointer corruption.
+//     #176: uint32 overflow guard for OOL pointer rebasing.
+//   - Only offsets ≥ 8 (the insertion point) are shifted, which covers all
+//     offsets produced by exif.Encode (which starts placing values at offset 8+).
 //
 // TIFF 6.0 §2: IFD entries are 12 bytes: tag(2)+type(2)+count(4)+val_or_off(4).
 // EXIF §4.6.3: sub-IFD pointer tags are TypeLong, Count=1, total=4 ≤ 4 → inline.
 //
 //nolint:cyclop,gocyclo // recursive IFD walk with OOL/inline/pointer dispatch mirrors rebaseAllIFDsAfterGUID; inherent TIFF §2 complexity
-func rebaseAllIFDsAfterCR2Marker(out []byte, ifdStart int, order binary.ByteOrder) {
+func rebaseAllIFDsAfterCR2Marker(out []byte, ifdStart int, order binary.ByteOrder, depth int) {
+	// #172: depth guard — mirrors the maxSubIFDDepth cap used by enumerateSubIFDsAt.
+	// A crafted CR2 chaining sub-IFD pointers more than 8 levels deep would drive
+	// the recursion to ~bufferSize/cr2MarkerLen calls, causing a runtime stack overflow.
+	// TIFF Extension §F: SubIFD nesting depth is bounded in practice; 8 is generous.
+	if depth >= maxSubIFDDepth {
+		return
+	}
 	if ifdStart+2 > len(out) {
 		return
 	}
@@ -362,7 +377,12 @@ func rebaseAllIFDsAfterCR2Marker(out []byte, ifdStart int, order binary.ByteOrde
 			// exif.Encode never places values at offsets < 8.
 			const insertionPoint = 8
 			if oldVOO >= insertionPoint {
-				order.PutUint32(out[e+8:], oldVOO+uint32(cr2MarkerLen))
+				// #176: guard against uint32 overflow: an OOL pointer near 4 GiB would
+				// wrap to ~0 (pointing at the TIFF header) if added to cr2MarkerLen.
+				// Skip such entries — they already point outside the valid region.
+				if oldVOO <= math.MaxUint32-uint32(cr2MarkerLen) {
+					order.PutUint32(out[e+8:], oldVOO+uint32(cr2MarkerLen))
+				}
 			}
 			continue
 		}
@@ -381,12 +401,17 @@ func rebaseAllIFDsAfterCR2Marker(out []byte, ifdStart int, order binary.ByteOrde
 			if oldVal < insertionPoint {
 				continue // guard: implausibly small offset (shouldn't happen)
 			}
+			// #176: guard against uint32 overflow for inline sub-IFD pointers.
+			if oldVal > math.MaxUint32-uint32(cr2MarkerLen) {
+				continue // would wrap: pointer already outside valid address space
+			}
 			newVal := oldVal + uint32(cr2MarkerLen)
 			order.PutUint32(out[e+8:], newVal)
 			// Recurse into the sub-IFD at its new position in out.
+			// #172: pass depth+1 to enforce the recursion depth cap.
 			subIFDStart := int(newVal)
 			if subIFDStart+2 <= len(out) {
-				rebaseAllIFDsAfterCR2Marker(out, subIFDStart, order)
+				rebaseAllIFDsAfterCR2Marker(out, subIFDStart, order, depth+1)
 			}
 		}
 	}

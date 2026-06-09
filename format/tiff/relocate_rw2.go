@@ -476,7 +476,7 @@ func insertRW2GUIDAndShiftOffsets(
 	if ifd0Start+2 > len(out) {
 		return nil, fmt.Errorf("rw2: insert GUID: %w (offset=%d, len=%d)", ErrRW2IFD0OutOfBounds, ifd0Start, len(out))
 	}
-	rebaseAllIFDsAfterGUID(out, ifd0Start, rawDataBlock, order)
+	rebaseAllIFDsAfterGUID(out, ifd0Start, rawDataBlock, order, 0)
 
 	// ── Step B5: restore RW2 magic ────────────────────────────────────────────
 	// Replace the standard TIFF header bytes [0:4] with RW2 magic "IIU\x00".
@@ -499,15 +499,28 @@ func insertRW2GUIDAndShiftOffsets(
 //     value by +16 AND recursively rebase the pointed-to sub-IFD.
 //   - Tag 0x0118 (RawDataOffset): shift the inline value by +16.
 //
-// This function is called once for IFD0 (at rw2IFD0Offset=24 in the output),
-// and recursively for each sub-IFD encountered via pointer tags.
+// depth limits recursion to maxSubIFDDepth (8) levels:
+//   - #172: a crafted RW2 chaining those pointers forward drives recursion to
+//     ~bufferSize/delta (≈16 B per level for RW2) levels, causing a runtime
+//     fatal stack overflow that defer/recover cannot catch.
+//
+// OOL pointers near math.MaxUint32 are left unchanged:
+//   - #176: adding rw2GUIDLen (16) to an OOL pointer near 4 GiB wraps it to ~0
+//     (pointing at the TIFF header), corrupting the file. Skip such entries.
 //
 // TIFF 6.0 §2: IFD entries are 12 bytes: tag(2)+type(2)+count(4)+val_or_off(4).
 // EXIF §4.6.3: sub-IFD pointers (0x8769, 0x8825, 0xA005) are TypeLong, Count=1,
 // total=4 ≤ 4, stored inline with the val_or_off field holding the sub-IFD offset.
 //
 //nolint:cyclop,gocyclo // recursive IFD walk with OOL/inline/pointer dispatch is inherent to the TIFF §2 format
-func rebaseAllIFDsAfterGUID(out []byte, ifdStart int, rawDataBlock *imageBlock, order binary.ByteOrder) {
+func rebaseAllIFDsAfterGUID(out []byte, ifdStart int, rawDataBlock *imageBlock, order binary.ByteOrder, depth int) {
+	// #172: depth guard — a crafted RW2 can chain sub-IFD pointers far enough to
+	// exhaust the Go stack (~1 MB default). Cap at maxSubIFDDepth to match the
+	// enumerateSubIFDsAt guard. real RW2 files have at most 3 levels (IFD0,
+	// ExifIFD, InteropIFD).
+	if depth >= maxSubIFDDepth {
+		return
+	}
 	if ifdStart+2 > len(out) {
 		return
 	}
@@ -538,7 +551,12 @@ func rebaseAllIFDsAfterGUID(out []byte, ifdStart int, rawDataBlock *imageBlock, 
 			// (offset 8 in the pre-insertion space = rw2GUIDOffset).
 			// exif.Encode never places values at offsets < 8.
 			if oldVOO >= rw2GUIDOffset {
-				order.PutUint32(out[e+8:], oldVOO+uint32(rw2GUIDLen))
+				// #176: guard against uint32 overflow: an OOL pointer near 4 GiB
+				// would wrap to ~0 (pointing at the TIFF header) if added to rw2GUIDLen.
+				// Skip such entries — they already point outside the valid region.
+				if oldVOO <= math.MaxUint32-uint32(rw2GUIDLen) {
+					order.PutUint32(out[e+8:], oldVOO+uint32(rw2GUIDLen))
+				}
 			}
 			continue
 		}
@@ -560,19 +578,27 @@ func rebaseAllIFDsAfterGUID(out []byte, ifdStart int, rawDataBlock *imageBlock, 
 			if oldVal < rw2GUIDOffset {
 				continue // guard: implausibly small offset
 			}
+			// #176: guard against uint32 overflow for inline sub-IFD pointers.
+			if oldVal > math.MaxUint32-uint32(rw2GUIDLen) {
+				continue // would wrap: pointer already outside valid address space
+			}
 			newVal := oldVal + uint32(rw2GUIDLen)
 			order.PutUint32(out[e+8:], newVal)
 			// Recurse into the sub-IFD at its new position.
 			// The sub-IFD was at oldVal in the pre-GUID space; it is now at newVal.
+			// #172: pass depth+1 to enforce the recursion depth cap.
 			subIFDStart := int(newVal)
 			if subIFDStart+2 <= len(out) {
-				rebaseAllIFDsAfterGUID(out, subIFDStart, nil, order) // no rawDataBlock in sub-IFDs
+				rebaseAllIFDsAfterGUID(out, subIFDStart, nil, order, depth+1) // no rawDataBlock in sub-IFDs
 			}
 		case rw2TagRawDataOffset:
 			if rawDataBlock != nil {
 				oldVal := order.Uint32(out[e+8:])
 				if oldVal >= rw2GUIDOffset {
-					order.PutUint32(out[e+8:], oldVal+uint32(rw2GUIDLen))
+					// #176: guard against uint32 overflow for raw data pointer.
+					if oldVal <= math.MaxUint32-uint32(rw2GUIDLen) {
+						order.PutUint32(out[e+8:], oldVal+uint32(rw2GUIDLen))
+					}
 				}
 			}
 		}

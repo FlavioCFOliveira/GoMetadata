@@ -91,6 +91,16 @@ var (
 	ErrSubIFDEntryNotFound = errors.New("tiff: 0x014A SubIFDs entry not found in re-encoded IFD0")
 )
 
+// maxSubIFDDepth is the maximum SubIFD recursion depth allowed by the IFD
+// walker functions (enumerateSubIFDsAt, rebaseAllIFDsAfterGUID,
+// rebaseAllIFDsAfterCR2Marker). A crafted file can chain sub-IFD pointers
+// arbitrarily deep; capping at 8 prevents stack overflow while covering every
+// real-world nesting depth (DNG spec only mandates one level).
+//
+// TIFF Extension §F: SubIFDs form a tree; real files have at most 2-3 levels.
+// #172: depth cap for unbounded recursive IFD walker.
+const maxSubIFDDepth = 8
+
 // imageBlock describes a contiguous range of image bytes in the source TIFF
 // and records the new position assigned to it in the rebuilt stream.
 //
@@ -297,7 +307,15 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte) (
 	// SubIFD blocks are placed first (SubIFD structures after the main EXIF
 	// block), then main image blocks follow after all SubIFD structures.
 	subIFDsSize := computeSubIFDsSize(subIFDs)
-	imageStart := ifdEnd + subIFDsSize // image blocks start after all SubIFD raw bytes
+	// Guard against uint32 overflow: ifdEnd + subIFDsSize > MaxUint32 means the
+	// combined IFD+SubIFD region alone is already beyond the TIFF 4 GiB limit.
+	// TIFF 6.0 §2: all offsets are uint32; a value that wraps around zero would
+	// make StripOffsets/TileOffsets point into the IFD region, corrupting the output.
+	imageStart64 := uint64(ifdEnd) + uint64(subIFDsSize)
+	if imageStart64 > math.MaxUint32 {
+		return nil, fmt.Errorf("tiff: ifdEnd=%d subIFDsSize=%d: %w", ifdEnd, subIFDsSize, ErrOffsetOverflow)
+	}
+	imageStart := uint32(imageStart64) // image blocks start after all SubIFD raw bytes
 	assignNewOffsets(blocks, imageStart)
 	assignSubIFDOffsets(subIFDs, ifdEnd)
 
@@ -761,7 +779,6 @@ func enumerateSubIFDs(base []byte, ifd0 *exif.IFD, order binary.ByteOrder) ([]*s
 		return nil, nil, nil
 	}
 
-	const maxSubIFDDepth = 8 // guard against pathological nesting
 	return enumerateSubIFDsAt(base, subEntry, n, elemSz, order, 0, maxSubIFDDepth)
 }
 

@@ -74,6 +74,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
 )
@@ -1068,8 +1069,27 @@ func arwRelocateWithSR2(
 		}
 		info.sr2NewOffset = sr2Start
 	}
-	imageStart := ifdEnd + subIFDsSize + sr2ActualSize
+	// Guard against uint32 overflow: ifdEnd + subIFDsSize + sr2ActualSize > MaxUint32
+	// would make StripOffsets/TileOffsets wrap around to the IFD region, corrupting
+	// the output. TIFF 6.0 §2: all offsets are uint32; no TIFF file can exceed 4 GiB.
+	imageStart64 := uint64(ifdEnd) + uint64(subIFDsSize) + uint64(sr2ActualSize)
+	if imageStart64 > math.MaxUint32 {
+		return nil, fmt.Errorf("arw: ifdEnd=%d subIFDsSize=%d sr2ActualSize=%d: %w",
+			ifdEnd, subIFDsSize, sr2ActualSize, ErrOffsetOverflow)
+	}
+	imageStart := uint32(imageStart64)
 	assignNewOffsets(blocks, imageStart)
+
+	// Guard: assignNewOffsets saturates newOffset to math.MaxUint32 when cumulative
+	// image data overflows uint32 (see assignNewOffsets in relocate.go). A written
+	// 0xFFFFFFFF strip offset makes the file unreadable; return an error instead.
+	// TIFF 6.0 §2: StripOffsets values are uint32 absolute file offsets.
+	// Mirror of the guard in relocate_nef.go:771-773 and relocate_rw2.go:256-258.
+	for _, blk := range blocks {
+		if blk.newOffset == math.MaxUint32 {
+			return nil, fmt.Errorf("arw: %w", ErrImageBlockOverflow)
+		}
+	}
 
 	// Step 8a: update placeholder value bytes (main-IFD blocks).
 	updatePlaceholders(mainBlocks, offsetValueSlices, order)

@@ -485,8 +485,24 @@ func ifdExtentInMN(base []byte, ifdFileOff, ifdTIFFBase uint32, order binary.Byt
 		}
 		// OOL: val-or-off is ifdTIFFBase-relative.
 		relOff := order.Uint32(base[e+8:])
+		// Guard: ifdTIFFBase + relOff may overflow uint32 when a crafted NEF
+		// places the MakerNote near 4 GiB.  Skip such entries — they are already
+		// outside the buffer (uint64(len(base)) < 2^32) so the subsequent
+		// len(base) clamp would catch them anyway, but the wrapped absOff would
+		// compare as a tiny value and falsely raise the high-water mark, causing
+		// OOL MakerNote values to be silently omitted.
+		// #184: integer overflow guard for ifdExtentInMN abs-offset computation.
+		if relOff > math.MaxUint32-ifdTIFFBase {
+			continue // wrapped: entry is beyond the addressable TIFF space
+		}
 		absOff := ifdTIFFBase + relOff
-		oolEnd := absOff + uint32(total) //nolint:gosec // G115: bounded by entry
+		// Guard: absOff + uint32(total) may overflow when total is large.
+		// #184: integer overflow guard for ifdExtentInMN OOL-end computation.
+		totalU32 := uint32(total) //nolint:gosec // G115: total bounded by typeSize(≤8) × entryCount(uint32)
+		if totalU32 > math.MaxUint32-absOff {
+			continue // would overflow: entry is corrupt or beyond addressable space
+		}
+		oolEnd := absOff + totalU32
 		if uint64(oolEnd) > uint64(len(base)) {
 			oolEnd = uint32(len(base)) //nolint:gosec // G115: len(base) < 2^32
 		}
