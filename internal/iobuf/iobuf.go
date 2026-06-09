@@ -56,6 +56,10 @@ func Get(n int) *[]byte {
 	if n > defaultSize {
 		p := largePool.Get().(*[]byte) //nolint:forcetypeassert,revive // largePool.New always stores *[]byte; pool invariant
 		if cap(*p) < n {
+			// The pooled buffer is too small for the request. Return it to the
+			// pool before allocating a fresh one — otherwise the pool slot is
+			// permanently lost, silently eroding pool hit-rate (#186).
+			largePool.Put(p)
 			b := make([]byte, n)
 			return &b
 		}
@@ -64,6 +68,8 @@ func Get(n int) *[]byte {
 	}
 	p := pool.Get().(*[]byte) //nolint:forcetypeassert,revive // pool.New always stores *[]byte; pool invariant
 	if cap(*p) < n {
+		// Same as above: return the undersized buffer before allocating (#186).
+		pool.Put(p)
 		b := make([]byte, n)
 		return &b
 	}

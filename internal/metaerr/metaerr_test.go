@@ -3,6 +3,7 @@ package metaerr
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -153,5 +154,125 @@ func TestErrorsAreDistinct(t *testing.T) {
 	var tr *TruncatedFileError
 	if errors.As(corr, &tr) {
 		t.Error("CorruptMetadataError erroneously matched as *TruncatedFileError")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #192 gate: error messages must not leak Go-internal identifiers or pointers
+// ---------------------------------------------------------------------------
+
+// TestCorruptMetadataError_NoGoInternalLeak is the regression gate for audit
+// finding #192. It asserts that Error() strings for representative
+// CorruptMetadataError and ParseSegmentError-wrapping scenarios contain:
+//
+//   - No pointer-address patterns (0x[0-9a-fA-F]+) which change between runs
+//     and expose GC internals.
+//   - No unexported Go identifier patterns (lower-case package-qualified names
+//     like "exif.ifd", "metaerr.CorruptMetadataError", or Go struct field names
+//     in "type.field" notation) that expose implementation vocabulary.
+//
+// Decimal byte offsets and buffer lengths (e.g. "offset 2048", "buf len 1024")
+// ARE permitted: they are file-position diagnostics that help callers locate
+// the malformed bytes in the source file, consistent with the diagnostic policy
+// documented in the CorruptMetadataError godoc.
+func TestCorruptMetadataError_NoGoInternalLeak(t *testing.T) {
+	t.Parallel()
+
+	// reGoPointer matches a Go runtime pointer address as formatted by %p or
+	// default %v on a pointer: "0x" followed by ≥8 hex digits. Short hex
+	// literals (e.g. EXIF tag IDs like "0x0100" which are only 4 hex digits)
+	// are valid file-format constants, not pointers, and must not be flagged.
+	// A real 64-bit address has 12 hex digits; 8 is the minimum on 32-bit.
+	reGoPointer := regexp.MustCompile(`0x[0-9a-fA-F]{8,}`)
+
+	// reGoInternal matches unexported package-qualified identifiers: a
+	// lower-case word, a dot, then another word (e.g. "exif.ifd", "metaerr.foo").
+	// Exported identifiers (CorruptMetadataError, TruncatedFileError) are fine
+	// in doc strings but should not appear in runtime error messages; however,
+	// this gate focuses specifically on unexported (lower-case first char)
+	// package-qualified names which are the primary leakage vector.
+	reGoInternal := regexp.MustCompile(`\b[a-z][a-zA-Z0-9_]*\.[a-z][a-zA-Z0-9_]+\b`)
+
+	// Representative CorruptMetadataError instances that mirror real parser output.
+	// These reason strings exercise the full range of patterns in exif/ifd.go and
+	// exif/exif.go while remaining within the documented diagnostic contract.
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "IFD_offset_out_of_bounds",
+			err: &CorruptMetadataError{
+				Format: "EXIF",
+				Reason: "IFD offset 2048 out of bounds (buf len 1024)",
+			},
+		},
+		{
+			name: "invalid_byte_order_marker",
+			err: &CorruptMetadataError{
+				Format: "EXIF",
+				Reason: `invalid byte order marker "\x00\x00"`,
+			},
+		},
+		{
+			name: "IFD_entry_count_overflow",
+			err: &CorruptMetadataError{
+				Format: "EXIF",
+				Reason: "IFD entry count 65535 overflows buffer (offset 8, buf len 16)",
+			},
+		},
+		{
+			name: "value_offset_out_of_range",
+			err: &CorruptMetadataError{
+				Format: "EXIF",
+				Reason: "tag 0x0100 value offset 99999 out of range (buf len 512)",
+			},
+		},
+		{
+			name: "IPTC_unexpected_end",
+			err: &CorruptMetadataError{
+				Format: "IPTC",
+				Reason: "unexpected end of stream at offset 42",
+			},
+		},
+		{
+			name: "XMP_malformed_RDF",
+			err: &CorruptMetadataError{
+				Format: "XMP",
+				Reason: "malformed RDF: nesting depth limit exceeded",
+			},
+		},
+		{
+			name: "TruncatedFileError",
+			err:  &TruncatedFileError{At: "IFD entry at offset 128"},
+		},
+		{
+			name: "wrapped_in_fmt_errorf",
+			err:  fmt.Errorf("parse: %w", &CorruptMetadataError{Format: "EXIF", Reason: "tag value length 0 at offset 64"}),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			msg := tc.err.Error()
+
+			// Gate 1: no Go pointer addresses.
+			if m := reGoPointer.FindString(msg); m != "" {
+				t.Errorf("error message contains Go pointer address %q: %q", m, msg)
+			}
+
+			// Gate 2: no unexported package-qualified identifiers.
+			if m := reGoInternal.FindString(msg); m != "" {
+				t.Errorf("error message contains unexported Go identifier %q: %q", m, msg)
+			}
+
+			// Sanity: the message must contain the "gometadata:" prefix or be
+			// wrapped (fmt.Errorf wrapping adds "parse: " prefix but the inner
+			// message still contains "gometadata:").
+			if !strings.Contains(msg, "gometadata:") {
+				t.Errorf("error message missing 'gometadata:' prefix: %q", msg)
+			}
+		})
 	}
 }
