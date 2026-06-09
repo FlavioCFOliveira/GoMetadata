@@ -3,6 +3,7 @@ package exif
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"testing"
 )
 
@@ -1069,5 +1070,207 @@ func TestParseMakerNoteIFDNoPanicCorrupted(t *testing.T) {
 			// Must not panic.
 			_ = parseMakerNoteIFD(payload, make, binary.LittleEndian)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Audit finding #114 — Nikon Type-3 TIFF header offset scan
+// ---------------------------------------------------------------------------
+
+// buildNikonType3WithPadding builds a Nikon Type-3 MakerNote blob whose
+// embedded TIFF header starts at the given offset (e.g. 8 for standard layout,
+// 10 for the Nikon D70 variant with 2 padding bytes).
+//
+// The IFD contains a single entry with the given tag ID (TypeShort, count=1,
+// value encoded as the first two bytes of the inline value field).
+func buildNikonType3WithPadding(order binary.ByteOrder, tiffHeaderOffset int, tagID uint16, tagVal uint16) []byte {
+	// IFD: count(2) + 1 entry(12) + next(4)
+	const ifdSize = 2 + 12 + 4
+	// total buf: tiffHeaderOffset(bytes up to TIFF header) + TIFF header(8) + IFD relative offset(8)
+	// The IFD offset within the embedded TIFF is 8 (non-zero so traverse works).
+	const ifdRelOffset = 8
+	buf := make([]byte, tiffHeaderOffset+8+ifdRelOffset+ifdSize)
+
+	// Nikon prefix at [0..5], version at [6..7].
+	copy(buf[0:6], "Nikon\x00")
+	buf[6] = 0x02
+	buf[7] = 0x00 // version 0x0200 (D70 variant for offset-10 case; standard for offset-8)
+
+	// Optional padding bytes between prefix and TIFF header.
+	// (for tiffHeaderOffset=8: no padding; for 10: 2 bytes at [8..9])
+	// (bytes left as zero — any non-II/MM bytes are acceptable as padding)
+
+	// Embedded TIFF header at tiffHeaderOffset.
+	tiff := buf[tiffHeaderOffset:]
+	if order == binary.LittleEndian {
+		tiff[0], tiff[1] = 'I', 'I'
+	} else {
+		tiff[0], tiff[1] = 'M', 'M'
+	}
+	order.PutUint16(tiff[2:], 0x002A)
+	order.PutUint32(tiff[4:], uint32(ifdRelOffset)) // IFD offset within embedded TIFF
+
+	// IFD at tiff[ifdRelOffset:].
+	ifd := tiff[ifdRelOffset:]
+	order.PutUint16(ifd[0:], 1) // 1 entry
+	order.PutUint16(ifd[2:], tagID)
+	order.PutUint16(ifd[4:], uint16(TypeShort))
+	order.PutUint32(ifd[6:], 1) // count
+	// Inline value: place tagVal in the first 2 bytes of the 4-byte field.
+	var valBuf [4]byte
+	order.PutUint16(valBuf[:], tagVal)
+	copy(ifd[10:], valBuf[:])
+
+	return buf
+}
+
+// TestParseNikonType3HeaderOffset is the regression gate for audit finding #114.
+//
+// Nikon Type-3 MakerNote: the embedded TIFF header is documented at offset 8
+// (after the 6-byte "Nikon\x00" prefix and 2-byte version), but the D70 with
+// firmware version 0x0200 inserts 2 padding bytes, moving the header to
+// offset 10. The parser must scan forward to find the header in both cases.
+//
+// ExifTool Nikon.pm: D70 firmware quirk; findNikonMNTIFFHeader in
+// format/tiff/relocate_nef.go uses the same scanning strategy.
+func TestParseNikonType3HeaderOffset(t *testing.T) {
+	t.Parallel()
+
+	const knownTag = uint16(0x0210) // tag used as a stable test anchor
+
+	tests := []struct {
+		name             string
+		tiffHeaderOffset int
+	}{
+		{"header at offset 8 (standard)", 8},
+		{"header at offset 10 (D70 padding)", 10},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			blob := buildNikonType3WithPadding(binary.LittleEndian, tc.tiffHeaderOffset, knownTag, 0x0001)
+			if !isNikonType3(blob) {
+				t.Fatal("precondition: isNikonType3 must return true for the synthesised blob")
+			}
+			ifd := parseNikonMakerNote(blob)
+			if ifd == nil {
+				t.Fatalf("parseNikonMakerNote returned nil for Nikon Type-3 with TIFF header at offset %d", tc.tiffHeaderOffset)
+			}
+			entry := ifd.Get(TagID(knownTag))
+			if entry == nil {
+				t.Errorf("MakerNoteIFD does not contain expected tag 0x%04X (header offset=%d)", knownTag, tc.tiffHeaderOffset)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Audit finding #144 — Casio QVC MakerNote (Format 1 / QV-series)
+// ---------------------------------------------------------------------------
+
+// buildCasioQVCMakerNote constructs a Casio QV-series Format 1 MakerNote blob.
+//
+// Layout: "QVC\x00" (4) + version (2) + big-endian IFD at offset 6.
+// Reference: ExifTool Casio.pm, QVC magic detection.
+func buildCasioQVCMakerNote(tagID uint16, tagVal uint16) []byte {
+	// IFD at offset 6: count(2) + 1 entry(12) + next-IFD ptr(4)
+	const ifdOffset = 6
+	const ifdSize = 2 + 12 + 4
+	buf := make([]byte, ifdOffset+ifdSize)
+
+	copy(buf[0:4], "QVC\x00")
+	buf[4], buf[5] = 0x01, 0x00 // version bytes
+
+	// Big-endian IFD at offset 6.
+	order := binary.BigEndian
+	ifd := buf[ifdOffset:]
+	order.PutUint16(ifd[0:], 1) // 1 entry
+	order.PutUint16(ifd[2:], tagID)
+	order.PutUint16(ifd[4:], uint16(TypeShort))
+	order.PutUint32(ifd[6:], 1) // count
+	// Inline value: tagVal in the first 2 bytes of the 4-byte field.
+	var valBuf [4]byte
+	order.PutUint16(valBuf[:], tagVal)
+	copy(ifd[10:], valBuf[:])
+
+	return buf
+}
+
+// TestParseCasioQVCMakerNote is the regression gate for audit finding #144.
+//
+// Casio QV-series cameras embed "QVC\x00" prefix + big-endian IFD at offset 6.
+// Prior to the fix, parseCasioMakerNote called traverse(b, 0, parentOrder)
+// which misinterpreted the "QVC\x00" bytes as IFD entry-count fields,
+// returning garbage entries instead of the real IFD.
+func TestParseCasioQVCMakerNote(t *testing.T) {
+	t.Parallel()
+
+	const wantTag = uint16(0x0001) // arbitrary known tag
+	const wantVal = uint16(0x0042) // arbitrary known value
+
+	blob := buildCasioQVCMakerNote(wantTag, wantVal)
+	ifd := parseCasioMakerNote(blob, binary.BigEndian)
+	if ifd == nil {
+		t.Fatal("parseCasioMakerNote returned nil for QVC-prefixed blob")
+	}
+
+	entry := ifd.Get(TagID(wantTag))
+	if entry == nil {
+		t.Fatalf("MakerNoteIFD does not contain expected tag 0x%04X", wantTag)
+	}
+	if entry.Type != TypeShort {
+		t.Errorf("tag 0x%04X: Type = %d, want TypeShort (%d)", wantTag, entry.Type, TypeShort)
+	}
+	got := entry.Uint16()
+	if got != wantVal {
+		t.Errorf("tag 0x%04X: value = %d, want %d", wantTag, got, wantVal)
+	}
+}
+
+// TestParseCasioQVCShortPayload verifies that a QVC-prefixed blob that is too
+// short to contain a valid IFD returns nil without panicking.
+func TestParseCasioQVCShortPayload(t *testing.T) {
+	t.Parallel()
+
+	for _, l := range []int{0, 4, 6, 7} {
+		buf := make([]byte, l)
+		if l >= 4 {
+			copy(buf[0:4], "QVC\x00")
+		}
+		ifd := parseCasioMakerNote(buf, binary.BigEndian)
+		if ifd != nil {
+			t.Errorf("len=%d: expected nil for short QVC blob, got non-nil", l)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Audit finding #188 — parsePentaxPENTAX length guard
+// ---------------------------------------------------------------------------
+
+// TestParsePentaxPENTAXShortBuffer is the regression gate for audit finding #188.
+//
+// parsePentaxPENTAX reads b[8] and b[9] to detect the embedded byte-order
+// marker. Without a length guard, any input shorter than 10 bytes causes an
+// index-out-of-range panic.
+//
+// The public caller (parsePentaxMakerNote) already requires len >= 14, so the
+// panic is not reachable via the normal parse path. This test exercises the
+// function directly to confirm the defence-in-depth guard works.
+func TestParsePentaxPENTAXShortBuffer(t *testing.T) {
+	t.Parallel()
+
+	for _, l := range []int{0, 8, 9} {
+		t.Run(fmt.Sprintf("len=%d", l), func(t *testing.T) {
+			t.Parallel()
+			buf := make([]byte, l)
+			// Should return nil and not panic for any input shorter than 10 bytes.
+			ifd := parsePentaxPENTAX(buf)
+			if ifd != nil {
+				t.Errorf("len=%d: expected nil, got non-nil IFD", l)
+			}
+		})
 	}
 }

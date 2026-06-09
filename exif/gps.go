@@ -39,20 +39,23 @@ const (
 // decodeCoordinate extracts a DMS (degrees/minutes/seconds) triplet from an
 // IFDEntry that must carry exactly 3 RATIONAL values (EXIF §4.6.6).
 // Returns (zero, false) when entry is nil, Count != 3, or the entry Type is
-// not TypeRational/TypeSRational.
+// not TypeRational.
 //
 // EXIF 2.32 CIPA DC-008-2023 §4.6.6 Table 15: GPSLatitude and GPSLongitude
-// are defined as RATIONAL with Count=3.  An entry whose Type is anything other
-// than RATIONAL/SRATIONAL must be rejected — Rational(i) silently returns
-// [0,0] for wrong-typed entries, which would produce (0,0,true) "Null Island"
-// instead of the correct (0,0,false) absent signal.
+// are defined as RATIONAL (unsigned) with Count=3. TypeSRational is
+// explicitly rejected: Rational(i) returns [0,0] for TypeSRational entries,
+// so accepting TypeSRational here silently produces the (0,0,true) "Null
+// Island" result rather than the correct (0,0,false) absent signal.
+// Audit finding #119.
 func decodeCoordinate(entry *IFDEntry) ([3][2]uint32, bool) {
 	if entry == nil || entry.Count != 3 {
 		return [3][2]uint32{}, false
 	}
-	// Reject non-RATIONAL types explicitly; do not rely on Rational()'s silent
-	// [0,0] fallback which collapses wrong-typed entries to Null Island.
-	if entry.Type != TypeRational && entry.Type != TypeSRational {
+	// EXIF 2.32 CIPA DC-008-2023 §4.6.6 Table 15: only TypeRational is valid
+	// for GPS coordinate fields. TypeSRational must be rejected: Rational(i)
+	// returns [0,0] for non-TypeRational entries, which would give the caller
+	// (0,0,true) — a false Null Island — instead of (0,0,false) = absent.
+	if entry.Type != TypeRational {
 		return [3][2]uint32{}, false
 	}
 	var dms [3][2]uint32

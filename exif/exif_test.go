@@ -3622,3 +3622,113 @@ func TestParseHighOffsetIFD(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Audit finding #119 — GPS TypeSRational must be rejected
+// ---------------------------------------------------------------------------
+
+// TestDecodeCoordinateSRationalReturnsNotOK is the regression gate for audit
+// finding #119.
+//
+// EXIF 2.32 CIPA DC-008-2023 §4.6.6 Table 15: GPSLatitude and GPSLongitude
+// must be TypeRational (unsigned). A malformed entry with TypeSRational and a
+// non-zero value must not silently produce (0,0,true) "Null Island".
+//
+// Prior to the fix, decodeCoordinate accepted TypeSRational; Rational(i) then
+// returned [0,0] for each element (wrong-type guard), so all denominators were
+// 0 and dmsToDecimal returned 0 for each component — yielding (0,0,true).
+func TestDecodeCoordinateSRationalReturnsNotOK(t *testing.T) {
+	t.Parallel()
+
+	order := binary.LittleEndian
+
+	// Encode a non-zero coordinate as TypeSRational (33° 52' 0" N — Sydney).
+	sratVal := make([]byte, 24)      // 3 × 8 bytes
+	order.PutUint32(sratVal[0:], 33) // degrees numerator
+	order.PutUint32(sratVal[4:], 1)  // degrees denominator
+	order.PutUint32(sratVal[8:], 52) // minutes numerator
+	order.PutUint32(sratVal[12:], 1) // minutes denominator
+	order.PutUint32(sratVal[16:], 0) // seconds numerator
+	order.PutUint32(sratVal[20:], 1) // seconds denominator
+
+	// Build a GPS IFD with TypeSRational GPSLatitude.
+	validLonVal := make([]byte, 24)
+	order.PutUint32(validLonVal[0:], 151)
+	order.PutUint32(validLonVal[4:], 1)
+	order.PutUint32(validLonVal[8:], 12)
+	order.PutUint32(validLonVal[12:], 1)
+	order.PutUint32(validLonVal[16:], 0)
+	order.PutUint32(validLonVal[20:], 1)
+
+	gpsIFD := &IFD{
+		Entries: []IFDEntry{
+			{Tag: TagGPSLatitudeRef, Type: TypeASCII, Count: 2, Value: []byte("N\x00"), byteOrder: order},
+			{Tag: TagGPSLatitude, Type: TypeSRational, Count: 3, Value: sratVal, byteOrder: order},
+			{Tag: TagGPSLongitudeRef, Type: TypeASCII, Count: 2, Value: []byte("E\x00"), byteOrder: order},
+			{Tag: TagGPSLongitude, Type: TypeRational, Count: 3, Value: validLonVal, byteOrder: order},
+		},
+	}
+	sortEntries(gpsIFD.Entries)
+
+	lat, lon, ok := parseGPS(gpsIFD)
+	if ok {
+		// A TypeSRational GPS coordinate must be treated as absent (ok=false),
+		// not as (0,0,true) — the silent Null Island result from the bug.
+		t.Errorf("parseGPS with TypeSRational GPSLatitude: got ok=true (lat=%f lon=%f), want ok=false (coordinate absent)", lat, lon)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Audit finding #189 — ifd0ByteOrder nil fallback
+// ---------------------------------------------------------------------------
+
+// TestSetMakeOnManuallyConstructedEXIF is the regression gate for audit
+// finding #189.
+//
+// A programmatically constructed EXIF whose IFD0 contains entries with a nil
+// byteOrder (zero value of the binary.ByteOrder interface) must not panic
+// when any Set* method is called.
+//
+// Prior to the fix, ifd0ByteOrder returned e.IFD0.Entries[0].byteOrder
+// directly without checking for nil. A nil binary.ByteOrder causes
+// PutUint16/PutUint32 calls to dereference a nil function pointer, panicking.
+// The fix adds a nil check and falls back to binary.LittleEndian.
+//
+//nolint:paralleltest // runs in isolation to keep the panic recovery deterministic
+func TestSetMakeOnManuallyConstructedEXIF(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("Set* methods panicked on manually constructed EXIF with nil byteOrder: %v", r)
+		}
+	}()
+
+	// Construct an EXIF whose IFD0 has an entry with a nil byteOrder (the zero
+	// value for a binary.ByteOrder interface — not set by Parse, but possible
+	// when code builds an EXIF struct directly).
+	e := &EXIF{
+		IFD0: &IFD{
+			Entries: []IFDEntry{
+				{Tag: TagMake}, // byteOrder is nil (zero value of interface)
+			},
+		},
+	}
+
+	// SetMake must not panic and must write the tag using the fallback byte order
+	// (binary.LittleEndian).
+	e.SetMake("Canon")
+
+	// SetOrientation also calls ifd0ByteOrder and uses PutUint16 — exercise it
+	// to confirm the nil guard covers all Set* callers.
+	e.SetOrientation(1)
+
+	// The tag must be set correctly regardless of the fallback byte order.
+	entry := e.IFD0.Get(TagMake)
+	if entry == nil {
+		t.Fatal("TagMake entry is nil after SetMake — tag was not written")
+	}
+	// EXIF ASCII values are NUL-terminated; the value must start with "Canon".
+	got := entry.String()
+	if got != "Canon" {
+		t.Errorf("TagMake value = %q, want %q", got, "Canon")
+	}
+}

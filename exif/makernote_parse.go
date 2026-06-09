@@ -308,6 +308,13 @@ func parsePentaxAOC(b []byte) *IFD {
 // PENTAX format ("PENTAX \x00" prefix): byte order at [8..9], IFD at offset 12.
 // Used by older Samsung GX-series and early Pentax DSLRs (ExifTool Pentax.pm).
 func parsePentaxPENTAX(b []byte) *IFD {
+	// Audit finding #188: defence-in-depth guard; b[8] and b[9] would index
+	// out of range if len(b) < 10. The public caller (parsePentaxMakerNote)
+	// already checks len(b) >= 14, but this guard keeps the function safe when
+	// called directly (e.g. from tests or future callers).
+	if len(b) < 10 {
+		return nil
+	}
 	var order binary.ByteOrder
 	switch {
 	case b[8] == 'I' && b[9] == 'I':
@@ -463,12 +470,32 @@ func parseSigmaMakerNote(b []byte) *IFD {
 
 // parseCasioMakerNote parses a Casio MakerNote.
 //
-// Casio MakerNote is a plain TIFF IFD at offset 0, parent byte order.
-// Used by Casio Exilim and older Casio camera series (ExifTool Casio.pm).
+// Two sub-formats are handled (ExifTool Casio.pm):
+//
+//   - QV-series (Format 1): "QVC\x00" (4-byte prefix) + 2-byte version, then
+//     a big-endian IFD at offset 6. Used by older QV-series cameras (e.g.
+//     QV-3000EX). Audit finding #144.
+//
+//   - Exilim / modern Casio (Format 2): plain IFD at offset 0, parent byte order.
+//     Used by Casio Exilim and other non-QV-series cameras.
 func parseCasioMakerNote(b []byte, parentOrder binary.ByteOrder) *IFD {
 	if len(b) < 6 {
 		return nil
 	}
+	// Casio QV-series Format 1: "QVC\x00" prefix + 2 version bytes + big-endian
+	// IFD at offset 6. ExifTool Casio.pm: QVC magic, big-endian, IFD at 6.
+	// Audit finding #144.
+	if bytes.HasPrefix(b, []byte("QVC\x00")) {
+		if len(b) < 8 {
+			return nil
+		}
+		ifd, _, err := traverse(b, 6, binary.BigEndian)
+		if err != nil {
+			return nil
+		}
+		return ifd
+	}
+	// Format 2: plain IFD at offset 0, parent byte order.
 	ifd, _, err := traverse(b, 0, parentOrder)
 	if err != nil {
 		return nil

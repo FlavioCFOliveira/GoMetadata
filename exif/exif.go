@@ -680,9 +680,18 @@ func (e *EXIF) Creator() string {
 
 // ifd0ByteOrder returns the byte order in use by IFD0, defaulting to
 // binary.LittleEndian for an empty or newly created IFD.
+//
+// The fallback to binary.LittleEndian also covers the case where a
+// programmatically constructed EXIF has IFD0 entries but none were created
+// via Parse (so their byteOrder field is the nil zero value of the interface).
+// Returning a nil binary.ByteOrder would cause any PutUint16/PutUint32 call
+// in the Set* methods to panic with a nil pointer dereference.
+// Audit finding #189.
 func (e *EXIF) ifd0ByteOrder() binary.ByteOrder {
 	if len(e.IFD0.Entries) > 0 {
-		return e.IFD0.Entries[0].byteOrder
+		if order := e.IFD0.Entries[0].byteOrder; order != nil {
+			return order
+		}
 	}
 	return binary.LittleEndian
 }
