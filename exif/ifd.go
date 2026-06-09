@@ -232,7 +232,15 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, error) {
 	var root, current *IFD
 	cur := offset
 
-	for cur != 0 {
+	// TIFF §2: the next-IFD pointer value 0 signals end-of-chain; it must NOT
+	// be treated as "no IFD" when offset=0 is the *starting* offset.  Canon,
+	// Sony, DJI, Samsung, Casio and Leica Type-0 MakerNotes are valid plain
+	// IFDs at file offset 0.  Using `first` lets us enter the loop exactly once
+	// regardless of offset, and then stop only when the *returned* next-IFD
+	// pointer is 0 (i.e., end-of-chain) or a cycle is detected.
+	first := true
+	for cur != 0 || first {
+		first = false
 		if visited[cur] {
 			break // cycle detected — stop following the chain
 		}
