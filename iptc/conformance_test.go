@@ -839,7 +839,7 @@ func TestIRBAPP1307(t *testing.T) {
 			val []byte
 		}{{2, DS2Caption, []byte("AB")}})
 		if len(iptcData)%2 == 0 {
-			t.Skipf("iptcData len=%d is even; cannot test odd-padding (add/remove a byte)", len(iptcData))
+			t.Fatalf("test setup error: iptcData len=%d must be odd to exercise IRB-APP13-07 odd-padding", len(iptcData))
 		}
 		full := buildApp13IRBPayload(iptcData)
 		// The IRB payload should include a padding byte.
