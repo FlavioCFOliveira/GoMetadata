@@ -154,6 +154,11 @@ func parseParsedMetadata(m *Metadata, rawEXIF, rawIPTC, rawXMP []byte, cfg *read
 
 // parseEXIF attempts to parse rawEXIF into m.EXIF when raw is non-nil and not lazy.
 // Returns a *ParseSegmentError on parse failure, nil on success or skip.
+//
+// On success, any lenient-parse warnings collected in e.Warnings (audit findings
+// #126/#129/#130/#131/#132) are appended to m.ParseWarnings as individual
+// *ParseSegmentError entries so that callers can inspect them at the top-level
+// Metadata API without aborting parsing.
 func parseEXIF(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
 	if raw == nil || cfg.lazyEXIF {
 		return nil
@@ -167,6 +172,15 @@ func parseEXIF(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
 		return &ParseSegmentError{Segment: "EXIF", Err: err}
 	}
 	m.EXIF = e
+	// Surface EXIF parser warnings as ParseWarnings at the top-level Metadata
+	// API. Each warning string is wrapped in a *ParseSegmentError so it is
+	// consistently typed and inspectable via errors.As.
+	for _, w := range e.Warnings {
+		m.ParseWarnings = append(m.ParseWarnings, &ParseSegmentError{
+			Segment: "EXIF",
+			Err:     fmt.Errorf("%s", w), //nolint:err113 // warning message is already descriptive; dynamic string wrapping is intentional here
+		})
+	}
 	return nil
 }
 

@@ -59,6 +59,18 @@ type EXIF struct {
 	// silent 0x002A downgrade which would truncate all 64-bit offsets to 32 bits.
 	// BigTIFF spec §2 (Aware Systems / libtiff); audit finding #107.
 	BigTIFF bool
+
+	// Warnings is a slice of diagnostic messages produced during parsing.
+	// A non-nil Warnings slice does not indicate a parse failure; the EXIF
+	// data is still usable. Each entry describes a recoverable anomaly such
+	// as a truncated IFD entry count (#130), duplicate tag (#126), an OOL
+	// value offset that aliases the IFD directory (#132), or an unreadable
+	// next-IFD pointer (#131).
+	//
+	// The caller (gometadata.Read) converts each warning into a
+	// *ParseSegmentError appended to Metadata.ParseWarnings so warnings are
+	// visible at the top-level API without aborting parsing.
+	Warnings []string
 }
 
 // ParseOption configures a Parse call.
@@ -100,21 +112,22 @@ func parseByteOrder(b []byte) (binary.ByteOrder, error) {
 // bytes (always retained for round-trip writes), the MakerNote's TIFF-relative
 // byte offset as both uint32 and uint64 (zero if absent), the parsed
 // MakerNoteIFD (nil when cfg.skipMakerNote is set or the make is unrecognised),
-// and the InteropIFD.
+// the InteropIFD, and any diagnostic warnings accumulated during traversal.
 // All fields are nil/empty when the corresponding pointer tag is absent or the
 // sub-IFD cannot be traversed — errors are silently discarded to match the
 // original Parse behaviour (corrupt sub-IFDs must not abort the whole parse).
 //
 // EXIF §4.6.3: ExifIFD pointer is tag 0x8769; InteropIFD pointer is tag 0xA005.
 // EXIF §4.6.5: MakerNote is tag 0x927C.
-func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseConfig) (exifIFD *IFD, makerNote []byte, makerNoteOffset uint32, makerNoteOffset64 uint64, makerNoteIFD *IFD, interopIFD *IFD) {
+func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseConfig) (exifIFD *IFD, makerNote []byte, makerNoteOffset uint32, makerNoteOffset64 uint64, makerNoteIFD *IFD, interopIFD *IFD, warnings []string) {
 	ptr := ifd0.Get(TagExifIFDPointer)
 	if ptr == nil || len(ptr.Value) < 4 {
-		return nil, nil, 0, 0, nil, nil
+		return nil, nil, 0, 0, nil, nil, nil
 	}
-	sub, err := traverse(b, order.Uint32(ptr.Value), order)
+	sub, subWarnings, err := traverse(b, order.Uint32(ptr.Value), order)
+	warnings = append(warnings, subWarnings...)
 	if err != nil {
-		return nil, nil, 0, 0, nil, nil
+		return nil, nil, 0, 0, nil, nil, warnings
 	}
 	exifIFD = sub
 
@@ -138,28 +151,29 @@ func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseCon
 
 	// Interoperability IFD pointer (EXIF §4.6.3, tag 0xA005).
 	if iptr := sub.Get(TagInteropIFDPointer); iptr != nil && len(iptr.Value) >= 4 {
-		if isub, ierr := traverse(b, order.Uint32(iptr.Value), order); ierr == nil {
+		if isub, isubWarnings, ierr := traverse(b, order.Uint32(iptr.Value), order); ierr == nil {
 			interopIFD = isub
+			warnings = append(warnings, isubWarnings...)
 		}
 	}
-	return exifIFD, makerNote, makerNoteOffset, makerNoteOffset64, makerNoteIFD, interopIFD
+	return exifIFD, makerNote, makerNoteOffset, makerNoteOffset64, makerNoteIFD, interopIFD, warnings
 }
 
 // parseGPSSubIFD traverses the GPS IFD rooted at the TagGPSIFDPointer entry
-// in ifd0.  Returns nil when the pointer tag is absent or the IFD cannot be
-// traversed.
+// in ifd0.  Returns the GPS IFD (nil when absent or unreadable) and any
+// diagnostic warnings accumulated during traversal.
 //
 // EXIF §4.6.3: GPS IFD pointer is tag 0x8825.
-func parseGPSSubIFD(b []byte, ifd0 *IFD, order binary.ByteOrder) *IFD {
+func parseGPSSubIFD(b []byte, ifd0 *IFD, order binary.ByteOrder) (*IFD, []string) {
 	ptr := ifd0.Get(TagGPSIFDPointer)
 	if ptr == nil || len(ptr.Value) < 4 {
-		return nil
+		return nil, nil
 	}
-	sub, err := traverse(b, order.Uint32(ptr.Value), order)
+	sub, warnings, err := traverse(b, order.Uint32(ptr.Value), order)
 	if err != nil {
-		return nil
+		return nil, warnings
 	}
-	return sub
+	return sub, warnings
 }
 
 // parseExifSubIFDsBigTIFF traverses the ExifIFD sub-tree for BigTIFF files.
@@ -172,15 +186,16 @@ func parseGPSSubIFD(b []byte, ifd0 *IFD, order binary.ByteOrder) *IFD {
 // EXIF §4.6.5: MakerNote is tag 0x927C.
 // Audit finding #142: MakerNoteOffset64 is populated from the full uint64 rawOffset
 // so that MakerNote positions above 4 GiB are reported without truncation.
-func parseExifSubIFDsBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseConfig) (exifIFD *IFD, makerNote []byte, makerNoteOffset uint32, makerNoteOffset64 uint64, makerNoteIFD *IFD, interopIFD *IFD) { //nolint:gocyclo,cyclop // BigTIFF ExifIFD traversal mirrors parseExifSubIFDs structure; complexity is inherent in the sub-IFD dispatch chain
+func parseExifSubIFDsBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseConfig) (exifIFD *IFD, makerNote []byte, makerNoteOffset uint32, makerNoteOffset64 uint64, makerNoteIFD *IFD, interopIFD *IFD, warnings []string) { //nolint:gocyclo,cyclop // BigTIFF ExifIFD traversal mirrors parseExifSubIFDs structure; complexity is inherent in the sub-IFD dispatch chain
 	ptr := ifd0.Get(TagExifIFDPointer)
 	off, ok := readBigTIFFSubIFDOffset(ptr)
 	if !ok || off == 0 {
-		return nil, nil, 0, 0, nil, nil
+		return nil, nil, 0, 0, nil, nil, nil
 	}
-	sub, err := traverseBigTIFF(b, off, order)
+	sub, subWarnings, err := traverseBigTIFF(b, off, order)
+	warnings = append(warnings, subWarnings...)
 	if err != nil {
-		return nil, nil, 0, 0, nil, nil
+		return nil, nil, 0, 0, nil, nil, warnings
 	}
 	exifIFD = sub
 
@@ -212,30 +227,32 @@ func parseExifSubIFDsBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *p
 	// Interoperability IFD pointer (EXIF §4.6.3, tag 0xA005).
 	if iptr := sub.Get(TagInteropIFDPointer); iptr != nil {
 		if ioff, iok := readBigTIFFSubIFDOffset(iptr); iok && ioff != 0 {
-			if isub, ierr := traverseBigTIFF(b, ioff, order); ierr == nil {
+			if isub, isubWarnings, ierr := traverseBigTIFF(b, ioff, order); ierr == nil {
 				interopIFD = isub
+				warnings = append(warnings, isubWarnings...)
 			}
 		}
 	}
-	return exifIFD, makerNote, makerNoteOffset, makerNoteOffset64, makerNoteIFD, interopIFD
+	return exifIFD, makerNote, makerNoteOffset, makerNoteOffset64, makerNoteIFD, interopIFD, warnings
 }
 
 // parseGPSSubIFDBigTIFF traverses the GPS IFD for BigTIFF files.
 // It is functionally equivalent to parseGPSSubIFD but reads the pointer offset
 // with readBigTIFFSubIFDOffset and traverses with traverseBigTIFF.
+// Returns the GPS IFD (nil when absent or unreadable) and any warnings.
 //
 // EXIF §4.6.3: GPS IFD pointer is tag 0x8825.
-func parseGPSSubIFDBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder) *IFD {
+func parseGPSSubIFDBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder) (*IFD, []string) {
 	ptr := ifd0.Get(TagGPSIFDPointer)
 	off, ok := readBigTIFFSubIFDOffset(ptr)
 	if !ok || off == 0 {
-		return nil
+		return nil, nil
 	}
-	sub, err := traverseBigTIFF(b, off, order)
+	sub, warnings, err := traverseBigTIFF(b, off, order)
 	if err != nil {
-		return nil
+		return nil, warnings
 	}
-	return sub
+	return sub, warnings
 }
 
 // bigTIFFMinHeader is the minimum valid BigTIFF header size.
@@ -278,13 +295,19 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) {
 		ifd0Off := order.Uint32(b[4:])
 		e := &EXIF{ByteOrder: order}
 
-		ifd0, ferr := traverse(b, ifd0Off, order)
+		ifd0, ifd0Warnings, ferr := traverse(b, ifd0Off, order)
 		if ferr != nil {
 			return nil, ferr
 		}
 		e.IFD0 = ifd0
-		e.ExifIFD, e.MakerNote, e.MakerNoteOffset, e.MakerNoteOffset64, e.MakerNoteIFD, e.InteropIFD = parseExifSubIFDs(b, ifd0, order, &cfg)
-		e.GPSIFD = parseGPSSubIFD(b, ifd0, order)
+		e.Warnings = append(e.Warnings, ifd0Warnings...)
+
+		var exifWarnings, gpsWarnings []string
+		e.ExifIFD, e.MakerNote, e.MakerNoteOffset, e.MakerNoteOffset64, e.MakerNoteIFD, e.InteropIFD, exifWarnings = parseExifSubIFDs(b, ifd0, order, &cfg)
+		e.Warnings = append(e.Warnings, exifWarnings...)
+
+		e.GPSIFD, gpsWarnings = parseGPSSubIFD(b, ifd0, order)
+		e.Warnings = append(e.Warnings, gpsWarnings...)
 		return e, nil
 
 	case 0x002B:
@@ -309,13 +332,19 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) {
 		// reject re-encoding this EXIF as classic TIFF (which would truncate all
 		// 64-bit offsets to 32 bits and silently corrupt the output).
 		e := &EXIF{ByteOrder: order, BigTIFF: true}
-		ifd0, ferr := traverseBigTIFF(b, ifd0Off, order)
+		ifd0, ifd0Warnings, ferr := traverseBigTIFF(b, ifd0Off, order)
 		if ferr != nil {
 			return nil, ferr
 		}
 		e.IFD0 = ifd0
-		e.ExifIFD, e.MakerNote, e.MakerNoteOffset, e.MakerNoteOffset64, e.MakerNoteIFD, e.InteropIFD = parseExifSubIFDsBigTIFF(b, ifd0, order, &cfg)
-		e.GPSIFD = parseGPSSubIFDBigTIFF(b, ifd0, order)
+		e.Warnings = append(e.Warnings, ifd0Warnings...)
+
+		var exifWarnings, gpsWarnings []string
+		e.ExifIFD, e.MakerNote, e.MakerNoteOffset, e.MakerNoteOffset64, e.MakerNoteIFD, e.InteropIFD, exifWarnings = parseExifSubIFDsBigTIFF(b, ifd0, order, &cfg)
+		e.Warnings = append(e.Warnings, exifWarnings...)
+
+		e.GPSIFD, gpsWarnings = parseGPSSubIFDBigTIFF(b, ifd0, order)
+		e.Warnings = append(e.Warnings, gpsWarnings...)
 		return e, nil
 
 	default:
@@ -361,7 +390,8 @@ func Encode(e *EXIF) ([]byte, error) {
 //
 // TIFF 6.0 §2: IFD layout — count(2) + entries(count×12) + nextIFD(4).
 func ParseIFDAt(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint32, bool) {
-	return parseSingleIFD(b, offset, order)
+	ifd, next, ok, _ := parseSingleIFD(b, offset, order)
+	return ifd, next, ok
 }
 
 // CameraModel returns the value of IFD0 tag 0x0110 (Model, EXIF §4.6.4 Table 3).
