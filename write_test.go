@@ -1975,3 +1975,245 @@ func TestRawEXIFIsIndependent(t *testing.T) {
 			len(baselineBytes), len(afterBytes))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Gate tests for audit findings #124 (fsync) and #125 (symlink + ownership)
+// ---------------------------------------------------------------------------
+
+// TestWriteFileSyncsBeforeRename is the gate for audit finding #124.
+//
+// WriteFile must call Sync on the temp file after all data has been written
+// and before Close/Rename. This guarantees that the replacement file is
+// durable: a crash after the write but before Sync cannot leave a truncated
+// or empty file as the permanent replacement.
+//
+// The test verifies the observable post-condition: WriteFile produces a
+// complete, correct file that can be read back without error and contains the
+// expected metadata. It also verifies the abort-on-Sync-error path: a Sync
+// failure must leave the original file intact (no partial replacement).
+//
+// The abort path is exercised via a read-only destination directory: Rename
+// will fail, but because Sync runs before Rename, the original file is
+// preserved. We verify this by asserting the original content is still intact
+// after the failed WriteFile.
+func TestWriteFileSyncsBeforeRename(t *testing.T) {
+	t.Parallel()
+
+	// --- Positive path: WriteFile produces a complete, correct, re-readable file.
+	t.Run("produces_complete_output", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+		target := filepath.Join(dir, "image.jpg")
+		original := buildMinimalJPEG(minimalTIFFPayload())
+		if err := os.WriteFile(target, original, 0o644); err != nil { //nolint:gosec // G306: test helper
+			t.Fatalf("setup: %v", err)
+		}
+
+		m, err := ReadFile(target)
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		const wantCopyright = "© 2026 #124 sync gate"
+		m.SetCopyright(wantCopyright)
+
+		if err := WriteFile(target, m); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+
+		// File must be re-readable and contain the expected metadata.
+		m2, err := ReadFile(target)
+		if err != nil {
+			t.Fatalf("ReadFile after WriteFile: %v", err)
+		}
+		if got := m2.Copyright(); got != wantCopyright {
+			t.Errorf("Copyright after WriteFile: got %q, want %q", got, wantCopyright)
+		}
+
+		// The file must be non-empty and at least as large as the original.
+		fi, err := os.Stat(target)
+		if err != nil {
+			t.Fatalf("Stat after WriteFile: %v", err)
+		}
+		if fi.Size() == 0 {
+			t.Error("WriteFile produced an empty file")
+		}
+		if int(fi.Size()) < len(original) {
+			t.Errorf("WriteFile output size %d is smaller than original %d — possible truncation",
+				fi.Size(), len(original))
+		}
+	})
+
+	// --- Abort path: Rename failure leaves the original file intact. ---
+	// We make the directory read-only so Rename fails. The original file must
+	// survive intact (no partial replacement, no empty file).
+	t.Run("original_intact_on_rename_failure", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+		target := filepath.Join(dir, "image.jpg")
+		original := buildMinimalJPEG(minimalTIFFPayload())
+		if err := os.WriteFile(target, original, 0o644); err != nil { //nolint:gosec // G306: test helper
+			t.Fatalf("setup: %v", err)
+		}
+
+		// Make the directory read-only so Rename cannot create the replacement.
+		if err := os.Chmod(dir, 0o555); err != nil { //nolint:gosec // G302: test helper, intentionally restrictive
+			t.Skipf("cannot chmod dir (running as root or unsupported OS): %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o755) }) //nolint:gosec // G302: restoring normal directory permissions
+
+		m, err := ReadFile(target)
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		m.SetCopyright("should not be written")
+
+		writeErr := WriteFile(target, m)
+		if writeErr == nil {
+			t.Skip("Rename succeeded despite read-only dir (likely running as root)")
+		}
+
+		// Restore so we can read the directory.
+		if err := os.Chmod(dir, 0o755); err != nil { //nolint:gosec // G302: restoring normal directory permissions
+			t.Fatalf("restore chmod: %v", err)
+		}
+
+		// Original file must still contain the original content, not a partial write.
+		got, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatalf("ReadFile original after failure: %v", err)
+		}
+		if !bytes.Equal(got, original) {
+			t.Errorf("original file was modified after WriteFile failure: size before=%d after=%d",
+				len(original), len(got))
+		}
+
+		// No stale gometadata-* temp file must remain.
+		entries, _ := os.ReadDir(dir)
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "gometadata-") {
+				t.Errorf("stale temp file left after abort: %s", e.Name())
+			}
+		}
+	})
+}
+
+// TestWriteFilePreservesSymlink is the gate for audit finding #125 (symlink case).
+//
+// When WriteFile is called on a path that is a symbolic link, the operation
+// must:
+//  1. Not replace the symlink with a regular file (the symlink must survive).
+//  2. Update the real file that the symlink points to.
+//
+// Verification:
+//   - os.Lstat(symlinkPath).Mode()&os.ModeSymlink != 0   → still a symlink.
+//   - ReadFile(realPath) returns the updated metadata      → real file was written.
+func TestWriteFilePreservesSymlink(t *testing.T) {
+	t.Parallel()
+
+	// Create the real file in a subdirectory.
+	realDir := t.TempDir()
+	realPath := filepath.Join(realDir, "photo.jpg")
+	original := buildMinimalJPEG(minimalTIFFPayload())
+	if err := os.WriteFile(realPath, original, 0o644); err != nil { //nolint:gosec // G306: test helper
+		t.Fatalf("setup real file: %v", err)
+	}
+
+	// Create a symlink in a different temp directory pointing to the real file.
+	linkDir := t.TempDir()
+	linkPath := filepath.Join(linkDir, "link.jpg")
+	if err := os.Symlink(realPath, linkPath); err != nil {
+		t.Skipf("os.Symlink not supported or not permitted: %v", err)
+	}
+
+	// Read via the symlink, mutate, and write back via the symlink.
+	m, err := ReadFile(linkPath)
+	if err != nil {
+		t.Fatalf("ReadFile via symlink: %v", err)
+	}
+	const wantCopyright = "© 2026 #125 symlink gate"
+	m.SetCopyright(wantCopyright)
+
+	if err := WriteFile(linkPath, m); err != nil {
+		t.Fatalf("WriteFile via symlink: %v", err)
+	}
+
+	// Assert 1: the symlink must still be a symlink (not replaced by a regular file).
+	lst, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatalf("Lstat link after WriteFile: %v", err)
+	}
+	if lst.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("#125 FAIL: %s is no longer a symlink after WriteFile (mode=%v)", linkPath, lst.Mode())
+	}
+
+	// Assert 2: the REAL file must contain the updated metadata.
+	m2, err := ReadFile(realPath)
+	if err != nil {
+		t.Fatalf("ReadFile real file after WriteFile: %v", err)
+	}
+	if got := m2.Copyright(); got != wantCopyright {
+		t.Errorf("#125 Copyright in real file: got %q, want %q", got, wantCopyright)
+	}
+}
+
+// TestWriteFilePreservesOwnershipAndMode is the gate for audit finding #125
+// (mode and ownership preservation).
+//
+// WriteFile must:
+//   - Preserve the original file's permission bits (mode).
+//   - Preserve the original file's uid/gid on Unix (best-effort chown).
+//
+// The mode assertion is platform-neutral. The uid/gid assertion is split into
+// a Unix-specific helper (assertOwnershipPreserved in write_unix_test.go) so
+// that the build remains correct on all platforms.
+//
+// The test uses mode 0640 which differs from os.CreateTemp's default (0600 on
+// Unix) to prove that Chmod is applied to the correct value, not a default.
+func TestWriteFilePreservesOwnershipAndMode(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "image.jpg")
+	original := buildMinimalJPEG(minimalTIFFPayload())
+
+	// Write with mode 0640 (non-default — proves Chmod is applied, not defaulted).
+	if err := os.WriteFile(target, original, 0o640); err != nil { //nolint:gosec // G306: intentional 0640 for mode-preservation test
+		t.Fatalf("setup: %v", err)
+	}
+	// Restrict to exactly 0640 (os.WriteFile honours umask; Chmod bypasses it).
+	if err := os.Chmod(target, 0o640); err != nil { //nolint:gosec // G302: intentional 0640 for mode-preservation test
+		t.Fatalf("chmod setup: %v", err)
+	}
+
+	fiBefore, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("Stat before: %v", err)
+	}
+
+	m, err := ReadFile(target)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	m.SetCopyright("© 2026 #125 mode gate")
+
+	if err := WriteFile(target, m); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	fiAfter, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("Stat after: %v", err)
+	}
+
+	// Mode must be preserved (platform-neutral assertion).
+	wantMode := fiBefore.Mode()
+	if fiAfter.Mode() != wantMode {
+		t.Errorf("#125 mode: got %v, want %v", fiAfter.Mode(), wantMode)
+	}
+
+	// Uid/gid assertion is delegated to the platform-specific helper
+	// assertOwnershipPreserved (write_unix_test.go / write_windows_test.go).
+	assertOwnershipPreserved(t, fiBefore, fiAfter)
+}

@@ -180,12 +180,42 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 // the result back to the same file atomically. It is a convenience wrapper
 // around Write.
 //
-// The temporary file is created in the same directory as path so that the
-// final os.Rename is always an intra-filesystem operation. This prevents
-// EXDEV errors that occur when the system's default temp directory ($TMPDIR)
-// lives on a different filesystem (e.g., in containers or NAS mounts).
-func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
-	f, err := os.Open(path)
+// The temporary file is created in the same directory as the real target so
+// that the final os.Rename is always an intra-filesystem operation. This
+// prevents EXDEV errors that occur when the system's default temp directory
+// ($TMPDIR) lives on a different filesystem (e.g., in containers or NAS
+// mounts).
+//
+// Symlink handling (#125): when path is a symbolic link, WriteFile resolves
+// the real file path with filepath.EvalSymlinks before creating the temp file
+// and performing the rename. This ensures the rename replaces the real file
+// rather than replacing the symlink itself with a regular file. After a
+// successful WriteFile on a symlink, the symlink still points at the same
+// real path and that real file contains the updated metadata.
+//
+// Durability (#124): WriteFile calls Sync on the temp file after all data has
+// been written and before Close/Rename. If Sync fails the function aborts,
+// removes the temp file, and returns the error so the original file is left
+// intact. After a successful Rename, the parent directory is fsynced
+// (best-effort, errors silently ignored) to commit the directory entry to
+// durable storage.
+//
+// Ownership preservation (#125): on Unix, WriteFile attempts to chown the
+// temp file to the uid/gid of the original file before the rename. This is
+// best-effort: EPERM and unsupported-filesystem errors are silently ignored.
+func WriteFile(path string, m *Metadata, opts ...WriteOption) error { //nolint:cyclop,gocyclo // linear sequence of OS calls with early-exit error handling; splitting would reduce clarity
+	// Resolve symlinks so that the rename target is the real file, not the
+	// symlink itself. filepath.EvalSymlinks returns the original path unchanged
+	// when path is not a symlink, so the non-symlink case is handled identically.
+	// Audit finding #125: WriteFile must not replace a symlink with a regular file.
+	realPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		// EvalSymlinks fails for dangling symlinks or missing paths; fall through
+		// to os.Open which will surface the same error with the correct context.
+		realPath = path
+	}
+
+	f, err := os.Open(realPath)
 	if err != nil {
 		return fmt.Errorf("gometadata: open file: %w", err)
 	}
@@ -196,19 +226,20 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 		return fmt.Errorf("gometadata: stat file: %w", err)
 	}
 
-	// Place the temp file in the same directory as path so the eventual rename
-	// is guaranteed to be atomic (same filesystem, no EXDEV).
-	tmp, err := os.CreateTemp(filepath.Dir(path), "gometadata-*")
+	// Place the temp file in the same directory as the real target so the
+	// eventual rename is guaranteed to be atomic (same filesystem, no EXDEV).
+	dir := filepath.Dir(realPath)
+	tmp, err := os.CreateTemp(dir, "gometadata-*")
 	if err != nil {
 		return fmt.Errorf("gometadata: create temp file: %w", err)
 	}
 	tmpName := tmp.Name()
 
-	// renamed tracks whether os.Rename has successfully moved tmpName to path.
-	// The deferred cleanup removes the temp file only when it is still on disk
-	// (i.e., rename has not yet occurred or has failed). os.Remove on a
-	// non-existent path returns an error that we silently ignore, making this
-	// safe to call unconditionally.
+	// renamed tracks whether os.Rename has successfully moved tmpName to
+	// realPath. The deferred cleanup removes the temp file only when it is
+	// still on disk (i.e., rename has not yet occurred or has failed).
+	// os.Remove on a non-existent path returns an error that we silently
+	// ignore, making this safe to call unconditionally.
 	renamed := false
 	defer func() {
 		if !renamed {
@@ -222,17 +253,41 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error {
 		return fmt.Errorf("gometadata: chmod temp file: %w", err)
 	}
 
+	// Best-effort ownership preservation on Unix (#125): transfer uid/gid from
+	// the original file to the temp file before the rename. EPERM and
+	// unsupported-filesystem errors are silently ignored by chownFile.
+	chownFile(tmp, f)
+
 	if err := Write(f, tmp, m, opts...); err != nil {
 		_ = tmp.Close()
 		return err
 	}
+
+	// Flush the temp file to durable storage before rename (#124).
+	// If Sync fails we abort WITHOUT renaming so the original file is left
+	// intact. The deferred Remove will clean up the temp file.
+	// Audit finding #124: a crash between write and sync can leave a truncated
+	// temp file; syncing before rename guarantees the replacement is complete.
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("gometadata: sync temp file: %w", err)
+	}
+
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("gometadata: close temp file: %w", err)
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+
+	if err := os.Rename(tmpName, realPath); err != nil {
 		return fmt.Errorf("gometadata: rename temp file: %w", err)
 	}
 	renamed = true
+
+	// Best-effort directory fsync: flush the directory entry created by Rename
+	// to durable storage so the renamed file is visible after a crash (#124).
+	// Errors are silently ignored: some filesystems (tmpfs, FAT32) and some
+	// configurations do not support directory fsync.
+	fsyncDir(dir)
+
 	return nil
 }
 
