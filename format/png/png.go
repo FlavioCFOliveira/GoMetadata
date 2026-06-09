@@ -171,7 +171,16 @@ func handleLegacyXMP(chunkType string, data []byte) ([]byte, error) {
 // handleXMPChunk dispatches iTXt, tEXt, and zTXt chunks to the appropriate
 // XMP extractor. It returns existing unchanged if the chunk does not contain
 // XMP, or if existing is already set and the chunk type does not override it.
+//
+// iTXt priority rule (XMP Part 3 §1.6 / PNG-04): "Exactly one XMP iTXt;
+// reader uses first." Once rawXMP is set from an iTXt, all subsequent iTXt
+// (and legacy tEXt/zTXt) XMP chunks are ignored.
 func handleXMPChunk(chunkType string, data []byte, existing []byte) ([]byte, error) {
+	// XMP Part 3 §1.6 (PNG-04): use the first XMP chunk encountered; never
+	// overwrite an already-found XMP with a later chunk of any type.
+	if existing != nil {
+		return existing, nil
+	}
 	switch chunkType {
 	case "iTXt":
 		xmp, err := handleITXtXMP(data)
@@ -182,15 +191,12 @@ func handleXMPChunk(chunkType string, data []byte, existing []byte) ([]byte, err
 			return xmp, nil
 		}
 	case "tEXt", "zTXt":
-		// Legacy text chunks are only used when no higher-priority XMP was found.
-		if existing == nil {
-			xmp, err := handleLegacyXMP(chunkType, data)
-			if err != nil {
-				return nil, err
-			}
-			if xmp != nil {
-				return xmp, nil
-			}
+		xmp, err := handleLegacyXMP(chunkType, data)
+		if err != nil {
+			return nil, err
+		}
+		if xmp != nil {
+			return xmp, nil
 		}
 	}
 	return existing, nil
