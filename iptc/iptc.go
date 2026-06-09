@@ -10,6 +10,7 @@ package iptc
 
 import (
 	"bytes"
+	"slices"
 	"sync"
 	"unicode/utf8"
 )
@@ -299,7 +300,7 @@ var encBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }} //nolin
 // misinterpret multi-byte UTF-8 sequences (mojibake). The injected declaration
 // also updates the internal UTF-8 flag so that an immediate Parse of the result
 // returns the correct strings (round-trip correctness).
-func Encode(i *IPTC) ([]byte, error) { //nolint:gocyclo,cyclop // complexity is inherent: UTF-8 auto-declaration, record-version injection, extended-length encoding all require distinct branches
+func Encode(i *IPTC) ([]byte, error) { //nolint:gocyclo,cyclop // complexity is inherent: UTF-8 auto-declaration, record-version injection, ascending-sort, extended-length encoding all require distinct branches
 	buf := encBufPool.Get().(*bytes.Buffer) //nolint:forcetypeassert,revive // encBufPool.New always stores *bytes.Buffer; pool invariant
 	buf.Reset()
 
@@ -310,6 +311,12 @@ func Encode(i *IPTC) ([]byte, error) { //nolint:gocyclo,cyclop // complexity is 
 	// Case (b) is the auto-inject path for #19: writing "café" into a fresh
 	// *IPTC (no declaration) must produce a stream that round-trips correctly.
 	emitUTF8Decl := i.isUTF8() || i.needsUTF8Declaration()
+
+	// #179 fix: track whether 1:00 EnvelopeRecordVersion was already emitted by
+	// the UTF-8 preamble path so the main-loop Record-1 injection can be skipped.
+	// IIM §1.5(v) MUST-NOT-REPEAT: exactly one 1:00 may appear per stream.
+	emittedR1Version := false
+
 	if emitUTF8Decl {
 		// IIM-REC-01 / IIM §1.6.1: when Record 1 is present, 1:00
 		// EnvelopeRecordVersion MUST be the first dataset, value = uint16 BE 4.
@@ -317,6 +324,7 @@ func Encode(i *IPTC) ([]byte, error) { //nolint:gocyclo,cyclop // complexity is 
 		// this library writes. 1:00 must precede it in the stream.
 		// Emit it unconditionally here to satisfy IIM-REC-01 whenever R1 is written.
 		buf.Write([]byte{0x1C, 0x01, 0x00, 0x00, 0x02, 0x00, 0x04})
+		emittedR1Version = true // #179: record emission to prevent duplication below
 
 		// Record 1, Dataset 90: coded character set = UTF-8 (ESC % G).
 		// IIM §1.5.1: ESC % G (0x1B 0x25 0x47) is the ISO 2022 designation for UTF-8.
@@ -341,31 +349,39 @@ func Encode(i *IPTC) ([]byte, error) { //nolint:gocyclo,cyclop // complexity is 
 			continue
 		}
 
+		// #146 fix: IIM §2.2 SHOULD — datasets within a record should be emitted
+		// in ascending DataSet-number order. Sort a local copy so that the receiver
+		// is never mutated (FINDING-002 constraint: Encode must be side-effect-free).
+		// slices.SortStableFunc preserves the relative order of equal DataSet numbers
+		// (important for repeatable datasets like 2:25 Keywords, 2:80 By-line).
+		// IPTC-NAA IIM 4.2 §2.2: the Application Record datasets shall be ordered
+		// by dataset number within the record (SHOULD).
+		sorted := slices.Clone(datasets) // clone is intentional: must not mutate receiver (FINDING-002)
+		slices.SortStableFunc(sorted, func(a, b Dataset) int {
+			return int(a.DataSet) - int(b.DataSet)
+		})
+
 		// IIM-REC-02 / IIM §2.2.1: when Record 2 is present, 2:00
 		// ApplicationRecordVersion MUST be the first dataset, value = uint16 BE 4.
 		// Emit it automatically unless the caller already stored a 2:00 entry.
 		// Same logic applies to Record 1 (IIM-REC-01 / IIM §1.6.1): 1:00 must be
-		// present when Record 1 is emitted; however Record 1 is only written when
-		// the user explicitly stored datasets there, and the 1:90 declaration above
-		// already covers the most common Record-1 case. Emit 1:00 here for
-		// completeness whenever Record 1 datasets are present.
+		// present when Record 1 is emitted. For Record 1: skip if already emitted
+		// by the UTF-8 preamble above (#179 fix: prevents duplicate 1:00).
 		if record == 1 || record == 2 {
 			// Check whether a version dataset (ds number 0) is already present.
-			hasVersion := false
-			for idx := range datasets {
-				if datasets[idx].DataSet == 0 {
-					hasVersion = true
-					break
-				}
-			}
-			if !hasVersion {
+			// After the ascending sort, a version dataset will be first if present.
+			hasVersion := len(sorted) > 0 && sorted[0].DataSet == 0
+			// #179: for Record 1, skip the 1:00 injection when the UTF-8
+			// preamble already emitted it. IIM §1.5(v) MUST-NOT-REPEAT.
+			// De Morgan's law applied: !hasVersion && (record != 1 || !emittedR1Version).
+			if !hasVersion && (record != 1 || !emittedR1Version) {
 				// Emit the mandatory record-version dataset first.
 				// IIM §2.2.1 (Record 2) / §1.6.1 (Record 1): value = big-endian uint16 = 4.
 				buf.Write([]byte{0x1C, record, 0x00, 0x00, 0x02, 0x00, 0x04})
 			}
 		}
 
-		for _, ds := range datasets {
+		for _, ds := range sorted {
 			buf.WriteByte(0x1C)
 			buf.WriteByte(ds.Record)
 			buf.WriteByte(ds.DataSet)
