@@ -1300,6 +1300,260 @@ func TestHEIFRobustIlocV2ItemID(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// §5(f) — Reliability-audit regression gates (HEIF-robust-audit-*)
+// These tests reproduce the exact panic/incorrect-read conditions found in
+// the 2026-06-09 audit (findings #106, #133, #169, #177).
+// ---------------------------------------------------------------------------
+
+// TestHEIFInjectMetaTooSmallForFullBox is the regression gate for finding #169.
+// A meta box whose declared size is < 12 bytes cannot hold the FullBox version+flags
+// (header=8 + version/flags=4 = 12 bytes minimum). Before the fix, Inject would
+// call buildInjectComponents with metaContentOff = metaAbsStart+12 > metaAbsEnd,
+// causing data[metaAbsStart+12 : metaAbsEnd] to panic with "slice bounds out of range".
+//
+// ISO 14496-12 §8.11.1: meta is a FullBox; minimum valid size = 12 bytes.
+func TestHEIFInjectMetaTooSmallForFullBox(t *testing.T) {
+	// HEIF-robust-audit-169: §5(f) CRITICAL — meta box < 12 bytes must not panic on Inject.
+	t.Parallel()
+
+	rawEXIF := []byte{'I', 'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+
+	cases := []struct {
+		name string
+		data []byte
+	}{
+		{
+			// 8-byte meta box: only the box header (size+type); no FullBox version/flags.
+			// metaContentOff = 8+4 = 12 > metaAbsEnd = 8 → was panic [12:8].
+			name: "meta-size-8",
+			data: []byte{
+				0x00, 0x00, 0x00, 0x08, // size = 8
+				'm', 'e', 't', 'a', // type = meta
+			},
+		},
+		{
+			// 9-byte meta box: 1 byte of FullBox version, still < 12.
+			name: "meta-size-9",
+			data: []byte{
+				0x00, 0x00, 0x00, 0x09, // size = 9
+				'm', 'e', 't', 'a', // type = meta
+				0x00, // 1 partial byte of version+flags
+			},
+		},
+		{
+			// 11-byte meta box: header(8) + 3 bytes of version+flags; still < 12.
+			// metaContentOff = 12 > metaAbsEnd = 11 → was panic [12:11].
+			name: "meta-size-11",
+			data: []byte{
+				0x00, 0x00, 0x00, 0x0B, // size = 11
+				'm', 'e', 't', 'a', // type = meta
+				0x00, 0x00, 0x00, // 3 bytes of version+flags (incomplete)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var out bytes.Buffer
+			err := Inject(bytes.NewReader(tc.data), &out, rawEXIF, nil, nil, true)
+			// Must not panic. Acceptable outcomes: pass-through write (err==nil)
+			// or an error. Panics are caught by the testing harness and fail the test.
+			_ = err
+		})
+	}
+}
+
+// TestHEIFRobustInfeV0V1Truncated is the regression gate for finding #106.
+// parseInfeV0V1 panics when the infe body has item_ID (2 bytes) but is missing
+// the item_protection_index (2 bytes), because the unconditional pos+=2 for the
+// protection_index advances pos past len(data) and the subsequent
+// bytes.IndexByte(data[pos:], 0x00) panics with "slice bounds out of range".
+//
+// ISO 14496-12 §8.11.6: all fields in infe v0/v1 must be bounds-checked.
+func TestHEIFRobustInfeV0V1Truncated(t *testing.T) {
+	// HEIF-robust-audit-106: §5(f) CRITICAL — truncated infe v0/v1 must not panic.
+	t.Parallel()
+
+	// Build a valid HEIF file that contains an infe v0 box with a deliberately
+	// truncated body (only item_ID present; item_protection_index and item_name
+	// are missing). The infe box must have a valid ISOBMFF header so that the
+	// loop in parseIinf dispatches into parseInfe → parseInfeV0V1.
+	//
+	// infe v0 body layout (total after header):
+	//   version(1)+flags(3)+item_ID(2)+item_protection_index(2)+item_name(NUL-term)…
+	// We create an infe body with only version+flags+item_ID = 6 bytes, so
+	// after pos=4 (skip v+flags), id is read at [4:5], then pos+=2 for
+	// protection_index would put pos=8 > len(data)=6 — triggering the panic.
+	infeBody := []byte{
+		0x00, 0x00, 0x00, 0x00, // version=0, flags=0
+		0x00, 0x01, // item_ID = 1 (only 2 bytes; protection_index absent)
+	}
+	// The infe box must be wrapped in a box header; total size = 8+6 = 14 bytes.
+	infeBox := bmffBox("infe", infeBody) // bmffBox prefixes 8-byte size+type
+
+	// Wrap infe in iinf: version+flags(4) + entry_count(2) + infe box.
+	iinfBody := make([]byte, 0, 6+len(infeBox)) // v0 + count=1 + infe
+	iinfBody = append(iinfBody, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01)
+	iinfBody = append(iinfBody, infeBox...)
+	iinf := bmffBox("iinf", iinfBody)
+
+	// Build minimal iloc (no items).
+	iloc := bmffIloc(nil)
+
+	// meta FullBox: version+flags(4) + iinf + iloc.
+	metaBody := make([]byte, 0, 4+len(iinf)+len(iloc))
+	metaBody = append(metaBody, 0, 0, 0, 0) // version=0, flags=0
+	metaBody = append(metaBody, iinf...)
+	metaBody = append(metaBody, iloc...)
+	meta := bmffBox("meta", metaBody)
+
+	ftyp := bmffFtyp("heic", 0, "mif1")
+	data := append(ftyp, meta...)
+
+	// Must not panic. Result may be nil EXIF/XMP (item type unrecognised); that is correct.
+	rawEXIF, _, rawXMP, err := Extract(bytes.NewReader(data))
+	_ = err
+	// Truncated infe v0 cannot yield an Exif item type (no item_type field in v0);
+	// rawEXIF must be nil.
+	if rawEXIF != nil {
+		t.Errorf("HEIF-robust-audit-106: rawEXIF non-nil for truncated infe v0: %d bytes", len(rawEXIF))
+	}
+	_ = rawXMP
+}
+
+// TestHEIFRobustIlocConstructionMethod1 is the regression gate for finding #177.
+// Before the fix, parseIlocItemSimple for iloc v1/v2 read the 2-byte
+// construction_method field but discarded it, resolving all extents as file-absolute
+// (method 0) regardless of the actual value. An item with method=1 (idat-relative)
+// would have its offset silently misinterpreted, potentially returning wrong bytes.
+//
+// The fix: construction_method != 0 → return zero itemLoc so the item is ignored
+// rather than mis-resolved.
+//
+// ISO 14496-12 §8.11.3: construction_method semantics.
+func TestHEIFRobustIlocConstructionMethod1(t *testing.T) {
+	// HEIF-robust-audit-177: §5(f) MEDIUM — iloc construction_method != 0 must yield nil EXIF.
+	t.Parallel()
+
+	// Build an iloc v1 body with a single item using construction_method=1 (idat-relative).
+	// The item claims to carry EXIF data, but its extent cannot be resolved without
+	// the idat box. The library must not guess and must return nil for this item.
+	//
+	// iloc v1 body layout:
+	//   version(1)+flags(3)+sizes(2)+item_count(2)+
+	//   item_ID(2)+construction_method(2)+base_offset(0)+extent_count(2)+offset(4)+length(4)
+	ilocBody := []byte{
+		0x01, 0x00, 0x00, 0x00, // version=1, flags=0
+		0x44,       // offset_size=4, length_size=4
+		0x10,       // base_offset_size=1, index_size=0
+		0x00, 0x01, // item_count=1
+		// Item entry:
+		0x00, 0x01, // item_ID=1
+		0x00, 0x01, // construction_method=1 (idat-relative — cannot resolve)
+		0x10,       // base_offset (1 byte, value=16)
+		0x00, 0x01, // extent_count=1
+		0x00, 0x00, 0x00, 0x10, // extent_offset=16
+		0x00, 0x00, 0x00, 0x08, // extent_length=8
+	}
+	rawIloc := make([]byte, 8+len(ilocBody))
+	binary.BigEndian.PutUint32(rawIloc, uint32(len(rawIloc))) //nolint:gosec // G115: test helper, bounded
+	copy(rawIloc[4:], "iloc")
+	copy(rawIloc[8:], ilocBody)
+
+	// Build an infe v2 for item 1 with type "Exif".
+	infe := bmffInfeV2(1, "Exif")
+	iinf := bmffIinf(infe)
+
+	// meta FullBox.
+	metaBody := make([]byte, 0, 4+len(iinf)+len(rawIloc))
+	metaBody = append(metaBody, 0, 0, 0, 0)
+	metaBody = append(metaBody, iinf...)
+	metaBody = append(metaBody, rawIloc...)
+	meta := bmffBox("meta", metaBody)
+
+	ftyp := bmffFtyp("heic", 0, "mif1")
+	data := append(ftyp, meta...)
+
+	// Must not panic. rawEXIF must be nil: the item's construction_method=1 cannot
+	// be resolved to a file offset, so the item must be skipped (not mis-resolved).
+	rawEXIF, _, _, err := Extract(bytes.NewReader(data))
+	_ = err
+	if rawEXIF != nil {
+		t.Errorf("HEIF-robust-audit-177: rawEXIF non-nil for iloc construction_method=1 item: "+
+			"method-1 items cannot be resolved to file offsets; got %d bytes", len(rawEXIF))
+	}
+}
+
+// TestReadIlocSimpleExtentsTruncatedIndex is the regression gate for finding #133.
+// readIlocSimpleExtents lacked a bounds check for the extent_index field (indexSize > 0,
+// present in iloc v1/v2). A truncated iloc where the data ends before extent_index
+// would silently advance pos past len(ilocData), then fail the subsequent offsetSize
+// check — returning ok=false but with offset=0, length=0. The caller discarded ok
+// (_ = ok), so the zero-offset item was recorded as valid, causing the EXIF read
+// to seek to file offset 0 and return image header bytes instead of metadata.
+//
+// The fix adds the indexSize bounds check and propagates ok so the item is omitted.
+//
+// ISO 14496-12 §8.11.3: all extent fields must be bounds-checked.
+func TestReadIlocSimpleExtentsTruncatedIndex(t *testing.T) {
+	// HEIF-robust-audit-133: §5(f) LOW — truncated iloc extent_index must not produce zero-offset item.
+	t.Parallel()
+
+	// Build iloc v1 with index_size=2 (i.e. extent_index is 2 bytes per extent)
+	// but the extent data is truncated after the item_ID and construction_method —
+	// there is no room for even the extent_index field.
+	//
+	// iloc v1 body: version(1)+flags(3)+sizes(2)+item_count(2)+
+	//   item_ID(2)+const_method(2)+extent_count(2)+extent_index(2)[truncated]
+	ilocBody := []byte{
+		0x01, 0x00, 0x00, 0x00, // version=1, flags=0
+		0x44,       // offset_size=4, length_size=4
+		0x02,       // base_offset_size=0, index_size=2  ← index present
+		0x00, 0x01, // item_count=1
+		// Item entry (truncated after extent_count):
+		0x00, 0x01, // item_ID=1
+		0x00, 0x00, // construction_method=0
+		0x00, 0x01, // extent_count=1
+		// extent_index (2 bytes) is missing — truncated here
+	}
+	rawIloc := make([]byte, 8+len(ilocBody))
+	binary.BigEndian.PutUint32(rawIloc, uint32(len(rawIloc))) //nolint:gosec // G115: test helper, bounded
+	copy(rawIloc[4:], "iloc")
+	copy(rawIloc[8:], ilocBody)
+
+	// Build an infe v2 for item 1 with type "Exif".
+	infe := bmffInfeV2(1, "Exif")
+	iinf := bmffIinf(infe)
+
+	// Add a fake EXIF payload at the start of the file (offset=0) to confirm that
+	// a wrongly-recorded zero-offset item would read these bytes as EXIF — which
+	// would be incorrect. After the fix the EXIF item must be omitted.
+	fakeEXIF := []byte{0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0x00, 0x00}
+
+	metaBody := make([]byte, 0, 4+len(iinf)+len(rawIloc))
+	metaBody = append(metaBody, 0, 0, 0, 0)
+	metaBody = append(metaBody, iinf...)
+	metaBody = append(metaBody, rawIloc...)
+	meta := bmffBox("meta", metaBody)
+
+	ftyp := bmffFtyp("heic", 0, "mif1")
+	data := make([]byte, 0, len(ftyp)+len(meta)+len(fakeEXIF))
+	data = append(data, ftyp...)
+	data = append(data, meta...)
+	data = append(data, fakeEXIF...)
+
+	// Must not panic. rawEXIF must be nil: the iloc extent_index is truncated,
+	// so the item should be dropped rather than silently recording offset=0.
+	rawEXIF, _, _, err := Extract(bytes.NewReader(data))
+	_ = err
+	if rawEXIF != nil {
+		t.Errorf("HEIF-robust-audit-133: rawEXIF non-nil for truncated iloc extent_index: "+
+			"truncated item should be dropped; got %d bytes (possible zero-offset mis-read)", len(rawEXIF))
+	}
+}
+
+// ---------------------------------------------------------------------------
 // §5 — Corpus parity (HEIF-corpus-*)
 // ---------------------------------------------------------------------------
 

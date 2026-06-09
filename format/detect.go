@@ -9,7 +9,18 @@ import (
 )
 
 // magicLen is the maximum number of bytes needed to identify any supported format.
-const magicLen = 12
+// 36 bytes covers the ISOBMFF ftyp box layout needed to scan compatible_brands:
+//
+//	offset 0-3:   box size
+//	offset 4-7:   box type ("ftyp")
+//	offset 8-11:  major_brand (4 bytes)
+//	offset 12-15: minor_version (4 bytes)
+//	offset 16-35: up to 5 compatible_brand entries (4 bytes each) — sufficient to
+//	              detect 'avif'/'avis'/'av01' in compatible_brands for mif1-major AVIF.
+//
+// ISO 14496-12 §4.3; ISO 23008-12 §B.4 (AVIF brand requirements).
+// All other formats require ≤ 12 bytes so the increase is free at call sites.
+const magicLen = 36
 
 // tiffScanSize is the number of bytes read for TIFF-variant refinement.
 // Classic TIFF:  8 (header) + 2 (IFD count) + 64×12 (IFD entries) + 256 (Make value) = 1034 bytes.
@@ -157,9 +168,12 @@ func detectMagic(b []byte) FormatID {
 	if isWebP(b) {
 		return FormatWebP
 	}
-	// HEIF family: ftyp box brand at offset 8 determines the exact sub-format.
+	// HEIF family: ftyp box brand determines the exact sub-format.
+	// Pass the full buffer so detectHEIFBrand can inspect compatible_brands when
+	// the major brand alone is ambiguous (e.g. 'mif1' can be either HEIF or AVIF).
+	// ISO 14496-12 §4.3; ISO 23008-12 §B.4.
 	if isHEIFFamily(b) {
-		return detectHEIFBrand(b[8:12])
+		return detectHEIFBrand(b[8:])
 	}
 	// Standard TIFF magic (LE or BE). CR2 is distinguished inside detectTIFFVariant;
 	// NEF/ARW/DNG require IFD inspection via refineTIFFVariant.
@@ -183,27 +197,71 @@ func detectMagic(b []byte) FormatID {
 	return FormatUnknown
 }
 
-// detectHEIFBrand maps the four-byte ftyp brand to a FormatID.
-// Recognised brands (ISO 23008-12 and CR3 spec):
-//   - CR3:  'crx '
-//   - AVIF: 'avif', 'avis', 'av01' (ISO 23008-12 §B.4)
-//   - HEIF/HEIC: all others (heic, mif1, msf1, etc.)
-func detectHEIFBrand(brand []byte) FormatID {
-	if len(brand) < 4 {
+// detectHEIFBrand identifies the HEIF-family FormatID from the ftyp box payload
+// starting at the major_brand field (file offset 8). The slice layout is:
+//
+//	b[0:4]  major_brand
+//	b[4:8]  minor_version (ignored)
+//	b[8:]   compatible_brands[] (4 bytes each, variable count)
+//
+// Recognised brands:
+//   - CR3:  major 'crx '
+//   - AVIF: major 'avif', 'avis', 'av01'; or major 'MA1A'/'MA1B' (MIAF §6.9);
+//     or any major + compatible_brands containing 'avif'/'avis'/'av01'
+//     (ISO 23008-12 §B.4: libavif emits major='mif1' + compat='avif')
+//   - HEIF/HEIC: all other brands
+//
+// #137 fix: previously only the 4-byte major brand was inspected, causing
+// files with major_brand='mif1' and 'avif' in compatible_brands (a valid and
+// common libavif output) to be misidentified as HEIF.
+// ISO 14496-12 §4.3; ISO 23008-12 §B.4 (AVIF brand requirements).
+func detectHEIFBrand(b []byte) FormatID { //nolint:cyclop,gocyclo // brand detection: each brand check is a separate spec-derived rule; complexity is necessary and documented
+	if len(b) < 4 {
 		return FormatHEIF
 	}
+	major := b[0:4]
+
 	// CR3 uses the 'crx ' brand.
-	if brand[0] == 0x63 && brand[1] == 0x72 && brand[2] == 0x78 {
+	if major[0] == 0x63 && major[1] == 0x72 && major[2] == 0x78 {
 		return FormatCR3
 	}
+
+	// isAVIFBrand reports whether the 4-byte brand slice is an AVIF brand.
 	// AVIF brands per ISO 23008-12 §B.4:
-	//   'avif' → brand[0..2] = 'a','v','i', brand[3] = 'f'
-	//   'avis' → brand[0..2] = 'a','v','i', brand[3] = 's'
-	//   'av01' → brand[0..1] = 'a','v', brand[2] = '0', brand[3] = '1'
-	if brand[0] == 0x61 && brand[1] == 0x76 &&
-		(brand[2] == 0x69 || brand[2] == 0x30) { // 'avi' → avif/avis; 'av0' → av01
+	//   'avif' (0x61 0x76 0x69 0x66)
+	//   'avis' (0x61 0x76 0x69 0x73) — AVIF image sequence
+	//   'av01' (0x61 0x76 0x30 0x31) — older brand still seen in the wild
+	// MIAF (ISO 23000-22) §6.9 application brands:
+	//   'MA1A' (0x4D 0x41 0x31 0x41) — AVIF baseline constrained
+	//   'MA1B' (0x4D 0x41 0x31 0x42) — AVIF high-tier constrained
+	isAVIFBrand := func(brand []byte) bool {
+		if len(brand) < 4 {
+			return false
+		}
+		return (brand[0] == 0x61 && brand[1] == 0x76 &&
+			(brand[2] == 0x69 || brand[2] == 0x30)) || // avif/avis/av01
+			(brand[0] == 0x4D && brand[1] == 0x41 &&
+				brand[2] == 0x31 && (brand[3] == 0x41 || brand[3] == 0x42)) // MA1A/MA1B
+	}
+
+	if isAVIFBrand(major) {
 		return FormatAVIF
 	}
+
+	// Check compatible_brands (present at b[8:], 4 bytes each) when the major
+	// brand alone is not AVIF. This handles the libavif pattern of
+	// major_brand='mif1' with 'avif' in compatible_brands.
+	// ISO 23008-12 §B.4: a conformant AVIF reader MUST accept files whose
+	// compatible_brands list includes 'avif' even when the major brand differs.
+	if len(b) >= 12 { // need at least major(4)+minor_version(4)+one_compat(4)
+		compatBrands := b[8:] // skip major_brand[4] + minor_version[4]
+		for i := 0; i+4 <= len(compatBrands); i += 4 {
+			if isAVIFBrand(compatBrands[i : i+4]) { //nolint:gosec // G602: bounds guaranteed by loop condition i+4 <= len(compatBrands)
+				return FormatAVIF
+			}
+		}
+	}
+
 	return FormatHEIF
 }
 

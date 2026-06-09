@@ -1008,6 +1008,13 @@ func parseInfeV0V1(data []byte, pos int) (uint16, string) {
 	}
 	id := binary.BigEndian.Uint16(data[pos:])
 	pos += 2
+	// #106 fix: bounds-check before skipping item_protection_index(2).
+	// ISO 14496-12 §8.11.6: item_protection_index is a mandatory 2-byte field.
+	// Without this guard, a 2-byte body (item_ID only) panics on data[pos:] when
+	// pos > len(data) (regression gate: TestHEIFRobustInfeV0V1Truncated).
+	if pos+2 > len(data) {
+		return id, ""
+	}
 	pos += 2 // item_protection_index
 	// Skip item_name (NUL-terminated string).
 	nul := bytes.IndexByte(data[pos:], 0x00)
@@ -1113,7 +1120,16 @@ func parseIloc(metaData []byte) map[uint16]itemLoc {
 // retained here (matching the original implementation's behaviour).
 func readIlocSimpleExtents(ilocData []byte, pos, extentCount int, baseOffset uint64, offsetSize, lengthSize, indexSize int) (offset, length uint64, newPos int, ok bool) {
 	for range extentCount {
+		// #133 fix: bounds-check the extent_index field before advancing.
+		// ISO 14496-12 §8.11.3: extent_index is present when indexSize > 0 (iloc v1/v2).
+		// Missing this guard allows a truncated extent to silently advance pos past
+		// len(ilocData), producing a zero-offset/zero-length item that is recorded
+		// as valid — the metadata is silently dropped (regression gate:
+		// TestReadIlocSimpleExtentsTruncatedIndex).
 		if indexSize > 0 {
+			if pos+indexSize > len(ilocData) {
+				return offset, length, pos, false
+			}
 			pos += indexSize
 		}
 		if offsetSize > 0 {
@@ -1145,15 +1161,50 @@ func readIlocSimpleExtents(ilocData []byte, pos, extentCount int, baseOffset uin
 //
 // ISO 14496-12 §8.11.3: extents accumulate; only the last extent's values are
 // retained here (matching the original implementation's behaviour).
-func parseIlocItemSimple(ilocData []byte, pos int, version uint8, offsetSize, lengthSize, baseOffsetSize, indexSize int) (id uint16, loc itemLoc, newPos int, ok bool) {
+func parseIlocItemSimple(ilocData []byte, pos int, version uint8, offsetSize, lengthSize, baseOffsetSize, indexSize int) (id uint16, loc itemLoc, newPos int, ok bool) { //nolint:cyclop,gocyclo // binary parser: each branch is a spec-derived field; ISO 14496-12 §8.11.3 construction_method handling requires nested version checks
 	// Read item ID (version-specific width).
 	id, pos, ok = readIlocItemID(ilocData, pos, version)
 	if !ok {
 		return 0, loc, pos, false
 	}
 
-	if version == 1 || version == 2 {
-		pos += 2 // construction_method
+	// #177 fix: read construction_method with a bounds check and honour it.
+	// ISO 14496-12 §8.11.3: construction_method is present only for iloc v1/v2.
+	//   0 = file-offset (absolute), 1 = idat-relative, 2 = item-relative.
+	// Previously the 2-byte field was consumed without a bounds check and its value
+	// was discarded, so method 1 and 2 items were silently resolved as file-absolute
+	// offsets — producing wrong metadata reads and a potential attacker-controlled
+	// seek (regression gate: TestHEIFRobustIlocConstructionMethod1).
+	if version == 1 || version == 2 { //nolint:nestif // ISO 14496-12 §8.11.3: construction_method handling requires per-field version-gated nested bounds checks; complexity is inherent to the spec structure
+		if pos+2 > len(ilocData) {
+			return id, itemLoc{}, pos, false
+		}
+		constructMethod := binary.BigEndian.Uint16(ilocData[pos:])
+		pos += 2
+		if constructMethod != 0 {
+			// Method 1 (idat-relative) and 2 (item-relative) cannot be resolved
+			// without idat box parsing, which is out of scope for this read path.
+			// Return a zero itemLoc so the item is skipped rather than mis-resolved.
+			// Advance past the remaining fields to keep the caller's position valid.
+			if baseOffsetSize > 0 {
+				if pos+baseOffsetSize > len(ilocData) {
+					return id, itemLoc{}, pos, true // parsed id; skip rest
+				}
+				pos += baseOffsetSize
+			}
+			if pos+2 > len(ilocData) {
+				return id, itemLoc{}, pos, true
+			}
+			extentCount := int(binary.BigEndian.Uint16(ilocData[pos:]))
+			pos += 2
+			// Advance past all extent fields without recording them.
+			extentFieldSize := indexSize + offsetSize + lengthSize
+			pos += extentCount * extentFieldSize
+			if pos > len(ilocData) {
+				pos = len(ilocData) // clamp: we only need to skip, not read
+			}
+			return id, itemLoc{}, pos, true // item valid but unsupported method; loc = zero
+		}
 	}
 
 	var baseOffset uint64
@@ -1171,16 +1222,43 @@ func parseIlocItemSimple(ilocData []byte, pos int, version uint8, offsetSize, le
 	extentCount := int(binary.BigEndian.Uint16(ilocData[pos:]))
 	pos += 2
 
+	// #133 fix: propagate the ok flag from readIlocSimpleExtents so that a
+	// truncated extent_index field (missing bounds check in the original) causes
+	// the item to be omitted rather than recorded with offset=0, length=0.
+	// A zero-offset/zero-length item produced by silent truncation causes the
+	// EXIF/XMP read to seek to offset 0, returning image bytes instead of metadata
+	// (regression gate: TestReadIlocSimpleExtentsTruncatedIndex).
 	var offset, length uint64
-	offset, length, pos, _ = readIlocSimpleExtents(ilocData, pos, extentCount, baseOffset, offsetSize, lengthSize, indexSize)
+	var extOK bool
+	offset, length, pos, extOK = readIlocSimpleExtents(ilocData, pos, extentCount, baseOffset, offsetSize, lengthSize, indexSize)
+	if !extOK {
+		return id, itemLoc{}, pos, false
+	}
 	return id, itemLoc{offset: offset, length: length}, pos, true
 }
 
+// metaFullBoxMinSize is the minimum valid size for a meta FullBox:
+// 4 bytes box-header-size + 4 bytes box-type + 4 bytes FullBox version/flags = 12 bytes.
+// A meta box with size < 12 bytes cannot contain valid FullBox metadata.
+// ISO 14496-12 §8.11.1: meta is a FullBox; its minimum declared size is 12.
+const metaFullBoxMinSize = 12
+
 // findMetaBoxAbs finds the 'meta' FullBox in the file and returns its
 // absolute start, end, and the offset where its content begins (after header+version/flags).
+// Returns found=false when the meta box is absent or smaller than metaFullBoxMinSize
+// (an under-sized FullBox cannot contain usable content and would otherwise cause
+// buildInjectComponents to slice data[12:8] → panic; regression gate:
+// TestHEIFInjectMetaTooSmallForFullBox).
+// ISO 14496-12 §8.11.1: meta FullBox minimum size = 12 bytes.
 func findMetaBoxAbs(data []byte) (absStart, absEnd, contentOff int, found bool) {
 	// Search at top level first.
 	if s, e, ok := flatBoxRangeInFile(data, "meta"); ok {
+		if e-s < metaFullBoxMinSize {
+			// #169 fix: meta box too small to be a valid FullBox.
+			// ISO 14496-12 §8.11.1: meta is a FullBox (header[8]+version/flags[4]=12 bytes minimum).
+			// If size < 12, contentOff = s+12 would exceed e, causing data[s+12:e] to panic.
+			return 0, 0, 0, false
+		}
 		return s, e, s + 8 + 4, true // +8 header, +4 FullBox version/flags
 	}
 	// Search inside moov.
@@ -1190,6 +1268,10 @@ func findMetaBoxAbs(data []byte) (absStart, absEnd, contentOff int, found bool) 
 	}
 	moovContent := data[ms+8 : me]
 	if s, e, ok := flatBoxRangeInFile(moovContent, "meta"); ok {
+		if e-s < metaFullBoxMinSize {
+			// Same size guard for the moov-nested meta box.
+			return 0, 0, 0, false
+		}
 		absS := ms + 8 + s
 		absE := ms + 8 + e
 		return absS, absE, absS + 8 + 4, true

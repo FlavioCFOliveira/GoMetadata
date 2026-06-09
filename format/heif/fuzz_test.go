@@ -54,6 +54,67 @@ func FuzzHEIFExtract(f *testing.F) {
 		f.Add(seed3)
 	}
 
+	// Seed: ftyp + meta containing an infe v0 box with only item_ID (no protection_index).
+	// Exercises the #106 fix: parseInfeV0V1 must not panic on truncated body.
+	// Before the fix: pos+=2 (protection_index) advances past len(data), then
+	// bytes.IndexByte(data[pos:], 0x00) panics with "slice bounds out of range".
+	// ISO 14496-12 §8.11.6: infe v0/v1 parsers must bounds-check every field.
+	{
+		// infe v0 box: header(8) + version(1)+flags(3)+item_ID(2) = 14 bytes total.
+		// item_protection_index(2) and item_name are deliberately absent.
+		infeBody := []byte{
+			0x00, 0x00, 0x00, 0x00, // version=0, flags=0
+			0x00, 0x01, // item_ID=1 (only field present; protection_index absent)
+		}
+		infeSize := uint32(8 + len(infeBody)) //nolint:gosec // G115: fuzz seed, bounded
+		infeBox := make([]byte, infeSize)
+		binary.BigEndian.PutUint32(infeBox, infeSize)
+		copy(infeBox[4:], "infe")
+		copy(infeBox[8:], infeBody)
+
+		// iinf FullBox: version+flags(4) + entry_count(2) + infe box.
+		iinfBody := make([]byte, 0, 6+len(infeBox))
+		iinfBody = append(iinfBody, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01)
+		iinfBody = append(iinfBody, infeBox...)
+		iinfSize := uint32(8 + len(iinfBody)) //nolint:gosec // G115: fuzz seed, bounded
+		iinfBox := make([]byte, iinfSize)
+		binary.BigEndian.PutUint32(iinfBox, iinfSize)
+		copy(iinfBox[4:], "iinf")
+		copy(iinfBox[8:], iinfBody)
+
+		// iloc FullBox: minimal (0 items).
+		ilocBody := []byte{
+			0x00, 0x00, 0x00, 0x00, // version=0, flags=0
+			0x44, 0x00, // offset_size=4, length_size=4, base_offset_size=0
+			0x00, 0x00, // item_count=0
+		}
+		ilocSize := uint32(8 + len(ilocBody)) //nolint:gosec // G115: fuzz seed, bounded
+		ilocBox := make([]byte, ilocSize)
+		binary.BigEndian.PutUint32(ilocBox, ilocSize)
+		copy(ilocBox[4:], "iloc")
+		copy(ilocBox[8:], ilocBody)
+
+		// meta FullBox.
+		metaBody := make([]byte, 0, 4+len(iinfBox)+len(ilocBox))
+		metaBody = append(metaBody, 0x00, 0x00, 0x00, 0x00)
+		metaBody = append(metaBody, iinfBox...)
+		metaBody = append(metaBody, ilocBox...)
+		metaSize := uint32(8 + len(metaBody)) //nolint:gosec // G115: fuzz seed, bounded
+		metaBox := make([]byte, metaSize)
+		binary.BigEndian.PutUint32(metaBox, metaSize)
+		copy(metaBox[4:], "meta")
+		copy(metaBox[8:], metaBody)
+
+		ftyp := [20]byte{
+			0x00, 0x00, 0x00, 0x14, 'f', 't', 'y', 'p',
+			'h', 'e', 'i', 'c', 0x00, 0x00, 0x00, 0x00, 'm', 'i', 'f', '1',
+		}
+		seed106 := make([]byte, 0, len(ftyp)+len(metaBox))
+		seed106 = append(seed106, ftyp[:]...)
+		seed106 = append(seed106, metaBox...)
+		f.Add(seed106)
+	}
+
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic regardless of input.
 		rawEXIF, _, _, err := Extract(bytes.NewReader(data))
@@ -139,6 +200,38 @@ func FuzzHEIFInject(f *testing.F) {
 		copy(buf[16:], "heic")                  // brand
 		f.Add(buf[:])
 	}
+
+	// Seed 8: ftyp + 8-byte meta box (size=8 = header only; no FullBox version/flags).
+	// Exercises the #169 fix: meta box < 12 bytes must be treated as absent → pass-through.
+	// Before the fix, findMetaBoxAbs returned contentOff=12 > metaAbsEnd=8 causing
+	// buildInjectComponents to panic with "slice bounds out of range [12:8]".
+	// ISO 14496-12 §8.11.1: meta FullBox minimum size = 12 bytes.
+	f.Add([]byte{
+		// ftyp box (20 bytes)
+		0x00, 0x00, 0x00, 0x14,
+		'f', 't', 'y', 'p',
+		'h', 'e', 'i', 'c',
+		0x00, 0x00, 0x00, 0x00,
+		'm', 'i', 'f', '1',
+		// meta box: size=8 (header only — no FullBox version/flags — invalid)
+		0x00, 0x00, 0x00, 0x08,
+		'm', 'e', 't', 'a',
+	})
+
+	// Seed 9: ftyp + 11-byte meta box (header+3 bytes of version/flags; still < 12).
+	// Exercises the same #169 fix at the off-by-one boundary.
+	f.Add([]byte{
+		// ftyp box (20 bytes)
+		0x00, 0x00, 0x00, 0x14,
+		'f', 't', 'y', 'p',
+		'h', 'e', 'i', 'c',
+		0x00, 0x00, 0x00, 0x00,
+		'm', 'i', 'f', '1',
+		// meta box: size=11 (header[8] + 3 bytes — not a complete FullBox)
+		0x00, 0x00, 0x00, 0x0B,
+		'm', 'e', 't', 'a',
+		0x00, 0x00, 0x00,
+	})
 
 	// Seed 7: JPEG XMP wire-frame sentinel as rawXMP — the wire-frame guard
 	// in Inject must return ErrCorruptXMP without panicking.

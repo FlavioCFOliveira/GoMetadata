@@ -136,6 +136,90 @@ func TestAVIFDetect(t *testing.T) {
 	}
 }
 
+// TestAVIFMIF1Brand is the regression gate for finding #137.
+// A file with major_brand='mif1' and 'avif' in compatible_brands is a valid AVIF
+// file (libavif emits this pattern). Before the fix, detectHEIFBrand only inspected
+// the 4-byte major brand, so 'mif1' fell through to FormatHEIF.
+//
+// ISO 23008-12 §B.4: a conformant AVIF reader MUST accept files with 'avif' in
+// compatible_brands even when the major brand differs.
+func TestAVIFMIF1Brand(t *testing.T) {
+	// AVIF-brand-mif1-major-avif-compat: §B.4 — mif1 major + avif compatible → FormatAVIF.
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		major        [4]byte
+		compatBrands [][4]byte
+		wantFormat   FormatID
+	}{
+		{
+			name:  "mif1-major-avif-compat",
+			major: [4]byte{'m', 'i', 'f', '1'},
+			compatBrands: [][4]byte{
+				{'m', 'i', 'a', 'f'}, // MIAF brand
+				{'a', 'v', 'i', 'f'}, // AVIF brand in compatible_brands
+			},
+			wantFormat: FormatAVIF,
+		},
+		{
+			name:  "mif1-major-avis-compat",
+			major: [4]byte{'m', 'i', 'f', '1'},
+			compatBrands: [][4]byte{
+				{'a', 'v', 'i', 's'}, // AVIF sequence
+			},
+			wantFormat: FormatAVIF,
+		},
+		{
+			name:  "mif1-major-no-avif-compat",
+			major: [4]byte{'m', 'i', 'f', '1'},
+			compatBrands: [][4]byte{
+				{'m', 'i', 'a', 'f'}, // MIAF only — not AVIF
+			},
+			wantFormat: FormatHEIF, // mif1 without avif compat → HEIF
+		},
+		{
+			name:         "mif1-major-empty-compat",
+			major:        [4]byte{'m', 'i', 'f', '1'},
+			compatBrands: nil,
+			wantFormat:   FormatHEIF,
+		},
+		{
+			name:       "MA1B-major",
+			major:      [4]byte{'M', 'A', '1', 'B'}, // MIAF baseline brand → AVIF
+			wantFormat: FormatAVIF,
+		},
+		{
+			name:       "MA1A-major",
+			major:      [4]byte{'M', 'A', '1', 'A'}, // MIAF high-tier brand → AVIF
+			wantFormat: FormatAVIF,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// Build a synthetic ftyp box: size(4) + "ftyp"(4) + major(4) + minor_version(4) + compat[].
+			totalSize := 16 + 4*len(tc.compatBrands)
+			buf := make([]byte, totalSize)
+			binary.BigEndian.PutUint32(buf[0:], uint32(totalSize)) //nolint:gosec // G115: test helper, bounded
+			copy(buf[4:], "ftyp")
+			copy(buf[8:], tc.major[:])
+			// minor_version = 0 at buf[12:16]
+			for i, cb := range tc.compatBrands {
+				copy(buf[16+i*4:], cb[:])
+			}
+			got, err := Detect(bytes.NewReader(buf))
+			if err != nil {
+				t.Fatalf("Detect(%s): %v", tc.name, err)
+			}
+			if got != tc.wantFormat {
+				t.Errorf("Detect(%s) = %v, want %v", tc.name, got, tc.wantFormat)
+			}
+		})
+	}
+}
+
 func TestAVIFSupportsWrite(t *testing.T) {
 	t.Parallel()
 	if !SupportsWrite(FormatAVIF) {
