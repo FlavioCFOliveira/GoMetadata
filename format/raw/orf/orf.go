@@ -42,9 +42,16 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if _, err = r.Seek(0, io.SeekStart); err != nil {
 		return nil, nil, nil, fmt.Errorf("orf: seek: %w", err)
 	}
-	data, err := io.ReadAll(r)
+	// #140 fix: cap the full-file read to maxFileSize+1 bytes so that an
+	// oversized or infinite streaming reader cannot trigger unbounded heap
+	// allocation. ErrFileTooLarge is returned when the limit is exceeded,
+	// before any parsing takes place.
+	data, err := io.ReadAll(io.LimitReader(r, maxFileSize+1))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("orf: read: %w", err)
+	}
+	if int64(len(data)) > maxFileSize {
+		return nil, nil, nil, fmt.Errorf("orf: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
 	}
 	if !isORFMagic(data) {
 		return nil, nil, nil, ErrInvalidMagic
@@ -90,9 +97,16 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("orf: seek: %w", err)
 	}
-	data, err := io.ReadAll(r)
+	// #140 fix: cap the full-file read to maxFileSize+1 bytes so that an
+	// oversized or infinite streaming reader cannot trigger unbounded heap
+	// allocation. ErrFileTooLarge is returned when the limit is exceeded,
+	// before any parsing takes place.
+	data, err := io.ReadAll(io.LimitReader(r, maxFileSize+1))
 	if err != nil {
 		return fmt.Errorf("orf: read: %w", err)
+	}
+	if int64(len(data)) > maxFileSize {
+		return fmt.Errorf("orf: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
 	}
 	if !isORFMagic(data) {
 		return ErrInvalidMagic

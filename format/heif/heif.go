@@ -76,9 +76,16 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if _, err = r.Seek(0, io.SeekStart); err != nil {
 		return nil, nil, nil, fmt.Errorf("heif: seek: %w", err)
 	}
-	data, err := io.ReadAll(r)
+	// #140 fix: slow-path fallback — cap the full-file read to maxFileSize+1
+	// bytes so that an oversized or infinite streaming reader cannot trigger
+	// unbounded heap allocation. ErrFileTooLarge is returned when the limit is
+	// exceeded, before any further parsing takes place.
+	data, err := io.ReadAll(io.LimitReader(r, maxFileSize+1))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("heif: read: %w", err)
+	}
+	if int64(len(data)) > maxFileSize {
+		return nil, nil, nil, fmt.Errorf("heif: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
 	}
 	rawEXIF, rawXMP, err = parseHEIFMetadata(data)
 	return rawEXIF, nil, rawXMP, err
@@ -242,9 +249,16 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("heif: seek: %w", err)
 	}
-	data, err := io.ReadAll(r)
+	// #140 fix: cap the full-file read to maxFileSize+1 bytes so that an
+	// oversized or infinite streaming reader cannot trigger unbounded heap
+	// allocation. ErrFileTooLarge is returned when the limit is exceeded,
+	// before any ISOBMFF parsing takes place.
+	data, err := io.ReadAll(io.LimitReader(r, maxFileSize+1))
 	if err != nil {
 		return fmt.Errorf("heif: read: %w", err)
+	}
+	if int64(len(data)) > maxFileSize {
+		return fmt.Errorf("heif: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
 	}
 
 	if rawEXIF == nil && rawXMP == nil {

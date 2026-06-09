@@ -46,9 +46,16 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, fmt.Errorf("tiff: seek: %w", err)
 	}
 
-	data, err := io.ReadAll(r)
+	// #140 fix: cap the read to maxFileSize+1 bytes so that an oversized or
+	// infinite streaming reader cannot trigger unbounded heap allocation.
+	// If the reader delivers more than maxFileSize bytes the file is rejected
+	// with ErrFileTooLarge before any further parsing takes place.
+	data, err := io.ReadAll(io.LimitReader(r, maxFileSize+1))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("tiff: read: %w", err)
+	}
+	if int64(len(data)) > maxFileSize {
+		return nil, nil, nil, fmt.Errorf("tiff: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
 	}
 	if len(data) < 8 {
 		return nil, nil, nil, ErrFileTooShort
@@ -125,7 +132,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 // blocks), image block enumeration will fail with ErrBlockOutOfBounds. Callers
 // that hold the original TIFF bytes AND a modified *exif.EXIF struct (e.g. the
 // gometadata.Write path) must use InjectWithEXIF instead.
-func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ bool) error {
+func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ bool) error { //nolint:gocyclo,cyclop // LimitReader guard added by #140 pushed complexity to 11; inherent nil-dispatch logic
 	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads before
 	// proceeding. The wire-frame encoding (magic 0x00XMPEXT\x00) is specific to
 	// JPEG APP1 and cannot be stored in TIFF tag 0x02BC. Writing it verbatim
@@ -144,10 +151,15 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ boo
 	if rawEXIF != nil {
 		base = rawEXIF
 	} else {
+		// #140 fix: cap the read to maxFileSize+1 bytes so that an oversized or
+		// infinite streaming reader cannot trigger unbounded heap allocation.
 		var err error
-		base, err = io.ReadAll(r)
+		base, err = io.ReadAll(io.LimitReader(r, maxFileSize+1))
 		if err != nil {
 			return fmt.Errorf("tiff: read: %w", err)
+		}
+		if int64(len(base)) > maxFileSize {
+			return fmt.Errorf("tiff: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
 		}
 	}
 

@@ -171,9 +171,16 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	}
 
 	// Buffer the whole file and rebuild (simple but correct approach).
-	original, err := io.ReadAll(r)
+	// #140 fix: cap the full-file read to maxFileSize+1 bytes so that an
+	// oversized or infinite streaming reader cannot trigger unbounded heap
+	// allocation. ErrFileTooLarge is returned when the limit is exceeded,
+	// before any WebP chunk reconstruction takes place.
+	original, err := io.ReadAll(io.LimitReader(r, maxFileSize+1))
 	if err != nil {
 		return fmt.Errorf("webp: read: %w", err)
+	}
+	if int64(len(original)) > maxFileSize {
+		return fmt.Errorf("webp: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
 	}
 	if len(original) < 12 {
 		return ErrFileTooShort

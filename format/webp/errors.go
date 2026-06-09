@@ -2,6 +2,31 @@ package webp
 
 import "errors"
 
+// maxFileSize is the upper bound on the total number of bytes this package will
+// read from an io.Reader in a single Inject call. The Inject path reads the
+// full file via io.ReadAll; it is wrapped with io.LimitReader(r, maxFileSize+1)
+// so that an oversized or infinite streaming reader cannot trigger unbounded
+// heap allocation. ErrFileTooLarge is returned when the limit is exceeded,
+// before any WebP chunk reconstruction takes place.
+//
+// Note: the Extract path already reads chunks individually and caps each chunk
+// at maxWebPChunkSize (256 MiB), so it is not affected by this guard.
+//
+// Real-world WebP files are well under 100 MiB; 256 MiB gives ample headroom
+// while bounding worst-case heap allocation to a predictable, safe value.
+//
+// Declared as a var (not a const) so that tests can lower it temporarily to
+// verify the OOM-guard path without allocating 256 MiB of memory.
+//
+// #140 fix: cap uncapped io.ReadAll call in Inject to prevent OOM on oversized
+// or infinite streaming readers.
+var maxFileSize int64 = 256 << 20 //nolint:gochecknoglobals // test-overridable cap; never mutated in production paths
+
+// ErrFileTooLarge is returned when the input exceeds maxFileSize. This prevents
+// a streaming or adversarially large reader from causing unbounded heap
+// allocation. Callers can detect this specific condition with errors.Is.
+var ErrFileTooLarge = errors.New("webp: input exceeds maximum file size (256 MiB)")
+
 // ErrNotWebP is returned when the input does not begin with a valid RIFF/WEBP header.
 var ErrNotWebP = errors.New("webp: not a WebP file")
 
