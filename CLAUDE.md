@@ -149,7 +149,7 @@ Every development cycle must follow these steps in order:
 
 All development cycles must be self-contained. Never complete only part of a task — each development cycle must produce a working deliverable. When new requirements are discovered during a task, resolve them immediately within the same cycle (add new tasks and implement them as quickly as possible).
 
-All code and development must be **full-fledged** by default. Skipped tests (`t.Skip(...)`) are forbidden.
+All code and development must be **full-fledged** by default. Skipping a test to hide a library bug is forbidden. `t.Skip` is permitted only for the three narrow categories defined in [`docs/TESTING.md §2.1`](docs/TESTING.md): corpus file absent, OS/privilege limitation, or a stale boundary-constant guard. In every other circumstance, use `t.Fatal` so the failure is visible. See [`docs/TESTING.md`](docs/TESTING.md) for the complete testing policy.
 
 Whenever pre-existing bugs are found, fix them immediately and continue the original task.
 

@@ -899,7 +899,7 @@ func TestConformance_CR2_makernote_no_signature(t *testing.T) {
 	}
 	makerEntry := e.IFD0.Get(exif.TagID(0x927C))
 	if makerEntry == nil {
-		t.Skip("CR2-makernote: MakerNote not present in fixture")
+		t.Fatal("CR2-makernote: MakerNote not present in synthetic fixture — buildCR2WithMakerNote must produce this tag")
 	}
 	if len(makerEntry.Value) < 5 {
 		return // too short to inspect
@@ -936,7 +936,7 @@ func TestConformance_CR2_makernote_write_preserves_blob(t *testing.T) {
 	}
 	makerEntry := e.IFD0.Get(exif.TagID(0x927C))
 	if makerEntry == nil {
-		t.Skip("CR2-makernote: MakerNote tag not found")
+		t.Fatal("CR2-makernote: MakerNote tag not found in synthetic fixture — buildCR2WithMakerNote must produce this tag")
 	}
 	originalBlob := make([]byte, len(makerEntry.Value))
 	copy(originalBlob, makerEntry.Value)

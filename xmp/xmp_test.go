@@ -1210,6 +1210,91 @@ func TestGPSInvalidFormat(t *testing.T) {
 	}
 }
 
+// TestGPSW3CGeoFallback verifies that GPS() decodes coordinates from the W3C
+// Basic Geo vocabulary namespace when exif:GPSLatitude / exif:GPSLongitude are
+// absent. This covers the fallback path added for files that embed geo:lat /
+// geo:lon instead of the Adobe XMP exif namespace. W3C Geo 2003/01.
+func TestGPSW3CGeoFallback(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		latProp string // "lat" with optional "lon" or "long"
+		lonProp string
+		latVal  string
+		lonVal  string
+		wantLat float64
+		wantLon float64
+	}{
+		{
+			name:    "geo:lat+geo:lon_DM_format",
+			latProp: "lat", lonProp: "lon",
+			latVal: "48,51.35N", lonVal: "2,21.07E",
+			wantLat: 48.8558, wantLon: 2.3512,
+		},
+		{
+			name:    "geo:lat+geo:long_DM_format",
+			latProp: "lat", lonProp: "long",
+			latVal: "51,30.00N", lonVal: "0,7.00W",
+			wantLat: 51.5, wantLon: -0.1167,
+		},
+		{
+			name:    "geo:lat+geo:lon_southern_hemisphere",
+			latProp: "lat", lonProp: "lon",
+			latVal: "33,52.00S", lonVal: "151,12.00E",
+			wantLat: -33.8667, wantLon: 151.2,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			x := &XMP{Properties: map[string]map[string]string{
+				NSgeo: {tc.latProp: tc.latVal, tc.lonProp: tc.lonVal},
+			}}
+			lat, lon, ok := x.GPS()
+			if !ok {
+				t.Fatalf("GPS() returned ok=false for W3C Geo namespace (lat=%q, lon=%q)", tc.latVal, tc.lonVal)
+			}
+			const tol = 0.01
+			if lat < tc.wantLat-tol || lat > tc.wantLat+tol {
+				t.Errorf("lat = %f, want ~%f (±%f)", lat, tc.wantLat, tol)
+			}
+			if lon < tc.wantLon-tol || lon > tc.wantLon+tol {
+				t.Errorf("lon = %f, want ~%f (±%f)", lon, tc.wantLon, tol)
+			}
+		})
+	}
+}
+
+// TestGPSW3CGeoFallbackAbsentWhenExifPresent verifies that the W3C Geo fallback
+// is NOT consulted when exif:GPSLatitude / exif:GPSLongitude are already present.
+// The Adobe XMP namespace must take precedence.
+func TestGPSW3CGeoFallbackAbsentWhenExifPresent(t *testing.T) {
+	t.Parallel()
+	x := &XMP{Properties: map[string]map[string]string{
+		NSexif: {
+			"GPSLatitude":  "40,26.77N",
+			"GPSLongitude": "79,58.36W",
+		},
+		NSgeo: {
+			"lat": "51,30.00N",
+			"lon": "0,7.00W",
+		},
+	}}
+	lat, lon, ok := x.GPS()
+	if !ok {
+		t.Fatal("GPS() returned ok=false when both namespaces are present")
+	}
+	// Must return the NSexif values (~40.4462 N, ~-79.9727 W), not W3C Geo.
+	const tol = 0.01
+	if lat < 40.0 || lat > 41.0 {
+		t.Errorf("lat = %f, want NSexif value ~40.44 (W3C Geo fallback must not override)", lat)
+	}
+	if lon > -79.0 || lon < -81.0 {
+		t.Errorf("lon = %f, want NSexif value ~-79.97 (W3C Geo fallback must not override)", lon)
+	}
+	_ = tol
+}
+
 // TestGPSDegreesMinutesSeconds covers the DDD,MM,SS.sss path in parseXMPGPS.
 func TestGPSDegreesMinutesSeconds(t *testing.T) {
 	t.Parallel()

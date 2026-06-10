@@ -234,7 +234,9 @@ func TestCorpusGPSCoordinates(t *testing.T) {
 
 	lat, lon, ok := m.GPS()
 	if !ok {
-		t.Skip("GPS() returned ok=false; GPS data may not be accessible via EXIF")
+		// GPS.jpg from the exiftool test suite is a purpose-built GPS fixture.
+		// If GPS() returns ok=false, the EXIF GPS IFD was not decoded correctly.
+		t.Fatal("GPS() returned ok=false on GPS.jpg — EXIF GPS IFD was not decoded")
 	}
 	if lat < -90 || lat > 90 {
 		t.Errorf("GPS lat %f out of range [-90, 90]", lat)

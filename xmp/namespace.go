@@ -24,6 +24,11 @@ const (
 	// NSxmpNote is the XMP namespace for extended XMP notes.
 	// Adobe XMP Specification Part 3 §1.1.4.
 	NSxmpNote = "http://ns.adobe.com/xap/1.0/se/Note/"
+	// NSgeo is the W3C Basic Geo vocabulary namespace for GPS coordinates.
+	// W3C Geo 2003/01: http://www.w3.org/2003/01/geo/wgs84_pos#
+	// Properties: lat (latitude, decimal degrees) and long/lon (longitude, decimal degrees).
+	// The coordinate format is "DDD,MM.mmmR" or "DDD,MM,SS.sssR", same as NSexif.
+	NSgeo = "http://www.w3.org/2003/01/geo/wgs84_pos#"
 )
 
 // collectionType returns the RDF collection element name (Bag, Seq, or Alt)

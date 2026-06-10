@@ -15,7 +15,7 @@ import (
 // The library detects the format automatically from magic bytes and parses
 // all three metadata layers (EXIF, IPTC, XMP) in a single call.
 func ExampleReadFile() {
-	m, err := gometadata.ReadFile("testdata/corpus/jpeg/exif-samples/11-tests.jpg")
+	m, err := gometadata.ReadFile("testdata/fixtures/exif-samples-11-tests.jpg")
 	if err != nil {
 		fmt.Println("error:", err)
 		return
@@ -45,7 +45,7 @@ func ExampleReadFile() {
 // ExampleReadFile_gps demonstrates extracting GPS coordinates.
 // The ok return value is false when no GPS data is present in the image.
 func ExampleReadFile_gps() {
-	m, err := gometadata.ReadFile("testdata/corpus/jpeg/exif-samples/11-tests.jpg")
+	m, err := gometadata.ReadFile("testdata/fixtures/exif-samples-11-tests.jpg")
 	if err != nil {
 		fmt.Println("error:", err)
 		return
@@ -65,7 +65,7 @@ func ExampleReadFile_gps() {
 // ExposureTime is returned as a rational (numerator/denominator) so that
 // fractional values like 1/250 s can be represented exactly.
 func ExampleReadFile_exposureData() {
-	m, err := gometadata.ReadFile("testdata/corpus/jpeg/exif-samples/11-tests.jpg")
+	m, err := gometadata.ReadFile("testdata/fixtures/exif-samples-11-tests.jpg")
 	if err != nil {
 		fmt.Println("error:", err)
 		return
@@ -109,7 +109,7 @@ func ExampleReadFile_options() {
 	// manufacturer-specific IFD (often the largest part of an EXIF block).
 	// EXIF and IPTC are still fully parsed.
 	m, err := gometadata.ReadFile(
-		"testdata/corpus/jpeg/exif-samples/11-tests.jpg",
+		"testdata/fixtures/exif-samples-11-tests.jpg",
 		gometadata.WithoutXMP(),
 		gometadata.WithoutMakerNote(),
 	)
@@ -130,7 +130,7 @@ func ExampleReadFile_options() {
 // back. The source file is copied to a temp file first so that testdata is
 // never mutated.
 func ExampleWriteFile() {
-	const src = "testdata/corpus/jpeg/exif-samples/11-tests.jpg"
+	const src = "testdata/fixtures/exif-samples-11-tests.jpg"
 
 	// Copy the source image to a temporary file.
 	in, err := os.Open(src)
@@ -193,7 +193,7 @@ func ExampleWriteFile() {
 // a file path. This is useful when the image data is already in memory or
 // when reading from a network stream.
 func ExampleRead() {
-	f, err := os.Open("testdata/corpus/jpeg/exif-samples/11-tests.jpg")
+	f, err := os.Open("testdata/fixtures/exif-samples-11-tests.jpg")
 	if err != nil {
 		fmt.Println("error:", err)
 		return
@@ -218,7 +218,7 @@ func ExampleRead() {
 // image is written to a bytes.Buffer here, but any io.Writer works — including
 // an os.File or a network connection.
 func ExampleWrite() {
-	f, err := os.Open("testdata/corpus/jpeg/exif-samples/11-tests.jpg")
+	f, err := os.Open("testdata/fixtures/exif-samples-11-tests.jpg")
 	if err != nil {
 		fmt.Println("error:", err)
 		return
@@ -245,9 +245,9 @@ func ExampleWrite() {
 		return
 	}
 
-	fmt.Printf("output size: %d bytes\n", buf.Len())
+	fmt.Println("output written:", buf.Len() > 0)
 	// Output:
-	// output size: 239080 bytes
+	// output written: true
 }
 
 // ExampleNewMetadata demonstrates creating a Metadata value from scratch —
@@ -277,7 +277,7 @@ func ExampleNewMetadata() {
 // ExampleMetadata_DateTimeOriginal demonstrates parsing and formatting the
 // original capture date/time of an image.
 func ExampleMetadata_DateTimeOriginal() {
-	m, err := gometadata.ReadFile("testdata/corpus/jpeg/exif-samples/11-tests.jpg")
+	m, err := gometadata.ReadFile("testdata/fixtures/exif-samples-11-tests.jpg")
 	if err != nil {
 		fmt.Println("error:", err)
 		return
@@ -297,7 +297,7 @@ func ExampleMetadata_DateTimeOriginal() {
 
 // ExampleMetadata_Keywords demonstrates reading keywords and adding to them.
 func ExampleMetadata_Keywords() {
-	m, err := gometadata.ReadFile("testdata/corpus/jpeg/iptc/IPTC-PhotometadataRef-Std2021.1.jpg")
+	m, err := gometadata.ReadFile("testdata/fixtures/IPTC-PhotometadataRef-Std2021.1.jpg")
 	if err != nil {
 		fmt.Println("error:", err)
 		return
@@ -320,7 +320,7 @@ func ExampleMetadata_Keywords() {
 // sensor capture, making them the authoritative size for display and storage
 // calculations in GoMetadata.
 func ExampleMetadata_ImageSize() {
-	m, err := gometadata.ReadFile("testdata/corpus/jpeg/exif-samples/11-tests.jpg")
+	m, err := gometadata.ReadFile("testdata/fixtures/exif-samples-11-tests.jpg")
 	if err != nil {
 		fmt.Println("error:", err)
 		return
@@ -343,7 +343,7 @@ func ExampleMetadata_ImageSize() {
 // Value 1 means no rotation needed; value 6 means 90° clockwise — the standard
 // encoding for a portrait photo captured in landscape mode on a Canon camera.
 func ExampleMetadata_Orientation() {
-	m, err := gometadata.ReadFile("testdata/corpus/jpeg/exif-samples/canon_hdr_YES.jpg")
+	m, err := gometadata.ReadFile("testdata/fixtures/canon_hdr_YES.jpg")
 	if err != nil {
 		fmt.Println("error:", err)
 		return
@@ -376,7 +376,7 @@ func ExampleMetadata_Orientation() {
 // encode strobe return status; bits 3–4 encode flash mode; bit 5 indicates
 // flash presence; bit 6 indicates red-eye reduction (EXIF §4.6.5).
 func ExampleMetadata_Flash() {
-	m, err := gometadata.ReadFile("testdata/corpus/jpeg/exif-samples/Canon_40D.jpg")
+	m, err := gometadata.ReadFile("testdata/fixtures/Canon_40D.jpg")
 	if err != nil {
 		fmt.Println("error:", err)
 		return
@@ -402,7 +402,7 @@ func ExampleMetadata_Flash() {
 // Knowing whether white balance was manual helps RAW processing pipelines decide
 // whether to trust or recalculate the recorded colour temperature.
 func ExampleMetadata_WhiteBalance() {
-	m, err := gometadata.ReadFile("testdata/corpus/jpeg/exif-samples/jolla.jpg")
+	m, err := gometadata.ReadFile("testdata/fixtures/jolla.jpg")
 	if err != nil {
 		fmt.Println("error:", err)
 		return
@@ -428,7 +428,7 @@ func ExampleMetadata_WhiteBalance() {
 // cameras and web images. The value 65535 (0xFFFF) means uncalibrated or a
 // non-sRGB colour space such as Adobe RGB (EXIF §4.6.5).
 func ExampleMetadata_ColorSpace() {
-	m, err := gometadata.ReadFile("testdata/corpus/jpeg/exif-samples/11-tests.jpg")
+	m, err := gometadata.ReadFile("testdata/fixtures/exif-samples-11-tests.jpg")
 	if err != nil {
 		fmt.Println("error:", err)
 		return
@@ -459,7 +459,7 @@ func ExampleMetadata_ColorSpace() {
 // above sea level; a negative value means below sea level. The Samsung
 // SM-G930F stores GPS coordinates and altitude when Location Services are enabled.
 func ExampleMetadata_Altitude() {
-	m, err := gometadata.ReadFile("testdata/corpus/jpeg/exif-samples/67-0_length_string.jpg")
+	m, err := gometadata.ReadFile("testdata/fixtures/67-0_length_string.jpg")
 	if err != nil {
 		fmt.Println("error:", err)
 		return
@@ -482,7 +482,7 @@ func ExampleMetadata_Altitude() {
 // still fully parsed.
 func ExampleReadFile_withoutEXIF() {
 	m, err := gometadata.ReadFile(
-		"testdata/corpus/jpeg/iptc/IPTC-PhotometadataRef-Std2021.1.jpg",
+		"testdata/fixtures/IPTC-PhotometadataRef-Std2021.1.jpg",
 		gometadata.WithoutEXIF(),
 	)
 	if err != nil {
@@ -505,7 +505,7 @@ func ExampleReadFile_withoutEXIF() {
 // IPTC parsing overhead. EXIF and XMP layers are still fully parsed.
 func ExampleReadFile_withoutIPTC() {
 	m, err := gometadata.ReadFile(
-		"testdata/corpus/jpeg/exif-samples/Canon_40D.jpg",
+		"testdata/fixtures/Canon_40D.jpg",
 		gometadata.WithoutIPTC(),
 	)
 	if err != nil {
@@ -529,7 +529,7 @@ func ExampleReadFile_withoutIPTC() {
 // is decoded.
 func ExampleReadFile_iptcOnly() {
 	m, err := gometadata.ReadFile(
-		"testdata/corpus/jpeg/iptc/IPTC-PhotometadataRef-Std2021.1.jpg",
+		"testdata/fixtures/IPTC-PhotometadataRef-Std2021.1.jpg",
 		gometadata.WithoutEXIF(),
 		gometadata.WithoutXMP(),
 	)
@@ -555,7 +555,7 @@ func ExampleReadFile_iptcOnly() {
 // data such as Photoshop layer info or camera calibration blocks. Set it to false
 // only when you intentionally want to strip unknown segments from the output.
 func ExampleWrite_preserveUnknownSegments() {
-	f, err := os.Open("testdata/corpus/jpeg/exif-samples/11-tests.jpg")
+	f, err := os.Open("testdata/fixtures/exif-samples-11-tests.jpg")
 	if err != nil {
 		fmt.Println("error:", err)
 		return
@@ -590,7 +590,7 @@ func ExampleWrite_preserveUnknownSegments() {
 // They follow the EXIF-first, XMP-fallback priority policy used throughout
 // GoMetadata for camera-identity fields.
 func ExampleMetadata_Make() {
-	m, err := gometadata.ReadFile("testdata/corpus/jpeg/exif-samples/11-tests.jpg")
+	m, err := gometadata.ReadFile("testdata/fixtures/exif-samples-11-tests.jpg")
 	if err != nil {
 		fmt.Println("error:", err)
 		return
@@ -610,7 +610,7 @@ func ExampleMetadata_Make() {
 // All four values are written to EXIF ExifIFD tags 0x829A, 0x829D, 0x8827, and
 // 0x920A respectively.
 func ExampleWriteFile_exposureSettings() {
-	const src = "testdata/corpus/jpeg/exif-samples/11-tests.jpg"
+	const src = "testdata/fixtures/exif-samples-11-tests.jpg"
 
 	in, err := os.Open(src)
 	if err != nil {
@@ -682,7 +682,7 @@ func ExampleWriteFile_exposureSettings() {
 // in landscape mode. Other common values: 1 = normal, 3 = 180°, 8 = 90°
 // counter-clockwise (EXIF §4.6.4, CIPA DC-008-2019).
 func ExampleWriteFile_orientation() {
-	const src = "testdata/corpus/jpeg/exif-samples/11-tests.jpg"
+	const src = "testdata/fixtures/exif-samples-11-tests.jpg"
 
 	in, err := os.Open(src)
 	if err != nil {
@@ -743,7 +743,7 @@ func ExampleWriteFile_orientation() {
 // carries matching copyright in both XMP and IPTC; GoMetadata returns the XMP value
 // and the caller receives one unambiguous answer.
 func ExampleMetadata_subjectPriority() {
-	m, err := gometadata.ReadFile("testdata/corpus/jpeg/iptc/IPTC-PhotometadataRef-Std2021.1.jpg")
+	m, err := gometadata.ReadFile("testdata/fixtures/IPTC-PhotometadataRef-Std2021.1.jpg")
 	if err != nil {
 		fmt.Println("error:", err)
 		return

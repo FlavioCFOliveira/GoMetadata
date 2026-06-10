@@ -588,7 +588,7 @@ func TestConformance_ARW_SR2Private_0xC634_rebase(t *testing.T) {
 	}
 	sr2EntryOrig := parsedOrig.IFD0.Get(exif.TagID(0xC634))
 	if sr2EntryOrig == nil || len(sr2EntryOrig.Value) < 4 {
-		t.Skip("ARW-SR2Private-0xC634-rebase: 0xC634 not found in fixture; skipping")
+		t.Fatal("ARW-SR2Private-0xC634-rebase: 0xC634 not found in synthetic fixture — buildARWwithSR2Private must produce this tag")
 	}
 	origSR2Off := binary.LittleEndian.Uint32(sr2EntryOrig.Value)
 
@@ -743,11 +743,11 @@ func TestConformance_ARW_makernote_absolute_rebase(t *testing.T) {
 		t.Fatalf("ARW-makernote-absolute-rebase: exif.Parse original: %v", err)
 	}
 	if parsedOrig.ExifIFD == nil {
-		t.Skip("ARW-makernote-absolute-rebase: ExifIFD nil in synthetic fixture; skipping")
+		t.Fatal("ARW-makernote-absolute-rebase: ExifIFD nil in synthetic fixture — buildARWwithMakerNote must produce ExifIFD")
 	}
 	mnEntry := parsedOrig.ExifIFD.Get(exif.TagMakerNote)
 	if mnEntry == nil {
-		t.Skip("ARW-makernote-absolute-rebase: MakerNote (0x927C) not found in ExifIFD; skipping")
+		t.Fatal("ARW-makernote-absolute-rebase: MakerNote (0x927C) not found in ExifIFD — buildARWwithMakerNote must produce this tag")
 	}
 
 	// The MakerNote blob is > 4 bytes → OOL. Record its original absolute position

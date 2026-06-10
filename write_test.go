@@ -1952,9 +1952,11 @@ func TestRawEXIFIsIndependent(t *testing.T) {
 	}
 
 	// Obtain raw and corrupt every byte.
+	// RawEXIF() must be non-empty for a TIFF parsed from buildTIFFWithStrip —
+	// the entire TIFF file is the EXIF payload for raw TIFF images.
 	raw := m.RawEXIF()
 	if len(raw) == 0 {
-		t.Skip("RawEXIF() returned empty slice — nothing to mutate")
+		t.Fatal("#139 RawEXIF() returned empty slice for synthetic TIFF — parser did not populate rawEXIF")
 	}
 	for i := range raw {
 		raw[i] ^= 0xFF

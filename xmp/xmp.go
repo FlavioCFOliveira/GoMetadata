@@ -111,14 +111,33 @@ func (x *XMP) CameraModel() string {
 	return x.getProp(NSxmp, "CreatorTool")
 }
 
-// GPS returns GPS coordinates from the exif:GPSLatitude / exif:GPSLongitude
-// properties (XMP §8.4). The format is "DDD,MM.mmmR" or "DDD,MM,SS.sssR".
-func (x *XMP) GPS() (lat, lon float64, ok bool) {
+// GPS returns GPS coordinates from available XMP namespaces, checked in order:
+//  1. exif:GPSLatitude / exif:GPSLongitude (NSexif, XMP §8.4) — canonical Adobe XMP GPS.
+//  2. geo:lat / geo:long (NSgeo, W3C Basic Geo 2003/01) — alternative GPS encoding.
+//
+// Both use the "DDD,MM.mmmR" or "DDD,MM,SS.sssR" coordinate format.
+// Returns ok=false when neither namespace contains both coordinates or
+// when the values cannot be parsed.
+func (x *XMP) GPS() (lat, lon float64, ok bool) { //nolint:cyclop,gocyclo // branching mirrors the two-namespace fallback + bounds checks; extracting sub-functions would obscure the priority logic
 	if x == nil {
 		return 0, 0, false
 	}
+
+	// Primary: Adobe XMP exif namespace (XMP §8.4).
 	latStr := x.getProp(NSexif, "GPSLatitude")
 	lonStr := x.getProp(NSexif, "GPSLongitude")
+
+	// Fallback: W3C Basic Geo vocabulary (geo:lat / geo:long, and also geo:lon
+	// which is a common alias). W3C Geo 2003/01.
+	if latStr == "" || lonStr == "" {
+		latStr = x.getProp(NSgeo, "lat")
+		// W3C Geo spec defines "long"; some producers use "lon" as an alias.
+		lonStr = x.getProp(NSgeo, "long")
+		if lonStr == "" {
+			lonStr = x.getProp(NSgeo, "lon")
+		}
+	}
+
 	if latStr == "" || lonStr == "" {
 		return 0, 0, false
 	}

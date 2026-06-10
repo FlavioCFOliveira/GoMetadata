@@ -183,7 +183,7 @@ func TestPrecedence_DescriptiveData(t *testing.T) {
 			t.Fatalf("Read: %v", err)
 		}
 		if m.IPTC == nil || m.XMP == nil {
-			t.Skip("IPTC or XMP nil — segments not parsed; test not meaningful")
+			t.Fatalf("IPTC or XMP nil after reading synthetic JPEG — parser failed to decode buildJPEGWithIPTCAndXMP output (IPTC=%v, XMP=%v)", m.IPTC, m.XMP)
 		}
 		if got := m.Caption(); got != xmpCaption {
 			t.Errorf("Caption() = %q, want XMP value %q", got, xmpCaption)
@@ -224,7 +224,7 @@ func TestPrecedence_DescriptiveData(t *testing.T) {
 			t.Fatalf("Read: %v", err)
 		}
 		if m.IPTC == nil {
-			t.Skip("IPTC nil")
+			t.Fatal("IPTC nil after reading synthetic JPEG — parser failed to decode buildJPEGWithIPTCAndXMP output")
 		}
 		m.IPTC.SetCopyright(iptcCopyright)
 		if m.XMP == nil {
