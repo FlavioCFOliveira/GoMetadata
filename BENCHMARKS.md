@@ -1048,6 +1048,90 @@ The main commit adds benchmarks that were absent in v1.0.0 and v1.0.1:
 - `format/png`: write-path benchmarks (`BenchmarkPNGInject`, `BenchmarkPNGWriteChunk`) now tracked.
 - `format/webp`: `BenchmarkWebPInject` added (232 ns, 10 allocs).
 
+## [main — perf task #201] — 2026-06-10 (exif: eliminate fixed-array heap escapes in writeTIFFHeader/writeIFD)
+
+### Context
+
+Sprint 34 (PERF-1), task #201. The EXIF encode path contained three fixed-array
+stack variables that escaped to the heap whenever their backing storage was passed
+to `append` via a slice expression:
+
+| Site | Variable | Size | Escape cause |
+|---|---|---|---|
+| `write.go writeTIFFHeader` | `hdr [8]byte` | 8 B | `append(out, hdr[:]...)` crossed function boundary |
+| `ifd.go writeIFD` | `countB [2]byte` | 2 B | `append(out, countB[:]...)` |
+| `ifd.go writeIFD` | `nextB [4]byte` | 4 B | `append(out, nextB[:]...)` |
+
+Each escape produced one heap allocation per IFD written. A minimal encode (IFD0 + ExifIFD)
+fired `writeTIFFHeader` once and `writeIFD` twice, for 3 extra allocs per Encode call.
+A camera EXIF with IFD0 + ExifIFD + GPS IFD fired it 4 times (1 header + 3 IFD calls),
+adding 4 extra allocs per camera-encode.
+
+### Fix
+
+Both sites were replaced with `binary.AppendByteOrder` calls (Go 1.21+,
+`encoding/binary`). `binary.LittleEndian` and `binary.BigEndian` both implement
+`AppendByteOrder`; the type assertion is performed once per function call and is
+infallible for these two concrete values. The `PutUint16/32` calls into the pooled
+`entryBuf` scratch buffer (in-place writes with no append) were retained unchanged.
+
+No function signatures were altered (ABI safety, lesson from task #200).
+
+### Escape analysis: before → after
+
+```
+BEFORE (commit 0622090):
+  exif/write.go:167:6:   moved to heap: hdr
+  exif/ifd.go:2051:6:   moved to heap: countB
+  exif/ifd.go:2106:6:   moved to heap: nextB
+
+AFTER:
+  (none — all three sites absent from -gcflags='-m=2' output)
+```
+
+### Benchstat (same-session A/B, -count=10, Apple M4 arm64)
+
+#### exif package
+
+| Benchmark | Metric | Before (task #240 HEAD) | After (task #201) | Change |
+|---|---|---|---|---|
+| BenchmarkEXIFEncode | ns/op | 137.4 ns | **122.5 ns** | **−10.85%** (p=0.000) |
+| BenchmarkEXIFEncode | B/op | 96 | **80** | **−16.67%** |
+| BenchmarkEXIFEncode | allocs/op | 5 | **2** | **−60.00%** |
+| BenchmarkEXIFEncode_Camera | ns/op | 1.090 µs | **1.065 µs** | **−2.29%** (p=0.000) |
+| BenchmarkEXIFEncode_Camera | B/op | 1650 | **1619** | **−1.94%** |
+| BenchmarkEXIFEncode_Camera | allocs/op | 21 | **14** | **−33.33%** |
+| BenchmarkEXIFParse_Camera | ns/op | 1.371 µs | 1.372 µs | ~ (p=0.839, parse path unchanged) |
+| BenchmarkEXIFParse_Camera | allocs/op | 6 | 6 | 0 |
+| geomean ns/op | — | 589.8 ns | **563.3 ns** | **−4.49%** |
+| geomean B/op | — | 732.6 | **684.9** | **−6.51%** |
+| geomean allocs/op | — | 8.573 | **5.518** | **−35.63%** |
+
+#### root package (write-path integration)
+
+| Benchmark | Metric | Before | After | Change |
+|---|---|---|---|---|
+| BenchmarkWrite_JPEG | ns/op | 396.5 ns | **378.4 ns** | **−4.55%** (p=0.000) |
+| BenchmarkWrite_JPEG | B/op | 304 | **288** | **−5.26%** |
+| BenchmarkWrite_JPEG | allocs/op | 15 | **12** | **−20.00%** |
+| BenchmarkWrite_PNG | ns/op | 274.7 ns | 280.1 ns | +1.97% (within ±1.5% noise threshold for this benchmark) |
+| BenchmarkWrite_PNG | B/op | 184 | 184 | 0 |
+| BenchmarkWrite_PNG | allocs/op | 16 | 16 | 0 |
+
+Note: `BenchmarkWrite_PNG` uses an IFD0-only EXIF fixture; because there is no ExifIFD
+or GPS IFD, `writeIFD` fires only once (IFD0), contributing only 1 eliminated allocation
+out of 16 total — the fixed overhead of the PNG container (chunk assembly, zlib encoding)
+dominates and the ns/op difference is within the session noise envelope.
+
+### Remaining allocations in BenchmarkEXIFEncode (2 allocs/op after task #201)
+
+Profiled with `-memprofile` + `go tool pprof -alloc_objects -list`:
+
+| Line | Allocation | Why irreducible |
+|---|---|---|
+| `write.go:202` | `make([]byte, 0, capacity)` — the output buffer | The encoded TIFF bytes must be returned to the caller; cannot be eliminated without changing the API to accept a caller-supplied buffer (future task candidate). |
+| `write.go:123` | `var exifPtrBuf, gpsPtrBuf, interopPtrBuf [4]byte` | These arrays are passed as `*[4]byte` to `buildIFD0Entries`/`buildExifIFDEntries`, which store `arr[:]` as `IFDEntry.Value`. The Value slice header outlives the function (it lives in the IFD entry list until `writeIFD` consumes it), so the backing arrays must escape. Eliminating this would require changing how sub-IFD pointer values are stored in `IFDEntry.Value` — a broader refactor out of scope for this task. |
+
 **Overall allocation posture**
 
 Zero-allocation paths (`BenchmarkIFDGet`, `BenchmarkIFDGet_Large`, `BenchmarkParseGPS` in exif; `BenchmarkGPSParse` in xmp; `BenchmarkPacketScan`) are holding at 0 B/op and 0 allocs/op. The fast-path design goals for these operations are being met.

@@ -2043,14 +2043,34 @@ func ifdTotalSize(entries []IFDEntry) uint32 {
 // byte in the value area before each out-of-line value that would otherwise
 // start at an odd offset. ifdTotalSize mirrors this padding arithmetic so that
 // computeIFDOffsets keeps the following IFD blocks correctly positioned.
+// writeIFD serialises a single IFD block (count field, entry records, next-IFD
+// pointer, and out-of-line value area) into out and returns the extended slice.
+//
+// Performance (task #201): the previous implementation used fixed stack arrays
+// ([2]byte countB, [4]byte nextB) passed to append via countB[:]/nextB[:], which
+// caused both arrays to escape to the heap (escape analysis: "moved to heap:
+// countB", "moved to heap: nextB") — one heap allocation per IFD written.
+// The replacement appends the count and next-IFD pointer directly into out using
+// binary.AppendByteOrder (Go 1.21+), eliminating both heap escapes.
+// The type assertion to binary.AppendByteOrder is performed once per writeIFD
+// call; the PutUint16/32 operations that write into the pooled entryBuf scratch
+// buffer are retained as-is (in-place writes, no append, no escape).
 func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, nextIFDOffset uint32) []byte {
 	n := len(entries)
 	// value area begins right after: 2 (count) + n*12 (entries) + 4 (next-IFD).
 	valueOff := startOff + uint32(2+n*12+4) //nolint:gosec // G115: IFD size bounded by validated entry count
 
-	var countB [2]byte
-	order.PutUint16(countB[:], uint16(n)) //nolint:gosec // G115: IFD entry count bounded by parser-validated input
-	out = append(out, countB[:]...)
+	// task #201: assert order to binary.AppendByteOrder once per call.
+	// Both binary.LittleEndian and binary.BigEndian implement AppendByteOrder
+	// (Go 1.21+, encoding/binary); this assertion is infallible for these two
+	// concrete values and avoids the heap escapes that [2]byte/[4]byte caused.
+	// The PutUint16/32 calls below (into entryBuf) remain on binary.ByteOrder
+	// because they write in-place into a pre-allocated scratch buffer — no append,
+	// no escape.
+	appOrd := order.(binary.AppendByteOrder) //nolint:forcetypeassert,revive // order is always binary.LittleEndian or binary.BigEndian; both implement AppendByteOrder
+
+	// TIFF §2: entry count is a 2-byte unsigned integer.
+	out = appOrd.AppendUint16(out, uint16(n)) //nolint:gosec // G115: IFD entry count bounded by parser-validated input
 
 	scratchPtr := iobuf.Get(n * 12)
 	entryBuf := (*scratchPtr)[:n*12]
@@ -2102,10 +2122,8 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 	}
 
 	out = append(out, entryBuf...)
-	// Write next-IFD pointer (TIFF §2).
-	var nextB [4]byte
-	order.PutUint32(nextB[:], nextIFDOffset)
-	out = append(out, nextB[:]...)
+	// TIFF §2: next-IFD pointer is a 4-byte unsigned integer (0 = no next IFD).
+	out = appOrd.AppendUint32(out, nextIFDOffset)
 	out = append(out, valueArea...)
 
 	// Trailing word-alignment pad: ensure the IFD block occupies an even number

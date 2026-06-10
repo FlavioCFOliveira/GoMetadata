@@ -162,16 +162,18 @@ func serialise(e *EXIF) ([]byte, error) {
 // (TIFF §2): byte order mark, magic 0x002A, and the IFD0 offset. It also
 // pre-allocates capacity for the IFD0, ExifIFD, GPS IFD, InteropIFD, and IFD1
 // chain blocks (including any JPEG thumbnail data).
+//
+// Performance (task #201): the previous implementation allocated a [8]byte
+// stack array and passed hdr[:] to append, which caused the compiler to move
+// hdr to the heap (escape analysis: "hdr escapes to heap in writeTIFFHeader").
+// The replacement builds the 8-byte header directly into the output slice via
+// binary.AppendByteOrder (Go 1.21+), eliminating the heap escape entirely.
+// The type assertion to binary.AppendByteOrder is performed once per call;
+// both binary.LittleEndian and binary.BigEndian implement the interface, and
+// order is always one of these two values (guaranteed by serialise which
+// defaults a nil order to binary.LittleEndian before calling writeTIFFHeader).
 func writeTIFFHeader(e *EXIF, order binary.ByteOrder, ifd0Entries, exifIFDEntries []IFDEntry) []byte {
 	const headerSize = uint32(8)
-	var hdr [8]byte
-	if order == binary.LittleEndian {
-		hdr[0], hdr[1] = 'I', 'I'
-	} else {
-		hdr[0], hdr[1] = 'M', 'M'
-	}
-	order.PutUint16(hdr[2:], 0x002A)
-	order.PutUint32(hdr[4:], headerSize) // IFD0 starts right after the header
 
 	ifd0Size := ifdTotalSize(ifd0Entries)
 	exifSize := uint32(0)
@@ -198,7 +200,21 @@ func writeTIFFHeader(e *EXIF, order binary.ByteOrder, ifd0Entries, exifIFDEntrie
 	}
 
 	out := make([]byte, 0, headerSize+ifd0Size+exifSize+gpsSize+interopSize+ifd1ChainSize)
-	out = append(out, hdr[:]...)
+
+	// TIFF §2: byte order mark (II = little-endian, MM = big-endian).
+	if order == binary.LittleEndian {
+		out = append(out, 'I', 'I')
+	} else {
+		out = append(out, 'M', 'M')
+	}
+	// task #201: assert order to binary.AppendByteOrder once per call.
+	// Both binary.LittleEndian and binary.BigEndian implement AppendByteOrder
+	// (Go 1.21+, encoding/binary); the assertion is infallible for these two
+	// concrete values and avoids the heap escape that [8]byte caused.
+	appOrd := order.(binary.AppendByteOrder) //nolint:forcetypeassert,revive // order is always binary.LittleEndian or binary.BigEndian (see serialise); both implement AppendByteOrder
+	// TIFF §2: magic number 0x002A, then IFD0 offset immediately after the header.
+	out = appOrd.AppendUint16(out, 0x002A)
+	out = appOrd.AppendUint32(out, headerSize) // IFD0 starts right after the header
 	return out
 }
 
