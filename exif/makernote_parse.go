@@ -97,6 +97,51 @@ func parseMakerNoteIFD(b []byte, cameraMake string, parentOrder binary.ByteOrder
 	return nil
 }
 
+// makerNoteDispatch performs MakerNote IFD dispatch directly from the raw
+// IFDEntry.Value bytes of the Make tag, bypassing the heap allocation that
+// (*IFDEntry).String() would incur.
+//
+// Trim semantics are byte-for-byte equivalent to the string-based path:
+//   - bytes.TrimRight(makeValue, "\x00")  ≡ (*IFDEntry).String()'s NUL stripping
+//   - bytes.TrimSpace(…)                  ≡ strings.TrimSpace applied inside parseMakerNoteIFD
+//
+// The map[string]V lookup with string([]byte) is a compiler-recognised pattern
+// (cmd/compile mapaccess2_faststr): the Go compiler elides the heap allocation
+// when string([]byte) appears directly as a map key expression.  This is why
+// makeValue must reach the lookup as a []byte sub-slice, not a pre-built string.
+// Confirmed no-alloc with go test -gcflags='-m' (see task #202 evidence).
+//
+// The trimmed slice is transient and never retained beyond this call, so there
+// is no aliasing risk with the task-#198 parse arena or the task-#240 entry pool.
+//
+// EXIF §4.6.4, tag 0x010F (Make): ASCII, NUL-terminated. Real-world cameras
+// (Canon EOS bodies) sometimes write a trailing space before the NUL terminator.
+// ExifTool normalises the Make value before its own MakerNote dispatch; we match
+// that behaviour. task #202, performance audit 2026-06-10.
+func makerNoteDispatch(makeValue []byte, parentOrder binary.ByteOrder, makerNote []byte) *IFD {
+	// Step 1: strip trailing NUL bytes — matches (*IFDEntry).String() semantics.
+	// bytes.TrimRight returns a sub-slice of makeValue (zero allocation).
+	raw := bytes.TrimRight(makeValue, "\x00")
+	// Step 2: strip leading/trailing ASCII whitespace — matches strings.TrimSpace
+	// applied inside parseMakerNoteIFD. Canon EOS cameras emit "Canon " (trailing
+	// space before NUL) in real-world files; this ensures those files dispatch
+	// correctly. bytes.TrimSpace returns a sub-slice (zero allocation).
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return nil
+	}
+	// Zero-alloc map lookup: the Go compiler (cmd/compile mapaccess2_faststr)
+	// special-cases map[string]V lookups where the key expression is string([]byte)
+	// — it reads the map bucket using the slice's backing array as a temporary string
+	// without heap-allocating. This is only guaranteed when string(raw) appears
+	// directly as the index expression, not when stored in a string variable first.
+	// EXIF §4.6.4 tag 0x010F; task #202.
+	if fn, ok := makerNoteParsers[string(raw)]; ok {
+		return fn(makerNote, parentOrder)
+	}
+	return nil
+}
+
 // parseCanonMakerNote parses a Canon MakerNote.
 //
 // Canon MakerNote structure (Canon EOS FAQ / ExifTool source):

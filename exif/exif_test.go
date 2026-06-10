@@ -1362,7 +1362,35 @@ func buildCameraIFD0Entries() []cameraEntry {
 	return entries
 }
 
+// buildCanonMakerNoteBlob returns a minimal Canon-style MakerNote payload.
+//
+// Canon MakerNote is a plain TIFF IFD at offset 0 with no magic prefix, using
+// parent byte order (CIPA MakerNote §Canon; ExifTool Canon.pm).
+// This helper produces a valid 18-byte plain IFD: 1 SHORT entry with tag 0x0001
+// value 3, followed by a zero next-IFD pointer.  It is used by
+// buildCameraExifEntries to add a MakerNote entry to the ExifIFD so that
+// BenchmarkEXIFParse_Camera exercises the full dispatch path (including the
+// zero-alloc string([]byte) lookup from task #202).
+//
+// Layout: count(2) + entry(12) + nextIFD(4) = 18 bytes.
+// LE byte order matches the parent TIFF used by buildCameraEXIF.
+func buildCanonMakerNoteBlob() []byte {
+	b := make([]byte, 18)
+	order := binary.LittleEndian
+	order.PutUint16(b[0:], 1)                 // count = 1 entry
+	order.PutUint16(b[2:], 0x0001)            // tag = CameraSettings
+	order.PutUint16(b[4:], uint16(TypeShort)) // type = SHORT
+	order.PutUint32(b[6:], 1)                 // count = 1
+	order.PutUint32(b[10:], 3)                // value (inline SHORT = 3)
+	order.PutUint32(b[14:], 0)                // next-IFD pointer = 0 (end of chain)
+	return b
+}
+
 // buildCameraExifEntries returns the ExifIFD entries for buildCameraEXIF.
+// Includes a Canon MakerNote (tag 0x927C) so that BenchmarkEXIFParse_Camera
+// exercises the full MakerNote dispatch path, making task-#202 alloc savings
+// visible in benchmarks.  The MakerNote is a 18-byte plain-IFD blob (Canon
+// format: IFD at offset 0, parent byte order, no magic prefix).
 func buildCameraExifEntries() []cameraEntry {
 	entries := []cameraEntry{
 		{0x829a, uint16(TypeRational), 1, 0, cameraRational(1, 200)},              // ExposureTime
@@ -1378,13 +1406,17 @@ func buildCameraExifEntries() []cameraEntry {
 		{0x9207, uint16(TypeShort), 1, 5, nil},                                    // MeteringMode=Pattern
 		{0x9209, uint16(TypeShort), 1, 0, nil},                                    // Flash=no
 		{0x920a, uint16(TypeRational), 1, 0, cameraRational(50, 1)},               // FocalLength 50mm
-		{0xa001, uint16(TypeShort), 1, 1, nil},                                    // ColorSpace=sRGB
-		{0xa002, uint16(TypeLong), 1, 6000, nil},                                  // PixelXDimension
-		{0xa003, uint16(TypeLong), 1, 4000, nil},                                  // PixelYDimension
-		{0xa20e, uint16(TypeRational), 1, 0, cameraRational(300, 1)},              // FocalPlaneXResolution
-		{0xa20f, uint16(TypeRational), 1, 0, cameraRational(300, 1)},              // FocalPlaneYResolution
-		{0xa210, uint16(TypeShort), 1, 3, nil},                                    // FocalPlaneResolutionUnit
-		{0xa405, uint16(TypeShort), 1, 50, nil},                                   // FocalLengthIn35mmFilm
+		// MakerNote (0x927C, TypeUndefined): Canon-style plain IFD blob (task #202).
+		// Inserted in tag-ascending order between 0x920a and 0xa001.
+		// count = len(blob); EXIF §4.6.5 tag 0x927C (MakerNote, TypeUndefined).
+		{0x927c, uint16(TypeUndefined), 0, 0, buildCanonMakerNoteBlob()},
+		{0xa001, uint16(TypeShort), 1, 1, nil},                       // ColorSpace=sRGB
+		{0xa002, uint16(TypeLong), 1, 6000, nil},                     // PixelXDimension
+		{0xa003, uint16(TypeLong), 1, 4000, nil},                     // PixelYDimension
+		{0xa20e, uint16(TypeRational), 1, 0, cameraRational(300, 1)}, // FocalPlaneXResolution
+		{0xa20f, uint16(TypeRational), 1, 0, cameraRational(300, 1)}, // FocalPlaneYResolution
+		{0xa210, uint16(TypeShort), 1, 3, nil},                       // FocalPlaneResolutionUnit
+		{0xa405, uint16(TypeShort), 1, 50, nil},                      // FocalLengthIn35mmFilm
 	}
 	fixASCIICounts(entries)
 	return entries

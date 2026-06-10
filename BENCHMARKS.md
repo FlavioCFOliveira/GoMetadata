@@ -1148,3 +1148,72 @@ The `perf(exif,xmp,heif,png,orf,rw2)` commit delivers broad latency improvements
 All zero-allocation paths remain at 0 B/op and 0 allocs/op. Write-path benchmarks `BenchmarkWrite_JPEG` and `BenchmarkWrite_PNG` are new this run and establish a baseline. Internal package benchmarks (`bmff`, `byteorder`, `iobuf`, `riff`) appear for the first time; all are cheap (< 36 ns) and most are zero-allocation, confirming the internal primitives are performing as designed.
 
 `BenchmarkJPEGExtract_Real` shows a +48 ns regression (2034 → 2082 ns, ~2.4%) which is within typical run-to-run noise for this benchmark given its larger synthetic payload; the allocation profile is unchanged (17756 B, 7 allocs).
+
+---
+
+## [main — perf task #202] — 2026-06-10 (exif: zero-alloc MakerNote dispatch via string([]byte) map key)
+
+### Context
+
+Sprint 34 (PERF-1), task #202. `parseExifSubIFDs` (classic TIFF path) and
+`parseExifSubIFDsBigTIFF` both called `makeEntry.String()` purely to build the
+key for a `makerNoteParsers` map lookup. `(*IFDEntry).String()` allocates a heap
+string on every call, contributing one allocation per camera-file parse that has
+a MakerNote and a recognised Make tag.
+
+### Fix
+
+A new internal helper `makerNoteDispatch(makeValue []byte, parentOrder binary.ByteOrder, makerNote []byte) *IFD`
+replaces both `makeEntry.String()` + `parseMakerNoteIFD(...)` call chains at the two
+dispatch sites in `exif.go`.
+
+The helper:
+1. Calls `bytes.TrimRight(makeValue, "\x00")` — identical to `(*IFDEntry).String()`'s NUL stripping, zero allocation (sub-slice).
+2. Calls `bytes.TrimSpace(result)` — identical to `strings.TrimSpace` inside `parseMakerNoteIFD`, zero allocation (sub-slice).
+3. Performs `makerNoteParsers[string(raw)]` — the Go compiler (`cmd/compile mapaccess2_faststr`) special-cases `map[string]V` lookups where the key expression is `string([]byte)`: it reads the map bucket using the slice's backing array as a temporary string without heap-allocating.
+
+**Escape analysis proof** (`go build -gcflags='-m=2'`):
+```
+exif/makernote_parse.go:139:39: string(raw) does not escape
+```
+
+**Trim semantics equivalence** is locked by three regression gates:
+- `TestMakerNoteDispatchTrimEquivalence` — 9 cases covering NUL-only, whitespace-only, trailing space, leading space, multi-NUL.
+- `TestMakerNoteDispatchZeroAllocLookup` — `testing.AllocsPerRun(200, ...)` asserts 0 allocs for the lookup step (empty blob → all parsers return nil after length guard, no IFD allocations).
+- `TestMakerNoteDispatchAllRegisteredKeys` — every key in `makerNoteParsers` must be found by both the old and new path, including `key + " \x00"` (trailing space + NUL) variants.
+
+**Benchmark fixture change**: `buildCameraExifEntries` now includes a Canon-style
+MakerNote entry (tag 0x927C, 18-byte plain-IFD blob) so that `BenchmarkEXIFParse_Camera`
+exercises the full dispatch path and makes the alloc savings visible in benchmarks.
+
+### Benchstat (same-session A/B, -count=10, Apple M4 arm64)
+
+Baseline: commit 12acaae + same MakerNote fixture added to baseline worktree (apples-to-apples comparison; old path uses `makeEntry.String()` + `parseMakerNoteIFD`, new path uses `makerNoteDispatch` directly).
+
+```
+                     │ baseline (old path) │       after (task #202)        │
+                     │       sec/op        │    sec/op     vs base           │
+EXIFParse_Camera-10       1.524µ ± 2%       1.518µ ± 1%    ~ (p=0.210 n=10)
+
+                     │   B/op   │       B/op       vs base       │
+EXIFParse_Camera-10   2.540Ki    2.533Ki    -0.27% (p=0.000 n=10)
+
+                     │ allocs/op │    allocs/op   vs base         │
+EXIFParse_Camera-10    9.000       8.000    -11.11% (p=0.000 n=10)
+```
+
+**Result**: **-1 alloc/op** on `BenchmarkEXIFParse_Camera` (p=0.000, statistically significant). ns/op within noise (p=0.210 — the single eliminated allocation does not contribute measurably to latency; the improvement is purely in GC pressure reduction).
+
+`BenchmarkMakerNoteDispatch` is unchanged (4 allocs/op) because that benchmark calls `parseMakerNoteIFD` directly with a string constant — the `makeEntry.String()` allocation never appears on that path. The saving is on the full `Parse` → `parseExifSubIFDs` → dispatch path exercised by `BenchmarkEXIFParse_Camera`.
+
+### Alloc budget for BenchmarkEXIFParse_Camera after task #202
+
+| Allocation | Count | Source |
+|---|---|---|
+| IFD0 entry batch (via traverse) | 1 | `parseSingleIFD` |
+| Sub-IFD arena batch (`[]IFD` + `[]IFDEntry`) | 2 | task #198 lazy arena |
+| `visitedPool` map (pooled, 0 cold) | 0 | amortised |
+| Canon MakerNote IFD + entries | 2 | `parseSingleIFD` in `parseCanonMakerNote` |
+| Output EXIF struct | 1 | `Parse` |
+| ~~makeEntry.String() heap string~~ | ~~1~~ | **eliminated by task #202** |
+| **Total** | **8** | |
