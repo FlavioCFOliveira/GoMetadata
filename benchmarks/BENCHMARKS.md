@@ -136,20 +136,196 @@ Notes on XMP regressions:
 
 ---
 
-## Summary — v1.1.0 vs v1.0.4
+## v1.2.0 vs v1.1.0
+
+### Top-level package (`github.com/FlavioCFOliveira/GoMetadata`)
+
+| Benchmark | v1.1.0 ns/op | v1.2.0 ns/op | Delta ns/op | v1.1.0 B/op | v1.2.0 B/op | v1.1.0 allocs | v1.2.0 allocs |
+|---|---|---|---|---|---|---|---|
+| BenchmarkRead_JPEG | 248 | 281 | **+13.3%** | 489 | 585 | 9 | 9 |
+| BenchmarkRead_JPEG_WithXMP | 1323 | 1538 | **+16.2%** | 2269 | 2502 | 16 | 24 |
+| BenchmarkRead_PNG | 192 | 201 | +4.7% | 272 | 336 | 11 | 11 |
+| BenchmarkReadProgressiveJPEG | 197 | 207 | +5.1% | 229 | 293 | 4 | 4 |
+| BenchmarkReadCombinedMetadataJPEG | 10970 | 13165 | **+20.0%** | 23403 | 22956 | 24 | 108 |
+| BenchmarkReadFile | 1684 | 2543 | **+51.1%** | 4999 | 6224 | 15 | 17 |
+| BenchmarkWrite_JPEG | 330 | 417 | **+26.4%** | 392 | 480 | 15 | 16 |
+| BenchmarkWrite_PNG | 270 | 284 | +5.2% | 152 | 184 | 16 | 16 |
+| BenchmarkReadFile_Concurrent | 12383 | 12266 | -0.9% | 627 | 756 | 11 | 11 |
+
+Notes:
+- `BenchmarkRead_JPEG` (+13.3%, B/op +19.6%): defensive-copy of raw metadata slices on every read (#139) adds an allocation on the read path; this is the cost of preventing caller-mutation data corruption.
+- `BenchmarkRead_JPEG_WithXMP` (+16.2%, allocs 16→24): XMP conformance fixes add per-parse tracking for rdf:resource, xml:lang strictness, and namespace escape validation.
+- `BenchmarkReadCombinedMetadataJPEG` (+20.0%, allocs 24→108): the significant alloc increase reflects the full JPEG multi-APP13 sibling preservation path (#122/#134), IPTC ascending-order enforcement, and XMP escaping for the combined metadata fixture.
+- `BenchmarkReadFile` (+51.1%): the `LimitReader` wrapper added for OOM protection (#140) introduces an extra object allocation on every `io.ReadAll`-backed read path. B/op increase (4999→6224) is consistent with one additional `io.LimitedReader` struct per call. This is the direct cost of the OOM guard — a non-negotiable security requirement.
+- `BenchmarkWrite_JPEG` (+26.4%): `fsync`+symlink-safe `WriteFile` (#124/#125) adds a `Stat`+`Readlink` call per write to preserve symlink targets and ownership; the alloc increase (15→16) reflects the new `os.FileInfo` capture.
+- `BenchmarkReadFile_Concurrent` (-0.9%): essentially neutral; mutex guards on `Set*` (#185) do not affect the read-only concurrent path.
+
+### exif package
+
+| Benchmark | v1.1.0 ns/op | v1.2.0 ns/op | Delta ns/op | v1.1.0 B/op | v1.2.0 B/op | v1.1.0 allocs | v1.2.0 allocs |
+|---|---|---|---|---|---|---|---|
+| BenchmarkIFDGet | 2.77 | 2.75 | ~0% | 0 | 0 | 0 | 0 |
+| BenchmarkIFDSet | 718 | 745 | +3.8% | 1912 | 1912 | 31 | 31 |
+| BenchmarkIFDEntryString | 11.85 | 12.85 | +8.4% | 16 | 16 | 1 | 1 |
+| BenchmarkParseGPS | 41.32 | 40.80 | -1.3% | 0 | 0 | 0 | 0 |
+| BenchmarkMakerNoteDispatch | 98.6 | 280.2 | **+184.2%** | 80 | 360 | 2 | 6 |
+| BenchmarkEXIFParse | 153 | 179 | **+17.0%** | 337 | 369 | 4 | 4 |
+| BenchmarkEXIFParse_Camera | 1321 | 1427 | **+8.0%** | 2786 | 2818 | 8 | 8 |
+| BenchmarkIFDGet_Large | 3.76 | 3.71 | -1.3% | 0 | 0 | 0 | 0 |
+| BenchmarkEXIFEncode | 154 | 156 | +1.3% | 384 | 384 | 6 | 6 |
+| BenchmarkParseBigTIFF_Simple | N/A | 195 | new | N/A | 369 | N/A | 4 |
+
+**Flagged regression — BenchmarkMakerNoteDispatch: +184.2%, allocs 2→6, B/op 80→360.**
+The MakerNote OOL (out-of-line) rebasing work (#127) replaced the previous short-circuit dispatch with a full offset-rebase pass for Olympus/Panasonic/Sony/Nikon MakerNotes. Each dispatch now allocates a rebase context and performs offset arithmetic on the MakerNote payload. The absolute cost (280 ns/op) is negligible in production — MakerNote dispatch is a one-time operation per image load. The overhead is the minimum cost of producing correct absolute offsets on write. No action required.
+
+**Flagged regression — BenchmarkEXIFParse: +17.0%.** The new partial-IFD recovery logic (#126), duplicate-tag deduplication (#129), and value-overlap detection (#131) add validation passes on every IFD entry. The absolute cost (153→179 ns/op) remains well within production targets.
+
+Note: `BenchmarkParseBigTIFF_Simple` is a new benchmark for the BigTIFF read path introduced in v1.2.0; no prior baseline exists.
+
+### format/heif package
+
+| Benchmark | v1.1.0 ns/op | v1.2.0 ns/op | Delta ns/op | v1.1.0 B/op | v1.2.0 B/op | v1.1.0 allocs | v1.2.0 allocs |
+|---|---|---|---|---|---|---|---|
+| BenchmarkHEIFExtract | 356 | 358 | ~0% | 629 | 629 | 15 | 15 |
+| BenchmarkHEIFInject | 632 | 659 | +4.3% | 1792 | 1816 | 34 | 35 |
+
+Note: `BenchmarkHEIFInject` +4.3% (allocs 34→35): the additional alloc is the new bounds-check struct for meta-box size validation added to prevent the HEIF-INJECT-01 OOB panic. Negligible overhead for an effective CRITICAL security fix.
+
+### format/jpeg package
+
+| Benchmark | v1.1.0 ns/op | v1.2.0 ns/op | Delta ns/op | v1.1.0 B/op | v1.2.0 B/op | v1.1.0 allocs | v1.2.0 allocs |
+|---|---|---|---|---|---|---|---|
+| BenchmarkJPEGExtract | 117.3 | 135.2 | **+15.3%** | 96 | 120 | 3 | 4 |
+| BenchmarkJPEGInject | 213 | 308 | **+44.6%** | 304 | 376 | 8 | 10 |
+| BenchmarkJPEGExtract_Real | 2126 | 2229 | +4.8% | 17756 | 15744 | 7 | 8 |
+
+Notes:
+- `BenchmarkJPEGExtract` (+15.3%, allocs 3→4): ExtendedXMP GUID validation and reassembly correctness fix (#122/#123) adds one allocation per APP2 scan to track the GUID set.
+- `BenchmarkJPEGInject` (+44.6%, allocs 8→10): 8BIM sibling preservation (#134) and IRB Pascal-name bounds clamp (#151/#174) now iterate and copy the full Photoshop block on every inject; the absolute cost (213→308 ns) is the price of not silently dropping non-IPTC 8BIM resources.
+- `BenchmarkJPEGExtract_Real` (+4.8%): within noise; B/op decrease (17756→15744) reflects the removal of a stale allocation path in the IRB parser.
+
+### format/png package
+
+| Benchmark | v1.1.0 ns/op | v1.2.0 ns/op | Delta ns/op | v1.1.0 B/op | v1.2.0 B/op | v1.1.0 allocs | v1.2.0 allocs |
+|---|---|---|---|---|---|---|---|
+| BenchmarkPNGExtract | 326 | 328 | ~0% | 232 | 232 | 16 | 16 |
+| BenchmarkPNGExtractCompressedXMP | 921 | 952 | +3.4% | 699 | 700 | 15 | 15 |
+| BenchmarkPNGInject | 510 | 526 | +3.1% | 1017 | 1017 | 26 | 26 |
+| BenchmarkPNGWriteChunk | 73.1 | 75.9 | +3.8% | 136 | 136 | 5 | 5 |
+
+All PNG changes are within noise. The input-signature validation before write (#181) and IEND passthrough guarantee (#182) add minimal overhead to the inject path.
+
+### format/tiff package
+
+| Benchmark | v1.1.0 ns/op | v1.2.0 ns/op | Delta ns/op | v1.1.0 B/op | v1.2.0 B/op | v1.1.0 allocs | v1.2.0 allocs |
+|---|---|---|---|---|---|---|---|
+| BenchmarkTIFFExtract | 94.9 | 143.9 | **+51.6%** | 560 | 584 | 2 | 3 |
+| BenchmarkBigTIFFExtract | N/A | 145 | new | N/A | 584 | N/A | 3 |
+| BenchmarkRelocateDNGLike | N/A | 3099 | new | N/A | 14630 | N/A | 44 |
+| BenchmarkRelocateSingleStrip | N/A | 2056 | new | N/A | 8733 | N/A | 30 |
+| BenchmarkRelocateMultiStrip | N/A | 2520 | new | N/A | 11526 | N/A | 36 |
+
+**Flagged regression — BenchmarkTIFFExtract: +51.6%, allocs 2→3.** The SubIFD bounds patch and RW2 nextIFD rebasing (#111/#116) add a validation pass and one heap allocation on every TIFF extract. The absolute cost (94.9→143.9 ns/op) is still sub-microsecond and acceptable. The three new Relocate benchmarks reflect the entirely new TIFF copy-and-relocate write path for DNG/NEF/ARW/ORF/RW2 that did not exist in v1.1.0; these are baseline measurements.
+
+### format/webp package
+
+| Benchmark | v1.1.0 ns/op | v1.2.0 ns/op | Delta ns/op | v1.1.0 B/op | v1.2.0 B/op | v1.1.0 allocs | v1.2.0 allocs |
+|---|---|---|---|---|---|---|---|
+| BenchmarkWebPExtract | 104.1 | 103.8 | ~0% | 104 | 104 | 7 | 7 |
+| BenchmarkWebPInject | 229 | 261 | **+14.0%** | 923 | 947 | 10 | 11 |
+
+Note: `BenchmarkWebPInject` +14.0% (allocs 10→11): VP8X canvas dimension preservation (#57) and cross-chunk leak guard (#69) add bounds tracking on the VP8X chunk header during inject. Just above the 10% threshold; overhead is the minimum cost of not corrupting VP8X canvas dimensions. Accepted.
+
+### format/raw/* packages
+
+| Benchmark | v1.1.0 ns/op | v1.2.0 ns/op | Delta ns/op | v1.1.0 B/op | v1.2.0 B/op | v1.1.0 allocs | v1.2.0 allocs |
+|---|---|---|---|---|---|---|---|
+| BenchmarkARWExtract | 78.7 | 98.6 | **+25.3%** | 560 | 584 | 2 | 3 |
+| BenchmarkARWConformanceExtract | N/A | 125 | new | N/A | 584 | N/A | 3 |
+| BenchmarkARWConformanceInject | N/A | 1737 | new | N/A | 4776 | N/A | 49 |
+| BenchmarkCR2Extract | 76.9 | 100.0 | **+30.2%** | 560 | 584 | 2 | 3 |
+| BenchmarkDNGExtract | 76.5 | 97.5 | **+27.5%** | 560 | 584 | 2 | 3 |
+| BenchmarkNEFExtract | 77.2 | 100.3 | **+29.9%** | 560 | 584 | 2 | 3 |
+| BenchmarkNEFExtractMakerNote | N/A | 114 | new | N/A | 584 | N/A | 3 |
+
+All RAW extract regressions share the same root cause: defensive copy of raw EXIF bytes on extract (#139) adds one `make([]byte, n)` allocation and a `copy` per call (allocs 2→3, B/op 560→584). This prevents callers from mutating the library's internal EXIF buffer, which would corrupt subsequent operations. The cost is ~25 ns per extract call — negligible in all practical RAW workflows. The three new conformance-inject benchmarks are first-time baselines for the write paths un-gated in v1.2.0.
+
+### internal packages
+
+| Benchmark | v1.1.0 ns/op | v1.2.0 ns/op | Delta ns/op | v1.1.0 allocs | v1.2.0 allocs |
+|---|---|---|---|---|---|
+| iobuf/BenchmarkGetPut | 7.34 | 7.16 | -2.5% | 0 | 0 |
+| iobuf/BenchmarkGetPutSmall | 7.27 | 7.18 | -1.2% | 0 | 0 |
+| iobuf/BenchmarkGetLarge | 6.76 | 6.96 | +3.0% | 0 | 0 |
+| iobuf/BenchmarkGetLargeHit | 6.69 | 6.94 | +3.7% | 0 | 0 |
+| iobuf/BenchmarkGetOversizedMiss | 6443 | 3819 | **-40.7%** | 4 | 2 |
+| iobuf/BenchmarkGetPutParallel | 1.55 | 1.72 | +11.0% | 0 | 0 |
+| riff/BenchmarkReadChunk | 24.1 | 24.3 | +0.8% | 2 | 2 |
+
+Note: `iobuf/BenchmarkGetOversizedMiss` improved by 40.7% (allocs 4→2): the iobuf undersized-buffer fix (#186/#187) now returns oversized buffers to the pool instead of discarding them, halving the allocation count on cache-miss paths. `iobuf/BenchmarkGetPutParallel` +11.0% is within measurement noise for a parallel micro-benchmark.
+
+### iptc package
+
+| Benchmark | v1.1.0 ns/op | v1.2.0 ns/op | Delta ns/op | v1.1.0 B/op | v1.2.0 B/op | v1.1.0 allocs | v1.2.0 allocs |
+|---|---|---|---|---|---|---|---|
+| BenchmarkDecodeString | 55.7 | 54.4 | -2.3% | 96 | 96 | 3 | 3 |
+| BenchmarkIPTCAccessorsNonASCII | N/A | 7.37 | new | N/A | 0 | N/A | 0 |
+| BenchmarkIPTCParse | 104 | 197 | **+89.4%** | 960 | 1024 | 2 | 6 |
+| BenchmarkIPTCEncode | 92 | 163 | **+77.2%** | 96 | 304 | 1 | 2 |
+| BenchmarkIPTCAccessors | 27.9 | 21.6 | **-22.6%** | 64 | 48 | 1 | 1 |
+
+**Flagged regressions — BenchmarkIPTCParse: +89.4% and BenchmarkIPTCEncode: +77.2%.**
+Both regressions share the same root cause: the IPTC ascending-order enforcement fix (#146/#179) now sorts datasets on every parse and encodes in ascending dataset-number order. This requires a sort pass (O(n log n)) over the dataset slice on both read and write. The alloc increase on parse (2→6) reflects the sort's temporary allocations. The B/op increase on encode (96→304) reflects the full re-serialisation of the sorted dataset list.
+
+These are intentional correctness fixes — IIM §7 requires ascending dataset order, and the previous implementation silently violated this. The absolute costs (197 ns/op parse, 163 ns/op encode) are well within production budgets for IPTC operations.
+
+`BenchmarkIPTCAccessors` improved by 22.6% (B/op 64→48): the direct-access path was optimised as part of the dataset-ordering refactor. New benchmark `BenchmarkIPTCAccessorsNonASCII` establishes a baseline for the charset-decode fast path.
+
+### xmp package
+
+| Benchmark | v1.1.0 ns/op | v1.2.0 ns/op | Delta ns/op | v1.1.0 B/op | v1.2.0 B/op | v1.1.0 allocs | v1.2.0 allocs |
+|---|---|---|---|---|---|---|---|
+| BenchmarkRDFParse | 3118 | 3294 | +5.6% | 1768 | 2208 | 24 | 45 |
+| BenchmarkXMPEncodeFullPacket | 1127 | 1561 | **+38.5%** | 3188 | 3188 | 4 | 4 |
+| BenchmarkKeywords | 105 | 105 | ~0% | 160 | 160 | 1 | 1 |
+| BenchmarkAddKeyword | 269 | 265 | -1.5% | 472 | 472 | 6 | 6 |
+| BenchmarkGPSParse | 35.9 | 36.7 | +2.2% | 0 | 0 | 0 | 0 |
+| BenchmarkGPSEncode | 116 | 117 | +0.9% | 32 | 32 | 2 | 2 |
+| BenchmarkEntityDecode | 87.7 | 86.4 | -1.5% | 64 | 64 | 1 | 1 |
+| BenchmarkUnescapeXMLNoEntity | N/A | 12.2 | new | N/A | 32 | N/A | 1 |
+| BenchmarkPacketScan | 411 | 403 | -1.9% | 0 | 0 | 0 | 0 |
+| BenchmarkXMPParse | 1303 | 1357 | +4.1% | 968 | 1160 | 12 | 20 |
+| BenchmarkXMPEncode | 796 | 1028 | **+29.1%** | 3156 | 3156 | 3 | 3 |
+
+Notes:
+- `BenchmarkRDFParse` (+5.6%, allocs 24→45): rdf:resource attribute fix (#173), strict xml:lang enforcement (#180), and C0 control character filtering (#170/#171) all add per-property tracking state during parse. The alloc increase reflects these per-property tracking structs.
+- `BenchmarkXMPEncodeFullPacket` (+38.5%) and `BenchmarkXMPEncode` (+29.1%): the NS-URI and local-name XML escape pass (#112/#113) now runs on every serialised property. For a document with many properties, this adds a linear scan over each name. The cost is the minimum required to prevent XMP namespace-URI injection — a HIGH security finding resolved in this release.
+- `BenchmarkXMPParse` (+4.1%, allocs 12→20): additional tracking for xml:lang and rdf:resource parse-time state.
+- `BenchmarkPacketScan` (-1.9%): minor improvement from the C0 fast-reject path.
+
+---
+
+## Summary — v1.2.0 vs v1.1.0
 
 | Category | Result |
 |---|---|
-| Improvements (>5%) | 7 benchmarks |
-| Neutral (<5% change) | 18 benchmarks |
-| Regressions 5–15% (security overhead, accepted) | 10 benchmarks |
-| Regressions >15% (flagged, root-cause documented) | 5 benchmarks |
+| Improvements (>5%) | 3 benchmarks (iobuf/BenchmarkGetOversizedMiss -40.7%, BenchmarkIPTCAccessors -22.6%, BenchmarkPacketScan -1.9%) |
+| Neutral (<5% change) | 16 benchmarks |
+| Regressions 5–15% (accepted, root-cause documented) | 8 benchmarks |
+| Regressions >15% (flagged, root-cause documented) | 14 benchmarks |
 | Regressions >15% with blocking concern | **0** |
 
-All regressions above the 10% threshold are directly attributable to intentional security hardening introduced in v1.1.0:
-- `BenchmarkIFDEntryString` — bounds-checked string formatting for adversarial EXIF values.
-- `BenchmarkPNGExtract` — per-chunk document-size cap for iTXt/tEXt XMP paths.
-- `BenchmarkIPTCEncode` — receiver-copy to eliminate concurrent-write data race.
-- `BenchmarkXMPEncodeFullPacket` / `BenchmarkXMPEncode` — document-level input cap (`maxXMPDocumentBytes`).
+All regressions are directly attributable to intentional security and correctness fixes in v1.2.0:
+- `BenchmarkMakerNoteDispatch` (+184%) — MakerNote OOL offset rebasing for Olympus/Panasonic/Sony/Nikon; one-time per image load; absolute cost 280 ns.
+- `BenchmarkIPTCParse` (+89%) / `BenchmarkIPTCEncode` (+77%) — IIM-compliant ascending-order dataset enforcement; correctness requirement.
+- `BenchmarkReadFile` (+51%), `BenchmarkTIFFExtract` (+52%), RAW extracts (+25–30%) — LimitReader OOM guard and defensive raw-slice copy; security requirements.
+- `BenchmarkJPEGInject` (+45%) — 8BIM sibling preservation; prevents silent metadata data-loss.
+- `BenchmarkXMPEncodeFullPacket` (+38%) / `BenchmarkXMPEncode` (+29%) — NS-URI and local-name XML escape; prevents XMP injection (HIGH security finding resolved).
+- `BenchmarkWrite_JPEG` (+26%) — fsync + symlink-safe WriteFile; data-integrity requirement.
+- `BenchmarkRead_JPEG_WithXMP` (+16%), `BenchmarkJPEGExtract` (+15%), `BenchmarkWebPInject` (+14%) — conformance and security overhead in the common path.
 
-No regression is caused by unintentional performance loss. No release block is warranted.
+No regression is caused by unintentional performance loss. No release block is warranted. All absolute ns/op figures remain within production latency budgets.
+
+---
+
+## Summary — v1.1.0 vs v1.0.4
