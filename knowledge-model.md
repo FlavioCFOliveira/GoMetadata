@@ -17,7 +17,7 @@ both in the same step.
 
 ---
 
-## Node labels (11)
+## Node labels (13)
 
 | Label | Key | Count* | Properties |
 |---|---|---|---|
@@ -32,6 +32,8 @@ both in the same step.
 | `Commit` | `hash` | 12 | `hash, short_hash, message, author, date, scope, gitCommit, gitDate` |
 | `Test` | `name` | ~4 | `name, package, file, type, description, commit_introduced, gitCommit, gitDate` |
 | `FormatCapability` | `format` | 13 | `format, extensions, read, write, exif, iptc, xmp, container, gitCommit, gitDate` |
+| `Audit` | `key` | 4 | `key, date, scope, method, baseline, prior_audit, critical, high, medium, low, findings_new, new_tasks, sprints, status, remediation_commits, remediation_date, confirmed_live, closed_verified_fixed, headlines, gitCommit, gitDate` |
+| `ConformanceBattery` | `name` | 1 | `name, id, package, file, ruleCount, ruleSections, defectsFixed, status, commitHash, completedDate` |
 
 \* approximate at bootstrap (`402a067`, 2026-06-01).
 
@@ -65,7 +67,7 @@ do with format X" and mirrors the README *Supported formats* table and `format.S
 | `format` | container name — JPEG, TIFF, PNG, WebP, HEIF, AVIF, CR2, CR3, NEF, ARW, DNG, ORF, RW2 |
 | `extensions` | recognised extensions (detection is by magic bytes, never by extension) |
 | `read` | metadata read supported — `true` for all 13 |
-| `write` | metadata write supported — **equals `format.SupportsWrite`**: `true` for JPEG/PNG/WebP/HEIF/AVIF/CR3/TIFF; `false` for DNG (re-gated task #101, bug #98 SubIFD value-loss), CR2/NEF/ARW/ORF/RW2 (gated by `ErrWriteNotSupported`, task #95). TIFF write: copy-and-relocate (tasks #92/#93). CR3 write: stco/co64 relocation (task #91). DNG: re-enabled as task #94, re-gated as task #101 pending bug #98 |
+| `write` | metadata write supported — **equals `format.SupportsWrite`**: `true` for **all 13 formats**. TIFF/DNG: copy-and-relocate (#92/#93/#94; DNG re-enabled after the #98 SubIFD out-of-line value fix). CR2: copy-and-relocate + Canon marker restore (#95). CR3: stco/co64 relocation (#91). NEF/ARW/ORF/RW2: un-gated (#102/#103/#104) with manufacturer MakerNote/SR2 rebasing, real-corpus validated. The **only** write exception is **BigTIFF**, which returns `ErrWriteNotSupported` (BigTIFF read is supported; #107). |
 | `exif` / `iptc` / `xmp` | which metadata blocks the format carries on read (`iptc` only JPEG + TIFF) |
 | `container` | structural family: `JPEG` / `TIFF` / `TIFF-based` / `ISOBMFF` / `RIFF` / `PNG` |
 
@@ -74,9 +76,9 @@ edges to pre-existing nodes cannot be added incrementally); the `format` / `cont
 properties carry the linkage. Example queries:
 
 ```cypher
-MATCH (c:FormatCapability {write:true})              RETURN c.format            // writable formats (7: JPEG, PNG, WebP, HEIF, AVIF, CR3, TIFF)
-MATCH (c:FormatCapability {iptc:true})               RETURN c.format            // carry IPTC (JPEG, TIFF, DNG)
-MATCH (c:FormatCapability {container:'TIFF-based'})  RETURN c.format, c.write   // TIFF-based formats (TIFF writable; DNG/CR2/NEF/ARW/ORF/RW2 read-only)
+MATCH (c:FormatCapability {write:true})              RETURN c.format            // writable formats (all 13)
+MATCH (c:FormatCapability {iptc:true})               RETURN c.format            // carry IPTC (JPEG, TIFF only)
+MATCH (c:FormatCapability {container:'TIFF-based'})  RETURN c.format, c.write   // TIFF-based formats (all writable: TIFF, DNG, CR2, NEF, ARW, ORF, RW2)
 ```
 
 Out-of-scope formats (CRW, RAF, MRW, IIQ, X3F, SRW, PEF, RWL — see `doc.go`) are intentionally
@@ -84,7 +86,7 @@ NOT modelled as `FormatCapability` nodes: the module returns `UnsupportedFormatE
 
 ---
 
-## Edge types (10)
+## Edge types (14)
 
 **Structural**
 
@@ -105,6 +107,10 @@ NOT modelled as `FormatCapability` nodes: the module returns `UnsupportedFormatE
 | `HAS_TEST` | `Package → Test` | package owns the (feature-linked) test |
 | `INTRODUCED` | `Commit → Feature` | commit that introduced the feature |
 | `FIXED` | `Commit → Feature` | commit that fixed/hardened the feature |
+| `RESOLVES` | `Commit → Audit` | commit that remediates an audit finding/sprint (×19) |
+| `FOLLOWS` | `Audit → Audit` | an audit pass that succeeds a prior one (×2) |
+| `ENABLES` | `Feature → Feature` | one feature unlocks another (×1) |
+| `HAS_CONFORMANCE_BATTERY` | `Package → ConformanceBattery` | package owns a spec-conformance test battery (×1) |
 
 ---
 
@@ -308,19 +314,58 @@ New files: `exif/bigtiff_test.go`, `format/tiff/bigtiff_test.go`, fixtures
 **New write-relocation files** (in `format/tiff`, all `DEPENDS_ON exif`): `relocate_arw.go`,
 `relocate_orf.go`, `relocate_rw2.go` (joining the existing `relocate.go`, `relocate_nef.go`).
 
-### ⚠️ Known graph/file discrepancy (pre-existing, surfaced 2026-06-05)
+### ✅ Graph/file discrepancy — RESOLVED (2026-06-10, sprint 33 / task #197)
 
-The graph holds **43 `Package` nodes** but the filesystem has **29** (21 production + 8
-example, per `go list ./...`). The 14 dead packages deleted by task #89
-(`exif/makernote` + 11 vendor subpkgs, `internal/bmff`, `internal/byteorder`) were removed
-from disk and documented as removed (above) but the corresponding graph nodes were **never
-actually deleted** — consistent with engine constraint #1 (targeted `DELETE` is WAL-risky and
-the engine tends to leave ghost records). They persist as fully-labelled `Package` nodes.
-Reconciliation requires a **full rebuild** (engine constraint #5), deliberately deferred to
-avoid WAL corruption on a healthy store. Until then, package queries must exclude the dead
-subtree, e.g. `MATCH (p:Package) WHERE NOT (p.name CONTAINS 'makernote' OR p.name IN
-['internal/bmff','internal/byteorder']) RETURN p.name`. `Commit` node count has likewise
-grown (58) as every tracked commit is now recorded.
+Previously the graph held **43 `Package` nodes** while the filesystem had **29** (21
+production + 8 example, per `go list ./...`): the 14 dead packages deleted by task #89
+(`exif/makernote` + 11 vendor subpkgs, `internal/bmff`, `internal/byteorder`) had been removed
+from disk but their graph nodes were never deleted (ghost records).
+
+**Reconciled via targeted `DETACH DELETE`** (no full rebuild needed — see the refined engine
+constraint #1 below). After taking a store backup, the 14 ghost `Package` nodes **and** their
+48 contained child nodes (15 `File`, 13 `Type`, 11 `FuzzTarget`, 5 `Benchmark`, 3 `Feature`,
+1 `Test`) were removed with two filtered deletes:
+
+```bash
+rmp graph delete -r gometadata -q "MATCH (n) WHERE n.package IN [<14 ghost names>] DETACH DELETE n"
+rmp graph delete -r gometadata -q "MATCH (p:Package) WHERE p.name IN [<14 ghost names>] DETACH DELETE p"
+```
+
+Post-cleanup integrity (all verified): `Package` count = **29**; label-less nodes = **0**;
+zero nodes whose `.package` references a removed subtree; total nodes 453 → **391**; edges
+intact at 428; sanity traversals (e.g. dependants of `exif` = `format/tiff`, `gometadata`)
+correct. The single surviving `makernote` reference is the **legitimate** `File`
+`makernote_parse.go` (the live dispatch in package `exif`), not a ghost. Package queries no
+longer need a dead-subtree filter.
+
+---
+
+## Update — Sprint 33: release-hardening (2026-06-10)
+
+Follow-up to the 2026-06-10 production-readiness assessment. Sprint 33 (roadmap `gometadata`,
+tasks #193–#197) remediated five findings. Knowledge-graph impact (this file ↔ graph reconciled):
+
+- **Capabilities matrix corrected (#196):** the `write` property description and the example
+  queries now match `format.SupportsWrite` and the live `FormatCapability` nodes — **all 13
+  formats `write=true`** (BigTIFF write the sole exception), and `iptc=true` only for **JPEG and
+  TIFF** (the earlier "JPEG, TIFF, DNG" note was wrong; DNG carries no IPTC on read).
+- **Ghost packages reconciled (#197):** see "Graph/file discrepancy — RESOLVED" above. A
+  filtered `DETACH DELETE` removed 14 ghost `Package` nodes + 48 child nodes; engine constraint
+  #1 refined (filtered deletes are safe, unfiltered whole-graph deletes are not).
+- **Model ↔ graph reconciliation:** two node labels (`Audit` ×4, `ConformanceBattery` ×1) and
+  four edge types (`RESOLVES`, `FOLLOWS`, `ENABLES`, `HAS_CONFORMANCE_BATTERY`) — added to the
+  live graph by the post-Sprint-22 reliability-audit and conformance-battery work but never
+  documented — are now in the Node-labels and Edge-types tables above.
+
+**Live graph totals after this update:** 391 nodes, 428 edges; 29 `Package` nodes; zero
+label-less nodes. By label: Commit 95, File 60, Benchmark 55, Feature 50, Package 29, Type 21,
+Test 20, FuzzTarget 16, Spec 16, FormatCapability 13, Function 11, Audit 4, ConformanceBattery 1.
+
+**Non-graph sprint outcomes** (code/docs on `main`): #193 reconciled README/CHANGELOG write
+capability with the code + added a doc↔code regression test; #195 fixed a real `xmp.GPS()` bug
+(W3C Geo namespace was not decoded), converted 10 result-masking `t.Skip` calls to `t.Fatal`,
+embedded CI fixtures so corpus tests no longer skip silently in CI, and added `docs/TESTING.md`;
+#194 raised `format/tiff` coverage 53.9% → 81.5%.
 
 ---
 
@@ -330,7 +375,13 @@ Discovered empirically during bootstrap. Violating these corrupts the store:
 
 1. **NEVER run unfiltered `MATCH (n) DETACH DELETE n`.** It does not delete nodes — it
    *strips their labels and properties*, leaving undeletable ghost records and corrupting the
-   append-only WAL. Any `DELETE` carries WAL-corruption risk; prefer a full rebuild.
+   append-only WAL. **Refinement (2026-06-10, task #197):** a *filtered* `DETACH DELETE`
+   scoped by label/property (e.g. `MATCH (p:Package {name:'x'}) DETACH DELETE p` or
+   `MATCH (n) WHERE n.package IN [...] DETACH DELETE n`) **is safe** — empirically verified by
+   removing the 14 ghost packages + 48 child nodes with zero label-less records and full
+   post-delete integrity. The catastrophic case is specifically the *unfiltered* whole-graph
+   form. Still take a store backup (`cp -r ~/.roadmaps/<rm>/graph graph.bak`) before any
+   delete, and verify counts + `size(labels(n))=0` afterwards.
 2. **Heterogeneous edges cannot be added between pre-existing nodes.**
    `MATCH (a:LabelA …) MATCH (b:LabelB …) MERGE (a)-[:R]->(b)` silently creates **0** edges
    when `LabelA ≠ LabelB` (every MATCH form tested). It works only for **same-label**
