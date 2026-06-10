@@ -37,17 +37,48 @@ var tiffScanPool = sync.Pool{ //nolint:gochecknoglobals // sync.Pool: reuse redu
 	},
 }
 
+// magicPool recycles the 36-byte magic-byte scan buffer used by Detect.
+//
+// Without pooling, `var buf [magicLen]byte` followed by `r.Read(buf[:])` causes
+// the array to escape to the heap on every call: the `buf[:]` slice expression
+// takes the address of a stack variable and passes it through the io.Reader
+// interface (an indirect call), which the escape analyser conservatively assumes
+// may retain the pointer beyond the call frame.  Pooling eliminates this
+// allocation entirely after the first warm-up call.
+//
+// Safety: Detect consumes the buffer synchronously in detectMagic and returns
+// FormatID by value before calling magicPool.Put; no reference to the buffer
+// escapes Detect.  The TIFF-refinement path (refineTIFFVariant) does its own
+// seek+read from the pool-free tiffScanPool and does not retain this buffer.
+var magicPool = sync.Pool{ //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
+	New: func() any {
+		b := new([magicLen]byte)
+		return b
+	},
+}
+
 // Detect reads up to magicLen bytes from r (without consuming them) and
 // returns the detected FormatID. For TIFF-family files it reads additional
 // bytes to distinguish NEF, ARW, and DNG from generic TIFF.
 func Detect(r io.ReadSeeker) (FormatID, error) {
-	var buf [magicLen]byte
-	n, err := r.Read(buf[:])
+	// Pool the magic-byte scan buffer to eliminate the per-call heap escape.
+	// `var buf [magicLen]byte` followed by r.Read(buf[:]) causes buf to escape
+	// because the slice passes &buf through the io.Reader interface (indirect
+	// call).  Using a *[magicLen]byte from a sync.Pool amortises the allocation
+	// to zero after the first warm-up call.
+	// Safety: buf is consumed synchronously by detectMagic and released before
+	// any return path; no reference to it escapes this function.
+	bp := magicPool.Get().(*[magicLen]byte) //nolint:forcetypeassert,revive // magicPool.New always stores *[magicLen]byte; pool invariant
+	n, err := r.Read(bp[:])
 	if err != nil && n == 0 {
+		magicPool.Put(bp)
 		return FormatUnknown, fmt.Errorf("format: read magic bytes: %w", err)
 	}
 
-	fmtID := detectMagic(buf[:n])
+	fmtID := detectMagic(bp[:n])
+	// Return the buffer to the pool immediately after use — detectMagic
+	// consumes the slice synchronously and retains no reference to it.
+	magicPool.Put(bp)
 
 	// FormatTIFF is a superset: NEF, ARW, and DNG all share the standard TIFF
 	// magic and cannot be distinguished from the first 12 bytes alone.

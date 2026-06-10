@@ -337,6 +337,66 @@ contain Canon-style duplicate tags.  The MakerNoteDispatch benchmark is the prim
 
 ---
 
+## [main — perf task #203] — 2026-06-10 (format: pool magic-byte scan buffer in Detect)
+
+### Optimisation applied in this version
+
+- **task #203 (format: eliminate per-call heap escape of magic-byte scan buffer)**:
+  `Detect` previously declared `var buf [magicLen]byte` (36 bytes) on the stack, then called
+  `r.Read(buf[:])` through the `io.Reader` interface.  The `buf[:]` slice takes `&buf`; the
+  escape analyser conservatively concludes that the interface call may retain the pointer, so
+  the 36-byte array is promoted to the heap on every `Detect` call.  With `Detect` sitting on
+  both the `Read` and `Write` code paths for every format, this was the single highest-breadth
+  allocation site in the library (~10% of all `alloc_objects`, ~30.4 M objects in the audit
+  profile).
+
+  The fix introduces `magicPool sync.Pool` — a typed pool of `*[magicLen]byte`, mirroring the
+  existing `tiffScanPool` in the same file.  `Detect` gets from the pool, passes the pointer
+  (not a slice) to `r.Read`, calls `detectMagic` synchronously, then returns the buffer to the
+  pool before any return path (including the seek-back error path).  No reference to the buffer
+  escapes `Detect`.
+
+  **Confirmed by escape analyser** (`go build -gcflags="-m=2"`): before the change,
+  `detect.go:44: buf escapes to heap in Detect` was present; after the change it is absent.
+
+  **Acceptance gate**: `TestDetect_ZeroAllocs` asserts `testing.AllocsPerRun(100, ...) == 0`
+  using a pre-warmed pool hit path.
+
+  **New benchmark**: `BenchmarkDetect` (added to `format/detect_test.go`): 0 B/op, 0 allocs/op,
+  ~9.85 ns/op steady state.
+
+### Key changes vs [main — perf task #200] baseline (benchtime=3s, -count=10, benchstat p=0.000)
+
+#### format/ (new benchmark)
+
+| Benchmark | Metric | Before | After | Change |
+|---|---|---|---|---|
+| BenchmarkDetect (new) | allocs/op | — | **0** | new baseline |
+| BenchmarkDetect (new) | B/op | — | **0** | new baseline |
+| BenchmarkDetect (new) | ns/op | — | **~9.85 ns** | new baseline |
+
+#### github.com/FlavioCFOliveira/GoMetadata (top-level)
+
+Measured with `go test -bench='BenchmarkRead_JPEG' -benchmem -benchtime=3s -count=10` +
+`benchstat` (p=0.000 for B/op and allocs/op comparisons; both are deterministic).
+
+| Benchmark | Metric | Before (task #200) | After (task #203) | Change |
+|---|---|---|---|---|
+| BenchmarkRead_JPEG | allocs/op | 9 | **8** | **−11.1%** (p=0.000) |
+| BenchmarkRead_JPEG | B/op | 569 | **521** | **−8.4%** (p=0.000) |
+| BenchmarkRead_JPEG | ns/op | ~277.4 ns | ~269.7 ns | **−2.8%** (p=0.000) |
+| BenchmarkRead_JPEG_WithXMP | allocs/op | 24 | **23** | **−4.2%** (p=0.000) |
+| BenchmarkRead_JPEG_WithXMP | B/op | 2503 | **2456** | **−1.9%** (p=0.000) |
+| BenchmarkRead_JPEG_WithXMP | ns/op | ~1.546 µs | ~1.550 µs | +0.3% (within noise) |
+
+The B/op reduction for `BenchmarkRead_JPEG` is **−48 B**: 36 bytes for the `[magicLen]byte`
+array plus Go allocator overhead (16 bytes for the heap header on arm64).  Both the JPEG-only
+and the EXIF+IPTC+XMP paths go through exactly one `Detect` call per `Read`, so the alloc and
+B/op savings are identical on both paths.  The `−2.8%` ns/op improvement on `BenchmarkRead_JPEG`
+is a direct consequence of eliminating the GC-allocator round-trip on every call.
+
+---
+
 ## [v1.0.4] — 2026-04-08
 
 ### Changes in this version

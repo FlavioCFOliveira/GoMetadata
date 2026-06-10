@@ -6,6 +6,9 @@ import (
 	"testing"
 )
 
+// jpegMagic is a minimal JPEG magic byte slice used in detection benchmarks.
+var jpegMagic = []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01} //nolint:gochecknoglobals // test-package global: shared read-only fixture across benchmark and allocs test
+
 func TestDetect(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -753,6 +756,53 @@ func TestCR2DetectionRequiresValidation(t *testing.T) {
 			t.Errorf("#136 regression: Detect = %v, want FormatCR2 for valid CR2 header", got)
 		}
 	})
+}
+
+// TestDetect_ZeroAllocs is the acceptance-criteria gate for task #203.
+//
+// Detect must contribute 0 allocs/op on the warm (pool-hit) path for every
+// non-TIFF format: the magic-byte buffer is now pooled via magicPool and
+// consumed synchronously before any return path.
+//
+// Note: bytes.NewReader itself allocates 1 heap object per call (it wraps a
+// struct), so the total allocs/op seen in a benchmark loop that creates a new
+// Reader each iteration is 1 (the Reader), not 0.  This test uses a single
+// pre-allocated Reader whose position is reset between iterations so that
+// Detect itself contributes exactly 0 additional allocations.
+//
+//nolint:paralleltest // testing.AllocsPerRun must not run in parallel
+func TestDetect_ZeroAllocs(t *testing.T) {
+	r := bytes.NewReader(jpegMagic)
+
+	// Warm the pool to guarantee a pool hit on the first measured iteration.
+	_, _ = Detect(r)
+
+	allocs := testing.AllocsPerRun(100, func() {
+		r.Seek(0, 0) //nolint:errcheck,gosec // G104: seek on bytes.Reader never fails
+		_, _ = Detect(r)
+	})
+
+	if allocs != 0 {
+		t.Errorf("Detect allocs/op = %g, want 0 (task #203: magic-byte buffer must be pooled)", allocs)
+	}
+}
+
+// BenchmarkDetect measures the per-call allocation cost of format.Detect on a
+// non-TIFF format (JPEG), isolating the magic-byte scan path from the TIFF
+// variant refinement path.  After task #203 this must reach 0 allocs/op on the
+// pool-hit steady state.
+//
+// A pre-built bytes.Reader is reset each iteration so that only Detect's own
+// allocations are counted — not the Reader construction overhead.
+func BenchmarkDetect(b *testing.B) {
+	r := bytes.NewReader(jpegMagic)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		r.Seek(0, 0) //nolint:errcheck,gosec // G104: seek on bytes.Reader never fails
+		_, _ = Detect(r)
+	}
 }
 
 // TestDetectTIFFHighIFD0Offset is the 32-bit-safe regression test for task #74.
