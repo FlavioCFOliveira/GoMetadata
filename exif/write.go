@@ -3,7 +3,78 @@ package exif
 import (
 	"encoding/binary"
 	"sort"
+	"sync"
 )
+
+// entrySlicePool recycles the scratch []IFDEntry slices used by
+// buildIFD0Entries and buildExifIFDEntries during serialise.
+//
+// Performance audit 2026-06-10, finding F41: filterEntries allocated
+// 652 MB (6.68% of alloc_space on the read/write profile) and was the
+// #2 flat allocator on the TIFF relocate profile (2450 MB = 9.35%).
+// It runs twice per Encode (once for IFD0, once for ExifIFD), and twice
+// more per relocate before task #220 eliminates the double-encode.
+//
+// The pool stores *[]IFDEntry (pointer to a slice header) so that the
+// backing array survives GC and is reused across Encode calls.  The
+// element type (IFDEntry, 48 B after task #199) makes even moderate-sized
+// IFDs cheap to recycle: a 60-entry camera IFD0 is 60×48 = 2880 B, well
+// under the iobuf largeSize threshold.
+//
+// Safety contract (buffer-lifetime risk class, cf. audit finding #56/#72):
+//   - Get/Put are always paired within a single serialise call.
+//   - Elements are zeroed before Put (clear) so IFDEntry.Value aliases —
+//     which point into the caller's live IFD data — do not prevent GC of
+//     caller-owned byte slices between Encode calls.
+//   - The scratch slice never escapes serialise: every consumer
+//     (ifdTotalSize, computeIFDOffsets, patchPointers, writeTIFFHeader,
+//     writeIFD, writeSubIFDs) reads from it within the same call frame and
+//     retains no reference after returning.
+//
+//nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure; identical pattern to visitedPool in ifd.go
+var entrySlicePool = sync.Pool{
+	New: func() any {
+		// 64 entries covers typical camera IFD0 (≤20) + ExifIFD (≤40) with room
+		// to spare.  Capacity is grown by append if a real IFD exceeds this; the
+		// enlarged backing array is discarded rather than pooled (see putEntrySlice).
+		s := make([]IFDEntry, 0, 64)
+		return &s
+	},
+}
+
+// getEntrySlice returns a pooled *[]IFDEntry reset to length 0.
+// The caller must call putEntrySlice when finished.
+func getEntrySlice() *[]IFDEntry {
+	p := entrySlicePool.Get().(*[]IFDEntry) //nolint:forcetypeassert,revive // entrySlicePool.New always stores *[]IFDEntry; pool invariant
+	*p = (*p)[:0]
+	return p
+}
+
+// putEntrySlice zeros the elements of *p (releasing Value aliases) and
+// returns *p to the pool.  Slices whose backing array grew beyond the
+// canonical capacity (128 entries = 6144 B after task #199) are discarded
+// to prevent a runaway encode from permanently inflating the pool.
+//
+// The canonical cap threshold (128) is chosen to be ≥2× the 64-entry New
+// default and large enough to absorb real-world IFDs (no known camera
+// produces an IFD0 with more than 60 entries, and ExifIFD with more than 60)
+// without leaving oversized arrays in the pool.
+func putEntrySlice(p *[]IFDEntry) {
+	if p == nil {
+		return
+	}
+	const maxPooledCap = 128
+	if cap(*p) > maxPooledCap {
+		// Discard: the array grew too large; do not return it to the pool.
+		return
+	}
+	// Zero the live elements so IFDEntry.Value byte-slice aliases are released.
+	// This prevents caller-owned Value data from being pinned in the pool across
+	// Encode calls.  clear() compiles to a single memclr — negligible cost.
+	clear(*p)
+	*p = (*p)[:0]
+	entrySlicePool.Put(p)
+}
 
 // serialise encodes e to a raw EXIF byte stream beginning with the TIFF
 // header. The caller is responsible for prepending the "Exif\x00\x00"
@@ -51,8 +122,23 @@ func serialise(e *EXIF) ([]byte, error) {
 	// Stack-allocated arrays avoid one heap allocation per sub-IFD pointer.
 	var exifPtrBuf, gpsPtrBuf, interopPtrBuf [4]byte
 
-	ifd0Entries := buildIFD0Entries(e, order, &exifPtrBuf, &gpsPtrBuf)
-	exifIFDEntries := buildExifIFDEntries(e, order, &interopPtrBuf)
+	// Acquire pooled scratch slices for the IFD0 and ExifIFD entry lists.
+	// Both are returned to the pool (with elements zeroed) via deferred puts,
+	// which fire on ALL return paths — including the BigTIFF error return above
+	// (though the Gets are after that check, so BigTIFF still returns early
+	// without touching the pool).  This single-ownership discipline ensures
+	// each pooled pointer is Put exactly once.
+	//
+	// Performance audit 2026-06-10, finding F41: filterEntries was the #2
+	// flat allocator on the TIFF relocate profile.  Pooling eliminates both
+	// per-Encode make([]IFDEntry) calls.
+	ifd0Ptr := getEntrySlice()
+	defer putEntrySlice(ifd0Ptr)
+	exifPtr := getEntrySlice()
+	defer putEntrySlice(exifPtr)
+
+	ifd0Entries := buildIFD0Entries(e, order, &exifPtrBuf, &gpsPtrBuf, ifd0Ptr)
+	exifIFDEntries := buildExifIFDEntries(e, order, &interopPtrBuf, exifPtr)
 
 	exifStart, gpsStart, interopStart, ifd1Start := computeIFDOffsets(e, ifd0Entries, exifIFDEntries)
 
@@ -216,8 +302,13 @@ func patchThumbnailEntries(entries []IFDEntry, order binary.ByteOrder, newOffset
 // entries for ExifIFD and GPS IFD (using the caller-supplied stack buffers),
 // and returns a sorted slice. The placeholder values are patched later by
 // patchPointers once the target offsets are known.
-func buildIFD0Entries(e *EXIF, order binary.ByteOrder, exifPtrBuf, gpsPtrBuf *[4]byte) []IFDEntry {
-	entries := filterEntries(e.IFD0, 2,
+//
+// scratch is a pooled *[]IFDEntry obtained by the caller via getEntrySlice.
+// buildIFD0Entries populates *scratch (resliced to 0 before use) and returns
+// a slice that aliases *scratch's backing array.  The caller must not Put
+// scratch until all consumers of the returned slice have finished.
+func buildIFD0Entries(e *EXIF, order binary.ByteOrder, exifPtrBuf, gpsPtrBuf *[4]byte, scratch *[]IFDEntry) []IFDEntry {
+	entries := filterEntriesInto(e.IFD0, scratch, 2,
 		TagExifIFDPointer, TagGPSIFDPointer, TagInteropIFDPointer)
 
 	// Reserve pointer entries so ifdTotalSize accounts for them correctly.
@@ -231,6 +322,8 @@ func buildIFD0Entries(e *EXIF, order binary.ByteOrder, exifPtrBuf, gpsPtrBuf *[4
 		entries = append(entries, IFDEntry{Tag: TagGPSIFDPointer, Type: TypeLong, Count: 1, Value: gpsPtrBuf[:], bigEndian: isBig})
 	}
 	sortEntries(entries)
+	// Sync the pooled slice header so putEntrySlice can zero the live elements.
+	*scratch = entries
 	return entries
 }
 
@@ -268,7 +361,7 @@ func buildIFD0Entries(e *EXIF, order binary.ByteOrder, exifPtrBuf, gpsPtrBuf *[4
 //
 // Reference: EXIF §4.6.5 tag 0x927C; ExifTool Sony.pm, Olympus.pm, Panasonic.pm,
 // Nikon.pm; empirical analysis per #127.
-func buildExifIFDEntries(e *EXIF, order binary.ByteOrder, interopPtrBuf *[4]byte) []IFDEntry {
+func buildExifIFDEntries(e *EXIF, order binary.ByteOrder, interopPtrBuf *[4]byte, scratch *[]IFDEntry) []IFDEntry {
 	if e.ExifIFD == nil {
 		return nil
 	}
@@ -278,7 +371,7 @@ func buildExifIFDEntries(e *EXIF, order binary.ByteOrder, interopPtrBuf *[4]byte
 	// lives in ExifIFD, not IFD0).
 	// task #199: bigEndian flag replaces binary.ByteOrder interface.
 	isBig := order == binary.BigEndian
-	entries := filterEntries(e.ExifIFD, 2, TagInteropIFDPointer)
+	entries := filterEntriesInto(e.ExifIFD, scratch, 2, TagInteropIFDPointer)
 	if e.InteropIFD != nil {
 		entries = append(entries, IFDEntry{Tag: TagInteropIFDPointer, Type: TypeLong, Count: 1, Value: interopPtrBuf[:], bigEndian: isBig})
 	}
@@ -292,6 +385,8 @@ func buildExifIFDEntries(e *EXIF, order binary.ByteOrder, interopPtrBuf *[4]byte
 		})
 	}
 	sortEntries(entries)
+	// Sync the pooled slice header so putEntrySlice can zero the live elements.
+	*scratch = entries
 	return entries
 }
 

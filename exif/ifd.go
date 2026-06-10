@@ -1513,22 +1513,41 @@ func utf8Value(s string) []byte {
 
 // --- helpers used by encode ---
 
-// filterEntries returns a copy of ifd.Entries with the given tags removed,
-// with capacity extended by extraCap to allow callers to append without
-// triggering a reallocation.
+// filterEntriesInto copies ifd.Entries into the pooled scratch buffer *dst
+// (resliced to 0), omitting any tag in the exclude list, and returns a slice
+// that aliases *dst's backing array.  It is the encode path's replacement for
+// the former allocating filterEntries function.
 //
-// All callers pass at most 3 tags, so a linear scan over the exclude slice
-// is cheaper than a map allocation (no heap escape, no hashing overhead).
+// Design note: this function is called exclusively by buildIFD0Entries and
+// buildExifIFDEntries in write.go, which obtain *dst from entrySlicePool.
+// After use the caller must sync *dst = result and then call putEntrySlice
+// so that the zero-before-Put step covers all live elements.
 //
-// Fast path: when none of the excluded tags are present (checked via binary
-// search) the function still returns a copy because callers append to the
-// result — returning the original slice would corrupt the source IFD.
-func filterEntries(ifd *IFD, extraCap int, exclude ...TagID) []IFDEntry {
+// The function is equivalent to the removed filterEntries except that it
+// reuses the provided backing array instead of allocating a fresh one:
+//
+//   - All callers pass at most 3 exclude tags, so a linear scan (no map
+//     allocation, no hashing overhead) is cheaper than a hash-based approach.
+//   - Fast path: when no excluded tag is present, a bulk copy is used so the
+//     entire entries array can be transferred with a single memcopy.
+//   - Returning the original slice is NOT safe (callers append pointer entries
+//     and sort the result, which would mutate the source IFD) — that is why a
+//     copy is always made, either via the pooled buffer or a fresh allocation
+//     when the pooled cap is exceeded.
+//   - extraCap spare slots are ensured beyond the filtered length so callers
+//     can append pointer placeholder entries without triggering a reallocation.
+//
+// Performance audit 2026-06-10, finding F41: this replaces the two per-Encode
+// make([]IFDEntry) calls that together accounted for 9.35% of alloc_space on
+// the TIFF relocate profile.
+func filterEntriesInto(ifd *IFD, dst *[]IFDEntry, extraCap int, exclude ...TagID) []IFDEntry {
 	if ifd == nil {
 		return nil
 	}
-	// Fast path: check whether any excluded tag is actually present before
-	// allocating the filtered result. Binary search is O(log n) per tag.
+	// Reuse the pooled backing array.  Reset to length 0 while preserving capacity.
+	result := (*dst)[:0]
+
+	// Fast path: no excluded tag present — bulk-copy all entries.
 	anyPresent := false
 	for _, tag := range exclude {
 		if hasEntry(ifd.Entries, tag) {
@@ -1537,17 +1556,28 @@ func filterEntries(ifd *IFD, extraCap int, exclude ...TagID) []IFDEntry {
 		}
 	}
 	if !anyPresent {
-		// No excluded tags present — return a copy with extraCap spare slots so
-		// callers can append without triggering a reallocation.
-		out := make([]IFDEntry, len(ifd.Entries), len(ifd.Entries)+extraCap)
-		copy(out, ifd.Entries)
-		return out
+		// Ensure capacity for len+extraCap entries, then bulk-copy.
+		need := len(ifd.Entries) + extraCap
+		if cap(result) < need {
+			result = make([]IFDEntry, len(ifd.Entries), need)
+		} else {
+			result = result[:len(ifd.Entries)]
+		}
+		copy(result, ifd.Entries)
+		return result
 	}
-	result := make([]IFDEntry, 0, len(ifd.Entries)+extraCap)
+
+	// Filtered path: copy only the non-excluded entries.
 	for _, entry := range ifd.Entries {
 		if !slices.Contains(exclude, entry.Tag) {
 			result = append(result, entry)
 		}
+	}
+	// Ensure the capacity guarantee (extraCap spare slots) is met.
+	if cap(result) < len(result)+extraCap {
+		grown := make([]IFDEntry, len(result), len(result)+extraCap)
+		copy(grown, result)
+		result = grown
 	}
 	return result
 }

@@ -161,6 +161,104 @@ fixture and is therefore unaffected.
 
 ---
 
+## [main — perf task #240] — 2026-06-10 (exif: pool filterEntries scratch slices in buildIFD0Entries/buildExifIFDEntries)
+
+### Optimisation applied in this version
+
+- **task #240 (exif: pool the encode-path scratch slices — library F41 allocator)**:
+  `buildIFD0Entries` and `buildExifIFDEntries` both call `filterEntries`, which did a
+  `make([]IFDEntry, n, n+extraCap) + copy` on every `Encode` call.  On the TIFF relocate profile
+  this was the #2 flat allocator at 9.35% of `alloc_space` (2450 MB per relocate bench run).
+
+  The fix introduces a package-level `entrySlicePool sync.Pool` (same pattern as `visitedPool`
+  in ifd.go and the `iobuf` package).  `serialise` acquires two pooled `*[]IFDEntry` at the top
+  of the call, passes them to `buildIFD0Entries` / `buildExifIFDEntries` (which now call the new
+  `filterEntriesInto` helper that reslices the pooled buffer to 0 and bulk-copies into it), and
+  returns both to the pool via deferred `putEntrySlice` calls.
+
+  **Safety contract**:
+  - Both Gets happen after the BigTIFF early-return check, so they are always paired with their
+    deferred Puts on every non-BigTIFF code path.
+  - `putEntrySlice` zeros the live elements (`clear(*p)`) before returning the slice to the pool,
+    releasing `IFDEntry.Value` byte-slice aliases (which point into the caller's live IFD data)
+    and preventing cross-call GC pinning.
+  - The scratch slices never escape `serialise`: every consumer (`ifdTotalSize`, `computeIFDOffsets`,
+    `patchPointers`, `writeTIFFHeader`, `writeIFD`, `writeSubIFDs`) reads the slice within the same
+    call frame and retains no reference to it after returning.
+  - Slices whose backing array grew beyond 128 entries (6144 B; would only occur for pathological
+    IFDs with >128 entries) are discarded rather than pooled to prevent unbounded pool growth.
+
+  **Regression gates added** (`exif/task240_entry_pool_test.go`):
+  - `TestTask240_EncodeDoesNotMutateIFD0` — Encode must not reorder or alter source IFD0 entries.
+  - `TestTask240_EncodeDoesNotMutateExifIFD` — same for ExifIFD.
+  - `TestTask240_ConcurrentEncodeByteIdentical` — 20 goroutines × 50 encodes each, run under
+    `-race`, must all produce byte-identical output vs a serial reference encode.
+  - `TestTask240_PoolPutClearsValueAliases` — two successive encodes with different EXIFs produce
+    correct independent outputs (guards against stale Value aliases in pooled slots).
+  - `BenchmarkEXIFEncode_Camera` — new benchmark for a full camera EXIF (IFD0 + ExifIFD + GPSIFD)
+    that exercises both build helpers; was missing before this task.
+
+  Spec: CIPA DC-008-2023 §4.6.2; TIFF 6.0 §2; performance audit 2026-06-10 finding F41.
+
+### Key changes vs [main — perf task #199] baseline (benchtime=3s, -count=10, benchstat p=0.000)
+
+#### exif/
+
+| Benchmark | Metric | Before (task #199) | After (task #240) | Change |
+|---|---|---|---|---|
+| BenchmarkEXIFEncode | ns/op | 156.7 ns | **140.1 ns** | **−10.6%** |
+| BenchmarkEXIFEncode | B/op | 336 | **96** | **−71.4%** |
+| BenchmarkEXIFEncode | allocs/op | 6 | **5** | **−16.7%** |
+| BenchmarkEXIFParse_Camera | ns/op | 1.442 µs | 1.438 µs | flat within noise |
+| BenchmarkEXIFParse_Camera | B/op | 2482 | 2482 | 0 (parse path untouched) |
+| BenchmarkEXIFParse_Camera | allocs/op | 6 | 6 | 0 (parse path untouched) |
+| BenchmarkEXIFEncode_Camera (new) | ns/op | — | **1.12 µs** | new baseline |
+| BenchmarkEXIFEncode_Camera (new) | B/op | — | **1651** | new baseline |
+| BenchmarkEXIFEncode_Camera (new) | allocs/op | — | **21** | new baseline |
+
+#### github.com/FlavioCFOliveira/GoMetadata (top-level write benchmarks)
+
+| Benchmark | Metric | Before (task #199) | After (task #240) | Change |
+|---|---|---|---|---|
+| BenchmarkWrite_JPEG | B/op | 448 | **305** | **−31.9%** |
+| BenchmarkWrite_JPEG | allocs/op | 16 | **15** | **−6.3%** |
+| BenchmarkWrite_JPEG | ns/op | 406.4 ns | 404.5 ns | flat (−0.5%, p=0.033) |
+| BenchmarkWrite_PNG | B/op | 184 | 184 | 0 (PNG fixture has IFD0-only EXIF) |
+| BenchmarkWrite_PNG | allocs/op | 16 | 16 | 0 |
+| BenchmarkWrite_PNG | ns/op | 280.6 ns | 283.0 ns | +0.9% (within noise) |
+
+Note: `BenchmarkWrite_PNG` uses an IFD0-only EXIF fixture (no ExifIFD), so `buildExifIFDEntries`
+returns nil and only the IFD0 scratch slice is allocated.  The pooled IFD0 scratch slice for this
+fixture is smaller than the 64-entry pool default, so the pool hit is a no-op on the first call
+and the allocation count is unchanged.  The benchmark isolates the PNG container overhead, which
+dominates.
+
+#### format/tiff (relocate benchmarks — the primary target of F41)
+
+| Benchmark | Metric | Before (task #199) | After (task #240) | Change |
+|---|---|---|---|---|
+| BenchmarkRelocateSingleStrip | B/op | 8412 | **7462** | **−11.3%** |
+| BenchmarkRelocateSingleStrip | allocs/op | 30 | **28** | **−6.7%** |
+| BenchmarkRelocateSingleStrip | ns/op | 1.960 µs | 1.933 µs | −1.4% (p=0.000) |
+| BenchmarkRelocateMultiStrip | B/op | 11207 | **10265** | **−8.4%** |
+| BenchmarkRelocateMultiStrip | allocs/op | 36 | **34** | **−5.6%** |
+| BenchmarkRelocateMultiStrip | ns/op | 2.399 µs | 2.442 µs | +1.8% (within noise) |
+| BenchmarkRelocateDNGLike | B/op | 14326 | **13457** | **−6.1%** |
+| BenchmarkRelocateDNGLike | allocs/op | 44 | **42** | **−4.5%** |
+| BenchmarkRelocateDNGLike | ns/op | 3.069 µs | 3.128 µs | +1.9% (within noise) |
+| geomean B/op | — | 10.79 Ki | **9.865 Ki** | **−8.6%** |
+| geomean allocs/op | — | 36.22 | **34.19** | **−5.6%** |
+
+#### pprof confirmation (`-memprofile` on BenchmarkRelocateSingleStrip, -benchtime=10s)
+
+`filterEntries` / `filterEntriesInto` is absent from the top-20 `alloc_space` nodes.
+Before task #240 it appeared as the #2 flat allocator at 9.35% of `alloc_space`; the
+node is now gone.  `exif.serialise` drops to 0.38% flat (down from combined ~9.7%),
+confirming that only the output-buffer allocation (heap-inescapable) remains on the
+encode hot path.
+
+---
+
 ## [v1.0.4] — 2026-04-08
 
 ### Changes in this version
