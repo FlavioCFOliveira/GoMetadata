@@ -60,6 +60,32 @@ var makerNoteParsers = map[string]func([]byte, binary.ByteOrder) *IFD{
 //   - Samsung: plain IFD at offset 0, parent byte order
 //   - Sigma: "SIGMA\0\0\0" or "FOVEON\0\0" prefix, LE IFD at offset 10
 //   - Casio: plain IFD at offset 0, parent byte order
+//
+// Arena exclusion (task #198, performance audit 2026-06-10):
+// The per-Parse lazy sub-IFD arena (parseArena in Parse) does NOT extend to
+// MakerNote IFDs.  There are three reasons:
+//
+//  1. Buffer origin: every manufacturer parser calls traverse(mn.Value, off, order)
+//     where mn.Value is the raw MakerNote blob.  Some parsers (Nikon Type 3,
+//     Fujifilm) further sub-slice that blob (e.g. tiff := b[tiffStart:]).
+//     IFDEntry.Value fields in MakerNote IFDs alias a different buffer origin
+//     from the main TIFF parse buffer; mixing them into the same entryBatch
+//     arena would violate the cap-clamping safety contract.
+//
+//  2. Format detection is interleaved with parsing: the 18+ manufacturer paths
+//     determine IFD count only after running format-detection heuristics (magic
+//     prefix check, byte-order scan, offset lookup).  Pre-scanning to obtain an
+//     entry count would require duplicating all that logic — significant
+//     complexity for ~2 allocs/op gain on camera files.
+//
+//  3. Unknown IFD count at scan time: scanSubIFDs (the arena pre-scan) runs
+//     before parseExifSubIFDs, before the Make tag is available to select a
+//     parser.  Without knowing the manufacturer format we cannot predict the IFD
+//     start offset or count.
+//
+// MakerNote IFDs therefore use the standard per-IFD allocation path (traverse →
+// parseSingleIFD → *IFD + []IFDEntry per IFD).  BenchmarkMakerNoteDispatch
+// holds steady at 6 allocs/op and ~280 ns/op, unchanged by the arena work.
 func parseMakerNoteIFD(b []byte, cameraMake string, parentOrder binary.ByteOrder) *IFD {
 	// Trim surrounding whitespace: real-world files (Canon, Nikon) sometimes store
 	// Make values with trailing spaces. ExifTool normalises the value before its

@@ -28,6 +28,221 @@ var visitedPoolBigTIFF = sync.Pool{ //nolint:gochecknoglobals // sync.Pool: reus
 	New: func() any { return make(map[uint64]bool) },
 }
 
+// maxArenaHints is the maximum number of per-IFD entry-count hints that can be
+// stored in parseArena without a heap allocation. 16 covers all realistic camera
+// EXIF trees (IFD0, IFD1, ExifIFD, InteropIFD, GPSIFD + spares).
+const maxArenaHints = 16
+
+// parseArena is a per-Parse-call allocation arena for IFD structs and their
+// entry backing slices. It is created once in Parse (after a cheap pre-scan)
+// and threaded to all traverseWithArena calls, eliminating the per-IFD
+// *IFD + []IFDEntry pair of allocations.
+//
+// Arena safety contract (task #198, performance audit 2026-06-10):
+//   - ifdBatch is allocated with exact capacity (ifdN == len); it must NEVER
+//     be grown after construction — taking &ifdBatch[i] is safe only when
+//     the slice header cannot move.
+//   - Per-IFD entry sub-slices are cap-clamped (s[:0:count]) so any
+//     slices.Insert beyond cap reallocates outside the arena and cannot
+//     overwrite a neighbour's entry region.
+//   - MakerNote IFDs (allocated from a separate MakerNote blob) are NOT
+//     tracked by this arena; they use the regular per-call allocators.
+//
+// hints is a fixed-size array of per-IFD clamped entry counts, populated by
+// scanAllClassicIFDs in the same IFD traversal order that Parse will use.
+// traverseWithArena reads the next hint instead of re-reading the count field
+// from the buffer, eliminating a duplicate memory access per IFD.
+//
+// Lifetime: parseArena is stack-allocated in Parse and escapes to the heap
+// only if the Go escape analyser decides so (unavoidable because traverseWithArena
+// takes a pointer). The IFD and IFDEntry backing slices within it outlive Parse
+// and are retained by the caller through the EXIF struct fields.
+type parseArena struct {
+	ifdBatch   []IFD              // pre-allocated backing for all IFD structs
+	entryBatch []IFDEntry         // pre-allocated backing for all IFDEntry slices
+	hints      [maxArenaHints]int // per-IFD clamped entry counts, in traversal order
+	ifdN       int                // next free slot in ifdBatch
+	entryN     int                // next free position in entryBatch
+	hintN      int                // number of valid hints populated by scanAllClassicIFDs
+	hintRead   int                // next hint index to read in traverseWithArena
+}
+
+// allocIFD returns the next free IFD slot from the arena, or nil if the arena
+// is nil or exhausted. The returned pointer is stable for the arena's lifetime.
+func (a *parseArena) allocIFD() *IFD {
+	if a == nil || a.ifdN >= len(a.ifdBatch) {
+		return nil
+	}
+	p := &a.ifdBatch[a.ifdN]
+	a.ifdN++
+	return p
+}
+
+// allocEntries returns a length-zero, cap-clamped sub-slice of entryBatch for
+// exactly count entries. Returns nil when the arena is nil or has fewer than
+// count entries remaining (callers must fall back to make in that case).
+//
+// Cap-clamping (s[lo:lo:lo+count]) ensures that any append beyond cap
+// reallocates outside the arena and cannot overwrite a neighbouring IFD's
+// entry region — arena safety invariant. task #198.
+func (a *parseArena) allocEntries(count int) []IFDEntry {
+	if a == nil || count <= 0 || a.entryN+count > len(a.entryBatch) {
+		return nil
+	}
+	lo := a.entryN
+	a.entryN += count
+	return a.entryBatch[lo : lo : lo+count]
+}
+
+// recordHint appends a clamped entry count hint for the next IFD in traversal
+// order. Silently dropped when the hints array is full (fallback: traverseWithArena
+// re-reads the count from the buffer).
+func (a *parseArena) recordHint(count int) {
+	if a.hintN < maxArenaHints {
+		a.hints[a.hintN] = count
+		a.hintN++
+	}
+}
+
+// nextHint returns the pre-scanned clamped entry count for the current IFD and
+// advances the hint cursor. Returns (0, false) when no more hints are available
+// (traverseWithArena falls back to re-reading the count from the buffer).
+func (a *parseArena) nextHint() (int, bool) {
+	if a == nil || a.hintRead >= a.hintN {
+		return 0, false
+	}
+	v := a.hints[a.hintRead]
+	a.hintRead++
+	return v, true
+}
+
+// EXIF sub-IFD pointer tag IDs used by scanSubIFDs.
+// EXIF §4.6.3: ExifIFD pointer = 0x8769; GPS IFD pointer = 0x8825;
+// Interop IFD pointer = 0xA005.
+const (
+	tagExifIFDPointer    TagID = 0x8769
+	tagGPSIFDPointer     TagID = 0x8825
+	tagInteropIFDPointer TagID = 0xA005
+)
+
+// scanSubIFDs counts IFDs and entries for the EXIF sub-IFDs (ExifIFD,
+// InteropIFD, GPSIFD) reachable from already-known pointer offsets.
+//
+// This is the lazy-arena variant used when IFD0 has already been parsed by
+// traverse and the caller wants to co-allocate only the sub-IFD structs and
+// entry backing arrays.  Unlike scanAllClassicIFDs it does NOT re-scan IFD0
+// (its entries are already in memory as IFDEntry values).
+//
+// exifOff and gpsOff are the raw uint32 offset values from the corresponding
+// IFD pointer tags in IFD0 (0 means absent).  InteropIFD (0xA005) is found
+// by scanning ExifIFD's entries.
+//
+// Arena hints are populated in the SAME order that traverseWithArena will
+// consume them, which matches the call order in parseExifSubIFDs and
+// parseGPSSubIFD:
+//
+//  1. ExifIFD (parseExifSubIFDs → traverseWithArena at the top of the function)
+//  2. InteropIFD (parseExifSubIFDs → traverseWithArena inside the interop block)
+//  3. GPSIFD (parseGPSSubIFD → traverseWithArena)
+//
+// Assumes sub-IFDs are single IFDs (no next-IFD chain) — this is universally
+// true for compliant files and is the same assumption scanAllClassicIFDs makes
+// in its fast path.  Count clamping matches parseSingleIFD.
+//
+// CIPA DC-008-2019 §4.5.2; EXIF §4.6.3; TIFF 6.0 §2.
+func scanSubIFDs(b []byte, exifOff, gpsOff uint32, order binary.ByteOrder, arena *parseArena) (nSubIFDs, totalSubEntries int) { //nolint:gocyclo,cyclop // per-sub-IFD bounds+clamp guards are inherent; count is low
+	const maxPrealloc = 1024
+
+	// --- ExifIFD (hint slot 0) ---
+	var interopOff uint32
+	if exifOff != 0 && uint64(exifOff)+2 <= uint64(len(b)) { //nolint:nestif // bounds+fallback+interop scan are inherent in a safe pre-scan; complexity is low
+		rawCount := int(order.Uint16(b[exifOff:]))
+		exifPos := int(exifOff) + 2
+		count := rawCount
+		if exifPos+count*12 > len(b) {
+			available := (len(b) - exifPos) / 12
+			if available > 0 {
+				count = available
+			} else {
+				goto gpsSection
+			}
+		}
+		count = min(count, maxPrealloc)
+
+		nSubIFDs++
+		totalSubEntries += count
+		arena.recordHint(count) // hint[0]: ExifIFD entry count
+
+		// Scan ExifIFD for InteropIFD pointer (tag 0xA005).
+		// Most entries are below 0xA005; the unsigned comparison provides a fast
+		// exit for the common case.  InteropIFD can appear at most once.
+		for i := 0; i < count; i++ { //nolint:intrange // binary parser: loop variable is a byte-slice offset multiplier
+			eOff := exifPos + i*12
+			if eOff+2 > len(b) {
+				break
+			}
+			tag := TagID(order.Uint16(b[eOff:]))
+			if tag != tagInteropIFDPointer {
+				continue
+			}
+			if eOff+12 > len(b) {
+				break
+			}
+			typ := DataType(order.Uint16(b[eOff+2:]))
+			cnt := order.Uint32(b[eOff+4:])
+			if cnt == 1 && (typ == TypeLong || typ == TypeShort) {
+				interopOff = order.Uint32(b[eOff+8:])
+			}
+			break
+		}
+	}
+
+	// --- InteropIFD (hint slot 1, if present) ---
+	// Must be recorded BEFORE GPSIFD to match parseExifSubIFDs' call order
+	// (InteropIFD traversal happens inside parseExifSubIFDs, before parseGPSSubIFD).
+	if interopOff != 0 && uint64(interopOff)+2 <= uint64(len(b)) {
+		rawCount := int(order.Uint16(b[interopOff:]))
+		interopPos := int(interopOff) + 2
+		count := rawCount
+		if interopPos+count*12 > len(b) {
+			available := (len(b) - interopPos) / 12
+			if available > 0 {
+				count = available
+			} else {
+				goto gpsSection
+			}
+		}
+		count = min(count, maxPrealloc)
+
+		nSubIFDs++
+		totalSubEntries += count
+		arena.recordHint(count) // hint[1]: InteropIFD entry count
+	}
+
+gpsSection:
+	// --- GPSIFD (last hint slot) ---
+	if gpsOff != 0 && uint64(gpsOff)+2 <= uint64(len(b)) {
+		rawCount := int(order.Uint16(b[gpsOff:]))
+		gpsPos := int(gpsOff) + 2
+		count := rawCount
+		if gpsPos+count*12 > len(b) {
+			available := (len(b) - gpsPos) / 12
+			if available > 0 {
+				count = available
+			} else {
+				return nSubIFDs, totalSubEntries
+			}
+		}
+		count = min(count, maxPrealloc)
+
+		nSubIFDs++
+		totalSubEntries += count
+		arena.recordHint(count) // hint[last]: GPSIFD entry count
+	}
+
+	return nSubIFDs, totalSubEntries
+}
+
 // IFD represents a TIFF Image File Directory (TIFF §2).
 // Entries must remain sorted by Tag in ascending order (TIFF §7) so that
 // Get() can use binary search. Use set() to modify entries; code that
@@ -164,7 +379,7 @@ func parseIFDEntry(b []byte, e, ifdStart, ifdEnd int, order binary.ByteOrder) (I
 //
 //   - #132 (TIFF 6.0 §2): OOL value offsets that alias the IFD directory region
 //     produce a ParseWarning but the entry is kept (lenient parse).
-func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint32, bool, []string) { //nolint:gocyclo,cyclop // lenient-parse recovery branches (R-05/#126/#132) are inherent in the spec-driven logic
+func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint32, bool, []string) { //nolint:cyclop // lenient-parse recovery branches (R-05/#126/#132) are inherent in the spec-driven logic
 	// Use uint64 arithmetic to avoid int truncation on 32-bit platforms
 	// (GOARCH=386/arm): int(uint32 >= 2^31) is negative, which would cause the
 	// guard to pass while the subsequent slice panics. Performing the comparison
@@ -205,7 +420,72 @@ func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint
 	const maxIFDEntryPrealloc = 1024
 	preallocCap := min(count, maxIFDEntryPrealloc)
 	ifd := &IFD{Entries: make([]IFDEntry, 0, preallocCap)}
-	for i := 0; i < count; i++ { //nolint:intrange // binary parser: loop variable is a byte-slice offset multiplier
+	return fillIFD(b, ifd, offset, pos, count, ifdStart, ifdEnd, order, warnings)
+}
+
+// parseSingleIFDInto is the arena-aware variant of parseSingleIFD.
+// Instead of allocating a new *IFD and a fresh []IFDEntry backing array, it
+// writes into the caller-supplied ifd (a pointer into a pre-allocated []IFD
+// batch from parseArena) and uses entrySlice (a capped sub-slice of a
+// pre-allocated []IFDEntry batch from parseArena) as the initial Entries
+// backing store.
+//
+// The entrySlice must have len == 0 and cap == the clamped entry count for
+// this IFD (as returned by parseArena.allocEntries). The cap-clamping ensures
+// that any later slices.Insert on ifd.Entries reallocates outside the arena,
+// never bleeding into a neighbour's region (task #198 arena safety contract).
+//
+// Callers must NOT re-use or grow the ifdBatch slice after calling this
+// function — pointers to batch elements are retained by the caller.
+func parseSingleIFDInto(b []byte, ifd *IFD, entrySlice []IFDEntry, offset uint32, order binary.ByteOrder) (uint32, bool, []string) { //nolint:cyclop // same lenient-parse branches as parseSingleIFD
+	if uint64(offset)+2 > uint64(len(b)) {
+		return 0, false, nil
+	}
+
+	count := int(order.Uint16(b[offset:]))
+	pos := int(offset) + 2
+
+	var warnings []string
+
+	if pos+count*12 > len(b) {
+		available := (len(b) - pos) / 12
+		if available <= 0 {
+			return 0, false, nil
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"exif: IFD at offset %d declares %d entries but only %d fit in the buffer (len %d); clamped — lenient parse (CIPA DC-008 §4.5.2)",
+			offset, count, available, len(b)))
+		count = available
+	}
+
+	ifdStart := int(offset)
+	ifdEnd := pos + count*12 + 4
+
+	// Use the caller-supplied arena slice as the initial backing store.
+	// entrySlice has len=0 and cap=slotCount (via arena.allocEntries).
+	// We use entrySlice[:0:cap(entrySlice)] so ifd.Entries starts with the
+	// correct capacity — using len(entrySlice) would give cap=0 since
+	// allocEntries returns a zero-length slice.
+	//
+	// task #198: arena safety — cap-clamped sub-slice ensures append beyond
+	// cap reallocates outside the arena and cannot overwrite a neighbour's region.
+	ifd.Entries = entrySlice[:0:cap(entrySlice)]
+	_, next, _, w := fillIFD(b, ifd, offset, pos, count, ifdStart, ifdEnd, order, warnings)
+	return next, true, w
+}
+
+// fillIFD populates ifd.Entries from the IFD at the given offset/pos and
+// applies the sort+dedup pass and thumbnail extraction. It returns ifd, the
+// next-IFD offset, ok=true, and accumulated warnings.
+//
+// This function is the shared body of parseSingleIFD and parseSingleIFDInto,
+// extracted to avoid code duplication. It assumes all count-clamping and OOB
+// checks have already been performed by the caller.
+//
+// ifd.Entries must already be set to a slice with len==0 and the correct cap
+// before this function is called.
+func fillIFD(b []byte, ifd *IFD, offset uint32, pos, count, ifdStart, ifdEnd int, order binary.ByteOrder, warnings []string) (*IFD, uint32, bool, []string) { //nolint:cyclop // lenient-parse branches (#126/#132) are inherent
+	for i := 0; i < count; i++ { //nolint:intrange,modernize // binary parser: loop variable is a byte-slice offset multiplier
 		entry, ok, warn := parseIFDEntry(b, pos+i*12, ifdStart, ifdEnd, order)
 		if warn != "" {
 			warnings = append(warnings, warn)
@@ -229,6 +509,10 @@ func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint
 	// Audit finding #126: dedupe duplicate tags, keeping the FIRST occurrence.
 	// After the stable sort, duplicates are adjacent. Walk forward and remove
 	// any entry whose tag equals its predecessor. Record a warning for each drop.
+	//
+	// Arena safety (task #198): ifd.Entries is cap-clamped (s[:0:n]) so this
+	// in-place compaction — which only shrinks the slice — stays within the
+	// slice's own cap region and cannot corrupt a neighbouring IFD's entries.
 	if len(ifd.Entries) > 1 {
 		out := ifd.Entries[:1]
 		for i := 1; i < len(ifd.Entries); i++ {
@@ -339,7 +623,126 @@ func extractJPEGThumbnail(b []byte, ifd *IFD, order binary.ByteOrder) []byte { /
 // already parsed are returned successfully. This matches ExifTool's behaviour
 // of surfacing what it can rather than discarding a good IFD0 because IFD1's
 // pointer is corrupt. TIFF 6.0 §2: next-IFD pointer 0 = end of chain.
+//
+// traverse is the allocation path for IFD chain traversal using individual
+// per-IFD allocations (parseSingleIFD).  Used for MakerNote parsers,
+// ParseIFDAt, and the lazy Parse path for IFD0 (task #198: IFD0 is parsed
+// before we know whether sub-IFDs exist; the lazy sub-IFD arena handles those
+// separately via traverseWithArena).
+//
+// Use uint64 arithmetic to avoid int truncation on 32-bit platforms
+// (GOARCH=386/arm): int(uint32 >= 2^31) is negative, which would cause the
+// guard to pass while the subsequent slice panics. Performing the comparison
+// in uint64 is safe on all platforms (task #74).
+//
+// TIFF §2: the next-IFD pointer value 0 signals end-of-chain; it must NOT
+// be treated as "no IFD" when offset=0 is the *starting* offset.  Canon,
+// Sony, DJI, Samsung, Casio and Leica Type-0 MakerNotes are valid plain
+// IFDs at file offset 0.  Using `first` lets us enter the loop exactly once
+// regardless of offset, and then stop only when the *returned* next-IFD
+// pointer is 0 (i.e., end-of-chain) or a cycle is detected.
 func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, []string, error) { //nolint:gocyclo,cyclop // IFD chain traversal with per-finding warning paths; branches are inherent in the spec-driven logic
+	if uint64(offset)+2 > uint64(len(b)) {
+		return nil, nil, &metaerr.CorruptMetadataError{
+			Format: "EXIF",
+			Reason: fmt.Sprintf("IFD offset %d out of bounds (buf len %d)", offset, len(b)),
+		}
+	}
+
+	// visited tracks offsets we have already started parsing to detect cycles.
+	// Obtained from visitedPool to avoid a per-call allocation on the hot path.
+	visited := visitedPool.Get().(map[uint32]bool) //nolint:forcetypeassert,revive // visitedPool.New always stores map[uint32]bool; pool invariant
+	defer func() {
+		for k := range visited {
+			delete(visited, k)
+		}
+		visitedPool.Put(visited)
+	}()
+
+	var root, current *IFD
+	var warnings []string
+	cur := offset
+
+	first := true
+	for cur != 0 || first {
+		first = false
+		if visited[cur] {
+			break // cycle detected — stop following the chain
+		}
+		visited[cur] = true
+
+		ifd, next, ok, ifdWarnings := parseSingleIFD(b, cur, order)
+		warnings = append(warnings, ifdWarnings...)
+		if !ok {
+			// Audit finding #131 (TIFF 6.0 §2): a non-zero next-IFD pointer that
+			// cannot be parsed is reported as a ParseWarning. If this is the very
+			// first IFD (root == nil) the parse fails normally; if we already have
+			// at least one valid IFD, we stop the chain but return what we have.
+			if root != nil && cur != 0 {
+				warnings = append(warnings, fmt.Sprintf(
+					"exif: next-IFD pointer 0x%08X is unreadable (out of bounds or corrupt); IFD chain terminated (TIFF 6.0 §2)",
+					cur))
+			}
+			break
+		}
+
+		// Link into the chain.
+		if root == nil {
+			root = ifd
+		} else {
+			current.Next = ifd
+		}
+		current = ifd
+
+		// Audit finding #131: if the next pointer is non-zero but falls outside the
+		// buffer, record a warning and stop following the chain. parseSingleIFD will
+		// handle it on the next iteration (returning !ok), but we can detect the
+		// condition early here to attach a cleaner message.
+		if next != 0 && uint64(next)+2 > uint64(len(b)) {
+			warnings = append(warnings, fmt.Sprintf(
+				"exif: next-IFD pointer 0x%08X points outside the buffer (len %d); IFD chain terminated (TIFF 6.0 §2)",
+				next, len(b)))
+			cur = 0 // stop the chain; IFDs parsed so far are valid
+		} else {
+			cur = next
+		}
+	}
+
+	if root == nil {
+		return nil, warnings, &metaerr.CorruptMetadataError{
+			Format: "EXIF",
+			Reason: fmt.Sprintf("IFD at offset %d could not be parsed (buf len %d)", offset, len(b)),
+		}
+	}
+	return root, warnings, nil
+}
+
+// traverseWithArena is the arena-aware IFD chain traversal function.
+// When arena is non-nil, IFD structs and their entry backing slices are drawn
+// from the pre-allocated arena rather than being individually heap-allocated.
+// When arena is nil (or exhausted) the function falls back to individual
+// allocations, preserving correctness in all cases.
+//
+// Arena safety contract (task #198, performance audit 2026-06-10):
+//   - parseArena.allocIFD() returns a stable pointer into ifdBatch; callers
+//     may hold this pointer indefinitely.
+//   - parseArena.allocEntries(count) returns a cap-clamped sub-slice (len=0,
+//     cap=count) so any append beyond cap reallocates outside the arena and
+//     cannot overwrite a neighbour's entry region.
+//   - The arena is created ONCE per Parse call (in Parse) after a global pre-scan
+//     (scanAllClassicIFDs) determines the exact total IFD and entry counts.
+//     All subsequent traverseWithArena calls for that Parse draw from the same
+//     arena, replacing the per-IFD pair of allocations (*IFD + []IFDEntry).
+//
+// This function also carries all the robustness guards from the previous
+// traverse implementation: cycle detection via a pooled map, OOB guards on
+// every buffer access, and lenient recovery on unreadable next-IFD pointers.
+//
+// TIFF §2: the next-IFD pointer value 0 signals end-of-chain; it must NOT
+// be treated as "no IFD" when offset=0 is the *starting* offset (Canon, Sony,
+// DJI, Samsung, Casio and Leica Type-0 MakerNotes are valid plain IFDs at
+// file offset 0). The `first` flag ensures we enter the loop exactly once.
+func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *parseArena) (*IFD, []string, error) { //nolint:gocyclo,cyclop,funlen // IFD chain traversal with per-finding warning paths; branches are inherent in the spec-driven logic
 	// Use uint64 arithmetic to avoid int truncation on 32-bit platforms
 	// (GOARCH=386/arm): int(uint32 >= 2^31) is negative, which would cause the
 	// guard to pass while the subsequent slice panics. Performing the comparison
@@ -365,12 +768,6 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, []string, 
 	var warnings []string
 	cur := offset
 
-	// TIFF §2: the next-IFD pointer value 0 signals end-of-chain; it must NOT
-	// be treated as "no IFD" when offset=0 is the *starting* offset.  Canon,
-	// Sony, DJI, Samsung, Casio and Leica Type-0 MakerNotes are valid plain
-	// IFDs at file offset 0.  Using `first` lets us enter the loop exactly once
-	// regardless of offset, and then stop only when the *returned* next-IFD
-	// pointer is 0 (i.e., end-of-chain) or a cycle is detected.
 	first := true
 	for cur != 0 || first {
 		first = false
@@ -379,20 +776,86 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, []string, 
 		}
 		visited[cur] = true
 
-		ifd, next, ok, ifdWarnings := parseSingleIFD(b, cur, order)
-		warnings = append(warnings, ifdWarnings...)
-		if !ok {
-			// Audit finding #131 (TIFF 6.0 §2): a non-zero next-IFD pointer that
-			// cannot be parsed is reported as a ParseWarning. If this is the very
-			// first IFD (root == nil) the parse fails normally; if we already have
-			// at least one valid IFD, we stop the chain but return what we have.
-			if root != nil && cur != 0 {
-				warnings = append(warnings, fmt.Sprintf(
-					"exif: next-IFD pointer 0x%08X is unreadable (out of bounds or corrupt); IFD chain terminated (TIFF 6.0 §2)",
-					cur))
+		var ifd *IFD
+		var next uint32
+		var ok bool
+		var ifdWarnings []string
+
+		// Arena path: attempt to allocate IFD slot and entry backing from the
+		// pre-allocated arena.  allocIFD / allocEntries return nil when the arena
+		// is nil or exhausted; in that case we fall through to individual allocs.
+		if ifdPtr := arena.allocIFD(); ifdPtr != nil { //nolint:nestif // arena+hint+fallback branches are inherent in safe arena allocation with graceful degradation
+			// Read the clamped entry count from the pre-scanned hint (avoids a
+			// duplicate buffer read of the count field).  If no hint is available
+			// (arena exhausted, or non-pre-scanned call), fall back to re-reading.
+			var slotCount int
+			if hint, hasHint := arena.nextHint(); hasHint {
+				slotCount = hint
+			} else if uint64(cur)+2 <= uint64(len(b)) {
+				rawCount := int(order.Uint16(b[cur:]))
+				pos := int(cur) + 2
+				count := rawCount
+				const maxPrealloc = 1024
+				if pos+count*12 > len(b) {
+					count = (len(b) - pos) / 12
+				}
+				if count < 0 {
+					count = 0
+				}
+				slotCount = min(count, maxPrealloc)
 			}
-			break
+
+			if entrySlice := arena.allocEntries(slotCount); entrySlice != nil {
+				// Both IFD slot and entry backing are available from the arena.
+				next, ok, ifdWarnings = parseSingleIFDInto(b, ifdPtr, entrySlice, cur, order)
+				if !ok {
+					// Arena slot was consumed but not usable; undo the IFD alloc.
+					// Entry alloc cannot be undone, but that region will just be unused.
+					arena.ifdN--
+					if root != nil {
+						warnings = append(warnings, fmt.Sprintf(
+							"exif: next-IFD pointer 0x%08X is unreadable (out of bounds or corrupt); IFD chain terminated (TIFF 6.0 §2)",
+							cur))
+					}
+					warnings = append(warnings, ifdWarnings...)
+					break
+				}
+				ifd = ifdPtr
+			} else {
+				// Entry backing exhausted: undo IFD alloc and fall through to
+				// individual alloc so no partial state is left in the arena.
+				arena.ifdN--
+				var parsedIFD *IFD
+				parsedIFD, next, ok, ifdWarnings = parseSingleIFD(b, cur, order)
+				if !ok {
+					if root != nil {
+						warnings = append(warnings, fmt.Sprintf(
+							"exif: next-IFD pointer 0x%08X is unreadable (out of bounds or corrupt); IFD chain terminated (TIFF 6.0 §2)",
+							cur))
+					}
+					warnings = append(warnings, ifdWarnings...)
+					break
+				}
+				ifd = parsedIFD
+			}
+		} else {
+			// Arena nil or IFD batch exhausted: allocate individually (MakerNote
+			// parsers, ParseIFDAt, and any chain IFD beyond the pre-scan count).
+			var parsedIFD *IFD
+			parsedIFD, next, ok, ifdWarnings = parseSingleIFD(b, cur, order)
+			if !ok {
+				if root != nil && cur != 0 {
+					warnings = append(warnings, fmt.Sprintf(
+						"exif: next-IFD pointer 0x%08X is unreadable (out of bounds or corrupt); IFD chain terminated (TIFF 6.0 §2)",
+						cur))
+				}
+				warnings = append(warnings, ifdWarnings...)
+				break
+			}
+			ifd = parsedIFD
 		}
+
+		warnings = append(warnings, ifdWarnings...)
 
 		// Link into the chain.
 		if root == nil {
@@ -580,7 +1043,16 @@ func parseSingleIFDBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IF
 	const maxPrealloc = 1024
 	preallocCap := min(int(count), maxPrealloc) //nolint:gosec // G115: count ≤ bigTIFFMaxEntries (65535) so fits int on all supported platforms
 	ifd := &IFD{Entries: make([]IFDEntry, 0, preallocCap)}
-	for i := uint64(0); i < count; i++ { //nolint:intrange // BigTIFF parser: loop variable is a byte-slice offset multiplier
+	return fillIFDBigTIFF(b, ifd, offset, pos, count, order, nil)
+}
+
+// fillIFDBigTIFF is the body of parseSingleIFDBigTIFF.
+// ifd.Entries must already be initialised (len==0, correct cap) before this
+// function is called.
+func fillIFDBigTIFF(b []byte, ifd *IFD, offset, pos, count uint64, order binary.ByteOrder, warnings []string) (*IFD, uint64, bool, []string) { //nolint:cyclop // BigTIFF sort+dedup mirrors fillIFD; inherent complexity
+	const bigTIFFEntrySize = uint64(20)
+
+	for i := uint64(0); i < count; i++ { //nolint:intrange,modernize // BigTIFF parser: loop variable is a byte-slice offset multiplier
 		entry, ok := parseIFDEntryBigTIFF(b, int(pos+i*bigTIFFEntrySize), order) //nolint:gosec // G115: pos+i*20 bounded by count clamping above
 		if !ok {
 			continue
@@ -596,7 +1068,7 @@ func parseSingleIFDBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IF
 	})
 
 	// Audit finding #126: dedupe duplicate tags keeping the first occurrence.
-	var warnings []string
+	// Arena safety (task #198): cap-clamped slice; compaction stays within own cap.
 	if len(ifd.Entries) > 1 {
 		out := ifd.Entries[:1]
 		for i := 1; i < len(ifd.Entries); i++ {
@@ -630,6 +1102,10 @@ func parseSingleIFDBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IF
 // uint64 visited-offset set recycled from visitedPoolBigTIFF to avoid
 // per-call allocations.
 //
+// BigTIFF files are rare in practice; this path uses per-IFD allocation
+// (*IFD + []IFDEntry) rather than a Parse-level arena. The allocation
+// overhead is acceptable given how seldom BigTIFF is encountered.
+//
 // Audit finding #131: non-zero next-IFD pointers that are out of bounds
 // generate a ParseWarning but do not abort parsing of already-parsed IFDs.
 func traverseBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IFD, []string, error) { //nolint:gocyclo,cyclop // BigTIFF IFD chain traversal; same inherent branching as classic-TIFF traverse
@@ -660,16 +1136,17 @@ func traverseBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IFD, []s
 		visited[cur] = true
 
 		ifd, next, ok, ifdWarnings := parseSingleIFDBigTIFF(b, cur, order)
-		warnings = append(warnings, ifdWarnings...)
 		if !ok {
-			// Audit finding #131: non-zero pointer that failed to parse.
 			if root != nil && cur != 0 {
 				warnings = append(warnings, fmt.Sprintf(
 					"exif: BigTIFF next-IFD pointer 0x%016X is unreadable; IFD chain terminated (BigTIFF spec §2)",
 					cur))
 			}
+			warnings = append(warnings, ifdWarnings...)
 			break
 		}
+
+		warnings = append(warnings, ifdWarnings...)
 
 		if root == nil {
 			root = ifd

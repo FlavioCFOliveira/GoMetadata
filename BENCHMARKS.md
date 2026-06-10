@@ -20,6 +20,78 @@ go test -bench=. -benchmem -benchtime=3s ./...
 
 ---
 
+## [main — perf task #198] — 2026-06-10 (exif: parse-level arena for sub-IFDs)
+
+### Optimisations applied in this version
+
+- **task #198 (exif: cut per-IFD allocation in parseSingleIFD — library #1 allocator)**:
+  Introduces a lazy sub-IFD arena: `Parse` now parses IFD0 with the original `traverse` path
+  (zero overhead for IFD0-only files), then, only when `ExifIFD` or `GPSIFD` pointers are
+  present, performs a cheap one-pass scan (`scanSubIFDs`) to count entries in each sub-IFD.
+  A single `[]IFD` + `[]IFDEntry` pair is allocated to back all sub-IFDs, with each IFD's
+  entry slice cap-clamped to its hint size (`entryBatch[lo:lo:lo+count]`).  This co-allocates
+  what were previously 2 separate heap allocations per sub-IFD (one `*IFD`, one `[]IFDEntry`)
+  into a single batch allocation.
+  - `BenchmarkEXIFParse_Camera`: **8 → 6 allocs/op** (−25%); ns/op flat within run-to-run variance (−0.4% to +1.7% across paired -count=10 benchstat runs on the same hardware session)
+  - `BenchmarkEXIFParse` (IFD0-only EXIF, no sub-IFDs): unchanged at 4 allocs/op; 174 ns/op (−4.4% from same-day baseline)
+  - Arena safety contract: cap-clamped sub-slices prevent entry-region bleed between adjacent slots; validated by `TestArenaNeighbourCorruption_*` regression gates.
+  - Dead code removed: `scanClassicIFDChain`, `scanAllClassicIFDs`, `scanVisitedCap` (all superseded by the lazy approach).
+  - **MakerNote IFDs excluded from the arena** (decision, task #198): `BenchmarkMakerNoteDispatch` is
+    unchanged at 6 allocs/op.  MakerNote parsers operate on a separate blob (`mn.Value`), use
+    18+ manufacturer-specific format-detection heuristics that are interleaved with parsing, and in
+    some cases (Nikon Type 3, Fujifilm) derive their IFD base from a sub-slice with a different
+    origin from the main TIFF buffer.  Pre-scanning that blob to size an arena slot would require
+    duplicating all detection logic, creating a maintenance hazard disproportionate to the ~2
+    allocs/op gain.  The exclusion is documented in a comment at `parseMakerNoteIFD`.
+
+### Key changes vs v1.2.0 baseline (same-day, benchtime=10s)
+
+| Benchmark | Metric | Before (v1.2.0) | After (task #198) | Change |
+|---|---|---|---|---|
+| BenchmarkEXIFParse_Camera | allocs/op | 8 | **6** | **−25%** |
+| BenchmarkEXIFParse_Camera | B/op | 2818 | 2994 | +6.2% (batch rounding) |
+| BenchmarkEXIFParse_Camera | ns/op | 1458 | ~1452–1477 | flat within noise (−0.4% to +1.7% across -count=10 runs) |
+| BenchmarkEXIFParse | allocs/op | 4 | 4 | 0 (no sub-IFDs — lazy skip) |
+| BenchmarkEXIFParse | B/op | 369 | 369 | 0 |
+| BenchmarkEXIFParse | ns/op | 182 | 174 | −4.4% |
+| BenchmarkRead_JPEG | allocs/op | 9 | 9 | 0 |
+| BenchmarkRead_JPEG | B/op | 584 | 585 | 0 |
+
+Note on B/op increase for `BenchmarkEXIFParse_Camera`: the arena allocates a single batch sized
+to the sum of all sub-IFD entry counts, rounded to slice granularity.  The previous code allocated
+individual slices that could be sized exactly; the arena costs ~176 B extra in this benchmark
+(2994 − 2818 = 176 B increase for 2 fewer allocs).  This is the expected trade-off: fewer
+allocations (and fewer GC roots) at the cost of slightly higher per-Parse memory usage.
+
+### github.com/FlavioCFOliveira/GoMetadata (top-level)
+
+Verified with `go test -bench='BenchmarkRead_JPEG|BenchmarkRead_PNG' -benchmem -benchtime=10s -count=10` +
+`benchstat` (p=0.000 for both ns/op comparisons).
+
+| Benchmark | ns/op | Δ vs v1.2.0 | MB/s | B/op | Δ B | allocs/op | Δ allocs |
+|---|---|---|---|---|---|---|---|
+| BenchmarkRead_JPEG | ~263 | **−3.12%** (p=0.000) | — | 585 | +1 | 9 | 0 |
+| BenchmarkRead_PNG | ~157 | **−1.78%** (p=0.000) | — | 224 | 0 | 11 | 0 |
+
+Note: absolute ns/op values for top-level benchmarks vary with thermal state and scheduler noise
+across sessions (±5% is normal; see v1.0.4 note).  The percentages above are from a paired
+-count=10 benchstat comparison within a single hardware session and are statistically reliable
+(p=0.000).  The alloc profiles (9 / 11 allocs/op) are deterministic and unchanged.
+
+### exif/
+
+Measured with `go test -bench='BenchmarkEXIFParse$|BenchmarkEXIFParse_Camera' -benchmem -benchtime=10s -count=3`.
+
+| Benchmark | ns/op | Δ vs v1.2.0 | B/op | Δ B | allocs/op | Δ allocs |
+|---|---|---|---|---|---|---|
+| BenchmarkParseGPS | 40.6 | ~0 | 0 | 0 | 0 | 0 |
+| BenchmarkMakerNoteDispatch | 282 | ~0 | 360 | 0 | 6 | 0 |
+| BenchmarkEXIFParse | 174 | −4.4% | 369 | 0 | 4 | 0 |
+| BenchmarkEXIFParse_Camera | ~1452–1477 | flat within noise | 2994 | +176 | **6** | **−2** |
+| BenchmarkIFDGet_Large | 3.71 | ~0 | 0 | 0 | 0 | 0 |
+
+---
+
 ## [v1.0.4] — 2026-04-08
 
 ### Changes in this version

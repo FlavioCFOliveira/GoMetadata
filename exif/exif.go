@@ -117,14 +117,19 @@ func parseByteOrder(b []byte) (binary.ByteOrder, error) {
 // sub-IFD cannot be traversed — errors are silently discarded to match the
 // original Parse behaviour (corrupt sub-IFDs must not abort the whole parse).
 //
+// arena is the per-Parse allocation arena created by Parse.  It is passed to
+// traverseWithArena so ExifIFD and InteropIFD draw from the same pre-allocated
+// pool as IFD0, eliminating per-IFD heap allocations.  Passing nil is safe and
+// degrades to individual allocations (used for BigTIFF and test helpers).
+//
 // EXIF §4.6.3: ExifIFD pointer is tag 0x8769; InteropIFD pointer is tag 0xA005.
 // EXIF §4.6.5: MakerNote is tag 0x927C.
-func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseConfig) (exifIFD *IFD, makerNote []byte, makerNoteOffset uint32, makerNoteOffset64 uint64, makerNoteIFD *IFD, interopIFD *IFD, warnings []string) {
+func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseConfig, arena *parseArena) (exifIFD *IFD, makerNote []byte, makerNoteOffset uint32, makerNoteOffset64 uint64, makerNoteIFD *IFD, interopIFD *IFD, warnings []string) {
 	ptr := ifd0.Get(TagExifIFDPointer)
 	if ptr == nil || len(ptr.Value) < 4 {
 		return nil, nil, 0, 0, nil, nil, nil
 	}
-	sub, subWarnings, err := traverse(b, order.Uint32(ptr.Value), order)
+	sub, subWarnings, err := traverseWithArena(b, order.Uint32(ptr.Value), order, arena)
 	warnings = append(warnings, subWarnings...)
 	if err != nil {
 		return nil, nil, 0, 0, nil, nil, warnings
@@ -151,7 +156,7 @@ func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseCon
 
 	// Interoperability IFD pointer (EXIF §4.6.3, tag 0xA005).
 	if iptr := sub.Get(TagInteropIFDPointer); iptr != nil && len(iptr.Value) >= 4 {
-		if isub, isubWarnings, ierr := traverse(b, order.Uint32(iptr.Value), order); ierr == nil {
+		if isub, isubWarnings, ierr := traverseWithArena(b, order.Uint32(iptr.Value), order, arena); ierr == nil {
 			interopIFD = isub
 			warnings = append(warnings, isubWarnings...)
 		}
@@ -163,13 +168,15 @@ func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseCon
 // in ifd0.  Returns the GPS IFD (nil when absent or unreadable) and any
 // diagnostic warnings accumulated during traversal.
 //
+// arena is the per-Parse allocation arena; see parseExifSubIFDs for details.
+//
 // EXIF §4.6.3: GPS IFD pointer is tag 0x8825.
-func parseGPSSubIFD(b []byte, ifd0 *IFD, order binary.ByteOrder) (*IFD, []string) {
+func parseGPSSubIFD(b []byte, ifd0 *IFD, order binary.ByteOrder, arena *parseArena) (*IFD, []string) {
 	ptr := ifd0.Get(TagGPSIFDPointer)
 	if ptr == nil || len(ptr.Value) < 4 {
 		return nil, nil
 	}
-	sub, warnings, err := traverse(b, order.Uint32(ptr.Value), order)
+	sub, warnings, err := traverseWithArena(b, order.Uint32(ptr.Value), order, arena)
 	if err != nil {
 		return nil, warnings
 	}
@@ -271,7 +278,7 @@ const bigTIFFMinHeader = 16
 // profile.  The BigTIFF path uses separate traversal functions
 // (traverseBigTIFF, parseSingleIFDBigTIFF, parseIFDEntryBigTIFF) that share
 // the same IFD/IFDEntry types with the classic path.
-func Parse(b []byte, opts ...ParseOption) (*EXIF, error) {
+func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cyclop,funlen // multi-format TIFF/BigTIFF dispatch; branches are inherent in format detection
 	var cfg parseConfig
 	for _, o := range opts {
 		o(&cfg)
@@ -290,11 +297,29 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) {
 	switch magic {
 	case 0x002A:
 		// Classic TIFF path: 8-byte header, 32-bit IFD offsets (TIFF §2).
-		// This path is byte-for-byte identical to the pre-BigTIFF implementation;
-		// no new branches or overhead are added on this fast path.
 		ifd0Off := order.Uint32(b[4:])
 		e := &EXIF{ByteOrder: order}
 
+		// Lazy sub-IFD arena (task #198, performance audit 2026-06-10):
+		//
+		// Phase 1: parse IFD0 (and its next-chain if any) with the original
+		// traverse path — no pre-scan overhead.  For EXIF payloads with no
+		// sub-IFDs this is the complete work, so the overhead vs the pre-arena
+		// baseline is exactly zero.
+		//
+		// Phase 2: if IFD0 carries ExifIFD or GPS IFD pointer tags, build a
+		// lazy arena covering only the sub-IFDs.  scanSubIFDs reads the count
+		// word at each sub-IFD offset (ExifIFD, GPSIFD, InteropIFD inside
+		// ExifIFD) and records per-IFD entry counts as hints.  The two batch
+		// allocations that follow replace the previous per-sub-IFD pattern of
+		// *IFD + []IFDEntry (2 allocs × N sub-IFDs → 2 allocs total for all
+		// sub-IFDs).
+		//
+		// MakerNote IFDs are NOT included: they are parsed from a separate blob
+		// (mn.Value) by parseMakerNoteIFD, so their lifetime and buffer are
+		// independent of the main parse arena.
+		//
+		// TIFF 6.0 §2; CIPA DC-008-2019 §4.5.2; EXIF §4.6.3.
 		ifd0, ifd0Warnings, ferr := traverse(b, ifd0Off, order)
 		if ferr != nil {
 			return nil, ferr
@@ -302,12 +327,37 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) {
 		e.IFD0 = ifd0
 		e.Warnings = append(e.Warnings, ifd0Warnings...)
 
-		var exifWarnings, gpsWarnings []string
-		e.ExifIFD, e.MakerNote, e.MakerNoteOffset, e.MakerNoteOffset64, e.MakerNoteIFD, e.InteropIFD, exifWarnings = parseExifSubIFDs(b, ifd0, order, &cfg)
-		e.Warnings = append(e.Warnings, exifWarnings...)
+		// Check for sub-IFDs before paying for the arena setup.
+		var exifOff, gpsOff uint32
+		if ep := ifd0.Get(TagExifIFDPointer); ep != nil && len(ep.Value) >= 4 {
+			exifOff = order.Uint32(ep.Value)
+		}
+		if gp := ifd0.Get(TagGPSIFDPointer); gp != nil && len(gp.Value) >= 4 {
+			gpsOff = order.Uint32(gp.Value)
+		}
 
-		e.GPSIFD, gpsWarnings = parseGPSSubIFD(b, ifd0, order)
-		e.Warnings = append(e.Warnings, gpsWarnings...)
+		if exifOff != 0 || gpsOff != 0 {
+			// Sub-IFDs present: build a lazy arena covering ExifIFD, GPSIFD, and
+			// InteropIFD (inside ExifIFD).  scanSubIFDs reads count words and
+			// records entry-count hints; traverseWithArena consumes those hints.
+			var subArena parseArena
+			nSub, totalSub := scanSubIFDs(b, exifOff, gpsOff, order, &subArena)
+			subArena.ifdBatch = make([]IFD, nSub)
+			subArena.entryBatch = make([]IFDEntry, totalSub)
+
+			var exifWarnings, gpsWarnings []string
+			e.ExifIFD, e.MakerNote, e.MakerNoteOffset, e.MakerNoteOffset64, e.MakerNoteIFD, e.InteropIFD, exifWarnings = parseExifSubIFDs(b, ifd0, order, &cfg, &subArena)
+			e.Warnings = append(e.Warnings, exifWarnings...)
+
+			e.GPSIFD, gpsWarnings = parseGPSSubIFD(b, ifd0, order, &subArena)
+			e.Warnings = append(e.Warnings, gpsWarnings...)
+		}
+		// When exifOff == 0 && gpsOff == 0 (single isolated IFD0 with no sub-IFDs),
+		// there are no ExifIFD, GPSIFD, InteropIFD, or MakerNote to parse.  All
+		// corresponding EXIF fields remain at their zero values (nil).  This is the
+		// common case for simple embedded EXIF payloads (e.g. PNG tEXt, synthetic
+		// test fixtures) and avoids the overhead of calling parseExifSubIFDs and
+		// parseGPSSubIFD when we already know they would return nil.
 		return e, nil
 
 	case 0x002B:
