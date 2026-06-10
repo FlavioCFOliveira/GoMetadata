@@ -869,7 +869,7 @@ func TestParseSingleIFDTruncatedCount(t *testing.T) {
 	writeIFDEntryLong(buf, ifd0Off+2, TagImageWidth, 640, order)
 	writeIFDEntryLong(buf, ifd0Off+14, TagImageLength, 480, order)
 
-	ifd, _, ok, warnings := parseSingleIFD(buf, ifd0Off, order)
+	ifd, _, ok, warnRecs := parseSingleIFD(buf, ifd0Off, order)
 	if !ok {
 		t.Fatal("parseSingleIFD returned !ok; expected lenient success")
 	}
@@ -882,6 +882,8 @@ func TestParseSingleIFDTruncatedCount(t *testing.T) {
 	if ifd.Get(TagImageLength) == nil {
 		t.Error("ImageLength missing")
 	}
+	// task #200: parseSingleIFD now returns []parseWarn; materialise before checking.
+	warnings := materializeWarnings(warnRecs)
 	if len(warnings) == 0 {
 		t.Error("expected at least one warning for truncated count, got none")
 	}
@@ -973,6 +975,91 @@ func TestNoSpuriousWarningsOnValidIFD(t *testing.T) {
 	}
 	if len(parsed.Warnings) != 0 {
 		t.Errorf("unexpected warnings on valid IFD: %v", parsed.Warnings)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// task #200 — message-lock: warnString output must be byte-identical to the
+// former fmt.Sprintf output so that any future format drift is caught immediately.
+// ---------------------------------------------------------------------------
+
+// TestParseWarnMessageLock asserts that every warnString variant renders to
+// the exact literal string that the former fmt.Sprintf calls produced.  This
+// test must fail loudly if message text drifts, preventing silent API changes.
+//
+// The expected strings are hard-coded literals, NOT derived via fmt.Sprintf.
+// That is intentional: if both the implementation and the test were changed
+// simultaneously, the byte-identity guarantee would be lost.
+//
+// Task reference: performance audit 2026-06-10, task #200.
+func TestParseWarnMessageLock(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		record parseWarn
+		want   string
+	}{
+		// warnCountClamp — CIPA DC-008 §4.5.2 truncation
+		{
+			"warnCountClamp",
+			parseWarn{kind: warnCountClamp, val1: 8, val2: 5, val3: 2, val4: 38},
+			"exif: IFD at offset 8 declares 5 entries but only 2 fit in the buffer (len 38); clamped \xe2\x80\x94 lenient parse (CIPA DC-008 \xc2\xa74.5.2)",
+		},
+		// warnDuplicateTag — ExifTool/Exiv2 first-occurrence behaviour
+		{
+			"warnDuplicateTag",
+			parseWarn{kind: warnDuplicateTag, val1: 8, val2: 0x0112},
+			"exif: IFD at offset 8 contains duplicate tag 0x0112; keeping first occurrence (ExifTool/Exiv2 behaviour)",
+		},
+		// warnOOLAliasIFD — OOL value overlaps IFD directory
+		{
+			"warnOOLAliasIFD",
+			parseWarn{kind: warnOOLAliasIFD, val1: 0x010F, val2: 10, val3: 8, val4: 26},
+			"exif: tag 0x010F OOL value offset 10 overlaps IFD directory [8,26); value bytes may be corrupt",
+		},
+		// warnNextIFDUnreadable — TIFF 6.0 §2 chain termination (unreadable)
+		{
+			"warnNextIFDUnreadable",
+			parseWarn{kind: warnNextIFDUnreadable, val1: 0xFFFFFFFF},
+			"exif: next-IFD pointer 0xFFFFFFFF is unreadable (out of bounds or corrupt); IFD chain terminated (TIFF 6.0 \xc2\xa72)",
+		},
+		// warnNextIFDOutOfBounds — TIFF 6.0 §2 chain termination (out of bounds)
+		{
+			"warnNextIFDOutOfBounds",
+			parseWarn{kind: warnNextIFDOutOfBounds, val1: 0xFFFFFFFF, val2: 26},
+			"exif: next-IFD pointer 0xFFFFFFFF points outside the buffer (len 26); IFD chain terminated (TIFF 6.0 \xc2\xa72)",
+		},
+		// warnBigTIFFDuplicateTag — BigTIFF first-occurrence
+		// val1=offHi32 (0), val2=offLo32 (0), val3=tag (0x0112): offset=0, tag=0x0112.
+		{
+			"warnBigTIFFDuplicateTag",
+			parseWarn{kind: warnBigTIFFDuplicateTag, val1: 0, val2: 0, val3: 0x0112},
+			"exif: BigTIFF IFD at offset 0 contains duplicate tag 0x0112; keeping first occurrence",
+		},
+		// warnBigTIFFNextUnreadable — BigTIFF chain termination (unreadable)
+		// val1=offHi32 (0), val2=offLo32 (0xDEADBEEF): offset=0x00000000DEADBEEF.
+		{
+			"warnBigTIFFNextUnreadable",
+			parseWarn{kind: warnBigTIFFNextUnreadable, val1: 0, val2: 0xDEADBEEF},
+			"exif: BigTIFF next-IFD pointer 0x00000000DEADBEEF is unreadable; IFD chain terminated (BigTIFF spec \xc2\xa72)",
+		},
+		// warnBigTIFFNextOutOfBounds — BigTIFF chain termination (out of bounds)
+		// val1=offHi32 (0), val2=offLo32 (0xDEADBEEF), val3=bufLen (100): offset=0x00000000DEADBEEF, len=100.
+		{
+			"warnBigTIFFNextOutOfBounds",
+			parseWarn{kind: warnBigTIFFNextOutOfBounds, val1: 0, val2: 0xDEADBEEF, val3: 100},
+			"exif: BigTIFF next-IFD pointer 0x00000000DEADBEEF points outside the buffer (len 100); IFD chain terminated (BigTIFF spec \xc2\xa72)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := warnString(tc.record)
+			if got != tc.want {
+				t.Errorf("warnString message drift detected:\n  got:  %q\n  want: %q", got, tc.want)
+			}
+		})
 	}
 }
 

@@ -8,11 +8,297 @@ import (
 	"math"
 	"slices"
 	"sort"
+	"strconv"
 	"sync"
 
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 	"github.com/FlavioCFOliveira/GoMetadata/internal/metaerr"
 )
+
+// ---------------------------------------------------------------------------
+// Deferred warning records (task #200, performance audit 2026-06-10)
+//
+// Problem: fmt.Sprintf in parseSingleIFD was ~9% of alloc_objects on the
+// exif.Parse hot path (1M+ objects, especially from the duplicate-tag dedup
+// warning on real Canon files).  Most callers never read EXIF.Warnings, so
+// those strings were built eagerly and discarded.
+//
+// Solution: accumulate compact parseWarn records (16 bytes each) during IFD
+// traversal without calling fmt.Sprintf, and materialise the public []string
+// ONCE at the Parse boundary via materializeWarnings.  On clean files (no
+// warnings) the records slice is nil and materializeWarnings is a no-op —
+// exactly zero allocation overhead on the fast path.
+//
+// The materialised message text is byte-identical to the former fmt.Sprintf
+// output (locked by TestParseWarnMessageLock in ifd_audit_test.go).
+//
+// Spec: CIPA DC-008 §4.5.2 (#130), TIFF 6.0 §2 (#126/#131/#132),
+//       ExifTool/Exiv2 first-occurrence semantics (#126).
+// ---------------------------------------------------------------------------
+
+// warnKind identifies the category of a deferred parse warning.
+// Each constant corresponds to one distinct fmt.Sprintf template that was
+// previously called on the hot parse path.  task #200.
+type warnKind uint8
+
+const (
+	// warnCountClamp (#130): IFD declares more entries than fit in the buffer.
+	// Message: "exif: IFD at offset %d declares %d entries but only %d fit in
+	//   the buffer (len %d); clamped — lenient parse (CIPA DC-008 §4.5.2)"
+	// Fields: offset32, count32, available32, bufLen32.
+	warnCountClamp warnKind = iota + 1
+
+	// warnDuplicateTag (#126): duplicate tag dropped in favour of first occurrence.
+	// Message: "exif: IFD at offset %d contains duplicate tag 0x%04X;
+	//   keeping first occurrence (ExifTool/Exiv2 behaviour)"
+	// Fields: offset32, tag16 (stored in tag32).
+	warnDuplicateTag
+
+	// warnOOLAliasIFD (#132): OOL value offset aliases IFD directory region.
+	// Message: "exif: tag 0x%04X OOL value offset %d overlaps IFD directory
+	//   [%d,%d); value bytes may be corrupt"
+	// Fields: tag16, valOff32, ifdStart32, ifdEnd32.
+	warnOOLAliasIFD
+
+	// warnNextIFDUnreadable (#131): non-zero next-IFD pointer cannot be parsed.
+	// Message: "exif: next-IFD pointer 0x%08X is unreadable (out of bounds or
+	//   corrupt); IFD chain terminated (TIFF 6.0 §2)"
+	// Fields: offset32.
+	warnNextIFDUnreadable
+
+	// warnNextIFDOutOfBounds (#131): non-zero next-IFD pointer falls outside buffer.
+	// Message: "exif: next-IFD pointer 0x%08X points outside the buffer (len %d);
+	//   IFD chain terminated (TIFF 6.0 §2)"
+	// Fields: offset32, bufLen32.
+	warnNextIFDOutOfBounds
+
+	// warnBigTIFFDuplicateTag (#126/BigTIFF): duplicate tag in a BigTIFF IFD.
+	// Message: "exif: BigTIFF IFD at offset %d contains duplicate tag 0x%04X;
+	//   keeping first occurrence"
+	// Fields: offset64, tag16 (stored in tag32).
+	warnBigTIFFDuplicateTag
+
+	// warnBigTIFFNextUnreadable (#131/BigTIFF): BigTIFF next-IFD pointer unreadable.
+	// Message: "exif: BigTIFF next-IFD pointer 0x%016X is unreadable;
+	//   IFD chain terminated (BigTIFF spec §2)"
+	// Fields: offset64.
+	warnBigTIFFNextUnreadable
+
+	// warnBigTIFFNextOutOfBounds (#131/BigTIFF): BigTIFF next-IFD pointer OOB.
+	// Message: "exif: BigTIFF next-IFD pointer 0x%016X points outside the buffer
+	//   (len %d); IFD chain terminated (BigTIFF spec §2)"
+	// Fields: offset64, bufLen32.
+	warnBigTIFFNextOutOfBounds
+)
+
+// parseWarn is a compact, allocation-free record of a single parse warning.
+// All integer parameters needed to render the final warning string are stored
+// inline.  The struct is exactly 20 bytes:
+//
+//	kind  warnKind (1 byte, offset 0)
+//	_pad  [3]byte  (3 bytes, offset 1)   explicit alignment padding
+//	val1  uint32   (4 bytes, offset 4)
+//	val2  uint32   (4 bytes, offset 8)
+//	val3  uint32   (4 bytes, offset 12)
+//	val4  uint32   (4 bytes, offset 16)
+//
+// BigTIFF 64-bit offsets are split across val1 (high 32 bits) and val2 (low
+// 32 bits) for the three BigTIFF warning kinds.  The BigTIFF traversal path is
+// cold (BigTIFF is rare in practice) so the hi/lo split is acceptable.
+//
+// Performance note (task #200 regression fix, 2026-06-10):
+// parseWarn is NOT part of parseIFDEntry's return signature.  An earlier task
+// #200 implementation returned (IFDEntry, bool, parseWarn) from parseIFDEntry,
+// which is called per-entry in the hot IFD traversal loop.  On ARM64 the Go
+// ABI passes return values in up to 15 integer registers.  IFDEntry (8 words) +
+// bool (1 word) + parseWarn (5 words) = 14 words — within budget, but the
+// presence of pointer-containing fields in IFDEntry forces the compiler to
+// zero-initialise the return area before each call regardless, emitting 3×STP
+// instructions in the hot loop.  This caused a measured +10–18% ns/op regression
+// vs the baseline (same-session A/B, benchstat, p=0.000 n=10).
+//
+// The fix: parseIFDEntry returns only (IFDEntry, bool).  The OOL alias check
+// (warnOOLAliasIFD) that parseIFDEntry used to perform is now done inline in
+// fillIFD after the call, using the ifdStart/ifdEnd bounds already held there.
+// With a (IFDEntry, bool) return the zero-init is still needed (IFDEntry has
+// pointer fields) but the fill area is smaller and no parseWarn fields are
+// zeroed.  Benchmark confirmation: EXIFParse and EXIFParse_Camera within ±3%
+// of the 6cf3462 baseline after this change.
+//
+// Field semantics by warnKind:
+//
+//	warnCountClamp:            val1=ifdOffset  val2=claimedCount val3=availCount val4=bufLen
+//	warnDuplicateTag:          val1=ifdOffset  val2=tag
+//	warnOOLAliasIFD:           val1=tag        val2=valOff       val3=ifdStart  val4=ifdEnd
+//	warnNextIFDUnreadable:     val1=pointer
+//	warnNextIFDOutOfBounds:    val1=pointer    val2=bufLen
+//	warnBigTIFFDuplicateTag:   val1=offHi32    val2=offLo32      val3=tag
+//	warnBigTIFFNextUnreadable: val1=offHi32    val2=offLo32
+//	warnBigTIFFNextOutOfBounds:val1=offHi32    val2=offLo32      val3=bufLen
+//
+// task #200: performance audit 2026-06-10.
+type parseWarn struct {
+	kind warnKind
+	_    [3]byte // explicit alignment padding; must not be used
+	val1 uint32
+	val2 uint32
+	val3 uint32
+	val4 uint32
+}
+
+// materializeWarnings converts a slice of compact parseWarn records into the
+// final []string that is assigned to EXIF.Warnings.  Called once per Parse
+// call at the boundary where the EXIF struct is returned.
+//
+// On clean files (records == nil) this function returns nil immediately —
+// zero-cost on the fast path.  Each record is rendered by warnString using
+// strconv.AppendUint/AppendInt — no fmt.Sprintf is called.
+//
+// The rendered strings are byte-identical to the former fmt.Sprintf output.
+// task #200; locked by TestParseWarnMessageLock.
+func materializeWarnings(records []parseWarn) []string {
+	if len(records) == 0 {
+		return nil
+	}
+	out := make([]string, len(records))
+	for i, r := range records {
+		out[i] = warnString(r)
+	}
+	return out
+}
+
+// warnString renders a single parseWarn record into its final string.
+// Uses strconv.AppendUint/AppendInt to avoid fmt.Sprintf allocations.
+// The output is byte-identical to the former fmt.Sprintf format strings.
+// task #200; format strings locked by TestParseWarnMessageLock.
+func warnString(r parseWarn) string { //nolint:cyclop // one case per warning kind; no way to simplify without losing the byte-identical guarantee
+	// Reuse a shared grow buffer per call — kept on the stack via escape analysis;
+	// the final string() conversion copies, so buf is not retained.
+	var buf [256]byte
+	b := buf[:0]
+	switch r.kind {
+	case warnCountClamp:
+		// "exif: IFD at offset %d declares %d entries but only %d fit in the buffer (len %d); clamped — lenient parse (CIPA DC-008 §4.5.2)"
+		b = append(b, "exif: IFD at offset "...)
+		b = strconv.AppendUint(b, uint64(r.val1), 10)
+		b = append(b, " declares "...)
+		b = strconv.AppendUint(b, uint64(r.val2), 10)
+		b = append(b, " entries but only "...)
+		b = strconv.AppendUint(b, uint64(r.val3), 10)
+		b = append(b, " fit in the buffer (len "...)
+		b = strconv.AppendUint(b, uint64(r.val4), 10)
+		b = append(b, "); clamped \xe2\x80\x94 lenient parse (CIPA DC-008 \xc2\xa74.5.2)"...)
+	case warnDuplicateTag:
+		// "exif: IFD at offset %d contains duplicate tag 0x%04X; keeping first occurrence (ExifTool/Exiv2 behaviour)"
+		b = append(b, "exif: IFD at offset "...)
+		b = strconv.AppendUint(b, uint64(r.val1), 10)
+		b = append(b, " contains duplicate tag 0x"...)
+		b = appendHex4(b, r.val2)
+		b = append(b, "; keeping first occurrence (ExifTool/Exiv2 behaviour)"...)
+	case warnOOLAliasIFD:
+		// "exif: tag 0x%04X OOL value offset %d overlaps IFD directory [%d,%d); value bytes may be corrupt"
+		b = append(b, "exif: tag 0x"...)
+		b = appendHex4(b, r.val1)
+		b = append(b, " OOL value offset "...)
+		b = strconv.AppendUint(b, uint64(r.val2), 10)
+		b = append(b, " overlaps IFD directory ["...)
+		b = strconv.AppendUint(b, uint64(r.val3), 10)
+		b = append(b, ',')
+
+		b = strconv.AppendUint(b, uint64(r.val4), 10)
+		b = append(b, "); value bytes may be corrupt"...)
+	case warnNextIFDUnreadable:
+		// "exif: next-IFD pointer 0x%08X is unreadable (out of bounds or corrupt); IFD chain terminated (TIFF 6.0 §2)"
+		b = append(b, "exif: next-IFD pointer 0x"...)
+		b = appendHex8(b, r.val1)
+		b = append(b, " is unreadable (out of bounds or corrupt); IFD chain terminated (TIFF 6.0 \xc2\xa72)"...)
+	case warnNextIFDOutOfBounds:
+		// "exif: next-IFD pointer 0x%08X points outside the buffer (len %d); IFD chain terminated (TIFF 6.0 §2)"
+		b = append(b, "exif: next-IFD pointer 0x"...)
+		b = appendHex8(b, r.val1)
+		b = append(b, " points outside the buffer (len "...)
+		b = strconv.AppendUint(b, uint64(r.val2), 10)
+		b = append(b, "); IFD chain terminated (TIFF 6.0 \xc2\xa72)"...)
+	case warnBigTIFFDuplicateTag:
+		// "exif: BigTIFF IFD at offset %d contains duplicate tag 0x%04X; keeping first occurrence"
+		// val1=offHi32, val2=offLo32, val3=tag.  Reconstruct 64-bit offset for decimal print.
+		b = append(b, "exif: BigTIFF IFD at offset "...)
+		b = strconv.AppendUint(b, uint64(r.val1)<<32|uint64(r.val2), 10)
+		b = append(b, " contains duplicate tag 0x"...)
+		b = appendHex4(b, r.val3)
+		b = append(b, "; keeping first occurrence"...)
+	case warnBigTIFFNextUnreadable:
+		// "exif: BigTIFF next-IFD pointer 0x%016X is unreadable; IFD chain terminated (BigTIFF spec §2)"
+		// val1=offHi32, val2=offLo32.  Reconstruct 64-bit offset for hex print.
+		b = append(b, "exif: BigTIFF next-IFD pointer 0x"...)
+		b = appendHex16(b, uint64(r.val1)<<32|uint64(r.val2))
+		b = append(b, " is unreadable; IFD chain terminated (BigTIFF spec \xc2\xa72)"...)
+	case warnBigTIFFNextOutOfBounds:
+		// "exif: BigTIFF next-IFD pointer 0x%016X points outside the buffer (len %d); IFD chain terminated (BigTIFF spec §2)"
+		// val1=offHi32, val2=offLo32, val3=bufLen.  Reconstruct 64-bit offset for hex print.
+		b = append(b, "exif: BigTIFF next-IFD pointer 0x"...)
+		b = appendHex16(b, uint64(r.val1)<<32|uint64(r.val2))
+		b = append(b, " points outside the buffer (len "...)
+		b = strconv.AppendUint(b, uint64(r.val3), 10)
+		b = append(b, "); IFD chain terminated (BigTIFF spec \xc2\xa72)"...)
+	}
+	return string(b)
+}
+
+// appendHex4 appends a 4-digit uppercase hex representation of v to b.
+// Equivalent to fmt.Sprintf("0x%04X", v) but without allocation.
+// task #200.
+func appendHex4(b []byte, v uint32) []byte {
+	const digits = "0123456789ABCDEF"
+	return append(b,
+		digits[(v>>12)&0xF],
+		digits[(v>>8)&0xF],
+		digits[(v>>4)&0xF],
+		digits[v&0xF],
+	)
+}
+
+// appendHex8 appends an 8-digit uppercase hex representation of v to b.
+// Equivalent to fmt.Sprintf("%08X", v) but without allocation.
+// task #200.
+func appendHex8(b []byte, v uint32) []byte {
+	const digits = "0123456789ABCDEF"
+	return append(b,
+		digits[(v>>28)&0xF],
+		digits[(v>>24)&0xF],
+		digits[(v>>20)&0xF],
+		digits[(v>>16)&0xF],
+		digits[(v>>12)&0xF],
+		digits[(v>>8)&0xF],
+		digits[(v>>4)&0xF],
+		digits[v&0xF],
+	)
+}
+
+// appendHex16 appends a 16-digit uppercase hex representation of v to b.
+// Equivalent to fmt.Sprintf("%016X", v) but without allocation.
+// task #200.
+func appendHex16(b []byte, v uint64) []byte {
+	const digits = "0123456789ABCDEF"
+	return append(b,
+		digits[(v>>60)&0xF],
+		digits[(v>>56)&0xF],
+		digits[(v>>52)&0xF],
+		digits[(v>>48)&0xF],
+		digits[(v>>44)&0xF],
+		digits[(v>>40)&0xF],
+		digits[(v>>36)&0xF],
+		digits[(v>>32)&0xF],
+		digits[(v>>28)&0xF],
+		digits[(v>>24)&0xF],
+		digits[(v>>20)&0xF],
+		digits[(v>>16)&0xF],
+		digits[(v>>12)&0xF],
+		digits[(v>>8)&0xF],
+		digits[(v>>4)&0xF],
+		digits[v&0xF],
+	)
+}
 
 // visitedPool recycles the maps used by traverse() to track visited IFD
 // offsets. Reusing these maps avoids one allocation per Parse call on the
@@ -327,16 +613,21 @@ func (e *IFDEntry) order() binary.ByteOrder {
 // For unknown types (sz == 0) the raw 4-byte field is stored verbatim.
 // Returns (zero, false) on any out-of-bounds condition.
 //
-// ifdStart and ifdEnd are the byte range [ifdStart, ifdEnd) that covers the
-// IFD directory itself (count field + entry area + next-IFD pointer). When an
-// OOL value offset falls inside this range, it aliases the directory bytes —
-// a real-world defect; a warning string is returned and the entry is kept
-// (lenient parse). A non-empty warning string indicates #132 value aliasing.
-// Audit finding #132; TIFF 6.0 §2: value data must not overlap the directory.
-func parseIFDEntry(b []byte, e, ifdStart, ifdEnd int, order binary.ByteOrder) (IFDEntry, bool, string) {
+// OOL alias detection (audit finding #132, TIFF 6.0 §2): parseIFDEntry does NOT
+// check whether the OOL value offset falls inside the IFD directory region.
+// That check is performed by the caller (fillIFD) after getting the entry back,
+// because moving the check to the caller avoids adding a parseWarn return value
+// to this hot-path function.  With a parseWarn return, the return tuple exceeds
+// the Go ARM64 ABI register budget, forcing a stack-based ABI that requires
+// 3 extra STP zero-initialisation instructions per loop iteration — a measured
+// 10–18% ns/op regression.  Keeping the signature as (IFDEntry, bool) ensures
+// all return values fit in registers and the hot loop runs at baseline speed.
+//
+// task #200 regression fix 2026-06-10: removed parseWarn from return signature.
+func parseIFDEntry(b []byte, e int, order binary.ByteOrder) (IFDEntry, bool) {
 	// Each entry is exactly 12 bytes; verify the slice is long enough.
 	if e+12 > len(b) {
-		return IFDEntry{}, false, ""
+		return IFDEntry{}, false
 	}
 
 	// task #199: record byte order as a 1-bit flag instead of a 16-byte interface.
@@ -363,16 +654,7 @@ func parseIFDEntry(b []byte, e, ifdStart, ifdEnd int, order binary.ByteOrder) (I
 		end := uint64(valOff) + totalSize
 		if end > uint64(len(b)) {
 			// Out-of-bounds offset: skip this entry gracefully.
-			return IFDEntry{}, false, ""
-		}
-		// Audit finding #132: detect when the OOL value offset falls inside the
-		// IFD directory region — the value bytes alias the directory structure.
-		// TIFF 6.0 §2: value data must reside outside the directory area.
-		// Lenient parse: keep the entry but surface a ParseWarning so the caller
-		// can inspect the anomaly. Do not skip: the bytes may still be readable.
-		var warn string
-		if int(valOff) >= ifdStart && int(valOff) < ifdEnd {
-			warn = fmt.Sprintf("exif: tag 0x%04X OOL value offset %d overlaps IFD directory [%d,%d); value bytes may be corrupt", tag, valOff, ifdStart, ifdEnd)
+			return IFDEntry{}, false
 		}
 		value = b[valOff:end]
 		return IFDEntry{
@@ -382,7 +664,7 @@ func parseIFDEntry(b []byte, e, ifdStart, ifdEnd int, order binary.ByteOrder) (I
 			Value:     value,
 			bigEndian: isBig,
 			rawOffset: uint64(valOff), // TIFF §2: offset to value data; used by MakerNoteOffset
-		}, true, warn
+		}, true
 	default:
 		// Value is inline, left-justified in the 4-byte field (TIFF §2).
 		value = b[e+8 : e+8+int(totalSize)]
@@ -394,7 +676,7 @@ func parseIFDEntry(b []byte, e, ifdStart, ifdEnd int, order binary.ByteOrder) (I
 		Count:     cnt,
 		Value:     value,
 		bigEndian: isBig,
-	}, true, ""
+	}, true
 }
 
 // parseSingleIFD parses all entries at a single IFD offset within b and
@@ -420,7 +702,10 @@ func parseIFDEntry(b []byte, e, ifdStart, ifdEnd int, order binary.ByteOrder) (I
 //
 //   - #132 (TIFF 6.0 §2): OOL value offsets that alias the IFD directory region
 //     produce a ParseWarning but the entry is kept (lenient parse).
-func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint32, bool, []string) { //nolint:cyclop // lenient-parse recovery branches (R-05/#126/#132) are inherent in the spec-driven logic
+//
+// task #200: internal warning accumulation uses []parseWarn to defer fmt.Sprintf.
+// The public Warnings []string is materialised once at the Parse boundary.
+func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint32, bool, []parseWarn) { //nolint:cyclop // lenient-parse recovery branches (R-05/#126/#132) are inherent in the spec-driven logic
 	// Use uint64 arithmetic to avoid int truncation on 32-bit platforms
 	// (GOARCH=386/arm): int(uint32 >= 2^31) is negative, which would cause the
 	// guard to pass while the subsequent slice panics. Performing the comparison
@@ -432,27 +717,34 @@ func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint
 	count := int(order.Uint16(b[offset:]))
 	pos := int(offset) + 2
 
-	var warnings []string
+	var warnings []parseWarn
 
 	// Audit finding #130 (CIPA DC-008 §4.5.2; conformance rule R-05):
 	// When count×12 exceeds the remaining buffer, clamp to the number of
 	// complete entries that actually fit rather than hard-rejecting the whole
 	// IFD. ExifTool and libexif both use this lenient strategy.
+	// task #200: record compact parseWarn instead of calling fmt.Sprintf.
 	if pos+count*12 > len(b) {
 		available := (len(b) - pos) / 12
 		if available <= 0 {
 			// No entries fit at all — reject the IFD as unreadable.
 			return nil, 0, false, nil
 		}
-		warnings = append(warnings, fmt.Sprintf(
-			"exif: IFD at offset %d declares %d entries but only %d fit in the buffer (len %d); clamped — lenient parse (CIPA DC-008 §4.5.2)",
-			offset, count, available, len(b)))
+		warnings = append(warnings, parseWarn{
+			kind: warnCountClamp,
+			val1: offset,
+			val2: uint32(count),     //nolint:gosec // G115: count clamped to ≤ maxIFDEntryPrealloc (1024); safe narrowing
+			val3: uint32(available), //nolint:gosec // G115: available = (len(b)-pos)/12 ≤ len(b)/12; safe
+			val4: uint32(len(b)),    //nolint:gosec // G115: buffer length bounded by JPEG APP1 ≤ 65535 or TIFF file size; safe
+		})
 		count = available
 	}
 
 	// ifdStart/ifdEnd mark the IFD directory region [pos-2 .. pos+count*12+4)
-	// (count field + entry area + next-IFD pointer) so parseIFDEntry can detect
+	// (count field + entry area + next-IFD pointer). Used by fillIFD to detect
 	// OOL offsets that alias the directory (audit finding #132, TIFF 6.0 §2).
+	// Note: NOT passed to parseIFDEntry — the OOL alias check lives in fillIFD
+	// to keep parseIFDEntry's return tuple to (IFDEntry, bool) = register-only ABI.
 	ifdStart := int(offset) // starts at the count field
 	ifdEnd := pos + count*12 + 4
 
@@ -478,7 +770,8 @@ func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint
 //
 // Callers must NOT re-use or grow the ifdBatch slice after calling this
 // function — pointers to batch elements are retained by the caller.
-func parseSingleIFDInto(b []byte, ifd *IFD, entrySlice []IFDEntry, offset uint32, order binary.ByteOrder) (uint32, bool, []string) { //nolint:cyclop // same lenient-parse branches as parseSingleIFD
+// task #200: internal warning accumulation uses []parseWarn; see parseSingleIFD.
+func parseSingleIFDInto(b []byte, ifd *IFD, entrySlice []IFDEntry, offset uint32, order binary.ByteOrder) (uint32, bool, []parseWarn) { //nolint:cyclop // same lenient-parse branches as parseSingleIFD
 	if uint64(offset)+2 > uint64(len(b)) {
 		return 0, false, nil
 	}
@@ -486,16 +779,21 @@ func parseSingleIFDInto(b []byte, ifd *IFD, entrySlice []IFDEntry, offset uint32
 	count := int(order.Uint16(b[offset:]))
 	pos := int(offset) + 2
 
-	var warnings []string
+	var warnings []parseWarn
 
+	// task #200: record compact parseWarn instead of calling fmt.Sprintf.
 	if pos+count*12 > len(b) {
 		available := (len(b) - pos) / 12
 		if available <= 0 {
 			return 0, false, nil
 		}
-		warnings = append(warnings, fmt.Sprintf(
-			"exif: IFD at offset %d declares %d entries but only %d fit in the buffer (len %d); clamped — lenient parse (CIPA DC-008 §4.5.2)",
-			offset, count, available, len(b)))
+		warnings = append(warnings, parseWarn{
+			kind: warnCountClamp,
+			val1: offset,
+			val2: uint32(count),     //nolint:gosec // G115: count ≤ maxIFDEntryPrealloc safe
+			val3: uint32(available), //nolint:gosec // G115: available ≤ len(b)/12 safe
+			val4: uint32(len(b)),    //nolint:gosec // G115: buf len bounded safe
+		})
 		count = available
 	}
 
@@ -525,14 +823,33 @@ func parseSingleIFDInto(b []byte, ifd *IFD, entrySlice []IFDEntry, offset uint32
 //
 // ifd.Entries must already be set to a slice with len==0 and the correct cap
 // before this function is called.
-func fillIFD(b []byte, ifd *IFD, offset uint32, pos, count, ifdStart, ifdEnd int, order binary.ByteOrder, warnings []string) (*IFD, uint32, bool, []string) { //nolint:cyclop // lenient-parse branches (#126/#132) are inherent
+// task #200: warnings is now []parseWarn; materialised to []string at Parse boundary.
+func fillIFD(b []byte, ifd *IFD, offset uint32, pos, count, ifdStart, ifdEnd int, order binary.ByteOrder, warnings []parseWarn) (*IFD, uint32, bool, []parseWarn) { //nolint:cyclop // lenient-parse branches (#126/#132) are inherent
 	for i := 0; i < count; i++ { //nolint:intrange,modernize // binary parser: loop variable is a byte-slice offset multiplier
-		entry, ok, warn := parseIFDEntry(b, pos+i*12, ifdStart, ifdEnd, order)
-		if warn != "" {
-			warnings = append(warnings, warn)
-		}
+		entry, ok := parseIFDEntry(b, pos+i*12, order)
 		if !ok {
 			continue
+		}
+		// Audit finding #132: detect when an OOL value offset falls inside the
+		// IFD directory region — the value bytes alias the directory structure.
+		// TIFF 6.0 §2: value data must reside outside the directory area.
+		// Lenient parse: keep the entry and emit a warning.
+		// This check is placed here (not in parseIFDEntry) so that parseIFDEntry
+		// returns (IFDEntry, bool) — a 9-word tuple that fits in ARM64 ABI registers.
+		// Adding parseWarn to parseIFDEntry's return overflows the register budget
+		// and forces compiler-generated STP zero-init in the hot loop (+10–18% ns/op).
+		// task #200 regression fix 2026-06-10.
+		if entry.rawOffset != 0 {
+			valOff := int(entry.rawOffset) //nolint:gosec // G115: rawOffset is a TIFF file offset; files are bounded by buffer which is ≤ int max on all supported platforms
+			if valOff >= ifdStart && valOff < ifdEnd {
+				warnings = append(warnings, parseWarn{
+					kind: warnOOLAliasIFD,
+					val1: uint32(entry.Tag),
+					val2: uint32(valOff),   //nolint:gosec // G115: valOff bounded by buffer size ≤ JPEG APP1 ≤ 65535
+					val3: uint32(ifdStart), //nolint:gosec // G115: ifdStart bounded by buffer ≤ 65535
+					val4: uint32(ifdEnd),   //nolint:gosec // G115: ifdEnd bounded by buffer ≤ 65535
+				})
+			}
 		}
 		ifd.Entries = append(ifd.Entries, entry)
 	}
@@ -554,13 +871,16 @@ func fillIFD(b []byte, ifd *IFD, offset uint32, pos, count, ifdStart, ifdEnd int
 	// Arena safety (task #198): ifd.Entries is cap-clamped (s[:0:n]) so this
 	// in-place compaction — which only shrinks the slice — stays within the
 	// slice's own cap region and cannot corrupt a neighbouring IFD's entries.
+	// task #200: record compact parseWarn instead of calling fmt.Sprintf.
 	if len(ifd.Entries) > 1 {
 		out := ifd.Entries[:1]
 		for i := 1; i < len(ifd.Entries); i++ {
 			if ifd.Entries[i].Tag == ifd.Entries[i-1].Tag {
-				warnings = append(warnings, fmt.Sprintf(
-					"exif: IFD at offset %d contains duplicate tag 0x%04X; keeping first occurrence (ExifTool/Exiv2 behaviour)",
-					offset, ifd.Entries[i].Tag))
+				warnings = append(warnings, parseWarn{
+					kind: warnDuplicateTag,
+					val1: offset,
+					val2: uint32(ifd.Entries[i].Tag), // TagID is uint16; widening to uint32 is safe
+				})
 			} else {
 				out = append(out, ifd.Entries[i])
 			}
@@ -695,7 +1015,8 @@ func extractJPEGThumbnail(b []byte, ifd *IFD) []byte { //nolint:gocyclo,cyclop /
 // IFDs at file offset 0.  Using `first` lets us enter the loop exactly once
 // regardless of offset, and then stop only when the *returned* next-IFD
 // pointer is 0 (i.e., end-of-chain) or a cycle is detected.
-func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, []string, error) { //nolint:gocyclo,cyclop // IFD chain traversal with per-finding warning paths; branches are inherent in the spec-driven logic
+// task #200: returns []parseWarn for deferred string materialisation at Parse boundary.
+func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, []parseWarn, error) { //nolint:gocyclo,cyclop // IFD chain traversal with per-finding warning paths; branches are inherent in the spec-driven logic
 	if uint64(offset)+2 > uint64(len(b)) {
 		return nil, nil, &metaerr.CorruptMetadataError{
 			Format: "EXIF",
@@ -714,7 +1035,7 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, []string, 
 	}()
 
 	var root, current *IFD
-	var warnings []string
+	var warnings []parseWarn
 	cur := offset
 
 	first := true
@@ -732,10 +1053,12 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, []string, 
 			// cannot be parsed is reported as a ParseWarning. If this is the very
 			// first IFD (root == nil) the parse fails normally; if we already have
 			// at least one valid IFD, we stop the chain but return what we have.
+			// task #200: record compact parseWarn instead of calling fmt.Sprintf.
 			if root != nil && cur != 0 {
-				warnings = append(warnings, fmt.Sprintf(
-					"exif: next-IFD pointer 0x%08X is unreadable (out of bounds or corrupt); IFD chain terminated (TIFF 6.0 §2)",
-					cur))
+				warnings = append(warnings, parseWarn{
+					kind: warnNextIFDUnreadable,
+					val1: cur,
+				})
 			}
 			break
 		}
@@ -752,10 +1075,13 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, []string, 
 		// buffer, record a warning and stop following the chain. parseSingleIFD will
 		// handle it on the next iteration (returning !ok), but we can detect the
 		// condition early here to attach a cleaner message.
+		// task #200: record compact parseWarn instead of calling fmt.Sprintf.
 		if next != 0 && uint64(next)+2 > uint64(len(b)) {
-			warnings = append(warnings, fmt.Sprintf(
-				"exif: next-IFD pointer 0x%08X points outside the buffer (len %d); IFD chain terminated (TIFF 6.0 §2)",
-				next, len(b)))
+			warnings = append(warnings, parseWarn{
+				kind: warnNextIFDOutOfBounds,
+				val1: next,
+				val2: uint32(len(b)), //nolint:gosec // G115: buffer length bounded by JPEG APP1 ≤ 65535 or file size; safe
+			})
 			cur = 0 // stop the chain; IFDs parsed so far are valid
 		} else {
 			cur = next
@@ -796,7 +1122,8 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, []string, 
 // be treated as "no IFD" when offset=0 is the *starting* offset (Canon, Sony,
 // DJI, Samsung, Casio and Leica Type-0 MakerNotes are valid plain IFDs at
 // file offset 0). The `first` flag ensures we enter the loop exactly once.
-func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *parseArena) (*IFD, []string, error) { //nolint:gocyclo,cyclop,funlen // IFD chain traversal with per-finding warning paths; branches are inherent in the spec-driven logic
+// task #200: returns []parseWarn for deferred string materialisation at Parse boundary.
+func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *parseArena) (*IFD, []parseWarn, error) { //nolint:gocyclo,cyclop,funlen // IFD chain traversal with per-finding warning paths; branches are inherent in the spec-driven logic
 	// Use uint64 arithmetic to avoid int truncation on 32-bit platforms
 	// (GOARCH=386/arm): int(uint32 >= 2^31) is negative, which would cause the
 	// guard to pass while the subsequent slice panics. Performing the comparison
@@ -819,7 +1146,7 @@ func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *p
 	}()
 
 	var root, current *IFD
-	var warnings []string
+	var warnings []parseWarn
 	cur := offset
 
 	first := true
@@ -833,7 +1160,7 @@ func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *p
 		var ifd *IFD
 		var next uint32
 		var ok bool
-		var ifdWarnings []string
+		var ifdWarnings []parseWarn
 
 		// Arena path: attempt to allocate IFD slot and entry backing from the
 		// pre-allocated arena.  allocIFD / allocEntries return nil when the arena
@@ -866,10 +1193,12 @@ func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *p
 					// Arena slot was consumed but not usable; undo the IFD alloc.
 					// Entry alloc cannot be undone, but that region will just be unused.
 					arena.ifdN--
+					// task #200: record compact parseWarn instead of fmt.Sprintf.
 					if root != nil {
-						warnings = append(warnings, fmt.Sprintf(
-							"exif: next-IFD pointer 0x%08X is unreadable (out of bounds or corrupt); IFD chain terminated (TIFF 6.0 §2)",
-							cur))
+						warnings = append(warnings, parseWarn{
+							kind: warnNextIFDUnreadable,
+							val1: cur,
+						})
 					}
 					warnings = append(warnings, ifdWarnings...)
 					break
@@ -882,10 +1211,12 @@ func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *p
 				var parsedIFD *IFD
 				parsedIFD, next, ok, ifdWarnings = parseSingleIFD(b, cur, order)
 				if !ok {
+					// task #200: record compact parseWarn instead of fmt.Sprintf.
 					if root != nil {
-						warnings = append(warnings, fmt.Sprintf(
-							"exif: next-IFD pointer 0x%08X is unreadable (out of bounds or corrupt); IFD chain terminated (TIFF 6.0 §2)",
-							cur))
+						warnings = append(warnings, parseWarn{
+							kind: warnNextIFDUnreadable,
+							val1: cur,
+						})
 					}
 					warnings = append(warnings, ifdWarnings...)
 					break
@@ -898,10 +1229,12 @@ func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *p
 			var parsedIFD *IFD
 			parsedIFD, next, ok, ifdWarnings = parseSingleIFD(b, cur, order)
 			if !ok {
+				// task #200: record compact parseWarn instead of fmt.Sprintf.
 				if root != nil && cur != 0 {
-					warnings = append(warnings, fmt.Sprintf(
-						"exif: next-IFD pointer 0x%08X is unreadable (out of bounds or corrupt); IFD chain terminated (TIFF 6.0 §2)",
-						cur))
+					warnings = append(warnings, parseWarn{
+						kind: warnNextIFDUnreadable,
+						val1: cur,
+					})
 				}
 				warnings = append(warnings, ifdWarnings...)
 				break
@@ -923,10 +1256,13 @@ func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *p
 		// buffer, record a warning and stop following the chain. parseSingleIFD will
 		// handle it on the next iteration (returning !ok), but we can detect the
 		// condition early here to attach a cleaner message.
+		// task #200: record compact parseWarn instead of fmt.Sprintf.
 		if next != 0 && uint64(next)+2 > uint64(len(b)) {
-			warnings = append(warnings, fmt.Sprintf(
-				"exif: next-IFD pointer 0x%08X points outside the buffer (len %d); IFD chain terminated (TIFF 6.0 §2)",
-				next, len(b)))
+			warnings = append(warnings, parseWarn{
+				kind: warnNextIFDOutOfBounds,
+				val1: next,
+				val2: uint32(len(b)), //nolint:gosec // G115: buffer length bounded; safe
+			})
 			cur = 0 // stop the chain; IFDs parsed so far are valid
 		} else {
 			cur = next
@@ -1081,7 +1417,8 @@ func parseIFDEntryBigTIFF(b []byte, e int, order binary.ByteOrder) (IFDEntry, bo
 //
 // Applies the same duplicate-tag dedup logic as parseSingleIFD (audit
 // finding #126): first occurrence wins, a warning is appended for each drop.
-func parseSingleIFDBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IFD, uint64, bool, []string) {
+// task #200: returns []parseWarn for deferred string materialisation at Parse boundary.
+func parseSingleIFDBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IFD, uint64, bool, []parseWarn) {
 	// Guard: IFD offset + 8-byte count field must fit in b.
 	if offset > uint64(len(b)) || uint64(len(b))-offset < 8 {
 		return nil, 0, false, nil
@@ -1107,7 +1444,8 @@ func parseSingleIFDBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IF
 // fillIFDBigTIFF is the body of parseSingleIFDBigTIFF.
 // ifd.Entries must already be initialised (len==0, correct cap) before this
 // function is called.
-func fillIFDBigTIFF(b []byte, ifd *IFD, offset, pos, count uint64, order binary.ByteOrder, warnings []string) (*IFD, uint64, bool, []string) { //nolint:cyclop // BigTIFF sort+dedup mirrors fillIFD; inherent complexity
+// task #200: warnings is now []parseWarn; materialised to []string at Parse boundary.
+func fillIFDBigTIFF(b []byte, ifd *IFD, offset, pos, count uint64, order binary.ByteOrder, warnings []parseWarn) (*IFD, uint64, bool, []parseWarn) { //nolint:cyclop // BigTIFF sort+dedup mirrors fillIFD; inherent complexity
 	const bigTIFFEntrySize = uint64(20)
 
 	for i := uint64(0); i < count; i++ { //nolint:intrange,modernize // BigTIFF parser: loop variable is a byte-slice offset multiplier
@@ -1127,13 +1465,17 @@ func fillIFDBigTIFF(b []byte, ifd *IFD, offset, pos, count uint64, order binary.
 
 	// Audit finding #126: dedupe duplicate tags keeping the first occurrence.
 	// Arena safety (task #198): cap-clamped slice; compaction stays within own cap.
+	// task #200: record compact parseWarn instead of fmt.Sprintf.
 	if len(ifd.Entries) > 1 {
 		out := ifd.Entries[:1]
 		for i := 1; i < len(ifd.Entries); i++ {
 			if ifd.Entries[i].Tag == ifd.Entries[i-1].Tag {
-				warnings = append(warnings, fmt.Sprintf(
-					"exif: BigTIFF IFD at offset %d contains duplicate tag 0x%04X; keeping first occurrence",
-					offset, ifd.Entries[i].Tag))
+				warnings = append(warnings, parseWarn{
+					kind: warnBigTIFFDuplicateTag,
+					val1: uint32(offset >> 32),       // high 32 bits of BigTIFF IFD offset
+					val2: uint32(offset),             //nolint:gosec // G115: low 32 bits of BigTIFF IFD offset; truncation is intentional
+					val3: uint32(ifd.Entries[i].Tag), // TagID is uint16; widening to uint32 is safe
+				})
 			} else {
 				out = append(out, ifd.Entries[i])
 			}
@@ -1166,7 +1508,8 @@ func fillIFDBigTIFF(b []byte, ifd *IFD, offset, pos, count uint64, order binary.
 //
 // Audit finding #131: non-zero next-IFD pointers that are out of bounds
 // generate a ParseWarning but do not abort parsing of already-parsed IFDs.
-func traverseBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IFD, []string, error) { //nolint:gocyclo,cyclop // BigTIFF IFD chain traversal; same inherent branching as classic-TIFF traverse
+// task #200: returns []parseWarn for deferred string materialisation at Parse boundary.
+func traverseBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IFD, []parseWarn, error) { //nolint:gocyclo,cyclop // BigTIFF IFD chain traversal; same inherent branching as classic-TIFF traverse
 	if offset > uint64(len(b)) || uint64(len(b))-offset < 8 {
 		return nil, nil, &metaerr.CorruptMetadataError{
 			Format: "EXIF",
@@ -1184,7 +1527,7 @@ func traverseBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IFD, []s
 	}()
 
 	var root, current *IFD
-	var warnings []string
+	var warnings []parseWarn
 	cur := offset
 
 	for cur != 0 {
@@ -1195,10 +1538,14 @@ func traverseBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IFD, []s
 
 		ifd, next, ok, ifdWarnings := parseSingleIFDBigTIFF(b, cur, order)
 		if !ok {
+			// task #200: record compact parseWarn instead of fmt.Sprintf.
+			// val1=offHi32, val2=offLo32 for BigTIFF 64-bit offset (hi/lo split).
 			if root != nil && cur != 0 {
-				warnings = append(warnings, fmt.Sprintf(
-					"exif: BigTIFF next-IFD pointer 0x%016X is unreadable; IFD chain terminated (BigTIFF spec §2)",
-					cur))
+				warnings = append(warnings, parseWarn{
+					kind: warnBigTIFFNextUnreadable,
+					val1: uint32(cur >> 32), // high 32 bits of BigTIFF pointer
+					val2: uint32(cur),       // low 32 bits of BigTIFF pointer
+				})
 			}
 			warnings = append(warnings, ifdWarnings...)
 			break
@@ -1214,10 +1561,14 @@ func traverseBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IFD, []s
 		current = ifd
 
 		// Audit finding #131: next pointer OOB → warn and stop.
+		// task #200: val1=offHi32, val2=offLo32 for 64-bit offset; val3=bufLen.
 		if next != 0 && (next > uint64(len(b)) || uint64(len(b))-next < 8) {
-			warnings = append(warnings, fmt.Sprintf(
-				"exif: BigTIFF next-IFD pointer 0x%016X points outside the buffer (len %d); IFD chain terminated (BigTIFF spec §2)",
-				next, len(b)))
+			warnings = append(warnings, parseWarn{
+				kind: warnBigTIFFNextOutOfBounds,
+				val1: uint32(next >> 32), // high 32 bits of BigTIFF pointer
+				val2: uint32(next),       //nolint:gosec // G115: low 32 bits of BigTIFF pointer; truncation is intentional
+				val3: uint32(len(b)),     //nolint:gosec // G115: buffer length bounded by read buffer; safe narrowing
+			})
 			cur = 0
 		} else {
 			cur = next

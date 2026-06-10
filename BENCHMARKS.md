@@ -259,6 +259,84 @@ encode hot path.
 
 ---
 
+## [main — perf task #200] — 2026-06-10 (exif: defer warning string construction — eliminate fmt.Sprintf from parse hot path)
+
+### Optimisation applied in this version
+
+- **task #200 (exif: defer fmt.Sprintf in parseSingleIFD — ~9% of alloc_objects on Canon files)**:
+  `fmt.Sprintf` calls that built warning strings inside `parseSingleIFD` / `fillIFD` /
+  `fillIFDBigTIFF` fired on every duplicate-tag dedup event.  Real Canon MakerNote IFDs regularly
+  carry duplicate tags (12.3% of that file's read-path alloc_objects in the audit profile).
+  Most callers never read `EXIF.Warnings`; the strings were built eagerly and discarded.
+
+  The fix introduces a compact `parseWarn` struct (20 bytes: `kind warnKind`, `[3]byte` explicit
+  padding, `val1–val4 uint32`) to accumulate warning parameters during IFD traversal — no
+  `fmt.Sprintf`, no string allocation, no heap pressure.  A single
+  `materializeWarnings([]parseWarn) []string` call at the `Parse` boundary converts records to
+  strings using `strconv.AppendUint` and a 256-byte stack buffer.  On clean files (no warnings)
+  the records slice is nil and materialisation is a no-op — zero overhead on the fast path.
+
+  **API invariant preserved**: `EXIF.Warnings []string` public type is unchanged; message text is
+  byte-identical to former `fmt.Sprintf` output, locked by `TestParseWarnMessageLock` (8
+  hard-coded literal assertions, one per `warnKind`).
+
+  **pprof proof**: `fmt.Sprintf` is absent from the top alloc_objects profile on
+  `BenchmarkEXIFParse_Camera`. The full profile now shows only `exif.Parse` and
+  `exif.parseSingleIFD` (the legitimate object allocations).
+
+  **Regression fix (same session, 2026-06-10)**: an earlier implementation of task #200 returned
+  `(IFDEntry, bool, parseWarn)` from `parseIFDEntry` — the per-entry function called in the hot
+  `fillIFD` loop.  A same-session A/B benchmark (baseline commit 6cf3462 vs task #200,
+  benchstat p=0.000 n=10) measured a real +10.56% regression on `EXIFParse` and +18.07% on
+  `EXIFParse_Camera`.  Root cause: on ARM64, Go's ABI passes return values in registers when the
+  tuple ≤ 15 register words.  The presence of pointer-containing fields in `IFDEntry` requires
+  the compiler to zero-initialise the return area before each call regardless of register count,
+  emitting 3×STP instructions per loop iteration with the extra `parseWarn` field vs the baseline.
+  The fix removes `parseWarn` from `parseIFDEntry`'s return signature entirely, restoring it to
+  `(IFDEntry, bool)`.  The OOL alias check (`warnOOLAliasIFD`) that `parseIFDEntry` previously
+  performed is moved inline into `fillIFD` using `ifdStart`/`ifdEnd` bounds already available
+  there — zero overhead on the common (no alias) path.
+
+  Spec: CIPA DC-008-2023 §4.5.2; TIFF 6.0 §2; BigTIFF spec §2; performance audit 2026-06-10
+  finding (MakerNoteDispatch ~9% fmt.Sprintf alloc_objects, Canon duplicate-tag dedup path).
+
+### Key changes vs [main — perf task #240] baseline (same-session A/B, benchtime=3s, -count=10, benchstat)
+
+#### exif/
+
+| Benchmark | Metric | Before (task #240 baseline, commit 6cf3462) | After (task #200 regression-fixed) | Change |
+|---|---|---|---|---|
+| BenchmarkMakerNoteDispatch | ns/op | 279 ns | **123 ns** | **−55.8%** (p=0.000) |
+| BenchmarkMakerNoteDispatch | B/op | 344 | **208** | **−39.5%** (p=0.000) |
+| BenchmarkMakerNoteDispatch | allocs/op | 6 | **4** | **−33.3%** (p=0.000) |
+| BenchmarkEXIFParse | ns/op | 172.6 ns | 172.1 ns | ~ (p=0.269, within noise) |
+| BenchmarkEXIFParse | B/op | 337 | 337 | 0 |
+| BenchmarkEXIFParse | allocs/op | 4 | 4 | 0 |
+| BenchmarkEXIFParse_Camera | ns/op | 1.445 µs | 1.437 µs | −0.55% (p=0.001) |
+| BenchmarkEXIFParse_Camera | B/op | 2482 | 2482 | 0 |
+| BenchmarkEXIFParse_Camera | allocs/op | 6 | 6 | 0 |
+
+`EXIFParse` and `EXIFParse_Camera` use clean (warning-free) TIFF buffers, so `fmt.Sprintf` was
+never called in the baseline and no alloc reduction is expected there.  After the regression fix,
+both benchmarks are within ±1% of the baseline — confirming zero overhead on the clean-file fast
+path.  `BenchmarkMakerNoteDispatch` is the primary measure for task #200: it exercises the
+Canon duplicate-tag path where `fmt.Sprintf` fired.  Its improvement is real and statistically
+robust (p=0.000, -count=10, same-session A/B).
+
+#### github.com/FlavioCFOliveira/GoMetadata (top-level)
+
+| Benchmark | Metric | Before | After | Change |
+|---|---|---|---|---|
+| BenchmarkRead_JPEG | B/op | 568 | 568 | 0 |
+| BenchmarkRead_JPEG | allocs/op | 9 | 9 | 0 |
+| BenchmarkReadCombinedMetadataJPEG | B/op | 22468 | 22468 | 0 |
+| BenchmarkReadCombinedMetadataJPEG | allocs/op | 108 | 108 | 0 |
+
+Top-level benchmarks are unaffected at the alloc level because the top-level fixtures do not
+contain Canon-style duplicate tags.  The MakerNoteDispatch benchmark is the primary evidence.
+
+---
+
 ## [v1.0.4] — 2026-04-08
 
 ### Changes in this version
