@@ -753,7 +753,7 @@ func TestConformance_S19_rational_denominator(t *testing.T) {
 	var neg1 int32 = -1
 	order.PutUint32(sval[0:], uint32(neg1)) //nolint:gosec // G115: intentional sign conversion for test
 	order.PutUint32(sval[4:], 0)
-	entry2 := IFDEntry{Type: TypeSRational, Count: 1, Value: sval, byteOrder: order}
+	entry2 := IFDEntry{Type: TypeSRational, Count: 1, Value: sval, bigEndian: orderIsBig(order)}
 	sr := entry2.SRational(0)
 	if sr[0] != -1 || sr[1] != 0 {
 		t.Errorf("S-19: SRational den=0 got %v, want [-1, 0]", sr)
@@ -1027,10 +1027,10 @@ func TestConformance_S27_exif_ifd_mandatory_tags(t *testing.T) {
 		ByteOrder: order,
 		IFD0:      &IFD{},
 		ExifIFD: &IFD{Entries: []IFDEntry{
-			{Tag: TagExifVersion, Type: TypeUndefined, Count: 4, Value: exifVersion, byteOrder: order},
-			{Tag: TagFlashpixVersion, Type: TypeUndefined, Count: 4, Value: fpxVersion, byteOrder: order},
-			{Tag: TagColorSpace, Type: TypeShort, Count: 1, Value: []byte{0x01, 0x00}, byteOrder: order},
-			{Tag: TagComponentsConfiguration, Type: TypeUndefined, Count: 4, Value: compConfig, byteOrder: order},
+			{Tag: TagExifVersion, Type: TypeUndefined, Count: 4, Value: exifVersion, bigEndian: orderIsBig(order)},
+			{Tag: TagFlashpixVersion, Type: TypeUndefined, Count: 4, Value: fpxVersion, bigEndian: orderIsBig(order)},
+			{Tag: TagColorSpace, Type: TypeShort, Count: 1, Value: []byte{0x01, 0x00}, bigEndian: orderIsBig(order)},
+			{Tag: TagComponentsConfiguration, Type: TypeUndefined, Count: 4, Value: compConfig, bigEndian: orderIsBig(order)},
 		}},
 	}
 	sortEntries(e.ExifIFD.Entries)
@@ -1106,7 +1106,7 @@ func TestConformance_S29_datetime_format(t *testing.T) {
 		ByteOrder: order,
 		IFD0:      &IFD{},
 		ExifIFD: &IFD{Entries: []IFDEntry{
-			{Tag: TagDateTimeOriginal, Type: TypeASCII, Count: 20, Value: []byte(dtStr), byteOrder: order},
+			{Tag: TagDateTimeOriginal, Type: TypeASCII, Count: 20, Value: []byte(dtStr), bigEndian: orderIsBig(order)},
 		}},
 	}
 	ts, ok := e.DateTimeOriginal()
@@ -1122,7 +1122,7 @@ func TestConformance_S29_datetime_format(t *testing.T) {
 		ByteOrder: order,
 		IFD0:      &IFD{},
 		ExifIFD: &IFD{Entries: []IFDEntry{
-			{Tag: TagDateTimeOriginal, Type: TypeASCII, Count: 20, Value: []byte(spacesStr), byteOrder: order},
+			{Tag: TagDateTimeOriginal, Type: TypeASCII, Count: 20, Value: []byte(spacesStr), bigEndian: orderIsBig(order)},
 		}},
 	}
 	mustNotPanic(t, "S-29 spaces datetime", func() {
@@ -1139,8 +1139,8 @@ func TestConformance_S30_subsectime(t *testing.T) {
 		ByteOrder: order,
 		IFD0:      &IFD{},
 		ExifIFD: &IFD{Entries: []IFDEntry{
-			{Tag: TagSubSecTime, Type: TypeASCII, Count: 4, Value: []byte("123\x00"), byteOrder: order},
-			{Tag: TagSubSecTimeOriginal, Type: TypeASCII, Count: 3, Value: []byte("45\x00"), byteOrder: order},
+			{Tag: TagSubSecTime, Type: TypeASCII, Count: 4, Value: []byte("123\x00"), bigEndian: orderIsBig(order)},
+			{Tag: TagSubSecTimeOriginal, Type: TypeASCII, Count: 3, Value: []byte("45\x00"), bigEndian: orderIsBig(order)},
 		}},
 	}
 	sortEntries(e.ExifIFD.Entries)
@@ -1163,8 +1163,8 @@ func TestConformance_S31_offset_time(t *testing.T) {
 		ByteOrder: order,
 		IFD0:      &IFD{},
 		ExifIFD: &IFD{Entries: []IFDEntry{
-			{Tag: TagDateTimeOriginal, Type: TypeASCII, Count: 20, Value: []byte("2024:07:15 14:30:00\x00"), byteOrder: order},
-			{Tag: TagOffsetTimeOriginal, Type: TypeASCII, Count: 7, Value: []byte("+02:00\x00"), byteOrder: order},
+			{Tag: TagDateTimeOriginal, Type: TypeASCII, Count: 20, Value: []byte("2024:07:15 14:30:00\x00"), bigEndian: orderIsBig(order)},
+			{Tag: TagOffsetTimeOriginal, Type: TypeASCII, Count: 7, Value: []byte("+02:00\x00"), bigEndian: orderIsBig(order)},
 		}},
 	}
 	sortEntries(e.ExifIFD.Entries)
@@ -1226,8 +1226,8 @@ func TestConformance_S33_interop_tags(t *testing.T) {
 		ByteOrder: order,
 		IFD0:      &IFD{},
 		InteropIFD: &IFD{Entries: []IFDEntry{
-			{Tag: TagInteroperabilityIndex, Type: TypeASCII, Count: 4, Value: []byte("R98\x00"), byteOrder: order},
-			{Tag: TagInteroperabilityVersion, Type: TypeUndefined, Count: 4, Value: []byte("0100"), byteOrder: order},
+			{Tag: TagInteroperabilityIndex, Type: TypeASCII, Count: 4, Value: []byte("R98\x00"), bigEndian: orderIsBig(order)},
+			{Tag: TagInteroperabilityVersion, Type: TypeUndefined, Count: 4, Value: []byte("0100"), bigEndian: orderIsBig(order)},
 		}},
 	}
 	sortEntries(e.InteropIFD.Entries)

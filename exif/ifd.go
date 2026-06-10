@@ -260,6 +260,28 @@ type IFD struct {
 }
 
 // IFDEntry represents a single TIFF directory entry (TIFF §2, 12 bytes each).
+//
+// Byte-order encoding (task #199, performance audit 2026-06-10):
+// The byte order is stored as a 1-byte bool flag (bigEndian) instead of a
+// 16-byte binary.ByteOrder interface.  The interface held a GC-scannable
+// pointer on every entry, inflating arena backing arrays and GC scan work.
+//
+// Flag semantics:
+//   - false = little-endian (zero value; matches the library's default LE
+//     convention used throughout setters, ensureExifIFD, and ifd0ByteOrder).
+//   - true  = big-endian (e.g. Motorola-order EXIF streams).
+//
+// No third state (nil) is needed: the old nil interface was a latent panic —
+// any decoder method called on a nil-byteOrder entry would immediately crash.
+// All Parse paths always set a concrete order; the ifd0ByteOrder() fallback
+// to LittleEndian exists only for zero-valued programmatic EXIF structs (which
+// never have their entries' decoder methods called with a nil byteOrder through
+// a normal code path).  The zero value of bool (false = LE) preserves the same
+// observable default behaviour.
+//
+// Decoder methods call the package-level e.order() helper which returns the
+// binary.BigEndian or binary.LittleEndian singleton — both are zero-size globals,
+// so no allocation occurs.  CIPA DC-008-2023 §4.6.2; TIFF 6.0 §2.
 type IFDEntry struct {
 	Tag   TagID
 	Type  DataType
@@ -268,7 +290,7 @@ type IFDEntry struct {
 	// the raw bytes are stored inline; otherwise this is a []byte slice into
 	// the original buffer (zero-copy).
 	Value     []byte
-	byteOrder binary.ByteOrder
+	bigEndian bool
 	// rawOffset is the TIFF-stream offset stored in the value-or-offset field
 	// when the value is out-of-line (totalSize > 4 for classic TIFF, > 8 for
 	// BigTIFF).  Zero for inline values.  Stored as uint64 to preserve BigTIFF
@@ -276,6 +298,19 @@ type IFDEntry struct {
 	// lower 32 bits.  Used by parseExifSubIFDs/parseExifSubIFDsBigTIFF to
 	// record MakerNoteOffset/MakerNoteOffset64 without unsafe pointer arithmetic.
 	rawOffset uint64
+}
+
+// order returns the binary.ByteOrder corresponding to the entry's bigEndian flag.
+// binary.BigEndian and binary.LittleEndian are zero-size package-level singletons;
+// returning them through the interface incurs no heap allocation.
+//
+// CIPA DC-008-2023 §4.6.2: TIFF byte order is uniform per stream; the flag
+// records which stream this entry was parsed from or constructed for.
+func (e *IFDEntry) order() binary.ByteOrder {
+	if e.bigEndian {
+		return binary.BigEndian
+	}
+	return binary.LittleEndian
 }
 
 // parseIFDEntry decodes a single 12-byte IFD entry starting at byte offset e
@@ -303,6 +338,12 @@ func parseIFDEntry(b []byte, e, ifdStart, ifdEnd int, order binary.ByteOrder) (I
 	if e+12 > len(b) {
 		return IFDEntry{}, false, ""
 	}
+
+	// task #199: record byte order as a 1-bit flag instead of a 16-byte interface.
+	// binary.BigEndian and binary.LittleEndian are package-level singletons (zero size);
+	// comparing by identity is both safe and allocation-free.
+	// CIPA DC-008-2023 §4.6.2; TIFF 6.0 §2.
+	isBig := order == binary.BigEndian
 
 	tag := TagID(order.Uint16(b[e:]))
 	typ := DataType(order.Uint16(b[e+2:]))
@@ -339,7 +380,7 @@ func parseIFDEntry(b []byte, e, ifdStart, ifdEnd int, order binary.ByteOrder) (I
 			Type:      typ,
 			Count:     cnt,
 			Value:     value,
-			byteOrder: order,
+			bigEndian: isBig,
 			rawOffset: uint64(valOff), // TIFF §2: offset to value data; used by MakerNoteOffset
 		}, true, warn
 	default:
@@ -352,7 +393,7 @@ func parseIFDEntry(b []byte, e, ifdStart, ifdEnd int, order binary.ByteOrder) (I
 		Type:      typ,
 		Count:     cnt,
 		Value:     value,
-		byteOrder: order,
+		bigEndian: isBig,
 	}, true, ""
 }
 
@@ -529,7 +570,8 @@ func fillIFD(b []byte, ifd *IFD, offset uint32, pos, count, ifdStart, ifdEnd int
 
 	// Extract JPEG thumbnail bytes when both JPEGInterchangeFormat (0x0201) and
 	// JPEGInterchangeFormatLength (0x0202) are present (EXIF §4.5.5).
-	ifd.ThumbnailData = extractJPEGThumbnail(b, ifd, order)
+	// task #199: extractJPEGThumbnail now derives order from the entry's bigEndian flag.
+	ifd.ThumbnailData = extractJPEGThumbnail(b, ifd)
 
 	// Read the next-IFD pointer (4 bytes after the last entry, TIFF §2).
 	// Use the original (unclamped) count stored in the IFD count field for the
@@ -556,7 +598,12 @@ func fillIFD(b []byte, ifd *IFD, offset uint32, pos, count, ifdStart, ifdEnd int
 // (0x0202) likewise accepts TypeLong8 — real BigTIFF thumbnail sizes will always
 // fit in a uint32, but we read 64-bit and range-check before narrowing.
 // BigTIFF spec §2 (Aware Systems / libtiff); EXIF §4.5.5.
-func extractJPEGThumbnail(b []byte, ifd *IFD, order binary.ByteOrder) []byte { //nolint:gocyclo,cyclop // BigTIFF-aware type dispatch for TypeLong8/TypeLong offset and length; branches are inherent in the two-type handling
+//
+// task #199: order is now read from jifEntry.order() (the entry's bigEndian flag)
+// rather than a caller-supplied binary.ByteOrder parameter.  Both entries must
+// belong to the same TIFF stream, so they carry the same order flag; the per-entry
+// call is equivalent to the previous stream-level parameter at zero extra cost.
+func extractJPEGThumbnail(b []byte, ifd *IFD) []byte { //nolint:gocyclo,cyclop // BigTIFF-aware type dispatch for TypeLong8/TypeLong offset and length; branches are inherent in the two-type handling
 	jifEntry := ifd.Get(TagJPEGInterchangeFormat)
 	if jifEntry == nil {
 		return nil
@@ -566,26 +613,33 @@ func extractJPEGThumbnail(b []byte, ifd *IFD, order binary.ByteOrder) []byte { /
 		return nil
 	}
 
+	// Derive byte order from the entry's own flag (task #199).
+	// All entries in a TIFF IFD share the same stream byte order; reading it
+	// from the entry is equivalent to the previous caller-supplied parameter.
+	// CIPA DC-008-2023 §4.6.2; TIFF 6.0 §2.
+	ord := jifEntry.order()
+
 	// Read the offset: TypeLong8 (BigTIFF) = 8 bytes; TypeLong (classic) = 4 bytes.
 	// BigTIFF spec §2: JPEGInterchangeFormat may be stored as TypeLong8 in BigTIFF
 	// containers.  Callers must read 8 bytes for TypeLong8 or the high 32 bits are lost.
 	var jifOff uint64
 	switch {
 	case jifEntry.Type == TypeLong8 && len(jifEntry.Value) >= 8:
-		jifOff = order.Uint64(jifEntry.Value)
+		jifOff = ord.Uint64(jifEntry.Value)
 	case len(jifEntry.Value) >= 4:
-		jifOff = uint64(order.Uint32(jifEntry.Value))
+		jifOff = uint64(ord.Uint32(jifEntry.Value))
 	default:
 		return nil
 	}
 
 	// Read the length using the same type-aware logic.
+	lenOrd := jifLenEntry.order()
 	var jifLen64 uint64
 	switch {
 	case jifLenEntry.Type == TypeLong8 && len(jifLenEntry.Value) >= 8:
-		jifLen64 = order.Uint64(jifLenEntry.Value)
+		jifLen64 = lenOrd.Uint64(jifLenEntry.Value)
 	case len(jifLenEntry.Value) >= 4:
-		jifLen64 = uint64(order.Uint32(jifLenEntry.Value))
+		jifLen64 = uint64(lenOrd.Uint32(jifLenEntry.Value))
 	default:
 		return nil
 	}
@@ -946,6 +1000,10 @@ func parseIFDEntryBigTIFF(b []byte, e int, order binary.ByteOrder) (IFDEntry, bo
 		return IFDEntry{}, false
 	}
 
+	// task #199: record byte order as a 1-bit flag — see parseIFDEntry.
+	// CIPA DC-008-2023 §4.6.2; BigTIFF spec §2.
+	isBig := order == binary.BigEndian
+
 	tag := TagID(order.Uint16(b[e:]))
 	typ := DataType(order.Uint16(b[e+2:]))
 	cnt := order.Uint64(b[e+4:])
@@ -970,7 +1028,7 @@ func parseIFDEntryBigTIFF(b []byte, e int, order binary.ByteOrder) (IFDEntry, bo
 			Type:      typ,
 			Count:     uint32(cnt), // safe: cnt ≤ maxBigTIFFCount (2^30) < MaxUint32
 			Value:     b[e+12 : e+20],
-			byteOrder: order,
+			bigEndian: isBig,
 		}, true
 	}
 
@@ -993,7 +1051,7 @@ func parseIFDEntryBigTIFF(b []byte, e int, order binary.ByteOrder) (IFDEntry, bo
 			Type:      typ,
 			Count:     uint32(cnt), // safe: cnt ≤ maxBigTIFFCount (2^30) < MaxUint32
 			Value:     b[e+12 : end],
-			byteOrder: order,
+			bigEndian: isBig,
 		}, true
 	}
 
@@ -1008,7 +1066,7 @@ func parseIFDEntryBigTIFF(b []byte, e int, order binary.ByteOrder) (IFDEntry, bo
 		Type:      typ,
 		Count:     uint32(cnt), // safe: cnt ≤ maxBigTIFFCount (2^30) < MaxUint32
 		Value:     b[valOff : valOff+totalSize],
-		byteOrder: order,
+		bigEndian: isBig,
 		rawOffset: valOff, // BigTIFF spec §2: full 64-bit offset preserved; used by MakerNoteOffset64 (#142)
 	}, true
 }
@@ -1085,8 +1143,8 @@ func fillIFDBigTIFF(b []byte, ifd *IFD, offset, pos, count uint64, order binary.
 
 	// BigTIFF JPEG thumbnails (if any) — reuse the same extraction logic;
 	// the thumbnail offset stored as TypeLong (4-byte) will be read correctly
-	// by the existing extractJPEGThumbnail which uses order.Uint32.
-	ifd.ThumbnailData = extractJPEGThumbnail(b, ifd, order)
+	// by extractJPEGThumbnail using the entry's own bigEndian flag (task #199).
+	ifd.ThumbnailData = extractJPEGThumbnail(b, ifd)
 
 	// Read the next-IFD pointer (8 bytes after the last entry, BigTIFF spec §2).
 	nextPtrPos := pos + count*bigTIFFEntrySize
@@ -1206,19 +1264,19 @@ func readBigTIFFSubIFDOffset(e *IFDEntry) (uint64, bool) {
 		if len(e.Value) < 2 {
 			return 0, false
 		}
-		return uint64(e.byteOrder.Uint16(e.Value)), true
+		return uint64(e.order().Uint16(e.Value)), true
 	case TypeLong:
 		// TypeLong (4 bytes): used by tiffcp / libtiff even in BigTIFF containers.
 		if len(e.Value) < 4 {
 			return 0, false
 		}
-		return uint64(e.byteOrder.Uint32(e.Value)), true
+		return uint64(e.order().Uint32(e.Value)), true
 	case TypeLong8, TypeIFD8:
 		// TypeLong8/TypeIFD8 (8 bytes): BigTIFF-native pointer types.
 		if len(e.Value) < 8 {
 			return 0, false
 		}
-		return e.byteOrder.Uint64(e.Value), true
+		return e.order().Uint64(e.Value), true
 	}
 	return 0, false
 }
@@ -1263,7 +1321,7 @@ func (e *IFDEntry) Uint16() uint16 {
 	if e.Type != TypeShort || len(e.Value) < 2 {
 		return 0
 	}
-	return e.byteOrder.Uint16(e.Value)
+	return e.order().Uint16(e.Value)
 }
 
 // Uint32 decodes the first LONG (unsigned 32-bit) value.
@@ -1280,7 +1338,7 @@ func (e *IFDEntry) Uint32() uint32 {
 	if e.Type != TypeLong || len(e.Value) < 4 {
 		return 0
 	}
-	return e.byteOrder.Uint32(e.Value)
+	return e.order().Uint32(e.Value)
 }
 
 // Rational decodes the i-th RATIONAL value as [numerator, denominator].
@@ -1312,9 +1370,10 @@ func (e *IFDEntry) Rational(i int) [2]uint32 {
 	if off+8 > len(e.Value) {
 		return [2]uint32{}
 	}
+	ord := e.order()
 	return [2]uint32{
-		e.byteOrder.Uint32(e.Value[off:]),
-		e.byteOrder.Uint32(e.Value[off+4:]),
+		ord.Uint32(e.Value[off:]),
+		ord.Uint32(e.Value[off+4:]),
 	}
 }
 
@@ -1337,9 +1396,10 @@ func (e *IFDEntry) SRational(i int) [2]int32 {
 	if off+8 > len(e.Value) {
 		return [2]int32{}
 	}
+	ord := e.order()
 	return [2]int32{
-		int32(e.byteOrder.Uint32(e.Value[off:])),   //nolint:gosec // G115: intentional bit-reinterpretation of uint32 as signed int32 per EXIF TypeSRational
-		int32(e.byteOrder.Uint32(e.Value[off+4:])), //nolint:gosec // G115: intentional bit-reinterpretation of uint32 as signed int32 per EXIF TypeSRational
+		int32(ord.Uint32(e.Value[off:])),   //nolint:gosec // G115: intentional bit-reinterpretation of uint32 as signed int32 per EXIF TypeSRational
+		int32(ord.Uint32(e.Value[off+4:])), //nolint:gosec // G115: intentional bit-reinterpretation of uint32 as signed int32 per EXIF TypeSRational
 	}
 }
 
@@ -1348,7 +1408,7 @@ func (e *IFDEntry) Int16() int16 {
 	if e.Type != TypeSShort || len(e.Value) < 2 {
 		return 0
 	}
-	return int16(e.byteOrder.Uint16(e.Value)) //nolint:gosec // G115: intentional bit-reinterpretation per EXIF TypeSShort
+	return int16(e.order().Uint16(e.Value)) //nolint:gosec // G115: intentional bit-reinterpretation per EXIF TypeSShort
 }
 
 // Int32 decodes the first SLONG value.
@@ -1356,7 +1416,7 @@ func (e *IFDEntry) Int32() int32 {
 	if e.Type != TypeSLong || len(e.Value) < 4 {
 		return 0
 	}
-	return int32(e.byteOrder.Uint32(e.Value)) //nolint:gosec // G115: intentional bit-reinterpretation per EXIF TypeSLong
+	return int32(e.order().Uint32(e.Value)) //nolint:gosec // G115: intentional bit-reinterpretation per EXIF TypeSLong
 }
 
 // Float32 decodes the first FLOAT value (IEEE 754 single-precision).
@@ -1364,7 +1424,7 @@ func (e *IFDEntry) Float32() float32 {
 	if e.Type != TypeFloat || len(e.Value) < 4 {
 		return 0
 	}
-	bits := e.byteOrder.Uint32(e.Value)
+	bits := e.order().Uint32(e.Value)
 	return math.Float32frombits(bits)
 }
 
@@ -1373,7 +1433,7 @@ func (e *IFDEntry) Float64() float64 {
 	if e.Type != TypeDouble || len(e.Value) < 8 {
 		return 0
 	}
-	bits := e.byteOrder.Uint64(e.Value)
+	bits := e.order().Uint64(e.Value)
 	return math.Float64frombits(bits)
 }
 
@@ -1412,11 +1472,14 @@ func (e *IFDEntry) Len() int {
 // log n)), making bulk IFD construction O(n²) in the worst case instead of
 // the previous O(n² log n).
 func (ifd *IFD) set(tag TagID, typ DataType, count uint32, value []byte) {
-	order := binary.ByteOrder(binary.LittleEndian)
+	// Inherit byte order from the first existing entry (false = LE is the zero-value
+	// default matching the library convention; see IFDEntry.bigEndian comment).
+	// task #199: bigEndian bool replaces binary.ByteOrder interface.
+	var isBig bool
 	if len(ifd.Entries) > 0 {
-		order = ifd.Entries[0].byteOrder
+		isBig = ifd.Entries[0].bigEndian
 	}
-	entry := IFDEntry{Tag: tag, Type: typ, Count: count, Value: value, byteOrder: order}
+	entry := IFDEntry{Tag: tag, Type: typ, Count: count, Value: value, bigEndian: isBig}
 	// Binary search for the insertion point (entries are always sorted by tag).
 	i := sort.Search(len(ifd.Entries), func(i int) bool { return ifd.Entries[i].Tag >= tag })
 	if i < len(ifd.Entries) && ifd.Entries[i].Tag == tag {

@@ -145,7 +145,7 @@ func TestEncodeWithExifIFD(t *testing.T) {
 	// Add a fake ExifIFD with one entry.
 	e.ExifIFD = &IFD{
 		Entries: []IFDEntry{
-			{Tag: 0x9000, Type: TypeASCII, Count: 4, Value: []byte("0232"), byteOrder: binary.LittleEndian},
+			{Tag: 0x9000, Type: TypeASCII, Count: 4, Value: []byte("0232"), bigEndian: false},
 		},
 	}
 
@@ -193,10 +193,10 @@ func TestGPSRoundTrip(t *testing.T) {
 
 	e.GPSIFD = &IFD{
 		Entries: []IFDEntry{
-			{Tag: TagGPSLatitudeRef, Type: TypeASCII, Count: 2, Value: []byte("N\x00"), byteOrder: order},
-			{Tag: TagGPSLatitude, Type: TypeRational, Count: 3, Value: makeRationals(latDMS), byteOrder: order},
-			{Tag: TagGPSLongitudeRef, Type: TypeASCII, Count: 2, Value: []byte("W\x00"), byteOrder: order},
-			{Tag: TagGPSLongitude, Type: TypeRational, Count: 3, Value: makeRationals(lonDMS), byteOrder: order},
+			{Tag: TagGPSLatitudeRef, Type: TypeASCII, Count: 2, Value: []byte("N\x00"), bigEndian: orderIsBig(order)},
+			{Tag: TagGPSLatitude, Type: TypeRational, Count: 3, Value: makeRationals(latDMS), bigEndian: orderIsBig(order)},
+			{Tag: TagGPSLongitudeRef, Type: TypeASCII, Count: 2, Value: []byte("W\x00"), bigEndian: orderIsBig(order)},
+			{Tag: TagGPSLongitude, Type: TypeRational, Count: 3, Value: makeRationals(lonDMS), bigEndian: orderIsBig(order)},
 		},
 	}
 
@@ -244,10 +244,10 @@ func TestGPSRangeValidation(t *testing.T) {
 	}
 	e.GPSIFD = &IFD{
 		Entries: []IFDEntry{
-			{Tag: TagGPSLatitudeRef, Type: TypeASCII, Count: 2, Value: []byte("N\x00"), byteOrder: order},
-			{Tag: TagGPSLatitude, Type: TypeRational, Count: 3, Value: makeRationals([3][2]uint32{{91, 1}, {0, 1}, {0, 1}}), byteOrder: order},
-			{Tag: TagGPSLongitudeRef, Type: TypeASCII, Count: 2, Value: []byte("E\x00"), byteOrder: order},
-			{Tag: TagGPSLongitude, Type: TypeRational, Count: 3, Value: makeRationals([3][2]uint32{{10, 1}, {0, 1}, {0, 1}}), byteOrder: order},
+			{Tag: TagGPSLatitudeRef, Type: TypeASCII, Count: 2, Value: []byte("N\x00"), bigEndian: orderIsBig(order)},
+			{Tag: TagGPSLatitude, Type: TypeRational, Count: 3, Value: makeRationals([3][2]uint32{{91, 1}, {0, 1}, {0, 1}}), bigEndian: orderIsBig(order)},
+			{Tag: TagGPSLongitudeRef, Type: TypeASCII, Count: 2, Value: []byte("E\x00"), bigEndian: orderIsBig(order)},
+			{Tag: TagGPSLongitude, Type: TypeRational, Count: 3, Value: makeRationals([3][2]uint32{{10, 1}, {0, 1}, {0, 1}}), bigEndian: orderIsBig(order)},
 		},
 	}
 	_, _, ok := parseGPS(e.GPSIFD)
@@ -269,7 +269,7 @@ func TestIFD1ChainRoundTrip(t *testing.T) {
 	// Attach an IFD1 (thumbnail IFD).
 	e.IFD0.Next = &IFD{
 		Entries: []IFDEntry{
-			{Tag: TagImageWidth, Type: TypeLong, Count: 1, Value: []byte{0x80, 0x00, 0x00, 0x00}, byteOrder: binary.LittleEndian},
+			{Tag: TagImageWidth, Type: TypeLong, Count: 1, Value: []byte{0x80, 0x00, 0x00, 0x00}, bigEndian: false},
 		},
 	}
 
@@ -297,7 +297,7 @@ func TestCameraModel(t *testing.T) {
 	t.Parallel()
 	e := &EXIF{
 		IFD0: &IFD{Entries: []IFDEntry{
-			{Tag: TagModel, Type: TypeASCII, Count: 6, Value: []byte("Canon\x00"), byteOrder: binary.LittleEndian},
+			{Tag: TagModel, Type: TypeASCII, Count: 6, Value: []byte("Canon\x00"), bigEndian: false},
 		}},
 	}
 	if got := e.CameraModel(); got != "Canon" {
@@ -314,7 +314,7 @@ func TestCopyright(t *testing.T) {
 	t.Parallel()
 	e := &EXIF{
 		IFD0: &IFD{Entries: []IFDEntry{
-			{Tag: TagCopyright, Type: TypeASCII, Count: 16, Value: []byte("2025 ACME Corp\x00"), byteOrder: binary.LittleEndian},
+			{Tag: TagCopyright, Type: TypeASCII, Count: 16, Value: []byte("2025 ACME Corp\x00"), bigEndian: false},
 		}},
 	}
 	if got := e.Copyright(); got != "2025 ACME Corp" {
@@ -330,7 +330,7 @@ func TestCaption(t *testing.T) {
 	t.Parallel()
 	e := &EXIF{
 		IFD0: &IFD{Entries: []IFDEntry{
-			{Tag: TagImageDescription, Type: TypeASCII, Count: 12, Value: []byte("Sunset view\x00"), byteOrder: binary.LittleEndian},
+			{Tag: TagImageDescription, Type: TypeASCII, Count: 12, Value: []byte("Sunset view\x00"), bigEndian: false},
 		}},
 	}
 	if got := e.Caption(); got != "Sunset view" {
@@ -346,7 +346,7 @@ func TestCreator(t *testing.T) {
 	t.Parallel()
 	e := &EXIF{
 		IFD0: &IFD{Entries: []IFDEntry{
-			{Tag: TagArtist, Type: TypeASCII, Count: 12, Value: []byte("Jane Doe\x00\x00\x00\x00"), byteOrder: binary.LittleEndian},
+			{Tag: TagArtist, Type: TypeASCII, Count: 12, Value: []byte("Jane Doe\x00\x00\x00\x00"), bigEndian: false},
 		}},
 	}
 	if got := e.Creator(); got != "Jane Doe" {
@@ -363,7 +363,7 @@ func TestOrientation(t *testing.T) {
 	order := binary.LittleEndian
 	e := &EXIF{
 		IFD0: &IFD{Entries: []IFDEntry{
-			{Tag: TagOrientation, Type: TypeShort, Count: 1, Value: []byte{0x06, 0x00}, byteOrder: order},
+			{Tag: TagOrientation, Type: TypeShort, Count: 1, Value: []byte{0x06, 0x00}, bigEndian: orderIsBig(order)},
 		}},
 	}
 	if got, ok := e.Orientation(); !ok || got != 6 {
@@ -385,7 +385,7 @@ func TestDateTimeOriginal(t *testing.T) {
 	order := binary.LittleEndian
 	e := &EXIF{
 		ExifIFD: &IFD{Entries: []IFDEntry{
-			{Tag: TagDateTimeOriginal, Type: TypeASCII, Count: 20, Value: []byte("2024:07:15 14:30:00\x00"), byteOrder: order},
+			{Tag: TagDateTimeOriginal, Type: TypeASCII, Count: 20, Value: []byte("2024:07:15 14:30:00\x00"), bigEndian: orderIsBig(order)},
 		}},
 	}
 	ts, ok := e.DateTimeOriginal()
@@ -411,8 +411,8 @@ func TestDateTimeOriginalWithTimezone(t *testing.T) {
 	order := binary.LittleEndian
 	e := &EXIF{
 		ExifIFD: &IFD{Entries: []IFDEntry{
-			{Tag: TagDateTimeOriginal, Type: TypeASCII, Count: 20, Value: []byte("2024:07:15 14:30:00\x00"), byteOrder: order},
-			{Tag: TagOffsetTimeOriginal, Type: TypeASCII, Count: 7, Value: []byte("+02:00\x00"), byteOrder: order},
+			{Tag: TagDateTimeOriginal, Type: TypeASCII, Count: 20, Value: []byte("2024:07:15 14:30:00\x00"), bigEndian: orderIsBig(order)},
+			{Tag: TagOffsetTimeOriginal, Type: TypeASCII, Count: 7, Value: []byte("+02:00\x00"), bigEndian: orderIsBig(order)},
 		}},
 	}
 	ts, ok := e.DateTimeOriginal()
@@ -467,7 +467,7 @@ func TestExposureTime(t *testing.T) {
 	order.PutUint32(val[4:], 200)
 	e := &EXIF{
 		ExifIFD: &IFD{Entries: []IFDEntry{
-			{Tag: TagExposureTime, Type: TypeRational, Count: 1, Value: val, byteOrder: order},
+			{Tag: TagExposureTime, Type: TypeRational, Count: 1, Value: val, bigEndian: orderIsBig(order)},
 		}},
 	}
 	num, den, ok := e.ExposureTime()
@@ -488,7 +488,7 @@ func TestFNumber(t *testing.T) {
 	order.PutUint32(val[4:], 10)
 	e := &EXIF{
 		ExifIFD: &IFD{Entries: []IFDEntry{
-			{Tag: TagFNumber, Type: TypeRational, Count: 1, Value: val, byteOrder: order},
+			{Tag: TagFNumber, Type: TypeRational, Count: 1, Value: val, bigEndian: orderIsBig(order)},
 		}},
 	}
 	f, ok := e.FNumber()
@@ -506,7 +506,7 @@ func TestISO(t *testing.T) {
 	order := binary.LittleEndian
 	e := &EXIF{
 		ExifIFD: &IFD{Entries: []IFDEntry{
-			{Tag: TagISOSpeedRatings, Type: TypeShort, Count: 1, Value: []byte{0x64, 0x01}, byteOrder: order}, // 356
+			{Tag: TagISOSpeedRatings, Type: TypeShort, Count: 1, Value: []byte{0x64, 0x01}, bigEndian: orderIsBig(order)}, // 356
 		}},
 	}
 	iso, ok := e.ISO()
@@ -527,7 +527,7 @@ func TestFocalLength(t *testing.T) {
 	order.PutUint32(val[4:], 1)
 	e := &EXIF{
 		ExifIFD: &IFD{Entries: []IFDEntry{
-			{Tag: TagFocalLength, Type: TypeRational, Count: 1, Value: val, byteOrder: order},
+			{Tag: TagFocalLength, Type: TypeRational, Count: 1, Value: val, bigEndian: orderIsBig(order)},
 		}},
 	}
 	fl, ok := e.FocalLength()
@@ -544,7 +544,7 @@ func TestLensModel(t *testing.T) {
 	t.Parallel()
 	e := &EXIF{
 		ExifIFD: &IFD{Entries: []IFDEntry{
-			{Tag: TagLensModel, Type: TypeASCII, Count: 14, Value: []byte("EF 50mm f/1.8\x00"), byteOrder: binary.LittleEndian},
+			{Tag: TagLensModel, Type: TypeASCII, Count: 14, Value: []byte("EF 50mm f/1.8\x00"), bigEndian: false},
 		}},
 	}
 	if got := e.LensModel(); got != "EF 50mm f/1.8" {
@@ -561,8 +561,8 @@ func TestImageSize(t *testing.T) {
 	order := binary.LittleEndian
 	e := &EXIF{
 		ExifIFD: &IFD{Entries: []IFDEntry{
-			{Tag: TagPixelXDimension, Type: TypeLong, Count: 1, Value: []byte{0x80, 0x07, 0x00, 0x00}, byteOrder: order}, // 1920
-			{Tag: TagPixelYDimension, Type: TypeLong, Count: 1, Value: []byte{0x38, 0x04, 0x00, 0x00}, byteOrder: order}, // 1080
+			{Tag: TagPixelXDimension, Type: TypeLong, Count: 1, Value: []byte{0x80, 0x07, 0x00, 0x00}, bigEndian: orderIsBig(order)}, // 1920
+			{Tag: TagPixelYDimension, Type: TypeLong, Count: 1, Value: []byte{0x38, 0x04, 0x00, 0x00}, bigEndian: orderIsBig(order)}, // 1080
 		}},
 	}
 	w, h, ok := e.ImageSize()
@@ -572,8 +572,8 @@ func TestImageSize(t *testing.T) {
 	// SHORT variant.
 	e2 := &EXIF{
 		ExifIFD: &IFD{Entries: []IFDEntry{
-			{Tag: TagPixelXDimension, Type: TypeShort, Count: 1, Value: []byte{0x80, 0x07}, byteOrder: order}, // 1920
-			{Tag: TagPixelYDimension, Type: TypeShort, Count: 1, Value: []byte{0x38, 0x04}, byteOrder: order}, // 1080
+			{Tag: TagPixelXDimension, Type: TypeShort, Count: 1, Value: []byte{0x80, 0x07}, bigEndian: orderIsBig(order)}, // 1920
+			{Tag: TagPixelYDimension, Type: TypeShort, Count: 1, Value: []byte{0x38, 0x04}, bigEndian: orderIsBig(order)}, // 1080
 		}},
 	}
 	w2, h2, ok2 := e2.ImageSize()
@@ -594,12 +594,12 @@ func TestIFDEntryInt16(t *testing.T) {
 	t.Parallel()
 	order := binary.LittleEndian
 	// -100 in little-endian signed short: 0x9C 0xFF
-	e := IFDEntry{Type: TypeSShort, Count: 1, Value: []byte{0x9C, 0xFF}, byteOrder: order}
+	e := IFDEntry{Type: TypeSShort, Count: 1, Value: []byte{0x9C, 0xFF}, bigEndian: orderIsBig(order)}
 	if got := e.Int16(); got != -100 {
 		t.Errorf("Int16() = %d, want -100", got)
 	}
 	// Wrong type returns 0.
-	e2 := IFDEntry{Type: TypeShort, Count: 1, Value: []byte{0x64, 0x00}, byteOrder: order}
+	e2 := IFDEntry{Type: TypeShort, Count: 1, Value: []byte{0x64, 0x00}, bigEndian: orderIsBig(order)}
 	if got := e2.Int16(); got != 0 {
 		t.Errorf("Int16() with TypeShort = %d, want 0", got)
 	}
@@ -611,11 +611,11 @@ func TestIFDEntryInt32(t *testing.T) {
 	var neg1M int32 = -1_000_000
 	val := make([]byte, 4)
 	order.PutUint32(val, uint32(neg1M)) //nolint:gosec // G115: test helper, intentional type cast
-	e := IFDEntry{Type: TypeSLong, Count: 1, Value: val, byteOrder: order}
+	e := IFDEntry{Type: TypeSLong, Count: 1, Value: val, bigEndian: orderIsBig(order)}
 	if got := e.Int32(); got != neg1M {
 		t.Errorf("Int32() = %d, want %d", got, neg1M)
 	}
-	e2 := IFDEntry{Type: TypeLong, Count: 1, Value: val, byteOrder: order}
+	e2 := IFDEntry{Type: TypeLong, Count: 1, Value: val, bigEndian: orderIsBig(order)}
 	if got := e2.Int32(); got != 0 {
 		t.Errorf("Int32() with TypeLong = %d, want 0", got)
 	}
@@ -626,12 +626,12 @@ func TestIFDEntryFloat32(t *testing.T) {
 	order := binary.LittleEndian
 	val := make([]byte, 4)
 	order.PutUint32(val, math.Float32bits(3.14))
-	e := IFDEntry{Type: TypeFloat, Count: 1, Value: val, byteOrder: order}
+	e := IFDEntry{Type: TypeFloat, Count: 1, Value: val, bigEndian: orderIsBig(order)}
 	got := e.Float32()
 	if got < 3.13 || got > 3.15 {
 		t.Errorf("Float32() = %f, want ~3.14", got)
 	}
-	e2 := IFDEntry{Type: TypeDouble, Count: 1, Value: make([]byte, 8), byteOrder: order}
+	e2 := IFDEntry{Type: TypeDouble, Count: 1, Value: make([]byte, 8), bigEndian: orderIsBig(order)}
 	if got := e2.Float32(); got != 0 {
 		t.Errorf("Float32() with TypeDouble = %f, want 0", got)
 	}
@@ -642,12 +642,12 @@ func TestIFDEntryFloat64(t *testing.T) {
 	order := binary.LittleEndian
 	val := make([]byte, 8)
 	order.PutUint64(val, math.Float64bits(2.718281828))
-	e := IFDEntry{Type: TypeDouble, Count: 1, Value: val, byteOrder: order}
+	e := IFDEntry{Type: TypeDouble, Count: 1, Value: val, bigEndian: orderIsBig(order)}
 	got := e.Float64()
 	if got < 2.718 || got > 2.719 {
 		t.Errorf("Float64() = %f, want ~2.718", got)
 	}
-	e2 := IFDEntry{Type: TypeFloat, Count: 1, Value: val[:4], byteOrder: order}
+	e2 := IFDEntry{Type: TypeFloat, Count: 1, Value: val[:4], bigEndian: orderIsBig(order)}
 	if got := e2.Float64(); got != 0 {
 		t.Errorf("Float64() with TypeFloat = %f, want 0", got)
 	}
@@ -656,7 +656,7 @@ func TestIFDEntryFloat64(t *testing.T) {
 func TestIFDEntryBytes(t *testing.T) {
 	t.Parallel()
 	payload := []byte{0xDE, 0xAD, 0xBE, 0xEF}
-	e := IFDEntry{Type: TypeUndefined, Count: 4, Value: payload, byteOrder: binary.LittleEndian}
+	e := IFDEntry{Type: TypeUndefined, Count: 4, Value: payload, bigEndian: false}
 	if got := e.Bytes(); !bytes.Equal(got, payload) {
 		t.Errorf("Bytes() = %v, want %v", got, payload)
 	}
@@ -664,7 +664,7 @@ func TestIFDEntryBytes(t *testing.T) {
 
 func TestIFDEntryLen(t *testing.T) {
 	t.Parallel()
-	e := IFDEntry{Type: TypeASCII, Count: 7, Value: []byte("hello\x00"), byteOrder: binary.LittleEndian}
+	e := IFDEntry{Type: TypeASCII, Count: 7, Value: []byte("hello\x00"), bigEndian: false}
 	if got := e.Len(); got != 7 {
 		t.Errorf("Len() = %d, want 7", got)
 	}
@@ -685,7 +685,7 @@ func TestIFDEntrySRational(t *testing.T) {
 	order.PutUint32(val[8:], uint32(posThree))
 	order.PutUint32(val[12:], uint32(posFour))
 
-	e := IFDEntry{Type: TypeSRational, Count: 2, Value: val, byteOrder: order}
+	e := IFDEntry{Type: TypeSRational, Count: 2, Value: val, bigEndian: orderIsBig(order)}
 
 	r0 := e.SRational(0)
 	if r0[0] != -1 || r0[1] != 2 {
@@ -700,7 +700,7 @@ func TestIFDEntrySRational(t *testing.T) {
 func TestIFDEntrySRationalOutOfRange(t *testing.T) {
 	t.Parallel()
 	val := make([]byte, 8) // only 1 SRational
-	e := IFDEntry{Type: TypeSRational, Count: 1, Value: val, byteOrder: binary.LittleEndian}
+	e := IFDEntry{Type: TypeSRational, Count: 1, Value: val, bigEndian: false}
 	r := e.SRational(1) // index 1 is out of range
 	if r != ([2]int32{}) {
 		t.Errorf("SRational out-of-range: got %v, want [0 0]", r)
@@ -711,7 +711,7 @@ func TestIFDEntrySRationalWrongType(t *testing.T) {
 	t.Parallel()
 	// Rational (unsigned) entry should not be decodable via SRational.
 	val := make([]byte, 8)
-	e := IFDEntry{Type: TypeRational, Count: 1, Value: val, byteOrder: binary.LittleEndian}
+	e := IFDEntry{Type: TypeRational, Count: 1, Value: val, bigEndian: false}
 	r := e.SRational(0)
 	if r != ([2]int32{}) {
 		t.Errorf("SRational wrong type: got %v, want [0 0]", r)
@@ -1091,7 +1091,7 @@ func TestSetOrientation(t *testing.T) {
 			e := &EXIF{
 				ByteOrder: tc.order,
 				IFD0: &IFD{Entries: []IFDEntry{
-					{Tag: TagImageWidth, Type: TypeShort, Count: 1, Value: seed, byteOrder: tc.order},
+					{Tag: TagImageWidth, Type: TypeShort, Count: 1, Value: seed, bigEndian: orderIsBig(tc.order)},
 				}},
 			}
 			e.SetOrientation(tc.value)
@@ -1183,10 +1183,10 @@ func TestEncodeRoundTripFull(t *testing.T) {
 	e := &EXIF{
 		ByteOrder: order,
 		IFD0: &IFD{Entries: []IFDEntry{
-			{Tag: TagMake, Type: TypeASCII, Count: 6, Value: []byte("Nikon\x00"), byteOrder: order},
+			{Tag: TagMake, Type: TypeASCII, Count: 6, Value: []byte("Nikon\x00"), bigEndian: orderIsBig(order)},
 		}},
 		ExifIFD: &IFD{Entries: []IFDEntry{
-			{Tag: TagFNumber, Type: TypeRational, Count: 1, Value: fnumVal, byteOrder: order},
+			{Tag: TagFNumber, Type: TypeRational, Count: 1, Value: fnumVal, bigEndian: orderIsBig(order)},
 		}},
 	}
 
@@ -1718,21 +1718,21 @@ func TestIFDEntryStringUint16Uint32Rational(t *testing.T) {
 
 	t.Run("String_correct_type", func(t *testing.T) {
 		t.Parallel()
-		e := &IFDEntry{Type: TypeASCII, Value: []byte("Canon\x00"), byteOrder: binary.LittleEndian}
+		e := &IFDEntry{Type: TypeASCII, Value: []byte("Canon\x00"), bigEndian: false}
 		if got := e.String(); got != "Canon" {
 			t.Errorf("String() = %q, want %q", got, "Canon")
 		}
 	})
 	t.Run("String_wrong_type", func(t *testing.T) {
 		t.Parallel()
-		e := &IFDEntry{Type: TypeShort, Value: []byte{0x01, 0x00}, byteOrder: binary.LittleEndian}
+		e := &IFDEntry{Type: TypeShort, Value: []byte{0x01, 0x00}, bigEndian: false}
 		if got := e.String(); got != "" {
 			t.Errorf("String() on TypeShort = %q, want empty", got)
 		}
 	})
 	t.Run("String_empty_value", func(t *testing.T) {
 		t.Parallel()
-		e := &IFDEntry{Type: TypeASCII, Value: []byte{}, byteOrder: binary.LittleEndian}
+		e := &IFDEntry{Type: TypeASCII, Value: []byte{}, bigEndian: false}
 		if got := e.String(); got != "" {
 			t.Errorf("String() on empty = %q, want empty", got)
 		}
@@ -1740,14 +1740,14 @@ func TestIFDEntryStringUint16Uint32Rational(t *testing.T) {
 
 	t.Run("Uint16_correct_type", func(t *testing.T) {
 		t.Parallel()
-		e := &IFDEntry{Type: TypeShort, Value: []byte{0x42, 0x00}, byteOrder: binary.LittleEndian}
+		e := &IFDEntry{Type: TypeShort, Value: []byte{0x42, 0x00}, bigEndian: false}
 		if got := e.Uint16(); got != 0x42 {
 			t.Errorf("Uint16() = 0x%04X, want 0x42", got)
 		}
 	})
 	t.Run("Uint16_wrong_type", func(t *testing.T) {
 		t.Parallel()
-		e := &IFDEntry{Type: TypeLong, Value: []byte{0x01, 0x00, 0x00, 0x00}, byteOrder: binary.LittleEndian}
+		e := &IFDEntry{Type: TypeLong, Value: []byte{0x01, 0x00, 0x00, 0x00}, bigEndian: false}
 		if got := e.Uint16(); got != 0 {
 			t.Errorf("Uint16() on TypeLong = 0x%04X, want 0", got)
 		}
@@ -1755,14 +1755,14 @@ func TestIFDEntryStringUint16Uint32Rational(t *testing.T) {
 
 	t.Run("Uint32_correct_type", func(t *testing.T) {
 		t.Parallel()
-		e := &IFDEntry{Type: TypeLong, Value: []byte{0x10, 0x00, 0x00, 0x80}, byteOrder: binary.LittleEndian}
+		e := &IFDEntry{Type: TypeLong, Value: []byte{0x10, 0x00, 0x00, 0x80}, bigEndian: false}
 		if got := e.Uint32(); got != 0x80000010 {
 			t.Errorf("Uint32() = 0x%08X, want 0x80000010", got)
 		}
 	})
 	t.Run("Uint32_wrong_type", func(t *testing.T) {
 		t.Parallel()
-		e := &IFDEntry{Type: TypeShort, Value: []byte{0x01, 0x00}, byteOrder: binary.LittleEndian}
+		e := &IFDEntry{Type: TypeShort, Value: []byte{0x01, 0x00}, bigEndian: false}
 		if got := e.Uint32(); got != 0 {
 			t.Errorf("Uint32() on TypeShort = 0x%08X, want 0", got)
 		}
@@ -1774,7 +1774,7 @@ func TestIFDEntryStringUint16Uint32Rational(t *testing.T) {
 		val := make([]byte, 8)
 		binary.LittleEndian.PutUint32(val[0:], 1)
 		binary.LittleEndian.PutUint32(val[4:], 500)
-		e := &IFDEntry{Type: TypeRational, Value: val, byteOrder: binary.LittleEndian}
+		e := &IFDEntry{Type: TypeRational, Value: val, bigEndian: false}
 		r := e.Rational(0)
 		if r[0] != 1 || r[1] != 500 {
 			t.Errorf("Rational(0) = %v, want [1 500]", r)
@@ -1782,7 +1782,7 @@ func TestIFDEntryStringUint16Uint32Rational(t *testing.T) {
 	})
 	t.Run("Rational_wrong_type", func(t *testing.T) {
 		t.Parallel()
-		e := &IFDEntry{Type: TypeShort, Value: []byte{0x01, 0x00}, byteOrder: binary.LittleEndian}
+		e := &IFDEntry{Type: TypeShort, Value: []byte{0x01, 0x00}, bigEndian: false}
 		r := e.Rational(0)
 		if r != ([2]uint32{}) {
 			t.Errorf("Rational(0) on TypeShort = %v, want [0 0]", r)
@@ -1791,7 +1791,7 @@ func TestIFDEntryStringUint16Uint32Rational(t *testing.T) {
 	t.Run("Rational_out_of_range", func(t *testing.T) {
 		t.Parallel()
 		val := make([]byte, 8)
-		e := &IFDEntry{Type: TypeRational, Value: val, byteOrder: binary.LittleEndian}
+		e := &IFDEntry{Type: TypeRational, Value: val, bigEndian: false}
 		r := e.Rational(5) // index 5 → offset 40, way beyond 8 bytes
 		if r != ([2]uint32{}) {
 			t.Errorf("Rational(5) OOB = %v, want [0 0]", r)
@@ -1805,14 +1805,14 @@ func TestIFDEntryByteAndUint8s(t *testing.T) {
 	t.Parallel()
 	t.Run("Byte_nonempty", func(t *testing.T) {
 		t.Parallel()
-		e := &IFDEntry{Value: []byte{0x42, 0x43}, byteOrder: binary.LittleEndian}
+		e := &IFDEntry{Value: []byte{0x42, 0x43}, bigEndian: false}
 		if got := e.Byte(); got != 0x42 {
 			t.Errorf("Byte() = 0x%02X, want 0x42", got)
 		}
 	})
 	t.Run("Byte_empty", func(t *testing.T) {
 		t.Parallel()
-		e := &IFDEntry{Value: []byte{}, byteOrder: binary.LittleEndian}
+		e := &IFDEntry{Value: []byte{}, bigEndian: false}
 		if got := e.Byte(); got != 0 {
 			t.Errorf("Byte() on empty = 0x%02X, want 0", got)
 		}
@@ -1820,7 +1820,7 @@ func TestIFDEntryByteAndUint8s(t *testing.T) {
 	t.Run("Uint8s", func(t *testing.T) {
 		t.Parallel()
 		payload := []byte{1, 2, 3, 4}
-		e := &IFDEntry{Value: payload, byteOrder: binary.LittleEndian}
+		e := &IFDEntry{Value: payload, bigEndian: false}
 		got := e.Uint8s()
 		if len(got) != len(payload) {
 			t.Fatalf("Uint8s() len = %d, want %d", len(got), len(payload))
@@ -2422,10 +2422,10 @@ func TestParseGPSWrongTypeReportsAbsent(t *testing.T) {
 			t.Parallel()
 			gpsIFD := &IFD{
 				Entries: []IFDEntry{
-					{Tag: TagGPSLatitudeRef, Type: TypeASCII, Count: 2, Value: []byte("S\x00"), byteOrder: order},
-					{Tag: TagGPSLatitude, Type: tc.latType, Count: 3, Value: tc.latValue, byteOrder: order},
-					{Tag: TagGPSLongitudeRef, Type: TypeASCII, Count: 2, Value: []byte("E\x00"), byteOrder: order},
-					{Tag: TagGPSLongitude, Type: TypeRational, Count: 3, Value: makeRationals(validLonDMS), byteOrder: order},
+					{Tag: TagGPSLatitudeRef, Type: TypeASCII, Count: 2, Value: []byte("S\x00"), bigEndian: orderIsBig(order)},
+					{Tag: TagGPSLatitude, Type: tc.latType, Count: 3, Value: tc.latValue, bigEndian: orderIsBig(order)},
+					{Tag: TagGPSLongitudeRef, Type: TypeASCII, Count: 2, Value: []byte("E\x00"), bigEndian: orderIsBig(order)},
+					{Tag: TagGPSLongitude, Type: TypeRational, Count: 3, Value: makeRationals(validLonDMS), bigEndian: orderIsBig(order)},
 				},
 			}
 			sortEntries(gpsIFD.Entries)
@@ -2588,7 +2588,7 @@ func TestFNumberZeroDenominator(t *testing.T) {
 	order.PutUint32(val[4:], 0)  // zero denominator
 	e := &EXIF{
 		ExifIFD: &IFD{Entries: []IFDEntry{
-			{Tag: TagFNumber, Type: TypeRational, Count: 1, Value: val, byteOrder: order},
+			{Tag: TagFNumber, Type: TypeRational, Count: 1, Value: val, bigEndian: orderIsBig(order)},
 		}},
 	}
 	_, ok := e.FNumber()
@@ -2607,7 +2607,7 @@ func TestFocalLengthZeroDenominator(t *testing.T) {
 	order.PutUint32(val[4:], 0)  // zero denominator
 	e := &EXIF{
 		ExifIFD: &IFD{Entries: []IFDEntry{
-			{Tag: TagFocalLength, Type: TypeRational, Count: 1, Value: val, byteOrder: order},
+			{Tag: TagFocalLength, Type: TypeRational, Count: 1, Value: val, bigEndian: orderIsBig(order)},
 		}},
 	}
 	_, ok := e.FocalLength()
@@ -3003,7 +3003,7 @@ func TestTypeUTF8TypeSize(t *testing.T) {
 // after the TypeUTF8 condition was added.
 func TestTypeUTF8StringDoesNotBreakASCII(t *testing.T) {
 	t.Parallel()
-	e := IFDEntry{Type: TypeASCII, Count: 6, Value: []byte("Canon\x00"), byteOrder: binary.LittleEndian}
+	e := IFDEntry{Type: TypeASCII, Count: 6, Value: []byte("Canon\x00"), bigEndian: false}
 	if got := e.String(); got != "Canon" {
 		t.Errorf("String() (TypeASCII) = %q, want \"Canon\"", got)
 	}
@@ -3266,9 +3266,9 @@ func TestWriteIFDInlineDeterminism(t *testing.T) {
 	e := &EXIF{
 		ByteOrder: order,
 		IFD0: &IFD{Entries: []IFDEntry{
-			{Tag: TagOrientation, Type: TypeShort, Count: 1, Value: []byte{0x01, 0x00}, byteOrder: order},
-			{Tag: TagResolutionUnit, Type: TypeShort, Count: 1, Value: []byte{0x02, 0x00}, byteOrder: order},
-			{Tag: TagImageWidth, Type: TypeLong, Count: 1, Value: []byte{0x80, 0x07, 0x00, 0x00}, byteOrder: order},
+			{Tag: TagOrientation, Type: TypeShort, Count: 1, Value: []byte{0x01, 0x00}, bigEndian: orderIsBig(order)},
+			{Tag: TagResolutionUnit, Type: TypeShort, Count: 1, Value: []byte{0x02, 0x00}, bigEndian: orderIsBig(order)},
+			{Tag: TagImageWidth, Type: TypeLong, Count: 1, Value: []byte{0x80, 0x07, 0x00, 0x00}, bigEndian: orderIsBig(order)},
 		}},
 	}
 
@@ -3314,8 +3314,8 @@ func TestWriteIFDInlineDeterminismPoolContamination(t *testing.T) {
 	poison := &EXIF{
 		ByteOrder: order,
 		IFD0: &IFD{Entries: []IFDEntry{
-			{Tag: TagOrientation, Type: TypeShort, Count: 1, Value: []byte{0xFF, 0xFF}, byteOrder: order},
-			{Tag: TagResolutionUnit, Type: TypeShort, Count: 1, Value: []byte{0xFF, 0xFF}, byteOrder: order},
+			{Tag: TagOrientation, Type: TypeShort, Count: 1, Value: []byte{0xFF, 0xFF}, bigEndian: orderIsBig(order)},
+			{Tag: TagResolutionUnit, Type: TypeShort, Count: 1, Value: []byte{0xFF, 0xFF}, bigEndian: orderIsBig(order)},
 		}},
 	}
 	if _, err := Encode(poison); err != nil {
@@ -3328,8 +3328,8 @@ func TestWriteIFDInlineDeterminismPoolContamination(t *testing.T) {
 	target := &EXIF{
 		ByteOrder: order,
 		IFD0: &IFD{Entries: []IFDEntry{
-			{Tag: TagOrientation, Type: TypeShort, Count: 1, Value: []byte{0x01, 0x00}, byteOrder: order},
-			{Tag: TagResolutionUnit, Type: TypeShort, Count: 1, Value: []byte{0x02, 0x00}, byteOrder: order},
+			{Tag: TagOrientation, Type: TypeShort, Count: 1, Value: []byte{0x01, 0x00}, bigEndian: orderIsBig(order)},
+			{Tag: TagResolutionUnit, Type: TypeShort, Count: 1, Value: []byte{0x02, 0x00}, bigEndian: orderIsBig(order)},
 		}},
 	}
 
@@ -3662,10 +3662,10 @@ func TestDecodeCoordinateSRationalReturnsNotOK(t *testing.T) {
 
 	gpsIFD := &IFD{
 		Entries: []IFDEntry{
-			{Tag: TagGPSLatitudeRef, Type: TypeASCII, Count: 2, Value: []byte("N\x00"), byteOrder: order},
-			{Tag: TagGPSLatitude, Type: TypeSRational, Count: 3, Value: sratVal, byteOrder: order},
-			{Tag: TagGPSLongitudeRef, Type: TypeASCII, Count: 2, Value: []byte("E\x00"), byteOrder: order},
-			{Tag: TagGPSLongitude, Type: TypeRational, Count: 3, Value: validLonVal, byteOrder: order},
+			{Tag: TagGPSLatitudeRef, Type: TypeASCII, Count: 2, Value: []byte("N\x00"), bigEndian: orderIsBig(order)},
+			{Tag: TagGPSLatitude, Type: TypeSRational, Count: 3, Value: sratVal, bigEndian: orderIsBig(order)},
+			{Tag: TagGPSLongitudeRef, Type: TypeASCII, Count: 2, Value: []byte("E\x00"), bigEndian: orderIsBig(order)},
+			{Tag: TagGPSLongitude, Type: TypeRational, Count: 3, Value: validLonVal, bigEndian: orderIsBig(order)},
 		},
 	}
 	sortEntries(gpsIFD.Entries)
@@ -3685,30 +3685,30 @@ func TestDecodeCoordinateSRationalReturnsNotOK(t *testing.T) {
 // TestSetMakeOnManuallyConstructedEXIF is the regression gate for audit
 // finding #189.
 //
-// A programmatically constructed EXIF whose IFD0 contains entries with a nil
-// byteOrder (zero value of the binary.ByteOrder interface) must not panic
+// A programmatically constructed EXIF whose IFD0 contains entries where the
+// bigEndian flag is at its zero value (false = little-endian) must not panic
 // when any Set* method is called.
 //
-// Prior to the fix, ifd0ByteOrder returned e.IFD0.Entries[0].byteOrder
-// directly without checking for nil. A nil binary.ByteOrder causes
-// PutUint16/PutUint32 calls to dereference a nil function pointer, panicking.
-// The fix adds a nil check and falls back to binary.LittleEndian.
+// Prior to task #199, this field was a binary.ByteOrder interface whose zero
+// value was nil; calling any PutUint16/PutUint32 method on a nil interface
+// panicked.  ifd0ByteOrder required an explicit nil-guard and fallback.
+// With the bool flag the zero value is well-defined (false = LE) and safe —
+// no nil-guard is needed.  task #199; Audit finding #189.
 //
 //nolint:paralleltest // runs in isolation to keep the panic recovery deterministic
 func TestSetMakeOnManuallyConstructedEXIF(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
-			t.Errorf("Set* methods panicked on manually constructed EXIF with nil byteOrder: %v", r)
+			t.Errorf("Set* methods panicked on manually constructed EXIF with zero-value bigEndian flag: %v", r)
 		}
 	}()
 
-	// Construct an EXIF whose IFD0 has an entry with a nil byteOrder (the zero
-	// value for a binary.ByteOrder interface — not set by Parse, but possible
-	// when code builds an EXIF struct directly).
+	// Construct an EXIF whose IFD0 has an entry with bigEndian=false (the zero
+	// value — not set by Parse, but possible when code builds an EXIF directly).
 	e := &EXIF{
 		IFD0: &IFD{
 			Entries: []IFDEntry{
-				{Tag: TagMake}, // byteOrder is nil (zero value of interface)
+				{Tag: TagMake}, // bigEndian defaults to false (little-endian)
 			},
 		},
 	}

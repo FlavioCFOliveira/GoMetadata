@@ -118,9 +118,9 @@ func TestWordAlignedEncodeBasic(t *testing.T) {
 		ByteOrder: order,
 		IFD0: &IFD{Entries: []IFDEntry{
 			// ASCII "Hello\x00\x00" — 7 bytes (odd length).
-			{Tag: TagMake, Type: TypeASCII, Count: 7, Value: []byte("Hello\x00\x00"), byteOrder: order},
+			{Tag: TagMake, Type: TypeASCII, Count: 7, Value: []byte("Hello\x00\x00"), bigEndian: orderIsBig(order)},
 			// RATIONAL (8 bytes, out-of-line).
-			{Tag: TagXResolution, Type: TypeRational, Count: 1, Value: ratVal, byteOrder: order},
+			{Tag: TagXResolution, Type: TypeRational, Count: 1, Value: ratVal, bigEndian: orderIsBig(order)},
 		}},
 	}
 
@@ -181,22 +181,22 @@ func TestWordAlignedEncodeAllIFDs(t *testing.T) {
 		ByteOrder: order,
 		IFD0: &IFD{Entries: []IFDEntry{
 			// 6-byte ASCII (even).
-			{Tag: TagMake, Type: TypeASCII, Count: 6, Value: []byte("Canon\x00"), byteOrder: order},
+			{Tag: TagMake, Type: TypeASCII, Count: 6, Value: []byte("Canon\x00"), bigEndian: orderIsBig(order)},
 			// 7-byte ASCII (odd) — forces a pad before the next OOL value.
-			{Tag: TagModel, Type: TypeASCII, Count: 7, Value: []byte("EOS R3\x00"), byteOrder: order},
+			{Tag: TagModel, Type: TypeASCII, Count: 7, Value: []byte("EOS R3\x00"), bigEndian: orderIsBig(order)},
 			// 8-byte RATIONAL — must land on even offset even after the odd ASCII above.
-			{Tag: TagXResolution, Type: TypeRational, Count: 1, Value: rat(72, 1), byteOrder: order},
+			{Tag: TagXResolution, Type: TypeRational, Count: 1, Value: rat(72, 1), bigEndian: orderIsBig(order)},
 			// 8-byte RATIONAL.
-			{Tag: TagYResolution, Type: TypeRational, Count: 1, Value: rat(72, 1), byteOrder: order},
+			{Tag: TagYResolution, Type: TypeRational, Count: 1, Value: rat(72, 1), bigEndian: orderIsBig(order)},
 			// 14-byte ASCII (even).
-			{Tag: TagCopyright, Type: TypeASCII, Count: 14, Value: []byte("(c) Test 2025\x00"), byteOrder: order},
+			{Tag: TagCopyright, Type: TypeASCII, Count: 14, Value: []byte("(c) Test 2025\x00"), bigEndian: orderIsBig(order)},
 		}},
 		ExifIFD: &IFD{Entries: []IFDEntry{
 			// 20-byte ASCII (even).
 			{Tag: TagDateTimeOriginal, Type: TypeASCII, Count: 20,
-				Value: []byte("2025:01:01 12:00:00\x00"), byteOrder: order},
+				Value: []byte("2025:01:01 12:00:00\x00"), bigEndian: orderIsBig(order)},
 			// 8-byte RATIONAL.
-			{Tag: TagFNumber, Type: TypeRational, Count: 1, Value: rat(28, 10), byteOrder: order},
+			{Tag: TagFNumber, Type: TypeRational, Count: 1, Value: rat(28, 10), bigEndian: orderIsBig(order)},
 		}},
 	}
 	// Add GPS via SetGPS so the encoding is correct (uses the internal representation).
@@ -334,11 +334,11 @@ func TestWordAlignedEncodeOddXMPThenCopyright(t *testing.T) {
 		ByteOrder: order,
 		IFD0: &IFD{Entries: []IFDEntry{
 			// TypeByte XMP blob (odd length).
-			{Tag: TagXMP, Type: TypeByte, Count: uint32(len(xmpBlob)), Value: xmpBlob, byteOrder: order}, //nolint:gosec // G115: length bounded by test data
+			{Tag: TagXMP, Type: TypeByte, Count: uint32(len(xmpBlob)), Value: xmpBlob, bigEndian: orderIsBig(order)}, //nolint:gosec // G115: length bounded by test data
 			// ASCII Copyright (even length) — must land on even offset.
-			{Tag: TagCopyright, Type: TypeASCII, Count: uint32(len(copyright)), Value: copyright, byteOrder: order}, //nolint:gosec // G115: bounded by test data
+			{Tag: TagCopyright, Type: TypeASCII, Count: uint32(len(copyright)), Value: copyright, bigEndian: orderIsBig(order)}, //nolint:gosec // G115: bounded by test data
 			// TypeLong IPTC (count = ceil(19/4) = 5).
-			{Tag: TagIPTC, Type: TypeLong, Count: 5, Value: iptcRaw, byteOrder: order},
+			{Tag: TagIPTC, Type: TypeLong, Count: 5, Value: iptcRaw, bigEndian: orderIsBig(order)},
 		}},
 	}
 	sortEntries(e.IFD0.Entries)
@@ -421,13 +421,13 @@ func TestWordAlignedEncodeIFD1Thumbnail(t *testing.T) {
 		IFD0: &IFD{
 			Entries: []IFDEntry{
 				// 7-byte ASCII (odd) — forces pad before next OOL.
-				{Tag: TagMake, Type: TypeASCII, Count: 7, Value: []byte("Nikon\x00\x00"), byteOrder: order},
-				{Tag: TagXResolution, Type: TypeRational, Count: 1, Value: rat(72, 1), byteOrder: order},
+				{Tag: TagMake, Type: TypeASCII, Count: 7, Value: []byte("Nikon\x00\x00"), bigEndian: orderIsBig(order)},
+				{Tag: TagXResolution, Type: TypeRational, Count: 1, Value: rat(72, 1), bigEndian: orderIsBig(order)},
 			},
 			Next: &IFD{
 				Entries: []IFDEntry{
 					// RATIONAL in IFD1.
-					{Tag: TagXResolution, Type: TypeRational, Count: 1, Value: rat(72, 1), byteOrder: order},
+					{Tag: TagXResolution, Type: TypeRational, Count: 1, Value: rat(72, 1), bigEndian: orderIsBig(order)},
 				},
 				ThumbnailData: thumb,
 			},

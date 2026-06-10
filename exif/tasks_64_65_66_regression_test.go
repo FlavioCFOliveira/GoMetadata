@@ -37,7 +37,7 @@ func TestRationalRejectsSRational(t *testing.T) {
 		Type:      TypeSRational,
 		Count:     1,
 		Value:     val,
-		byteOrder: binary.LittleEndian,
+		bigEndian: false,
 	}
 
 	got := e.Rational(0)
@@ -64,7 +64,7 @@ func TestSRationalNegativeNumeratorPositiveControl(t *testing.T) {
 		Type:      TypeSRational,
 		Count:     1,
 		Value:     val,
-		byteOrder: binary.LittleEndian,
+		bigEndian: false,
 	}
 
 	got := e.SRational(0)

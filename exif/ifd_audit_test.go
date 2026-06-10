@@ -912,7 +912,7 @@ func TestUint16DirectSShort(t *testing.T) {
 		Type:      TypeSShort,
 		Count:     1,
 		Value:     []byte{0x9C, 0xFF},
-		byteOrder: binary.LittleEndian,
+		bigEndian: false,
 	}
 	if got := e.Uint16(); got != 0 {
 		t.Errorf("Uint16() on TypeSShort entry = %d, want 0 (audit finding #129)", got)
@@ -936,7 +936,7 @@ func TestUint32DirectSLong(t *testing.T) {
 		Type:      TypeSLong,
 		Count:     1,
 		Value:     val,
-		byteOrder: binary.LittleEndian,
+		bigEndian: false,
 	}
 	if got := e.Uint32(); got != 0 {
 		t.Errorf("Uint32() on TypeSLong entry = %d, want 0 (audit finding #129)", got)

@@ -6,6 +6,16 @@ import (
 	"testing"
 )
 
+// orderIsBig returns true when order is binary.BigEndian.
+// It accepts both concrete types (binary.LittleEndian, binary.BigEndian) and
+// the binary.ByteOrder interface, so it can be used inline in IFDEntry struct
+// literals without triggering the unconvert linter.
+//
+// task #199: replaces direct bigEndian field comparisons in test helpers.
+func orderIsBig(order binary.ByteOrder) bool {
+	return order == binary.BigEndian
+}
+
 // buildBenchIFD returns a pre-built IFD with n entries whose tags are
 // consecutive uint16 values starting at 0x0100. Used by benchmarks that
 // need a realistic sorted IFD.

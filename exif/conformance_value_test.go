@@ -40,14 +40,14 @@ func TestConformance_V01_rational_layout(t *testing.T) {
 			val := make([]byte, 8)
 			order.PutUint32(val[0:], 1)
 			order.PutUint32(val[4:], 250)
-			entry := IFDEntry{Type: TypeRational, Count: 1, Value: val, byteOrder: order}
+			entry := IFDEntry{Type: TypeRational, Count: 1, Value: val, bigEndian: orderIsBig(order)}
 			r := entry.Rational(0)
 			if r[0] != 1 || r[1] != 250 {
 				t.Errorf("V-01 %s: Rational = [%d/%d], want [1/250]", name, r[0], r[1])
 			}
 			// Zero denominator must not crash.
 			order.PutUint32(val[4:], 0)
-			entry2 := IFDEntry{Type: TypeRational, Count: 1, Value: val, byteOrder: order}
+			entry2 := IFDEntry{Type: TypeRational, Count: 1, Value: val, bigEndian: orderIsBig(order)}
 			mustNotPanic(t, "V-01 zero den", func() {
 				r2 := entry2.Rational(0)
 				if r2[1] != 0 {
@@ -69,7 +69,7 @@ func TestConformance_V01_rational_layout(t *testing.T) {
 		var neg2 int32 = -2
 		order.PutUint32(val[0:], uint32(neg2)) //nolint:gosec // G115: intentional signed-to-unsigned conversion for test
 		order.PutUint32(val[4:], 3)
-		entry := IFDEntry{Type: TypeSRational, Count: 1, Value: val, byteOrder: order}
+		entry := IFDEntry{Type: TypeSRational, Count: 1, Value: val, bigEndian: orderIsBig(order)}
 		r := entry.SRational(0)
 		if r[0] != -2 || r[1] != 3 {
 			t.Errorf("V-01 SRATIONAL: got [%d/%d], want [-2/3]", r[0], r[1])
@@ -105,7 +105,7 @@ func TestConformance_V02_signed_tags(t *testing.T) {
 			val := make([]byte, 8)
 			order.PutUint32(val[0:], uint32(tc.numI32)) //nolint:gosec // G115: intentional signed-to-unsigned conversion
 			order.PutUint32(val[4:], uint32(tc.denI32)) //nolint:gosec // G115: intentional signed-to-unsigned conversion
-			entry := IFDEntry{Tag: tc.tag, Type: TypeSRational, Count: 1, Value: val, byteOrder: order}
+			entry := IFDEntry{Tag: tc.tag, Type: TypeSRational, Count: 1, Value: val, bigEndian: orderIsBig(order)}
 
 			// SRational must decode the signed value.
 			sr := entry.SRational(0)
@@ -141,7 +141,7 @@ func TestConformance_V03_orientation(t *testing.T) {
 		e := &EXIF{
 			ByteOrder: order,
 			IFD0: &IFD{Entries: []IFDEntry{
-				{Tag: TagOrientation, Type: TypeShort, Count: 1, Value: b[:], byteOrder: order},
+				{Tag: TagOrientation, Type: TypeShort, Count: 1, Value: b[:], bigEndian: orderIsBig(order)},
 			}},
 		}
 		got, ok := e.Orientation()
@@ -156,7 +156,7 @@ func TestConformance_V03_orientation(t *testing.T) {
 		e := &EXIF{
 			ByteOrder: order,
 			IFD0: &IFD{Entries: []IFDEntry{
-				{Tag: TagOrientation, Type: TypeShort, Count: 1, Value: b[:], byteOrder: order},
+				{Tag: TagOrientation, Type: TypeShort, Count: 1, Value: b[:], bigEndian: orderIsBig(order)},
 			}},
 		}
 		mustNotPanic(t, "V-03 OOR orientation", func() {
@@ -190,7 +190,7 @@ func TestConformance_V04_resolution_unit(t *testing.T) {
 			e := &EXIF{
 				ByteOrder: order,
 				IFD0: &IFD{Entries: []IFDEntry{
-					{Tag: TagResolutionUnit, Type: TypeShort, Count: 1, Value: b[:], byteOrder: order},
+					{Tag: TagResolutionUnit, Type: TypeShort, Count: 1, Value: b[:], bigEndian: orderIsBig(order)},
 				}},
 			}
 			ru := e.IFD0.Get(TagResolutionUnit)
@@ -243,10 +243,10 @@ func TestConformance_V05_gps_coordinate_ranges(t *testing.T) {
 
 	// Valid: lat = 37°46'29.64"N.
 	gps := &IFD{Entries: []IFDEntry{
-		{Tag: TagGPSLatitudeRef, Type: TypeASCII, Count: 2, Value: []byte("N\x00"), byteOrder: order},
-		{Tag: TagGPSLatitude, Type: TypeRational, Count: 3, Value: makeRats([2]uint32{37, 1}, [2]uint32{46, 1}, [2]uint32{2964, 100}), byteOrder: order},
-		{Tag: TagGPSLongitudeRef, Type: TypeASCII, Count: 2, Value: []byte("W\x00"), byteOrder: order},
-		{Tag: TagGPSLongitude, Type: TypeRational, Count: 3, Value: makeRats([2]uint32{122, 1}, [2]uint32{25, 1}, [2]uint32{984, 100}), byteOrder: order},
+		{Tag: TagGPSLatitudeRef, Type: TypeASCII, Count: 2, Value: []byte("N\x00"), bigEndian: orderIsBig(order)},
+		{Tag: TagGPSLatitude, Type: TypeRational, Count: 3, Value: makeRats([2]uint32{37, 1}, [2]uint32{46, 1}, [2]uint32{2964, 100}), bigEndian: orderIsBig(order)},
+		{Tag: TagGPSLongitudeRef, Type: TypeASCII, Count: 2, Value: []byte("W\x00"), bigEndian: orderIsBig(order)},
+		{Tag: TagGPSLongitude, Type: TypeRational, Count: 3, Value: makeRats([2]uint32{122, 1}, [2]uint32{25, 1}, [2]uint32{984, 100}), bigEndian: orderIsBig(order)},
 	}}
 	sortEntries(gps.Entries)
 	lat, lon, ok := parseGPS(gps)
@@ -262,10 +262,10 @@ func TestConformance_V05_gps_coordinate_ranges(t *testing.T) {
 
 	// Out-of-range lat = 91 → rejected.
 	gps2 := &IFD{Entries: []IFDEntry{
-		{Tag: TagGPSLatitudeRef, Type: TypeASCII, Count: 2, Value: []byte("N\x00"), byteOrder: order},
-		{Tag: TagGPSLatitude, Type: TypeRational, Count: 3, Value: makeRats([2]uint32{91, 1}, [2]uint32{0, 1}, [2]uint32{0, 1}), byteOrder: order},
-		{Tag: TagGPSLongitudeRef, Type: TypeASCII, Count: 2, Value: []byte("E\x00"), byteOrder: order},
-		{Tag: TagGPSLongitude, Type: TypeRational, Count: 3, Value: makeRats([2]uint32{10, 1}, [2]uint32{0, 1}, [2]uint32{0, 1}), byteOrder: order},
+		{Tag: TagGPSLatitudeRef, Type: TypeASCII, Count: 2, Value: []byte("N\x00"), bigEndian: orderIsBig(order)},
+		{Tag: TagGPSLatitude, Type: TypeRational, Count: 3, Value: makeRats([2]uint32{91, 1}, [2]uint32{0, 1}, [2]uint32{0, 1}), bigEndian: orderIsBig(order)},
+		{Tag: TagGPSLongitudeRef, Type: TypeASCII, Count: 2, Value: []byte("E\x00"), bigEndian: orderIsBig(order)},
+		{Tag: TagGPSLongitude, Type: TypeRational, Count: 3, Value: makeRats([2]uint32{10, 1}, [2]uint32{0, 1}, [2]uint32{0, 1}), bigEndian: orderIsBig(order)},
 	}}
 	sortEntries(gps2.Entries)
 	_, _, ok2 := parseGPS(gps2)
@@ -275,10 +275,10 @@ func TestConformance_V05_gps_coordinate_ranges(t *testing.T) {
 
 	// Zero denominator in degrees: must not divide by zero.
 	gps3 := &IFD{Entries: []IFDEntry{
-		{Tag: TagGPSLatitudeRef, Type: TypeASCII, Count: 2, Value: []byte("N\x00"), byteOrder: order},
-		{Tag: TagGPSLatitude, Type: TypeRational, Count: 3, Value: makeRats([2]uint32{37, 0}, [2]uint32{46, 1}, [2]uint32{0, 1}), byteOrder: order},
-		{Tag: TagGPSLongitudeRef, Type: TypeASCII, Count: 2, Value: []byte("E\x00"), byteOrder: order},
-		{Tag: TagGPSLongitude, Type: TypeRational, Count: 3, Value: makeRats([2]uint32{10, 1}, [2]uint32{0, 1}, [2]uint32{0, 1}), byteOrder: order},
+		{Tag: TagGPSLatitudeRef, Type: TypeASCII, Count: 2, Value: []byte("N\x00"), bigEndian: orderIsBig(order)},
+		{Tag: TagGPSLatitude, Type: TypeRational, Count: 3, Value: makeRats([2]uint32{37, 0}, [2]uint32{46, 1}, [2]uint32{0, 1}), bigEndian: orderIsBig(order)},
+		{Tag: TagGPSLongitudeRef, Type: TypeASCII, Count: 2, Value: []byte("E\x00"), bigEndian: orderIsBig(order)},
+		{Tag: TagGPSLongitude, Type: TypeRational, Count: 3, Value: makeRats([2]uint32{10, 1}, [2]uint32{0, 1}, [2]uint32{0, 1}), bigEndian: orderIsBig(order)},
 	}}
 	sortEntries(gps3.Entries)
 	mustNotPanic(t, "V-05 zero-den GPS", func() {
@@ -331,10 +331,10 @@ func TestConformance_V06_gps_ref_strings(t *testing.T) {
 				return b
 			}
 			gps := &IFD{Entries: []IFDEntry{
-				{Tag: TagGPSLatitudeRef, Type: TypeASCII, Count: 2, Value: []byte(tc.latRef + "\x00"), byteOrder: order},
-				{Tag: TagGPSLatitude, Type: TypeRational, Count: 3, Value: makeRats37(), byteOrder: order},
-				{Tag: TagGPSLongitudeRef, Type: TypeASCII, Count: 2, Value: []byte(tc.lonRef + "\x00"), byteOrder: order},
-				{Tag: TagGPSLongitude, Type: TypeRational, Count: 3, Value: makeRats122(), byteOrder: order},
+				{Tag: TagGPSLatitudeRef, Type: TypeASCII, Count: 2, Value: []byte(tc.latRef + "\x00"), bigEndian: orderIsBig(order)},
+				{Tag: TagGPSLatitude, Type: TypeRational, Count: 3, Value: makeRats37(), bigEndian: orderIsBig(order)},
+				{Tag: TagGPSLongitudeRef, Type: TypeASCII, Count: 2, Value: []byte(tc.lonRef + "\x00"), bigEndian: orderIsBig(order)},
+				{Tag: TagGPSLongitude, Type: TypeRational, Count: 3, Value: makeRats122(), bigEndian: orderIsBig(order)},
 			}}
 			sortEntries(gps.Entries)
 			lat, lon, ok := parseGPS(gps)
@@ -393,8 +393,8 @@ func TestConformance_V08_gps_altitude(t *testing.T) {
 	order.PutUint32(altVal[0:], 100)
 	order.PutUint32(altVal[4:], 1)
 	gps := &IFD{Entries: []IFDEntry{
-		{Tag: TagGPSAltitudeRef, Type: TypeByte, Count: 1, Value: []byte{0}, byteOrder: order},
-		{Tag: TagGPSAltitude, Type: TypeRational, Count: 1, Value: altVal, byteOrder: order},
+		{Tag: TagGPSAltitudeRef, Type: TypeByte, Count: 1, Value: []byte{0}, bigEndian: orderIsBig(order)},
+		{Tag: TagGPSAltitude, Type: TypeRational, Count: 1, Value: altVal, bigEndian: orderIsBig(order)},
 	}}
 	sortEntries(gps.Entries)
 	ref := gps.Get(TagGPSAltitudeRef)
@@ -432,8 +432,8 @@ func TestConformance_V09_gps_time(t *testing.T) {
 	// GPSDateStamp: ASCII[11] "YYYY:MM:DD\0"
 	dateVal := []byte("2024:07:15\x00")
 	gps := &IFD{Entries: []IFDEntry{
-		{Tag: TagGPSTimeStamp, Type: TypeRational, Count: 3, Value: tsVal, byteOrder: order},
-		{Tag: TagGPSDateStamp, Type: TypeASCII, Count: 11, Value: dateVal, byteOrder: order},
+		{Tag: TagGPSTimeStamp, Type: TypeRational, Count: 3, Value: tsVal, bigEndian: orderIsBig(order)},
+		{Tag: TagGPSDateStamp, Type: TypeASCII, Count: 11, Value: dateVal, bigEndian: orderIsBig(order)},
 	}}
 	sortEntries(gps.Entries)
 	ts := gps.Get(TagGPSTimeStamp)

@@ -55,7 +55,7 @@ func exifWithExifIFDEntry(tag TagID, typ DataType, value []byte, order binary.By
 				Type:      typ,
 				Count:     uint32(len(value)), //nolint:gosec // G115: test helper, intentional type cast
 				Value:     value,
-				byteOrder: order,
+				bigEndian: orderIsBig(order),
 			},
 		}},
 	}
@@ -72,7 +72,7 @@ func exifWithXPTag(tag TagID, value []byte) *EXIF {
 				Type:      TypeByte,
 				Count:     uint32(len(value)), //nolint:gosec // G115: test helper, intentional type cast
 				Value:     value,
-				byteOrder: binary.LittleEndian,
+				bigEndian: false,
 			},
 		}},
 	}

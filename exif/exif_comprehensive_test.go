@@ -596,7 +596,7 @@ func TestMMIIParity(t *testing.T) {
 		// Add seed entry so ifd0ByteOrder() returns the correct order.
 		seed := make([]byte, 4)
 		order.PutUint32(seed, 4000)
-		e.IFD0.Entries = append(e.IFD0.Entries, IFDEntry{Tag: TagImageWidth, Type: TypeLong, Count: 1, Value: seed, byteOrder: order})
+		e.IFD0.Entries = append(e.IFD0.Entries, IFDEntry{Tag: TagImageWidth, Type: TypeLong, Count: 1, Value: seed, bigEndian: orderIsBig(order)})
 		e.ByteOrder = order
 
 		oriB := make([]byte, 2)
@@ -1356,7 +1356,7 @@ func TestWriteIFDInlineDeterminismAllInlineTypes(t *testing.T) {
 			poison := &EXIF{
 				ByteOrder: order,
 				IFD0: &IFD{Entries: []IFDEntry{
-					{Tag: 0x9C9F, Type: tc.typ, Count: tc.count, Value: poisonVal, byteOrder: order},
+					{Tag: 0x9C9F, Type: tc.typ, Count: tc.count, Value: poisonVal, bigEndian: orderIsBig(order)},
 				}},
 			}
 			if _, err := Encode(poison); err != nil {
@@ -1367,7 +1367,7 @@ func TestWriteIFDInlineDeterminismAllInlineTypes(t *testing.T) {
 			target := &EXIF{
 				ByteOrder: order,
 				IFD0: &IFD{Entries: []IFDEntry{
-					{Tag: 0x9C9F, Type: tc.typ, Count: tc.count, Value: tc.value, byteOrder: order},
+					{Tag: 0x9C9F, Type: tc.typ, Count: tc.count, Value: tc.value, bigEndian: orderIsBig(order)},
 				}},
 			}
 

@@ -621,7 +621,7 @@ func TestConformance_Dev2_zero_denominator_rational(t *testing.T) {
 	val := make([]byte, 8)
 	order.PutUint32(val[0:], 1)
 	order.PutUint32(val[4:], 0) // zero denominator
-	entry := IFDEntry{Type: TypeRational, Count: 1, Value: val, byteOrder: order}
+	entry := IFDEntry{Type: TypeRational, Count: 1, Value: val, bigEndian: orderIsBig(order)}
 	r := entry.Rational(0)
 	if r[1] != 0 {
 		t.Errorf("Dev2: expected den=0, got den=%d", r[1])
@@ -652,7 +652,7 @@ func TestConformance_Dev3_datetime_spaces_partial(t *testing.T) {
 				ByteOrder: order,
 				IFD0:      &IFD{},
 				ExifIFD: &IFD{Entries: []IFDEntry{
-					{Tag: TagDateTimeOriginal, Type: TypeASCII, Count: 20, Value: []byte(s), byteOrder: order},
+					{Tag: TagDateTimeOriginal, Type: TypeASCII, Count: 20, Value: []byte(s), bigEndian: orderIsBig(order)},
 				}},
 			}
 			mustNotPanic(t, "Dev3 "+s[:8], func() {
@@ -674,7 +674,7 @@ func TestConformance_Dev4_ascii_tag_wrong_type(t *testing.T) {
 		Type:      TypeASCII, // deviation: should be TypeUndefined
 		Count:     4,
 		Value:     []byte{1, 2, 3, 0},
-		byteOrder: order,
+		bigEndian: orderIsBig(order),
 	}
 	mustNotPanic(t, "Dev4 wrong type ASCII", func() {
 		// Bytes() always returns raw bytes regardless of type.
@@ -722,7 +722,7 @@ func TestConformance_Dev6_iptc_tag_wrong_type(t *testing.T) {
 		Type:      TypeUndefined,    // deviation: should be TypeLong per tag registry
 		Count:     uint32(len(val)), //nolint:gosec // G115: test fixture
 		Value:     val,
-		byteOrder: order,
+		bigEndian: orderIsBig(order),
 	}
 	mustNotPanic(t, "Dev6 IPTC wrong type", func() {
 		raw := entry.Bytes()
@@ -743,7 +743,7 @@ func TestConformance_Dev7_exifversion_count8(t *testing.T) {
 		Type:      TypeUndefined,
 		Count:     8,
 		Value:     []byte("02200000"), // first 4 = "0220"
-		byteOrder: order,
+		bigEndian: orderIsBig(order),
 	}
 	mustNotPanic(t, "Dev7 ExifVersion count=8", func() {
 		raw := entry.Bytes()

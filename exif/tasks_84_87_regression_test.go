@@ -38,7 +38,7 @@ func TestRationalNegativeIndex(t *testing.T) {
 		Type:      TypeRational,
 		Count:     1,
 		Value:     val,
-		byteOrder: binary.LittleEndian,
+		bigEndian: false,
 	}
 
 	// This must not panic. Pre-fix: panic("slice bounds out of range [-8:]").
@@ -69,7 +69,7 @@ func TestRationalNegativeIndexPositiveControl(t *testing.T) {
 		Type:      TypeRational,
 		Count:     1,
 		Value:     val,
-		byteOrder: binary.LittleEndian,
+		bigEndian: false,
 	}
 
 	got := e.Rational(0)
@@ -94,7 +94,7 @@ func TestSRationalNegativeIndex(t *testing.T) {
 		Type:      TypeSRational,
 		Count:     1,
 		Value:     val,
-		byteOrder: binary.LittleEndian,
+		bigEndian: false,
 	}
 
 	// This must not panic. Pre-fix: panic("slice bounds out of range [-8:]").
@@ -125,7 +125,7 @@ func TestSRationalNegativeIndexPositiveControl(t *testing.T) {
 		Type:      TypeSRational,
 		Count:     1,
 		Value:     val,
-		byteOrder: binary.LittleEndian,
+		bigEndian: false,
 	}
 
 	got := e.SRational(0)

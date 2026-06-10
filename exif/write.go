@@ -222,11 +222,13 @@ func buildIFD0Entries(e *EXIF, order binary.ByteOrder, exifPtrBuf, gpsPtrBuf *[4
 
 	// Reserve pointer entries so ifdTotalSize accounts for them correctly.
 	// TypeLong / Count 1 → value fits inline (4 bytes); no value-area impact.
+	// task #199: bigEndian flag replaces binary.ByteOrder interface.
+	isBig := order == binary.BigEndian
 	if e.ExifIFD != nil {
-		entries = append(entries, IFDEntry{Tag: TagExifIFDPointer, Type: TypeLong, Count: 1, Value: exifPtrBuf[:], byteOrder: order})
+		entries = append(entries, IFDEntry{Tag: TagExifIFDPointer, Type: TypeLong, Count: 1, Value: exifPtrBuf[:], bigEndian: isBig})
 	}
 	if e.GPSIFD != nil {
-		entries = append(entries, IFDEntry{Tag: TagGPSIFDPointer, Type: TypeLong, Count: 1, Value: gpsPtrBuf[:], byteOrder: order})
+		entries = append(entries, IFDEntry{Tag: TagGPSIFDPointer, Type: TypeLong, Count: 1, Value: gpsPtrBuf[:], bigEndian: isBig})
 	}
 	sortEntries(entries)
 	return entries
@@ -274,9 +276,11 @@ func buildExifIFDEntries(e *EXIF, order binary.ByteOrder, interopPtrBuf *[4]byte
 	// Strip existing InteropIFD pointer; we will re-add it with a freshly
 	// computed offset when InteropIFD is present (EXIF §4.6.3, tag 0xA005
 	// lives in ExifIFD, not IFD0).
+	// task #199: bigEndian flag replaces binary.ByteOrder interface.
+	isBig := order == binary.BigEndian
 	entries := filterEntries(e.ExifIFD, 2, TagInteropIFDPointer)
 	if e.InteropIFD != nil {
-		entries = append(entries, IFDEntry{Tag: TagInteropIFDPointer, Type: TypeLong, Count: 1, Value: interopPtrBuf[:], byteOrder: order})
+		entries = append(entries, IFDEntry{Tag: TagInteropIFDPointer, Type: TypeLong, Count: 1, Value: interopPtrBuf[:], bigEndian: isBig})
 	}
 	if e.MakerNote != nil && !hasEntry(entries, TagMakerNote) {
 		entries = append(entries, IFDEntry{
@@ -284,7 +288,7 @@ func buildExifIFDEntries(e *EXIF, order binary.ByteOrder, interopPtrBuf *[4]byte
 			Type:      TypeUndefined,
 			Count:     uint32(len(e.MakerNote)), //nolint:gosec // G115: MakerNote length bounded by input
 			Value:     e.MakerNote,
-			byteOrder: order,
+			bigEndian: isBig,
 		})
 	}
 	sortEntries(entries)

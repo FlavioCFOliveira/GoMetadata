@@ -92,6 +92,75 @@ Measured with `go test -bench='BenchmarkEXIFParse$|BenchmarkEXIFParse_Camera' -b
 
 ---
 
+## [main — perf task #199] — 2026-06-10 (exif: replace per-entry byteOrder interface with 1-byte bool flag)
+
+### Optimisation applied in this version
+
+- **task #199 (exif: cut GC-scannable interface pointer from every IFDEntry)**:
+  `IFDEntry.byteOrder binary.ByteOrder` (a 16-byte Go interface carrying a type pointer + a value
+  pointer) is replaced by `IFDEntry.bigEndian bool` (1 byte).  A one-line helper method
+  `func (e *IFDEntry) order() binary.ByteOrder` converts the flag to the package-level
+  `binary.BigEndian` / `binary.LittleEndian` singletons at call sites; no heap allocation occurs.
+
+  **Struct size reduction**: `unsafe.Sizeof(IFDEntry{})` 56 B → **48 B** (−14.3%).
+
+  Because every sub-IFD slot in the task #198 arena is a contiguous `[]IFDEntry` batch, the size
+  reduction shrinks the arena backing array proportionally.  A Camera EXIF file with 64 sub-IFD
+  entries saves 64 × 8 = 512 B per `Parse` call; at 6 allocs/op the saving lands entirely in the
+  arena's single batch allocation, confirmed by the benchstat B/op deltas below.
+
+  **Nil-interface safety fix (audit finding #189)**:
+  Before task #199, the zero value of `IFDEntry` held a nil `byteOrder` interface; any call to a
+  decoder method (`Uint16`, `Uint32`, `Rational`, …) on a zero-value or programmatically constructed
+  entry would panic.  `ifd0ByteOrder()` had an explicit nil guard as a workaround.  The bool zero
+  value (`false` = little-endian) is well-defined and safe; the nil guard and its accompanying
+  comment are removed.  Regression gates: `TestIFDEntryOrder_ZeroValue` and
+  `TestSetMakeOnManuallyConstructedEXIF`.
+
+  All construction sites updated: `parseIFDEntry`, `parseIFDEntryBigTIFF`, `buildIFD0Entries`,
+  `buildExifIFDEntries` (write path), `set()`, and all test helpers.
+
+  Spec: CIPA DC-008-2023 §4.6.2; TIFF 6.0 §2.
+
+### Key changes vs [main — perf task #198] baseline (benchtime=10s, -count=10, benchstat)
+
+#### exif/
+
+| Benchmark | Metric | Before (task #198) | After (task #199) | Change |
+|---|---|---|---|---|
+| BenchmarkEXIFParse_Camera | B/op | 2994 | **2482** | **-17.10%** (p=0.000) |
+| BenchmarkEXIFParse_Camera | ns/op | 1494 | 1456 | **-2.58%** (p=0.000) |
+| BenchmarkEXIFParse_Camera | allocs/op | 6 | 6 | 0 |
+| BenchmarkIFDSet | B/op | 1912 | **1656** | **-13.39%** (p=0.000) |
+| BenchmarkIFDSet | ns/op | 744.8 | 743.9 | ~ (p=0.393) |
+| BenchmarkMakerNoteDispatch | B/op | 360 | **344** | **-4.44%** (p=0.000) |
+| BenchmarkEXIFParse | B/op | 369 | **337** | **-8.67%** (p=0.000) |
+| BenchmarkEXIFParse | ns/op | 179.6 | 169.8 | **-5.46%** (p=0.000) |
+| BenchmarkIFDGet | B/op | 0 | 0 | 0 (zero-alloc, unchanged) |
+| BenchmarkIFDGet_Large | B/op | 0 | 0 | 0 (zero-alloc, unchanged) |
+
+geomean B/op across non-zero benchmarks: **-7.50%**.
+
+Note on B/op deltas: each saved byte maps exactly to entries × 8 B (the width of the replaced
+interface).  `BenchmarkEXIFParse` (4 IFD0 entries): -32 B = 4 × 8.  `BenchmarkMakerNoteDispatch`
+(2 entries): -16 B = 2 × 8.  `BenchmarkEXIFParse_Camera` (64 sub-IFD entries in the arena): -512 B
+= 64 × 8.  `BenchmarkIFDSet` (31 inserted entries + 1 slot guard): -256 B ≈ 31 × 8.
+
+#### github.com/FlavioCFOliveira/GoMetadata (top-level)
+
+| Benchmark | Metric | Before (task #198) | After (task #199) | Change |
+|---|---|---|---|---|
+| BenchmarkRead_JPEG | B/op | 585 | **569** | **-2.74%** (p=0.000) |
+| BenchmarkRead_JPEG | ns/op | 277.1 | 279.2 | +0.78% (within noise) |
+| BenchmarkRead_PNG | B/op | 336 | 336 | 0 (no sub-IFDs) |
+| BenchmarkRead_PNG | ns/op | 199.3 | 200.0 | ~ (p=0.107) |
+
+The JPEG read path traverses IFD0 + ExifIFD (2 sub-IFDs), saving 2 × 8 = 16 B per entry, which
+accounts for the -16 B reduction at the top level.  PNG uses no EXIF sub-IFDs in the benchmark
+fixture and is therefore unaffected.
+
+---
+
 ## [v1.0.4] — 2026-04-08
 
 ### Changes in this version
