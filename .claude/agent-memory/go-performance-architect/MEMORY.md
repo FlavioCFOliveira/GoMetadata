@@ -1,6 +1,11 @@
 # Memory Index
 
+- [HEIF iloc off-by-one panic (task #243)](project_heif_iloc_offbyone_243.md) — parseIloc AND parseIlocFull guard widened 5→6; 5-byte iloc body panic fixed in both read+write paths
+- [exif sub-IFD lazy arena (task #198)](project_task198_arena.md) — lazy arena for sub-IFDs only; -25% allocs Camera; hint order: ExifIFD→InteropIFD→GPSIFD; cap-clamped safety
+- [format.Detect magic-byte pool (task #203)](project_task203_magic_pool.md) — magicPool *[36]byte; -11% allocs/op BenchmarkRead_JPEG; -8.4% B/op; TestDetect_ZeroAllocs gate
+
 - [Project identity](project_identity.md) — GoMetadata; module github.com/FlavioCFOliveira/GoMetadata; 25 packages; Go 1.26
+- [HEIF reliability fixes commit 1140781](project_heif_reliability_fixes_1140781.md) — #106/#133/#137/#169/#177 fixed: meta<12 panic, infe v0/v1 truncation, iloc method≠0, indexSize bounds, AVIF compat_brands
 - [os.IsNotExist vs errors.Is pattern](feedback_os_error_wrapping.md) — os.IsNotExist/IsPermission do not unwrap %w errors in Go 1.26; tests must use errors.Is with sentinel values
 - [Example output trailing spaces](feedback_example_output.md) — Go 1.26 does NOT strip trailing whitespace in example output; fmt.Println with empty string args fails // Output: comparisons
 - [intrange + modernize nolint for binary parsers](feedback_intrange_nolint.md) — Loops using i*12 offset need //nolint:intrange,modernize; min builtin shadowed in fuzz_test.go affects test builds
@@ -45,3 +50,22 @@
 - [ARW conformance battery (task #165)](project_arw_conformance_battery.md) — ARW-detect/SR2Private/makernote/IFD0/write/robust/corpus; 0 violations; uses arw.Inject not InjectWithEXIFARW
 - [CR2 conformance battery (task #162)](project_cr2_conformance_battery.md) — CR marker insert+rebase fix in InjectWithEXIFCR2; IFD0 at 16 not 8; 0 violations; 0 lint issues
 - [CR2 write: insert-marker-and-shift pattern](feedback_cr2_marker_insertion_pattern.md) — never overwrite IFD0 with proprietary marker; insert at position 8 + rebase all offsets by delta
+- [xml prefix pre-population in rdfParser](feedback_xml_namespace_prepopulation.md) — pre-populate nsTable[0]={xml→XMLNamespaceURI} before parse loop; without it xml:lang resolves to "" and all rdf:Alt breaks
+- [scanAttrs infinite loop on bare '<'](feedback_scanattrs_infinite_loop.md) — scanAttrs exit condition must include '<' in addition to '>' and '/'; omitting it causes infinite loop on malformed tags
+- [canCarryIPTC truth table for TIFF-based RAW](feedback_iptc_cancarry_raw.md) — JPEG+TIFF+DNG+CR2+NEF+ARW+ORF+RW2=true; CR3/PNG/WebP/HEIF/AVIF/Unknown=false; gate: TestCanCarryIPTC_TIFFBasedRAW
+- [Metadata.mu mutex guard on all Set* methods](feedback_metadata_mutex_guard.md) — every Set* holds mu.Lock for full body incl. ensure*; Metadata must not be copied by value
+- [JPEG audit batch #122/#123/#134/#135/#151/#174 (commit eea3957)](project_jpeg_audit_batch_eea3957.md) — ExtXMP: validated reassembly, xmp.Parse merge, truncation surface, GUID uppercase, IRB pad clamp, 8BIM sibling preserve
+- [PNG audit #147/#181/#182 (commit 1f506be)](feedback_png_write_before_validate.md) — validate input sig before writing to w; XMP size guard; always emit IEND on EOF-exit
+- [WriteFile fsync+symlink+chown fixes #124/#125 (commit 278a38b)](project_write_fsync_symlink_124_125.md) — Sync before rename; EvalSymlinks for real target; chownFile uid/gid; _unix.go/_windows.go split pattern
+- [ORF/RW2 rawEXIF carries original magic — patch before exif.Parse](feedback_orf_rw2_rawexif_original_magic.md) — Extract returns IIRO/IIRS/RW2 magic; call patchRawEXIFForParse before exif.Parse; #117 fix commit 929ec97
+- [relocateTIFFFromParsed short-circuit skips post-encode steps](feedback_makernote_short_circuit.md) — Always apply post-encode mutations to BOTH the short-circuit path (no image blocks) AND the main path after step 9
+- [MakerNote OOL offset convention matrix (#127, commit 07c7355)](project_makernote_ool_rebasing.md) — OLYMP-type/Sony=TIFF-absolute (rebaseGenericMakerNote); Nikon Type-3/Panasonic/Canon=blob-relative (safe); all now CORRECT
+- [t.Skip policy — only corpus/OS/constant guards](feedback_tskip_policy.md) — synthetic fixture skips are always bugs; parser assertion skips are always bugs; docs/TESTING.md codifies the rules
+- [testdata/fixtures/ strategy and TestMain generator](project_testing_fixtures.md) — committed fixtures + testmain_test.go idempotent generator; CI passes without corpus
+- [xmp.GPS() W3C Geo namespace fallback (task #195)](project_xmp_geo_namespace.md) — NSgeo fallback for geo:lat/geo:long/geo:lon; was masked by t.Skip; now tested and enforced
+- [filterEntries pool design (task #240)](project_task240_entry_pool.md) — entrySlicePool in write.go; -71% B/op EXIFEncode; -11% TIFF relocate; filterEntriesInto replaces filterEntries; clear before Put pattern
+- [Deferred warning records (task #200)](project_task200_warn_defer.md) — parseWarn 20-byte struct replaces fmt.Sprintf; -55.8% ns/op MakerNoteDispatch; parseIFDEntry must return (IFDEntry,bool) only — any struct return causes STP zero-init regression
+- [parseIFDEntry ABI constraint — no struct returns](feedback_parseifdentry_abi_constraint.md) — returning struct from per-entry hot-loop function causes ARM64 compiler STP zero-init; measured +10-18% ns/op; keep return as (IFDEntry,bool) forever
+- [binary.AppendByteOrder eliminates [N]byte→append heap escapes](feedback_append_byteorder_escape.md) — use comma-ok assertion (task #247), NOT direct assertion (task #201 reverted for panic safety on custom ByteOrder)
+- [Zero-alloc MakerNote dispatch string([]byte) key (task #202)](project_task202_zero_alloc_dispatch.md) — makerNoteDispatch replaces makeEntry.String()+parseMakerNoteIFD; -1 alloc/op Camera; string([]byte) must appear directly as map index; buildCameraEXIF now has Canon MakerNote blob
+- [Security-audit batch #244-247 (2026-07-06)](project_security_audit_batch_244_247.md) — DETECT-SHORTREAD-01 io.ReadFull; EXIF-BO-001 ifd0ByteOrder empty-IFD0; PERF-201-LOW comma-ok; XMPCONC-01 doc-only
