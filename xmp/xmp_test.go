@@ -1295,6 +1295,59 @@ func TestGPSW3CGeoFallbackAbsentWhenExifPresent(t *testing.T) {
 	_ = tol
 }
 
+// TestEncodeGeoNamespaceUsesConventionalPrefix verifies that encoding a
+// document carrying a W3C Basic Geo (NSgeo) property emits the conventional
+// "geo:" prefix — xmlns:geo="http://www.w3.org/2003/01/geo/wgs84_pos#" and a
+// geo:lat / geo:long property — rather than a generated "nsN:" prefix, and
+// that the property round-trips through Parse. Regression test for the
+// missing prefixMap[NSgeo] entry: before the fix, uniquePrefixFor treated
+// NSgeo as unknown and assigned ns0 (or higher), which is spec-legal
+// (ISO 16684-1 §7.4 resolves properties by namespace URI, not prefix) but
+// breaks the conventional "geo:" binding that readers/tools expect and that
+// xmp.GPS()'s W3C Geo fallback is documented against.
+func TestEncodeGeoNamespaceUsesConventionalPrefix(t *testing.T) {
+	t.Parallel()
+	x := &XMP{Properties: map[string]map[string]string{
+		NSgeo: {
+			"lat":  "48,51.35N",
+			"long": "2,21.07E",
+		},
+	}}
+
+	encoded, err := Encode(x)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	encStr := string(encoded)
+
+	wantNS := `xmlns:geo="http://www.w3.org/2003/01/geo/wgs84_pos#"`
+	if !strings.Contains(encStr, wantNS) {
+		t.Errorf("Encode output missing %s; got:\n%s", wantNS, encStr)
+	}
+	if !strings.Contains(encStr, "geo:long=") && !strings.Contains(encStr, "<geo:long>") {
+		t.Errorf("Encode output missing geo:long property; got:\n%s", encStr)
+	}
+	if strings.Contains(encStr, `xmlns:ns`) {
+		t.Errorf("Encode output used a generated nsN: prefix for NSgeo instead of the conventional geo: prefix; got:\n%s", encStr)
+	}
+
+	x2, err := Parse(encoded)
+	if err != nil {
+		t.Fatalf("Parse (round-trip): %v", err)
+	}
+	lat, lon, ok := x2.GPS()
+	if !ok {
+		t.Fatal("GPS() returned ok=false after round-trip through Encode/Parse")
+	}
+	const tol = 0.01
+	if lat < 48.8558-tol || lat > 48.8558+tol {
+		t.Errorf("lat after round-trip = %f, want ~48.8558", lat)
+	}
+	if lon < 2.3512-tol || lon > 2.3512+tol {
+		t.Errorf("lon after round-trip = %f, want ~2.3512", lon)
+	}
+}
+
 // TestGPSDegreesMinutesSeconds covers the DDD,MM,SS.sss path in parseXMPGPS.
 func TestGPSDegreesMinutesSeconds(t *testing.T) {
 	t.Parallel()

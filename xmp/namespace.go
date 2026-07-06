@@ -79,6 +79,14 @@ var prefixMap = map[string]string{ //nolint:gochecknoglobals // read-only namesp
 	NScc:        "cc",
 	NSpdf:       "pdf",
 	NSxmpNote:   "xmpNote",
+	// NSgeo: the W3C Basic Geo (WGS84 lat/long) vocabulary conventionally
+	// binds to the "geo" prefix (http://www.w3.org/2003/01/geo/). Without
+	// this entry, uniquePrefixFor treats NSgeo as an unknown namespace and
+	// assigns a generated nsN prefix — spec-legal (XMP resolves properties
+	// by namespace URI, not prefix; ISO 16684-1 §7.4) but not the
+	// conventional binding that xmp.GPS()'s W3C Geo fallback expects to see
+	// on write, and confusing for tools/readers that key off "geo:lat".
+	NSgeo: "geo",
 }
 
 // uniquePrefixFor returns a prefix for uri that is not already in used.
