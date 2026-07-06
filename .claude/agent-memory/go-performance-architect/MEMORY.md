@@ -1,7 +1,10 @@
 # Memory Index
 
+- [Task #272 Clean-GO final polish (commits 3b72a26, 8890788)](project_task272_clean_go_polish.md) — DC array allowlist +6 props; IPTC doc hygiene; V-15 named test (primitive+fixture)
+- [Width claims need a primitive-level test, not just fixtures](feedback_width_claims_need_primitive_test.md) — bounded real fixtures can't detect uint32-truncation regressions in "uint64 throughout" claims; verified via bug injection
 - [BigTIFF write support in exif.Encode (task #264, commit aa24232)](project_bigtiff_write.md) — serialiseBigTIFF dispatch; typeSizeBigTIFF #1 rule; word-alignment decision; ErrBigTIFFPointerOverflow/ErrBigTIFFEncodeSizeExceeded; #270 tracks container relocation separately
-- [BigTIFF standalone CONTAINER write / relocation (task #270)](project_task270_bigtiff_container_write.md) — full support in format/tiff; type-13 EXIF-3.0/TIFF-Extension collision bug fixed; write.go:416 top-level gate still blocks gometadata.Write (out of scope, follow-up needed)
+- [BigTIFF standalone CONTAINER write / relocation (task #270)](project_task270_bigtiff_container_write.md) — full support in format/tiff; type-13 EXIF-3.0/TIFF-Extension collision bug fixed; follow-up gate closed by #271
+- [BigTIFF public-API write gate removed (task #271, commit 0ebf5d4)](project_task271_bigtiff_public_api_gate.md) — isBigTIFFSource + writeTIFF short-circuit removed; gometadata.Write now writes BigTIFF end-to-end; new TestWriteBigTIFFEndToEnd on real LE/BE fixtures
 - [geo: prefix + iptc.Encode overflow guard (2026-07-06)](project_geo_prefix_and_iptc_overflow_fixes.md) — NSgeo→"geo" in prefixMap; ErrDatasetValueTooLarge + test-overridable maxDatasetValueLen var (mirrors maxFileSize idiom)
 - [JPEG #262 maxFileSize cap via pooled countingReader](project_task262_jpeg_maxfilesize.md) — countingReader resets budget per-Seek; io.WriterTo fast-path bug found via benchmarking (376B→1017B/op), fixed with remainingFitsBudget guard
 - [GM-W1 TIFF write-path imageBlockBudget fix (task #261)](project_gmw1_imageblock_budget.md) — per-entry caps (65536 strips, 1024 SubIFDs) + fixed 262144 aggregate budget mirroring traverseBudget; ErrTooManyImageBlocks
