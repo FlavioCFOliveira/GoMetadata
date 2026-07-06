@@ -2411,3 +2411,197 @@ func TestAltNoXDefault(t *testing.T) {
 		t.Errorf("Caption no-x-default fallback: got %q, want %q", got, "en|English Description")
 	}
 }
+
+// TestXMPCreators covers XMP.Creators(): document-order preservation,
+// nil/empty handling, and independence from Creator() (which returns only
+// the first item). Mirrors TestKeywords in shape (RECONCILE-04 support).
+func TestXMPCreators(t *testing.T) {
+	t.Parallel()
+
+	t.Run("OrderPreserved", func(t *testing.T) {
+		t.Parallel()
+		x := &XMP{Properties: map[string]map[string]string{
+			NSdc: {"creator": "Alice\x1eBob\x1eCarol"},
+		}}
+		got := x.Creators()
+		want := []string{"Alice", "Bob", "Carol"}
+		if len(got) != len(want) {
+			t.Fatalf("Creators() len = %d, want %d", len(got), len(want))
+		}
+		for i, w := range want {
+			if got[i] != w {
+				t.Errorf("Creators()[%d] = %q, want %q", i, got[i], w)
+			}
+		}
+	})
+
+	t.Run("SingleValue", func(t *testing.T) {
+		t.Parallel()
+		x := &XMP{Properties: map[string]map[string]string{
+			NSdc: {"creator": "Alice"},
+		}}
+		got := x.Creators()
+		if len(got) != 1 || got[0] != "Alice" {
+			t.Errorf("Creators() = %v, want [Alice]", got)
+		}
+		// Creator() must agree with the first element of Creators().
+		if c := x.Creator(); c != got[0] {
+			t.Errorf("Creator() = %q, want %q (must match Creators()[0])", c, got[0])
+		}
+	})
+
+	t.Run("AbsentPropertyReturnsNil", func(t *testing.T) {
+		t.Parallel()
+		x := &XMP{Properties: map[string]map[string]string{}}
+		if got := x.Creators(); got != nil {
+			t.Errorf("Creators() = %v, want nil", got)
+		}
+	})
+
+	t.Run("NilReceiverReturnsNil", func(t *testing.T) {
+		t.Parallel()
+		var x *XMP
+		if got := x.Creators(); got != nil {
+			t.Errorf("Creators() on nil receiver = %v, want nil", got)
+		}
+	})
+}
+
+// TestXMPSetCreators covers XMP.SetCreators(): full-replace semantics,
+// U+001E stripping, empty/nil deletion, and round-trip through the RDF
+// encoder as an ordered rdf:Seq (RECONCILE-04).
+func TestXMPSetCreators(t *testing.T) {
+	t.Parallel()
+
+	t.Run("OrderPreservedThroughEncoder", func(t *testing.T) {
+		t.Parallel()
+		x := &XMP{}
+		x.SetCreators([]string{"Alice", "Bob", "Carol"})
+
+		encoded, err := Encode(x)
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		if !strings.Contains(string(encoded), "<rdf:Seq>") {
+			t.Error("encoded XMP: dc:creator must use rdf:Seq (RECONCILE-04)")
+		}
+
+		x2, err := Parse(encoded)
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		got := x2.Creators()
+		want := []string{"Alice", "Bob", "Carol"}
+		if len(got) != len(want) {
+			t.Fatalf("Creators() round-trip len = %d, want %d", len(got), len(want))
+		}
+		for i, w := range want {
+			if got[i] != w {
+				t.Errorf("Creators() round-trip [%d] = %q, want %q", i, got[i], w)
+			}
+		}
+	})
+
+	t.Run("FullReplaceNotAppend", func(t *testing.T) {
+		t.Parallel()
+		x := &XMP{}
+		x.SetCreators([]string{"A", "B"})
+		x.SetCreators([]string{"C"})
+		got := x.Creators()
+		if len(got) != 1 || got[0] != "C" {
+			t.Errorf("Creators() = %v, want [C] (full replace, not append)", got)
+		}
+	})
+
+	t.Run("EmptySliceDeletesProperty", func(t *testing.T) {
+		t.Parallel()
+		x := &XMP{}
+		x.SetCreators([]string{"Alice", "Bob"})
+		x.SetCreators([]string{})
+		if got := x.Creators(); got != nil {
+			t.Errorf("Creators() = %v, want nil", got)
+		}
+		if got := x.Get(NSdc, "creator"); got != "" {
+			t.Errorf("Get(dc:creator) = %q, want empty (property deleted)", got)
+		}
+	})
+
+	t.Run("NilSliceTreatedSameAsEmpty", func(t *testing.T) {
+		t.Parallel()
+		x := &XMP{}
+		x.SetCreators([]string{"Alice", "Bob"})
+		x.SetCreators(nil)
+		if got := x.Creators(); got != nil {
+			t.Errorf("Creators() = %v, want nil", got)
+		}
+	})
+
+	t.Run("StripsEmbeddedRecordSeparator", func(t *testing.T) {
+		t.Parallel()
+		x := &XMP{}
+		x.SetCreators([]string{"Alice\x1eBob"})
+		got := x.Creators()
+		if len(got) != 1 || got[0] != "AliceBob" {
+			t.Errorf("Creators() = %v, want [AliceBob] (U+001E stripped)", got)
+		}
+	})
+
+	t.Run("NilReceiverNoPanic", func(t *testing.T) {
+		t.Parallel()
+		var x *XMP
+		x.SetCreators([]string{"a", "b"}) // must not panic
+	})
+}
+
+// TestXMPSetDateCreated covers XMP.SetDateCreated(): photoshop:DateCreated
+// RFC 3339 encoding, and the regression guard that it never touches
+// xmp:CreateDate (a distinct, unrelated field — RECONCILE-03 / reconciliation
+// spec §0.1).
+func TestXMPSetDateCreated(t *testing.T) {
+	t.Parallel()
+
+	t.Run("RFC3339Encoding", func(t *testing.T) {
+		t.Parallel()
+		x := &XMP{}
+		ts := time.Date(2026, 6, 15, 14, 30, 22, 0, time.FixedZone("+0100", 3600))
+		x.SetDateCreated(ts)
+		want := "2026-06-15T14:30:22+01:00"
+		if got := x.Get(NSphotoshop, "DateCreated"); got != want {
+			t.Errorf("Get(photoshop:DateCreated) = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("UTCZSuffix", func(t *testing.T) {
+		t.Parallel()
+		x := &XMP{}
+		ts := time.Date(2026, 6, 15, 14, 30, 22, 0, time.UTC)
+		x.SetDateCreated(ts)
+		got := x.Get(NSphotoshop, "DateCreated")
+		if !strings.HasSuffix(got, "Z") {
+			t.Errorf("Get(photoshop:DateCreated) = %q, want Z-suffixed UTC value", got)
+		}
+	})
+
+	t.Run("DoesNotTouchXMPCreateDate", func(t *testing.T) {
+		t.Parallel()
+		x := &XMP{}
+		x.SetDateCreated(time.Now())
+		if got := x.Get(NSxmp, "CreateDate"); got != "" {
+			t.Errorf("Get(xmp:CreateDate) = %q, want empty (SetDateCreated must not write it)", got)
+		}
+	})
+
+	t.Run("DistinctFromSetDateTimeOriginal", func(t *testing.T) {
+		t.Parallel()
+		x := &XMP{}
+		ts := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		x.SetDateTimeOriginal(ts)
+		x.SetDateCreated(ts)
+		if x.Get(NSexif, "DateTimeOriginal") == "" {
+			t.Error("Get(exif:DateTimeOriginal) empty after SetDateTimeOriginal")
+		}
+		if x.Get(NSphotoshop, "DateCreated") == "" {
+			t.Error("Get(photoshop:DateCreated) empty after SetDateCreated")
+		}
+	})
+}

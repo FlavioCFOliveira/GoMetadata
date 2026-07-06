@@ -13,6 +13,7 @@ import (
 	"math"
 	"slices"
 	"sync"
+	"time"
 	"unicode/utf8"
 )
 
@@ -556,6 +557,32 @@ func (i *IPTC) TimeCreated() string {
 	return i.firstRecord2(DS2TimeCreated)
 }
 
+// SetDateCreated sets dataset 2:55 (Date Created, IIM §2.2.23) and dataset
+// 2:60 (Time Created, IIM §2.2.23) from t, replacing any existing values.
+//
+//	2:55 = t.Format("20060102")    → 8 ASCII digits "CCYYMMDD"
+//	2:60 = t.Format("150405-0700") → 11 ASCII bytes "HHMMSS±HHMM"
+//
+// ("-0700" layout renders "+0000" for UTC, never "Z" — IIM §2.2.23 defines
+// no zone-letter form, only a signed 4-digit offset.) Sub-second precision
+// in t is discarded; IIM has no sub-second field (RECONCILE-03).
+//
+// Guard (IPTC/XMP reconciliation spec §0.3): if t.Year() is outside
+// [0, 9999], the 4-digit "2006" component of the CCYYMMDD layout would
+// overflow the fixed 8-byte 2:55 encoding. SetDateCreated is then a
+// complete no-op — neither dataset is written or modified — favouring "no
+// corruption" over silently emitting a malformed, non-8-byte field.
+func (i *IPTC) SetDateCreated(t time.Time) {
+	if i == nil {
+		return
+	}
+	if y := t.Year(); y < 0 || y > 9999 {
+		return
+	}
+	i.setRecord2(DS2DateCreated, []byte(t.Format("20060102")))
+	i.setRecord2(DS2TimeCreated, []byte(t.Format("150405-0700")))
+}
+
 // SetCaption sets dataset 2:120 (Caption/Abstract) to s, replacing any existing value.
 // Values exceeding 2000 bytes are truncated at a UTF-8 rune boundary (IIM §2.2.29).
 func (i *IPTC) SetCaption(s string) {
@@ -585,6 +612,48 @@ func (i *IPTC) AddCreator(creator string) {
 	d := Dataset{Record: 2, DataSet: DS2Byline, Value: v}
 	d.setDecodedValue(true) // write-path: v is always UTF-8 (truncated from a Go string)
 	i.Records[2] = append(i.Records[2], d)
+}
+
+// SetCreators replaces all dataset 2:80 (By-line, IIM §2.2.25) entries in
+// record 2 with creators, in order — order is significant (RECONCILE-04).
+// Existing By-line datasets are removed first; one Dataset is appended per
+// creator (each truncated to 32 octets at a UTF-8 rune boundary, UTF-8 flag
+// set as needed, same as AddKeyword/SetKeywords). Passing an empty slice
+// (or nil) removes all By-line entries without adding new ones.
+//
+// A creator string containing U+001E (the internal multi-value separator
+// used by the XMP package's in-memory representation, see xmp.XMP.Creators)
+// has that byte stripped before storage, so that a value round-tripped from
+// XMP cannot corrupt this package's dataset structure (IPTC/XMP
+// reconciliation spec §4, defensive requirements).
+//
+// Unlike SetCreator (which updates only the first occurrence and preserves
+// any others), SetCreators is a full replace — do not mix the two calls on
+// the same *IPTC if predictable list semantics are required.
+func (i *IPTC) SetCreators(creators []string) {
+	if i == nil {
+		return
+	}
+	// Remove all existing DS2Byline entries from record 2 (full replace),
+	// mirroring the SetKeywords pattern exactly.
+	filtered := i.Records[2][:0]
+	for _, d := range i.Records[2] {
+		if d.DataSet != DS2Byline {
+			filtered = append(filtered, d)
+		}
+	}
+	i.Records[2] = filtered
+	for _, creator := range creators {
+		// Strip any embedded U+001E before truncation so the rune-boundary
+		// truncation below never has to account for a byte that was never
+		// part of the caller's intended text.
+		v := bytes.ReplaceAll([]byte(creator), []byte("\x1e"), nil)
+		v = truncateToLimit(v, datasetMaxLen[DS2Byline])
+		i.setUTF8IfNeeded(v)
+		d := Dataset{Record: 2, DataSet: DS2Byline, Value: v}
+		d.setDecodedValue(true) // write-path: v is always UTF-8 (truncated from a Go string)
+		i.Records[2] = append(i.Records[2], d)
+	}
 }
 
 // AddKeyword appends a keyword to dataset 2:25 (Keywords, IIM §2.2.17).

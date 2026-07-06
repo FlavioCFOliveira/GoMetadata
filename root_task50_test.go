@@ -846,6 +846,7 @@ func TestNilComponents_SettersNoOp(t *testing.T) {
 	m.SetCaption("x")
 	m.SetCopyright("x")
 	m.SetCreator("x")
+	m.SetCreators([]string{"x"})
 	m.SetCameraModel("x")
 	m.SetGPS(0, 0)
 	m.SetKeywords([]string{"a"})

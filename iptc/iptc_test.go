@@ -3,6 +3,8 @@ package iptc
 import (
 	"bytes"
 	"testing"
+	"time"
+	"unicode/utf8"
 )
 
 // buildIPTC builds a minimal IPTC IIM stream with the given datasets.
@@ -780,5 +782,213 @@ func TestIPTCSetKeywords(t *testing.T) {
 		t.Parallel()
 		var i *IPTC
 		i.SetKeywords([]string{"a", "b"}) // must not panic
+	})
+}
+
+// TestIPTCSetDateCreated covers iptc.IPTC.SetDateCreated: dataset 2:55/2:60
+// encoding, sub-second truncation, the UTC "+0000" (never "Z") offset form,
+// and the year-overflow guard (IPTC/XMP reconciliation spec §0.3).
+func TestIPTCSetDateCreated(t *testing.T) {
+	t.Parallel()
+
+	t.Run("BasicEncoding", func(t *testing.T) {
+		t.Parallel()
+		i := new(IPTC)
+		ts := time.Date(2026, 6, 15, 14, 30, 22, 500_000_000, time.FixedZone("+0100", 3600))
+		i.SetDateCreated(ts)
+		if got := i.DateCreated(); got != "20260615" {
+			t.Errorf("DateCreated() = %q, want %q", got, "20260615")
+		}
+		if got := i.TimeCreated(); got != "143022+0100" {
+			t.Errorf("TimeCreated() = %q, want %q", got, "143022+0100")
+		}
+	})
+
+	t.Run("UTCZeroOffsetNeverZ", func(t *testing.T) {
+		t.Parallel()
+		i := new(IPTC)
+		ts := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+		i.SetDateCreated(ts)
+		if got := i.TimeCreated(); got != "030405+0000" {
+			t.Errorf("TimeCreated() = %q, want %q (explicit +0000, never Z)", got, "030405+0000")
+		}
+	})
+
+	t.Run("ReplacesExisting", func(t *testing.T) {
+		t.Parallel()
+		i := new(IPTC)
+		i.SetDateCreated(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC))
+		i.SetDateCreated(time.Date(2025, 12, 31, 23, 59, 59, 0, time.UTC))
+		if got := i.DateCreated(); got != "20251231" {
+			t.Errorf("DateCreated() = %q, want %q (replace, not append)", got, "20251231")
+		}
+		if got := i.TimeCreated(); got != "235959+0000" {
+			t.Errorf("TimeCreated() = %q, want %q", got, "235959+0000")
+		}
+	})
+
+	t.Run("YearOverflowGuardNoOp", func(t *testing.T) {
+		t.Parallel()
+		i := new(IPTC)
+		i.SetDateCreated(time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC))
+		if got := i.DateCreated(); got != "" {
+			t.Errorf("DateCreated() = %q, want empty (year 10000 overflows 8-byte CCYYMMDD)", got)
+		}
+		if got := i.TimeCreated(); got != "" {
+			t.Errorf("TimeCreated() = %q, want empty (guard is a complete no-op)", got)
+		}
+	})
+
+	t.Run("YearOverflowGuardDoesNotClobberExisting", func(t *testing.T) {
+		t.Parallel()
+		// A prior valid SetDateCreated must survive an out-of-range follow-up
+		// call: the guard is a no-op, not a clear.
+		i := new(IPTC)
+		i.SetDateCreated(time.Date(2024, 6, 21, 12, 0, 0, 0, time.UTC))
+		i.SetDateCreated(time.Date(-1, 1, 1, 0, 0, 0, 0, time.UTC))
+		if got := i.DateCreated(); got != "20240621" {
+			t.Errorf("DateCreated() = %q, want %q (out-of-range call must not clobber)", got, "20240621")
+		}
+	})
+
+	t.Run("NilReceiverNoPanic", func(t *testing.T) {
+		t.Parallel()
+		var i *IPTC
+		i.SetDateCreated(time.Now()) // must not panic
+	})
+}
+
+// TestIPTCSetCreators covers iptc.IPTC.SetCreators: full-replace semantics,
+// order preservation, 32-octet UTF-8-safe truncation, the UTF-8 flag, and
+// U+001E stripping (IPTC/XMP reconciliation spec §4, defensive requirements).
+func TestIPTCSetCreators(t *testing.T) {
+	t.Parallel()
+
+	t.Run("OrderPreserved", func(t *testing.T) {
+		t.Parallel()
+		i := new(IPTC)
+		i.SetCreators([]string{"Alice", "Bob", "Carol"})
+		got := i.AllCreators()
+		want := []string{"Alice", "Bob", "Carol"}
+		if len(got) != len(want) {
+			t.Fatalf("AllCreators() len = %d, want %d", len(got), len(want))
+		}
+		for idx, w := range want {
+			if got[idx] != w {
+				t.Errorf("AllCreators()[%d] = %q, want %q", idx, got[idx], w)
+			}
+		}
+	})
+
+	t.Run("FullReplaceNotAppend", func(t *testing.T) {
+		t.Parallel()
+		i := new(IPTC)
+		i.SetCreators([]string{"A", "B"})
+		i.SetCreators([]string{"C"})
+		got := i.AllCreators()
+		if len(got) != 1 || got[0] != "C" {
+			t.Errorf("AllCreators() = %v, want [C] (full replace, not append)", got)
+		}
+	})
+
+	t.Run("EmptySliceRemovesAll", func(t *testing.T) {
+		t.Parallel()
+		i := new(IPTC)
+		i.SetCreators([]string{"Alice", "Bob"})
+		i.SetCreators([]string{})
+		if got := i.AllCreators(); got != nil {
+			t.Errorf("AllCreators() = %v, want nil", got)
+		}
+	})
+
+	t.Run("NilSliceTreatedSameAsEmpty", func(t *testing.T) {
+		t.Parallel()
+		i := new(IPTC)
+		i.SetCreators([]string{"Alice", "Bob"})
+		i.SetCreators(nil)
+		if got := i.AllCreators(); got != nil {
+			t.Errorf("AllCreators() = %v, want nil", got)
+		}
+	})
+
+	t.Run("PreservesOtherDatasets", func(t *testing.T) {
+		t.Parallel()
+		i := new(IPTC)
+		i.SetCaption("my caption")
+		i.SetCreators([]string{"Alice"})
+		if got := i.Caption(); got != "my caption" {
+			t.Errorf("Caption changed after SetCreators: got %q, want %q", got, "my caption")
+		}
+	})
+
+	t.Run("TruncatesAtUTF8RuneBoundary", func(t *testing.T) {
+		t.Parallel()
+		// 32-octet limit (IIM §2.2.25); "café" repeated forces a multi-byte
+		// rune to straddle the boundary if truncation is not rune-safe.
+		long := ""
+		for len(long) < 40 {
+			long += "café "
+		}
+		i := new(IPTC)
+		i.SetCreators([]string{long})
+		got := i.AllCreators()
+		if len(got) != 1 {
+			t.Fatalf("AllCreators() len = %d, want 1", len(got))
+		}
+		if len(got[0]) > 32 {
+			t.Errorf("AllCreators()[0] length = %d, want <= 32", len(got[0]))
+		}
+		if !utf8.ValidString(got[0]) {
+			t.Errorf("AllCreators()[0] = %q is not valid UTF-8 after truncation", got[0])
+		}
+	})
+
+	t.Run("StripsEmbeddedRecordSeparator", func(t *testing.T) {
+		t.Parallel()
+		i := new(IPTC)
+		i.SetCreators([]string{"Alice\x1eBob"})
+		got := i.AllCreators()
+		if len(got) != 1 || got[0] != "AliceBob" {
+			t.Errorf("AllCreators() = %v, want [AliceBob] (U+001E stripped)", got)
+		}
+	})
+
+	t.Run("SetsUTF8FlagForNonASCII", func(t *testing.T) {
+		t.Parallel()
+		i := new(IPTC)
+		i.SetCreators([]string{"café"})
+		if !i.isUTF8() {
+			t.Error("isUTF8() = false after SetCreators with non-ASCII content")
+		}
+	})
+
+	t.Run("RoundTrip", func(t *testing.T) {
+		t.Parallel()
+		i := new(IPTC)
+		i.SetCreators([]string{"Alice", "Bob", "Carol"})
+		encoded, err := Encode(i)
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		i2, err := Parse(encoded)
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		got := i2.AllCreators()
+		want := []string{"Alice", "Bob", "Carol"}
+		if len(got) != len(want) {
+			t.Fatalf("AllCreators() round-trip len = %d, want %d", len(got), len(want))
+		}
+		for idx, w := range want {
+			if got[idx] != w {
+				t.Errorf("AllCreators() round-trip [%d] = %q, want %q", idx, got[idx], w)
+			}
+		}
+	})
+
+	t.Run("NilReceiverNoPanic", func(t *testing.T) {
+		t.Parallel()
+		var i *IPTC
+		i.SetCreators([]string{"a", "b"}) // must not panic
 	})
 }

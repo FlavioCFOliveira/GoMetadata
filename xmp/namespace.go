@@ -61,6 +61,39 @@ func collectionType(ns, local string) string {
 	return "Bag"
 }
 
+// isCollectionProperty reports whether (ns, local) is a property whose XMP
+// schema type is a structured array (rdf:Alt / rdf:Seq / rdf:Bag) per
+// ISO 16684-1 §7.5, regardless of how many values it currently holds.
+//
+// An array-typed property MUST always be serialised using its collection
+// container — even when it holds exactly one item — unlike a Simple (Text)
+// property, for which the compact `<prefix:local>value</prefix:local>` form
+// is correct. write.go's classification loop uses this (rather than
+// "does the in-memory value contain the internal U+001E separator") to
+// decide the serialisation form, because a value can be array-typed and
+// still hold exactly one item (e.g. a caption with only an x-default entry;
+// RECONCILE-05, docs/conformance/iptc.md §4).
+//
+// This mirrors, and must be kept in sync with, every namespace/local pair
+// that collectionType above recognises explicitly (dc:subject is also
+// listed here even though collectionType reaches it only via the default
+// "Bag" fallback).
+func isCollectionProperty(ns, local string) bool {
+	if ns == NSdc {
+		switch local {
+		case "creator", "subject", "description", "rights", "title":
+			return true
+		}
+	}
+	if ns == NSxmpMM {
+		switch local {
+		case "History", "Ingredients", "Pantry":
+			return true
+		}
+	}
+	return false
+}
+
 // prefixMap maps well-known XMP namespace URIs to their canonical prefix strings.
 // XMP Part 1 §B, Adobe XMP Specification Appendix A.
 var prefixMap = map[string]string{ //nolint:gochecknoglobals // read-only namespace→prefix lookup table per XMP Part 1 §B; never mutated

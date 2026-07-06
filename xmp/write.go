@@ -115,7 +115,14 @@ func serialise(x *XMP) ([]byte, error) { //nolint:gocyclo,cyclop // complexity i
 
 		for _, local := range topProps {
 			val := props[local]
-			if strings.IndexByte(val, '\x1e') < 0 {
+			// #RECONCILE-05 fix: an array-typed property (dc:creator, dc:subject,
+			// dc:description, dc:rights, dc:title, xmpMM's ordered-array set) MUST
+			// always use its rdf:Alt/Seq/Bag collection container per
+			// ISO 16684-1 §7.5, even when it holds exactly one item — the presence
+			// of the internal U+001E multi-item separator is not, by itself, a
+			// reliable signal of array-ness. isCollectionProperty carries that
+			// schema knowledge independently of value count.
+			if strings.IndexByte(val, '\x1e') < 0 && !isCollectionProperty(ns, local) {
 				writeSimpleProperty(buf, prefix, local, val)
 			} else {
 				writeMultiValuedProperty(buf, prefix, ns, local, val)

@@ -164,6 +164,11 @@ func testSetMake(t *testing.T, m *Metadata) {
 }
 
 // testSetDateTimeOriginal is a helper for TestMetadataSetters/SetDateTimeOriginal.
+//
+// RECONCILE-03: SetDateTimeOriginal now also bridges to IPTC (2:55 Date
+// Created + 2:60 Time Created) and to a second XMP property
+// (photoshop:DateCreated), in addition to the pre-existing EXIF and
+// exif:DateTimeOriginal writes. This helper asserts all four targets.
 func testSetDateTimeOriginal(t *testing.T, m *Metadata) {
 	t.Helper()
 	ts := time.Date(2024, 6, 21, 12, 0, 0, 0, time.UTC)
@@ -178,6 +183,30 @@ func testSetDateTimeOriginal(t *testing.T, m *Metadata) {
 	xmpStr := m.XMP.DateTimeOriginal()
 	if xmpStr == "" {
 		t.Error("XMP.DateTimeOriginal empty after set")
+	}
+	if got := m.IPTC.DateCreated(); got != "20240621" {
+		t.Errorf("IPTC.DateCreated() = %q, want %q", got, "20240621")
+	}
+	if got := m.IPTC.TimeCreated(); got != "120000+0000" {
+		t.Errorf("IPTC.TimeCreated() = %q, want %q", got, "120000+0000")
+	}
+	if got := m.XMP.Get(xmp.NSphotoshop, "DateCreated"); got != "2024-06-21T12:00:00Z" {
+		t.Errorf("XMP photoshop:DateCreated = %q, want %q", got, "2024-06-21T12:00:00Z")
+	}
+}
+
+// testSetCreators is a helper for TestMetadataSetters/SetCreators.
+func testSetCreators(t *testing.T, m *Metadata) {
+	t.Helper()
+	m.SetCreators([]string{"Alice", "Bob"})
+	if got := m.IPTC.AllCreators(); len(got) != 2 || got[0] != "Alice" || got[1] != "Bob" {
+		t.Errorf("IPTC.AllCreators() = %v, want [Alice Bob]", got)
+	}
+	if got := m.XMP.Creators(); len(got) != 2 || got[0] != "Alice" || got[1] != "Bob" {
+		t.Errorf("XMP.Creators() = %v, want [Alice Bob]", got)
+	}
+	if got := m.EXIF.Creator(); got != "Alice; Bob" {
+		t.Errorf("EXIF.Creator() = %q, want %q", got, "Alice; Bob")
 	}
 }
 
@@ -275,6 +304,10 @@ func TestMetadataSetters(t *testing.T) {
 		t.Parallel()
 		testSetCreator(t, newTestMetadata(t))
 	})
+	t.Run("SetCreators", func(t *testing.T) {
+		t.Parallel()
+		testSetCreators(t, newTestMetadata(t))
+	})
 	t.Run("SetCameraModel", func(t *testing.T) {
 		t.Parallel()
 		testSetCameraModel(t, newTestMetadata(t))
@@ -335,6 +368,7 @@ func TestMetadataSettersNilComponents(t *testing.T) {
 	m.SetCaption("x")
 	m.SetCopyright("x")
 	m.SetCreator("x")
+	m.SetCreators([]string{"x"})
 	m.SetCameraModel("x")
 	m.SetGPS(0, 0)
 	m.SetKeywords([]string{"a"})

@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
+### Added
+
+- **IPTC↔XMP↔EXIF write-side bridging for dates and creators** (`iptc/`, `xmp/`, `metadata.go`, #265): `iptc.IPTC.SetDateCreated` (dataset 2:55 Date Created + 2:60 Time Created, IIM §2.2.23) and `iptc.IPTC.SetCreators` (full-replace dataset 2:80 By-line, order-preserving); `xmp.XMP.SetDateCreated` (`photoshop:DateCreated`, RFC 3339), `xmp.XMP.Creators`, and `xmp.XMP.SetCreators` (ordered `dc:creator`); `Metadata.SetDateTimeOriginal` now also writes IPTC 2:55/2:60 and XMP `photoshop:DateCreated` alongside its existing EXIF and `exif:DateTimeOriginal` writes, and a new `Metadata.SetCreators([]string)` fans an ordered creator list out to IPTC 2:80 (repeatable, order preserved), XMP `dc:creator` (ordered `rdf:Seq`), and EXIF `0x013B Artist` (flattened, `"; "`-joined per MWG list-handling convention). `IPTC.SetDateCreated` guards against `t.Year()` outside `[0, 9999]` by no-op'ing the IPTC write only; EXIF and XMP proceed normally. `xmp:CreateDate` (digitization date) is a distinct field and is never written by this bridge.
+
+### Fixed
+
+- **XMP encoder now always wraps array-typed properties in their RDF collection container** (`xmp/write.go`, `xmp/namespace.go`): `dc:creator`, `dc:subject`, `dc:description`, `dc:rights`, `dc:title`, and the `xmpMM` ordered-array set (`History`, `Ingredients`, `Pantry`) are now serialised as `<rdf:Seq>`/`<rdf:Bag>`/`<rdf:Alt>` even when they hold exactly one value, per ISO 16684-1 §7.5. Previously, a single-item array-typed property (e.g. the common case of `SetCaption`/`SetCreator` writing exactly one value) was serialised as a bare `<prefix:local>value</prefix:local>` element, which is only correct for Simple (Text) properties. Round-trip value correctness (via this library's own lenient parser) was unaffected, but the produced wire format did not conform to the formal Lang-Alt/array schema that other XMP consumers expect.
+
 ## [1.2.0] - 2026-06-10
 
 ### Added

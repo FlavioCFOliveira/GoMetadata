@@ -119,11 +119,43 @@ Namespaces: `Iptc4xmpCore` = `http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/`,
 | 2:120 Caption | dc:description | Lang Alt (x-default) |
 | 2:122 Writer | photoshop:CaptionWriter | Text |
 
-- **RECONCILE-01** Dual-write: write both IIM and XMP with equivalent content.
-- **RECONCILE-02** Read priority: XMP > IIM on conflict. — MWG §2.
-- **RECONCILE-03** Split XMP photoshop:DateCreated into 2:55 (CCYYMMDD) + 2:60 (HHMMSS±HHMM); drop sub-seconds on IIM write.
-- **RECONCILE-04** Preserve By-line order into dc:creator seq.
-- **RECONCILE-05** Lang Alt ↔ IIM string via the `x-default` key.
+- **RECONCILE-01** Dual-write parity (write path): every convenience setter that
+  targets more than one backend (IIM, XMP, EXIF) MUST leave all targeted
+  backends holding semantically equivalent content, modulo each backend's own
+  lossy constraints (sub-second truncation, single-string flattening of a
+  repeatable field, 8859-1 vs UTF-8 transcoding). — IPTC Photo Metadata 2025.1
+  Mapping Guidelines; MWG §2 ("Synchronization").
+- **RECONCILE-02** Read priority: default is XMP > IIM (MWG §2, "MWG-01").
+  Exception (MWG §3.3.1, "MWG-02"): when Photoshop IRB resource `0x0425`
+  ("IPTC Digest") is present, compare `MD5(raw 0x0404 IIM stream)` to the
+  stored 16-byte value. All-zero stored digest ("unknown" sentinel) OR a
+  computed/stored mismatch ⇒ elevate IIM priority (IIM > XMP > EXIF) for the
+  conflict-prone field set {Caption/Abstract, CopyrightNotice, By-line,
+  Keywords}. Digest match, or resource absent, ⇒ default MWG-01 applies
+  unchanged. Digest is not consulted for any field outside the set above
+  (in particular, not for DateCreated/DateTimeOriginal in this codebase).
+  Proven by `TestConformance_MWG02` (metadata_conformance_test.go).
+- **RECONCILE-03** Date bridging (write path): a single capture timestamp is
+  split into IIM 2:55 `CCYYMMDD` + 2:60 `HHMMSS±HHMM` (IIM §2.2.23), EXIF
+  ExifIFD 0x9003 DateTimeOriginal (EXIF §4.6.5), and XMP `photoshop:DateCreated`
+  as RFC 3339 (Adobe XMP Spec Part 2 §1.2.7 / IPTC Mapping Guidelines 2025.1).
+  Sub-second precision is dropped on both IIM and XMP (neither format's chosen
+  layout carries a fractional-second slot). `xmp:CreateDate` (digitization
+  date) is a distinct field and MUST NOT be written by this bridge.
+- **RECONCILE-04** By-line sequencing (bidirectional): IIM 2:80 By-line
+  (repeatable, IIM §2.2.25) order MUST be preserved into XMP `dc:creator`'s
+  ordered `rdf:Seq` (ISO 16684-1 §7.5, ordered array) and vice versa on read.
+  The convenience setter also flattens the ordered list into EXIF IFD0 0x013B
+  Artist (EXIF §4.6.4 Table 3) as a single string joined with `"; "`
+  (semicolon-space), the MWG list-handling convention for single-string EXIF
+  fields that mirror a multi-valued XMP/IIM property.
+- **RECONCILE-05** Lang Alt ↔ IIM plain-string reconciliation: an IIM Record 2
+  text dataset (2:05 ObjectName, 2:116 CopyrightNotice, 2:120 Caption/Abstract)
+  round-trips through XMP as an `rdf:Alt` collection whose `x-default`
+  (ISO 16684-1 §7.5 / P1-H) item is authoritative in both directions. Any
+  non-default `xml:lang` alternative present in the XMP `rdf:Alt` is preserved
+  on the XMP side but has no IIM representation (IIM carries one un-tagged
+  string) and MUST be dropped, not concatenated, when the value flows into IIM.
 
 ## Section 5: Robustness Cases (MUST NOT crash)
 - **ROBUST-01** Oversized standard length, value truncated by EOF → Truncated, rescan.

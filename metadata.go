@@ -3,6 +3,7 @@ package gometadata
 import (
 	"bytes"
 	"encoding/binary"
+	"strings"
 	"sync"
 	"time"
 
@@ -883,6 +884,40 @@ func (m *Metadata) SetCreator(s string) {
 	}
 }
 
+// SetCreators writes an ordered list of creators to IPTC (2:80 By-line,
+// repeatable, order preserved), XMP (dc:creator, ordered rdf:Seq, order
+// preserved — RECONCILE-04), and EXIF (0x013B Artist, flattened to a single
+// "; "-joined string per the MWG list-handling convention for EXIF tags
+// that mirror a multi-valued XMP/IIM property). Components are auto-created
+// when nil and the format supports them. Concurrent calls are safe.
+//
+// SetCreators is a FULL REPLACE across all three backends. This differs
+// from SetCreator(s string), which updates only the first IIM By-line
+// occurrence (preserving any additional pre-existing entries) while fully
+// replacing the XMP dc:creator property outright. Prefer SetCreators
+// exclusively once a document's creator list has more than one entry — the
+// two setters are not designed to be mixed on the same *Metadata.
+//
+// Empty (or nil) creators clears dc:creator and all 2:80 By-line entries;
+// EXIF Artist is left UNTOUCHED (not zeroed), because the current Set*
+// surface has no "delete tag" primitive.
+func (m *Metadata) SetCreators(creators []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureEXIF()
+	m.ensureIPTC()
+	m.ensureXMP()
+	if m.EXIF != nil && len(creators) > 0 {
+		m.EXIF.SetCreator(strings.Join(creators, "; "))
+	}
+	if m.IPTC != nil {
+		m.IPTC.SetCreators(creators)
+	}
+	if m.XMP != nil {
+		m.XMP.SetCreators(creators)
+	}
+}
+
 // SetCameraModel writes s to EXIF and XMP. Components are auto-created when
 // nil and the format supports them. Concurrent calls are safe.
 func (m *Metadata) SetCameraModel(s string) {
@@ -957,18 +992,47 @@ func (m *Metadata) SetMake(s string) {
 	}
 }
 
-// SetDateTimeOriginal writes t to EXIF and XMP. Components are auto-created
-// when nil and the format supports them. Concurrent calls are safe.
+// SetDateTimeOriginal writes t to EXIF, IPTC, and XMP. Components are
+// auto-created when nil and the format supports them. Concurrent calls are
+// safe.
+//
+// This is the single write-side bridge for "when was this taken" across all
+// three backends (RECONCILE-03):
+//   - EXIF ExifIFD 0x9003 DateTimeOriginal (EXIF §4.6.5).
+//   - IPTC dataset 2:55 Date Created + 2:60 Time Created (IIM §2.2.23), via
+//     IPTC.SetDateCreated. Sub-second precision is dropped (IIM has no
+//     sub-second field). If t.Year() is outside [0, 9999], the IPTC write is
+//     a complete no-op (IPTC.SetDateCreated's year-overflow guard) while
+//     EXIF and XMP still proceed normally.
+//   - Two distinct XMP properties: exif:DateTimeOriginal (mirrors the EXIF
+//     tag) and photoshop:DateCreated (the XMP equivalent of IIM 2:55+2:60,
+//     per the IPTC Photo Metadata Mapping Guidelines 2025.1). Both describe
+//     the same real-world moment; writing both maximises reader
+//     interoperability — Lightroom/Bridge honour photoshop:DateCreated,
+//     other tools honour exif:DateTimeOriginal.
+//
+// xmp:CreateDate (digitization date, the XMP analogue of EXIF
+// 0x9004 DateTimeDigitized) is a distinct field and is deliberately NOT
+// written here — see the IPTC/XMP reconciliation spec §0.1.
+//
+// For formats that cannot carry IPTC (PNG, WebP, HEIF, AVIF, CR3), m.IPTC
+// stays nil and only EXIF+XMP are written — the same fallback pattern used
+// by SetKeywords.
 func (m *Metadata) SetDateTimeOriginal(t time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ensureEXIF()
+	m.ensureIPTC()
 	m.ensureXMP()
 	if m.EXIF != nil {
 		m.EXIF.SetDateTimeOriginal(t)
 	}
+	if m.IPTC != nil {
+		m.IPTC.SetDateCreated(t)
+	}
 	if m.XMP != nil {
-		m.XMP.SetDateTimeOriginal(t)
+		m.XMP.SetDateTimeOriginal(t) // exif:DateTimeOriginal
+		m.XMP.SetDateCreated(t)      // photoshop:DateCreated (RECONCILE-03)
 	}
 }
 

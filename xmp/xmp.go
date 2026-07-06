@@ -241,6 +241,37 @@ func (x *XMP) Creator() string {
 	return x.firstValue(NSdc, "creator")
 }
 
+// Creators returns all dc:creator values in document order (XMP §8.3;
+// ISO 16684-1 §7.5 — dc:creator is an ordered rdf:Seq). Mirrors Keywords()'s
+// U+001E-split logic exactly; order is preserved because both the internal
+// join and the rdf:Seq encoder (collectionType) iterate in slice/string
+// order (RECONCILE-04).
+func (x *XMP) Creators() []string {
+	if x == nil {
+		return nil
+	}
+	v := x.getProp(NSdc, "creator")
+	if v == "" {
+		return nil
+	}
+	// Multi-valued properties are joined with U+001E (record separator).
+	result := make([]string, 0, strings.Count(v, "\x1e")+1)
+	for {
+		i := strings.IndexByte(v, '\x1e')
+		if i < 0 {
+			if v != "" {
+				result = append(result, v)
+			}
+			break
+		}
+		if i > 0 {
+			result = append(result, v[:i])
+		}
+		v = v[i+1:]
+	}
+	return result
+}
+
 // Get returns the property value for the given namespace URI and local name.
 // Returns "" when the property is absent or when x is nil.
 func (x *XMP) Get(ns, local string) string {
@@ -287,6 +318,19 @@ func (x *XMP) SetCameraModel(s string) { x.putProp(NStiff, "Model", s) }
 // (XMP §8.4 / ISO 8601).
 func (x *XMP) SetDateTimeOriginal(t time.Time) {
 	x.putProp(NSexif, "DateTimeOriginal", t.Format(time.RFC3339))
+}
+
+// SetDateCreated sets photoshop:DateCreated to t formatted as RFC 3339
+// (Adobe XMP Specification Part 2 §1.2.7; IPTC Photo Metadata Mapping
+// Guidelines 2025.1 — photoshop:DateCreated is the XMP equivalent of IIM
+// 2:55 Date Created + 2:60 Time Created, RECONCILE-03).
+//
+// Do not confuse this with xmp:CreateDate, which records the digitization
+// date (the XMP analogue of EXIF 0x9004 DateTimeDigitized) — a distinct
+// field that this method never writes. See the IPTC/XMP reconciliation
+// spec §0.1.
+func (x *XMP) SetDateCreated(t time.Time) {
+	x.putProp(NSphotoshop, "DateCreated", t.Format(time.RFC3339))
 }
 
 // SetGPS writes exif:GPSLatitude and exif:GPSLongitude in the XMP
@@ -352,6 +396,32 @@ func (x *XMP) SetKeywords(kws []string) {
 		return
 	}
 	x.putProp(NSdc, "subject", strings.Join(kws, "\x1e"))
+}
+
+// SetCreators replaces dc:creator entirely with creators, in order (full
+// replace, mirrors SetKeywords — RECONCILE-04). Passing an empty (or nil)
+// slice deletes the property so Creators() returns nil after a round-trip.
+//
+// A creator string containing U+001E (this package's internal multi-value
+// separator) has that byte stripped before storage; an embedded U+001E
+// would otherwise corrupt the split performed by Creators() on the next
+// read (IPTC/XMP reconciliation spec §4, defensive requirements).
+func (x *XMP) SetCreators(creators []string) {
+	if x == nil {
+		return
+	}
+	if len(creators) == 0 {
+		// Delete the property entirely so Creators() returns nil.
+		if x.Properties != nil {
+			delete(x.Properties[NSdc], "creator")
+		}
+		return
+	}
+	cleaned := make([]string, len(creators))
+	for idx, c := range creators {
+		cleaned[idx] = strings.ReplaceAll(c, "\x1e", "")
+	}
+	x.putProp(NSdc, "creator", strings.Join(cleaned, "\x1e"))
 }
 
 // Set is the public equivalent of the private set() method.
