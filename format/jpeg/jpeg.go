@@ -392,7 +392,14 @@ func readSOI(soi []byte) error {
 //
 // iptcDigest is a 16-byte MD5 slice when the IRB contained a 0x0425 resource,
 // or nil when absent. MWG §3.3.1.
-func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte) (rawEXIF, rawIPTC, iptcDigest []byte, xmp xmpResult) {
+//
+// err is non-nil only for ErrFileTooLarge (task #262): either the cumulative
+// bytes read from r exceeded maxFileSize (countingReader, limits.go), or the
+// aggregate size of all accumulated Photoshop APP13 payloads did. All other
+// read failures (EOF, malformed markers) are handled by the pre-existing
+// graceful-degradation policy — the function returns whatever metadata was
+// collected so far with err == nil, exactly as before this change.
+func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte) (rawEXIF, rawIPTC, iptcDigest []byte, xmp xmpResult, err error) {
 	// extended collects chunks from extended XMP APP1 segments, keyed by GUID.
 	// Adobe XMP Specification Part 3 §1.1.4.
 	// Lazily initialised: most JPEGs do not contain extended XMP, so we avoid
@@ -416,12 +423,28 @@ func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte) (rawEXIF, raw
 	//
 	// We accumulate raw Photoshop payloads here; the 0x0404 IRB search runs once
 	// over the concatenated bytes after all segments have been collected.
+	//
+	// app13Total independently bounds the aggregate size of app13Payloads at
+	// maxFileSize (task #262): individual APP13 segments are already bounded to
+	// 65533 bytes by the 16-bit JPEG length field, but nothing previously
+	// bounded how MANY such segments could be accumulated, so a flood of
+	// small-but-numerous Photoshop APP13 segments could otherwise grow
+	// app13Payloads without limit before the overall countingReader cap (which
+	// bounds total bytes READ, not bytes retained) had a chance to trip on a
+	// file that interleaves large non-APP13 segments to stay under the read cap.
 	var app13Payloads [][]byte
+	var app13Total int64
 
 	for {
 		marker, data, rerr := readSegment(r, scratchPtr)
 		if rerr != nil {
-			// Both EOF and malformed-stream errors: degrade gracefully and
+			if errors.Is(rerr, ErrFileTooLarge) {
+				// #262: the input exceeds maxFileSize. Unlike ordinary
+				// malformed-stream errors, this must propagate as a hard
+				// failure rather than degrade gracefully.
+				return nil, nil, nil, xmpResult{}, rerr
+			}
+			// EOF and malformed-stream errors: degrade gracefully and
 			// return whatever metadata has been collected so far.
 			break
 		}
@@ -439,18 +462,23 @@ func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte) (rawEXIF, raw
 				// Copy the IRB portion (data aliases scratch).
 				irb := data[len(identPS):]
 				if len(irb) > 0 {
+					if app13Total+int64(len(irb)) > maxFileSize {
+						return nil, nil, nil, xmpResult{}, fmt.Errorf(
+							"jpeg: aggregate APP13 payload exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
+					}
 					app13Payloads = append(app13Payloads, bytes.Clone(irb))
+					app13Total += int64(len(irb))
 				}
 			}
 		case markerSOS, markerEOI:
 			// SOS/EOI: no more metadata segments follow.
 			rawIPTC, iptcDigest = extractIPTCAndDigestFromIRBPayloads(app13Payloads)
-			return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, extended, extFullLens, extTruncated)
+			return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, extended, extFullLens, extTruncated), nil
 		}
 	}
 
 	rawIPTC, iptcDigest = extractIPTCAndDigestFromIRBPayloads(app13Payloads)
-	return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, extended, extFullLens, extTruncated)
+	return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, extended, extFullLens, extTruncated), nil
 }
 
 // parseIRBForIPTCAndDigest scans a single contiguous Photoshop IRB byte block
@@ -594,6 +622,14 @@ func extractFullInternal(r io.ReadSeeker) (rawEXIF, rawIPTC, iptcDigest []byte, 
 		return nil, nil, nil, xmpResult{}, fmt.Errorf("jpeg: seek: %w", err)
 	}
 
+	// #262: wrap r so the total bytes read across the SOI check and the
+	// marker scan are bounded by maxFileSize, mirroring the aggregate
+	// input-size cap every sibling format package enforces. See limits.go
+	// for why this preserves the streaming design and io.ReadSeeker
+	// semantics instead of buffering the whole file.
+	cr := getCountingReader(r)
+	defer putCountingReader(cr)
+
 	// Obtain a pooled scratch buffer first so the SOI read can reuse it,
 	// avoiding the heap escape that occurs when a stack-allocated [2]byte
 	// is passed to io.ReadFull via the io.Reader interface.
@@ -602,14 +638,17 @@ func extractFullInternal(r io.ReadSeeker) (rawEXIF, rawIPTC, iptcDigest []byte, 
 
 	// Read and verify SOI using the pooled scratch buffer.
 	soi := (*scratchPtr)[:2]
-	if _, err = io.ReadFull(r, soi); err != nil {
+	if _, err = io.ReadFull(cr, soi); err != nil {
 		return nil, nil, nil, xmpResult{}, fmt.Errorf("jpeg: read SOI: %w", err)
 	}
-	if err := readSOI(soi); err != nil {
-		return nil, nil, nil, xmpResult{}, err
+	if soiErr := readSOI(soi); soiErr != nil {
+		return nil, nil, nil, xmpResult{}, soiErr
 	}
 
-	rawEXIF, rawIPTC, iptcDigest, xmp = scanMetadataSegmentsWithWire(r, scratchPtr)
+	rawEXIF, rawIPTC, iptcDigest, xmp, err = scanMetadataSegmentsWithWire(cr, scratchPtr)
+	if err != nil {
+		return nil, nil, nil, xmpResult{}, err
+	}
 	return rawEXIF, rawIPTC, iptcDigest, xmp, nil
 }
 
@@ -1040,17 +1079,36 @@ func copyNonMetadataSegments(r io.Reader, w io.Writer, scratch *[]byte, preserve
 //
 // The caller is responsible for seeking r back to the desired position after
 // this call. scratch is used as an internal read buffer and must not be nil.
-func extractOriginalIRB(r io.ReadSeeker, scratch *[]byte) []byte { //nolint:cyclop,gocyclo // multi-APP13 accumulation requires the extra branches; complexity is essential not accidental
-	// Seek past the SOI (already validated by the caller — 2 bytes).
+//
+// err is non-nil for a Seek failure, or for ErrFileTooLarge (task #262):
+// either the cumulative bytes read from r since the caller's last Seek
+// exceeded maxFileSize (countingReader, limits.go), or the aggregate size of
+// all accumulated Photoshop APP13 payloads did. All other read failures
+// (EOF, malformed markers) degrade gracefully exactly as before this change
+// (err == nil, whatever payloads were collected so far are returned).
+func extractOriginalIRB(r io.ReadSeeker, scratch *[]byte) ([]byte, error) { //nolint:cyclop,gocyclo // multi-APP13 accumulation requires the extra branches; complexity is essential not accidental
+	// Seek past the SOI (already validated by the caller — 2 bytes). A failure
+	// here is surfaced rather than swallowed: the caller's immediately
+	// preceding Seek(0, ...) just succeeded on the same reader, so a failure
+	// on this second Seek signals a genuinely broken io.ReadSeeker rather than
+	// a benign, ignorable condition.
 	if _, err := r.Seek(2, io.SeekStart); err != nil {
-		return nil
+		return nil, fmt.Errorf("jpeg: seek: %w", err)
 	}
 	// #174: accumulate payloads from ALL Photoshop APP13 segments, not just
 	// the first. The logical IRB is the concatenation of all APP13 payloads.
+	//
+	// app13Total independently bounds the aggregate size of payloads at
+	// maxFileSize (task #262), mirroring the identical guard in
+	// scanMetadataSegmentsWithWire.
 	var payloads [][]byte
+	var app13Total int64
 	for {
 		marker, data, err := readSegment(r, scratch)
 		if err != nil {
+			if errors.Is(err, ErrFileTooLarge) {
+				return nil, err
+			}
 			break
 		}
 		switch marker {
@@ -1058,7 +1116,12 @@ func extractOriginalIRB(r io.ReadSeeker, scratch *[]byte) []byte { //nolint:cycl
 			if bytes.HasPrefix(data, identPS) {
 				irb := data[len(identPS):]
 				if len(irb) > 0 {
+					if app13Total+int64(len(irb)) > maxFileSize {
+						return nil, fmt.Errorf(
+							"jpeg: aggregate APP13 payload exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
+					}
 					payloads = append(payloads, bytes.Clone(irb))
+					app13Total += int64(len(irb))
 				}
 			}
 		case markerSOS, markerEOI:
@@ -1067,10 +1130,10 @@ func extractOriginalIRB(r io.ReadSeeker, scratch *[]byte) []byte { //nolint:cycl
 	}
 done:
 	if len(payloads) == 0 {
-		return nil
+		return nil, nil
 	}
 	if len(payloads) == 1 {
-		return payloads[0]
+		return payloads[0], nil
 	}
 	// Concatenate all payloads into one logical IRB.
 	var total int
@@ -1081,7 +1144,7 @@ done:
 	for _, p := range payloads {
 		combined = append(combined, p...)
 	}
-	return combined
+	return combined, nil
 }
 
 // Inject reads the JPEG marker stream from r, replaces the relevant APP
@@ -1108,7 +1171,18 @@ done:
 // removed while all other 8BIM sibling resources are preserved (#174). When the
 // source has no APP13 at all, no APP13 is emitted in the output.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
-	if _, err := r.Seek(0, io.SeekStart); err != nil {
+	// #262: wrap r so the total bytes read across the IRB pre-scan, the SOI
+	// check, and the main copy pass (including the passthrough io.Copy of the
+	// compressed image data in writeSOS) are bounded by maxFileSize, mirroring
+	// the aggregate input-size cap every sibling format package enforces. cr
+	// resets its budget on every Seek, so the pre-scan and the main pass are
+	// each independently bounded rather than sharing one combined budget — see
+	// limits.go for why this is both safe and necessary to avoid false
+	// positives on legitimate large files.
+	cr := getCountingReader(r)
+	defer putCountingReader(cr)
+
+	if _, err := cr.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("jpeg: seek: %w", err)
 	}
 
@@ -1122,17 +1196,20 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	// IPTC digest). Without this pre-scan the nil-IPTC path drops the whole
 	// APP13, destroying all Photoshop siblings.
 	preScratch := iobuf.Get(4096)
-	origIRB := extractOriginalIRB(r, preScratch)
+	origIRB, err := extractOriginalIRB(cr, preScratch)
 	iobuf.Put(preScratch)
+	if err != nil {
+		return err
+	}
 
 	// Seek back to the start for the main copy pass.
-	if _, err := r.Seek(0, io.SeekStart); err != nil {
+	if _, err := cr.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("jpeg: seek: %w", err)
 	}
 
 	// Read and write SOI.
 	soi := [2]byte{}
-	if _, err := io.ReadFull(r, soi[:]); err != nil {
+	if _, err := io.ReadFull(cr, soi[:]); err != nil {
 		return fmt.Errorf("jpeg: read SOI: %w", err)
 	}
 	if soi[0] != 0xFF || soi[1] != markerSOI {
@@ -1153,7 +1230,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	injectScratch := iobuf.Get(4096)
 	defer iobuf.Put(injectScratch)
 
-	return copyNonMetadataSegments(r, w, injectScratch, preserveUnknownSegments)
+	return copyNonMetadataSegments(cr, w, injectScratch, preserveUnknownSegments)
 }
 
 // writeExtendedXMP splits rawXMP across a main APP1 and one or more extended

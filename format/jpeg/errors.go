@@ -32,3 +32,35 @@ var ErrExtendedXMPTruncated = errors.New("jpeg: extended XMP payload exceeds siz
 // field in a Photoshop IRB entry names a value that cannot be safely represented
 // as a Go int on the current platform, or that would exceed the containing buffer.
 var ErrIRBDataSizeTooLarge = errors.New("jpeg: IRB entry data size exceeds buffer")
+
+// maxFileSize is the upper bound on the total number of bytes this package will
+// read from an io.Reader in a single Extract or Inject call. Every per-APP-segment
+// payload is already bounded to 65535 bytes by the JPEG 16-bit length field
+// (ISO/IEC 10918-1 §B.1.1.4), so this package carries no per-segment amplification
+// risk; this cap exists purely for defense-in-depth uniformity with the sibling
+// container packages (webp, tiff, heif, dng, cr2, cr3, nef, arw, orf, rw2), which
+// all enforce the identical #140-style aggregate cap.
+//
+// Unlike those packages, format/jpeg does not buffer the whole file via
+// io.ReadAll: it streams the marker sequence incrementally so that Extract and
+// Inject never hold more than one scratch buffer's worth of the file in memory
+// at a time. The cap is instead enforced by countingReader (limits.go), which
+// wraps the caller's io.ReadSeeker and rejects reads once the cumulative byte
+// count since the last Seek exceeds maxFileSize.
+//
+// Real-world JPEG files are well under 100 MiB; 256 MiB gives ample headroom
+// while bounding worst-case total input to a predictable, safe value.
+//
+// Declared as a var (not a const) so that tests can lower it temporarily to
+// verify the size-cap path without allocating 256 MiB of memory.
+//
+// #262 fix (defense-in-depth): add the project-wide aggregate input-size cap to
+// the one container package (format/jpeg) that lacked it, so the codebase's
+// security posture is uniform across every supported format.
+var maxFileSize int64 = 256 << 20 //nolint:gochecknoglobals // test-overridable cap; never mutated in production paths
+
+// ErrFileTooLarge is returned when the cumulative bytes read from the input
+// (or the aggregate size of all Photoshop APP13 payloads collected during a
+// single scan) exceeds maxFileSize. Callers can detect this specific condition
+// with errors.Is.
+var ErrFileTooLarge = errors.New("jpeg: input exceeds maximum file size (256 MiB)")
