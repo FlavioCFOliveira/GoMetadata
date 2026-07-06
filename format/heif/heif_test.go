@@ -1026,6 +1026,81 @@ func TestExtractExifFromData(t *testing.T) {
 	})
 }
 
+// TestExtractExifFromData_32BitSignednessOverflow is a regression test for
+// HEIF-32BIT-01: on a 32-bit platform (GOARCH=386/arm/mips/mipsle) int is
+// 32-bit, so int(uint32) for a 4-byte prefix >= 0x80000000 used to wrap
+// negative. A negative skip is never > len(data), so the old int-typed guard
+// (`skip > len(data)`) was silently bypassed and `data[skip:]` panicked with
+// a negative slice index (CWE-681 -> CWE-190 -> CWE-129). The fix computes
+// skip in uint64 before comparing, which has no wraparound on any platform.
+// This test passes on this 64-bit host both before and after the fix — it
+// exists to lock the contract for 32-bit builds, which cannot be exercised
+// directly by `go test` on this host (see GOARCH=386 build check instead).
+func TestExtractExifFromData_32BitSignednessOverflow(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		prefix uint32
+		want   []byte // nil means "must return nil, never panic"
+	}{
+		{
+			name:   "prefix exactly 0x80000000 (32-bit int sign boundary)",
+			prefix: 0x80000000,
+			want:   nil,
+		},
+		{
+			name:   "prefix 0xFFFFFFFF (maximum uint32)",
+			prefix: 0xFFFFFFFF,
+			want:   nil,
+		},
+		{
+			name:   "prefix 0xC0000000 (well past the 32-bit sign boundary)",
+			prefix: 0xC0000000,
+			want:   nil,
+		},
+		{
+			name:   "small valid prefix still extracts correctly",
+			prefix: 0,
+			want:   []byte("EXIFPAYLOAD"),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var data []byte
+			if tc.want == nil {
+				// Any payload length is fine here: the point is that a huge
+				// prefix must never pass the length guard, regardless of
+				// int word size.
+				data = make([]byte, 16)
+			} else {
+				data = append([]byte{0, 0, 0, 0}, tc.want...)
+			}
+			binary.BigEndian.PutUint32(data, tc.prefix)
+
+			// The guarantee under test: this call must never panic, on any
+			// platform. testing.T has no built-in "must not panic" assertion,
+			// so a plain call that runs to completion under -race is the
+			// proof; a regression would surface as a test crash, not a
+			// failed assertion.
+			got := extractExifFromData(data)
+
+			if tc.want == nil {
+				if got != nil {
+					t.Errorf("extractExifFromData(prefix=0x%08X) = %v, want nil", tc.prefix, got)
+				}
+				return
+			}
+			if !bytes.Equal(got, tc.want) {
+				t.Errorf("extractExifFromData(prefix=0x%08X) = %q, want %q", tc.prefix, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestExtractMalformedBoxSizeLessThanHeader is a regression test for the
 // panic "slice bounds out of range [8:N]" triggered when an ISOBMFF box
 // declares a size smaller than its own minimum header length.

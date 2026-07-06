@@ -884,10 +884,21 @@ func extractExifFromData(data []byte) []byte {
 	if len(data) < 4 {
 		return nil
 	}
-	skip := int(binary.BigEndian.Uint32(data[:4])) + 4
-	if skip > len(data) {
+	// Security audit HEIF-32BIT-01 (CWE-681 -> CWE-190 -> CWE-129): compute the
+	// skip offset in uint64, not int, before comparing against len(data). On a
+	// 32-bit platform (GOARCH=386/arm/mips/mipsle) int is 32-bit, so
+	// int(uint32 value >= 2^31) wraps negative; a negative skip is never
+	// > len(data), so the guard below would be silently bypassed and
+	// data[skip:] would panic with a negative slice index. uint64 arithmetic
+	// has no such wraparound on any platform. Mirrors the #74 fix in
+	// format/detect.go's parseClassicTIFFIFD0 and the FIX 5 fix in
+	// format/tiff/tiff.go's extractTagValues.
+	skip := uint64(binary.BigEndian.Uint32(data[:4])) + 4
+	if skip > uint64(len(data)) {
 		return nil
 	}
+	// skip <= uint64(len(data)) and len(data) is a valid int on this
+	// platform, so skip fits in int safely here.
 	return data[skip:]
 }
 
@@ -987,7 +998,19 @@ func parseIinfItemCount(data []byte, version byte, pos int) (count, newPos int, 
 	if pos+4 > len(data) {
 		return 0, pos, false
 	}
-	return int(binary.BigEndian.Uint32(data[pos:])), pos + 4, true
+	// Security audit HEIF-32BIT-01 (CWE-681 -> CWE-190 -> CWE-129, class
+	// consistency with extractExifFromData above): decode in uint64 first and
+	// reject any item_count that would not fit in a non-negative int on a
+	// 32-bit platform (GOARCH=386/arm/mips/mipsle), where int is 32-bit and
+	// int(uint32 value >= 2^31) wraps negative. No legitimate ISOBMFF file
+	// declares anywhere near this many items — both call sites additionally
+	// cap at maxIlocItems (4096) before doing per-item work — so this changes
+	// no observable behavior for well-formed input.
+	raw := uint64(binary.BigEndian.Uint32(data[pos:]))
+	if raw > uint64(math.MaxInt32) {
+		return 0, pos, false
+	}
+	return int(raw), pos + 4, true
 }
 
 // parseIinf parses an 'iinf' box body and returns a map from item ID to type string.
