@@ -84,3 +84,22 @@ var ErrCorruptXMP = errors.New("tiff: corrupt or invalid XMP data")
 // Task #116 regression: the mismatch previously passed silently; now it surfaces
 // as an explicit error so callers can log or propagate it.
 var ErrSubIFDCountMismatch = errors.New("tiff: 0x014A SubIFDs count mismatch between declared entry and subIFD slice")
+
+// ErrTooManyImageBlocks is returned when a single StripOffsets/StripByteCounts
+// or TileOffsets/TileByteCounts entry declares more elements than
+// maxImageBlocksPerOffsetEntry, when a 0x014A SubIFDs entry declares more
+// pointers than maxSubIFDsPerEntry, or when the cumulative number of image
+// blocks and SubIFD entries enumerated across a single relocate call exceeds
+// maxAggregateImageBlocks.
+//
+// GM-W1 (CWE-770 uncontrolled resource consumption / CWE-405 asymmetric
+// resource consumption): each element in a StripOffsets/StripByteCounts,
+// TileOffsets/TileByteCounts, or 0x014A array costs only 2-4 bytes of file
+// content but drives one heap-allocated *imageBlock (or *subIFDInfo) in the
+// write-path relocator. Without a bound, a crafted file well under this
+// package's 256 MiB file-size cap can declare an implausibly large element
+// count and drive multi-gigabyte allocation before any real image data is
+// ever copied. See relocate.go (maxImageBlocksPerOffsetEntry,
+// maxSubIFDsPerEntry, maxAggregateImageBlocks, imageBlockBudget) for the cap
+// constants and the full rationale.
+var ErrTooManyImageBlocks = errors.New("tiff: too many image blocks or SubIFD entries declared for a single write")

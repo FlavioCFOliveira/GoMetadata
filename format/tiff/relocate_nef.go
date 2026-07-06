@@ -743,7 +743,10 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	}
 
 	// Step 3: enumerate image blocks from the main IFD chain.
-	mainIFDBlocks, err := enumerateImageBlocks(base, e, order)
+	// GM-W1: budget is shared with the SubIFD enumeration below so the
+	// cumulative image-block + SubIFD count for this write is bounded.
+	budget := newImageBlockBudget()
+	mainIFDBlocks, err := enumerateImageBlocks(base, e, order, budget)
 	if err != nil {
 		return nil, fmt.Errorf("nef: enumerate image blocks: %w", err)
 	}
@@ -755,7 +758,7 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	allBlocks := append(mainIFDBlocks, info.previewBlock)
 
 	// Step 4: parse SubIFDs (tag 0x014A).
-	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e.IFD0, order)
+	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e.IFD0, order, budget)
 	if subErr != nil {
 		return nil, fmt.Errorf("nef: enumerate SubIFDs: %w", subErr)
 	}

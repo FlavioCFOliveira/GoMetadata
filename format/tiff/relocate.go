@@ -101,6 +101,122 @@ var (
 // #172: depth cap for unbounded recursive IFD walker.
 const maxSubIFDDepth = 8
 
+// ---------------------------------------------------------------------------
+// GM-W1 (CWE-770/CWE-405): image-block and SubIFD count budget
+// ---------------------------------------------------------------------------
+//
+// Confirmed finding GM-W1: extractParallelOffsetBlocks and
+// enumerateSubIFDsAt each allocate proportionally to an attacker-controlled
+// Count field (StripOffsets/StripByteCounts/TileOffsets/TileByteCounts for
+// the former, the 0x014A SubIFDs entry for the latter) with no upper bound
+// beyond "does the declared array actually fit in the source buffer". Each
+// array element costs only 2-4 bytes of genuine file content but drives one
+// heap-allocated *imageBlock (or *subIFDInfo) plus, for SubIFDs, a
+// map[uint32]bool sized with that same count as a pre-allocation hint. A
+// crafted file well under maxFileSize (256 MiB) can therefore declare an
+// implausibly large element count and drive multi-gigabyte allocation and
+// seconds of CPU before any real image data is copied — reachable from the
+// public Write/WriteFile API on every TIFF-based container (TIFF, DNG, CR2,
+// NEF, ARW, ORF, RW2) via a plain Read->Write round-trip, with no metadata
+// modification required.
+//
+// The fix mirrors exif/ifd.go's read-path traverseBudget: a fixed per-entry
+// ceiling (maxImageBlocksPerOffsetEntry, maxSubIFDsPerEntry) rejects any ONE
+// entry that is implausibly large before doing per-element work, and a
+// single per-relocate-call aggregate budget (maxAggregateImageBlocks,
+// imageBlockBudget) bounds the SUM across every entry, IFD1-chain link, and
+// SubIFD-recursion level visited — closing the residual amplification where
+// many entries, each individually within the per-entry cap, are chained
+// together (up to maxTraverseChainIFDs=512 next-IFD links and/or
+// maxSubIFDDepth=8 nested SubIFD levels).
+// ---------------------------------------------------------------------------
+
+// maxImageBlocksPerOffsetEntry caps the number of image-data blocks (strips
+// or tiles) accepted from a single StripOffsets/StripByteCounts or
+// TileOffsets/TileByteCounts entry pair, checked before
+// extractParallelOffsetBlocks allocates anything proportional to the
+// declared count.
+//
+// TIFF 6.0 §7 (strip organisation): NumberOfStrips = ceil(ImageLength /
+// RowsPerStrip); with the spec's own guidance of ~8 KB per strip, even a
+// large (100+ megapixel) sensor with RowsPerStrip=1 needs at most a few tens
+// of thousands of strips. TIFF 6.0 §15 (tiled images) is bounded the same
+// way for any tile size a real camera/scanner produces. 65536 (2^16) is a
+// two-order-of-magnitude safety margin above any legitimate strip/tile count
+// this library's target formats (TIFF, DNG, CR2, NEF, ARW, ORF, RW2) are
+// known to produce, while bounding a single extractParallelOffsetBlocks call
+// to at most a few MiB of heap.
+const maxImageBlocksPerOffsetEntry = 65536
+
+// maxSubIFDsPerEntry caps the number of SubIFD pointers accepted from a
+// single 0x014A (SubIFDs) entry, at any recursion depth, checked before
+// enumerateSubIFDsAt sizes the visited-set map or recurses further.
+//
+// TIFF Extension §F / Adobe DNG Spec §4: SubIFDs attach a small number of
+// alternate-resolution or preview IFDs to a parent IFD — DNG typically has
+// one, and multi-resolution previews raise that to at most a handful. 1024
+// is a generous ceiling that no known real-world file approaches even 1% of,
+// while bounding both the SubIFD walk and the visited-set map to a small,
+// fixed cost.
+const maxSubIFDsPerEntry = 1024
+
+// maxAggregateImageBlocks bounds the cumulative number of image blocks
+// (strips, tiles, JPEG previews) and SubIFD entries enumerated across every
+// IFD, IFD1-chain link, and SubIFD visited within a single relocate call.
+//
+// maxImageBlocksPerOffsetEntry and maxSubIFDsPerEntry already bound any ONE
+// entry, but a crafted file can still chain up to maxTraverseChainIFDs (512,
+// exif/ifd.go) next-IFD links and/or maxSubIFDDepth (8) levels of nested
+// SubIFDs, each individually within its own per-entry cap, to multiply the
+// total block count far beyond what any real file needs. This budget closes
+// that gap: it is charged once per enumerated entry (via
+// imageBlockBudget.spend), so exhausting it aborts enumeration immediately
+// rather than after the fact.
+//
+// A real TIFF/DNG/CR2/NEF/ARW/ORF/RW2 file carries at most a few IFDs (IFD0,
+// an IFD1 thumbnail, and — for DNG — a handful of SubIFDs), each with at
+// most a few thousand strips/tiles; the combined total across a whole file
+// is in the low tens of thousands. 262144 (2^18, four times the per-entry
+// strip/tile cap) is a two-order-of-magnitude safety margin above that,
+// while bounding worst-case allocation across an entire write to a low
+// tens-of-MiB figure regardless of how an attacker shapes the input.
+const maxAggregateImageBlocks = 262144
+
+// imageBlockBudget is the per-relocate-call accounting object for
+// maxAggregateImageBlocks. See that constant's doc comment for the full
+// rationale. A single imageBlockBudget is shared across the
+// enumerateImageBlocks and enumerateSubIFDs calls made by each relocate
+// entry point (relocateTIFFFromParsed and the CR2/NEF/ARW/ORF/RW2 variants),
+// so the cap applies to their combined output, not to each call
+// independently.
+type imageBlockBudget struct {
+	remaining int
+}
+
+// newImageBlockBudget returns a freshly sized budget for one relocate call.
+func newImageBlockBudget() *imageBlockBudget {
+	return &imageBlockBudget{remaining: maxAggregateImageBlocks}
+}
+
+// spend charges n units against the budget and reports whether the charge
+// was accepted. Once a charge is rejected the budget stays exhausted (it is
+// never restored), so callers must stop enumerating and return
+// ErrTooManyImageBlocks as soon as spend returns false.
+//
+// A nil budget is treated as unbounded — every call site in this package
+// always constructs a non-nil budget via newImageBlockBudget, so this is a
+// defensive fallback, never the production behaviour.
+func (bud *imageBlockBudget) spend(n int) bool {
+	if bud == nil {
+		return true
+	}
+	if n < 0 || n > bud.remaining {
+		return false
+	}
+	bud.remaining -= n
+	return true
+}
+
 // imageBlock describes a contiguous range of image bytes in the source TIFF
 // and records the new position assigned to it in the rebuilt stream.
 //
@@ -263,7 +379,12 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte) (
 	// Image block offsets in e point into base (the original TIFF bytes), which
 	// is correct: we copy bytes from base[blk.srcOffset : blk.srcOffset+blk.size]
 	// in step 12 below.
-	blocks, enumerateErr := enumerateImageBlocks(base, e, order)
+	//
+	// GM-W1: budget is shared across both enumeration calls below so that the
+	// cumulative number of image blocks + SubIFD entries for this entire
+	// relocate call is bounded, not merely each call independently.
+	budget := newImageBlockBudget()
+	blocks, enumerateErr := enumerateImageBlocks(base, e, order, budget)
 	if enumerateErr != nil {
 		return nil, fmt.Errorf("tiff: enumerate image blocks: %w", enumerateErr)
 	}
@@ -274,7 +395,7 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte) (
 	// array of LONG offsets, each pointing to an independent child IFD. DNG
 	// stores its full-resolution image data in one or more SubIFDs. Each SubIFD
 	// may carry its own StripOffsets / TileOffsets blocks that must be relocated.
-	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e.IFD0, order)
+	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e.IFD0, order, budget)
 	if subErr != nil {
 		return nil, fmt.Errorf("tiff: enumerate SubIFDs: %w", subErr)
 	}
@@ -422,10 +543,14 @@ func filterMainBlocks(blocks []*imageBlock, subIFDs []*subIFDInfo) []*imageBlock
 // enumerateImageBlocks scans IFD0 and the IFD1 chain for image-data blocks
 // referenced by offset/bytecount tag pairs. SubIFD recursion (tag 0x014A)
 // is handled separately by enumerateSubIFDs (task #94).
-func enumerateImageBlocks(base []byte, e *exif.EXIF, order binary.ByteOrder) ([]*imageBlock, error) {
+//
+// GM-W1: budget bounds the cumulative number of image blocks accepted across
+// every IFD in the chain (up to maxTraverseChainIFDs=512); see
+// maxAggregateImageBlocks for the full rationale.
+func enumerateImageBlocks(base []byte, e *exif.EXIF, order binary.ByteOrder, budget *imageBlockBudget) ([]*imageBlock, error) {
 	var blocks []*imageBlock
 	for ifd := e.IFD0; ifd != nil; ifd = ifd.Next {
-		iblocks, err := enumerateIFDBlocks(base, ifd, order)
+		iblocks, err := enumerateIFDBlocks(base, ifd, order, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -443,13 +568,16 @@ func enumerateImageBlocks(base []byte, e *exif.EXIF, order binary.ByteOrder) ([]
 //
 // For IFDs whose ThumbnailData is non-nil, JPEGInterchangeFormat is already
 // managed by exif.Encode and must be skipped here.
-func enumerateIFDBlocks(base []byte, ifd *exif.IFD, order binary.ByteOrder) ([]*imageBlock, error) { //nolint:cyclop // handles all three tag-pair patterns in a single linear scan; splitting would hurt readability
+//
+// GM-W1: budget bounds the cumulative number of blocks accepted from both
+// the strip and tile entry pairs; see maxAggregateImageBlocks.
+func enumerateIFDBlocks(base []byte, ifd *exif.IFD, order binary.ByteOrder, budget *imageBlockBudget) ([]*imageBlock, error) { //nolint:cyclop // handles all three tag-pair patterns in a single linear scan; splitting would hurt readability
 	var blocks []*imageBlock
 
 	stripOff := ifd.Get(exif.TagStripOffsets)
 	stripLen := ifd.Get(exif.TagStripByteCounts)
 	if stripOff != nil && stripLen != nil {
-		sb, err := extractParallelOffsetBlocks(base, ifd, exif.TagStripOffsets, stripOff, stripLen, order)
+		sb, err := extractParallelOffsetBlocks(base, ifd, exif.TagStripOffsets, stripOff, stripLen, order, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -459,7 +587,7 @@ func enumerateIFDBlocks(base []byte, ifd *exif.IFD, order binary.ByteOrder) ([]*
 	tileOff := ifd.Get(exif.TagTileOffsets)
 	tileLen := ifd.Get(exif.TagTileByteCounts)
 	if tileOff != nil && tileLen != nil {
-		tb, err := extractParallelOffsetBlocks(base, ifd, exif.TagTileOffsets, tileOff, tileLen, order)
+		tb, err := extractParallelOffsetBlocks(base, ifd, exif.TagTileOffsets, tileOff, tileLen, order, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -509,12 +637,20 @@ func appendJPEGBlock(baseLen int, ifd *exif.IFD, blocks []*imageBlock, order bin
 //
 // TIFF 6.0 §7: StripOffsets[i] is an absolute offset; StripByteCounts[i] is
 // the byte length of that strip. Same for TileOffsets/TileByteCounts.
+//
+// GM-W1 (CWE-770/CWE-405): n is rejected outright once it exceeds
+// maxImageBlocksPerOffsetEntry, and the accepted n is additionally charged
+// against budget (maxAggregateImageBlocks), both BEFORE the
+// `blocks := make([]*imageBlock, 0, n)` allocation below — a crafted file
+// with an implausibly large StripOffsets/TileOffsets Count must not be able
+// to drive proportional heap allocation.
 func extractParallelOffsetBlocks( //nolint:cyclop,gocyclo // bounds-checking on two parallel arrays requires several branches; splitting further reduces clarity
 	base []byte,
 	ifd *exif.IFD,
 	offsetTag exif.TagID,
 	offsetEntry, countEntry *exif.IFDEntry,
 	order binary.ByteOrder,
+	budget *imageBlockBudget,
 ) ([]*imageBlock, error) {
 	if offsetEntry.Count != countEntry.Count {
 		// Mismatched counts are a format error; skip silently to avoid blocking writes.
@@ -523,6 +659,13 @@ func extractParallelOffsetBlocks( //nolint:cyclop,gocyclo // bounds-checking on 
 	n := int(offsetEntry.Count)
 	if n == 0 {
 		return nil, nil
+	}
+	if n > maxImageBlocksPerOffsetEntry {
+		return nil, fmt.Errorf("tiff: tag 0x%04X: count=%d exceeds %d: %w",
+			offsetTag, n, maxImageBlocksPerOffsetEntry, ErrTooManyImageBlocks)
+	}
+	if !budget.spend(n) {
+		return nil, fmt.Errorf("tiff: tag 0x%04X: count=%d: %w", offsetTag, n, ErrTooManyImageBlocks)
 	}
 
 	offElemSz := int(typeSize(uint16(offsetEntry.Type)))
@@ -781,7 +924,11 @@ func upsertIFDEntryWithCount(ifd *exif.IFD, tag exif.TagID, count uint32, value 
 //     each entry holds the source offset, parsed IFD, raw bytes, and new offset.
 //   - blocks: image-data blocks from all SubIFDs; ifdPtr fields point to the
 //     corresponding subIFDInfo.ifd.
-func enumerateSubIFDs(base []byte, ifd0 *exif.IFD, order binary.ByteOrder) ([]*subIFDInfo, []*imageBlock, error) {
+//
+// GM-W1: budget bounds the cumulative number of SubIFD entries and image
+// blocks accepted across this call and every nested recursion level; see
+// maxAggregateImageBlocks.
+func enumerateSubIFDs(base []byte, ifd0 *exif.IFD, order binary.ByteOrder, budget *imageBlockBudget) ([]*subIFDInfo, []*imageBlock, error) {
 	if ifd0 == nil {
 		return nil, nil, nil
 	}
@@ -806,26 +953,45 @@ func enumerateSubIFDs(base []byte, ifd0 *exif.IFD, order binary.ByteOrder) ([]*s
 		return nil, nil, nil
 	}
 
-	return enumerateSubIFDsAt(base, subEntry, n, elemSz, order, 0, maxSubIFDDepth)
+	return enumerateSubIFDsAt(base, subEntry, n, elemSz, order, 0, maxSubIFDDepth, budget)
 }
 
 // enumerateSubIFDsAt recursively enumerates SubIFDs. depth is the current
 // nesting depth; maxDepth prevents unbounded recursion on crafted inputs.
+//
+// GM-W1 (CWE-770/CWE-405): n is rejected outright once it exceeds
+// maxSubIFDsPerEntry, and the accepted n is additionally charged against
+// budget (maxAggregateImageBlocks), both BEFORE the visited-set map below is
+// sized — a crafted file with an implausibly large 0x014A Count must not be
+// able to drive proportional heap allocation, at any recursion depth.
 func enumerateSubIFDsAt( //nolint:cyclop,gocyclo // SubIFD recursion and cycle detection require several branches; complexity is inherent to the algorithm
 	base []byte,
 	subEntry *exif.IFDEntry,
 	n, elemSz int,
 	order binary.ByteOrder,
 	depth, maxDepth int,
+	budget *imageBlockBudget,
 ) ([]*subIFDInfo, []*imageBlock, error) {
 	if depth > maxDepth {
 		return nil, nil, nil
+	}
+	if n > maxSubIFDsPerEntry {
+		return nil, nil, fmt.Errorf("tiff: 0x014A SubIFDs: count=%d exceeds %d: %w",
+			n, maxSubIFDsPerEntry, ErrTooManyImageBlocks)
+	}
+	if !budget.spend(n) {
+		return nil, nil, fmt.Errorf("tiff: 0x014A SubIFDs: count=%d: %w", n, ErrTooManyImageBlocks)
 	}
 
 	var subIFDs []*subIFDInfo
 	var allBlocks []*imageBlock
 
-	visited := make(map[uint32]bool, n)
+	// Belt-and-suspenders (task convention: see extractRawIFD): the map hint is
+	// clamped independently of the per-entry cap above, so a future change to
+	// that cap cannot silently reintroduce an oversized map pre-allocation. n
+	// is already ≤ maxSubIFDsPerEntry at this point, so min() is a no-op on
+	// the hot path.
+	visited := make(map[uint32]bool, min(n, maxSubIFDsPerEntry))
 
 	for i := range n {
 		off, err := readUint(subEntry.Value[i*elemSz:], elemSz, order)
@@ -875,7 +1041,7 @@ func enumerateSubIFDsAt( //nolint:cyclop,gocyclo // SubIFD recursion and cycle d
 		subIFDs = append(subIFDs, si)
 
 		// Enumerate image blocks from this SubIFD.
-		iblocks, err := enumerateIFDBlocks(base, parsedIFD, order)
+		iblocks, err := enumerateIFDBlocks(base, parsedIFD, order, budget)
 		if err != nil {
 			return nil, nil, fmt.Errorf("tiff: SubIFD at offset %d: %w", off, err)
 		}
@@ -892,7 +1058,7 @@ func enumerateSubIFDsAt( //nolint:cyclop,gocyclo // SubIFD recursion and cycle d
 			if nestedElemSz > 0 && len(nestedEntry.Value) >= int(nestedEntry.Count)*nestedElemSz {
 				nestSubs, nestBlocks, nestErr := enumerateSubIFDsAt(
 					base, nestedEntry, int(nestedEntry.Count), nestedElemSz,
-					order, depth+1, maxDepth,
+					order, depth+1, maxDepth, budget,
 				)
 				if nestErr != nil {
 					return nil, nil, nestErr

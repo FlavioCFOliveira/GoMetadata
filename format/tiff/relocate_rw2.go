@@ -214,7 +214,10 @@ func relocateTIFFFromParsedRW2(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 	rawDataBlock := extractRW2RawDataBlock(base, e.IFD0, order)
 
 	// ── Step 3: enumerate image blocks from the main IFD chain ───────────────
-	mainIFDBlocks, err := enumerateImageBlocks(base, e, order)
+	// GM-W1: budget is shared with the SubIFD enumeration below so the
+	// cumulative image-block + SubIFD count for this write is bounded.
+	budget := newImageBlockBudget()
+	mainIFDBlocks, err := enumerateImageBlocks(base, e, order, budget)
 	if err != nil {
 		return nil, fmt.Errorf("rw2: enumerate image blocks: %w", err)
 	}
@@ -227,7 +230,7 @@ func relocateTIFFFromParsedRW2(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 	}
 
 	// ── Step 4: enumerate SubIFDs ────────────────────────────────────────────
-	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e.IFD0, order)
+	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e.IFD0, order, budget)
 	if subErr != nil {
 		return nil, fmt.Errorf("rw2: enumerate SubIFDs: %w", subErr)
 	}

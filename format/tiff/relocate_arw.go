@@ -1037,13 +1037,16 @@ func arwRelocateWithSR2(
 	e.IFD0.ThumbnailData = nil
 
 	// Step 3: enumerate image blocks from the main IFD chain.
-	blocks, err := enumerateImageBlocks(base, e, order)
+	// GM-W1: budget is shared with the SubIFD enumeration below so the
+	// cumulative image-block + SubIFD count for this write is bounded.
+	budget := newImageBlockBudget()
+	blocks, err := enumerateImageBlocks(base, e, order, budget)
 	if err != nil {
 		return nil, fmt.Errorf("arw: enumerate image blocks: %w", err)
 	}
 
 	// Step 4: parse SubIFDs (tag 0x014A).
-	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e.IFD0, order)
+	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e.IFD0, order, budget)
 	if subErr != nil {
 		return nil, fmt.Errorf("arw: enumerate SubIFDs: %w", subErr)
 	}
