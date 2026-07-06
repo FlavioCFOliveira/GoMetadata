@@ -97,3 +97,20 @@ concurrent arena parse) + fuzzing. Notes:
 GoMetadata at commit **6a0bbc6** is **cleared for production use**. Recommend keeping the
 27→20 fuzz corpus running continuously in CI (P0 on any crasher) and re-running this
 security gate before each release tag, per SECURITY.md.
+
+## Confirmation pass — 2026-07-06, HEAD 5e76f72 (post-R5)
+Re-verified GO clearance holds. `git diff 0d03bf5..HEAD -- . ':(exclude).claude' ':(exclude)*.md'`
+is EMPTY — zero production code changed since R5 (0d03bf5); only agent-memory .md files
+and an uncommitted CLAUDE.md policy-doc edit landed. `go build`/`go vet`/`govulncheck` clean;
+`go test -race ./...` clean across all 21 packages (34.7s). No `recover()` in any non-test .go
+file (structural no-panic guarantee holds). All 6 certified caps re-confirmed present by grep:
+IPTC `maxIPTCTotalBytes` (256 MiB, iptc/iptc.go:141) + `maxIPTCDatasets` (65536, :150); XMP
+`maxXMPDocumentBytes`/`maxXMPTranscodeBytes` (16 MiB each, xmp/xmp.go:60, xmp/encoding.go:75);
+HEIF `maxIlocItems` (4096)/`maxIlocExtentsPerItem` (1024) at format/heif/heif.go:429-439; EXIF
+`traverseBudget`/`newTraverseBudget` (exif/ifd.go:1154+) — note: exact term is `traverseBudget`,
+NOT "imageBlockBudget"/"maxIFDChain" as might be guessed from memory summaries, grep by that
+literal name; TIFF `maxImageBlocksPerOffsetEntry` (65536) + `imageBlockBudget` at
+format/tiff/relocate.go:124-149; JPEG `countingReader`/`maxFileSize` (256 MiB) at
+format/jpeg/limits.go. No full fuzz re-sweep run per task instructions — prior sweeps
+(R3: 1.27M+ execs 0 crashers; R4: ~27.6M execs across 29 targets 0 crashers; R5: GM-W1 +
+JPEG-262 targeted, 0 crashers) stand as evidence. Verdict: GO (confirmed, unchanged).
