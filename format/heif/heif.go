@@ -351,7 +351,12 @@ func parseHEIFBoxHeader(data []byte, pos int) (size uint64, typ string, headerLe
 func parseIlocFull(metaContent []byte) (ilocBoxInfo, bool) {
 	var info ilocBoxInfo
 	ilocData := findInnerBox(metaContent, "iloc")
-	if len(ilocData) < 5 {
+	// HEIF-ILOC-OFFBYONE-01 fix (task #243): same fixed-header layout as
+	// parseIloc below — offset_size|length_size at index 4 and
+	// base_offset_size|index_size at index 5 — both reads require
+	// len(ilocData) >= 6. See the parseIloc guard comment for the full
+	// rationale; this is the write-path (Inject) counterpart of the same bug.
+	if len(ilocData) < 6 {
 		return info, false
 	}
 
@@ -1093,7 +1098,16 @@ func parseIloc(metaData []byte) map[uint16]itemLoc {
 		return result
 	}
 
-	if len(ilocData) < 5 {
+	// HEIF-ILOC-OFFBYONE-01 fix (task #243): the fixed iloc header spans two
+	// size-nibble bytes — offset_size|length_size at index 4 and
+	// base_offset_size|index_size at index 5 — so both reads require
+	// len(ilocData) >= 6, not >= 5. The previous "< 5" guard let a 5-byte iloc
+	// body (box size=13, the minimum legal iloc box) pass the check, read
+	// ilocData[4] safely, then panic on ilocData[5] after pos++.
+	// ISO 14496-12 §8.11.3: both size-nibble bytes are mandatory fixed fields
+	// present in every iloc version (analogous to the #133/#177 bounds checks
+	// on the variable-length extent fields further down this parser).
+	if len(ilocData) < 6 {
 		return result
 	}
 	version := ilocData[0]

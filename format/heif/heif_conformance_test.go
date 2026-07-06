@@ -1553,6 +1553,95 @@ func TestReadIlocSimpleExtentsTruncatedIndex(t *testing.T) {
 	}
 }
 
+// TestHEIFIlocBody5BytesNoPanic is the regression gate for finding
+// HEIF-ILOC-OFFBYONE-01 (task #243).
+//
+// parseIloc guarded its fixed header with "len(ilocData) < 5" and then read
+// ilocData[4] (offset_size|length_size), advanced pos to 5, and read
+// ilocData[5] (base_offset_size|index_size) with no further bounds check.
+// An iloc box body of exactly 5 bytes — the minimum legal iloc box size (13
+// bytes total: 8-byte header + 5-byte body) — passed the "< 5" guard, made
+// the first read safely, then panicked on the second with
+// "runtime error: index out of range [5] with length 5".
+//
+// The fix widens the guard to "len(ilocData) < 6", covering both fixed
+// size-nibble bytes before any variable-length field is touched (the same
+// class of fix as the #133 extent-past-EOF and #177 construction_method
+// guards elsewhere in this file).
+//
+// ISO 14496-12 §8.11.3: the iloc FullBox's offset_size|length_size and
+// base_offset_size|index_size bytes are mandatory fixed fields present in
+// every iloc version.
+func TestHEIFIlocBody5BytesNoPanic(t *testing.T) {
+	// HEIF-ILOC-OFFBYONE-01: §5(f) CRITICAL — 5-byte iloc body must not panic.
+	t.Parallel()
+
+	// Verified 41-byte reproducer: ftyp(heic) + meta(FullBox, version=0) +
+	// iloc(FullBox body = 5 zero bytes, box size = 13).
+	data := []byte{
+		0x00, 0x00, 0x00, 0x10, // ftyp box size = 16
+		'f', 't', 'y', 'p',
+		'h', 'e', 'i', 'c', // major brand
+		0x00, 0x00, 0x00, 0x00, // minor version
+		0x00, 0x00, 0x00, 0x19, // meta box size = 25
+		'm', 'e', 't', 'a',
+		0x00, 0x00, 0x00, 0x00, // meta FullBox: version=0, flags=0
+		0x00, 0x00, 0x00, 0x0d, // iloc box size = 13 (8-byte header + 5-byte body)
+		'i', 'l', 'o', 'c',
+		0x00, 0x00, 0x00, 0x00, 0x00, // iloc body: exactly 5 bytes
+	}
+	if len(data) != 41 {
+		t.Fatalf("HEIF-ILOC-OFFBYONE-01: reproducer must be 41 bytes, got %d", len(data))
+	}
+
+	// Must not panic. A 5-byte iloc body cannot yield any resolvable item
+	// (it is truncated before item_count), so all outputs must be empty and
+	// any error must be nil or non-nil — either is acceptable as long as the
+	// call returns instead of crashing the process.
+	rawEXIF, rawIPTC, rawXMP, err := Extract(bytes.NewReader(data))
+	_ = err
+	if rawEXIF != nil || rawIPTC != nil || rawXMP != nil {
+		t.Errorf("HEIF-ILOC-OFFBYONE-01: expected all-nil metadata for a 5-byte iloc body, "+
+			"got rawEXIF=%d rawIPTC=%d rawXMP=%d bytes", len(rawEXIF), len(rawIPTC), len(rawXMP))
+	}
+}
+
+// TestHEIFInjectIlocBody5BytesNoPanic is the write-path regression gate for
+// finding HEIF-ILOC-OFFBYONE-01 (task #243).
+//
+// parseIlocFull — the counterpart of parseIloc used by buildInjectComponents
+// during Inject — had the identical "len(ilocData) < 5" off-by-one guard.
+// Inject is reachable with attacker-controlled input whenever a caller
+// re-writes metadata into an existing HEIF/HEIC/AVIF file, so this path must
+// be fixed and regression-tested independently of the read path above.
+//
+// ISO 14496-12 §8.11.3: see TestHEIFIlocBody5BytesNoPanic for the full field
+// layout rationale.
+func TestHEIFInjectIlocBody5BytesNoPanic(t *testing.T) {
+	// HEIF-ILOC-OFFBYONE-01: §5(f) CRITICAL — 5-byte iloc body must not panic on write.
+	t.Parallel()
+
+	data := []byte{
+		0x00, 0x00, 0x00, 0x10, // ftyp box size = 16
+		'f', 't', 'y', 'p',
+		'h', 'e', 'i', 'c', // major brand
+		0x00, 0x00, 0x00, 0x00, // minor version
+		0x00, 0x00, 0x00, 0x19, // meta box size = 25
+		'm', 'e', 't', 'a',
+		0x00, 0x00, 0x00, 0x00, // meta FullBox: version=0, flags=0
+		0x00, 0x00, 0x00, 0x0d, // iloc box size = 13 (8-byte header + 5-byte body)
+		'i', 'l', 'o', 'c',
+		0x00, 0x00, 0x00, 0x00, 0x00, // iloc body: exactly 5 bytes
+	}
+
+	var out bytes.Buffer
+	// Must not panic. A truncated iloc cannot be resolved, so
+	// buildInjectComponents must fall back to a pass-through write (err==nil)
+	// rather than crashing; a non-nil error is also an acceptable outcome.
+	err := Inject(bytes.NewReader(data), &out, []byte("fake-exif"), nil, nil, true)
+	_ = err
+}
+
 // ---------------------------------------------------------------------------
 // §5 — Corpus parity (HEIF-corpus-*)
 // ---------------------------------------------------------------------------
