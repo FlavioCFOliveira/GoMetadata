@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -582,6 +583,195 @@ func TestConformance_R19_makernote_bigtiff_failsafe_noop(t *testing.T) {
 
 	if !bytes.Equal(finalTIFF, before) {
 		t.Errorf("R-19 violation: rebaseGenericMakerNote modified finalTIFF when e.BigTIFF=true (want byte-for-byte no-op)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// V-15: uint64 arithmetic throughout BigTIFF relocation
+// ---------------------------------------------------------------------------
+
+// TestConformance_V15_uint64_relocation_arithmetic proves docs/conformance/
+// exif-tiff.md rule V-15: every offset/size value flowing through the
+// copy-and-relocate serializer's image-block and SubIFD bookkeeping
+// (imageBlock.srcOffset/size/newOffset, subIFDInfo.srcOffset/newOffset,
+// readUint, decodeOffsetArray) is carried in uint64, so a value legitimately
+// sourced from a LONG8/IFD8 (8-byte) field is never pre-truncated to uint32
+// at any intermediate step.
+//
+// V-15 is otherwise only exercised INDIRECTLY, by S-41/S-42/R-18 (see
+// docs/conformance/exif-tiff.md §2.8) — this test gives the rule its own
+// dedicated, directly-named sub-tests:
+//
+//   - "primitive": readUint's elemSz=8 branch, exercised with a synthetic
+//     8-byte value ABOVE math.MaxUint32 — the one case S-41/S-42/R-18 cannot
+//     reach through any real corpus fixture, because this package's own
+//     maxFileSize cap (256 MiB, far under 4 GiB) means no legitimate
+//     real-world file this package will ever process has a strip/SubIFD
+//     offset that large (see V-15's own rationale in exif-tiff.md). A naive
+//     uint32(order.Uint64(b)) truncation inside readUint would silently drop
+//     the high bits and this sub-test would fail.
+//   - "fixture": real BigTIFF fixtures with LONG8-typed StripOffsets/
+//     StripByteCounts (task #264/#270) round-trip through the full
+//     relocateTIFFFromParsed pipeline with every strip's exact 64-bit
+//     offset/size decoded via this package's own decodeOffsetArray (the same
+//     elemSz=8 code path production uses) and its content byte-identical at
+//     the new position. Includes both the always-committed big_cramps_le/be.tif
+//     (libtiff-derived, guaranteeing this rule is never skip-only in a normal
+//     checkout) and the metadata-extractor corpus fixtures, which skip
+//     gracefully when the corpus is absent, per docs/TESTING.md §2.1's
+//     "corpus absent" allowed-skip category.
+func TestConformance_V15_uint64_relocation_arithmetic(t *testing.T) {
+	t.Parallel()
+
+	t.Run("V-15/primitive-readUint-elemSz8-above-uint32-range", func(t *testing.T) {
+		t.Parallel()
+		const want uint64 = 0x1_2345_6789 // 4,886,718,345 — exceeds math.MaxUint32 (4,294,967,295).
+		if want <= math.MaxUint32 {
+			t.Fatalf("test invariant broken: want=%d must exceed math.MaxUint32=%d", want, uint32(math.MaxUint32))
+		}
+
+		for _, order := range []binary.ByteOrder{binary.LittleEndian, binary.BigEndian} {
+			buf := make([]byte, 8)
+			order.PutUint64(buf, want)
+
+			got, err := readUint(buf, 8, order)
+			if err != nil {
+				t.Fatalf("readUint(order=%v): %v", order, err)
+			}
+			if got != want {
+				t.Errorf("V-15 violation: readUint(elemSz=8, order=%v) = %d, want %d (value was truncated to uint32 range: %d)",
+					order, got, want, uint32(got)) //nolint:gosec // G115: intentional truncation to DEMONSTRATE the failure mode in the error message, not production code
+			}
+		}
+	})
+
+	fixtures := []string{
+		filepath.Join("testdata", "big_cramps_le.tif"),
+		filepath.Join("testdata", "big_cramps_be.tif"),
+		filepath.Join("testdata", "corpus", "tiff", "metadata-extractor", "BigTIFFLong8.tif"),
+		filepath.Join("testdata", "corpus", "tiff", "metadata-extractor", "BigTIFFLong8Tiles.tif"),
+	}
+	for _, path := range fixtures {
+		t.Run("V-15/fixture-long8-offset-and-size-preserved-end-to-end/"+filepath.Base(path), func(t *testing.T) {
+			t.Parallel()
+			assertV15LONG8OffsetsPreserved(t, path)
+		})
+	}
+}
+
+// assertV15LONG8OffsetsPreserved is the V-15 fixture workhorse: loads path
+// (skipping gracefully if absent), decodes its LONG8-typed StripOffsets/
+// StripByteCounts pair via this package's own decodeOffsetArray, relocates it
+// through relocateTIFFFromParsed, decodes the relocated pair the same way,
+// and proves every strip's exact 64-bit offset/size arithmetic and byte
+// content survive unchanged (docs/conformance/exif-tiff.md V-15).
+func assertV15LONG8OffsetsPreserved(t *testing.T, path string) { //nolint:cyclop // sequential decode/compare steps mirror assertBigTIFFRoundTrip's structure; splitting further would obscure the single V-15 comparison
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			t.Skipf("fixture %s not present", path)
+		}
+		t.Fatalf("read %s: %v", path, err)
+	}
+
+	e, err := exif.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse(orig): %v", err)
+	}
+	if !e.BigTIFF {
+		t.Fatalf("test invariant broken: fixture is not BigTIFF")
+	}
+	order := e.ByteOrder
+
+	origIFD0Off, ok := readIFD0Offset(data, true, order)
+	if !ok {
+		t.Fatalf("readIFD0Offset(orig) failed")
+	}
+	origOff, ok := findEntryInIFD(data, origIFD0Off, uint16(exif.TagStripOffsets), true, order)
+	if !ok {
+		t.Fatalf("test invariant broken: fixture has no StripOffsets entry")
+	}
+	origCnt, ok := findEntryInIFD(data, origIFD0Off, uint16(exif.TagStripByteCounts), true, order)
+	if !ok {
+		t.Fatalf("test invariant broken: fixture has no StripByteCounts entry")
+	}
+	offElemSz := elemSizeFor(origOff.typ, true)
+	if offElemSz != 8 {
+		t.Fatalf("test invariant broken: fixture StripOffsets element size = %d, want 8 (TypeLong8)", offElemSz)
+	}
+	cntElemSz := elemSizeFor(origCnt.typ, true)
+
+	origOffsets, ok1 := decodeOffsetArray(data, origOff.valField, origOff.count, offElemSz, true, order)
+	origSizes, ok2 := decodeOffsetArray(data, origCnt.valField, origCnt.count, cntElemSz, true, order)
+	if !ok1 || !ok2 {
+		t.Fatalf("decodeOffsetArray(orig) failed (offsets ok=%v, sizes ok=%v)", ok1, ok2)
+	}
+	if len(origOffsets) != len(origSizes) {
+		t.Fatalf("test invariant broken: StripOffsets count=%d != StripByteCounts count=%d", len(origOffsets), len(origSizes))
+	}
+
+	out := relocateForTest(t, data)
+
+	resultE, err := exif.Parse(out)
+	if err != nil {
+		t.Fatalf("Parse(result): %v", err)
+	}
+	if !resultE.BigTIFF {
+		t.Errorf("V-15 violation: relocated output is no longer BigTIFF-provenanced")
+	}
+	resultIFD0Off, ok := readIFD0Offset(out, true, order)
+	if !ok {
+		t.Fatalf("readIFD0Offset(result) failed")
+	}
+	resultOff, ok := findEntryInIFD(out, resultIFD0Off, uint16(exif.TagStripOffsets), true, order)
+	if !ok {
+		t.Fatalf("V-15 violation: relocated output has no StripOffsets entry")
+	}
+	resultCnt, ok := findEntryInIFD(out, resultIFD0Off, uint16(exif.TagStripByteCounts), true, order)
+	if !ok {
+		t.Fatalf("V-15 violation: relocated output has no StripByteCounts entry")
+	}
+	resultOffElemSz := elemSizeFor(resultOff.typ, true)
+	if resultOffElemSz != 8 {
+		t.Errorf("V-15 violation: relocated StripOffsets element size = %d, want 8 (TypeLong8 downgraded)", resultOffElemSz)
+	}
+
+	resultOffsets, ok3 := decodeOffsetArray(out, resultOff.valField, resultOff.count, resultOffElemSz, true, order)
+	resultSizes, ok4 := decodeOffsetArray(out, resultCnt.valField, resultCnt.count, elemSizeFor(resultCnt.typ, true), true, order)
+	if !ok3 || !ok4 {
+		t.Fatalf("decodeOffsetArray(result) failed (offsets ok=%v, sizes ok=%v)", ok3, ok4)
+	}
+
+	n := min(len(origOffsets), len(resultOffsets))
+	if n == 0 {
+		t.Fatalf("test invariant broken: fixture has zero strips")
+	}
+	for i := range n {
+		if origSizes[i] != resultSizes[i] {
+			t.Errorf("V-15 violation: strip[%d] size changed across relocation: orig=%d result=%d", i, origSizes[i], resultSizes[i])
+			continue
+		}
+		size := resultSizes[i]
+		// uint64 arithmetic: if any intermediate step in the relocation
+		// pipeline had narrowed newOffset/size to uint32, a source file large
+		// enough to matter would see this sum wrap around; the addition and
+		// the bounds check below run entirely in uint64, exercising the exact
+		// arithmetic V-15 requires.
+		end := resultOffsets[i] + size
+		if end > uint64(len(out)) {
+			t.Errorf("V-15 violation: strip[%d] relocated offset=%d size=%d end=%d exceeds output length %d",
+				i, resultOffsets[i], size, end, len(out))
+			continue
+		}
+		origEnd := origOffsets[i] + size
+		if origEnd > uint64(len(data)) {
+			t.Fatalf("test invariant broken: strip[%d] original offset=%d size=%d exceeds input length %d", i, origOffsets[i], size, len(data))
+		}
+		if !bytes.Equal(data[origOffsets[i]:origEnd], out[resultOffsets[i]:end]) {
+			t.Errorf("V-15 violation: strip[%d] content changed across relocation (LONG8 offset/size decode or arithmetic mismatch)", i)
+		}
 	}
 }
 

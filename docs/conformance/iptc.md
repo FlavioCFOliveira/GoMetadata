@@ -30,7 +30,8 @@ sub-test names. Cite in code as `// IIM §X.Y`, `// Adobe-IRB §"Image Resources
 ### 2.2 Record Structure & Mandatory Datasets
 - **IIM-REC-01** 1:00 EnvelopeRecordVersion mandatory when Record 1 present; uint16 = 4; 2 bytes. — IIM §1.6.1.
 - **IIM-REC-02** 2:00 ApplicationRecordVersion mandatory when Record 2 present; uint16 = 4; 2 bytes. — IIM §2.2.1.
-  **(Known gap, audit 2026-06-09 FINDING 3: Encode may not emit 2:00 — this test must drive a fix.)**
+  Implemented and tested: `Encode` always emits 2:00 as the first Record-2 dataset (`TestIIMREC02`,
+  `TestIIMREC02RoundTrip`; fixed audit 2026-06-09 FINDING 3).
 - **IIM-REC-03** 1:20 FileFormat, 1:22 FileVersion mandatory in transmission context; parser must not reject embedded streams lacking them.
 
 ### 2.3 Coded Character Set (1:90)
@@ -48,7 +49,10 @@ sub-test names. Cite in code as `// IIM §X.Y`, `// Adobe-IRB §"Image Resources
 - **IRB-APP13-06** big-endian uint32 data length (excludes itself and preceding fields).
 - **IRB-APP13-07** Data payload padded with one `0x00` iff length is odd (next block on even boundary).
 - **IRB-APP13-08** Resource `0x0404` payload is a raw, unwrapped IIM dataset stream.
-- **IRB-APP13-09** Multiple APP13 segments: concatenate all "Photoshop 3.0" payloads. **(Known gap, FINDING 4: last-segment-wins must be fixed.)**
+- **IRB-APP13-09** Multiple APP13 segments: concatenate all "Photoshop 3.0" payloads.
+  Implemented and tested: the JPEG layer concatenates every "Photoshop 3.0" APP13 payload before
+  IRB parsing, so IPTC in any segment is found regardless of position (`TestIRBAPP1309`,
+  `TestROBUST15`; fixed FINDING 4).
 
 ## Section 3: Per-Dataset Conformance Table (Record 2)
 Min/Max = IIM octet bounds for the value (excl. 5-byte header). Rep. = repeatable.
