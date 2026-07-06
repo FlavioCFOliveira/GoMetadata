@@ -1040,13 +1040,13 @@ func arwRelocateWithSR2(
 	// GM-W1: budget is shared with the SubIFD enumeration below so the
 	// cumulative image-block + SubIFD count for this write is bounded.
 	budget := newImageBlockBudget()
-	blocks, err := enumerateImageBlocks(base, e, order, budget)
+	blocks, err := enumerateImageBlocks(base, e, order, false, budget)
 	if err != nil {
 		return nil, fmt.Errorf("arw: enumerate image blocks: %w", err)
 	}
 
 	// Step 4: parse SubIFDs (tag 0x014A).
-	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e.IFD0, order, budget)
+	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget)
 	if subErr != nil {
 		return nil, fmt.Errorf("arw: enumerate SubIFDs: %w", subErr)
 	}
@@ -1057,13 +1057,13 @@ func arwRelocateWithSR2(
 	removeImageOffsetEntries(mainBlocks)
 
 	// Step 6: re-insert placeholder entries and encode to learn the structure size.
-	offsetValueSlices := insertPlaceholders(mainBlocks, order)
+	offsetValueSlices := insertPlaceholders(mainBlocks)
 
 	skeleton, skelErr := exif.Encode(e)
 	if skelErr != nil {
 		return nil, fmt.Errorf("arw: encode placeholder: %w", skelErr)
 	}
-	ifdEnd := uint32(len(skeleton)) //nolint:gosec // G115: len bounded by TIFF stream
+	ifdEnd := uint64(len(skeleton))
 
 	// Step 7: assign new absolute offsets.
 	// SubIFD blocks come first, then the SR2 block, then image data.
@@ -1074,26 +1074,27 @@ func arwRelocateWithSR2(
 	// TIFF 6.0 §2: data items must start at word (even) boundaries.
 	// Compute the exact SR2 start and block size now (not a worst-case estimate)
 	// so that imageStart is exact and assignNewOffsets writes correct pointers.
-	var sr2ActualSize uint32
+	var sr2ActualSize uint64
 	if info.sr2RawBytes != nil {
 		sr2Start := ifdEnd + subIFDsSize
 		if sr2Start&1 == 1 {
 			sr2Start++
-			sr2ActualSize = 1 + uint32(len(info.sr2RawBytes)) //nolint:gosec // G115: SR2 block < 2^32
+			sr2ActualSize = 1 + uint64(len(info.sr2RawBytes))
 		} else {
-			sr2ActualSize = uint32(len(info.sr2RawBytes)) //nolint:gosec // G115: SR2 block < 2^32
+			sr2ActualSize = uint64(len(info.sr2RawBytes))
 		}
-		info.sr2NewOffset = sr2Start
+		info.sr2NewOffset = uint32(sr2Start) //nolint:gosec // G115: sr2Start bounded by maxFileSize, always < 2^32
 	}
 	// Guard against uint32 overflow: ifdEnd + subIFDsSize + sr2ActualSize > MaxUint32
 	// would make StripOffsets/TileOffsets wrap around to the IFD region, corrupting
 	// the output. TIFF 6.0 §2: all offsets are uint32; no TIFF file can exceed 4 GiB.
-	imageStart64 := uint64(ifdEnd) + uint64(subIFDsSize) + uint64(sr2ActualSize)
-	if imageStart64 > math.MaxUint32 {
+	// ARW is always classic TIFF (never BigTIFF in practice), so this ceiling is
+	// a real format limit here, not merely a defensive one.
+	imageStart := ifdEnd + subIFDsSize + sr2ActualSize
+	if imageStart > math.MaxUint32 {
 		return nil, fmt.Errorf("arw: ifdEnd=%d subIFDsSize=%d sr2ActualSize=%d: %w",
 			ifdEnd, subIFDsSize, sr2ActualSize, ErrOffsetOverflow)
 	}
-	imageStart := uint32(imageStart64)
 	assignNewOffsets(blocks, imageStart)
 
 	// Guard: assignNewOffsets saturates newOffset to math.MaxUint32 when cumulative
@@ -1111,7 +1112,7 @@ func arwRelocateWithSR2(
 	updatePlaceholders(mainBlocks, offsetValueSlices, order)
 
 	// Step 8b: patch SubIFD raw bytes.
-	patchSubIFDImageOffsets(subIFDs, blocks, order)
+	patchSubIFDImageOffsets(subIFDs, blocks, false, order)
 
 	// Step 9: re-encode → finalTIFF.
 	finalTIFF, finalErr := exif.Encode(e)
@@ -1128,7 +1129,7 @@ func arwRelocateWithSR2(
 
 	// Step 10: patch the 0x014A SubIFDs pointer array in finalTIFF.
 	if len(subIFDs) > 0 {
-		if pErr := patchSubIFDPointers(finalTIFF, subIFDs, order); pErr != nil {
+		if pErr := patchSubIFDPointers(finalTIFF, subIFDs, false, order); pErr != nil {
 			return nil, fmt.Errorf("arw: patch SubIFD pointers: %w", pErr)
 		}
 	}
@@ -1166,7 +1167,7 @@ func arwRelocateWithSR2(
 
 	// Step 12: append image block bytes from source.
 	for _, blk := range blocks {
-		end := uint64(blk.srcOffset) + uint64(blk.size)
+		end := blk.srcOffset + blk.size
 		if end > uint64(len(base)) {
 			return nil, fmt.Errorf("arw: image block offset=%d size=%d: %w",
 				blk.srcOffset, blk.size, ErrBlockOutOfBounds)

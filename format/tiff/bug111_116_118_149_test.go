@@ -292,7 +292,7 @@ func TestPatchSubIFDPointersMismatch(t *testing.T) {
 	subIFDs := []*subIFDInfo{sub0, sub1, sub2}
 
 	// Must not panic under -race.
-	err := patchSubIFDPointers(finalTIFF, subIFDs, order)
+	err := patchSubIFDPointers(finalTIFF, subIFDs, false, order)
 
 	// (c) Error must be ErrSubIFDCountMismatch.
 	if !errors.Is(err, ErrSubIFDCountMismatch) {
@@ -300,8 +300,8 @@ func TestPatchSubIFDPointersMismatch(t *testing.T) {
 	}
 
 	// (b) Exactly 2 slots written: value area at bytes [26:34].
-	gotSlot0 := order.Uint32(finalTIFF[26:])
-	gotSlot1 := order.Uint32(finalTIFF[30:])
+	gotSlot0 := uint64(order.Uint32(finalTIFF[26:]))
+	gotSlot1 := uint64(order.Uint32(finalTIFF[30:]))
 	if gotSlot0 != sub0.newOffset {
 		t.Errorf("slot 0: got 0x%X, want 0x%X", gotSlot0, sub0.newOffset)
 	}
@@ -345,14 +345,14 @@ func TestPatchSubIFDPointersMismatchReverse(t *testing.T) {
 	sub1 := &subIFDInfo{newOffset: 0xBBBB}
 	subIFDs := []*subIFDInfo{sub0, sub1} // only 2, declared = 3
 
-	err := patchSubIFDPointers(buf, subIFDs, order)
+	err := patchSubIFDPointers(buf, subIFDs, false, order)
 	if !errors.Is(err, ErrSubIFDCountMismatch) {
 		t.Errorf("want ErrSubIFDCountMismatch, got %v", err)
 	}
-	if got := order.Uint32(buf[valueAreaOff:]); got != sub0.newOffset {
+	if got := uint64(order.Uint32(buf[valueAreaOff:])); got != sub0.newOffset {
 		t.Errorf("slot 0: got 0x%X, want 0x%X", got, sub0.newOffset)
 	}
-	if got := order.Uint32(buf[valueAreaOff+4:]); got != sub1.newOffset {
+	if got := uint64(order.Uint32(buf[valueAreaOff+4:])); got != sub1.newOffset {
 		t.Errorf("slot 1: got 0x%X, want 0x%X", got, sub1.newOffset)
 	}
 	// Slot 2 must be zero (never written).

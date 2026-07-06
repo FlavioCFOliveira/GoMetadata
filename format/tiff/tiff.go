@@ -795,6 +795,35 @@ func trimIPTCLongPadding(v []byte) []byte {
 }
 
 // typeSize returns the byte size of a single value for the given TIFF type.
+//
+// Type 13 ("IFD") intentionally diverges from exif/type.go's DataType table
+// (task #270, format/tiff-only fix — does NOT touch the exif package).
+//
+// CIPA DC-008-2023 §4.6.3 (EXIF 3.0) assigns type code 13 to TypeUTF8, a NEW
+// 1-byte-per-element EXIF-registry string type. Adobe TIFF 6.0 Extensions
+// ("Adding New Fields", also codified in libtiff's tif_dir.h as TIFF_IFD)
+// assigns the SAME numeric code 13 to IFD — a 4-byte pointer to a child IFD —
+// predating EXIF 3.0 by decades. This is a genuine type-code collision between
+// the two specifications' independent numbering spaces.
+//
+// exif/type.go correctly follows CIPA DC-008-2023 for its OWN EXIF-registry
+// tag table (IFD0/ExifIFD/GPSIFD tags never legitimately used type 13 before
+// EXIF 3.0, so the EXIF-3.0 interpretation is safe there). But tag 0x014A
+// (SubIFDs) is a TIFF-Extension tag, not an EXIF-registry tag (TIFF Extension
+// §F; Adobe DNG Spec §4), and real-world files legitimately declare it as
+// type 13 meaning IFD — see the conformance fixture
+// testdata/corpus/tiff/metadata-extractor/BigTIFFSubIFD4.tif, purpose-built to
+// exercise exactly this. format/tiff's own generic raw-IFD scanners (which
+// walk 0x014A arrays and SubIFD entries independently of exif.Parse) must
+// interpret type 13 as IFD (4 bytes) for that tag family, matching the
+// TIFF-Extension meaning, not the EXIF-3.0 one.
+//
+// #270 regression: exif.Parse (which correctly follows CIPA DC-008-2023 for
+// type 13 in its own struct-based IFD model) mis-sizes a 0x014A/type=13
+// entry's inline value to 1 byte instead of 4, silently truncating the SubIFD
+// pointer. format/tiff's write-path relocator never relies on exif's parsed
+// Value for 0x014A; it re-reads the raw bytes directly using this table (see
+// findEntryInIFD / enumerateSubIFDs in relocate_bigtiff.go).
 func typeSize(t uint16) uint32 {
 	switch t {
 	case 1, 2, 6, 7: // BYTE, ASCII, SBYTE, UNDEFINED
@@ -802,6 +831,8 @@ func typeSize(t uint16) uint32 {
 	case 3, 8: // SHORT, SSHORT
 		return 2
 	case 4, 9, 11: // LONG, SLONG, FLOAT
+		return 4
+	case 13: // IFD — TIFF 6.0 Extensions / libtiff TIFF_IFD; see doc comment above.
 		return 4
 	case 5, 10, 12: // RATIONAL, SRATIONAL, DOUBLE
 		return 8
@@ -819,6 +850,11 @@ func typeSize(t uint16) uint32 {
 // These types are only valid inside a BigTIFF container; classic TIFF parsers
 // must reject them.  Returns 0 for any unknown type code (same sentinel as
 // typeSize) to allow the caller to skip unrecognised entries gracefully.
+//
+// Type 13 ("IFD", 4 bytes) is handled identically to typeSize — see that
+// function's doc comment for the EXIF-3.0-vs-TIFF-Extension type-code
+// collision this deliberately resolves in favour of the TIFF-Extension
+// meaning for format/tiff's own generic raw-IFD scanners.
 func typeSizeBigTIFF(t uint16) uint64 {
 	switch t {
 	case 1, 2, 6, 7: // BYTE, ASCII, SBYTE, UNDEFINED
@@ -826,6 +862,8 @@ func typeSizeBigTIFF(t uint16) uint64 {
 	case 3, 8: // SHORT, SSHORT
 		return 2
 	case 4, 9, 11: // LONG, SLONG, FLOAT
+		return 4
+	case 13: // IFD — TIFF 6.0 Extensions / libtiff TIFF_IFD; see typeSize doc comment.
 		return 4
 	case 5, 10, 12: // RATIONAL, SRATIONAL, DOUBLE
 		return 8

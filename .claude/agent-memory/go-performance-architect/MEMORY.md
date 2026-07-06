@@ -1,5 +1,8 @@
 # Memory Index
 
+- [BigTIFF write support in exif.Encode (task #264, commit aa24232)](project_bigtiff_write.md) — serialiseBigTIFF dispatch; typeSizeBigTIFF #1 rule; word-alignment decision; ErrBigTIFFPointerOverflow/ErrBigTIFFEncodeSizeExceeded; #270 tracks container relocation separately
+- [BigTIFF standalone CONTAINER write / relocation (task #270)](project_task270_bigtiff_container_write.md) — full support in format/tiff; type-13 EXIF-3.0/TIFF-Extension collision bug fixed; write.go:416 top-level gate still blocks gometadata.Write (out of scope, follow-up needed)
+- [geo: prefix + iptc.Encode overflow guard (2026-07-06)](project_geo_prefix_and_iptc_overflow_fixes.md) — NSgeo→"geo" in prefixMap; ErrDatasetValueTooLarge + test-overridable maxDatasetValueLen var (mirrors maxFileSize idiom)
 - [JPEG #262 maxFileSize cap via pooled countingReader](project_task262_jpeg_maxfilesize.md) — countingReader resets budget per-Seek; io.WriterTo fast-path bug found via benchmarking (376B→1017B/op), fixed with remainingFitsBudget guard
 - [GM-W1 TIFF write-path imageBlockBudget fix (task #261)](project_gmw1_imageblock_budget.md) — per-entry caps (65536 strips, 1024 SubIFDs) + fixed 262144 aggregate budget mirroring traverseBudget; ErrTooManyImageBlocks
 - [FuzzXxxInject write-path coverage (task #258)](project_task258_inject_fuzz_coverage.md) — 9 new targets jpeg/png/7-RAW; rawEXIF semantics diverge (TIFF-base vs container-payload vs ORF/RW2-nil); CR3 seeds reuse extended_size_test.go helpers

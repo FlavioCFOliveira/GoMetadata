@@ -472,7 +472,7 @@ func TestRebaseOlympMNEntry_ExternalThumbUpdated(t *testing.T) {
 		thumbSrcOffset: externalOldOff, // marks this as an external thumbnail
 		order:          order,
 	}
-	thumbBlock := &imageBlock{newOffset: newThumbOff}
+	thumbBlock := &imageBlock{newOffset: uint64(newThumbOff)}
 	mnBlobEnd := uint64(info.mnSrcOffset) + uint64(info.mnBlobSize) // 1200
 	newMNAbs := 2000
 

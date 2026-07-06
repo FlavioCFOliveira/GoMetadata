@@ -63,7 +63,7 @@ func TestExtractRW2RawDataBlock_ValidEntry(t *testing.T) {
 	if blk.srcOffset != rawDataOff {
 		t.Errorf("srcOffset: got %d, want %d", blk.srcOffset, rawDataOff)
 	}
-	wantSize := uint32(bufSize - rawDataOff)
+	wantSize := uint64(bufSize - rawDataOff)
 	if blk.size != wantSize {
 		t.Errorf("size: got %d, want %d", blk.size, wantSize)
 	}
@@ -178,7 +178,7 @@ func TestPatchRW2RawDataOffsetInFinalTIFF_Updated(t *testing.T) {
 	const newOff = uint32(5000)
 
 	finalTIFF := buildMinimalRW2FinalTIFF(originalOff)
-	rawBlk := &imageBlock{newOffset: newOff}
+	rawBlk := &imageBlock{newOffset: uint64(newOff)}
 
 	err := patchRW2RawDataOffsetInFinalTIFF(finalTIFF, rawBlk, order)
 	if err != nil {

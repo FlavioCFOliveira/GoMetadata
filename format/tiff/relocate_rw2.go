@@ -217,7 +217,7 @@ func relocateTIFFFromParsedRW2(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 	// GM-W1: budget is shared with the SubIFD enumeration below so the
 	// cumulative image-block + SubIFD count for this write is bounded.
 	budget := newImageBlockBudget()
-	mainIFDBlocks, err := enumerateImageBlocks(base, e, order, budget)
+	mainIFDBlocks, err := enumerateImageBlocks(base, e, order, false, budget)
 	if err != nil {
 		return nil, fmt.Errorf("rw2: enumerate image blocks: %w", err)
 	}
@@ -230,7 +230,7 @@ func relocateTIFFFromParsedRW2(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 	}
 
 	// ── Step 4: enumerate SubIFDs ────────────────────────────────────────────
-	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e.IFD0, order, budget)
+	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget)
 	if subErr != nil {
 		return nil, fmt.Errorf("rw2: enumerate SubIFDs: %w", subErr)
 	}
@@ -242,13 +242,13 @@ func relocateTIFFFromParsedRW2(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 	removeImageOffsetEntries(mainBlocks)
 
 	// ── Step 6: insert placeholders and encode to learn the IFD size ─────────
-	offsetValueSlices := insertPlaceholders(mainBlocks, order)
+	offsetValueSlices := insertPlaceholders(mainBlocks)
 
 	skeleton, skelErr := exif.Encode(e)
 	if skelErr != nil {
 		return nil, fmt.Errorf("rw2: encode placeholder: %w", skelErr)
 	}
-	ifdEnd := uint32(len(skeleton)) //nolint:gosec // G115: len bounded by TIFF stream
+	ifdEnd := uint64(len(skeleton))
 
 	// ── Step 7: assign new absolute offsets ──────────────────────────────────
 	subIFDsSize := computeSubIFDsSize(subIFDs)
@@ -264,7 +264,7 @@ func relocateTIFFFromParsedRW2(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 	updatePlaceholders(mainBlocks, offsetValueSlices, order)
 
 	// ── Step 8b: patch SubIFD raw bytes ──────────────────────────────────────
-	patchSubIFDImageOffsets(subIFDs, allBlocks, order)
+	patchSubIFDImageOffsets(subIFDs, allBlocks, false, order)
 
 	// ── Step 9: re-encode → finalTIFF ────────────────────────────────────────
 	// exif.Encode produces: "II" + 0x2A 0x00 + IFD0_off=8 + IFD block.
@@ -289,7 +289,7 @@ func relocateTIFFFromParsedRW2(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 
 	// ── Step 10: patch the 0x014A SubIFDs pointer array ──────────────────────
 	if len(subIFDs) > 0 {
-		if pErr := patchSubIFDPointers(finalTIFF, subIFDs, order); pErr != nil {
+		if pErr := patchSubIFDPointers(finalTIFF, subIFDs, false, order); pErr != nil {
 			return nil, fmt.Errorf("rw2: patch SubIFD pointers: %w", pErr)
 		}
 	}
@@ -304,7 +304,7 @@ func relocateTIFFFromParsedRW2(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 
 	// ── Step 12: append image block bytes from source ─────────────────────────
 	for _, blk := range allBlocks {
-		end := uint64(blk.srcOffset) + uint64(blk.size)
+		end := blk.srcOffset + blk.size
 		if end > uint64(len(base)) {
 			return nil, fmt.Errorf("rw2: image block offset=%d size=%d: %w",
 				blk.srcOffset, blk.size, ErrBlockOutOfBounds)
@@ -359,8 +359,8 @@ func extractRW2RawDataBlock(base []byte, ifd0 *exif.IFD, order binary.ByteOrder)
 	}
 	rawSize := uint32(len(base)) - rawOff //nolint:gosec // G115: len(base) < 2^32
 	return &imageBlock{
-		srcOffset: rawOff,
-		size:      rawSize,
+		srcOffset: uint64(rawOff),
+		size:      uint64(rawSize),
 		ifdPtr:    nil, // standalone (not owned by any exif.IFD entry)
 		entryTag:  rw2TagRawDataOffset,
 		index:     0,
@@ -398,7 +398,7 @@ func patchRW2RawDataOffsetInFinalTIFF(finalTIFF []byte, rawDataBlock *imageBlock
 		}
 		// Found 0x0118: overwrite the val_or_off field with the new raw data offset.
 		// This is an inline entry (TypeLong Count=1 total=4); the val_or_off IS the value.
-		order.PutUint32(finalTIFF[e+8:], rawDataBlock.newOffset)
+		order.PutUint32(finalTIFF[e+8:], uint32(rawDataBlock.newOffset)) //nolint:gosec // G115: RW2 is always classic TIFF; bounded by maxFileSize, always < 2^32
 		return nil
 	}
 	// 0x0118 not found in finalTIFF IFD0 — this can happen if the original RW2

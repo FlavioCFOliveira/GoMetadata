@@ -473,9 +473,12 @@ func TestTypeSizeAllBranches(t *testing.T) {
 		{5, 8},  // RATIONAL
 		{10, 8}, // SRATIONAL
 		{12, 8}, // DOUBLE
+		// Task #270: type 13 = IFD (4 bytes), format/tiff's own generic table
+		// diverges here from exif/type.go's TypeUTF8 — see typeSize's doc
+		// comment in tiff.go and TestConformance_TIFF_type_sizes.
+		{13, 4}, // IFD
 		// unknown
 		{0, 0},
-		{13, 0},
 		{99, 0},
 		{0xFF, 0},
 	}

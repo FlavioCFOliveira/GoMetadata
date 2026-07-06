@@ -680,8 +680,8 @@ func TestARWAssignNewOffsetsOverflow(t *testing.T) {
 
 	// Step (a): verify assignNewOffsets saturates newOffset to MaxUint32 on overflow.
 	// imageStart near MaxUint32 such that imageStart + blk.size overflows.
-	const blockSize = uint32(100)
-	imageStart := uint32(math.MaxUint32) - blockSize + 1 // imageStart + blockSize wraps
+	const blockSize = uint64(100)
+	imageStart := uint64(math.MaxUint32) - blockSize + 1 // imageStart + blockSize wraps
 
 	blk := &imageBlock{
 		srcOffset: 0,

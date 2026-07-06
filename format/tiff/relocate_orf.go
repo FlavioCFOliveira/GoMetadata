@@ -377,7 +377,7 @@ func rebaseOlympMNEntry(
 		if oldVOO == info.thumbSrcOffset ||
 			uint64(oldVOO) < uint64(info.mnSrcOffset) ||
 			uint64(oldVOO) >= mnBlobEnd {
-			order.PutUint32(finalTIFF[entryPos+8:], thumbBlock.newOffset)
+			order.PutUint32(finalTIFF[entryPos+8:], uint32(thumbBlock.newOffset)) //nolint:gosec // G115: ORF is always classic TIFF; bounded by maxFileSize, always < 2^32
 			return
 		}
 	}
@@ -545,7 +545,7 @@ func orfRelocateWithOLYMP(
 	// GM-W1: budget is shared with the SubIFD enumeration below so the
 	// cumulative image-block + SubIFD count for this write is bounded.
 	budget := newImageBlockBudget()
-	blocks, err := enumerateImageBlocks(base, e, order, budget)
+	blocks, err := enumerateImageBlocks(base, e, order, false, budget)
 	if err != nil {
 		return nil, fmt.Errorf("enumerate image blocks: %w", err)
 	}
@@ -567,8 +567,8 @@ func orfRelocateWithOLYMP(
 	var thumbBlock *imageBlock
 	if mnInfo.thumbSrcOffset > 0 && mnInfo.thumbSize > 0 {
 		thumbBlock = &imageBlock{
-			srcOffset: mnInfo.thumbSrcOffset,
-			size:      mnInfo.thumbSize,
+			srcOffset: uint64(mnInfo.thumbSrcOffset),
+			size:      uint64(mnInfo.thumbSize),
 			ifdPtr:    nil, // standalone; not owned by any exif.IFD entry
 			entryTag:  olympMNTagThumbnailImage,
 			index:     0,
@@ -576,7 +576,7 @@ func orfRelocateWithOLYMP(
 	}
 
 	// Step 4: enumerate SubIFDs (tag 0x014A).
-	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e.IFD0, order, budget)
+	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget)
 	if subErr != nil {
 		return nil, fmt.Errorf("enumerate SubIFDs: %w", subErr)
 	}
@@ -588,13 +588,13 @@ func orfRelocateWithOLYMP(
 	removeImageOffsetEntries(mainBlocks)
 
 	// Step 6: re-insert placeholder entries and encode to learn the IFD size.
-	offsetValueSlices := insertPlaceholders(mainBlocks, order)
+	offsetValueSlices := insertPlaceholders(mainBlocks)
 
 	skeleton, skelErr := exif.Encode(e)
 	if skelErr != nil {
 		return nil, fmt.Errorf("encode placeholder: %w", skelErr)
 	}
-	ifdEnd := uint32(len(skeleton)) //nolint:gosec // G115: len bounded by TIFF stream
+	ifdEnd := uint64(len(skeleton))
 
 	// Step 7: assign new absolute offsets.
 	subIFDsSize := computeSubIFDsSize(subIFDs)
@@ -611,7 +611,7 @@ func orfRelocateWithOLYMP(
 	updatePlaceholders(mainBlocks, offsetValueSlices, order)
 
 	// Step 8b: patch SubIFD raw bytes.
-	patchSubIFDImageOffsets(subIFDs, allBlocks, order)
+	patchSubIFDImageOffsets(subIFDs, allBlocks, false, order)
 
 	// Step 9: re-encode → finalTIFF.
 	finalTIFF, finalErr := exif.Encode(e)
@@ -633,7 +633,7 @@ func orfRelocateWithOLYMP(
 
 	// Step 10: patch the 0x014A SubIFDs pointer array in finalTIFF.
 	if len(subIFDs) > 0 {
-		if pErr := patchSubIFDPointers(finalTIFF, subIFDs, order); pErr != nil {
+		if pErr := patchSubIFDPointers(finalTIFF, subIFDs, false, order); pErr != nil {
 			return nil, fmt.Errorf("patch SubIFD pointers: %w", pErr)
 		}
 	}
@@ -648,7 +648,7 @@ func orfRelocateWithOLYMP(
 
 	// Step 12: append all image block bytes from source (main IFD blocks + thumbBlock).
 	for _, blk := range allBlocks {
-		end := uint64(blk.srcOffset) + uint64(blk.size)
+		end := blk.srcOffset + blk.size
 		if end > uint64(len(base)) {
 			return nil, fmt.Errorf("image block offset=%d size=%d: %w",
 				blk.srcOffset, blk.size, ErrBlockOutOfBounds)

@@ -196,6 +196,24 @@ func rebaseGenericMakerNote(finalTIFF []byte, e *exif.EXIF, order binary.ByteOrd
 	if len(finalTIFF) < 8 {
 		return
 	}
+	// #270 documented fail-safe deferral: this function's OUTER-container scan
+	// below (finalTIFF[4:] for IFD0 offset, 12-byte entries in ExifIFD) is
+	// classic-TIFF-only. A Sony plain-IFD or Olympus OLYMP-type MakerNote
+	// combined with a genuinely BigTIFF outer container has no known real-world
+	// occurrence (both maker conventions predate BigTIFF, and BigTIFF is used
+	// for large scientific/GIS/aerial imagery, never for camera MakerNotes).
+	// Declining here is a SAFE no-op, not a corruption risk: every write below
+	// this point either patches bytes it has independently located via this
+	// same classic-only scan, or does nothing. Without this guard, the classic
+	// scan would silently misinterpret BigTIFF's 16-byte header/20-byte
+	// entries as classic 8-byte header/12-byte entries; the existing bounds
+	// checks throughout this function happen to make that misinterpretation
+	// fail closed (no writes occur — see relocate_makernote_bigtiff_test.go),
+	// but relying on that accident is not acceptable engineering. Full
+	// BigTIFF-aware outer-container rebasing is tracked as a follow-up.
+	if e.BigTIFF {
+		return
+	}
 
 	// Determine IFD offset within blob and byte order for this maker.
 	ifdOff, mnOrder := makerNoteIFDOffset(e.MakerNote, order)

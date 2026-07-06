@@ -414,7 +414,7 @@ func checkIFDBlocks(t *testing.T, original, output []byte, ifd *exif.IFD, order 
 			}
 
 			// Verify bounds in output.
-			end := uint64(offVal) + uint64(cntVal)
+			end := offVal + cntVal
 			if end > uint64(len(output)) {
 				t.Errorf("block tag 0x%04X[%d]: output offset %d size %d exceeds output len %d",
 					offsetTag, i, offVal, cntVal, len(output))
@@ -470,7 +470,7 @@ func findOriginalBlock(t *testing.T, original, newBlockData []byte, offsetTag, c
 		if err != nil {
 			continue
 		}
-		end := uint64(offVal) + uint64(cntVal)
+		end := offVal + cntVal
 		if end > uint64(len(original)) {
 			continue
 		}

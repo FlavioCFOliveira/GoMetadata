@@ -556,7 +556,10 @@ func TestConformance_TIFF_overflow_count_uint64_guard(t *testing.T) {
 // TestConformance_TIFF_type_sizes verifies that typeSize returns the correct
 // byte size for all standard TIFF 6.0 type codes.
 //
-// TIFF 6.0 §2 (types 1–12), Exif 2.32 §4.6.3 (type 13 = UTF8, Exif 3.0 only).
+// TIFF 6.0 §2 (types 1–12); TIFF 6.0 Extensions (type 13 = IFD, format/tiff's
+// OWN generic table — task #270; see the {13, 4, "IFD"} case below and
+// typeSize's doc comment in tiff.go for why this diverges from
+// exif/type.go's CIPA DC-008-2023 §4.6.3 TypeUTF8 assignment of the same code).
 // S-18 validation.
 func TestConformance_TIFF_type_sizes(t *testing.T) {
 	t.Parallel()
@@ -577,9 +580,19 @@ func TestConformance_TIFF_type_sizes(t *testing.T) {
 		{10, 8, "SRATIONAL"},
 		{11, 4, "FLOAT"},
 		{12, 8, "DOUBLE"},
+		// Task #270: type 13 ("IFD") returns 4, NOT 0. TIFF 6.0 Extensions
+		// ("Adding New Fields" / libtiff TIFF_IFD) assign code 13 to IFD, a
+		// 4-byte child-IFD pointer — distinct from exif/type.go's CIPA
+		// DC-008-2023 §4.6.3 TypeUTF8 assignment of the SAME numeric code for
+		// EXIF-registry tags. format/tiff's own generic raw-IFD scanners
+		// (extractRawIFD, patchRawIFDOffsets, enumerateSubIFDs,
+		// patchSubIFDPointers) need the TIFF-Extension meaning because tag
+		// 0x014A (SubIFDs) legitimately declares type 13 — see
+		// testdata/corpus/tiff/metadata-extractor/BigTIFFSubIFD4.tif and
+		// typeSize's doc comment in tiff.go for the full rationale.
+		{13, 4, "IFD"},
 		// Unknown types must return 0 (skip them).
 		{0, 0, "unknown-0"},
-		{13, 0, "UTF8-unknown-in-classic"},
 		{14, 0, "unknown-14"},
 		{15, 0, "unknown-15"},
 		{0xFF, 0, "unknown-255"},

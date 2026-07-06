@@ -117,8 +117,8 @@ func TestInjectWithEXIFRealFile_PassThrough(t *testing.T) {
 
 // stripRecord records a single strip's original offset and byte count.
 type stripRecord struct {
-	srcOffset uint32
-	length    uint32
+	srcOffset uint64
+	length    uint64
 }
 
 // snapshotStrips reads the StripOffsets and StripByteCounts from e before any
@@ -230,8 +230,8 @@ func verifyImageBlocksIdentical(t *testing.T, original []byte, origStrips []stri
 			continue // zero-size strip; nothing to compare
 		}
 
-		end1 := uint64(orig.srcOffset) + uint64(orig.length)
-		end2 := uint64(resNewOff) + uint64(resSrcLen)
+		end1 := orig.srcOffset + orig.length
+		end2 := resNewOff + resSrcLen
 		if end1 > uint64(len(original)) {
 			t.Errorf("strip[%d]: original offset %d+%d out of bounds (file len %d)",
 				i, orig.srcOffset, orig.length, len(original))

@@ -507,7 +507,7 @@ func assertSubIFDBlocksRelocated(t *testing.T, base, output []byte, subIFDOff ui
 				if newCnt == 0 {
 					continue
 				}
-				end := uint64(newOff) + uint64(newCnt)
+				end := newOff + newCnt
 				if end > uint64(len(output)) {
 					t.Errorf("SubIFD[%d] strip[%d]: offset %d+%d exceeds output len %d", idx, j, newOff, newCnt, len(output))
 					continue
@@ -547,7 +547,7 @@ func assertSubIFDBlocksRelocated(t *testing.T, base, output []byte, subIFDOff ui
 				if newCnt == 0 {
 					continue
 				}
-				end := uint64(newOff) + uint64(newCnt)
+				end := newOff + newCnt
 				if end > uint64(len(output)) {
 					t.Errorf("SubIFD[%d] tile[%d]: offset %d+%d exceeds output len %d", idx, j, newOff, newCnt, len(output))
 					continue
@@ -1273,7 +1273,7 @@ func TestSubIFDRationalValuesPreservedOnRelocation(t *testing.T) {
 	if elemSz > 0 && cntSz > 0 && len(subSOff.Value) >= elemSz && len(subSCnt.Value) >= cntSz {
 		newFullOff, _ := readUint(subSOff.Value, elemSz, order)
 		newFullCnt, _ := readUint(subSCnt.Value, cntSz, order)
-		end := uint64(newFullOff) + uint64(newFullCnt)
+		end := newFullOff + newFullCnt
 		if end > uint64(len(output)) {
 			t.Fatalf("bug #98: SubIFD full-res block %d+%d exceeds output len %d", newFullOff, newFullCnt, len(output))
 		}

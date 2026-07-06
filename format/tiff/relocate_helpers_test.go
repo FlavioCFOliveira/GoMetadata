@@ -776,7 +776,8 @@ func TestEnumerateSubIFDs_CycleGuard(t *testing.T) {
 	ifd0.Entries = append(ifd0.Entries, subEntry)
 
 	// Must not panic or loop.
-	subIFDs, subBlocks, err := enumerateSubIFDs(buf, ifd0, order, newImageBlockBudget())
+	e := &exif.EXIF{IFD0: ifd0}
+	subIFDs, subBlocks, err := enumerateSubIFDs(buf, e, order, newImageBlockBudget())
 	// Either returns empty or shallow result; no error expected for a valid struct.
 	_ = subIFDs
 	_ = subBlocks

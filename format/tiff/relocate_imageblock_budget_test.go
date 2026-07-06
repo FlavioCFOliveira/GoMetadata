@@ -30,7 +30,7 @@ package tiff
 //   - TestExtractParallelOffsetBlocksRejectsHugeCountFast — internal
 //     function proves rejection happens before the value array is even
 //     consulted (Count alone is enough to reject).
-//   - TestEnumerateSubIFDsAtRejectsHugeCountFast — same, for SubIFDs.
+//   - TestEnumerateSubIFDsRejectsHugeCountFast — same, for SubIFDs.
 //   - TestWrite_RejectsAggregateImageBlockBudget — cross-IFD amplification:
 //     several entries, each individually within the per-entry cap, chained
 //     together to exceed the aggregate budget.
@@ -498,7 +498,7 @@ func TestExtractParallelOffsetBlocksRejectsHugeCountFast(t *testing.T) {
 
 	blocks, err := extractParallelOffsetBlocks(
 		make([]byte, 16), ifd, exif.TagStripOffsets, offsetEntry, countEntry,
-		binary.LittleEndian, newImageBlockBudget(),
+		binary.LittleEndian, false, newImageBlockBudget(),
 	)
 	if err == nil {
 		t.Fatalf("extractParallelOffsetBlocks: expected error for Count=%d, got nil (blocks=%d)", hugeCount, len(blocks))
@@ -511,32 +511,59 @@ func TestExtractParallelOffsetBlocksRejectsHugeCountFast(t *testing.T) {
 	}
 }
 
-// TestEnumerateSubIFDsAtRejectsHugeCountFast is the SubIFD analogue of
-// TestExtractParallelOffsetBlocksRejectsHugeCountFast.
-func TestEnumerateSubIFDsAtRejectsHugeCountFast(t *testing.T) {
+// buildTinyTIFFWithHugeSubIFDCount builds a classic TIFF whose IFD0 declares a
+// single 0x014A (SubIFDs) entry with an implausibly large Count (n) but NO
+// backing array — the buffer is exactly large enough to hold the fixed IFD0
+// block itself (count + 1 entry + next-IFD pointer), never n*elemSz bytes of
+// value data. Used to prove enumerateSubIFDs rejects on the Count field alone
+// (task #270 regression: the pre-decode cap check must run BEFORE
+// decodeOffsetArray, which would otherwise allocate a []uint64 proportional
+// to n — see the doc comment on the cap check in enumerateSubIFDs).
+func buildTinyTIFFWithHugeSubIFDCount(n uint32) []byte {
+	order := binary.LittleEndian
+	const (
+		tagSubIFDs = uint16(0x014A)
+		typeLong   = uint16(4)
+		nEntries   = 1
+	)
+	// IFD0 fixed block only: count(2) + entry(12) + nextIFD(4). The
+	// value-or-offset field points at an offset that is NEVER dereferenced
+	// because the Count-alone rejection must happen first.
+	total := 8 + 2 + nEntries*12 + 4
+	buf := make([]byte, total)
+	buf[0], buf[1] = 'I', 'I'
+	order.PutUint16(buf[2:], 0x002A)
+	order.PutUint32(buf[4:], 8)
+	order.PutUint16(buf[8:], uint16(nEntries))
+	order.PutUint16(buf[10:], tagSubIFDs)
+	order.PutUint16(buf[12:], typeLong)
+	order.PutUint32(buf[14:], n)
+	order.PutUint32(buf[18:], 0) // never dereferenced; Count alone must reject first
+	return buf
+}
+
+// TestEnumerateSubIFDsRejectsHugeCountFast is the SubIFD analogue of
+// TestExtractParallelOffsetBlocksRejectsHugeCountFast, exercised against the
+// public entry point enumerateSubIFDs (task #270: decoding was moved from
+// enumerateSubIFDsAt into enumerateSubIFDs itself, so the fast-fail-on-Count
+// property must be proven there).
+func TestEnumerateSubIFDsRejectsHugeCountFast(t *testing.T) {
 	t.Parallel()
 
-	const hugeCount = 100_000_000
-	subEntry := &exif.IFDEntry{
-		Tag:   exif.TagSubIFDs,
-		Type:  exif.TypeLong,
-		Count: hugeCount,
-		Value: make([]byte, 4), // deliberately far shorter than hugeCount*4
-	}
+	const hugeCount = 100_000_000 // no backing buffer could plausibly hold this
+	buf := buildTinyTIFFWithHugeSubIFDCount(hugeCount)
+	e := &exif.EXIF{IFD0: &exif.IFD{}}
 
-	subIFDs, blocks, err := enumerateSubIFDsAt(
-		make([]byte, 16), subEntry, hugeCount, 4,
-		binary.LittleEndian, 0, maxSubIFDDepth, newImageBlockBudget(),
-	)
+	subIFDs, blocks, err := enumerateSubIFDs(buf, e, binary.LittleEndian, newImageBlockBudget())
 	if err == nil {
-		t.Fatalf("enumerateSubIFDsAt: expected error for Count=%d, got nil (subIFDs=%d blocks=%d)",
+		t.Fatalf("enumerateSubIFDs: expected error for Count=%d, got nil (subIFDs=%d blocks=%d)",
 			hugeCount, len(subIFDs), len(blocks))
 	}
 	if !errors.Is(err, ErrTooManyImageBlocks) {
-		t.Errorf("enumerateSubIFDsAt: error does not wrap ErrTooManyImageBlocks: %v", err)
+		t.Errorf("enumerateSubIFDs: error does not wrap ErrTooManyImageBlocks: %v", err)
 	}
 	if subIFDs != nil || blocks != nil {
-		t.Errorf("enumerateSubIFDsAt: expected nil results on error, got subIFDs=%d blocks=%d", len(subIFDs), len(blocks))
+		t.Errorf("enumerateSubIFDs: expected nil results on error, got subIFDs=%d blocks=%d", len(subIFDs), len(blocks))
 	}
 }
 

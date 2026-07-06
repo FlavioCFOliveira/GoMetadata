@@ -110,6 +110,49 @@ code MUST be skipped/preserved (treat 4 value bytes as raw, never dereference).
 - **S-38** Sub-IFD pointer tags (ExifIFDPointer `0x8769`, GPSIFDPointer `0x8825`, InteropIFDPointer `0xA005`) and thumbnail pointer tags (JPEGInterchangeFormat `0x0201`, JPEGInterchangeFormatLength `0x0202`) are encoded with type field = TypeLong (never promoted to LONG8/IFD8); the 4-byte value is left-justified in the 8-byte field with the upper 4 bytes zero. — EXIF §4.6.3, §4.5.5; BigTIFF spec §2.
 - **S-39** Value-area alignment is word (2-byte), matching the classic-TIFF padding strategy (writeIFD/ifdTotalSize) reused with wider field constants — a deliberate deviation from the BigTIFF design-doc's advisory 8-byte-alignment text, chosen for interoperability with the reference implementation (libtiff `tif_dirwrite.c`, which enforces only word alignment) and with this project's own committed fixtures. — BigTIFF spec §2 (see exif/ifd.go `ifdTotalSizeBigTIFF` doc comment for the full rationale).
 
+### 2.8 BigTIFF Container Write / Relocation (task #270) — **S-40..S-43**
+
+Task #264 (S-34..S-39) covers `exif.Encode`'s BigTIFF-provenanced EXIF-blob
+serialisation. These rules cover the layer above it: `format/tiff`'s
+copy-and-relocate serializer (`relocateTIFFFromParsed`, the implementation
+behind `tiff.Inject`/`tiff.InjectWithEXIF`), which additionally has to rebuild
+the surrounding TIFF/BigTIFF *container* — image-data blocks (strips, tiles),
+SubIFDs, and any outer-container byte scans performed after `exif.Encode`
+produces the IFD skeleton.
+
+- **S-40** When the source container is BigTIFF (`EXIF.BigTIFF == true`), every
+  outer-container structural lookup the relocator performs after
+  `exif.Encode` (locating IFD0's offset field, scanning IFD0 for the 0x014A
+  SubIFDs entry, scanning IFD0/ExifIFD for MakerNote OOL rebasing) uses
+  BigTIFF's 16-byte header, 20-byte entries, and 8-byte value-or-offset
+  fields — never the classic 8-byte header / 12-byte entries / 4-byte fields.
+  — BigTIFF spec §2.
+- **S-41** StripOffsets/StripByteCounts/TileOffsets/TileByteCounts declared as
+  LONG8 (type 16) in a BigTIFF source are read using 8-byte elements (not
+  misread as 4-byte LONG or silently rejected); an unrecognised element type
+  returns `ErrUnsupportedOffsetType` rather than reading a wrong-width value.
+  — BigTIFF spec §3.3; fixtures: `testdata/corpus/tiff/metadata-extractor/
+  BigTIFFLong8.tif`, `BigTIFFLong8Tiles.tif`, `format/tiff/testdata/
+  big_cramps_{be,le}.tif`.
+- **S-42** On relocation, the offset/bytecount placeholder entry re-inserted
+  for StripOffsets/TileOffsets/StripByteCounts/TileByteCounts preserves the
+  SOURCE entry's declared element width (SHORT/LONG/LONG8) rather than always
+  forcing LONG — a BigTIFF file that legitimately used LONG8 for these arrays
+  is not silently downgraded on write. — TIFF 6.0 §2 / BigTIFF spec §2 (no
+  single mandated width for these tags; readers must accept whichever the
+  writer used).
+- **S-43** SubIFDs (tag 0x014A) may legitimately be declared as LONG (type 4),
+  IFD (type 13 — TIFF 6.0 Extensions / libtiff `TIFF_IFD`; NOT the same
+  meaning as EXIF 3.0's TypeUTF8 assignment of the same numeric code, see
+  `typeSize`'s doc comment in `format/tiff/tiff.go`), LONG8 (type 16,
+  BigTIFF), or IFD8 (type 18, BigTIFF). The relocator decodes and re-encodes
+  the pointer array correctly for all four widths, using format/tiff's own
+  generic raw-IFD type table (which is NOT `exif/type.go`'s EXIF-registry
+  table) — see `enumerateSubIFDs`/`patchSubIFDPointers` in
+  `format/tiff/relocate.go` and `format/tiff/relocate_bigtiff.go`. Fixtures:
+  `testdata/corpus/tiff/metadata-extractor/BigTIFFSubIFD4.tif` (type 13),
+  `BigTIFFSubIFD8.tif` (type 18).
+
 ## Section 3: Value-Level Conformance
 - **V-01** RATIONAL [num@0..3, den@4..7] in stream byte order; guard den==0 before float. SRATIONAL = two i32.
 - **V-02** Signed tags (ShutterSpeedValue `0x9201`, BrightnessValue `0x9203`, ExposureBiasValue `0x9204`) MUST use SRational(); using Rational() misreads the sign bit.
@@ -125,6 +168,7 @@ code MUST be skipped/preserved (treat 4 value bytes as raw, never dereference).
 - **V-12 (BigTIFF write, task #264)** Every BigTIFF encode-side size computation (ifdTotalSizeBigTIFF, writeIFDBigTIFF) MUST call typeSizeBigTIFF, never typeSize — a regression guard against silently treating LONG8/SLONG8/IFD8 (16/17/18) as size-0.
 - **V-13 (BigTIFF write)** A total of 5–8 bytes (e.g. RATIONAL count=1 = 8 bytes) is placed inline under the BigTIFF threshold, though the same total would be out-of-line under the classic 4-byte threshold; placement is a deterministic function of (Type, Count), never of how the source stored it.
 - **V-14 (BigTIFF write)** An entry with an unrecognised type code round-trips as an opaque 8-byte raw inline field (mirrors parseIFDEntryBigTIFF's `sz == 0` handling) — the exact 8 bytes present at parse time are reproduced verbatim on re-encode.
+- **V-15 (BigTIFF container write, task #270)** All image-block and SubIFD relocation offset arithmetic in `format/tiff`'s copy-and-relocate serializer (`imageBlock.srcOffset/size/newOffset`, `subIFDInfo.srcOffset/newOffset`, `readUint`) is carried in `uint64`, so that a value legitimately sourced from a LONG8/IFD8 (8-byte) field is never pre-truncated to `uint32` at any intermediate step before the final classic-4-GiB defence-in-depth ceiling check (see R-15's rationale: this package's own `maxFileSize` cap of 256 MiB means the ceiling itself is never realistically reached for either container, but the arithmetic leading up to it must still be widened to avoid silent precision loss on the wire-format values).
 
 ## Section 4: Robustness / Graceful Degradation
 - **R-01** Circular IFD chains MUST be detected (visited-offset set); break, no infinite loop.
@@ -144,6 +188,8 @@ code MUST be skipped/preserved (treat 4 value bytes as raw, never dereference).
 - **R-15 (BigTIFF write)** All BigTIFF encode-side offset/size arithmetic is performed in uint64; because classic TIFF's implicit ceiling (offset fields are 32 bits wide, so ifdTotalSize saturates at math.MaxUint32) does not apply to BigTIFF's 64-bit fields, an explicit, documented, test-overridable sanity ceiling (maxBigTIFFEncodeSize) is checked before any allocation proportional to the computed size — never math.MaxUint32 saturation, and never an unchecked allocation.
 - **R-16 (BigTIFF write)** Sub-IFD pointer tags and thumbnail pointer tags (fixed EXIF LONG fields, S-38) never silently receive a value ≥ 2^32 when encoding BigTIFF; Encode fails loudly with ErrBigTIFFPointerOverflow instead of truncating the pointer.
 - **R-17 (BigTIFF write)** The MakerNote/IFD1 verbatim-preserve contract (classic-TIFF R-11) applies identically when the source is BigTIFF: MakerNote bytes and IFD1 (thumbnail) entries survive an Encode round-trip unchanged.
+- **R-18 (BigTIFF container write, task #270)** Round-trip fidelity for standalone BigTIFF container write: extracting a real-world BigTIFF fixture (including one with SubIFDs and/or LONG8-typed strip/tile arrays), rewriting it via `tiff.Inject`/`tiff.InjectWithEXIF` with a metadata change that forces the copy-and-relocate path, and re-parsing the output MUST preserve every IFD0 tag value and every byte of every strip/tile/SubIFD image block untouched.
+- **R-19 (BigTIFF container write)** MakerNote OOL rebasing (the classic-TIFF R-11 contract, implemented by `rebaseGenericMakerNote`) is a documented, tested, fail-safe no-op — never a corruption — when the outer container is BigTIFF (`EXIF.BigTIFF == true`). No known real-world file combines a Sony plain-IFD or Olympus OLYMP-type MakerNote (both predate BigTIFF) with a genuinely BigTIFF outer container; full BigTIFF-aware outer-container MakerNote rebasing is a tracked follow-up, not a corruption risk in the interim.
 
 ## Section 5: Real-World Deviations (handle gracefully)
 1. Unsorted IFD entries (MUST sort/linear-search, not binary-search-on-unsorted).

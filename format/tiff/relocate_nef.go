@@ -327,8 +327,8 @@ func extractNikonPreviewInfo(base []byte, e *exif.EXIF) (*nikonPreviewInfo, erro
 	}
 
 	blk := &imageBlock{
-		srcOffset: previewImgFileOff,
-		size:      previewImgSize,
+		srcOffset: uint64(previewImgFileOff),
+		size:      uint64(previewImgSize),
 		ifdPtr:    nil, // standalone
 		entryTag:  exif.TagJPEGInterchangeFormat,
 		index:     0,
@@ -582,14 +582,14 @@ func patchNikonPreviewInFinalTIFF(finalTIFF []byte, info *nikonPreviewInfo, orde
 
 	// mnBlobOff is the absolute position of the MakerNote blob within finalTIFF.
 	// The embedded TIFF header starts at info.mnTIFFHdrOff bytes into the blob.
-	newMNTIFFBase := uint32(mnBlobOff) + uint32(info.mnTIFFHdrOff) //nolint:gosec // G115: mnBlobOff < len(finalTIFF)
+	newMNTIFFBase := uint64(mnBlobOff) + uint64(info.mnTIFFHdrOff) //nolint:gosec // G115: both bounded by finalTIFF length, itself bounded by maxFileSize, never negative
 
 	newPreviewAbsOff := info.previewBlock.newOffset
 	if newPreviewAbsOff < newMNTIFFBase {
 		return fmt.Errorf("%w: preview abs offset 0x%08X < MakerNote TIFF base 0x%08X",
 			ErrNikonPatchFailed, newPreviewAbsOff, newMNTIFFBase)
 	}
-	newPreviewRelOff := newPreviewAbsOff - newMNTIFFBase
+	newPreviewRelOff := uint32(newPreviewAbsOff - newMNTIFFBase) //nolint:gosec // G115: NEF is always classic TIFF; bounded by maxFileSize, always < 2^32
 
 	// Patch 0x0201 and 0x0202 in the finalTIFF blob.
 	pos201 := mnBlobOff + info.previewOff201InBlob
@@ -746,7 +746,7 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	// GM-W1: budget is shared with the SubIFD enumeration below so the
 	// cumulative image-block + SubIFD count for this write is bounded.
 	budget := newImageBlockBudget()
-	mainIFDBlocks, err := enumerateImageBlocks(base, e, order, budget)
+	mainIFDBlocks, err := enumerateImageBlocks(base, e, order, false, budget)
 	if err != nil {
 		return nil, fmt.Errorf("nef: enumerate image blocks: %w", err)
 	}
@@ -758,7 +758,7 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	allBlocks := append(mainIFDBlocks, info.previewBlock)
 
 	// Step 4: parse SubIFDs (tag 0x014A).
-	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e.IFD0, order, budget)
+	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget)
 	if subErr != nil {
 		return nil, fmt.Errorf("nef: enumerate SubIFDs: %w", subErr)
 	}
@@ -773,13 +773,13 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	removeImageOffsetEntries(mainBlocks)
 
 	// Step 6: re-insert placeholder entries and encode to learn the structure size.
-	offsetValueSlices := insertPlaceholders(mainBlocks, order)
+	offsetValueSlices := insertPlaceholders(mainBlocks)
 
 	skeleton, skelErr := exif.Encode(e)
 	if skelErr != nil {
 		return nil, fmt.Errorf("nef: encode placeholder: %w", skelErr)
 	}
-	ifdEnd := uint32(len(skeleton)) //nolint:gosec // G115: len bounded by TIFF stream
+	ifdEnd := uint64(len(skeleton))
 
 	// Step 7: assign new absolute offsets.
 	subIFDsSize := computeSubIFDsSize(subIFDs)
@@ -795,7 +795,7 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	updatePlaceholders(mainBlocks, offsetValueSlices, order)
 
 	// Step 8b: patch SubIFD raw bytes.
-	patchSubIFDImageOffsets(subIFDs, allBlocks, order)
+	patchSubIFDImageOffsets(subIFDs, allBlocks, false, order)
 
 	// Step 9: re-encode → finalTIFF.
 	finalTIFF, finalErr := exif.Encode(e)
@@ -811,7 +811,7 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 
 	// Step 10: patch 0x014A SubIFDs pointer array.
 	if len(subIFDs) > 0 {
-		if pErr := patchSubIFDPointers(finalTIFF, subIFDs, order); pErr != nil {
+		if pErr := patchSubIFDPointers(finalTIFF, subIFDs, false, order); pErr != nil {
 			return nil, fmt.Errorf("nef: patch SubIFD pointers: %w", pErr)
 		}
 	}
@@ -829,7 +829,7 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 
 	// Step 12: append image block bytes from source.
 	for _, blk := range allBlocks {
-		end := uint64(blk.srcOffset) + uint64(blk.size)
+		end := blk.srcOffset + blk.size
 		if end > uint64(len(base)) {
 			return nil, fmt.Errorf("nef: image block offset=%d size=%d: %w",
 				blk.srcOffset, blk.size, ErrBlockOutOfBounds)

@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"io"
 	"testing"
+
+	"github.com/FlavioCFOliveira/GoMetadata/exif"
 )
 
 func FuzzTIFFExtract(f *testing.F) {
@@ -235,9 +237,11 @@ func FuzzTIFFInject(f *testing.F) {
 		[]byte("<xmpmeta inject='1'/>"),
 	))
 
-	// Seed 7: BigTIFF LE — exercises the BigTIFF parse path in Extract (task #54).
-	// Note: Inject still rejects BigTIFF (write is not supported) because
-	// exif.Parse only handles classic TIFF magic 0x002A.
+	// Seed 7: BigTIFF LE, empty IFD0 — exercises the BigTIFF parse path in
+	// Extract (task #54) and the BigTIFF copy-and-relocate path in Inject
+	// (task #270: standalone BigTIFF container write). This minimal header
+	// has no entries; Inject must handle the resulting empty-IFD0 relocation
+	// (or a parse error on the zero-length tail) without panicking.
 	bigTIFFLE := make([]byte, 16)
 	bigTIFFLE[0], bigTIFFLE[1] = 'I', 'I'
 	binary.LittleEndian.PutUint16(bigTIFFLE[2:], 0x002B) // BigTIFF magic
@@ -245,6 +249,18 @@ func FuzzTIFFInject(f *testing.F) {
 	binary.LittleEndian.PutUint16(bigTIFFLE[6:], 0)
 	binary.LittleEndian.PutUint64(bigTIFFLE[8:], 16)
 	f.Add(bigTIFFLE)
+
+	// Seed 7b/7c/7d (task #270): structurally complete BigTIFF fixtures with
+	// real IFD0 content, giving the fuzzer real starting points that exercise
+	// relocateTIFFFromParsed's BigTIFF-aware code paths (readIFD0Offset,
+	// findEntryInIFD, extractParallelOffsetBlocks with LONG8 elements,
+	// enumerateSubIFDs/patchSubIFDPointers for all four legitimate 0x014A
+	// type codes) rather than only the classic-TIFF paths every other seed
+	// above covers. buildSyntheticBigTIFF is shared with
+	// conformance_bigtiff_write_test.go.
+	f.Add(buildSyntheticBigTIFF(binary.LittleEndian, uint16(exif.TypeLong8), 0))
+	f.Add(buildSyntheticBigTIFF(binary.BigEndian, uint16(exif.TypeLong), 13)) // 0x014A as IFD (EXIF-3.0/TIFF-Extension type-13 collision case)
+	f.Add(buildSyntheticBigTIFF(binary.LittleEndian, uint16(exif.TypeLong), uint16(exif.TypeIFD8)))
 
 	// Seed 8: TIFF with max-value count entry — exercises overflow guards in
 	// exif.Parse field-width arithmetic.
