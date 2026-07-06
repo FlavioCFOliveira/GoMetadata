@@ -69,3 +69,5 @@
 - [binary.AppendByteOrder eliminates [N]byte→append heap escapes](feedback_append_byteorder_escape.md) — use comma-ok assertion (task #247), NOT direct assertion (task #201 reverted for panic safety on custom ByteOrder)
 - [Zero-alloc MakerNote dispatch string([]byte) key (task #202)](project_task202_zero_alloc_dispatch.md) — makerNoteDispatch replaces makeEntry.String()+parseMakerNoteIFD; -1 alloc/op Camera; string([]byte) must appear directly as map index; buildCameraEXIF now has Canon MakerNote blob
 - [Security-audit batch #244-247 (2026-07-06)](project_security_audit_batch_244_247.md) — DETECT-SHORTREAD-01 io.ReadFull; EXIF-BO-001 ifd0ByteOrder empty-IFD0; PERF-201-LOW comma-ok; XMPCONC-01 doc-only
+- [Security-audit batch 2 (2026-07-06)](project_security_audit_batch_2_20260706.md) — HEIF iloc zero-field DoS (8200x); ORF/RW2 double-write clone fix; root readAllCapped; EXIF-BO-002 IFD.set bigEndian param; 32-bit offset truncation (5 sites)
+- [Lint after adding parser branches/tests](feedback_lint_iteration_after_new_code.md) — new nolint directives + gocyclo bumps common after hot-path edits; always run golangci-lint before declaring done
