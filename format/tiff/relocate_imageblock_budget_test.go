@@ -296,9 +296,20 @@ const allocBudgetForRejection = 64 << 20
 
 // TestWrite_RejectsHugeStripCount is the regression gate for GM-W1 sink A
 // (extractParallelOffsetBlocks).
+//
+// Deliberately NOT t.Parallel(): this test measures process-global
+// runtime.MemStats.TotalAlloc. That counter is a single cumulative value
+// shared by the whole test binary, so any sibling test allocating
+// concurrently (this package has 100+ t.Parallel() subtests elsewhere —
+// conformance, bigtiff, bug111_116_118_149, etc.) inflates the measured
+// delta and makes the allocation-budget assertion flaky, especially under
+// -race. Running sequentially keeps the TotalAlloc window clean: the Go
+// test runner holds already-declared parallel siblings paused at their own
+// t.Parallel() call (not allocating) until this test and every other
+// sequential test finish. See rmp task #263.
+//
+//nolint:paralleltest // global TotalAlloc measurement requires a clean (non-parallel) window; see comment above.
 func TestWrite_RejectsHugeStripCount(t *testing.T) {
-	t.Parallel()
-
 	cases := []struct {
 		name string
 		n    uint32
@@ -309,8 +320,6 @@ func TestWrite_RejectsHugeStripCount(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
 			original := buildTIFFWithHugeStripArrayCount(tc.n)
 
 			var before, after runtime.MemStats
@@ -344,9 +353,14 @@ func TestWrite_RejectsHugeStripCount(t *testing.T) {
 
 // TestWrite_RejectsHugeSubIFDCount is the regression gate for GM-W1 sink B
 // (enumerateSubIFDsAt).
+//
+// Deliberately NOT t.Parallel(): same rationale as
+// TestWrite_RejectsHugeStripCount above — this test measures process-global
+// runtime.MemStats.TotalAlloc, which is unreliable while sibling tests
+// allocate concurrently. See rmp task #263.
+//
+//nolint:paralleltest // global TotalAlloc measurement requires a clean (non-parallel) window; see comment above.
 func TestWrite_RejectsHugeSubIFDCount(t *testing.T) {
-	t.Parallel()
-
 	cases := []struct {
 		name string
 		n    uint32
@@ -357,8 +371,6 @@ func TestWrite_RejectsHugeSubIFDCount(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
 			original := buildTIFFWithHugeSubIFDCount(tc.n)
 
 			var before, after runtime.MemStats
@@ -413,9 +425,15 @@ const allocBudgetForAggregateRejection = 256 << 20
 // 5 IFDs x 65536 (== maxImageBlocksPerOffsetEntry, so no single entry trips
 // the per-entry cap) = 327680 > maxAggregateImageBlocks (262144): the 5th
 // IFD's charge must be rejected by the shared budget.
+//
+// Deliberately NOT t.Parallel(): same rationale as the two tests above —
+// this test measures process-global runtime.MemStats.TotalAlloc, which is
+// unreliable while sibling tests allocate concurrently. This is the test
+// that was observed to flake under -race with a reported 4.4 GiB delta
+// entirely attributable to concurrent siblings. See rmp task #263.
+//
+//nolint:paralleltest // global TotalAlloc measurement requires a clean (non-parallel) window; see comment above.
 func TestWrite_RejectsAggregateImageBlockBudget(t *testing.T) {
-	t.Parallel()
-
 	const numIFDs = 5
 	original := buildChainedStripTIFFs(maxImageBlocksPerOffsetEntry, numIFDs)
 
