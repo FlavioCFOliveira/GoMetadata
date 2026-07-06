@@ -310,6 +310,92 @@ func TestEncodeCollectionType(t *testing.T) {
 	}
 }
 
+// TestCollectionTypeDCArrayProperties verifies that collectionType returns the
+// correct RDF container (Seq or Bag) for the six array-typed dc: properties
+// that task #272 adds to the allowlist: contributor, date, language,
+// publisher, relation, and type. Adobe XMP Specification Part 1, Appendix 8.3
+// (Dublin Core schema) / dc: namespace reference table: dc:date is an ordered
+// array of Date (rdf:Seq, like dc:creator); the other five are unordered
+// arrays (rdf:Bag).
+func TestCollectionTypeDCArrayProperties(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		local string
+		want  string
+	}{
+		{"contributor", "Bag"},
+		{"date", "Seq"},
+		{"language", "Bag"},
+		{"publisher", "Bag"},
+		{"relation", "Bag"},
+		{"type", "Bag"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.local, func(t *testing.T) {
+			t.Parallel()
+			if got := collectionType(NSdc, tc.local); got != tc.want {
+				t.Errorf("collectionType(NSdc, %q) = %q, want %q", tc.local, got, tc.want)
+			}
+			if !isCollectionProperty(NSdc, tc.local) {
+				t.Errorf("isCollectionProperty(NSdc, %q) = false, want true", tc.local)
+			}
+		})
+	}
+}
+
+// TestSingleValueDCArrayPropertiesUseCollectionContainer proves that a
+// single-value Set(NSdc, local, v) for each of the six dc: array-typed
+// properties added by task #272 (contributor, date, language, publisher,
+// relation, type) is serialised through its rdf:Seq/rdf:Bag container — not
+// as a bare `<dc:local>value</dc:local>` scalar — even though it holds
+// exactly one item (ISO 16684-1 §7.5; mirrors the pre-existing behaviour for
+// dc:creator/subject/description/rights/title proved by
+// TestEncodeCollectionType and the RECONCILE-05 conformance test).
+//
+// Before task #272, isCollectionProperty(NSdc, "contributor") (etc.) returned
+// false, so this test would fail with the value serialised as a bare scalar
+// (verified red-before / green-after during development of this fix).
+func TestSingleValueDCArrayPropertiesUseCollectionContainer(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		local string
+		value string
+		ctype string
+	}{
+		{"contributor", "Alice", "Bag"},
+		{"date", "2024-01-15T10:30:00Z", "Seq"},
+		{"language", "en-US", "Bag"},
+		{"publisher", "Acme Press", "Bag"},
+		{"relation", "isVersionOf urn:example:1", "Bag"},
+		{"type", "Image", "Bag"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.local, func(t *testing.T) {
+			t.Parallel()
+			x := &XMP{}
+			x.Set(NSdc, tc.local, tc.value)
+
+			encoded, err := Encode(x)
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+			out := string(encoded)
+
+			bareScalar := "<dc:" + tc.local + ">" + tc.value + "</dc:" + tc.local + ">"
+			if strings.Contains(out, bareScalar) {
+				t.Errorf("dc:%s encoded as bare scalar %q; want rdf:%s container:\n%s",
+					tc.local, bareScalar, tc.ctype, out)
+			}
+
+			wantContainer := "<rdf:" + tc.ctype + ">\n     <rdf:li>" + tc.value + "</rdf:li>\n    </rdf:" + tc.ctype + ">"
+			if !strings.Contains(out, wantContainer) {
+				t.Errorf("dc:%s missing expected single-item rdf:%s container %q:\n%s",
+					tc.local, tc.ctype, wantContainer, out)
+			}
+		})
+	}
+}
+
 // TestXMPGet verifies the public Get accessor for arbitrary namespace/property
 // combinations (XMP §7.3 — property access by namespace URI and local name).
 func TestXMPGet(t *testing.T) {

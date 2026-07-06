@@ -35,6 +35,17 @@ const (
 // for the given namespace URI and local property name per ISO 16684-1 §7.5.
 // Defaults to "Bag" for unrecognised properties.
 //
+// Dublin Core array cardinality (task #272):
+// Adobe XMP Specification Part 1, Appendix 8.3 (Dublin Core schema) — the
+// dc: namespace property reference table — defines exactly eleven array-typed
+// dc: properties and their container kind: creator (seq ProperName), date
+// (seq Date), description/rights/title (Lang Alt, handled above), subject
+// (bag Text, reached via the default "Bag" fallback), contributor/publisher
+// (bag ProperName), language (bag Locale), relation (bag Text), and type
+// (bag, open Choice of Text). dc:format, dc:identifier, and dc:source are
+// Simple (Text/MIMEType) properties, not arrays, and are intentionally
+// absent from this table.
+//
 // xmpMM ordered sequences (#43):
 // Adobe XMP Specification Part 2 §1.2.8 specifies that xmpMM:History,
 // xmpMM:Ingredients, and xmpMM:Pantry are ordered arrays (rdf:Seq), not bags.
@@ -45,10 +56,25 @@ const (
 func collectionType(ns, local string) string {
 	if ns == NSdc {
 		switch local {
-		case "creator":
+		case "creator", "date":
+			// dc:date is "ordered array of Date" per Adobe XMP Specification
+			// Part 1, Appendix 8.3 (Dublin Core schema) / dc: namespace
+			// reference table — an ordered array, like dc:creator, so rdf:Seq.
 			return "Seq"
 		case "rights", "description", "title":
 			return "Alt"
+		case "contributor", "publisher":
+			// "Unordered array of ProperName" per the same table. Would also
+			// be reached via the default "Bag" fallback below; listed
+			// explicitly here for documentation parity with
+			// isCollectionProperty, which must recognise the same set.
+			return "Bag"
+		case "language", "relation", "type":
+			// dc:language: "Unordered array of Locale"; dc:relation and dc:type:
+			// "Unordered array of Text" (dc:type is an open Choice of Text) —
+			// all rdf:Bag per the same table. Listed explicitly for the same
+			// documentation-parity reason as above.
+			return "Bag"
 		}
 	}
 	// #43: Adobe XMP Specification Part 2 §1.2.8 — xmpMM ordered arrays.
@@ -75,13 +101,24 @@ func collectionType(ns, local string) string {
 // RECONCILE-05, docs/conformance/iptc.md §4).
 //
 // This mirrors, and must be kept in sync with, every namespace/local pair
-// that collectionType above recognises explicitly (dc:subject is also
-// listed here even though collectionType reaches it only via the default
-// "Bag" fallback).
+// that collectionType above recognises explicitly. dc:subject, dc:contributor,
+// dc:publisher, dc:language, dc:relation, and dc:type are all listed here even
+// though collectionType reaches them only via the default "Bag" fallback (or,
+// for dc:contributor/publisher/language/relation/type, an explicit "Bag" case
+// added for documentation parity — see collectionType).
+//
+// Task #272 / Adobe XMP Specification Part 1, Appendix 8.3 (Dublin Core
+// schema): completes the array-typed dc: allowlist to all eleven array-typed
+// properties (creator, subject, description, rights, title were already
+// present; contributor, date, language, publisher, relation, type are added
+// by this change). dc:format, dc:identifier, and dc:source remain
+// deliberately absent: they are Simple (Text/MIMEType) properties, not
+// arrays.
 func isCollectionProperty(ns, local string) bool {
 	if ns == NSdc {
 		switch local {
-		case "creator", "subject", "description", "rights", "title":
+		case "creator", "subject", "description", "rights", "title",
+			"contributor", "date", "language", "publisher", "relation", "type":
 			return true
 		}
 	}
