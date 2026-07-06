@@ -266,7 +266,7 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 |---|---|
 | Metadata standards | EXIF 3.0 (CIPA DC-008 / TIFF 6.0), IPTC IIM 4.2, XMP (ISO 16684-1) |
 | Read | Whichever of EXIF / IPTC / XMP the container carries, across all 13 formats (IPTC is only carried by JPEG and TIFF) |
-| Write | All three standards across all 13 container formats; preserves unmodified metadata byte-for-byte. All TIFF-based formats (TIFF, DNG, CR2, NEF, ARW, ORF, RW2) use a copy-and-relocate serializer that preserves image-data blocks (strips/tiles/MakerNote blobs) at corrected offsets. BigTIFF write is not yet supported (`ErrWriteNotSupported`). |
+| Write | All three standards across all 13 container formats, including BigTIFF (magic `0x002B`); preserves unmodified metadata byte-for-byte. All TIFF-based formats (TIFF, DNG, CR2, NEF, ARW, ORF, RW2) use a copy-and-relocate serializer that preserves image-data blocks (strips/tiles/MakerNote blobs) at corrected offsets; BigTIFF uses a native 64-bit encoder and a container-width-aware relocator. |
 | Atomic writes | `WriteFile` uses temp file + rename — no partial writes |
 | Format detection | Magic bytes only; file extension is never consulted |
 | MakerNote (read) | Canon, Nikon, Sony, Olympus, Panasonic, Pentax, DJI, FujiFilm, Leica, Samsung, Sigma, Minolta, Casio |
@@ -297,7 +297,7 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 | Olympus ORF | .orf | Yes | Yes³ | Yes | No | Yes |
 | Panasonic RW2 | .rw2 | Yes | Yes⁴ | Yes | No | Yes |
 
-> ² **Copy-and-relocate write** (`format/tiff/relocate.go`). Image strips, tiles, and non-thumbnail JPEG blocks are enumerated, copied verbatim to fresh absolute offsets in the output stream, and all offset entries are patched. DNG additionally relocates SubIFD structures and their out-of-line values (RATIONAL, SRATIONAL, etc.). CR2 and NEF route through the same path; Canon MakerNote blobs are copied verbatim (blob-relative offsets; move-safe). NEF extends the Nikon Type-3 MakerNote blob to cover PreviewIFD and NikonScanIFD. ARW rebases Sony MakerNote TIFF-absolute offsets and relocates the SR2Private block verbatim. Use `format.SupportsWrite(id)` to check programmatically. BigTIFF write is not supported — `Write` returns `ErrWriteNotSupported` for BigTIFF sources.
+> ² **Copy-and-relocate write** (`format/tiff/relocate.go`). Image strips, tiles, and non-thumbnail JPEG blocks are enumerated, copied verbatim to fresh absolute offsets in the output stream, and all offset entries are patched. DNG additionally relocates SubIFD structures and their out-of-line values (RATIONAL, SRATIONAL, etc.). CR2 and NEF route through the same path; Canon MakerNote blobs are copied verbatim (blob-relative offsets; move-safe). NEF extends the Nikon Type-3 MakerNote blob to cover PreviewIFD and NikonScanIFD. ARW rebases Sony MakerNote TIFF-absolute offsets and relocates the SR2Private block verbatim. Use `format.SupportsWrite(id)` to check programmatically. BigTIFF sources (magic `0x002B`) are written through the same TIFF row: `exif.Encode` emits a native 16-byte-header, 64-bit-offset BigTIFF IFD skeleton, and the relocator's raw-offset scans, image-block enumeration, and SubIFD handling are all container-width-aware, so image data and metadata round-trip byte-for-byte just as they do for classic TIFF.
 >
 > ³ **ORF copy-and-relocate write**: the non-standard IIRO/IIRS magic bytes are patched to standard LE TIFF before relocation and restored in the output. Both IIRO (Olympus DSLRs) and IIRS (older compacts) are supported.
 >

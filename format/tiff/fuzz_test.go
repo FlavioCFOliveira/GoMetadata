@@ -197,13 +197,16 @@ func FuzzTIFFExtract(f *testing.F) {
 //   - valid LE/BE TIFF headers so Inject can reach the exif.Parse call
 //   - cyclic IFD chains (exercises cycle-detection in exif.traverse)
 //   - truncated inputs (exercises early-return error paths)
-//   - BigTIFF (exercises the unsupported-magic rejection path)
+//   - BigTIFF (exercises the container-width-aware relocation path added in
+//     task #270 — tiff.Inject fully supports BigTIFF sources, it does not
+//     reject them)
 //
-// Note: the top-level gometadata.Write gates TIFF-based camera formats behind
-// ErrWriteNotSupported. tiff.Inject itself does not return that error; it
-// processes the call and either succeeds or returns a parse/encode error.
-// The fuzz target exercises tiff.Inject directly so the write logic is covered
-// regardless of the top-level gate.
+// Note: prior to task #271, the top-level gometadata.Write gated BigTIFF
+// sources behind ErrWriteNotSupported even though tiff.Inject itself never
+// returned that error — it always processed the call and either succeeded
+// or returned a parse/encode error. That root-package gate has since been
+// removed (task #271); this fuzz target continues to exercise tiff.Inject
+// directly regardless, since it is the lower-level entry point.
 func FuzzTIFFInject(f *testing.F) {
 	// Seed 1: minimal LE TIFF with 0 entries — Inject with IPTC/XMP must call
 	// exif.Parse and succeed (empty IFD0, no cycle, valid header).

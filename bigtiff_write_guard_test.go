@@ -1,25 +1,42 @@
 package gometadata
 
-// bigtiff_write_guard_test.go — gate tests for audit finding #107.
+// bigtiff_write_guard_test.go — gate tests for audit finding #107 / task #271.
 //
 // Spec references:
 //   - BigTIFF spec (Aware Systems / libtiff) §2: magic 0x002B, 16-byte header,
 //     8-byte IFD offsets, 64-bit counts; offset bytesize = 8.
 //   - TIFF 6.0 §2: magic 0x002A, 8-byte header, 32-bit IFD offsets.
 //
-// Gate tests:
-//   TestBigTIFFWriteReturnsError     — gometadata.Write on BigTIFF: ErrWriteNotSupported, zero bytes.
-//   TestBigTIFFWriteClassicPositive  — gometadata.Write on classic TIFF still succeeds (regression guard).
+// History:
+//   - Audit finding #107 (pre-task #264/#270/#271): gometadata.Write on a
+//     BigTIFF source silently emitted a classic TIFF (0x002A) header,
+//     truncating every 64-bit offset to 32 bits — a silent corruption risk.
+//     The immediate fix was a fast-fail guard: Write returned
+//     ErrWriteNotSupported for BigTIFF sources before any I/O.
+//   - Task #264: exif.Encode gained a native BigTIFF write path
+//     (serialiseBigTIFF); the underlying EXIF blob encoder was ready, but the
+//     root package's guard (isBigTIFFSource in write.go) still refused all
+//     BigTIFF writes at the top-level API.
+//   - Task #270: format/tiff's copy-and-relocate serializer became
+//     container-width-aware for the surrounding image blocks, SubIFDs, and
+//     raw offset scans, closing the second half of the BigTIFF write gap.
+//   - Task #271: with both layers verified end-to-end, the root-package gate
+//     (isBigTIFFSource + the ErrWriteNotSupported short-circuit in
+//     writeTIFF) was removed. gometadata.Write now writes BigTIFF sources
+//     successfully. TestBigTIFFWriteReturnsError (which pinned the pre-#271
+//     refusal behaviour) is replaced by TestBigTIFFWriteSucceeds below.
 //
-// These tests confirm the FIX for audit finding #107:
-//   BEFORE: Write silently emitted a classic TIFF (0x002A) for BigTIFF input,
-//           truncating all 64-bit offsets to 32 bits — silent corruption.
-//   AFTER:  Write returns ErrWriteNotSupported and writes zero bytes.
+// Gate tests:
+//   TestBigTIFFWriteSucceeds         — gometadata.Write on BigTIFF: succeeds,
+//                                       output re-parses and preserves the
+//                                       BigTIFF magic (0x002B).
+//   TestBigTIFFWriteClassicPositive  — gometadata.Write on classic TIFF still
+//                                       succeeds (regression guard, unchanged
+//                                       by task #271).
 
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"testing"
 )
 
@@ -29,7 +46,7 @@ import (
 //   - withLong8=true:  includes a TypeLong8 (type 16) entry — the canonical
 //     BigTIFF-specific type used for large StripOffsets.
 //   - withLong8=false: uses only standard TIFF types with small values;
-//     proves the guard fires on magic alone, not on type codes.
+//     proves the write path succeeds on magic alone, not on type codes.
 //
 // BigTIFF spec §2: magic 0x002B, 16-byte header, 8-byte offsets.
 func buildBigTIFFForWriteGuardTest(withLong8 bool) []byte {
@@ -77,7 +94,7 @@ func buildBigTIFFForWriteGuardTest(withLong8 bool) []byte {
 		order.PutUint64(buf[int(dataOff):], 0x0000_0001_0000_0000) // offset > 4 GiB
 	} else {
 		// Make (0x010F), TypeASCII, count=9, OOL (9 > 8 BigTIFF inline threshold).
-		// This exercises the guard for a BigTIFF with only standard type codes.
+		// This exercises the write path for a BigTIFF with only standard type codes.
 		const payload = "CameraNN\x00"
 		order.PutUint16(buf[ifdPos:], 0x010F)
 		order.PutUint16(buf[ifdPos+2:], 2) // TypeASCII
@@ -88,22 +105,27 @@ func buildBigTIFFForWriteGuardTest(withLong8 bool) []byte {
 	return buf
 }
 
-// TestBigTIFFWriteReturnsError is the top-level gate for audit finding #107.
+// TestBigTIFFWriteSucceeds is the top-level gate for task #271.
 //
-// Before the fix: gometadata.Write on a BigTIFF source silently emitted a
-// classic TIFF (magic 0x002A) without error, truncating all 64-bit offsets.
+// Before task #271: gometadata.Write on a BigTIFF source returned
+// ErrWriteNotSupported and wrote zero bytes, even though both underlying
+// layers (exif.Encode since task #264, format/tiff's relocator since #270)
+// were already capable of producing a correct BigTIFF output.
 //
-// After the fix: gometadata.Write returns ErrWriteNotSupported and writes zero
-// bytes to the output writer when the source is BigTIFF (magic 0x002B).
+// After task #271: gometadata.Write succeeds for BigTIFF sources. The output
+// re-parses without error and preserves the BigTIFF magic (0x002B) — it must
+// never be silently downgraded to classic TIFF (0x002A), which would
+// truncate every 64-bit offset.
 //
-// Two sub-cases cover both variants described in the task:
+// Two sub-cases cover both variants described in the original guard test:
 //
 //	(a) BigTIFF with a TypeLong8 entry — canonical large-file BigTIFF.
-//	(b) BigTIFF with only small/standard-type entries — proves the guard fires
-//	    on the 0x002B magic regardless of actual offset magnitude.
+//	(b) BigTIFF with only small/standard-type entries — proves the write path
+//	    succeeds regardless of actual offset magnitude, not just when a
+//	    64-bit-only type code happens to be present.
 //
-// BigTIFF spec §2; audit finding #107.
-func TestBigTIFFWriteReturnsError(t *testing.T) {
+// BigTIFF spec §2; audit finding #107; tasks #264/#270/#271.
+func TestBigTIFFWriteSucceeds(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -125,29 +147,40 @@ func TestBigTIFFWriteReturnsError(t *testing.T) {
 				t.Fatalf("Read BigTIFF: unexpected error: %v", readErr)
 			}
 
-			// Write must return ErrWriteNotSupported and produce zero bytes.
-			// BigTIFF spec §2; audit finding #107: write is not yet supported.
+			// Write must now succeed (task #271) and produce non-empty output.
 			var out bytes.Buffer
 			writeErr := Write(bytes.NewReader(data), &out, m)
-			if writeErr == nil {
-				t.Errorf("Write BigTIFF: expected error, got nil (wrote %d bytes)", out.Len())
-				return
+			if writeErr != nil {
+				t.Fatalf("Write BigTIFF: unexpected error: %v", writeErr)
 			}
-			if !errors.Is(writeErr, ErrWriteNotSupported) {
-				t.Errorf("Write BigTIFF: error does not wrap ErrWriteNotSupported: %v", writeErr)
+			if out.Len() == 0 {
+				t.Fatal("Write BigTIFF: produced no output bytes")
 			}
-			if out.Len() != 0 {
-				t.Errorf("Write BigTIFF: wrote %d bytes on error, want 0", out.Len())
+
+			// Output must re-parse without error and still carry BigTIFF magic
+			// 0x002B — a silent downgrade to classic TIFF would truncate every
+			// 64-bit offset (the original audit finding #107 corruption).
+			if out.Len() < 4 || binary.LittleEndian.Uint16(out.Bytes()[2:]) != 0x002B {
+				t.Fatalf("Write BigTIFF: output magic = 0x%04X, want 0x002B (BigTIFF must not be downgraded)",
+					binary.LittleEndian.Uint16(out.Bytes()[2:]))
+			}
+
+			m2, reReadErr := Read(bytes.NewReader(out.Bytes()))
+			if reReadErr != nil {
+				t.Fatalf("Read (round-trip) BigTIFF output: unexpected error: %v", reReadErr)
+			}
+			if m2.EXIF == nil || !m2.EXIF.BigTIFF {
+				t.Error("Read (round-trip) BigTIFF output: EXIF.BigTIFF = false, want true")
 			}
 		})
 	}
 }
 
-// TestBigTIFFWriteClassicPositive verifies that the BigTIFF write guard does
-// NOT prevent writes for classic TIFF sources (magic 0x002A).
+// TestBigTIFFWriteClassicPositive verifies that BigTIFF write support does
+// NOT change behaviour for classic TIFF sources (magic 0x002A).
 //
-// This is the regression guard: the BigTIFF guard must not accidentally
-// block valid classic TIFF writes.
+// This is the regression guard: enabling BigTIFF writes must not accidentally
+// alter or break valid classic TIFF writes. Unchanged by task #271.
 //
 // TIFF 6.0 §2; audit finding #107 (regression guard).
 func TestBigTIFFWriteClassicPositive(t *testing.T) {
@@ -169,7 +202,7 @@ func TestBigTIFFWriteClassicPositive(t *testing.T) {
 	var out bytes.Buffer
 	writeErr := Write(bytes.NewReader(data), &out, m)
 	if writeErr != nil {
-		t.Errorf("Write classic TIFF: unexpected error (BigTIFF guard must not fire for 0x002A): %v", writeErr)
+		t.Errorf("Write classic TIFF: unexpected error (BigTIFF support must not affect classic TIFF): %v", writeErr)
 	}
 	if out.Len() == 0 {
 		t.Error("Write classic TIFF: produced no output bytes")
