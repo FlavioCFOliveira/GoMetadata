@@ -2180,18 +2180,42 @@ func decodeFirstRune(b []byte) (rune, int) {
 	return unicode.ReplacementChar, 1
 }
 
-// ── Issue #43: xmpMM ordered arrays serialised as rdf:Seq ────────────────────
+// ── Issue #43 / task #273: xmpMM array-typed properties ──────────────────────
 
-// TestCollectionTypeXmpMMSeq verifies that collectionType returns "Seq" for
-// xmpMM:History, xmpMM:Ingredients, and xmpMM:Pantry per Adobe XMP Spec Part 2 §1.2.8.
-func TestCollectionTypeXmpMMSeq(t *testing.T) {
+// TestCollectionTypeXmpMMArrayProperties verifies that collectionType and
+// isCollectionProperty return the spec-correct RDF container for every
+// xmpMM array-typed property. Adobe XMP Specification Part 2 §1.2.8;
+// exiv2.org/tags-xmp-xmpMM.html "Value type" column: History=seq
+// ResourceEvent, Ingredients=bag ResourceRef, Pantry=bag struct,
+// Versions=seq Version.
+//
+// Task #273 regression gate: prior to this fix, Ingredients and Pantry were
+// WRONGLY coded as Seq (this test used to assert exactly that, under the
+// name TestCollectionTypeXmpMMSeq — see git history) because a comment
+// incorrectly cited both as ordered arrays alongside History. Cross-checked
+// against adobe/xmp-docs, developer.adobe.com, and exiv2.org's xmpMM tag
+// table (three independent sources): only History is an ordered sequence;
+// Ingredients and Pantry are unordered bags. Versions was previously
+// missing entirely and fell through to the wrong "Bag" default.
+func TestCollectionTypeXmpMMArrayProperties(t *testing.T) {
 	t.Parallel()
-	seqProps := []string{"History", "Ingredients", "Pantry"}
-	for _, local := range seqProps {
-		t.Run(local, func(t *testing.T) {
+	tests := []struct {
+		local string
+		want  string
+	}{
+		{"History", "Seq"},
+		{"Versions", "Seq"},
+		{"Ingredients", "Bag"},
+		{"Pantry", "Bag"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.local, func(t *testing.T) {
 			t.Parallel()
-			if got := collectionType(NSxmpMM, local); got != "Seq" {
-				t.Errorf("collectionType(%q, %q) = %q, want %q", NSxmpMM, local, got, "Seq")
+			if got := collectionType(NSxmpMM, tc.local); got != tc.want {
+				t.Errorf("collectionType(%q, %q) = %q, want %q", NSxmpMM, tc.local, got, tc.want)
+			}
+			if !isCollectionProperty(NSxmpMM, tc.local) {
+				t.Errorf("isCollectionProperty(%q, %q) = false, want true", NSxmpMM, tc.local)
 			}
 		})
 	}

@@ -379,6 +379,38 @@ func TestConformanceRDF05(t *testing.T) {
 			t.Error("RDF-05: Alt not preserved on round-trip encode")
 		}
 	})
+	// Task #273: the three sub-tests above all use dc: properties with TWO
+	// or more rdf:li items, and dc: is in the spec-sourced allowlist. Neither
+	// condition held for the container-preservation defect fixed by task
+	// #273: a SINGLE-item collection in a namespace/property NOT in that
+	// allowlist (or in no allowlist at all) was silently downgraded to a
+	// bare scalar on Encode. This sub-test is the direct, minimal
+	// reproduction of that defect for the checklist rule it violates.
+	t.Run("RDF-05/SingleItemAnyNamespace", func(t *testing.T) {
+		t.Parallel()
+		const customNS = "http://example.com/rdf05-custom/1.0/"
+		x := mustParse(t, xmpDoc(
+			`<rdf:Description rdf:about="" xmlns:cust="`+customNS+`">`+
+				`<cust:Tags><rdf:Seq><rdf:li>onlytag</rdf:li></rdf:Seq></cust:Tags>`+
+				`</rdf:Description>`,
+		))
+		if got := x.Get(customNS, "Tags"); got != "onlytag" {
+			t.Fatalf("RDF-05 single-item: Get = %q", got)
+		}
+		enc := mustEncode(t, x)
+		out := string(enc)
+		bareScalar := "<cust:Tags>onlytag</cust:Tags>"
+		if strings.Contains(out, bareScalar) {
+			t.Errorf("RDF-05: single-item unknown-namespace collection downgraded to bare scalar %q:\n%s", bareScalar, out)
+		}
+		if !strings.Contains(out, "<rdf:Seq>") {
+			t.Errorf("RDF-05: single-item rdf:Seq container not preserved on round-trip encode:\n%s", out)
+		}
+		x2 := mustParse(t, enc)
+		if got := x2.Get(customNS, "Tags"); got != "onlytag" {
+			t.Errorf("RDF-05 single-item round-trip: Get = %q", got)
+		}
+	})
 }
 
 // TestConformance_RDF-06 verifies rdf:Alt x-default handling.
@@ -1575,6 +1607,39 @@ func TestConformanceROB04(t *testing.T) {
 		x2 := mustParse(t, enc)
 		if x2.Get(unknownNS, "CustomProp") != "ROB04value" {
 			t.Errorf("ROB-04: unknown property lost after re-serialisation; got %q", x2.Get(unknownNS, "CustomProp"))
+		}
+	})
+	// Task #273: ROB-04's original sub-test above only covers a Simple
+	// (shorthand-attribute) property. "Preserved losslessly" (per this
+	// rule's own text) also requires the property's CONTAINER structure —
+	// not just its value — to survive re-serialisation; an unknown namespace
+	// can never appear in the spec-sourced arrayProperties table
+	// (namespace.go), so this is the strongest test of the fix: it proves
+	// preservation is driven by what the source document actually contained,
+	// not by a namespace/property allowlist.
+	t.Run("ROB-04/ArrayTypedUnknownNamespace", func(t *testing.T) {
+		t.Parallel()
+		const unknownNS = "http://example.com/rob04-array/1.0/"
+		raw := xmpDoc(
+			`<rdf:Description rdf:about="" xmlns:myapp="` + unknownNS + `">` +
+				`<myapp:CustomBag><rdf:Bag><rdf:li>ROB04item</rdf:li></rdf:Bag></myapp:CustomBag>` +
+				`</rdf:Description>`,
+		)
+		x := mustParse(t, raw)
+		if x.Get(unknownNS, "CustomBag") != "ROB04item" {
+			t.Fatalf("ROB-04: unknown-namespace array property dropped; got %q", x.Get(unknownNS, "CustomBag"))
+		}
+		enc := mustEncode(t, x)
+		out := string(enc)
+		if strings.Contains(out, "<myapp:CustomBag>ROB04item</myapp:CustomBag>") {
+			t.Errorf("ROB-04: unknown-namespace array property re-serialised as a bare scalar, losing its rdf:Bag container:\n%s", out)
+		}
+		if !strings.Contains(out, "<rdf:Bag>") {
+			t.Errorf("ROB-04: unknown-namespace rdf:Bag container not preserved on re-serialisation:\n%s", out)
+		}
+		x2 := mustParse(t, enc)
+		if x2.Get(unknownNS, "CustomBag") != "ROB04item" {
+			t.Errorf("ROB-04: unknown-namespace array property lost after re-serialisation; got %q", x2.Get(unknownNS, "CustomBag"))
 		}
 	})
 }

@@ -115,24 +115,32 @@ func serialise(x *XMP) ([]byte, error) { //nolint:gocyclo,cyclop // complexity i
 
 		for _, local := range topProps {
 			val := props[local]
-			// #RECONCILE-05 fix: an array-typed property (dc:creator, dc:subject,
-			// dc:description, dc:rights, dc:title, xmpMM's ordered-array set) MUST
-			// always use its rdf:Alt/Seq/Bag collection container per
-			// ISO 16684-1 §7.5, even when it holds exactly one item — the presence
-			// of the internal U+001E multi-item separator is not, by itself, a
-			// reliable signal of array-ness. isCollectionProperty carries that
-			// schema knowledge independently of value count.
-			if strings.IndexByte(val, '\x1e') < 0 && !isCollectionProperty(ns, local) {
+			// #RECONCILE-05 / task #273 fix: an array-typed property MUST always
+			// use its rdf:Alt/Seq/Bag collection container per ISO 16684-1 §7.5,
+			// even when it holds exactly one item — the presence of the internal
+			// U+001E multi-item separator is not, by itself, a reliable signal of
+			// array-ness. effectiveContainerType carries that knowledge (from the
+			// source document's own container, when x was parsed, or else the
+			// spec-sourced table) independently of value count.
+			ctype, isColl := x.effectiveContainerType(ns, local)
+			if strings.IndexByte(val, '\x1e') < 0 && !isColl {
 				writeSimpleProperty(buf, prefix, local, val)
 			} else {
-				writeMultiValuedProperty(buf, prefix, ns, local, val)
+				if ctype == "" {
+					// The value carries the \x1e separator but (ns, local) has no
+					// parse-time record and no spec-table entry — e.g. a caller
+					// joined values manually via Set() for an unrecognised
+					// property. Fall back to the historical default container.
+					ctype = collectionType(ns, local)
+				}
+				writeMultiValuedProperty(buf, prefix, local, val, ctype)
 			}
 		}
 		for _, parent := range structParents {
 			writeStructProperty(buf, prefix, parent, props, localList)
 		}
 		for _, parent := range listStructParents {
-			writeStructInListProperty(buf, prefix, ns, parent, props, localList)
+			writeStructInListProperty(buf, x, prefix, ns, parent, props, localList)
 		}
 
 		// #151: localListPool.Put MUST follow the last use of localList (i.e.
@@ -178,14 +186,19 @@ func writeSimpleProperty(buf *bytes.Buffer, prefix, local, val string) {
 }
 
 // writeMultiValuedProperty writes a multi-valued XMP property element to buf.
-// val is a '\x1e'-delimited list of values. The RDF collection type (Alt, Seq,
-// or Bag) is determined by collectionType(ns, local) per ISO 16684-1 §7.5.
-// For Alt collections, items may carry an xml:lang prefix encoded as "lang|value".
+// val is a '\x1e'-delimited list of values (or, for a single-item array-typed
+// property, a value with no separator at all). ctype is the RDF collection
+// kind ("Alt", "Seq", or "Bag") to use, resolved by the caller via
+// effectiveContainerType per ISO 16684-1 §7.5 (task #273: this used to be
+// resolved internally via collectionType(ns, local), which only ever
+// consulted the spec-sourced table — the caller now resolves it so that a
+// property's own parse-time-observed container takes priority; see
+// effectiveContainerType in namespace.go). For Alt collections, items may
+// carry an xml:lang prefix encoded as "lang|value".
 //
 // #171 / XML 1.0 §2.3: local is emitted as an XML element tag name; writeXMLName
 // strips illegal NCName bytes to prevent XML injection.
-func writeMultiValuedProperty(buf *bytes.Buffer, prefix, ns, local, val string) {
-	ctype := collectionType(ns, local)
+func writeMultiValuedProperty(buf *bytes.Buffer, prefix, local, val, ctype string) {
 	buf.WriteString("   <")
 	buf.WriteString(prefix)
 	buf.WriteByte(':')
@@ -346,10 +359,13 @@ func writeStructProperty(buf *bytes.Buffer, prefix, parent string, props map[str
 // #14 / #13 — XMP Part 1 §C.2.5 and §C.2.6: an ordered sequence of structs is
 // an rdf:Seq whose items are rdf:li elements each containing a struct value
 // (rdf:parseType="Resource" shorthand). The collection type (Seq/Bag) is
-// determined by collectionType; xmpMM:History uses Seq.
+// resolved via x.effectiveContainerType, which prefers the container actually
+// observed in the source document (task #273) and falls back to the
+// spec-sourced collectionType table (xmpMM:History → Seq, etc.) for
+// properties with no parse-time record.
 //
 // Items are sorted by index to ensure deterministic, correct ordering.
-func writeStructInListProperty(buf *bytes.Buffer, prefix, ns, parent string, props map[string]string, localList []string) {
+func writeStructInListProperty(buf *bytes.Buffer, x *XMP, prefix, ns, parent string, props map[string]string, localList []string) {
 	// Collect all unique indices present for this parent.
 	indices := collectStructInListIndices(parent, localList)
 	if len(indices) == 0 {
@@ -357,7 +373,14 @@ func writeStructInListProperty(buf *bytes.Buffer, prefix, ns, parent string, pro
 	}
 	slices.Sort(indices)
 
-	ctype := collectionType(ns, parent)
+	ctype, isColl := x.effectiveContainerType(ns, parent)
+	if !isColl {
+		// A struct-in-list property is always wrapped in a collection — there
+		// is no "simple" rendering for an array of structs — so fall back to
+		// the historical default (collectionType's unconditional "Bag"
+		// default for anything with no spec-table entry).
+		ctype = collectionType(ns, parent)
+	}
 	buf.WriteString("   <")
 	buf.WriteString(prefix)
 	buf.WriteByte(':')

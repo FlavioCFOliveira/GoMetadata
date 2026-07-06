@@ -244,11 +244,58 @@ func (p *rdfParser) onStartProperty(ns string, tagLocal []byte, attrs []xmpAttr)
 // onStartCollection handles rdf:Alt, rdf:Seq, and rdf:Bag container elements
 // immediately inside a property element.
 // Compliance: XMP Part 1 §C.2.5.
+//
+// Task #273: also records the observed container kind for (p.propNS,
+// p.propLocal) via recordContainerType (through startCollection below), so
+// Encode can reproduce the source document's container structure exactly on
+// round trip — see the containerTypes field doc in xmp.go for the full
+// rationale. This happens before any rdf:li children are parsed, so a
+// collection that turns out to hold exactly one item (or zero) is still
+// recorded correctly.
+//
+// Allocation note: tl is used EXCLUSIVELY inside the tl == "…" comparisons
+// below — never passed to a function call or stored — which lets the Go
+// compiler apply its "compare a []byte-derived string against a literal
+// without allocating" optimisation. startCollection is always called with
+// one of the three string *literals* ("Alt"/"Seq"/"Bag" — references to
+// static read-only data, never freshly allocated) rather than with tl
+// itself; passing tl straight through to specTableMatches/
+// recordContainerType instead would defeat that optimisation (the compiler
+// must then materialise tl as a real heap string on every collection open,
+// even when the record ends up being skipped) — verified via
+// testing.AllocsPerRun bisection during development of this fix: 4 extra
+// allocations per parse of a representative multi-collection document.
 func (p *rdfParser) onStartCollection(ns string, tagLocal []byte) {
 	tl := string(tagLocal) // zero-alloc compare (compiler optimisation)
-	if ns == NSrdf && (tl == "Alt" || tl == "Seq" || tl == "Bag") {
-		p.inColl = true
-		*p.liVals = (*p.liVals)[:0]
+	if ns != NSrdf {
+		return
+	}
+	switch tl {
+	case "Alt":
+		p.startCollection("Alt")
+	case "Seq":
+		p.startCollection("Seq")
+	case "Bag":
+		p.startCollection("Bag")
+	}
+}
+
+// startCollection marks the parser as inside a collection and records its
+// container kind (task #273). ctype MUST always be called with one of the
+// three string literals from onStartCollection above — see the allocation
+// note there. Recording is skipped when specTableMatches reports that the
+// spec-sourced table (namespace.go) already agrees with the observed
+// container: Encode would reach the identical answer via its fallback path
+// regardless, so recording it is redundant. This keeps parsing standard,
+// spec-compliant XMP (the overwhelming majority of real-world files)
+// allocation-free for this step; only a property whose container the table
+// has never heard of, or gets wrong for this specific document, pays the
+// recording cost — precisely the cases where it changes the outcome.
+func (p *rdfParser) startCollection(ctype string) {
+	p.inColl = true
+	*p.liVals = (*p.liVals)[:0]
+	if !specTableMatches(p.propNS, p.propLocal, ctype) {
+		recordContainerType(p.x, p.propNS, p.propLocal, ctype)
 	}
 }
 
@@ -1308,6 +1355,29 @@ func trimSpace(b []byte) []byte {
 // isASCIISpace reports whether b is an ASCII whitespace character.
 func isASCIISpace(b byte) bool {
 	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
+// recordContainerType records the RDF collection kind (ctype: "Alt", "Seq",
+// or "Bag") observed for property (ns, local) at parse time.
+//
+// Task #273 / ISO 16684-1 §7.5: round-trip fidelity requires reproducing the
+// source document's container structure for ANY property in ANY namespace,
+// not just the ones enumerated in namespace.go's spec-sourced table. See the
+// XMP.containerTypes field doc (xmp.go) for the full design rationale, and
+// startCollection's doc for why ctype must always be a string literal.
+//
+// Allocates x.containerTypes lazily, mirroring storeProperty's lazy
+// allocation of x.Properties below: a document with no collections needing
+// an override at all never allocates this map, so the zero/low-alloc parse
+// fast path for standard, spec-compliant XMP is unaffected.
+func recordContainerType(x *XMP, ns, local, ctype string) {
+	if x.containerTypes == nil {
+		x.containerTypes = make(map[string]map[string]string)
+	}
+	if x.containerTypes[ns] == nil {
+		x.containerTypes[ns] = make(map[string]string)
+	}
+	x.containerTypes[ns][local] = ctype
 }
 
 // storeProperty writes val to x.Properties[ns][local], initialising inner maps

@@ -35,6 +35,44 @@ type XMP struct {
 	// Multi-valued properties (rdf:Alt, rdf:Seq, rdf:Bag) are joined with
 	// the Unicode "record separator" U+001E so callers can split them.
 	Properties map[string]map[string]string
+
+	// containerTypes records, for a property parsed from a source document,
+	// the RDF collection kind ("Seq", "Bag", or "Alt") that the source
+	// actually used for it. Keyed the same way as Properties — namespace URI
+	// → local property name — using the top-level (parent) local name even
+	// for struct-in-list properties (e.g. "History", not "History[0].action").
+	//
+	// Task #273 / ISO 16684-1 §7.5 / CLAUDE.md "existing metadata not
+	// explicitly modified is preserved exactly": Properties alone cannot
+	// distinguish "this array happens to hold one item" from "this was never
+	// an array" — a flat map has no per-property container-type tag. Without
+	// this field, Encode had exactly one source of truth for every
+	// property's container (the spec-sourced collectionType/
+	// isCollectionProperty table in namespace.go), so any array-typed
+	// property outside that table's namespace/name allowlist — including
+	// every property in every unknown/custom namespace, which the table can
+	// never enumerate — was silently downgraded to a bare scalar element on
+	// a plain Parse → (unrelated field write) → Encode round trip, with no
+	// Set() call on the affected property required to trigger it.
+	//
+	// recordContainerType (rdf.go) populates this map the moment an
+	// rdf:Alt/Seq/Bag element opens during parsing — before its rdf:li
+	// children are read — so the container is captured even for a
+	// collection that turns out to hold exactly one item. effectiveContainerType
+	// (namespace.go) consults it first on Encode, falling back to the
+	// spec-sourced table only for properties with no parse-time record
+	// (typically properties newly created via Set()/the named setters,
+	// which have no source document to preserve).
+	//
+	// Deliberately unexported: this is derived read-path provenance, not
+	// part of the public data model, so a caller cannot desynchronise it
+	// from Properties by editing one but not the other. Left nil — and
+	// never allocated — for any XMP value with no rdf:Alt/Seq/Bag
+	// collection at all (the common case for shorthand-attribute-only or
+	// EXIF-flavoured XMP, and for every XMP value constructed directly by a
+	// caller rather than via Parse), so the zero/low-alloc parse fast path
+	// is unaffected when a document has no collections to preserve.
+	containerTypes map[string]map[string]string
 }
 
 // maxXMPDocumentBytes is the maximum number of UTF-8 bytes that Parse accepts
