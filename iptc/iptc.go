@@ -10,6 +10,7 @@ package iptc
 
 import (
 	"bytes"
+	"math"
 	"slices"
 	"sync"
 	"unicode/utf8"
@@ -148,6 +149,20 @@ const maxIPTCTotalBytes = 256 << 20 // 256 MiB
 // bytes only, not struct overhead). When the cap is reached Truncated is set
 // and parsing stops.
 const maxIPTCDatasets = 65536
+
+// maxDatasetValueLen is the largest Dataset.Value length, in bytes, that
+// Encode will emit via the IIM 4.2 §1.6.2 extended-length encoding. That
+// encoding's length field is a 4-byte big-endian unsigned integer, so the
+// largest value it can faithfully represent is math.MaxUint32 (0xFFFFFFFF)
+// bytes; Encode rejects anything longer with ErrDatasetValueTooLarge rather
+// than silently truncating the length field while still writing every byte
+// of the value (a corrupt, desynchronised stream).
+//
+// Declared as a var (not a const), mirroring the maxFileSize pattern used
+// elsewhere in this project (e.g. the root package and format/webp), so
+// tests can lower it and exercise the guard without allocating a
+// multi-gigabyte Dataset.Value. Production code must never mutate it.
+var maxDatasetValueLen uint64 = math.MaxUint32 //nolint:gochecknoglobals // test-overridable cap; never mutated in production paths
 
 // Parse parses a raw IPTC IIM byte stream.
 // b must begin with (or contain) the IPTC tag marker 0x1C (IIM §1.6).
@@ -300,6 +315,13 @@ var encBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }} //nolin
 // misinterpret multi-byte UTF-8 sequences (mojibake). The injected declaration
 // also updates the internal UTF-8 flag so that an immediate Parse of the result
 // returns the correct strings (round-trip correctness).
+//
+// Encode returns ErrDatasetValueTooLarge if any Dataset.Value is longer than
+// math.MaxUint32 bytes (IIM 4.2 §1.6.2's extended-length field is a 4-byte
+// big-endian unsigned integer and cannot represent a longer value). This is
+// unreachable for an *IPTC produced by Parse, whose size caps keep every
+// Value well under this limit, but Dataset is a public struct and a caller
+// may construct one directly with an oversized Value.
 func Encode(i *IPTC) ([]byte, error) { //nolint:gocyclo,cyclop // complexity is inherent: UTF-8 auto-declaration, record-version injection, ascending-sort, extended-length encoding all require distinct branches
 	buf := encBufPool.Get().(*bytes.Buffer) //nolint:forcetypeassert,revive // encBufPool.New always stores *bytes.Buffer; pool invariant
 	buf.Reset()
@@ -382,10 +404,27 @@ func Encode(i *IPTC) ([]byte, error) { //nolint:gocyclo,cyclop // complexity is 
 		}
 
 		for _, ds := range sorted {
+			n := len(ds.Value)
+			// IIM 4.2 §1.6.2: the extended-length field is a 4-byte big-endian
+			// unsigned integer, so the largest Value length the wire format can
+			// faithfully represent is maxDatasetValueLen (math.MaxUint32 in
+			// production). Parse's aggregate (maxIPTCTotalBytes/maxIPTCDatasets)
+			// caps make this unreachable for any *IPTC produced by Parse, but
+			// Dataset is a public struct — a caller can construct one directly
+			// with an arbitrarily large Value, bypassing those caps entirely.
+			// Without this guard, the byte(n>>24)/byte(n>>16)/byte(n>>8)/byte(n)
+			// writes below would silently truncate n to its low 32 bits while
+			// buf.Write(ds.Value) still wrote every byte of the oversized
+			// Value — producing a stream whose declared length disagrees with
+			// its actual content (corrupt output; a reader desynchronises on
+			// the next dataset marker).
+			if uint64(n) > maxDatasetValueLen {
+				encBufPool.Put(buf)
+				return nil, ErrDatasetValueTooLarge
+			}
 			buf.WriteByte(0x1C)
 			buf.WriteByte(ds.Record)
 			buf.WriteByte(ds.DataSet)
-			n := len(ds.Value)
 			if n >= 0x8000 {
 				// Extended length encoding (IIM §1.6.2): the 2-byte size field
 				// has bit 15 set; the remaining 15 bits encode the byte count
