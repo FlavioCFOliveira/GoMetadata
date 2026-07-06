@@ -425,9 +425,30 @@ func rebuildMoovContent(moovContent, rawEXIF, rawXMP []byte) []byte {
 	if !hasUUID {
 		return moovContent
 	}
-	// uuidData is the UUID payload: everything after the 8-byte header + 16-byte UUID.
-	const uuidHeaderLen = 8 + 16
-	uuidData := moovContent[uuidStart+uuidHeaderLen : uuidEnd]
+	// CR3-EXTSIZE-01 fix: re-derive the Canon uuid box's ACTUAL header length
+	// instead of assuming the normal 8-byte header. ISO 14496-12 §4.2: when a
+	// box's 32-bit size field is 1, the real size lives in an 8-byte largesize
+	// field immediately after the type, making the header 16 bytes, not 8. The
+	// previous code hardcoded `const uuidHeaderLen = 8 + 16`, which — on a
+	// source file whose Canon uuid box used the extended encoding — sliced 8
+	// bytes too early, embedding half of the largesize field as bogus leading
+	// "content" and silently dropping every sibling sub-box (CMT2, XMP , ...)
+	// while returning no error.
+	//
+	// flatUUIDBoxRange already parsed a well-formed box header at uuidStart
+	// (that is how it located this box), so re-parsing it here is a cheap,
+	// pure, side-effect-free re-derivation — not a hardcoded assumption — and
+	// is guaranteed to succeed.
+	_, _, uuidHeaderLen, ok := parseCR3BoxHeader(moovContent, uuidStart)
+	if !ok {
+		// Unreachable in practice; degrade gracefully rather than panic.
+		return moovContent
+	}
+	// uuidData is the UUID payload: everything after the box header (8 or 16
+	// bytes) plus the mandatory 16-byte UUID field. flatUUIDBoxRange guarantees
+	// size >= headerLen+16, so uuidEnd >= uuidStart+uuidHeaderLen+16 and this
+	// slice cannot underflow.
+	uuidData := moovContent[uuidStart+int(uuidHeaderLen)+16 : uuidEnd] //nolint:gosec // G115: uuidHeaderLen is 8 or 16; bounds guaranteed by flatUUIDBoxRange's size>=headerLen+16 check
 	newUUIDContent, hadXMP := rebuildUUIDContent(uuidData, rawEXIF, rawXMP)
 	// Append a new "XMP " sub-box if XMP was not already present but is now provided.
 	if !hadXMP && rawXMP != nil {
@@ -514,8 +535,29 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 // metadata payloads, relocates stco/co64 offsets, and returns the reassembled
 // file bytes. rawIPTC is intentionally ignored: CR3 does not carry IPTC.
 func injectIntoMoov(data []byte, moovStart, moovEnd int, rawEXIF, rawXMP []byte) ([]byte, error) {
-	// moovContent is the moov box payload (everything after the 8-byte header).
-	moovContent := data[moovStart+8 : moovEnd]
+	// CR3-EXTSIZE-01 fix: re-derive moov's ACTUAL header length instead of
+	// hardcoding +8. ISO 14496-12 §4.2: when the source moov box uses the
+	// extended box-size encoding (32-bit size field == 1, followed by an
+	// 8-byte largesize), the real header is 16 bytes, not 8. The previous code
+	// hardcoded +8, which — on such a file — sliced 8 bytes too early,
+	// embedding half of the largesize field as bogus leading "content" and
+	// corrupting the entire rebuilt box tree: Inject returned no error, but
+	// the new EXIF was silently discarded and a subsequent Extract on the
+	// "successfully written" output failed with ErrNoCMT1Box.
+	//
+	// findMoovRange already parsed a well-formed box header at moovStart (that
+	// is how it located this box), so re-parsing it here is a cheap, pure,
+	// side-effect-free re-derivation — not a hardcoded assumption — and is
+	// guaranteed to succeed.
+	_, _, moovHeaderLen, ok := parseCR3BoxHeader(data, moovStart)
+	if !ok {
+		// Unreachable in practice: findMoovRange already validated this exact
+		// header. Guarded defensively rather than assumed.
+		return nil, fmt.Errorf("cr3: moov box header at offset %d could not be re-parsed: %w", moovStart, ErrNoMoovBox)
+	}
+	// moovContent is the moov box payload: everything after the header, which
+	// is 8 bytes for a normal box or 16 bytes for an extended-size box.
+	moovContent := data[moovStart+int(moovHeaderLen) : moovEnd] //nolint:gosec // G115: moovHeaderLen is 8 or 16; moovStart+moovHeaderLen <= moovEnd guaranteed by parseCR3BoxHeader's size>=headerLen check
 	newMoovContent := rebuildMoovContent(moovContent, rawEXIF, rawXMP)
 	newMoovBox := buildBox("moov", newMoovContent)
 
@@ -584,7 +626,13 @@ func flatUUIDBoxRange(data []byte, uuid []byte) (start, end int, found bool) {
 		if !ok {
 			break
 		}
-		if typ == "uuid" && pos+int(headerLen)+16 <= len(data) { //nolint:gosec // G115: headerLen is 8 or 16
+		// ISOBMFF (ISO 14496-12) §4.2: a uuid box payload must accommodate both
+		// the header and the mandatory 16-byte UUID field. The size>=headerLen+16
+		// guard mirrors the identical check already present in findUUIDBox below;
+		// without it, rebuildMoovContent's slice
+		// (moovContent[uuidStart+headerLen+16 : uuidEnd]) could underflow on a
+		// box whose declared size is smaller than headerLen+16.
+		if typ == "uuid" && size >= headerLen+16 && pos+int(headerLen)+16 <= len(data) { //nolint:gosec // G115: headerLen is 8 or 16
 			if matchesUUID(data[pos+int(headerLen):], uuid) { //nolint:gosec // G115: headerLen is 8 or 16
 				return pos, pos + int(size), true //nolint:gosec // G115: ISOBMFF box size bounded by file size
 			}
