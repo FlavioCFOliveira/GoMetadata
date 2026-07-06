@@ -1,6 +1,6 @@
 package exif
 
-// conformance_structural_test.go — EXIF/TIFF/BigTIFF conformance battery: structural rules S-01..S-33.
+// conformance_structural_test.go — EXIF/TIFF/BigTIFF conformance battery: structural rules S-01..S-39.
 //
 // Spec references:
 //   - TIFF 6.0 (Adobe, 1992) §2 — IFD layout, byte order, field types, offsets.
@@ -1243,12 +1243,263 @@ func TestConformance_S33_interop_tags(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Section 2.7 — BigTIFF Write / Encode (S-34..S-39, task #264)
+// ---------------------------------------------------------------------------
+
+// TestConformance_S34_bigtiff_header_encode verifies that Encode emits a
+// conformant 16-byte BigTIFF header for a BigTIFF-provenanced EXIF, for both
+// byte orders. BigTIFF spec §2.
+func TestConformance_S34_bigtiff_header_encode(t *testing.T) {
+	t.Parallel()
+	for _, order := range []binary.ByteOrder{binary.LittleEndian, binary.BigEndian} {
+		e := &EXIF{ByteOrder: order, BigTIFF: true, IFD0: &IFD{Entries: []IFDEntry{
+			{Tag: TagImageWidth, Type: TypeShort, Count: 1, Value: []byte{100, 0}, bigEndian: orderIsBig(order)},
+		}}}
+		out, err := Encode(e)
+		if err != nil {
+			t.Fatalf("S-34: Encode: %v", err)
+		}
+		if len(out) < 16 {
+			t.Fatalf("S-34: output shorter than the 16-byte BigTIFF header (%d bytes)", len(out))
+		}
+		if order == binary.LittleEndian {
+			if out[0] != 'I' || out[1] != 'I' {
+				t.Errorf("S-34: BOM = %q, want \"II\"", out[0:2])
+			}
+		} else {
+			if out[0] != 'M' || out[1] != 'M' {
+				t.Errorf("S-34: BOM = %q, want \"MM\"", out[0:2])
+			}
+		}
+		if got := order.Uint16(out[2:4]); got != 0x002B {
+			t.Errorf("S-34: magic = 0x%04X, want 0x002B", got)
+		}
+		if got := order.Uint16(out[4:6]); got != 8 {
+			t.Errorf("S-34: bytesize-of-offsets = %d, want 8", got)
+		}
+		if got := order.Uint16(out[6:8]); got != 0 {
+			t.Errorf("S-34: reserved = %d, want 0", got)
+		}
+		if got := order.Uint64(out[8:16]); got != 16 {
+			t.Errorf("S-34: IFD0 offset = %d, want 16", got)
+		}
+	}
+}
+
+// TestConformance_S35_bigtiff_ifd_layout_encode verifies that Encode writes a
+// BigTIFF IFD as a uint64 entry count followed by 20-byte entries (tag u16,
+// type u16, count u64, value/offset u64) and a uint64 next-IFD pointer, sorted
+// ascending by tag. BigTIFF spec §2.
+func TestConformance_S35_bigtiff_ifd_layout_encode(t *testing.T) {
+	t.Parallel()
+	order := binary.LittleEndian
+	e := &EXIF{ByteOrder: order, BigTIFF: true, IFD0: &IFD{Entries: []IFDEntry{
+		// Deliberately unsorted input; buildIFD0Entries/sortEntries must sort it.
+		{Tag: TagImageLength, Type: TypeShort, Count: 1, Value: []byte{200, 0}},
+		{Tag: TagImageWidth, Type: TypeShort, Count: 1, Value: []byte{100, 0}},
+	}}}
+	out, err := Encode(e)
+	if err != nil {
+		t.Fatalf("S-35: Encode: %v", err)
+	}
+	ifd0Off := order.Uint64(out[8:16])
+	if ifd0Off != 16 {
+		t.Fatalf("S-35: IFD0 offset = %d, want 16", ifd0Off)
+	}
+	n := order.Uint64(out[ifd0Off:])
+	if n != 2 {
+		t.Fatalf("S-35: entry count = %d, want 2", n)
+	}
+	const entrySize = 20
+	firstTag := TagID(order.Uint16(out[ifd0Off+8:]))
+	secondTag := TagID(order.Uint16(out[ifd0Off+8+entrySize:]))
+	if firstTag != TagImageWidth || secondTag != TagImageLength {
+		t.Errorf("S-35: entries not sorted ascending by tag: got [0x%04X, 0x%04X], want [0x%04X, 0x%04X]",
+			firstTag, secondTag, TagImageWidth, TagImageLength)
+	}
+	nextIFDOff := ifd0Off + 8 + n*entrySize
+	if order.Uint64(out[nextIFDOff:]) != 0 {
+		t.Errorf("S-35: next-IFD pointer = %d, want 0 (no IFD1)", order.Uint64(out[nextIFDOff:]))
+	}
+}
+
+// TestConformance_S36_bigtiff_inline_threshold_encode verifies that Encode
+// places a total of exactly 8 bytes (typeSizeBigTIFF(Type)*Count) inline,
+// left-justified and zero-padded, and a total of 9+ bytes out-of-line with a
+// uint64 absolute offset. BigTIFF spec §2.
+func TestConformance_S36_bigtiff_inline_threshold_encode(t *testing.T) {
+	t.Parallel()
+	order := binary.LittleEndian
+
+	// RATIONAL count=1 = 8 bytes: must be inline.
+	rat := make([]byte, 8)
+	order.PutUint32(rat[0:], 1)
+	order.PutUint32(rat[4:], 100)
+	e := &EXIF{ByteOrder: order, BigTIFF: true, IFD0: &IFD{Entries: []IFDEntry{
+		{Tag: TagExposureTime, Type: TypeRational, Count: 1, Value: rat},
+	}}}
+	out, err := Encode(e)
+	if err != nil {
+		t.Fatalf("S-36: Encode: %v", err)
+	}
+	e2, err := Parse(out)
+	if err != nil {
+		t.Fatalf("S-36: Parse: %v", err)
+	}
+	entry := e2.IFD0.Get(TagExposureTime)
+	if entry == nil {
+		t.Fatal("S-36: ExposureTime missing after round-trip")
+	}
+	if r := entry.Rational(0); r[0] != 1 || r[1] != 100 {
+		t.Errorf("S-36: Rational = [%d/%d], want [1/100]", r[0], r[1])
+	}
+	// The IFD block itself must be exactly the fixed overhead (8+20+8=36
+	// bytes, rounded to even) with NO value area appended, proving the 8-byte
+	// RATIONAL landed inline rather than out-of-line.
+	if got := ifdTotalSizeBigTIFF(e.IFD0.Entries); got != 36 {
+		t.Errorf("S-36: ifdTotalSizeBigTIFF = %d, want 36 (fixed overhead only, no OOL value area)", got)
+	}
+
+	// UNDEFINED count=9 = 9 bytes: must be out-of-line (total > 8).
+	blob := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9}
+	e.IFD0.Entries = []IFDEntry{
+		{Tag: TagMakerNote, Type: TypeUndefined, Count: uint32(len(blob)), Value: blob}, //nolint:gosec // G115: test data, fixed 9-byte length
+	}
+	if got := ifdTotalSizeBigTIFF(e.IFD0.Entries); got <= 36 {
+		t.Errorf("S-36: ifdTotalSizeBigTIFF = %d for a 9-byte OOL value, want > 36 (value area must be appended)", got)
+	}
+}
+
+// TestConformance_S37_bigtiff_next_ifd_pointer_encode verifies that Encode
+// writes the next-IFD pointer as a uint64 and that it correctly targets IFD1
+// when present, 0 otherwise. BigTIFF spec §2.
+func TestConformance_S37_bigtiff_next_ifd_pointer_encode(t *testing.T) {
+	t.Parallel()
+	order := binary.LittleEndian
+	e := &EXIF{ByteOrder: order, BigTIFF: true, IFD0: &IFD{
+		Entries: []IFDEntry{{Tag: TagImageWidth, Type: TypeShort, Count: 1, Value: []byte{100, 0}}},
+		Next:    &IFD{Entries: []IFDEntry{{Tag: TagImageWidth, Type: TypeShort, Count: 1, Value: []byte{50, 0}}}},
+	}}
+	out, err := Encode(e)
+	if err != nil {
+		t.Fatalf("S-37: Encode: %v", err)
+	}
+	ifd0Off := order.Uint64(out[8:16])
+	n := order.Uint64(out[ifd0Off:])
+	const entrySize = 20
+	nextIFDOff := ifd0Off + 8 + n*entrySize
+	nextPtr := order.Uint64(out[nextIFDOff:])
+	if nextPtr == 0 {
+		t.Fatal("S-37: next-IFD pointer = 0, want non-zero (IFD1 present)")
+	}
+	// The pointer must actually resolve to a valid IFD1.
+	e2, err := Parse(out)
+	if err != nil {
+		t.Fatalf("S-37: Parse: %v", err)
+	}
+	if e2.IFD0.Next == nil {
+		t.Fatal("S-37: IFD1 not reachable via next-IFD pointer")
+	}
+}
+
+// TestConformance_S38_bigtiff_subifd_pointer_type_encode verifies that Encode
+// writes sub-IFD pointer tags (ExifIFDPointer, GPSIFDPointer,
+// InteropIFDPointer) with type field = TypeLong — never promoted to
+// TypeIFD8/TypeLong8 — and the 4-byte value left-justified with the upper 4
+// bytes of the 8-byte field zero. EXIF §4.6.3; BigTIFF spec §2.
+func TestConformance_S38_bigtiff_subifd_pointer_type_encode(t *testing.T) {
+	t.Parallel()
+	order := binary.LittleEndian
+	e := &EXIF{ByteOrder: order, BigTIFF: true, IFD0: &IFD{Entries: []IFDEntry{
+		{Tag: TagImageWidth, Type: TypeShort, Count: 1, Value: []byte{100, 0}},
+	}}}
+	e.ExifIFD = &IFD{Entries: []IFDEntry{
+		{Tag: 0x9000, Type: TypeUndefined, Count: 4, Value: []byte("0232")},
+	}}
+	out, err := Encode(e)
+	if err != nil {
+		t.Fatalf("S-38: Encode: %v", err)
+	}
+
+	ifd0Off := order.Uint64(out[8:16])
+	n := order.Uint64(out[ifd0Off:])
+	const entrySize = 20
+	found := false
+	for i := range n {
+		p := ifd0Off + 8 + i*entrySize
+		if TagID(order.Uint16(out[p:])) != TagExifIFDPointer {
+			continue
+		}
+		found = true
+		if typ := DataType(order.Uint16(out[p+2:])); typ != TypeLong {
+			t.Errorf("S-38: ExifIFDPointer type = %d, want TypeLong (%d)", typ, TypeLong)
+		}
+		for _, b := range out[p+16 : p+20] {
+			if b != 0 {
+				t.Errorf("S-38: ExifIFDPointer value field upper 4 bytes not zero: %v", out[p+16:p+20])
+				break
+			}
+		}
+	}
+	if !found {
+		t.Fatal("S-38: ExifIFDPointer entry not found in encoded IFD0")
+	}
+}
+
+// TestConformance_S39_bigtiff_alignment_encode verifies that Encode applies
+// word (2-byte) alignment to BigTIFF out-of-line values — the documented
+// design decision (see ifdTotalSizeBigTIFF's doc comment) — consistently
+// between ifdTotalSizeBigTIFF (used for offset planning) and writeIFDBigTIFF
+// (the actual byte writer): every OOL value's absolute file offset must be
+// even, and the two functions must agree exactly on the resulting IFD block
+// length. BigTIFF spec §2 (word-alignment decision).
+func TestConformance_S39_bigtiff_alignment_encode(t *testing.T) {
+	t.Parallel()
+	order := binary.LittleEndian
+	// ASCII count=9 (9 bytes, odd) forces the value area to become odd-length,
+	// which would misalign a second OOL entry placed immediately after it
+	// without a padding byte.
+	odd := []byte("12345678\x00")                 // 9 bytes
+	blob := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10} // 10 bytes, OOL
+	entries := []IFDEntry{
+		{Tag: TagImageDescription, Type: TypeASCII, Count: uint32(len(odd)), Value: odd}, //nolint:gosec // G115: test data, fixed 9-byte length
+		{Tag: TagMakerNote, Type: TypeUndefined, Count: uint32(len(blob)), Value: blob},  //nolint:gosec // G115: test data, fixed 10-byte length
+	}
+	sortEntries(entries)
+
+	wantSize := ifdTotalSizeBigTIFF(entries)
+	got := writeIFDBigTIFF(nil, entries, order, 0, 0)
+	if uint64(len(got)) != wantSize {
+		t.Fatalf("S-39: writeIFDBigTIFF produced %d bytes, ifdTotalSizeBigTIFF predicted %d", len(got), wantSize)
+	}
+
+	// Locate the second (out-of-line) entry's offset field and verify it is even.
+	const entrySize = 20
+	n := order.Uint64(got[0:])
+	for i := range n {
+		p := 8 + i*entrySize
+		tag := TagID(order.Uint16(got[p:]))
+		if tag != TagMakerNote {
+			continue
+		}
+		off := order.Uint64(got[p+12:])
+		if off&1 != 0 {
+			t.Errorf("S-39: MakerNote OOL offset = %d, want even (word-aligned)", off)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Corpus-parity sub-tests for structural rules
 // ---------------------------------------------------------------------------
 
 // TestConformance_Structural_CorpusParity parses all TIFF files in the test corpus
 // and verifies that none panic and all produce a valid (non-nil) EXIF struct or a
 // well-typed error. This validates structural rules S-01..S-33 against real files.
+// (S-34..S-39, the BigTIFF write/Encode rules, are validated against the same
+// corpus by the round-trip tests in bigtiff_write_test.go and
+// TestConformance_R14_bigtiff_roundtrip_fidelity, since they concern Encode's
+// output rather than Parse's input.)
 func TestConformance_Structural_CorpusParity(t *testing.T) {
 	t.Parallel()
 	// Use the testdata/corpus/tiff directory directly (exif package lives at exif/).

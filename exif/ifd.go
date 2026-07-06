@@ -2474,3 +2474,171 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 	}
 	return out
 }
+
+// ---------------------------------------------------------------------------
+// BigTIFF IFD encoding (BigTIFF spec §2, Aware Systems / libtiff; task #264)
+// ---------------------------------------------------------------------------
+//
+// ifdTotalSizeBigTIFF and writeIFDBigTIFF are the BigTIFF counterparts of
+// ifdTotalSize and writeIFD above. Every classic-TIFF constant widens to its
+// BigTIFF equivalent:
+//
+//	entry count field     2 bytes (u16)  -> 8 bytes (u64)
+//	entry width           12 bytes       -> 20 bytes (tag u16 + type u16 + count u64 + value/offset u64)
+//	inline/OOL threshold   4 bytes        -> 8 bytes
+//	next-IFD pointer       4 bytes (u32)  -> 8 bytes (u64)
+//
+// #1 correctness rule (task #264): every size computation below calls
+// typeSizeBigTIFF, NEVER typeSize. typeSize returns 0 for the BigTIFF-only
+// types LONG8/SLONG8/IFD8 (16/17/18); using it here would treat every 8-byte
+// BigTIFF-only value as size 0, causing writeIFDBigTIFF's
+// copy(entryBuf[p+12:p+20], e.Value) to silently truncate 8-byte values, and
+// ifdTotalSizeBigTIFF to undercount the value area — desynchronising every
+// subsequent offset in the stream. This is the single most important
+// invariant of the BigTIFF write path; conflating the two functions corrupts
+// LONG8/SLONG8/IFD8 data without any visible error.
+//
+// Alignment decision (BigTIFF Design doc vs libtiff tif_dirwrite.c): the
+// design-doc TEXT states "all values must begin at an 8-byte-aligned
+// address", but the REFERENCE IMPLEMENTATION (libtiff — the de-facto authority
+// for BigTIFF interoperability) enforces only word (2-byte) alignment even in
+// its BigTIFF writer (`if (tif_dataoff & 1) tif_dataoff++`, tif_dirwrite.c) —
+// identical to classic TIFF. This is also the alignment observed in this
+// project's own committed reference fixtures (exif/testdata/BigTIFF_{LE,BE}.tif,
+// produced by `tiffcp -8`). We follow libtiff's actual behaviour rather than
+// the design-doc's advisory text because: (1) it guarantees byte-for-byte
+// interoperability with the reference implementation and with every BigTIFF
+// file already accepted by this package's read path; (2) it lets
+// writeIFDBigTIFF/ifdTotalSizeBigTIFF reuse the exact, already-audited
+// padding arithmetic from writeIFD/ifdTotalSize — only the field widths
+// change; (3) 8-byte alignment is a read-performance (mmap/DMA) convention
+// for some big-data TIFF readers, not a data-integrity requirement — no known
+// reader rejects a word-aligned BigTIFF value area.
+//
+// ifdTotalSizeBigTIFF returns the total bytes occupied by the serialised
+// BigTIFF IFD block: 8 (entry count) + len(entries)*20 (entry list) + 8
+// (next-IFD pointer) + value area. Accumulation is performed entirely in
+// uint64; Count is a uint32 field (see IFDEntry) and typeSizeBigTIFF never
+// exceeds 8, so a single entry's total cannot exceed roughly 2^35 — summing
+// even bigTIFFMaxEntries (65535) such entries stays several orders of
+// magnitude below the uint64 range, so no wrap-around guard is needed in the
+// accumulator itself (R-15). The caller (writeTIFFHeaderBigTIFF) applies the
+// explicit, documented sanity ceiling (maxBigTIFFEncodeSize) before using
+// this value to size a real allocation — see its doc comment for the
+// memory-exhaustion rationale.
+func ifdTotalSizeBigTIFF(entries []IFDEntry) uint64 {
+	// fixed = 8 (count) + n*20 (entries) + 8 (next-IFD pointer); always even
+	// (8 + 20n + 8 = even + even*n = even), matching the classic invariant
+	// that lets writeIFDBigTIFF/ifdTotalSizeBigTIFF agree on value-area parity
+	// without knowing the absolute start offset.
+	sz := uint64(8 + len(entries)*20 + 8)
+
+	valueParity := uint64(0)
+	for _, e := range entries {
+		ts := typeSizeBigTIFF(e.Type) // #1 correctness rule: never typeSize here.
+		if ts == 0 {
+			continue
+		}
+		total := ts * uint64(e.Count)
+		if total > 8 {
+			// BigTIFF spec §2 / word-alignment decision above: insert a single
+			// 0x00 pad byte if the running value-area offset is odd.
+			if valueParity == 1 {
+				sz++
+			}
+			sz += total
+			valueParity = total & 1
+		}
+	}
+
+	// Round up to the nearest even byte count so the next IFD block placed
+	// immediately after also starts at an even file offset.
+	if sz&1 == 1 {
+		sz++
+	}
+	return sz
+}
+
+// writeIFDBigTIFF is the BigTIFF counterpart of writeIFD; see the section
+// comment above ifdTotalSizeBigTIFF for the full BigTIFF-vs-classic constant
+// mapping and the word-alignment design decision. startOff is the absolute
+// file offset at which the IFD block begins; nextIFDOffset is the absolute
+// file offset of the next IFD in the chain (0 = end of chain).
+func writeIFDBigTIFF(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, nextIFDOffset uint64) []byte {
+	n := len(entries)
+	// value area begins right after: 8 (count) + n*20 (entries) + 8 (next-IFD).
+	valueOff := startOff + uint64(8+n*20+8)
+
+	// BigTIFF spec §2: IFD entry count is an 8-byte unsigned integer.
+	out = appendUint64Order(out, order, uint64(n))
+
+	scratchPtr := iobuf.Get(n * 20)
+	entryBuf := (*scratchPtr)[:n*20]
+	// Zero the scratch buffer before writing (see writeIFD's identical
+	// rationale): unused inline-value padding — including the 4 zero-padding
+	// bytes that follow every left-justified 4-byte TypeLong sub-IFD pointer
+	// value (BigTIFF spec §2 / task #264 §4) — must be deterministic, not
+	// stale pool contents from a prior Encode call.
+	clear(entryBuf)
+	defer iobuf.Put(scratchPtr)
+	var valueArea []byte
+	curOff := valueOff
+
+	for i, e := range entries {
+		p := i * 20
+		order.PutUint16(entryBuf[p:], uint16(e.Tag))
+		order.PutUint16(entryBuf[p+2:], uint16(e.Type))
+		order.PutUint64(entryBuf[p+4:], uint64(e.Count))
+
+		// #1 correctness rule: typeSizeBigTIFF, never typeSize (see the
+		// section comment above ifdTotalSizeBigTIFF). Conflating the two
+		// would silently truncate every LONG8/SLONG8/IFD8 (16/17/18) value.
+		ts := typeSizeBigTIFF(e.Type)
+		total := ts * uint64(e.Count)
+
+		if ts == 0 || total <= 8 {
+			// Inline value: left-justified in the 8-byte field, zero-padded
+			// (BigTIFF spec §2). Sub-IFD pointer tags (ExifIFDPointer 0x8769,
+			// GPSIFDPointer 0x8825, InteropIFDPointer 0xA005) and thumbnail
+			// pointer tags (JPEGInterchangeFormat 0x0201,
+			// JPEGInterchangeFormatLength 0x0202) stay TypeLong per EXIF
+			// §4.6.3/§4.5.5 regardless of container, so their 4-byte value
+			// lands here left-justified with 4 zero-padding bytes — exactly
+			// the libtiff/tiffcp convention this package's reader already
+			// accepts (see readBigTIFFSubIFDOffset). Unknown-type entries
+			// (ts == 0) are copied back verbatim: parseIFDEntryBigTIFF stores
+			// their full 8-byte raw field as Value, so this copy reproduces
+			// it exactly (V-14).
+			copy(entryBuf[p+12:p+20], e.Value)
+		} else {
+			// Out-of-line: word-align (see design decision above), then
+			// store a uint64 absolute file offset in the 8-byte field.
+			if curOff&1 == 1 {
+				valueArea = append(valueArea, 0x00)
+				curOff++
+			}
+			order.PutUint64(entryBuf[p+12:], curOff)
+			valueArea = append(valueArea, e.Value...)
+			// BigTIFF spec §2: the value area for this entry must be exactly
+			// Count * typeSizeBigTIFF(Type) bytes; zero-fill any shortfall so
+			// subsequent entries receive correct offsets.
+			if uint64(len(e.Value)) < total {
+				pad := total - uint64(len(e.Value))
+				valueArea = append(valueArea, make([]byte, pad)...)
+			}
+			curOff += total
+		}
+	}
+
+	out = append(out, entryBuf...)
+	// BigTIFF spec §2: next-IFD pointer is an 8-byte unsigned integer (0 = end).
+	out = appendUint64Order(out, order, nextIFDOffset)
+	out = append(out, valueArea...)
+
+	// Trailing word-alignment pad — mirrors ifdTotalSizeBigTIFF's parity logic
+	// so the next IFD block placed immediately after also starts even.
+	if len(out)&1 == 1 {
+		out = append(out, 0x00)
+	}
+	return out
+}

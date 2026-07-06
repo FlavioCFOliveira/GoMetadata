@@ -1,6 +1,6 @@
 package exif
 
-// conformance_robustness_test.go — EXIF/TIFF conformance battery: robustness rules R-01..R-13
+// conformance_robustness_test.go — EXIF/TIFF conformance battery: robustness rules R-01..R-17
 // and Section 5 real-world deviations 1–12.
 //
 // Spec references:
@@ -13,7 +13,9 @@ package exif
 // Every sub-test name matches the rule ID from docs/conformance/exif-tiff.md.
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -569,6 +571,152 @@ func TestConformance_R13_min_length(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// R-14..R-17 — BigTIFF write (Encode) robustness (task #264)
+// ---------------------------------------------------------------------------
+
+// TestConformance_R14_bigtiff_roundtrip_fidelity is the corpus-wide gate for
+// R-14: every BigTIFF file in the shared TIFF corpus that Parse identifies as
+// BigTIFF-provenanced (magic 0x002B) MUST, after an unmodified
+// Encode + re-Parse round-trip, decode every (Tag, Type, Count, Value)
+// identically at every level of the IFD0→IFD1→… chain, and preserve
+// ThumbnailData byte-for-byte.
+//
+// This validates R-14 against real-world encoders (tiffcp -8, ExifTool,
+// metadata-extractor, exiv2 test fixtures) rather than only synthetic inputs
+// — see TestBigTIFFEncodeRoundTrip_Corpus (bigtiff_write_test.go) for the
+// implementation this delegates to.
+func TestConformance_R14_bigtiff_roundtrip_fidelity(t *testing.T) {
+	t.Parallel()
+	const corpusDir = "../testdata/corpus/tiff"
+	paths := corpusFilesFromDir(t, corpusDir)
+
+	tested := 0
+	for _, path := range paths {
+		data := mustReadFile(t, path)
+		e, err := Parse(data)
+		if err != nil || e == nil || !e.BigTIFF {
+			continue
+		}
+		tested++
+		t.Run(path, func(t *testing.T) {
+			t.Parallel()
+			mustNotPanic(t, "R-14 "+path, func() {
+				encoded, encErr := Encode(e)
+				if encErr != nil {
+					t.Fatalf("R-14: Encode: %v", encErr)
+				}
+				e2, reErr := Parse(encoded)
+				if reErr != nil {
+					t.Fatalf("R-14: Parse (round-trip): %v", reErr)
+				}
+				a, b := e.IFD0, e2.IFD0
+				for level := 0; a != nil && b != nil; level++ {
+					if !entriesEqual(snapshotEntries(a.Entries), snapshotEntries(b.Entries)) {
+						t.Errorf("R-14: IFD level %d entries differ after round-trip", level)
+					}
+					if !bytes.Equal(a.ThumbnailData, b.ThumbnailData) {
+						t.Errorf("R-14: IFD level %d ThumbnailData differs after round-trip", level)
+					}
+					a, b = a.Next, b.Next
+				}
+				if (a == nil) != (b == nil) {
+					t.Error("R-14: IFD chain length differs after round-trip")
+				}
+			})
+		})
+	}
+	if tested == 0 {
+		t.Skip("no BigTIFF files found in corpus; run 'make testdata'")
+	}
+}
+
+// TestConformance_R15_bigtiff_size_ceiling is the gate for R-15: BigTIFF
+// encode-side arithmetic is uint64 throughout, and an explicit, documented
+// sanity ceiling (maxBigTIFFEncodeSize) — never math.MaxUint32 saturation —
+// is enforced before any allocation proportional to the computed size.
+func TestConformance_R15_bigtiff_size_ceiling(t *testing.T) {
+	t.Parallel()
+	// A single entry whose declared Count, multiplied by its BigTIFF element
+	// size, computes (in pure uint64 arithmetic — no real allocation) to
+	// roughly 34 GiB. No ExifIFD/GPSIFD/InteropIFD is attached, so R-16's
+	// pointer-overflow guard cannot fire; only R-15's aggregate ceiling can.
+	e := &EXIF{
+		ByteOrder: binary.LittleEndian,
+		BigTIFF:   true,
+		IFD0: &IFD{Entries: []IFDEntry{
+			{Tag: TagStripOffsets, Type: TypeDouble, Count: 0xFFFFFFFF, Value: []byte{}},
+		}},
+	}
+	mustNotPanic(t, "R-15", func() {
+		_, err := Encode(e)
+		if !errors.Is(err, ErrBigTIFFEncodeSizeExceeded) {
+			t.Errorf("R-15: error = %v, want ErrBigTIFFEncodeSizeExceeded", err)
+		}
+	})
+}
+
+// TestConformance_R16_bigtiff_pointer_overflow_guard is the gate for R-16:
+// sub-IFD pointer tags (ExifIFDPointer, GPSIFDPointer, InteropIFDPointer) and
+// thumbnail pointer tags (JPEGInterchangeFormat, JPEGInterchangeFormatLength)
+// are fixed EXIF LONG (4-byte) fields even in BigTIFF (S-38); Encode must
+// fail loudly with ErrBigTIFFPointerOverflow rather than truncate the pointer
+// when the true target offset does not fit in 32 bits.
+func TestConformance_R16_bigtiff_pointer_overflow_guard(t *testing.T) {
+	t.Parallel()
+	e := &EXIF{
+		ByteOrder: binary.LittleEndian,
+		BigTIFF:   true,
+		IFD0: &IFD{Entries: []IFDEntry{
+			{Tag: TagStripOffsets, Type: TypeDouble, Count: 0xFFFFFFFF, Value: []byte{}},
+		}},
+		ExifIFD: &IFD{Entries: []IFDEntry{
+			{Tag: 0x9000, Type: TypeUndefined, Count: 4, Value: []byte("0232")},
+		}},
+	}
+	mustNotPanic(t, "R-16", func() {
+		_, err := Encode(e)
+		if !errors.Is(err, ErrBigTIFFPointerOverflow) {
+			t.Errorf("R-16: error = %v, want ErrBigTIFFPointerOverflow", err)
+		}
+	})
+}
+
+// TestConformance_R17_bigtiff_makernote_verbatim_preserve is the gate for
+// R-17: the MakerNote/IFD1 verbatim-preserve contract (classic-TIFF R-11)
+// applies identically when the source is BigTIFF.
+func TestConformance_R17_bigtiff_makernote_verbatim_preserve(t *testing.T) {
+	t.Parallel()
+	order := binary.LittleEndian
+	data := minimalTIFF(order, [][4]uint32{
+		{uint32(TagImageWidth), uint32(TypeLong), 1, 1920},
+	})
+	e, err := Parse(data)
+	if err != nil {
+		t.Fatalf("R-17: Parse: %v", err)
+	}
+	e.BigTIFF = true
+	mn := bytes.Repeat([]byte{'M', 'N'}, 20) // 40 bytes, out-of-line
+	e.ExifIFD = &IFD{Entries: []IFDEntry{
+		{Tag: TagMakerNote, Type: TypeUndefined, Count: uint32(len(mn)), Value: mn}, //nolint:gosec // G115: test data, fixed 40-byte length
+	}}
+
+	out, err := Encode(e)
+	if err != nil {
+		t.Fatalf("R-17: Encode: %v", err)
+	}
+	e2, err := Parse(out)
+	if err != nil {
+		t.Fatalf("R-17: Parse (round-trip): %v", err)
+	}
+	if e2.MakerNote == nil {
+		t.Fatal("R-17: MakerNote lost across BigTIFF round-trip")
+	}
+	if !bytes.Equal(e2.MakerNote, mn) {
+		t.Error("R-17: MakerNote bytes changed across BigTIFF round-trip")
 	}
 }
 

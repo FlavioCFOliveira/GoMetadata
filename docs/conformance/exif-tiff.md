@@ -102,6 +102,14 @@ code MUST be skipped/preserved (treat 4 value bytes as raw, never dereference).
 - **S-32 (GPS)** GPSVersionID `0x0000` BYTE[4] = {2,3,0,0}; GPSLatitudeRef `0x0001` ASCII "N/S"; GPSLatitude `0x0002` RATIONAL[3]; GPSLongitudeRef `0x0003` "E/W"; GPSLongitude `0x0004` RATIONAL[3]. — Exif §4.6.6 Table 15.
 - **S-33 (Interop)** InteroperabilityIndex `0x0001` ASCII "R98"/"THM"/"R03"; InteroperabilityVersion `0x0002` UNDEFINED "0100". — Exif Annex A.
 
+### 2.7 BigTIFF Write (Encode) — **S-34..S-39** (task #264)
+- **S-34** Encode of a BigTIFF-provenanced EXIF (`EXIF.BigTIFF == true`) emits a 16-byte header: BOM (II/MM) + magic 43 (`2B 00`/`00 2B`) + bytesize-of-offsets `08 00`/`00 08` + reserved `00 00` + uint64 IFD0 offset = 16, for both byte orders. — BigTIFF spec §2.
+- **S-35** Encoded BigTIFF IFD = uint64 entry count + count×20-byte entries (tag u16 @+0, type u16 @+2, count u64 @+4, value-or-offset u64 @+12) + uint64 next-IFD pointer; entries sorted ascending by tag. — BigTIFF spec §2.
+- **S-36** Encoded inline/out-of-line threshold is 8 bytes, computed as `typeSizeBigTIFF(Type) * Count`: totals ≤ 8 are written inline, left-justified, zero-padded; totals > 8 are written out-of-line with a uint64 absolute offset in the value field. — BigTIFF spec §2.
+- **S-37** Encoded next-IFD pointer is a uint64; 0 marks the end of the chain. — BigTIFF spec §2.
+- **S-38** Sub-IFD pointer tags (ExifIFDPointer `0x8769`, GPSIFDPointer `0x8825`, InteropIFDPointer `0xA005`) and thumbnail pointer tags (JPEGInterchangeFormat `0x0201`, JPEGInterchangeFormatLength `0x0202`) are encoded with type field = TypeLong (never promoted to LONG8/IFD8); the 4-byte value is left-justified in the 8-byte field with the upper 4 bytes zero. — EXIF §4.6.3, §4.5.5; BigTIFF spec §2.
+- **S-39** Value-area alignment is word (2-byte), matching the classic-TIFF padding strategy (writeIFD/ifdTotalSize) reused with wider field constants — a deliberate deviation from the BigTIFF design-doc's advisory 8-byte-alignment text, chosen for interoperability with the reference implementation (libtiff `tif_dirwrite.c`, which enforces only word alignment) and with this project's own committed fixtures. — BigTIFF spec §2 (see exif/ifd.go `ifdTotalSizeBigTIFF` doc comment for the full rationale).
+
 ## Section 3: Value-Level Conformance
 - **V-01** RATIONAL [num@0..3, den@4..7] in stream byte order; guard den==0 before float. SRATIONAL = two i32.
 - **V-02** Signed tags (ShutterSpeedValue `0x9201`, BrightnessValue `0x9203`, ExposureBiasValue `0x9204`) MUST use SRational(); using Rational() misreads the sign bit.
@@ -114,6 +122,9 @@ code MUST be skipped/preserved (treat 4 value bytes as raw, never dereference).
 - **V-09** GPSTimeStamp `0x0007` RATIONAL[3] UTC; GPSDateStamp `0x001D` ASCII[11] `"YYYY:MM:DD\0"`.
 - **V-10** UserComment `0x9286` UNDEFINED: 8-byte charset prefix ("ASCII\0\0\0", "UNICODE\0", "JIS\0\0\0\0\0", or all-NUL) + payload; payload < 8 bytes → empty, no panic.
 - **V-11** IFD1 JPEG thumbnail: Compression `0x0103`=6; JPEGInterchangeFormat `0x0201` offset + `0x0202` length within stream; out-of-range → nil thumbnail, no panic.
+- **V-12 (BigTIFF write, task #264)** Every BigTIFF encode-side size computation (ifdTotalSizeBigTIFF, writeIFDBigTIFF) MUST call typeSizeBigTIFF, never typeSize — a regression guard against silently treating LONG8/SLONG8/IFD8 (16/17/18) as size-0.
+- **V-13 (BigTIFF write)** A total of 5–8 bytes (e.g. RATIONAL count=1 = 8 bytes) is placed inline under the BigTIFF threshold, though the same total would be out-of-line under the classic 4-byte threshold; placement is a deterministic function of (Type, Count), never of how the source stored it.
+- **V-14 (BigTIFF write)** An entry with an unrecognised type code round-trips as an opaque 8-byte raw inline field (mirrors parseIFDEntryBigTIFF's `sz == 0` handling) — the exact 8 bytes present at parse time are reproduced verbatim on re-encode.
 
 ## Section 4: Robustness / Graceful Degradation
 - **R-01** Circular IFD chains MUST be detected (visited-offset set); break, no infinite loop.
@@ -129,6 +140,10 @@ code MUST be skipped/preserved (treat 4 value bytes as raw, never dereference).
 - **R-11** Relocating a MakerNote with TIFF-absolute offsets makes them stale: library MUST preserve-in-place, fully rebase, or document the limitation.
 - **R-12** Truncated after header before IFD0 → error (no panic); truncated mid-IFD → partial IFD.
 - **R-13** Classic stream < 8 bytes / BigTIFF < 16 bytes always invalid; check min length first.
+- **R-14 (BigTIFF write, task #264)** Round-trip fidelity: encoding an unmodified BigTIFF-provenanced EXIF and re-parsing it MUST decode every (Tag, Type, Count, Value) identically to the original, at every level of the IFD0→IFD1→… chain, for both real-world fixtures and the shared TIFF corpus.
+- **R-15 (BigTIFF write)** All BigTIFF encode-side offset/size arithmetic is performed in uint64; because classic TIFF's implicit ceiling (offset fields are 32 bits wide, so ifdTotalSize saturates at math.MaxUint32) does not apply to BigTIFF's 64-bit fields, an explicit, documented, test-overridable sanity ceiling (maxBigTIFFEncodeSize) is checked before any allocation proportional to the computed size — never math.MaxUint32 saturation, and never an unchecked allocation.
+- **R-16 (BigTIFF write)** Sub-IFD pointer tags and thumbnail pointer tags (fixed EXIF LONG fields, S-38) never silently receive a value ≥ 2^32 when encoding BigTIFF; Encode fails loudly with ErrBigTIFFPointerOverflow instead of truncating the pointer.
+- **R-17 (BigTIFF write)** The MakerNote/IFD1 verbatim-preserve contract (classic-TIFF R-11) applies identically when the source is BigTIFF: MakerNote bytes and IFD1 (thumbnail) entries survive an Encode round-trip unchanged.
 
 ## Section 5: Real-World Deviations (handle gracefully)
 1. Unsorted IFD entries (MUST sort/linear-search, not binary-search-on-unsorted).

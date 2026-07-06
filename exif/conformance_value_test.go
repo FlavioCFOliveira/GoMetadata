@@ -1,15 +1,17 @@
 package exif
 
-// conformance_value_test.go — EXIF/TIFF conformance battery: value-level rules V-01..V-11.
+// conformance_value_test.go — EXIF/TIFF conformance battery: value-level rules V-01..V-14.
 //
 // Spec references:
 //   - CIPA DC-X008-Translation-2019 (Exif 2.32) §4.6.3–§4.6.6.
 //   - CIPA DC-008-Translation-2023 (Exif 3.0) §4.6.3.
 //   - TIFF 6.0 §2 Table 1.
+//   - BigTIFF spec (Aware Systems / libtiff) §2/§3.3 (V-12..V-14, task #264).
 //
 // Every sub-test name matches the rule ID from docs/conformance/exif-tiff.md.
 
 import (
+	"bytes"
 	"encoding/binary"
 	"testing"
 )
@@ -576,4 +578,118 @@ func TestConformance_V11_ifd1_jpeg_thumbnail(t *testing.T) {
 			_ = e2.IFD0.Next.ThumbnailData
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// V-12..V-14 — BigTIFF write (Encode) value-level conformance (task #264)
+// ---------------------------------------------------------------------------
+
+// TestConformance_V12_typeSizeBigTIFF_used_not_typeSize is the regression
+// guard for V-12: ifdTotalSizeBigTIFF and writeIFDBigTIFF must size and place
+// LONG8/SLONG8/IFD8 (16/17/18) values using typeSizeBigTIFF (8 bytes each),
+// never typeSize (which returns 0 for these codes). A two-element LONG8 array
+// (16 bytes total) must be placed out-of-line with its full 16 bytes intact —
+// if typeSize were used instead, ts would be 0, causing total=0 (<=8, wrongly
+// inline) and truncating the array to whatever fits in the 8-byte field.
+func TestConformance_V12_typeSizeBigTIFF_used_not_typeSize(t *testing.T) {
+	t.Parallel()
+	order := binary.LittleEndian
+	var want [16]byte
+	order.PutUint64(want[0:], 0x1122334455667788)
+	order.PutUint64(want[8:], 0x99AABBCCDDEEFF00)
+
+	e := &EXIF{ByteOrder: order, BigTIFF: true, IFD0: &IFD{Entries: []IFDEntry{
+		{Tag: TagStripOffsets, Type: TypeLong8, Count: 2, Value: want[:]},
+	}}}
+	// Sanity: typeSizeBigTIFF(TypeLong8)=8 and Count=2 gives total=16 > 8,
+	// so this entry MUST be encoded out-of-line — ifdTotalSizeBigTIFF's
+	// return value must reflect the 16-byte value area.
+	if sz := ifdTotalSizeBigTIFF(e.IFD0.Entries); sz <= 36 {
+		t.Fatalf("V-12: ifdTotalSizeBigTIFF = %d, want > 36 (16-byte LONG8[2] value area missing — typeSize used instead of typeSizeBigTIFF?)", sz)
+	}
+
+	out, err := Encode(e)
+	if err != nil {
+		t.Fatalf("V-12: Encode: %v", err)
+	}
+	e2, err := Parse(out)
+	if err != nil {
+		t.Fatalf("V-12: Parse: %v", err)
+	}
+	entry := e2.IFD0.Get(TagStripOffsets)
+	if entry == nil {
+		t.Fatal("V-12: StripOffsets missing after round-trip")
+	}
+	if entry.Type != TypeLong8 {
+		t.Errorf("V-12: type = %d, want TypeLong8 (%d)", entry.Type, TypeLong8)
+	}
+	if !bytes.Equal(entry.Value, want[:]) {
+		t.Errorf("V-12: Value = %v, want %v (LONG8[2] truncated — typeSize used instead of typeSizeBigTIFF)", entry.Value, want[:])
+	}
+}
+
+// TestConformance_V13_bigtiff_inline_5to8_bytes verifies that totals in the
+// 5-8 byte range — which would be out-of-line under the classic 4-byte
+// threshold — are placed inline under the BigTIFF 8-byte threshold, and that
+// placement depends only on (Type, Count), never on how many bytes the
+// in-memory Value slice happens to occupy.
+func TestConformance_V13_bigtiff_inline_5to8_bytes(t *testing.T) {
+	t.Parallel()
+	order := binary.LittleEndian
+
+	for _, tc := range []struct {
+		name  string
+		typ   DataType
+		count uint32
+		value []byte
+	}{
+		{"ASCII_5", TypeASCII, 5, []byte("abcd\x00")},
+		{"ASCII_8", TypeASCII, 8, []byte("abcdefg\x00")},
+		{"RATIONAL_8", TypeRational, 1, func() []byte { b := make([]byte, 8); order.PutUint32(b, 1); order.PutUint32(b[4:], 2); return b }()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			entries := []IFDEntry{{Tag: TagImageDescription, Type: tc.typ, Count: tc.count, Value: tc.value}}
+			// Fixed overhead only (8+20+8=36, already even) proves the value
+			// landed inline — no value-area bytes appended.
+			if sz := ifdTotalSizeBigTIFF(entries); sz != 36 {
+				t.Errorf("V-13 %s: ifdTotalSizeBigTIFF = %d, want 36 (value must be inline, total=%d<=8)", tc.name, sz, typeSizeBigTIFF(tc.typ)*uint64(tc.count))
+			}
+		})
+	}
+}
+
+// TestConformance_V14_unknown_type_roundtrip is the gate for V-14: an entry
+// with an unrecognised type code (not defined by TIFF 6.0/EXIF/BigTIFF) is
+// parsed as an opaque 8-byte raw field and must round-trip through Encode
+// byte-for-byte as an inline 8-byte field. See
+// TestBigTIFFEncode_UnknownTypeRoundTrip (bigtiff_write_test.go) for the
+// full end-to-end version of this gate; this sub-test is the conformance
+// checklist's canonical entry point for V-14.
+func TestConformance_V14_unknown_type_roundtrip(t *testing.T) {
+	t.Parallel()
+	order := binary.LittleEndian
+	want := []byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22}
+	data := buildBigTIFF(order, []bigTIFFEntry{
+		{tag: uint16(TagImageWidth), typ: 200, count: 1, payload: want},
+	})
+	e, err := Parse(data)
+	if err != nil {
+		t.Fatalf("V-14: Parse: %v", err)
+	}
+	out, err := Encode(e)
+	if err != nil {
+		t.Fatalf("V-14: Encode: %v", err)
+	}
+	e2, err := Parse(out)
+	if err != nil {
+		t.Fatalf("V-14: Parse (round-trip): %v", err)
+	}
+	entry := e2.IFD0.Get(TagImageWidth)
+	if entry == nil {
+		t.Fatal("V-14: unknown-type entry lost across round-trip")
+	}
+	if !bytes.Equal(entry.Value, want) {
+		t.Errorf("V-14: Value = %v, want %v", entry.Value, want)
+	}
 }

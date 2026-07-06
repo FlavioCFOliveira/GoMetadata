@@ -2,6 +2,7 @@ package exif
 
 import (
 	"encoding/binary"
+	"os"
 	"testing"
 )
 
@@ -156,6 +157,16 @@ func FuzzParseEXIF(f *testing.F) {
 		f.Add(buf)
 	}
 
+	// Seed: the committed real-world BigTIFF fixture (produced by
+	// `tiffcp -8`), added directly as fuzz-corpus material (task #264). This
+	// gives the mutator a structurally rich, spec-conformant BigTIFF starting
+	// point — 22 IFD0 entries spanning inline SHORT/RATIONAL/LONG8 values and
+	// a large out-of-line UNDEFINED (ICC profile) blob — rather than only the
+	// minimal synthetic seeds above.
+	if data, err := os.ReadFile("testdata/BigTIFF_LE.tif"); err == nil {
+		f.Add(data)
+	}
+
 	f.Fuzz(func(t *testing.T, b []byte) {
 		// Must not panic on any input.
 		e, err := Parse(b)
@@ -176,6 +187,24 @@ func FuzzParseEXIF(f *testing.F) {
 			if e.IFD0 != nil {
 				// Calling Get must not panic regardless of tag.
 				_ = e.IFD0.Get(TagMake)
+			}
+
+			// task #264: fuzz the Encode round-trip too, not just Parse. Any
+			// successfully parsed EXIF (classic or BigTIFF) must Encode without
+			// panicking, and a successful Encode must produce output that
+			// re-Parses without panicking and never silently changes container
+			// provenance (BigTIFF must stay BigTIFF — audit finding #107).
+			// Deep per-tag equality is intentionally NOT asserted here: that is
+			// covered precisely by the deterministic round-trip tests in
+			// bigtiff_write_test.go and TestConformance_R14_bigtiff_roundtrip_fidelity;
+			// this fuzz target's job is to catch crashes and format-downgrade
+			// regressions across the full space of malformed/edge-case inputs.
+			encoded, encErr := Encode(e)
+			if encErr == nil {
+				e2, reErr := Parse(encoded)
+				if reErr == nil && e2 != nil && e.BigTIFF != e2.BigTIFF {
+					t.Errorf("Encode round-trip changed BigTIFF provenance: before=%v after=%v", e.BigTIFF, e2.BigTIFF)
+				}
 			}
 		}
 	})

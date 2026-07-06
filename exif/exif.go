@@ -39,11 +39,16 @@ import (
 // BigTIFF spec §2 (Aware Systems / libtiff); fix for audit finding #142.
 //
 // BigTIFF is true when the EXIF was parsed from a BigTIFF source (magic 0x002B,
-// 64-bit IFD offsets). When BigTIFF is true, Encode returns
-// ErrBigTIFFEncodeNotSupported without emitting any bytes: downgrading a BigTIFF
-// source to classic TIFF (32-bit offsets) would silently truncate every 64-bit
-// offset and corrupt any file whose structures reside above 4 GiB.
-// BigTIFF spec §2; audit finding #107.
+// 64-bit IFD offsets). When BigTIFF is true, Encode emits a native BigTIFF
+// stream (16-byte header, 20-byte IFD entries, 64-bit offsets throughout —
+// BigTIFF spec §2) rather than downgrading to classic TIFF, which would
+// otherwise silently truncate every 64-bit offset and corrupt any file whose
+// structures reside above 4 GiB. Sub-IFD and thumbnail pointer tags
+// (ExifIFDPointer, GPSIFDPointer, InteropIFDPointer, JPEGInterchangeFormat,
+// JPEGInterchangeFormatLength) remain fixed-width EXIF LONG fields even in
+// BigTIFF; if their target offset does not fit in 32 bits, Encode returns
+// ErrBigTIFFPointerOverflow rather than truncating it.
+// BigTIFF spec §2; audit finding #107; task #264.
 //
 // Thread-safety: not safe for concurrent use. Write-path helpers (every Set*
 // method, ensureExifIFD, and the internal IFD.set) are not designed to be
@@ -64,9 +69,10 @@ type EXIF struct {
 	MakerNoteOffset   uint32 // absolute TIFF-stream offset of the raw MakerNote value; 0 when absent; truncated for BigTIFF >4GiB
 	MakerNoteOffset64 uint64 // 64-bit counterpart of MakerNoteOffset; never truncated; preferred for new callers
 	// BigTIFF is set to true by Parse when the source magic is 0x002B (BigTIFF).
-	// Encode returns ErrBigTIFFEncodeNotSupported for BigTIFF sources to prevent
-	// silent 0x002A downgrade which would truncate all 64-bit offsets to 32 bits.
-	// BigTIFF spec §2 (Aware Systems / libtiff); audit finding #107.
+	// Encode dispatches to a native BigTIFF encode path for such sources
+	// (task #264) instead of downgrading to classic TIFF (0x002A), which would
+	// truncate all 64-bit offsets to 32 bits.
+	// BigTIFF spec §2 (Aware Systems / libtiff); audit finding #107; task #264.
 	BigTIFF bool
 
 	// Warnings is a slice of diagnostic messages produced during parsing.
@@ -475,6 +481,16 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 }
 
 // Encode serialises e back to a raw EXIF byte stream (TIFF header + IFDs).
+//
+// Both classic TIFF (EXIF.BigTIFF == false, magic 0x002A, 32-bit offsets) and
+// BigTIFF (EXIF.BigTIFF == true, magic 0x002B, 64-bit offsets — BigTIFF spec
+// §2, Aware Systems / libtiff) sources are supported; Encode dispatches on
+// EXIF.BigTIFF and emits the matching container format (task #264). Sub-IFD
+// pointer tags (ExifIFDPointer, GPSIFDPointer, InteropIFDPointer) and
+// thumbnail pointer tags (JPEGInterchangeFormat, JPEGInterchangeFormatLength)
+// remain fixed-width EXIF LONG fields in both containers; if a BigTIFF target
+// offset for one of these tags does not fit in 32 bits, Encode returns
+// ErrBigTIFFPointerOverflow rather than truncating it.
 //
 // Round-trip fidelity guarantee:
 //   - Known-type inline entries (total value size ≤ 4 bytes) are perfectly preserved.
