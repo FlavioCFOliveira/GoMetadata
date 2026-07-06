@@ -2060,17 +2060,19 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 	// value area begins right after: 2 (count) + n*12 (entries) + 4 (next-IFD).
 	valueOff := startOff + uint32(2+n*12+4) //nolint:gosec // G115: IFD size bounded by validated entry count
 
-	// task #201: assert order to binary.AppendByteOrder once per call.
-	// Both binary.LittleEndian and binary.BigEndian implement AppendByteOrder
-	// (Go 1.21+, encoding/binary); this assertion is infallible for these two
-	// concrete values and avoids the heap escapes that [2]byte/[4]byte caused.
+	// task #201/#247: appendUint16Order/appendUint32Order (write.go) reach
+	// binary.AppendByteOrder's allocation-free Append* methods via a
+	// comma-ok assertion instead of the former direct assertion, which
+	// panicked for any binary.ByteOrder implementation other than
+	// binary.LittleEndian/binary.BigEndian (PERF-201-LOW). Both singletons
+	// still take the zero-alloc fast path, so this is byte-identical to the
+	// former implementation for every order this package produces.
 	// The PutUint16/32 calls below (into entryBuf) remain on binary.ByteOrder
 	// because they write in-place into a pre-allocated scratch buffer — no append,
 	// no escape.
-	appOrd := order.(binary.AppendByteOrder) //nolint:forcetypeassert,revive // order is always binary.LittleEndian or binary.BigEndian; both implement AppendByteOrder
 
 	// TIFF §2: entry count is a 2-byte unsigned integer.
-	out = appOrd.AppendUint16(out, uint16(n)) //nolint:gosec // G115: IFD entry count bounded by parser-validated input
+	out = appendUint16Order(out, order, uint16(n)) //nolint:gosec // G115: IFD entry count bounded by parser-validated input
 
 	scratchPtr := iobuf.Get(n * 12)
 	entryBuf := (*scratchPtr)[:n*12]
@@ -2123,7 +2125,7 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 
 	out = append(out, entryBuf...)
 	// TIFF §2: next-IFD pointer is a 4-byte unsigned integer (0 = no next IFD).
-	out = appOrd.AppendUint32(out, nextIFDOffset)
+	out = appendUint32Order(out, order, nextIFDOffset)
 	out = append(out, valueArea...)
 
 	// Trailing word-alignment pad: ensure the IFD block occupies an even number

@@ -44,6 +44,15 @@ import (
 // source to classic TIFF (32-bit offsets) would silently truncate every 64-bit
 // offset and corrupt any file whose structures reside above 4 GiB.
 // BigTIFF spec §2; audit finding #107.
+//
+// Thread-safety: not safe for concurrent use. Write-path helpers (every Set*
+// method, ensureExifIFD, and the internal IFD.set) are not designed to be
+// called concurrently on the same *EXIF — they mutate the IFD0/ExifIFD/GPSIFD
+// entry slices in place with no synchronisation. Only read accessors
+// (CameraModel, GPS, Orientation, and similar) are safe to call concurrently
+// with each other, provided no Set* call is in flight. Callers that need
+// concurrent mutation must provide their own synchronisation (see
+// gometadata.Metadata, whose Set* methods serialise on an internal mutex).
 type EXIF struct {
 	ByteOrder         binary.ByteOrder
 	IFD0              *IFD
@@ -757,17 +766,30 @@ func (e *EXIF) Creator() string {
 // ---------------------------------------------------------------------------
 
 // ifd0ByteOrder returns the byte order in use by IFD0, defaulting to
-// binary.LittleEndian for an empty or newly created IFD.
+// binary.LittleEndian for a caller-constructed EXIF that never went through
+// Parse.
 //
-// task #199: reads the bigEndian bool flag from the first entry instead of the
-// former binary.ByteOrder interface.  The zero value of bool (false) corresponds
-// to little-endian, which is the library's default for programmatically-constructed
-// EXIF structs — the previous nil-interface guard is no longer needed because the
-// zero value is well-defined and safe (no nil dereference possible with a bool).
-// Audit finding #189; CIPA DC-008-2023 §4.6.2.
+// Audit finding EXIF-BO-001 (task #246): the former implementation (task #199)
+// inferred byte order from e.IFD0.Entries[0].bigEndian, which required at
+// least one IFD0 entry to resolve correctly. A spec-legal big-endian TIFF
+// stream ("MM") whose IFD0 has zero entries has no Entries[0], so that
+// implementation silently fell back to binary.LittleEndian even though the
+// stream is big-endian. The six numeric setters (SetOrientation, SetGPS*,
+// SetExposureTime, SetFNumber, SetISO, SetFocalLength) then pre-encoded LE
+// value bytes into a structure that Encode writes as BE — corrupting the
+// output (e.g. a set value of 6 reads back as 1536).
+//
+// e.ByteOrder is set unconditionally and correctly by every Parse path
+// (exif.go: `&EXIF{ByteOrder: order}` / `&EXIF{ByteOrder: order, BigTIFF: true}`)
+// regardless of how many entries IFD0 ends up with, so it is the authoritative
+// source of truth. It is nil only for a struct the caller assembled directly
+// without setting ByteOrder — write.go's serialise() already treats that same
+// nil as "default to LittleEndian" (task #59), so ifd0ByteOrder mirrors that
+// exact fallback to keep the setter path and the Encode path consistent.
+// CIPA DC-008-2023 §4.6.2.
 func (e *EXIF) ifd0ByteOrder() binary.ByteOrder {
-	if len(e.IFD0.Entries) > 0 && e.IFD0.Entries[0].bigEndian {
-		return binary.BigEndian
+	if e.ByteOrder != nil {
+		return e.ByteOrder
 	}
 	return binary.LittleEndian
 }

@@ -50,6 +50,18 @@ func NewMetadata(fmtID format.FormatID) *Metadata {
 //	synchronisation may see partially-updated state; callers that mix reads
 //	and writes concurrently must provide their own synchronisation.
 //
+//	The mutex above guards Metadata's own Set* methods only. The embedded
+//	EXIF, IPTC, and XMP objects are NOT independently safe for concurrent
+//	mutation: calling m.EXIF.SetOrientation, m.IPTC.SetKeywords, or
+//	m.XMP.SetCaption directly from multiple goroutines bypasses mu entirely
+//	and races on the underlying IFD entry slices, dataset slices, or the XMP
+//	Properties map (the latter can trigger "fatal error: concurrent map
+//	writes", which the Go runtime cannot recover from). Mutate metadata either
+//	through Metadata's own Set* methods (which serialise on mu), or hold your
+//	own lock around any direct m.EXIF / m.IPTC / m.XMP mutation. See the
+//	Thread-safety notes on exif.EXIF, iptc.IPTC, and xmp.XMP for the same
+//	contract stated at the component level.
+//
 // Copy semantics:
 //
 //	Metadata contains a sync.Mutex and must not be copied by value after

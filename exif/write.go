@@ -158,6 +158,46 @@ func serialise(e *EXIF) ([]byte, error) {
 	return out, nil
 }
 
+// appendUint16Order appends the 2-byte encoding of v (per order) to out and
+// returns the extended slice.
+//
+// PERF-201-LOW hardening (task #247): task #201 introduced a direct,
+// non-comma-ok type assertion (order.(binary.AppendByteOrder)) at the two call
+// sites below in order to reach binary.AppendByteOrder's allocation-free
+// Append* methods. That assertion panics for any binary.ByteOrder
+// implementation that does not also implement AppendByteOrder — unreachable
+// from any file this package parses (order is always the binary.LittleEndian
+// or binary.BigEndian singleton inside serialise), but reachable if a caller
+// hand-builds &EXIF{ByteOrder: <custom implementation>} and calls Encode.
+//
+// The comma-ok form below preserves the task #201 fast path exactly: both
+// binary.LittleEndian and binary.BigEndian implement AppendByteOrder, so for
+// every order this package's own parse/encode paths ever produce, the branch
+// taken and the bytes appended are byte-identical to the former
+// implementation — no allocation, no behavioural change. Any other
+// binary.ByteOrder implementation falls back to a small on-stack scratch
+// array + PutUint16 + append, which works for any implementation and never
+// panics.
+func appendUint16Order(out []byte, order binary.ByteOrder, v uint16) []byte {
+	if ao, ok := order.(binary.AppendByteOrder); ok {
+		return ao.AppendUint16(out, v)
+	}
+	var b [2]byte
+	order.PutUint16(b[:], v)
+	return append(out, b[:]...)
+}
+
+// appendUint32Order is the 4-byte counterpart of appendUint16Order; see its
+// doc comment for the fast-path/fallback rationale (task #247).
+func appendUint32Order(out []byte, order binary.ByteOrder, v uint32) []byte {
+	if ao, ok := order.(binary.AppendByteOrder); ok {
+		return ao.AppendUint32(out, v)
+	}
+	var b [4]byte
+	order.PutUint32(b[:], v)
+	return append(out, b[:]...)
+}
+
 // writeTIFFHeader builds the initial output buffer containing the TIFF header
 // (TIFF §2): byte order mark, magic 0x002A, and the IFD0 offset. It also
 // pre-allocates capacity for the IFD0, ExifIFD, GPS IFD, InteropIFD, and IFD1
@@ -207,14 +247,15 @@ func writeTIFFHeader(e *EXIF, order binary.ByteOrder, ifd0Entries, exifIFDEntrie
 	} else {
 		out = append(out, 'M', 'M')
 	}
-	// task #201: assert order to binary.AppendByteOrder once per call.
-	// Both binary.LittleEndian and binary.BigEndian implement AppendByteOrder
-	// (Go 1.21+, encoding/binary); the assertion is infallible for these two
-	// concrete values and avoids the heap escape that [8]byte caused.
-	appOrd := order.(binary.AppendByteOrder) //nolint:forcetypeassert,revive // order is always binary.LittleEndian or binary.BigEndian (see serialise); both implement AppendByteOrder
 	// TIFF §2: magic number 0x002A, then IFD0 offset immediately after the header.
-	out = appOrd.AppendUint16(out, 0x002A)
-	out = appOrd.AppendUint32(out, headerSize) // IFD0 starts right after the header
+	// task #201/#247: appendUint16Order/appendUint32Order reach
+	// binary.AppendByteOrder's allocation-free Append* methods via a
+	// comma-ok assertion (see their doc comment above) — zero-alloc and
+	// byte-identical to the former direct-assertion implementation for
+	// binary.LittleEndian/binary.BigEndian, and panic-free for any other
+	// binary.ByteOrder implementation.
+	out = appendUint16Order(out, order, 0x002A)
+	out = appendUint32Order(out, order, headerSize) // IFD0 starts right after the header
 	return out
 }
 

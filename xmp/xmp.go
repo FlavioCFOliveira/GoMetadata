@@ -19,6 +19,17 @@ import (
 )
 
 // XMP holds the parsed XMP properties organised by namespace URI.
+//
+// Thread-safety: not safe for concurrent use. Write-path helpers (SetCaption,
+// SetCopyright, SetCreator, SetKeywords, putProp, and every other setter) are
+// not designed to be called concurrently on the same *XMP — putProp writes
+// directly into the Properties map, and two goroutines racing on the same
+// inner map trigger "fatal error: concurrent map writes", which the Go
+// runtime cannot recover from. Only read accessors (Caption, Copyright,
+// Creator, Keywords, GPS, and similar) are safe to call concurrently with
+// each other, provided no Set* call is in flight. Callers that need
+// concurrent mutation must provide their own synchronisation (see
+// gometadata.Metadata, whose Set* methods serialise on an internal mutex).
 type XMP struct {
 	// Properties maps namespace URI → property local-name → value string.
 	// Multi-valued properties (rdf:Alt, rdf:Seq, rdf:Bag) are joined with

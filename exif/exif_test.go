@@ -3764,3 +3764,134 @@ func TestSetMakeOnManuallyConstructedEXIF(t *testing.T) {
 		t.Errorf("TagMake value = %q, want %q", got, "Canon")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Audit finding EXIF-BO-001 (task #246) — ifd0ByteOrder empty-IFD0 fallback
+// ---------------------------------------------------------------------------
+
+// TestIFD0ByteOrderEmptyIFD0RoundTrip is the regression gate for audit
+// finding EXIF-BO-001.
+//
+// The former ifd0ByteOrder implementation (task #199) inferred byte order
+// from e.IFD0.Entries[0].bigEndian, which requires at least one IFD0 entry to
+// resolve correctly. A spec-legal big-endian TIFF stream ("MM") whose IFD0
+// has zero entries has no Entries[0], so that implementation silently fell
+// back to binary.LittleEndian even though the stream is big-endian. Every
+// numeric setter that calls e.ifd0ByteOrder() (SetOrientation, SetGPS,
+// SetExposureTime, SetFNumber, SetISO, SetFocalLength) then pre-encoded LE
+// value bytes into a structure that Encode serialises as BE, silently
+// corrupting the output — e.g. a set Orientation of 6 (0x0006 as two LE
+// bytes: 0x06, 0x00) is later read back by any conformant BE reader as
+// 0x0600 = 1536.
+//
+// The fix prefers the authoritative e.ByteOrder (set unconditionally by every
+// Parse path regardless of IFD0 entry count) and only falls back to
+// binary.LittleEndian when e.ByteOrder is nil (a caller-constructed EXIF that
+// never went through Parse — see TestSetMakeOnManuallyConstructedEXIF above).
+//
+// The non-empty-IFD0 case is included as a control: it must keep round-
+// tripping correctly, proving the fix does not regress the case the former
+// implementation already handled.
+func TestIFD0ByteOrderEmptyIFD0RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		entries [][4]uint32
+	}{
+		{"empty IFD0 (EXIF-BO-001 regression)", nil},
+		{"non-empty IFD0 (control)", [][4]uint32{
+			{uint32(TagCompression), uint32(TypeShort), 1, 1},
+		}},
+	}
+
+	const (
+		wantOrientation                = uint16(6)
+		wantExpNum, wantExpDen         = uint32(1), uint32(250)
+		wantFNumber                    = 2.8
+		wantISO                        = uint(400)
+		wantFocalLength                = 50.0
+		wantLat, wantLon               = 37.7749, -122.4194
+		coordTolerance, valueTolerance = 1e-4, 1e-6
+	)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			raw := minimalTIFF(binary.BigEndian, tc.entries)
+			e, err := Parse(raw)
+			if err != nil {
+				t.Fatalf("Parse(synthetic BE TIFF) error = %v", err)
+			}
+			if e.ByteOrder != binary.BigEndian {
+				t.Fatalf("Parse(synthetic BE TIFF).ByteOrder = %v, want binary.BigEndian", e.ByteOrder)
+			}
+			if len(e.IFD0.Entries) != len(tc.entries) {
+				t.Fatalf("Parse(synthetic BE TIFF).IFD0.Entries = %d entries, want %d", len(e.IFD0.Entries), len(tc.entries))
+			}
+
+			// ifd0ByteOrder is the exact code path every numeric setter below
+			// depends on; it must resolve to BigEndian regardless of entry count.
+			if got := e.ifd0ByteOrder(); got != binary.BigEndian {
+				t.Fatalf("ifd0ByteOrder() = %v, want binary.BigEndian (EXIF-BO-001 regression)", got)
+			}
+
+			// Exercise all six numeric setters named in audit finding EXIF-BO-001.
+			e.SetOrientation(wantOrientation)
+			e.SetGPS(wantLat, wantLon)
+			e.SetExposureTime(wantExpNum, wantExpDen)
+			e.SetFNumber(wantFNumber)
+			e.SetISO(wantISO)
+			e.SetFocalLength(wantFocalLength)
+
+			// Direct byte-level proof (pre-Encode): the Orientation entry's inline
+			// value must already be BE-encoded — SetOrientation calls
+			// order.PutUint16 using e.ifd0ByteOrder() directly, with no
+			// intervening Encode step to mask a wrong-order write.
+			ori := e.IFD0.Get(TagOrientation)
+			if ori == nil {
+				t.Fatal("TagOrientation entry missing after SetOrientation")
+			}
+			if got := binary.BigEndian.Uint16(ori.Value); got != wantOrientation {
+				t.Errorf("raw Orientation inline value decoded as binary.BigEndian = %d, want %d (value was pre-encoded as LE bytes into a BE stream)", got, wantOrientation)
+			}
+
+			// Encode and re-Parse: the full round trip a real caller performs.
+			out, err := Encode(e)
+			if err != nil {
+				t.Fatalf("Encode() error = %v", err)
+			}
+			if len(out) < 2 || out[0] != 'M' || out[1] != 'M' {
+				t.Fatalf("Encode() output byte-order mark = %q, want \"MM\" (big-endian)", out[:min(2, len(out))])
+			}
+
+			e2, err := Parse(out)
+			if err != nil {
+				t.Fatalf("re-Parse(Encode() output) error = %v", err)
+			}
+			if e2.ByteOrder != binary.BigEndian {
+				t.Fatalf("re-Parse(Encode() output).ByteOrder = %v, want binary.BigEndian", e2.ByteOrder)
+			}
+
+			if got, ok := e2.Orientation(); !ok || got != wantOrientation {
+				t.Errorf("round-tripped Orientation() = (%d, %v), want (%d, true)", got, ok, wantOrientation)
+			}
+			if lat, lon, ok := e2.GPS(); !ok || math.Abs(lat-wantLat) > coordTolerance || math.Abs(lon-wantLon) > coordTolerance {
+				t.Errorf("round-tripped GPS() = (%f, %f, %v), want approximately (%f, %f, true)", lat, lon, ok, wantLat, wantLon)
+			}
+			if num, den, ok := e2.ExposureTime(); !ok || num != wantExpNum || den != wantExpDen {
+				t.Errorf("round-tripped ExposureTime() = (%d, %d, %v), want (%d, %d, true)", num, den, ok, wantExpNum, wantExpDen)
+			}
+			if got, ok := e2.FNumber(); !ok || math.Abs(got-wantFNumber) > valueTolerance {
+				t.Errorf("round-tripped FNumber() = (%f, %v), want approximately (%f, true)", got, ok, wantFNumber)
+			}
+			if got, ok := e2.ISO(); !ok || got != wantISO {
+				t.Errorf("round-tripped ISO() = (%d, %v), want (%d, true)", got, ok, wantISO)
+			}
+			if got, ok := e2.FocalLength(); !ok || math.Abs(got-wantFocalLength) > valueTolerance {
+				t.Errorf("round-tripped FocalLength() = (%f, %v), want approximately (%f, true)", got, ok, wantFocalLength)
+			}
+		})
+	}
+}

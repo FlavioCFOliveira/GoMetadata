@@ -3,6 +3,7 @@ package format
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -69,8 +70,22 @@ func Detect(r io.ReadSeeker) (FormatID, error) {
 	// Safety: buf is consumed synchronously by detectMagic and released before
 	// any return path; no reference to it escapes this function.
 	bp := magicPool.Get().(*[magicLen]byte) //nolint:forcetypeassert,revive // magicPool.New always stores *[magicLen]byte; pool invariant
-	n, err := r.Read(bp[:])
-	if err != nil && n == 0 {
+	// DETECT-SHORTREAD-01: a single r.Read is permitted by io.Reader to return
+	// fewer bytes than requested even mid-stream (io.Reader doc: "Implementations
+	// of Read are discouraged from returning a zero byte count ... except when
+	// len(p) == 0"; short reads are otherwise explicitly allowed). A chunking
+	// reader (network socket, io.Pipe, decompressing stream, small bufio) would
+	// then misdetect a valid PNG/JPEG/WebP/ORF/RW2 as FormatUnknown. io.ReadFull
+	// loops internally until magicLen bytes are read, EOF is hit, or a hard
+	// error occurs — matching every other read site in this codebase (e.g.
+	// parseTIFFScanHeader below, heif.Extract, riff.ReadChunk).
+	//
+	// io.ReadFull still returns the exact number of bytes read (n) even on
+	// io.EOF/io.ErrUnexpectedEOF, so a short-but-valid file (fewer than magicLen
+	// bytes on disk) is still classified on the bytes actually available via
+	// bp[:n]; only a different, non-nil error is a hard failure.
+	n, err := io.ReadFull(r, bp[:])
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		magicPool.Put(bp)
 		return FormatUnknown, fmt.Errorf("format: read magic bytes: %w", err)
 	}

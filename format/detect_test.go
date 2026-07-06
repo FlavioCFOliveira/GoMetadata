@@ -94,6 +94,83 @@ func TestDetectTruncated(t *testing.T) {
 	}
 }
 
+// shortReader wraps a *bytes.Reader and hands back at most 1 byte per Read
+// call, regardless of the caller-requested buffer size. This simulates a
+// chunking transport (network socket, io.Pipe, decompressing stream, small
+// bufio) where io.Reader.Read is fully entitled to return fewer bytes than
+// requested even mid-stream (io.Reader doc: short reads are allowed).
+//
+// Seek is inherited from the embedded *bytes.Reader so shortReader still
+// satisfies io.ReadSeeker, which Detect requires.
+type shortReader struct {
+	*bytes.Reader
+}
+
+// Read returns at most 1 byte per call. DETECT-SHORTREAD-01 regression harness.
+func (s *shortReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	return s.Reader.Read(p[:1]) //nolint:wrapcheck // test helper: delegates to underlying reader; wrapping obscures io.EOF
+}
+
+// TestDetectShortReads is the regression gate for DETECT-SHORTREAD-01.
+//
+// Prior to the fix, Detect issued a single r.Read(bp[:magicLen]) call and
+// trusted it to fill the whole 36-byte magic buffer. Against a reader that
+// only ever returns 1 byte per call, that single Read yielded n==1, and
+// detectMagic(bp[:1]) misidentified every one of these formats as
+// FormatUnknown (PNG needs 8 bytes, WebP needs 12, etc. — even JPEG's 2-byte
+// SOI marker was unreachable at n==1 for the PNG/WebP/ORF/RW2 cases below).
+// io.ReadFull loops until the full window is read (or a hard EOF/error),
+// exactly like every other read site in this codebase.
+func TestDetectShortReads(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		magic []byte
+		want  FormatID
+	}{
+		// PNG: 8-byte signature; a single 1-byte Read would leave detectMagic
+		// with far too few bytes to match isPNG.
+		{"PNG", []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D}, FormatPNG},
+
+		// JPEG: 2-byte SOI marker — chosen because even a minimal short read
+		// could accidentally satisfy it; proves the fix does not merely work
+		// by coincidence for the smallest magic.
+		{"JPEG", []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01}, FormatJPEG},
+
+		// WebP: 12-byte RIFF/WEBP header — the largest of this set.
+		{"WebP", []byte{0x52, 0x49, 0x46, 0x46, 0x12, 0x34, 0x56, 0x78, 0x57, 0x45, 0x42, 0x50}, FormatWebP},
+
+		// ORF: "IIRO" Olympus marker.
+		{"ORF", []byte{0x49, 0x49, 0x52, 0x4F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, FormatORF},
+
+		// RW2: "IIU\x00" Panasonic marker.
+		{"RW2", []byte{0x49, 0x49, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, FormatRW2},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// Pad to magicLen: a real file continues past the magic bytes, so
+			// the chunking reader still has magicLen total bytes to hand out
+			// 1-per-call, exactly like Detect expects to receive on a full read.
+			buf := make([]byte, magicLen)
+			copy(buf, tc.magic)
+			sr := &shortReader{Reader: bytes.NewReader(buf)}
+
+			got, err := Detect(sr)
+			if err != nil {
+				t.Fatalf("Detect() with 1-byte-per-Read reader: unexpected error = %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("Detect() with 1-byte-per-Read reader = %v, want %v (DETECT-SHORTREAD-01 regression)", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDetectSeekReset(t *testing.T) {
 	t.Parallel()
 	// Detect must leave the reader at position 0 after detection.
