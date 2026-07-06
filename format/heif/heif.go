@@ -376,6 +376,14 @@ func parseIlocFull(metaContent []byte) (ilocBoxInfo, bool) {
 	if !ok {
 		return info, false
 	}
+	// Security audit FIX 1 (HEIF-ILOC-EXTENT-AMPLIFICATION): reject an iloc box
+	// whose declared item_count exceeds a sane ceiling before doing any
+	// per-item work. iloc version 2 encodes item_count as a 4-byte field (up to
+	// 2^32-1); without this guard a crafted box could drive a very large
+	// number of outer-loop iterations. See maxIlocItems for the rationale.
+	if itemCount > maxIlocItems {
+		return info, false
+	}
 	pos = newPos
 
 	for range itemCount {
@@ -420,18 +428,42 @@ func readIlocItemID(ilocData []byte, pos int, version uint8) (id uint16, newPos 
 // memory amplification.
 const maxIlocExtentsPerItem = 1024
 
+// maxIlocItems caps the number of items processed from a single iloc box.
+// Real-world HEIF/AVIF files carry from one to a few hundred items (image
+// variants, thumbnails, alpha planes, EXIF/XMP metadata items). 4096 is a
+// generous ceiling that mirrors the sanity cap format/detect.go's
+// parseBigTIFFIFD0 applies to BigTIFF IFD entry counts: it defends against an
+// attacker-controlled item_count field (up to 2^32-1 for iloc version 2)
+// driving unbounded outer-loop work, without affecting any legitimate file.
+// ISO 14496-12 §8.11.3.
+const maxIlocItems = 4096
+
 // readIlocFullExtents reads extentCount extents from ilocData at pos using the
 // field sizes in info. Returns the populated extents and updated position.
 // If the data is truncated before all extents are read, parsing stops early
 // and only the extents read so far are returned.
+//
+// Security (CWE-770/834): extents beyond maxIlocExtentsPerItem are dropped —
+// NOT merely capped at the pre-allocation stage — by guarding the append with
+// a length check; the position is still advanced for every extent that
+// genuinely consumes input bytes, so the caller correctly lands at the next
+// item. Additionally, when every per-extent field width is zero
+// (indexSize == offsetSize == lengthSize == 0), no iteration consumes any
+// input byte at all, so an attacker-controlled extent_count of up to 65535
+// would otherwise force 65535 no-op iterations per item at zero cost to the
+// attacker; the loop bound itself is capped at maxIlocExtentsPerItem in that
+// degenerate case (task: security audit FIX 1, HEIF-ILOC-EXTENT-AMPLIFICATION).
 // ISO 14496-12 §8.11.3.
-func readIlocFullExtents(ilocData []byte, pos, extentCount int, info ilocBoxInfo) (extents []ilocExtent, newPos int) {
-	// Clamp the pre-allocation to prevent allocation amplification from an
-	// attacker-controlled extent_count field. We still advance pos through
-	// the data for all declared extents so the caller lands at the correct
-	// position for the next item; extents beyond the cap are simply dropped.
+func readIlocFullExtents(ilocData []byte, pos, extentCount int, info ilocBoxInfo) (extents []ilocExtent, newPos int) { //nolint:gocyclo // binary parser: each branch is a mandatory spec-derived bounds check (indexSize/offsetSize/lengthSize) plus the FIX-1 zero-field-size DoS guard; splitting would reduce clarity without reducing branch count
 	extents = make([]ilocExtent, 0, min(extentCount, maxIlocExtentsPerItem))
-	for range extentCount {
+
+	extentFieldSize := info.indexSize + info.offsetSize + info.lengthSize
+	loopCount := extentCount
+	if extentFieldSize == 0 && loopCount > maxIlocExtentsPerItem {
+		loopCount = maxIlocExtentsPerItem
+	}
+
+	for range loopCount {
 		var ext ilocExtent
 		if info.indexSize > 0 {
 			if pos+info.indexSize > len(ilocData) {
@@ -454,7 +486,9 @@ func readIlocFullExtents(ilocData []byte, pos, extentCount int, info ilocBoxInfo
 			ext.length = readUintN(ilocData[pos:], info.lengthSize)
 			pos += info.lengthSize
 		}
-		extents = append(extents, ext)
+		if len(extents) < maxIlocExtentsPerItem {
+			extents = append(extents, ext)
+		}
 	}
 	return extents, pos
 }
@@ -1127,6 +1161,12 @@ func parseIloc(metaData []byte) map[uint16]itemLoc {
 	if !ok {
 		return result
 	}
+	// Security audit FIX 1 (HEIF-ILOC-EXTENT-AMPLIFICATION): see the identical
+	// guard in parseIlocFull for the full rationale — reject an iloc box whose
+	// declared item_count exceeds maxIlocItems before doing any per-item work.
+	if itemCount > maxIlocItems {
+		return result
+	}
 
 	for range itemCount {
 		id, loc, newPos, itemOK := parseIlocItemSimple(ilocData, pos, version, offsetSize, lengthSize, baseOffsetSize, indexSize)
@@ -1146,8 +1186,24 @@ func parseIloc(metaData []byte) map[uint16]itemLoc {
 //
 // ISO 14496-12 §8.11.3: extents accumulate; only the last extent's values are
 // retained here (matching the original implementation's behaviour).
-func readIlocSimpleExtents(ilocData []byte, pos, extentCount int, baseOffset uint64, offsetSize, lengthSize, indexSize int) (offset, length uint64, newPos int, ok bool) {
-	for range extentCount {
+//
+// Security (CWE-770/834, security audit FIX 1): when every per-extent field
+// width is zero (indexSize == offsetSize == lengthSize == 0), no iteration
+// consumes any input byte, so an attacker-controlled extent_count of up to
+// 65535 would otherwise force 65535 no-op iterations per item at zero cost —
+// combined across maxIlocItems items this is a CPU-exhaustion vector. The
+// loop bound is capped at maxIlocExtentsPerItem in that degenerate case,
+// mirroring the identical guard in readIlocFullExtents. When at least one
+// field has non-zero width, extentCount remains naturally bounded by the
+// per-field bounds checks below (truncation stops the loop early), so no
+// legitimate file is affected.
+func readIlocSimpleExtents(ilocData []byte, pos, extentCount int, baseOffset uint64, offsetSize, lengthSize, indexSize int) (offset, length uint64, newPos int, ok bool) { //nolint:gocyclo // binary parser: each branch is a mandatory spec-derived bounds check (indexSize/offsetSize/lengthSize) plus the FIX-1 zero-field-size DoS guard; splitting would reduce clarity without reducing branch count
+	extentFieldSize := indexSize + offsetSize + lengthSize
+	loopCount := extentCount
+	if extentFieldSize == 0 && loopCount > maxIlocExtentsPerItem {
+		loopCount = maxIlocExtentsPerItem
+	}
+	for range loopCount {
 		// #133 fix: bounds-check the extent_index field before advancing.
 		// ISO 14496-12 §8.11.3: extent_index is present when indexSize > 0 (iloc v1/v2).
 		// Missing this guard allows a truncated extent to silently advance pos past

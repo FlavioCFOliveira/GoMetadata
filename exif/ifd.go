@@ -1813,24 +1813,33 @@ func (e *IFDEntry) Len() int {
 	return int(e.Count)
 }
 
-// set inserts or replaces an entry in the IFD. The byteOrder field of the
-// new entry is inherited from the existing entries in the IFD (or defaults
-// to binary.LittleEndian for an empty IFD). Entries are kept sorted by tag
+// set inserts or replaces an entry in the IFD. Entries are kept sorted by tag
 // so that Get() can use binary search.
+//
+// bigEndian must reflect the TRUE byte order of the stream this IFD belongs
+// to (typically the caller's EXIF.ifd0ByteOrder() result, converted with
+// EXIF.ifd0BigEndian()) — never inferred from the IFD's own current state.
+// It controls how IFDEntry accessors (Uint16, Uint32, Rational, ...) decode
+// entry.Value; it must match the ENCODING byte order those value bytes were
+// just written with by the caller, or in-memory reads will return garbage
+// until the next Parse() round-trip.
+//
+// Security audit FIX 4 (EXIF-BO-002, CWE-198): this method previously
+// inherited bigEndian from ifd.Entries[0], defaulting to false (LE) for an
+// empty IFD regardless of the true stream order. For a freshly created
+// GPSIFD/ExifIFD on a big-endian source, every accessor that reads a value
+// just written via a Set* method (e.g. GPS, ExposureTime, FNumber, ISO,
+// FocalLength, ImageSize) returned incorrect results until the *EXIF was
+// round-tripped through Encode/Parse. Encode() itself was never affected —
+// ifd0ByteOrder() already controlled value-byte ENCODING there (the #246
+// fix) — only this in-memory decode-flag was wrong. CIPA DC-008-2023 §4.6.2.
 //
 // Insertion uses sort.Search to find the insertion point and slices.Insert to
 // place the new entry in O(n) time instead of re-sorting the whole slice (O(n
 // log n)), making bulk IFD construction O(n²) in the worst case instead of
 // the previous O(n² log n).
-func (ifd *IFD) set(tag TagID, typ DataType, count uint32, value []byte) {
-	// Inherit byte order from the first existing entry (false = LE is the zero-value
-	// default matching the library convention; see IFDEntry.bigEndian comment).
-	// task #199: bigEndian bool replaces binary.ByteOrder interface.
-	var isBig bool
-	if len(ifd.Entries) > 0 {
-		isBig = ifd.Entries[0].bigEndian
-	}
-	entry := IFDEntry{Tag: tag, Type: typ, Count: count, Value: value, bigEndian: isBig}
+func (ifd *IFD) set(tag TagID, typ DataType, count uint32, value []byte, bigEndian bool) {
+	entry := IFDEntry{Tag: tag, Type: typ, Count: count, Value: value, bigEndian: bigEndian}
 	// Binary search for the insertion point (entries are always sorted by tag).
 	i := sort.Search(len(ifd.Entries), func(i int) bool { return ifd.Entries[i].Tag >= tag })
 	if i < len(ifd.Entries) && ifd.Entries[i].Tag == tag {

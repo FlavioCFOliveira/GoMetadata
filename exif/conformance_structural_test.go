@@ -1068,12 +1068,12 @@ func TestConformance_S28_ifd0_mandatory_tags(t *testing.T) {
 	xResVal := make([]byte, 8)
 	order.PutUint32(xResVal[0:], 72)
 	order.PutUint32(xResVal[4:], 1)
-	e.IFD0.set(TagXResolution, TypeRational, 1, xResVal)
-	e.IFD0.set(TagYResolution, TypeRational, 1, xResVal)
+	e.IFD0.set(TagXResolution, TypeRational, 1, xResVal, orderIsBig(order))
+	e.IFD0.set(TagYResolution, TypeRational, 1, xResVal, orderIsBig(order))
 	// ResolutionUnit: SHORT = 2 (inch)
 	var ru [2]byte
 	order.PutUint16(ru[:], 2)
-	e.IFD0.set(TagResolutionUnit, TypeShort, 1, ru[:])
+	e.IFD0.set(TagResolutionUnit, TypeShort, 1, ru[:], orderIsBig(order))
 
 	encoded, err := Encode(e)
 	if err != nil {

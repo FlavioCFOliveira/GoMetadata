@@ -96,10 +96,10 @@ func TestIFDSetSortedUniqueInvariant(t *testing.T) {
 	// Insert tags in reverse order (worst case for naive append-then-sort).
 	// Tags chosen: ImageWidth(0x0100), IPTC(0x83BB), ExifIFDPointer(0x8769), XMP(0x02BC=700).
 	// In hex sorted order: 0x0100 < 0x02BC < 0x8769 < 0x83BB.
-	ifd.set(TagIPTC, TypeUndefined, 4, []byte{1, 2, 3, 4})      // 0x83BB = 33723
-	ifd.set(TagExifIFDPointer, TypeLong, 1, []byte{0, 0, 0, 0}) // 0x8769 = 34665
-	ifd.set(TagXMP, TypeUndefined, 4, []byte{5, 6, 7, 8})       // 0x02BC = 700
-	ifd.set(TagImageWidth, TypeLong, 1, []byte{128, 0, 0, 0})   // 0x0100 = 256
+	ifd.set(TagIPTC, TypeUndefined, 4, []byte{1, 2, 3, 4}, false)      // 0x83BB = 33723
+	ifd.set(TagExifIFDPointer, TypeLong, 1, []byte{0, 0, 0, 0}, false) // 0x8769 = 34665
+	ifd.set(TagXMP, TypeUndefined, 4, []byte{5, 6, 7, 8}, false)       // 0x02BC = 700
+	ifd.set(TagImageWidth, TypeLong, 1, []byte{128, 0, 0, 0}, false)   // 0x0100 = 256
 
 	// Verify sorted order.
 	for i := 1; i < len(ifd.Entries); i++ {
@@ -124,7 +124,7 @@ func TestIFDSetSortedUniqueInvariant(t *testing.T) {
 	}
 
 	// Replace an existing tag: count must stay at 4.
-	ifd.set(TagXMP, TypeUndefined, 4, []byte{9, 10, 11, 12})
+	ifd.set(TagXMP, TypeUndefined, 4, []byte{9, 10, 11, 12}, false)
 	if len(ifd.Entries) != 4 {
 		t.Errorf("after replace: expected 4 entries, got %d (duplicate?)", len(ifd.Entries))
 	}

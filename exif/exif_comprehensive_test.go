@@ -601,9 +601,9 @@ func TestMMIIParity(t *testing.T) {
 
 		oriB := make([]byte, 2)
 		order.PutUint16(oriB, 6)
-		e.IFD0.set(TagOrientation, TypeShort, 1, oriB)
+		e.IFD0.set(TagOrientation, TypeShort, 1, oriB, orderIsBig(order))
 		makeV := asciiValue("ACME Corp")
-		e.IFD0.set(TagMake, TypeASCII, uint32(len(makeV)), makeV) //nolint:gosec // G115: test helper
+		e.IFD0.set(TagMake, TypeASCII, uint32(len(makeV)), makeV, orderIsBig(order)) //nolint:gosec // G115: test helper
 		e.SetGPS(51.5, -0.127)
 		e.SetISO(400)
 		e.SetFNumber(2.8)
@@ -735,13 +735,13 @@ func TestGPSAltitudeAboveBelowSeaLevel(t *testing.T) {
 
 		// Add altitude tags directly into the GPS IFD.
 		// GPSAltitudeRef (0x0005): TypeByte, count=1, inline value = altRef.
-		e.GPSIFD.set(TagGPSAltitudeRef, TypeByte, 1, []byte{altRef})
+		e.GPSIFD.set(TagGPSAltitudeRef, TypeByte, 1, []byte{altRef}, orderIsBig(order))
 
 		// GPSAltitude (0x0006): TypeRational, count=1, out-of-line (8 bytes).
 		altVal := make([]byte, 8)
 		order.PutUint32(altVal[0:], altMetres)
 		order.PutUint32(altVal[4:], 1)
-		e.GPSIFD.set(TagGPSAltitude, TypeRational, 1, altVal)
+		e.GPSIFD.set(TagGPSAltitude, TypeRational, 1, altVal, orderIsBig(order))
 
 		return e
 	}

@@ -7,6 +7,33 @@ import (
 	"github.com/FlavioCFOliveira/GoMetadata/internal/metaerr"
 )
 
+// maxFileSize is the upper bound on the total number of bytes the root
+// package's TIFF-family write paths (writeTIFF, writeTIFFCR2, writeTIFFARW,
+// writeTIFFORF, writeTIFFRW2, writeTIFFNEF) will read from an io.Reader in a
+// single Write call when m.rawEXIF is nil (forcing a full-file read of the
+// source container). Reads are wrapped with io.LimitReader(r, maxFileSize+1);
+// if the reader delivers more bytes than this limit, the write is aborted
+// with ErrFileTooLarge before any allocation proportional to an unbounded or
+// adversarial stream length is retained.
+//
+// Real-world TIFF/DNG/NEF/ARW/CR2/ORF/RW2 files are well under 100 MiB;
+// 256 MiB gives ample headroom for future sensor improvements while bounding
+// worst-case heap allocation to a predictable, safe value. This mirrors the
+// identical maxFileSize cap already applied to every format/* package's
+// Extract and Inject entry points (format/tiff/errors.go, format/heif/errors.go)
+// under the #140 fix; the six root-package call sites above were missed by
+// that fix and are the subject of security audit FIX 3 (CWE-770/400).
+//
+// Declared as a var (not a const) so that tests can lower it temporarily to
+// verify the OOM-guard path without allocating 256 MiB of memory.
+var maxFileSize int64 = 256 << 20 //nolint:gochecknoglobals // test-overridable cap; never mutated in production paths
+
+// ErrFileTooLarge is returned by Write when the source container exceeds
+// maxFileSize and m.rawEXIF is nil (forcing a full-file read). This prevents
+// a streaming or adversarially large reader from causing unbounded heap
+// allocation. Callers can detect this specific condition with errors.Is.
+var ErrFileTooLarge = errors.New("gometadata: input exceeds maximum file size (256 MiB)")
+
 // ErrNilIFD0 is returned when an EXIF struct has a nil IFD0 field.
 var ErrNilIFD0 = errors.New("gometadata: EXIF struct has nil IFD0; use exif.Parse to construct a valid EXIF")
 

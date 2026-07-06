@@ -115,6 +115,15 @@ func FuzzHEIFExtract(f *testing.F) {
 		f.Add(seed106)
 	}
 
+	// Seed: security audit FIX 1 (HEIF-ILOC-EXTENT-AMPLIFICATION, CWE-770/834).
+	// An iloc box with several items, each declaring extent_count=0xFFFF but
+	// with every per-extent field-size nibble set to zero, so pre-fix code
+	// spun the full attacker-controlled extent_count per item with no bound
+	// tied to actual input size. See TestHEIFIlocZeroFieldSizeAmplificationBounded
+	// for the full root-cause writeup and the readIlocFullExtents/
+	// readIlocSimpleExtents/parseIloc/parseIlocFull fix.
+	f.Add(buildIlocZeroFieldAmplification(5, 0xFFFF, 0))
+
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic regardless of input.
 		rawEXIF, _, _, err := Extract(bytes.NewReader(data))
@@ -250,6 +259,13 @@ func FuzzHEIFInject(f *testing.F) {
 	// Confirm the wire-frame seed exercises the guard path (not a fuzz seed —
 	// just a direct call to document the expected error).
 	_ = wireFrameXMP
+
+	// Seed: security audit FIX 1 (HEIF-ILOC-EXTENT-AMPLIFICATION, CWE-770/834).
+	// Same crafted zero-field-size, extent_count=0xFFFF iloc box as the
+	// FuzzHEIFExtract seed above, but with an iloc version (1) that exercises
+	// parseIlocFull (the Inject write path) instead of the simple read-path
+	// parser. See TestHEIFIlocZeroFieldSizeAmplificationBounded.
+	f.Add(buildIlocZeroFieldAmplification(5, 0xFFFF, 1))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic regardless of input. Inject must return an error or

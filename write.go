@@ -349,6 +349,28 @@ func isBigTIFFSource(raw []byte, e *exif.EXIF) bool {
 	return false
 }
 
+// readAllCapped reads all of r, capping the total to maxFileSize+1 bytes via
+// io.LimitReader so that an oversized or infinite streaming reader cannot
+// trigger unbounded heap allocation.
+//
+// Security audit FIX 3 (CWE-770/400): every writeTIFF* entry point falls back
+// to a bare io.ReadAll(r) when m.rawEXIF is nil (the caller constructed
+// *Metadata via NewMetadata rather than Read). #140 already capped every
+// io.ReadAll in the format/* packages (format/tiff, format/heif, ...) with
+// this identical pattern; these six root-package call sites were missed.
+// tag identifies the calling write path (e.g. "tiff", "cr2") for the wrapped
+// error message.
+func readAllCapped(r io.Reader, tag string) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxFileSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("gometadata: %s read: %w", tag, err)
+	}
+	if int64(len(data)) > maxFileSize {
+		return nil, fmt.Errorf("gometadata: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
+	}
+	return data, nil
+}
+
 func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // conditional logic for originalBytes source + nil guards + three encode paths; splitting would reduce clarity
 	// BigTIFF guard: reject BigTIFF sources before any I/O.
 	// exif.Encode would return ErrBigTIFFEncodeNotSupported deep inside the
@@ -374,9 +396,9 @@ func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclo
 			return fmt.Errorf("gometadata: tiff seek: %w", err)
 		}
 		var err error
-		originalBytes, err = io.ReadAll(r)
+		originalBytes, err = readAllCapped(r, "tiff")
 		if err != nil {
-			return fmt.Errorf("gometadata: tiff read: %w", err)
+			return err
 		}
 	}
 
@@ -440,9 +462,9 @@ func writeTIFFCR2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 			return fmt.Errorf("gometadata: cr2 seek: %w", err)
 		}
 		var err error
-		originalBytes, err = io.ReadAll(r)
+		originalBytes, err = readAllCapped(r, "cr2")
 		if err != nil {
-			return fmt.Errorf("gometadata: cr2 read: %w", err)
+			return err
 		}
 	}
 
@@ -500,9 +522,9 @@ func writeTIFFARW(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 			return fmt.Errorf("gometadata: arw seek: %w", err)
 		}
 		var err error
-		originalBytes, err = io.ReadAll(r)
+		originalBytes, err = readAllCapped(r, "arw")
 		if err != nil {
-			return fmt.Errorf("gometadata: arw read: %w", err)
+			return err
 		}
 	}
 
@@ -576,9 +598,9 @@ func writeTIFFORF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 			return fmt.Errorf("gometadata: orf seek: %w", err)
 		}
 		var err error
-		originalBytes, err = io.ReadAll(r)
+		originalBytes, err = readAllCapped(r, "orf")
 		if err != nil {
-			return fmt.Errorf("gometadata: orf read: %w", err)
+			return err
 		}
 	}
 
@@ -598,7 +620,15 @@ func writeTIFFORF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 		return nil
 	}
 
-	if err := tiff.InjectWithEXIFORF(originalBytes, m.EXIF, rawIPTC, rawXMP, w); err != nil {
+	// Security audit FIX 2: pass a clone, not m.EXIF directly.
+	// relocateTIFFFromParsedORF permanently mutates the *exif.EXIF it is given
+	// (clears ThumbnailData, rewrites StripOffsets/StripByteCounts/MakerNote
+	// pointer entries with relocated offsets). Every sibling path already
+	// clones (writeTIFF, writeTIFFCR2, writeTIFFARW, writeTIFFNEF — the #109
+	// fix); ORF was added later in #104 and missed the clone, so a second
+	// Write() call on the same *Metadata reused the already-mutated EXIF and
+	// silently corrupted the output image data.
+	if err := tiff.InjectWithEXIFORF(originalBytes, cloneEXIF(m.EXIF), rawIPTC, rawXMP, w); err != nil {
 		return fmt.Errorf("gometadata: %w", err)
 	}
 	return nil
@@ -649,9 +679,9 @@ func writeTIFFRW2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 			return fmt.Errorf("gometadata: rw2 seek: %w", err)
 		}
 		var err error
-		originalBytes, err = io.ReadAll(r)
+		originalBytes, err = readAllCapped(r, "rw2")
 		if err != nil {
-			return fmt.Errorf("gometadata: rw2 read: %w", err)
+			return err
 		}
 	}
 
@@ -671,7 +701,10 @@ func writeTIFFRW2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 		return nil
 	}
 
-	if err := tiff.InjectWithEXIFRW2(originalBytes, m.EXIF, rawIPTC, rawXMP, w); err != nil {
+	// Security audit FIX 2: pass a clone, not m.EXIF directly. See the
+	// identical comment in writeTIFFORF above for the full rationale
+	// (relocateTIFFFromParsedRW2 permanently mutates its *exif.EXIF argument).
+	if err := tiff.InjectWithEXIFRW2(originalBytes, cloneEXIF(m.EXIF), rawIPTC, rawXMP, w); err != nil {
 		return fmt.Errorf("gometadata: %w", err)
 	}
 	return nil
@@ -907,9 +940,9 @@ func writeTIFFNEF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 			return fmt.Errorf("gometadata: nef seek: %w", err)
 		}
 		var err error
-		originalBytes, err = io.ReadAll(r)
+		originalBytes, err = readAllCapped(r, "nef")
 		if err != nil {
-			return fmt.Errorf("gometadata: nef read: %w", err)
+			return err
 		}
 	}
 

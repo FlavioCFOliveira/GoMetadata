@@ -3094,7 +3094,7 @@ func TestSetGPSDoesNotOverwriteVersionID(t *testing.T) {
 	e := &EXIF{ByteOrder: binary.LittleEndian, IFD0: &IFD{}}
 	// Pre-populate GPS IFD with a custom GPSVersionID.
 	e.GPSIFD = &IFD{}
-	e.GPSIFD.set(TagGPSVersionID, TypeByte, 4, []byte{2, 2, 0, 0}) // older version
+	e.GPSIFD.set(TagGPSVersionID, TypeByte, 4, []byte{2, 2, 0, 0}, false) // older version, LE fixture
 
 	e.SetGPS(48.8566, 2.3522) // Paris
 
@@ -3770,28 +3770,48 @@ func TestSetMakeOnManuallyConstructedEXIF(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestIFD0ByteOrderEmptyIFD0RoundTrip is the regression gate for audit
-// finding EXIF-BO-001.
+// findings EXIF-BO-001 and EXIF-BO-002.
 //
-// The former ifd0ByteOrder implementation (task #199) inferred byte order
-// from e.IFD0.Entries[0].bigEndian, which requires at least one IFD0 entry to
-// resolve correctly. A spec-legal big-endian TIFF stream ("MM") whose IFD0
-// has zero entries has no Entries[0], so that implementation silently fell
-// back to binary.LittleEndian even though the stream is big-endian. Every
-// numeric setter that calls e.ifd0ByteOrder() (SetOrientation, SetGPS,
-// SetExposureTime, SetFNumber, SetISO, SetFocalLength) then pre-encoded LE
-// value bytes into a structure that Encode serialises as BE, silently
-// corrupting the output — e.g. a set Orientation of 6 (0x0006 as two LE
-// bytes: 0x06, 0x00) is later read back by any conformant BE reader as
-// 0x0600 = 1536.
+// EXIF-BO-001 (task #246): the former ifd0ByteOrder implementation (task
+// #199) inferred byte order from e.IFD0.Entries[0].bigEndian, which requires
+// at least one IFD0 entry to resolve correctly. A spec-legal big-endian TIFF
+// stream ("MM") whose IFD0 has zero entries has no Entries[0], so that
+// implementation silently fell back to binary.LittleEndian even though the
+// stream is big-endian. Every numeric setter that calls e.ifd0ByteOrder()
+// (SetOrientation, SetGPS, SetExposureTime, SetFNumber, SetISO,
+// SetFocalLength) then pre-encoded LE value bytes into a structure that
+// Encode serialises as BE, silently corrupting the output — e.g. a set
+// Orientation of 6 (0x0006 as two LE bytes: 0x06, 0x00) is later read back by
+// any conformant BE reader as 0x0600 = 1536.
 //
-// The fix prefers the authoritative e.ByteOrder (set unconditionally by every
-// Parse path regardless of IFD0 entry count) and only falls back to
-// binary.LittleEndian when e.ByteOrder is nil (a caller-constructed EXIF that
-// never went through Parse — see TestSetMakeOnManuallyConstructedEXIF above).
+// The EXIF-BO-001 fix prefers the authoritative e.ByteOrder (set
+// unconditionally by every Parse path regardless of IFD0 entry count) and
+// only falls back to binary.LittleEndian when e.ByteOrder is nil (a
+// caller-constructed EXIF that never went through Parse — see
+// TestSetMakeOnManuallyConstructedEXIF above).
 //
-// The non-empty-IFD0 case is included as a control: it must keep round-
-// tripping correctly, proving the fix does not regress the case the former
-// implementation already handled.
+// EXIF-BO-002 (security audit FIX 4, CWE-198): fixing ifd0ByteOrder alone
+// (EXIF-BO-001) was not sufficient. IFD.set's OWN bigEndian flag — which
+// controls how in-memory accessors DECODE an entry (IFDEntry.Uint16,
+// .Rational, ...), as opposed to ifd0ByteOrder which only controls how
+// Set* methods ENCODE the value bytes they write — was inherited from
+// ifd.Entries[0], independently defaulting to false (LE) for a freshly
+// created, empty GPSIFD/ExifIFD regardless of e.ifd0ByteOrder(). On a
+// big-endian source this meant: value bytes are BE-encoded (correct, thanks
+// to EXIF-BO-001) but the entry's decode flag says LE, so e.GPS(),
+// e.ExposureTime(), e.FNumber(), e.ISO(), e.FocalLength(), and
+// e.ImageSize() all returned garbage when called on the SAME *EXIF object
+// immediately after the corresponding Set* call — i.e. before any
+// Encode()/Parse() round-trip. Encode()'s own output was never affected.
+// The fix threads e.ifd0BigEndian() explicitly into every IFD.set call
+// instead of letting IFD.set infer it. CIPA DC-008-2023 §4.6.2.
+//
+// The "non-empty IFD0 (control)" case below exercises exactly the freshly-
+// created-sub-IFD scenario named in EXIF-BO-002: e.IFD0 already has one
+// entry (so EXIF-BO-001's fix path is not what determines correctness here),
+// but e.GPSIFD and e.ExifIFD both start nil and are created from scratch by
+// SetGPS/ensureExifIFD — proving the fix does not depend on IFD0's own entry
+// count.
 func TestIFD0ByteOrderEmptyIFD0RoundTrip(t *testing.T) {
 	t.Parallel()
 
@@ -3811,6 +3831,7 @@ func TestIFD0ByteOrderEmptyIFD0RoundTrip(t *testing.T) {
 		wantFNumber                    = 2.8
 		wantISO                        = uint(400)
 		wantFocalLength                = 50.0
+		wantWidth, wantHeight          = uint32(4032), uint32(3024)
 		wantLat, wantLon               = 37.7749, -122.4194
 		coordTolerance, valueTolerance = 1e-4, 1e-6
 	)
@@ -3837,13 +3858,17 @@ func TestIFD0ByteOrderEmptyIFD0RoundTrip(t *testing.T) {
 				t.Fatalf("ifd0ByteOrder() = %v, want binary.BigEndian (EXIF-BO-001 regression)", got)
 			}
 
-			// Exercise all six numeric setters named in audit finding EXIF-BO-001.
+			// Exercise all seven numeric setters named in audit findings
+			// EXIF-BO-001/EXIF-BO-002. SetGPS and SetExposureTime/SetFNumber/
+			// SetISO/SetFocalLength/SetImageSize all create fresh, empty
+			// sub-IFDs (GPSIFD, ExifIFD) the first time they are called.
 			e.SetOrientation(wantOrientation)
 			e.SetGPS(wantLat, wantLon)
 			e.SetExposureTime(wantExpNum, wantExpDen)
 			e.SetFNumber(wantFNumber)
 			e.SetISO(wantISO)
 			e.SetFocalLength(wantFocalLength)
+			e.SetImageSize(wantWidth, wantHeight)
 
 			// Direct byte-level proof (pre-Encode): the Orientation entry's inline
 			// value must already be BE-encoded — SetOrientation calls
@@ -3855,6 +3880,34 @@ func TestIFD0ByteOrderEmptyIFD0RoundTrip(t *testing.T) {
 			}
 			if got := binary.BigEndian.Uint16(ori.Value); got != wantOrientation {
 				t.Errorf("raw Orientation inline value decoded as binary.BigEndian = %d, want %d (value was pre-encoded as LE bytes into a BE stream)", got, wantOrientation)
+			}
+
+			// EXIF-BO-002 regression: read every value back via its in-memory
+			// accessor on the SAME *EXIF object, BEFORE any Encode()/Parse()
+			// round-trip. Before the fix, IFD.set inherited its bigEndian decode
+			// flag from ifd.Entries[0] — defaulting to false (LE) for the
+			// freshly created, empty GPSIFD/ExifIFD regardless of the true BE
+			// stream order — so these accessors decoded the just-written
+			// BE-encoded value bytes as if they were LE, returning wrong results
+			// even though the value bytes themselves (and Encode()'s eventual
+			// output) were already correct.
+			if lat, lon, ok := e.GPS(); !ok || math.Abs(lat-wantLat) > coordTolerance || math.Abs(lon-wantLon) > coordTolerance {
+				t.Errorf("pre-Encode GPS() = (%f, %f, %v), want approximately (%f, %f, true) (EXIF-BO-002 regression)", lat, lon, ok, wantLat, wantLon)
+			}
+			if num, den, ok := e.ExposureTime(); !ok || num != wantExpNum || den != wantExpDen {
+				t.Errorf("pre-Encode ExposureTime() = (%d, %d, %v), want (%d, %d, true) (EXIF-BO-002 regression)", num, den, ok, wantExpNum, wantExpDen)
+			}
+			if got, ok := e.FNumber(); !ok || math.Abs(got-wantFNumber) > valueTolerance {
+				t.Errorf("pre-Encode FNumber() = (%f, %v), want approximately (%f, true) (EXIF-BO-002 regression)", got, ok, wantFNumber)
+			}
+			if got, ok := e.ISO(); !ok || got != wantISO {
+				t.Errorf("pre-Encode ISO() = (%d, %v), want (%d, true) (EXIF-BO-002 regression)", got, ok, wantISO)
+			}
+			if got, ok := e.FocalLength(); !ok || math.Abs(got-wantFocalLength) > valueTolerance {
+				t.Errorf("pre-Encode FocalLength() = (%f, %v), want approximately (%f, true) (EXIF-BO-002 regression)", got, ok, wantFocalLength)
+			}
+			if w, h, ok := e.ImageSize(); !ok || w != wantWidth || h != wantHeight {
+				t.Errorf("pre-Encode ImageSize() = (%d, %d, %v), want (%d, %d, true) (EXIF-BO-002 regression)", w, h, ok, wantWidth, wantHeight)
 			}
 
 			// Encode and re-Parse: the full round trip a real caller performs.

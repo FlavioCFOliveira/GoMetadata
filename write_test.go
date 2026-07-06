@@ -1799,21 +1799,34 @@ func TestWrite_CrossFormatMismatchRejected(t *testing.T) {
 	}
 }
 
-// TestWriteTwicePreservesMetadata is the gate for finding #109.
+// TestWriteTwicePreservesMetadata is the gate for finding #109, extended by
+// security audit FIX 2 (ORF/RW2 double-write corruption, CWE-664).
 //
 // Writing the same *Metadata twice must produce byte-identical output both
 // times: IFD0 entry count, thumbnail bytes, and ImageDataHash must all match.
 //
-// Before the fix, the second Write on a TIFF *Metadata would fail with
+// Before the #109 fix, the second Write on a TIFF *Metadata would fail with
 // ErrBlockOutOfBounds or silently produce wrong output because
 // relocateTIFFFromParsed permanently mutated m.EXIF (removed strip/tile entries,
 // cleared ThumbnailData, appended IPTC/XMP entries without deduplication).
+//
+// The #109 fix cloned m.EXIF (via cloneEXIF) at every writeTIFF* call site
+// except writeTIFFORF and writeTIFFRW2, which were added later (task #104)
+// and passed m.EXIF directly to InjectWithEXIFORF/InjectWithEXIFRW2 — both of
+// which permanently mutate the *exif.EXIF they receive (clear ThumbnailData,
+// rewrite StripOffsets/StripByteCounts/MakerNote-pointer entries with
+// relocated offsets). A second Write() on the same *Metadata therefore reused
+// the already-mutated EXIF and silently corrupted the output image data. The
+// ORF/RW2 subcases below use real corpus fixtures (not synthetic data) since
+// the corruption only manifests with realistic strip/MakerNote layouts.
 func TestWriteTwicePreservesMetadata(t *testing.T) {
 	t.Parallel()
 
 	type subcase struct {
 		name      string
-		buildData func() []byte
+		buildData func() []byte     // synthetic fixture builder; nil if path is set
+		path      string            // real corpus fixture path; "" if buildData is set
+		setTag    func(m *Metadata) // mutates m before both Write calls
 	}
 
 	subcases := []subcase{
@@ -1824,6 +1837,7 @@ func TestWriteTwicePreservesMetadata(t *testing.T) {
 				strip := []byte("WRITE-TWICE-STRIP-DATA-GUARD-109!")
 				return buildTIFFWithStrip(binary.LittleEndian, false, strip, false)
 			},
+			setTag: func(m *Metadata) { m.SetCopyright("© 2026 twice-TIFF") },
 		},
 		{
 			// NEF-like (big-endian TIFF) — exercises the writeTIFFNEF path.
@@ -1832,6 +1846,7 @@ func TestWriteTwicePreservesMetadata(t *testing.T) {
 				strip := []byte("WRITE-TWICE-NEF-STRIP-DATA-GUARD!")
 				return buildTIFFWithStrip(binary.BigEndian, true, strip, false)
 			},
+			setTag: func(m *Metadata) { m.SetCopyright("© 2026 twice-NEF") },
 		},
 		{
 			// ARW-like synthetic (TIFF LE + SONY make tag) — exercises writeTIFFARW.
@@ -1844,6 +1859,21 @@ func TestWriteTwicePreservesMetadata(t *testing.T) {
 				previewData[0], previewData[1] = 0xFF, 0xD8
 				return buildARWWithIFD0Preview(previewData, stripData)
 			},
+			setTag: func(m *Metadata) { m.SetCopyright("© 2026 twice-ARW") },
+		},
+		{
+			// Security audit FIX 2 regression: real Olympus ORF corpus file —
+			// exercises the writeTIFFORF path (InjectWithEXIFORF).
+			name:   "ORF",
+			path:   "testdata/corpus/raw/metadata-extractor/Olympus E410.orf",
+			setTag: func(m *Metadata) { m.SetOrientation(3) },
+		},
+		{
+			// Security audit FIX 2 regression: real Panasonic RW2 corpus file —
+			// exercises the writeTIFFRW2 path (InjectWithEXIFRW2).
+			name:   "RW2",
+			path:   "testdata/corpus/raw/metadata-extractor/Panasonic DMC-GF1.rw2",
+			setTag: func(m *Metadata) { m.SetOrientation(3) },
 		},
 	}
 
@@ -1851,13 +1881,22 @@ func TestWriteTwicePreservesMetadata(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			data := tc.buildData()
+			var data []byte
+			if tc.path != "" {
+				var err error
+				data, err = os.ReadFile(tc.path)
+				if err != nil {
+					t.Skipf("fixture not found (%s): %v", tc.path, err)
+				}
+			} else {
+				data = tc.buildData()
+			}
 
 			m, err := Read(bytes.NewReader(data))
 			if err != nil {
 				t.Fatalf("Read %s: %v", tc.name, err)
 			}
-			m.SetCopyright("© 2026 twice-" + tc.name)
+			tc.setTag(m)
 
 			// Record the IFD0 entry count before any Write so we can detect mutations.
 			var entryCountBefore int

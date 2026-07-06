@@ -794,13 +794,25 @@ func (e *EXIF) ifd0ByteOrder() binary.ByteOrder {
 	return binary.LittleEndian
 }
 
+// ifd0BigEndian reports whether ifd0ByteOrder() is binary.BigEndian, as a
+// bool suitable for the bigEndian parameter of IFD.set.
+//
+// Security audit FIX 4 (EXIF-BO-002, CWE-198): every Set* method must pass
+// this value (not let IFD.set infer it from the IFD's own, possibly-empty,
+// Entries slice) so that in-memory accessors decode a just-written value
+// correctly even before the first Encode/Parse round-trip. See IFD.set's doc
+// comment for the full root-cause explanation. CIPA DC-008-2023 §4.6.2.
+func (e *EXIF) ifd0BigEndian() bool {
+	return e.ifd0ByteOrder() == binary.BigEndian
+}
+
 // SetCameraModel sets IFD0 tag 0x0110 (Model, EXIF §4.6.4 Table 3).
 func (e *EXIF) SetCameraModel(s string) {
 	if e == nil || e.IFD0 == nil {
 		return
 	}
 	v := asciiValue(s)
-	e.IFD0.set(TagModel, TypeASCII, uint32(len(v)), v) //nolint:gosec // G115: string length bounded by input
+	e.IFD0.set(TagModel, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
 }
 
 // SetCaption sets IFD0 tag 0x010E (ImageDescription, EXIF §4.6.4 Table 3).
@@ -809,7 +821,7 @@ func (e *EXIF) SetCaption(s string) {
 		return
 	}
 	v := asciiValue(s)
-	e.IFD0.set(TagImageDescription, TypeASCII, uint32(len(v)), v) //nolint:gosec // G115: string length bounded by input
+	e.IFD0.set(TagImageDescription, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
 }
 
 // SetCopyright sets IFD0 tag 0x8298 (Copyright, EXIF §4.6.4 Table 3).
@@ -818,7 +830,7 @@ func (e *EXIF) SetCopyright(s string) {
 		return
 	}
 	v := asciiValue(s)
-	e.IFD0.set(TagCopyright, TypeASCII, uint32(len(v)), v) //nolint:gosec // G115: string length bounded by input
+	e.IFD0.set(TagCopyright, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
 }
 
 // SetCreator sets IFD0 tag 0x013B (Artist, EXIF §4.6.4 Table 3).
@@ -827,7 +839,7 @@ func (e *EXIF) SetCreator(s string) {
 		return
 	}
 	v := asciiValue(s)
-	e.IFD0.set(TagArtist, TypeASCII, uint32(len(v)), v) //nolint:gosec // G115: string length bounded by input
+	e.IFD0.set(TagArtist, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
 }
 
 // SetOrientation sets IFD0 tag 0x0112 (Orientation, EXIF §4.6.4 Table 3).
@@ -841,7 +853,7 @@ func (e *EXIF) SetOrientation(v uint16) {
 	order := e.ifd0ByteOrder()
 	var b [2]byte
 	order.PutUint16(b[:], v)
-	e.IFD0.set(TagOrientation, TypeShort, 1, b[:])
+	e.IFD0.set(TagOrientation, TypeShort, 1, b[:], order == binary.BigEndian)
 }
 
 // ensureExifIFD creates ExifIFD if nil and ensures IFD0 carries a placeholder
@@ -856,7 +868,7 @@ func (e *EXIF) ensureExifIFD() {
 		// Value 0 is a placeholder; encode() (write.go) overwrites it with the
 		// correct absolute offset once the ExifIFD is serialised.
 		var placeholder [4]byte
-		e.IFD0.set(TagExifIFDPointer, TypeLong, 1, placeholder[:])
+		e.IFD0.set(TagExifIFDPointer, TypeLong, 1, placeholder[:], e.ifd0BigEndian())
 	}
 }
 
@@ -866,7 +878,7 @@ func (e *EXIF) SetMake(s string) {
 		return
 	}
 	v := asciiValue(s)
-	e.IFD0.set(TagMake, TypeASCII, uint32(len(v)), v) //nolint:gosec // G115: string length bounded by input
+	e.IFD0.set(TagMake, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
 }
 
 // SetDateTimeOriginal sets ExifIFD tag 0x9003 (DateTimeOriginal, EXIF §4.6.5)
@@ -879,7 +891,7 @@ func (e *EXIF) SetDateTimeOriginal(t time.Time) {
 	// EXIF §4.6.5: DateTimeOriginal is a 20-byte ASCII field including the NUL.
 	formatted := t.Format("2006:01:02 15:04:05") + "\x00"
 	v := []byte(formatted)
-	e.ExifIFD.set(TagDateTimeOriginal, TypeASCII, uint32(len(v)), v) //nolint:gosec // G115: string length bounded by input
+	e.ExifIFD.set(TagDateTimeOriginal, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
 }
 
 // SetExposureTime sets ExifIFD tag 0x829A (ExposureTime, EXIF §4.6.5).
@@ -893,7 +905,7 @@ func (e *EXIF) SetExposureTime(num, den uint32) {
 	b := make([]byte, 8)
 	order.PutUint32(b[0:], num)
 	order.PutUint32(b[4:], den)
-	e.ExifIFD.set(TagExposureTime, TypeRational, 1, b)
+	e.ExifIFD.set(TagExposureTime, TypeRational, 1, b, order == binary.BigEndian)
 }
 
 // SetFNumber sets ExifIFD tag 0x829D (FNumber, EXIF §4.6.5).
@@ -909,7 +921,7 @@ func (e *EXIF) SetFNumber(f float64) {
 	b := make([]byte, 8)
 	order.PutUint32(b[0:], num)
 	order.PutUint32(b[4:], denom)
-	e.ExifIFD.set(TagFNumber, TypeRational, 1, b)
+	e.ExifIFD.set(TagFNumber, TypeRational, 1, b, order == binary.BigEndian)
 }
 
 // SetISO sets ExifIFD tag 0x8827 (ISOSpeedRatings, EXIF §4.6.5).
@@ -924,7 +936,7 @@ func (e *EXIF) SetISO(iso uint) {
 		iso = 65535
 	}
 	order.PutUint16(b[:], uint16(iso))
-	e.ExifIFD.set(TagISOSpeedRatings, TypeShort, 1, b[:])
+	e.ExifIFD.set(TagISOSpeedRatings, TypeShort, 1, b[:], order == binary.BigEndian)
 }
 
 // SetFocalLength sets ExifIFD tag 0x920A (FocalLength, EXIF §4.6.5).
@@ -940,7 +952,7 @@ func (e *EXIF) SetFocalLength(mm float64) {
 	b := make([]byte, 8)
 	order.PutUint32(b[0:], num)
 	order.PutUint32(b[4:], denom)
-	e.ExifIFD.set(TagFocalLength, TypeRational, 1, b)
+	e.ExifIFD.set(TagFocalLength, TypeRational, 1, b, order == binary.BigEndian)
 }
 
 // SetLensModel sets ExifIFD tag 0xA434 (LensModel, EXIF §4.6.5).
@@ -950,7 +962,7 @@ func (e *EXIF) SetLensModel(s string) {
 	}
 	e.ensureExifIFD()
 	v := asciiValue(s)
-	e.ExifIFD.set(TagLensModel, TypeASCII, uint32(len(v)), v) //nolint:gosec // G115: string length bounded by input
+	e.ExifIFD.set(TagLensModel, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
 }
 
 // SetImageSize sets ExifIFD tags 0xA002 and 0xA003 (PixelXDimension /
@@ -964,8 +976,9 @@ func (e *EXIF) SetImageSize(width, height uint32) {
 	var bw, bh [4]byte
 	order.PutUint32(bw[:], width)
 	order.PutUint32(bh[:], height)
-	e.ExifIFD.set(TagPixelXDimension, TypeLong, 1, bw[:])
-	e.ExifIFD.set(TagPixelYDimension, TypeLong, 1, bh[:])
+	isBig := order == binary.BigEndian
+	e.ExifIFD.set(TagPixelXDimension, TypeLong, 1, bw[:], isBig)
+	e.ExifIFD.set(TagPixelYDimension, TypeLong, 1, bh[:], isBig)
 }
 
 // validWGS84Coords reports whether lat and lon are finite, non-NaN values
@@ -1043,6 +1056,7 @@ func (e *EXIF) SetGPS(lat, lon float64) {
 
 	// Determine byte order from IFD0 — GPS IFD entries must match the stream.
 	order := e.ifd0ByteOrder()
+	isBig := order == binary.BigEndian
 
 	latRef := "N\x00"
 	if lat < 0 {
@@ -1067,18 +1081,18 @@ func (e *EXIF) SetGPS(lat, lon float64) {
 	// present. EXIF §4.6.6 Table 15: GPSVersionID indicates the GPS IFD version;
 	// {2,3,0,0} corresponds to EXIF 2.3/3.0 GPS attribute information revision.
 	if gps.Get(TagGPSVersionID) == nil {
-		gps.set(TagGPSVersionID, TypeByte, 4, []byte{2, 3, 0, 0})
+		gps.set(TagGPSVersionID, TypeByte, 4, []byte{2, 3, 0, 0}, isBig)
 	}
-	gps.set(TagGPSLatitudeRef, TypeASCII, 2, []byte(latRef))
-	gps.set(TagGPSLatitude, TypeRational, 3, latDMS[:])
-	gps.set(TagGPSLongitudeRef, TypeASCII, 2, []byte(lonRef))
-	gps.set(TagGPSLongitude, TypeRational, 3, lonDMS[:])
+	gps.set(TagGPSLatitudeRef, TypeASCII, 2, []byte(latRef), isBig)
+	gps.set(TagGPSLatitude, TypeRational, 3, latDMS[:], isBig)
+	gps.set(TagGPSLongitudeRef, TypeASCII, 2, []byte(lonRef), isBig)
+	gps.set(TagGPSLongitude, TypeRational, 3, lonDMS[:], isBig)
 
 	// Ensure IFD0 carries a TagGPSIFDPointer entry so encode() will serialise
 	// the GPS IFD and patch the real offset.  Value 0 is a placeholder;
 	// encode() (write.go) overwrites it with the correct absolute offset.
 	if e.IFD0.Get(TagGPSIFDPointer) == nil {
 		var placeholder [4]byte
-		e.IFD0.set(TagGPSIFDPointer, TypeLong, 1, placeholder[:])
+		e.IFD0.set(TagGPSIFDPointer, TypeLong, 1, placeholder[:], isBig)
 	}
 }

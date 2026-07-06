@@ -144,10 +144,18 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 }
 
 func extractTIFFTags(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawIPTC, rawXMP []byte) { //nolint:gocyclo // IPTC trimming branch is inherent to TypeLong-vs-TypeUndefined handling; extracting a helper would reduce clarity
-	if int(ifd0Off)+2 > len(data) {
+	// Security audit FIX 5 (CWE-681/190): compare in uint64, not int, before
+	// converting ifd0Off to int. On a 32-bit platform (GOARCH=386/arm),
+	// int(ifd0Off) for ifd0Off >= 2^31 is negative, which would let a bad
+	// offset pass an int-typed bound check and then panic on data[ifd0Off:].
+	// Mirrors the #74 fix in format/detect.go's parseClassicTIFFIFD0 and the
+	// #45 fix in format/jpeg's parseIRBEntry.
+	if uint64(ifd0Off)+2 > uint64(len(data)) {
 		return nil, nil
 	}
 	count := int(order.Uint16(data[ifd0Off:]))
+	// ifd0Off ≤ uint64(len(data))-2, and len(data) is a valid int on this
+	// platform, so ifd0Off < len(data) fits int safely here.
 	pos := int(ifd0Off) + 2
 	for i := 0; i < count; i++ { //nolint:intrange,modernize // binary parser: loop variable is a byte-slice offset multiplier
 		e := pos + i*12

@@ -25,7 +25,7 @@ func buildBenchIFD(n int) *IFD {
 		tag := TagID(0x0100 + i)
 		var v [4]byte
 		binary.LittleEndian.PutUint32(v[:], uint32(i))
-		ifd.set(tag, TypeLong, 1, v[:])
+		ifd.set(tag, TypeLong, 1, v[:], false) // LE fixture
 	}
 	return ifd
 }
@@ -36,15 +36,15 @@ func buildGPSIFD() *IFD {
 	ifd := &IFD{}
 
 	// GPSLatitudeRef: "N\x00"
-	ifd.set(TagGPSLatitudeRef, TypeASCII, 2, []byte("N\x00"))
+	ifd.set(TagGPSLatitudeRef, TypeASCII, 2, []byte("N\x00"), orderIsBig(order))
 	// GPSLatitude: 51°30'26.496" N  (London approximate)
 	latDMS := decimalToDMSBytes(51.507360, order)
-	ifd.set(TagGPSLatitude, TypeRational, 3, latDMS[:])
+	ifd.set(TagGPSLatitude, TypeRational, 3, latDMS[:], orderIsBig(order))
 	// GPSLongitudeRef: "W\x00"
-	ifd.set(TagGPSLongitudeRef, TypeASCII, 2, []byte("W\x00"))
+	ifd.set(TagGPSLongitudeRef, TypeASCII, 2, []byte("W\x00"), orderIsBig(order))
 	// GPSLongitude: 0°07'39.60" W
 	lonDMS := decimalToDMSBytes(-0.127700, order)
-	ifd.set(TagGPSLongitude, TypeRational, 3, lonDMS[:])
+	ifd.set(TagGPSLongitude, TypeRational, 3, lonDMS[:], orderIsBig(order))
 
 	return ifd
 }
@@ -79,7 +79,7 @@ func BenchmarkIFDSet(b *testing.B) {
 		for _, tag := range tags {
 			var v [4]byte
 			binary.LittleEndian.PutUint32(v[:], uint32(tag))
-			ifd.set(tag, TypeLong, 1, v[:])
+			ifd.set(tag, TypeLong, 1, v[:], false) // LE fixture
 		}
 	}
 }

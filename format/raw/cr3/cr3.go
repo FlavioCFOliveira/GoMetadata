@@ -158,7 +158,14 @@ func mergeCMT(cmt1, cmt2 []byte) []byte {
 	}
 	exifIFDOffset := getExifIFDOffset(cmt1)
 	// If the ExifIFD offset is within CMT1, no merge needed.
-	if exifIFDOffset == 0 || int(exifIFDOffset) < len(cmt1) {
+	//
+	// Security audit FIX 5 (CWE-681/190): compare in uint64, not int. On a
+	// 32-bit platform (GOARCH=386/arm), int(exifIFDOffset) for an offset
+	// >= 2^31 is negative, which would make this comparison true for ANY
+	// len(cmt1) — silently skipping the CMT1+CMT2 merge and leaving the
+	// ExifIFD pointer dangling past the end of cmt1. Mirrors the identical
+	// fix in findExifIFDOffset below.
+	if exifIFDOffset == 0 || uint64(exifIFDOffset) < uint64(len(cmt1)) {
 		return cmt1
 	}
 	// ExifIFD pointer extends into CMT2: concatenate.
@@ -172,10 +179,18 @@ func mergeCMT(cmt1, cmt2 []byte) []byte {
 // 0x8769 (ExifIFD) and returns its LONG value (the offset). Returns 0 if not
 // found or if buf is too short to parse.
 func findExifIFDOffset(buf []byte, ifd0Off uint32, order binary.ByteOrder) uint32 {
-	if int(ifd0Off)+2 > len(buf) {
+	// Security audit FIX 5 (CWE-681/190): compare in uint64, not int, before
+	// converting ifd0Off to int. On a 32-bit platform (GOARCH=386/arm),
+	// int(ifd0Off) for ifd0Off >= 2^31 is negative, which would let a bad
+	// offset pass an int-typed bound check and then panic on buf[pos:].
+	// Mirrors the #74 fix in format/detect.go's parseClassicTIFFIFD0 and the
+	// #45 fix in format/jpeg's parseIRBEntry.
+	if uint64(ifd0Off)+2 > uint64(len(buf)) {
 		return 0
 	}
 	count := order.Uint16(buf[ifd0Off:])
+	// ifd0Off ≤ uint64(len(buf))-2, and len(buf) is a valid int on this
+	// platform, so ifd0Off < len(buf) fits int safely here.
 	pos := int(ifd0Off) + 2
 	for range int(count) {
 		if pos+12 > len(buf) {

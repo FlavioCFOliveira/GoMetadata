@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"math"
 	"testing"
+	"time"
 )
 
 // buildHEIF assembles a minimal ISOBMFF/HEIF stream containing optional EXIF
@@ -1568,6 +1569,229 @@ func TestHEIFInjectLargeExtentCountBounded(t *testing.T) {
 		_ = Inject(bytes.NewReader(data), &out, nil, nil, newXMP, true)
 		// We do not assert a specific return value — the crafted truncated iloc
 		// may cause graceful early-termination. The key invariant is: no crash.
+	})
+}
+
+// boxWithHeader assembles a single ISOBMFF box: a 4-byte size, a 4-byte type,
+// then body. size is computed automatically. ISO 14496-12 §4.2.
+func boxWithHeader(typ string, body []byte) []byte {
+	hdr := make([]byte, 0, 8+len(body))
+	hdr = append(hdr, 0, 0, 0, 0)
+	hdr = append(hdr, typ...)
+	binary.BigEndian.PutUint32(hdr, uint32(8+len(body))) //nolint:gosec // G115: test helper, bounded body length
+	return append(hdr, body...)
+}
+
+// buildIlocZeroFieldAmplification assembles a minimal ftyp+meta HEIF stream
+// whose iloc box declares itemCount items, each with extentCount extents, but
+// with EVERY per-extent field-size nibble (offset_size, length_size,
+// base_offset_size, index_size) set to zero. Zero field width means no extent
+// consumes any input byte, so pre-fix code would spin extentCount times per
+// item (and itemCount times overall) without the loop bound ever being
+// naturally limited by input length — the exact amplification vector fixed
+// by HEIF-ILOC-EXTENT-AMPLIFICATION (security audit FIX 1).
+//
+// The iinf box is intentionally empty (item_count=0): both parseIloc (used by
+// Extract, via extractFromMetaData) and parseIlocFull (used by Inject, via
+// buildInjectComponents) parse the iloc box unconditionally, before any
+// iinf-driven item-type matching takes place, so the vulnerable code path is
+// reached through the public Extract/Inject entry points regardless of
+// whether any item actually resolves to Exif/XMP.
+func buildIlocZeroFieldAmplification(itemCount int, extentCount uint16, ilocVersion uint8) []byte {
+	iinfBody := []byte{0, 0, 0, 0, 0, 0} // version=0, flags=0, item_count=0
+	iinfBox := boxWithHeader("iinf", iinfBody)
+
+	ilocBody := make([]byte, 0, 8+itemCount*6)
+	// version + flags, then offset|length=0, base_offset|index=0.
+	ilocBody = append(ilocBody, ilocVersion, 0, 0, 0, 0x00, 0x00)
+
+	if ilocVersion < 2 {
+		var ic [2]byte
+		binary.BigEndian.PutUint16(ic[:], uint16(itemCount)) //nolint:gosec // G115: test helper, itemCount is a small constant
+		ilocBody = append(ilocBody, ic[:]...)
+	} else {
+		var ic [4]byte
+		binary.BigEndian.PutUint32(ic[:], uint32(itemCount)) //nolint:gosec // G115: test helper, itemCount is a small constant
+		ilocBody = append(ilocBody, ic[:]...)
+	}
+
+	for i := range itemCount {
+		var id [2]byte
+		binary.BigEndian.PutUint16(id[:], uint16(i+1)) // i is bounded by itemCount (a small test constant)
+		ilocBody = append(ilocBody, id[:]...)
+		if ilocVersion == 1 || ilocVersion == 2 {
+			ilocBody = append(ilocBody, 0x00, 0x00) // construction_method = 0
+		}
+		// base_offset: 0 bytes (base_offset_size = 0).
+		var ec [2]byte
+		binary.BigEndian.PutUint16(ec[:], extentCount)
+		ilocBody = append(ilocBody, ec[:]...)
+		// extents: 0 bytes each — offset_size, length_size, index_size are all 0.
+	}
+	ilocBox := boxWithHeader("iloc", ilocBody)
+
+	metaBody := make([]byte, 0, 4+len(iinfBox)+len(ilocBox))
+	metaBody = append(metaBody, 0, 0, 0, 0) // meta FullBox version+flags
+	metaBody = append(metaBody, iinfBox...)
+	metaBody = append(metaBody, ilocBox...)
+	metaBox := boxWithHeader("meta", metaBody)
+
+	ftyp := []byte{
+		0x00, 0x00, 0x00, 0x14, 'f', 't', 'y', 'p',
+		'h', 'e', 'i', 'c', 0x00, 0x00, 0x00, 0x00, 'm', 'i', 'f', '1',
+	}
+
+	out := make([]byte, 0, len(ftyp)+len(metaBox))
+	out = append(out, ftyp...)
+	out = append(out, metaBox...)
+	return out
+}
+
+// TestHEIFIlocZeroFieldSizeAmplificationBounded is the regression gate for
+// security audit FIX 1 (HEIF-ILOC-EXTENT-AMPLIFICATION, CWE-770/834).
+//
+// Root cause (pre-fix): readIlocFullExtents and readIlocSimpleExtents looped
+// `for range extentCount` (an attacker-controlled uint16, up to 65535)
+// unconditionally. The doc comment claimed excess extents were "dropped", but
+// the append in readIlocFullExtents was unconditional, so once the
+// pre-allocated 1024-capacity slice filled, append silently reallocated a
+// larger backing array anyway. Worse: when every per-extent field-size nibble
+// is zero (offset_size == length_size == index_size == 0), no iteration reads
+// any input byte — pos never advances — so the full extentCount iterations
+// ran regardless of the actual file size: an ~8-20 KB crafted file with
+// itemCount items each declaring extentCount=0xFFFF drove itemCount×65535
+// slice appends (readIlocFullExtents, Inject path) or itemCount×65535 no-op
+// loop iterations (readIlocSimpleExtents, Extract path) — multi-GB memory
+// amplification / CPU-exhaustion DoS from a tiny input.
+//
+// Fix: both functions now cap their effective loop bound at
+// maxIlocExtentsPerItem when the combined per-extent field size is zero, and
+// readIlocFullExtents additionally guards its append with a length check so
+// extents genuinely are dropped once the cap is reached (matching the
+// original doc comment's intent). parseIloc and parseIlocFull additionally
+// reject an iloc box whose declared item_count exceeds maxIlocItems before
+// doing any per-item work.
+func TestHEIFIlocZeroFieldSizeAmplificationBounded(t *testing.T) {
+	t.Parallel()
+
+	const extentCount = 0xFFFF // max uint16 — fully attacker-controlled
+	const itemCount = 5        // "several" items, per the audit's PoC shape
+
+	// --- White-box: readIlocFullExtents (Inject/write path) ---
+	t.Run("readIlocFullExtents zero field size is bounded", func(t *testing.T) {
+		t.Parallel()
+		info := ilocBoxInfo{version: 1} // offsetSize=lengthSize=indexSize=0 (zero value)
+		start := time.Now()
+		extents, pos := readIlocFullExtents(nil, 0, extentCount, info)
+		elapsed := time.Since(start)
+		if len(extents) > maxIlocExtentsPerItem {
+			t.Errorf("readIlocFullExtents returned %d extents, want <= %d (maxIlocExtentsPerItem)",
+				len(extents), maxIlocExtentsPerItem)
+		}
+		if cap(extents) > maxIlocExtentsPerItem {
+			t.Errorf("readIlocFullExtents allocated cap=%d, want <= %d (maxIlocExtentsPerItem)",
+				cap(extents), maxIlocExtentsPerItem)
+		}
+		if pos != 0 {
+			t.Errorf("readIlocFullExtents advanced pos to %d, want 0 (zero field size consumes no bytes)", pos)
+		}
+		if elapsed > time.Second {
+			t.Errorf("readIlocFullExtents took %v, want well under 1s (amplification not bounded)", elapsed)
+		}
+	})
+
+	// --- White-box: readIlocSimpleExtents (Extract/read path) ---
+	t.Run("readIlocSimpleExtents zero field size is bounded", func(t *testing.T) {
+		t.Parallel()
+		start := time.Now()
+		_, _, pos, ok := readIlocSimpleExtents(nil, 0, extentCount, 0, 0, 0, 0)
+		elapsed := time.Since(start)
+		if !ok {
+			t.Fatal("readIlocSimpleExtents returned ok=false for a well-formed (zero-width) extent loop")
+		}
+		if pos != 0 {
+			t.Errorf("readIlocSimpleExtents advanced pos to %d, want 0 (zero field size consumes no bytes)", pos)
+		}
+		if elapsed > time.Second {
+			t.Errorf("readIlocSimpleExtents took %v, want well under 1s (amplification not bounded)", elapsed)
+		}
+	})
+
+	// --- Black-box: full Extract() on a crafted zero-field-size iloc (v0, simple parser) ---
+	t.Run("Extract completes promptly", func(t *testing.T) {
+		t.Parallel()
+		data := buildIlocZeroFieldAmplification(itemCount, extentCount, 0)
+		start := time.Now()
+		_, _, _, err := Extract(bytes.NewReader(data))
+		elapsed := time.Since(start)
+		if elapsed > 2*time.Second {
+			t.Errorf("Extract took %v on a %d-byte crafted file, want well under 2s (amplification not bounded)",
+				elapsed, len(data))
+		}
+		_ = err // no specific error expected; absence of a hang/OOM is the invariant under test
+	})
+
+	// --- Black-box: full Inject() on a crafted zero-field-size iloc (v1, full parser) ---
+	t.Run("Inject completes promptly", func(t *testing.T) {
+		t.Parallel()
+		data := buildIlocZeroFieldAmplification(itemCount, extentCount, 1)
+		rawXMP := []byte(`<?xpacket begin="" id="x"?><x:xmpmeta><new/></x:xmpmeta><?xpacket end="r"?>`)
+		var out bytes.Buffer
+		start := time.Now()
+		err := Inject(bytes.NewReader(data), &out, nil, nil, rawXMP, true)
+		elapsed := time.Since(start)
+		if elapsed > 2*time.Second {
+			t.Errorf("Inject took %v on a %d-byte crafted file, want well under 2s (amplification not bounded)",
+				elapsed, len(data))
+		}
+		_ = err // no specific error expected; absence of a hang/OOM is the invariant under test
+	})
+
+	// --- White-box: parseIlocFull rejects an oversized item_count outright ---
+	t.Run("parseIlocFull rejects item_count above maxIlocItems", func(t *testing.T) {
+		t.Parallel()
+		// A 4-item iloc box, but with item_count patched to maxIlocItems+1
+		// after construction — parseIlocFull must reject it (ok=false) before
+		// attempting to iterate any items.
+		//
+		// Layout produced by buildIlocZeroFieldAmplification: ftyp(20 bytes) +
+		// meta box [size(4)+type(4)+version/flags(4)+iinf+iloc]. metaContent is
+		// the meta box payload with its own header and version/flags stripped —
+		// exactly the argument shape parseIloc/parseIlocFull expect (see their
+		// doc comments) — reached here by skipping ftyp(20) + meta header(8) +
+		// meta version/flags(4) = 32 bytes.
+		const ftypAndMetaHeaderLen = 20 + 8 + 4
+		data := buildIlocZeroFieldAmplification(4, 1, 2) // version 2 -> 4-byte item_count field
+		metaContent := data[ftypAndMetaHeaderLen:]
+		ilocData := findInnerBox(metaContent, "iloc")
+		if ilocData == nil {
+			t.Fatal("test setup: could not locate iloc box in crafted data")
+		}
+		// item_count field is at ilocData[6:10] for version >= 2. ilocData
+		// shares metaContent's backing array, so this mutates data in place.
+		binary.BigEndian.PutUint32(ilocData[6:], maxIlocItems+1)
+		if _, ok := parseIlocFull(metaContent); ok {
+			t.Error("parseIlocFull accepted item_count > maxIlocItems, want ok=false")
+		}
+	})
+
+	// --- White-box: parseIloc rejects an oversized item_count outright ---
+	t.Run("parseIloc rejects item_count above maxIlocItems", func(t *testing.T) {
+		t.Parallel()
+		const ftypAndMetaHeaderLen = 20 + 8 + 4
+		data := buildIlocZeroFieldAmplification(4, 1, 0) // version 0 -> 2-byte item_count field
+		metaContent := data[ftypAndMetaHeaderLen:]
+		ilocData := findInnerBox(metaContent, "iloc")
+		if ilocData == nil {
+			t.Fatal("test setup: could not locate iloc box in crafted data")
+		}
+		// item_count field is at ilocData[6:8] for version < 2; math.MaxUint16
+		// (65535) exceeds maxIlocItems (4096) while still fitting the 2-byte
+		// field width that version < 2 mandates.
+		binary.BigEndian.PutUint16(ilocData[6:], math.MaxUint16)
+		if result := parseIloc(metaContent); len(result) != 0 {
+			t.Errorf("parseIloc accepted item_count > maxIlocItems, want empty result, got %d items", len(result))
+		}
 	})
 }
 
