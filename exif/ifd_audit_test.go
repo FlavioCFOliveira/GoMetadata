@@ -869,7 +869,7 @@ func TestParseSingleIFDTruncatedCount(t *testing.T) {
 	writeIFDEntryLong(buf, ifd0Off+2, TagImageWidth, 640, order)
 	writeIFDEntryLong(buf, ifd0Off+14, TagImageLength, 480, order)
 
-	ifd, _, ok, warnRecs := parseSingleIFD(buf, ifd0Off, order)
+	ifd, _, ok, _, warnRecs := parseSingleIFD(buf, ifd0Off, order)
 	if !ok {
 		t.Fatal("parseSingleIFD returned !ok; expected lenient success")
 	}

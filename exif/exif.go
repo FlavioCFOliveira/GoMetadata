@@ -131,15 +131,21 @@ func parseByteOrder(b []byte) (binary.ByteOrder, error) {
 // pool as IFD0, eliminating per-IFD heap allocations.  Passing nil is safe and
 // degrades to individual allocations (used for BigTIFF and test helpers).
 //
+// budget is the Parse-wide traversal budget (EXIF-IFDCHAIN-01; CWE-400/405/834)
+// shared with the IFD0 chain and the GPS/Interop sub-IFD lookups so that an
+// attacker cannot obtain a fresh full allowance per sub-IFD pointer. See
+// "IFD chain traversal budget" above traverse() in ifd.go for the full
+// rationale.
+//
 // EXIF §4.6.3: ExifIFD pointer is tag 0x8769; InteropIFD pointer is tag 0xA005.
 // EXIF §4.6.5: MakerNote is tag 0x927C.
 // task #200: returns []parseWarn for deferred string materialisation at Parse boundary.
-func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseConfig, arena *parseArena) (exifIFD *IFD, makerNote []byte, makerNoteOffset uint32, makerNoteOffset64 uint64, makerNoteIFD *IFD, interopIFD *IFD, warnings []parseWarn) {
+func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseConfig, arena *parseArena, budget *traverseBudget) (exifIFD *IFD, makerNote []byte, makerNoteOffset uint32, makerNoteOffset64 uint64, makerNoteIFD *IFD, interopIFD *IFD, warnings []parseWarn) {
 	ptr := ifd0.Get(TagExifIFDPointer)
 	if ptr == nil || len(ptr.Value) < 4 {
 		return nil, nil, 0, 0, nil, nil, nil
 	}
-	sub, subWarnings, err := traverseWithArena(b, order.Uint32(ptr.Value), order, arena)
+	sub, subWarnings, err := traverseWithArena(b, order.Uint32(ptr.Value), order, arena, budget)
 	warnings = append(warnings, subWarnings...)
 	if err != nil {
 		return nil, nil, 0, 0, nil, nil, warnings
@@ -171,7 +177,7 @@ func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseCon
 
 	// Interoperability IFD pointer (EXIF §4.6.3, tag 0xA005).
 	if iptr := sub.Get(TagInteropIFDPointer); iptr != nil && len(iptr.Value) >= 4 {
-		if isub, isubWarnings, ierr := traverseWithArena(b, order.Uint32(iptr.Value), order, arena); ierr == nil {
+		if isub, isubWarnings, ierr := traverseWithArena(b, order.Uint32(iptr.Value), order, arena, budget); ierr == nil {
 			interopIFD = isub
 			warnings = append(warnings, isubWarnings...)
 		}
@@ -184,15 +190,17 @@ func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseCon
 // diagnostic warnings accumulated during traversal.
 //
 // arena is the per-Parse allocation arena; see parseExifSubIFDs for details.
+// budget is the Parse-wide traversal budget shared with the IFD0 chain and
+// the ExifIFD/InteropIFD lookups (EXIF-IFDCHAIN-01); see parseExifSubIFDs.
 //
 // EXIF §4.6.3: GPS IFD pointer is tag 0x8825.
 // task #200: returns []parseWarn for deferred string materialisation at Parse boundary.
-func parseGPSSubIFD(b []byte, ifd0 *IFD, order binary.ByteOrder, arena *parseArena) (*IFD, []parseWarn) {
+func parseGPSSubIFD(b []byte, ifd0 *IFD, order binary.ByteOrder, arena *parseArena, budget *traverseBudget) (*IFD, []parseWarn) {
 	ptr := ifd0.Get(TagGPSIFDPointer)
 	if ptr == nil || len(ptr.Value) < 4 {
 		return nil, nil
 	}
-	sub, warnings, err := traverseWithArena(b, order.Uint32(ptr.Value), order, arena)
+	sub, warnings, err := traverseWithArena(b, order.Uint32(ptr.Value), order, arena, budget)
 	if err != nil {
 		return nil, warnings
 	}
@@ -210,13 +218,17 @@ func parseGPSSubIFD(b []byte, ifd0 *IFD, order binary.ByteOrder, arena *parseAre
 // Audit finding #142: MakerNoteOffset64 is populated from the full uint64 rawOffset
 // so that MakerNote positions above 4 GiB are reported without truncation.
 // task #200: returns []parseWarn for deferred string materialisation at Parse boundary.
-func parseExifSubIFDsBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseConfig) (exifIFD *IFD, makerNote []byte, makerNoteOffset uint32, makerNoteOffset64 uint64, makerNoteIFD *IFD, interopIFD *IFD, warnings []parseWarn) { //nolint:gocyclo,cyclop // BigTIFF ExifIFD traversal mirrors parseExifSubIFDs structure; complexity is inherent in the sub-IFD dispatch chain
+//
+// budget is the Parse-wide traversal budget (EXIF-IFDCHAIN-01) shared with
+// the BigTIFF IFD0 chain and the GPS sub-IFD lookup; see parseExifSubIFDs
+// (the classic-TIFF counterpart) for the full rationale.
+func parseExifSubIFDsBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseConfig, budget *traverseBudget) (exifIFD *IFD, makerNote []byte, makerNoteOffset uint32, makerNoteOffset64 uint64, makerNoteIFD *IFD, interopIFD *IFD, warnings []parseWarn) { //nolint:gocyclo,cyclop // BigTIFF ExifIFD traversal mirrors parseExifSubIFDs structure; complexity is inherent in the sub-IFD dispatch chain
 	ptr := ifd0.Get(TagExifIFDPointer)
 	off, ok := readBigTIFFSubIFDOffset(ptr)
 	if !ok || off == 0 {
 		return nil, nil, 0, 0, nil, nil, nil
 	}
-	sub, subWarnings, err := traverseBigTIFF(b, off, order)
+	sub, subWarnings, err := traverseBigTIFF(b, off, order, budget)
 	warnings = append(warnings, subWarnings...)
 	if err != nil {
 		return nil, nil, 0, 0, nil, nil, warnings
@@ -256,7 +268,7 @@ func parseExifSubIFDsBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *p
 	// Interoperability IFD pointer (EXIF §4.6.3, tag 0xA005).
 	if iptr := sub.Get(TagInteropIFDPointer); iptr != nil {
 		if ioff, iok := readBigTIFFSubIFDOffset(iptr); iok && ioff != 0 {
-			if isub, isubWarnings, ierr := traverseBigTIFF(b, ioff, order); ierr == nil {
+			if isub, isubWarnings, ierr := traverseBigTIFF(b, ioff, order, budget); ierr == nil {
 				interopIFD = isub
 				warnings = append(warnings, isubWarnings...)
 			}
@@ -270,15 +282,19 @@ func parseExifSubIFDsBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *p
 // with readBigTIFFSubIFDOffset and traverses with traverseBigTIFF.
 // Returns the GPS IFD (nil when absent or unreadable) and any warnings.
 //
+// budget is the Parse-wide traversal budget (EXIF-IFDCHAIN-01) shared with
+// the BigTIFF IFD0 chain and the ExifIFD/InteropIFD lookups; see
+// parseExifSubIFDsBigTIFF.
+//
 // EXIF §4.6.3: GPS IFD pointer is tag 0x8825.
 // task #200: returns []parseWarn for deferred string materialisation at Parse boundary.
-func parseGPSSubIFDBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder) (*IFD, []parseWarn) {
+func parseGPSSubIFDBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, budget *traverseBudget) (*IFD, []parseWarn) {
 	ptr := ifd0.Get(TagGPSIFDPointer)
 	off, ok := readBigTIFFSubIFDOffset(ptr)
 	if !ok || off == 0 {
 		return nil, nil
 	}
-	sub, warnings, err := traverseBigTIFF(b, off, order)
+	sub, warnings, err := traverseBigTIFF(b, off, order, budget)
 	if err != nil {
 		return nil, warnings
 	}
@@ -347,7 +363,19 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 		// task #200: warn records are []parseWarn throughout the parse path.
 		// materializeWarnings converts them to []string once here, at the
 		// Parse boundary, to eliminate fmt.Sprintf from the hot path.
-		ifd0, ifd0WarnRecs, ferr := traverse(b, ifd0Off, order)
+		//
+		// EXIF-IFDCHAIN-01 (CWE-400/405/834): budget is a single traversal
+		// allowance shared by the IFD0 chain AND every sub-IFD lookup below
+		// (ExifIFD, GPSIFD, InteropIFD) for this Parse call. Sharing one
+		// budget — rather than letting each traverse call size its own from
+		// len(b) — prevents an attacker from obtaining a fresh full allowance
+		// per sub-IFD pointer and bounds the total traversal cost for the
+		// whole call to O(len(b)) instead of O(sub-IFD count × len(b)).
+		// budget does not escape to the heap: it is only used for arithmetic
+		// by traverse/traverseWithArena and their callees, none of which
+		// retain the pointer beyond the call.
+		budget := newTraverseBudget(len(b))
+		ifd0, ifd0WarnRecs, ferr := traverse(b, ifd0Off, order, &budget)
 		if ferr != nil {
 			return nil, ferr
 		}
@@ -374,10 +402,10 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 			subArena.entryBatch = make([]IFDEntry, totalSub)
 
 			var exifWarnRecs, gpsWarnRecs []parseWarn
-			e.ExifIFD, e.MakerNote, e.MakerNoteOffset, e.MakerNoteOffset64, e.MakerNoteIFD, e.InteropIFD, exifWarnRecs = parseExifSubIFDs(b, ifd0, order, &cfg, &subArena)
+			e.ExifIFD, e.MakerNote, e.MakerNoteOffset, e.MakerNoteOffset64, e.MakerNoteIFD, e.InteropIFD, exifWarnRecs = parseExifSubIFDs(b, ifd0, order, &cfg, &subArena, &budget)
 			warnRecs = append(warnRecs, exifWarnRecs...)
 
-			e.GPSIFD, gpsWarnRecs = parseGPSSubIFD(b, ifd0, order, &subArena)
+			e.GPSIFD, gpsWarnRecs = parseGPSSubIFD(b, ifd0, order, &subArena, &budget)
 			warnRecs = append(warnRecs, gpsWarnRecs...)
 		}
 		// When exifOff == 0 && gpsOff == 0 (single isolated IFD0 with no sub-IFDs),
@@ -414,7 +442,11 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 		// reject re-encoding this EXIF as classic TIFF (which would truncate all
 		// 64-bit offsets to 32 bits and silently corrupt the output).
 		e := &EXIF{ByteOrder: order, BigTIFF: true}
-		ifd0, ifd0WarnRecs, ferr := traverseBigTIFF(b, ifd0Off, order)
+		// EXIF-IFDCHAIN-01: one traversal budget shared by the BigTIFF IFD0
+		// chain and the ExifIFD/GPSIFD/InteropIFD sub-IFD lookups below; see
+		// the classic-TIFF branch above for the full rationale.
+		budget := newTraverseBudget(len(b))
+		ifd0, ifd0WarnRecs, ferr := traverseBigTIFF(b, ifd0Off, order, &budget)
 		if ferr != nil {
 			return nil, ferr
 		}
@@ -424,10 +456,10 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 		warnRecs := ifd0WarnRecs
 
 		var exifWarnRecs, gpsWarnRecs []parseWarn
-		e.ExifIFD, e.MakerNote, e.MakerNoteOffset, e.MakerNoteOffset64, e.MakerNoteIFD, e.InteropIFD, exifWarnRecs = parseExifSubIFDsBigTIFF(b, ifd0, order, &cfg)
+		e.ExifIFD, e.MakerNote, e.MakerNoteOffset, e.MakerNoteOffset64, e.MakerNoteIFD, e.InteropIFD, exifWarnRecs = parseExifSubIFDsBigTIFF(b, ifd0, order, &cfg, &budget)
 		warnRecs = append(warnRecs, exifWarnRecs...)
 
-		e.GPSIFD, gpsWarnRecs = parseGPSSubIFDBigTIFF(b, ifd0, order)
+		e.GPSIFD, gpsWarnRecs = parseGPSSubIFDBigTIFF(b, ifd0, order, &budget)
 		warnRecs = append(warnRecs, gpsWarnRecs...)
 
 		// task #200: materialise all deferred warn records into []string ONCE here.
@@ -477,7 +509,7 @@ func Encode(e *EXIF) ([]byte, error) {
 //
 // TIFF 6.0 §2: IFD layout — count(2) + entries(count×12) + nextIFD(4).
 func ParseIFDAt(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint32, bool) {
-	ifd, next, ok, _ := parseSingleIFD(b, offset, order)
+	ifd, next, ok, _, _ := parseSingleIFD(b, offset, order)
 	return ifd, next, ok
 }
 

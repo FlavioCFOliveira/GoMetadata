@@ -89,6 +89,23 @@ const (
 	//   (len %d); IFD chain terminated (BigTIFF spec §2)"
 	// Fields: offset64, bufLen32.
 	warnBigTIFFNextOutOfBounds
+
+	// warnTraverseBudgetExceeded (EXIF-IFDCHAIN-01): the shared IFD-chain
+	// traversal budget (cumulative entry count or chain length) was exhausted
+	// before the next-IFD pointer resolved to 0; the chain is terminated early
+	// to prevent O(chain-length x entries-per-IFD) resource-exhaustion
+	// amplification via overlapping IFDs at distinct offsets (CWE-400/405/834).
+	// Message: "exif: IFD chain traversal budget exhausted at offset %d
+	//   (buf len %d); chain terminated - resource-exhaustion guard (EXIF-IFDCHAIN-01)"
+	// Fields: offset32, bufLen32.
+	warnTraverseBudgetExceeded
+
+	// warnBigTIFFTraverseBudgetExceeded (EXIF-IFDCHAIN-01/BigTIFF): same guard
+	// as warnTraverseBudgetExceeded, for the BigTIFF traversal path.
+	// Message: "exif: BigTIFF IFD chain traversal budget exhausted at offset %d
+	//   (buf len %d); chain terminated - resource-exhaustion guard (EXIF-IFDCHAIN-01)"
+	// Fields: offHi32, offLo32, bufLen32.
+	warnBigTIFFTraverseBudgetExceeded
 )
 
 // parseWarn is a compact, allocation-free record of a single parse warning.
@@ -135,8 +152,13 @@ const (
 //	warnBigTIFFDuplicateTag:   val1=offHi32    val2=offLo32      val3=tag
 //	warnBigTIFFNextUnreadable: val1=offHi32    val2=offLo32
 //	warnBigTIFFNextOutOfBounds:val1=offHi32    val2=offLo32      val3=bufLen
+//	warnTraverseBudgetExceeded:        val1=offset     val2=bufLen
+//	warnBigTIFFTraverseBudgetExceeded: val1=offHi32    val2=offLo32     val3=bufLen
 //
 // task #200: performance audit 2026-06-10.
+// EXIF-IFDCHAIN-01: warnTraverseBudgetExceeded / warnBigTIFFTraverseBudgetExceeded
+// added 2026-07-06 (security audit) — see traverseBudget, defined further
+// below immediately before traverse().
 type parseWarn struct {
 	kind warnKind
 	_    [3]byte // explicit alignment padding; must not be used
@@ -171,7 +193,7 @@ func materializeWarnings(records []parseWarn) []string {
 // Uses strconv.AppendUint/AppendInt to avoid fmt.Sprintf allocations.
 // The output is byte-identical to the former fmt.Sprintf format strings.
 // task #200; format strings locked by TestParseWarnMessageLock.
-func warnString(r parseWarn) string { //nolint:cyclop // one case per warning kind; no way to simplify without losing the byte-identical guarantee
+func warnString(r parseWarn) string { //nolint:cyclop,gocyclo,funlen // one case per warning kind; no way to simplify without losing the byte-identical guarantee
 	// Reuse a shared grow buffer per call — kept on the stack via escape analysis;
 	// the final string() conversion copies, so buf is not retained.
 	var buf [256]byte
@@ -241,6 +263,21 @@ func warnString(r parseWarn) string { //nolint:cyclop // one case per warning ki
 		b = append(b, " points outside the buffer (len "...)
 		b = strconv.AppendUint(b, uint64(r.val3), 10)
 		b = append(b, "); IFD chain terminated (BigTIFF spec \xc2\xa72)"...)
+	case warnTraverseBudgetExceeded:
+		// "exif: IFD chain traversal budget exhausted at offset %d (buf len %d); chain terminated — resource-exhaustion guard (EXIF-IFDCHAIN-01)"
+		b = append(b, "exif: IFD chain traversal budget exhausted at offset "...)
+		b = strconv.AppendUint(b, uint64(r.val1), 10)
+		b = append(b, " (buf len "...)
+		b = strconv.AppendUint(b, uint64(r.val2), 10)
+		b = append(b, "); chain terminated \xe2\x80\x94 resource-exhaustion guard (EXIF-IFDCHAIN-01)"...)
+	case warnBigTIFFTraverseBudgetExceeded:
+		// "exif: BigTIFF IFD chain traversal budget exhausted at offset %d (buf len %d); chain terminated — resource-exhaustion guard (EXIF-IFDCHAIN-01)"
+		// val1=offHi32, val2=offLo32, val3=bufLen.  Reconstruct 64-bit offset for decimal print.
+		b = append(b, "exif: BigTIFF IFD chain traversal budget exhausted at offset "...)
+		b = strconv.AppendUint(b, uint64(r.val1)<<32|uint64(r.val2), 10)
+		b = append(b, " (buf len "...)
+		b = strconv.AppendUint(b, uint64(r.val3), 10)
+		b = append(b, "); chain terminated \xe2\x80\x94 resource-exhaustion guard (EXIF-IFDCHAIN-01)"...)
 	}
 	return string(b)
 }
@@ -705,13 +742,28 @@ func parseIFDEntry(b []byte, e int, order binary.ByteOrder) (IFDEntry, bool) {
 //
 // task #200: internal warning accumulation uses []parseWarn to defer fmt.Sprintf.
 // The public Warnings []string is materialised once at the Parse boundary.
-func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint32, bool, []parseWarn) { //nolint:cyclop // lenient-parse recovery branches (R-05/#126/#132) are inherent in the spec-driven logic
+//
+// EXIF-IFDCHAIN-01 residual (round 2, 2026-07-06): the 4th return value is
+// parsedCount — the clamped, buffer-fit-checked entry count this call
+// actually iterated over (the fillIFD loop bound), BEFORE the duplicate-tag
+// dedup pass. Callers MUST charge traverseBudget with parsedCount, not
+// len(ifd.Entries): dedup can collapse thousands of identical-tag entries
+// down to a handful of retained IFDEntry structs, but the CPU cost
+// (parseIFDEntry calls) and the transient backing-array growth already
+// happened by the time dedup runs. Charging the post-dedup count let an
+// attacker fill each of up to 512 overlapping IFDs with the classic-TIFF
+// count-field ceiling (65535) of identical-tag entries — the entries
+// budget dimension barely moved, leaving only the (looser) 512-IFD chain
+// cap as a backstop: 512 x 65535 entries is a bounded but severe ~4000x
+// amplification (measured: 770KB input -> ~13GB peak heap). See
+// "IFD chain traversal budget" above traverse() for the full budget design.
+func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint32, bool, int, []parseWarn) { //nolint:cyclop // lenient-parse recovery branches (R-05/#126/#132) are inherent in the spec-driven logic
 	// Use uint64 arithmetic to avoid int truncation on 32-bit platforms
 	// (GOARCH=386/arm): int(uint32 >= 2^31) is negative, which would cause the
 	// guard to pass while the subsequent slice panics. Performing the comparison
 	// in uint64 is safe on all platforms (task #74).
 	if uint64(offset)+2 > uint64(len(b)) {
-		return nil, 0, false, nil
+		return nil, 0, false, 0, nil
 	}
 
 	count := int(order.Uint16(b[offset:]))
@@ -728,7 +780,7 @@ func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint
 		available := (len(b) - pos) / 12
 		if available <= 0 {
 			// No entries fit at all — reject the IFD as unreadable.
-			return nil, 0, false, nil
+			return nil, 0, false, 0, nil
 		}
 		warnings = append(warnings, parseWarn{
 			kind: warnCountClamp,
@@ -771,9 +823,13 @@ func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint
 // Callers must NOT re-use or grow the ifdBatch slice after calling this
 // function — pointers to batch elements are retained by the caller.
 // task #200: internal warning accumulation uses []parseWarn; see parseSingleIFD.
-func parseSingleIFDInto(b []byte, ifd *IFD, entrySlice []IFDEntry, offset uint32, order binary.ByteOrder) (uint32, bool, []parseWarn) { //nolint:cyclop // same lenient-parse branches as parseSingleIFD
+//
+// EXIF-IFDCHAIN-01 residual (round 2): the 3rd return value is parsedCount —
+// see parseSingleIFD's doc comment for why callers must charge
+// traverseBudget with this value instead of len(ifd.Entries).
+func parseSingleIFDInto(b []byte, ifd *IFD, entrySlice []IFDEntry, offset uint32, order binary.ByteOrder) (uint32, bool, int, []parseWarn) { //nolint:cyclop // same lenient-parse branches as parseSingleIFD
 	if uint64(offset)+2 > uint64(len(b)) {
-		return 0, false, nil
+		return 0, false, 0, nil
 	}
 
 	count := int(order.Uint16(b[offset:]))
@@ -785,7 +841,7 @@ func parseSingleIFDInto(b []byte, ifd *IFD, entrySlice []IFDEntry, offset uint32
 	if pos+count*12 > len(b) {
 		available := (len(b) - pos) / 12
 		if available <= 0 {
-			return 0, false, nil
+			return 0, false, 0, nil
 		}
 		warnings = append(warnings, parseWarn{
 			kind: warnCountClamp,
@@ -809,8 +865,8 @@ func parseSingleIFDInto(b []byte, ifd *IFD, entrySlice []IFDEntry, offset uint32
 	// task #198: arena safety — cap-clamped sub-slice ensures append beyond
 	// cap reallocates outside the arena and cannot overwrite a neighbour's region.
 	ifd.Entries = entrySlice[:0:cap(entrySlice)]
-	_, next, _, w := fillIFD(b, ifd, offset, pos, count, ifdStart, ifdEnd, order, warnings)
-	return next, true, w
+	_, next, _, parsedCount, w := fillIFD(b, ifd, offset, pos, count, ifdStart, ifdEnd, order, warnings)
+	return next, true, parsedCount, w
 }
 
 // fillIFD populates ifd.Entries from the IFD at the given offset/pos and
@@ -824,7 +880,15 @@ func parseSingleIFDInto(b []byte, ifd *IFD, entrySlice []IFDEntry, offset uint32
 // ifd.Entries must already be set to a slice with len==0 and the correct cap
 // before this function is called.
 // task #200: warnings is now []parseWarn; materialised to []string at Parse boundary.
-func fillIFD(b []byte, ifd *IFD, offset uint32, pos, count, ifdStart, ifdEnd int, order binary.ByteOrder, warnings []parseWarn) (*IFD, uint32, bool, []parseWarn) { //nolint:cyclop // lenient-parse branches (#126/#132) are inherent
+//
+// EXIF-IFDCHAIN-01 residual (round 2): the 4th return value is parsedCount,
+// equal to the count parameter (the clamped, buffer-fit-checked loop bound
+// this call iterated over). It is returned verbatim — not derived from
+// len(ifd.Entries) — because the duplicate-tag dedup pass below shrinks the
+// logical length without reducing the CPU work already spent in the loop
+// or the backing array already grown to hold every pre-dedup entry. See
+// parseSingleIFD's doc comment for the amplification this closes.
+func fillIFD(b []byte, ifd *IFD, offset uint32, pos, count, ifdStart, ifdEnd int, order binary.ByteOrder, warnings []parseWarn) (*IFD, uint32, bool, int, []parseWarn) { //nolint:cyclop,gocyclo // lenient-parse branches (#126/#132) plus the EXIF-IFDCHAIN-01 round-2 retention right-sizing branch are inherent
 	for i := 0; i < count; i++ { //nolint:intrange,modernize // binary parser: loop variable is a byte-slice offset multiplier
 		entry, ok := parseIFDEntry(b, pos+i*12, order)
 		if !ok {
@@ -873,6 +937,7 @@ func fillIFD(b []byte, ifd *IFD, offset uint32, pos, count, ifdStart, ifdEnd int
 	// slice's own cap region and cannot corrupt a neighbouring IFD's entries.
 	// task #200: record compact parseWarn instead of calling fmt.Sprintf.
 	if len(ifd.Entries) > 1 {
+		preDedupLen := len(ifd.Entries)
 		out := ifd.Entries[:1]
 		for i := 1; i < len(ifd.Entries); i++ {
 			if ifd.Entries[i].Tag == ifd.Entries[i-1].Tag {
@@ -884,6 +949,24 @@ func fillIFD(b []byte, ifd *IFD, offset uint32, pos, count, ifdStart, ifdEnd int
 			} else {
 				out = append(out, ifd.Entries[i])
 			}
+		}
+		// EXIF-IFDCHAIN-01 residual (round 2): the compaction above only
+		// shrinks the LOGICAL length (len(out)) — being an in-place
+		// re-slice, the backing array's CAPACITY stays at whatever it grew
+		// to during the pre-dedup append loop, up to the classic-TIFF
+		// count-field ceiling (65535) if the IFD was filled with
+		// identical-tag entries. Since ifd.Entries still points into that
+		// array, the whole oversized backing store remains reachable (and
+		// therefore retained by the GC) even though len(ifd.Entries) looks
+		// small. Re-copying to a right-sized slice drops that retention.
+		// This branch only runs when a duplicate was actually found — a
+		// cold path in legitimate files that already pays for a parseWarn
+		// append per duplicate — so it never touches the common,
+		// no-duplicate hot path.
+		if len(out) < preDedupLen {
+			tight := make([]IFDEntry, len(out))
+			copy(tight, out)
+			out = tight
 		}
 		ifd.Entries = out
 	}
@@ -899,9 +982,9 @@ func fillIFD(b []byte, ifd *IFD, offset uint32, pos, count, ifdStart, ifdEnd int
 	// which is the end of the entries we parsed.
 	nextPtrPos := pos + count*12
 	if nextPtrPos+4 > len(b) {
-		return ifd, 0, true, warnings
+		return ifd, 0, true, count, warnings
 	}
-	return ifd, order.Uint32(b[nextPtrPos:]), true, warnings
+	return ifd, order.Uint32(b[nextPtrPos:]), true, count, warnings
 }
 
 // extractJPEGThumbnail extracts the raw JPEG thumbnail bytes from b when the
@@ -985,6 +1068,123 @@ func extractJPEGThumbnail(b []byte, ifd *IFD) []byte { //nolint:gocyclo,cyclop /
 	return thumb
 }
 
+// ---------------------------------------------------------------------------
+// IFD chain traversal budget (audit finding EXIF-IFDCHAIN-01, 2026-07-06)
+//
+// Vulnerability: TIFF 6.0 §2 places no constraint on where a next-IFD
+// pointer may point, nor on how many IFDs a chain may contain. Cycle
+// detection (the visited-offset map in traverse/traverseWithArena/
+// traverseBigTIFF) only rejects an offset seen twice — it does nothing to
+// bound a chain of K IFDs at K distinct, densely-spaced (e.g. stride-4)
+// offsets whose 12-byte entry regions overlap almost entirely in the
+// buffer. Each of the K IFDs re-parses up to C entries from largely the
+// same bytes, so the traversal performs O(K*C) work and retains O(K*C)
+// IFDEntry structs from only O(len(b)) input bytes. Choosing K ~ C turns a
+// linear-size input into quadratic CPU and memory cost — measured on the
+// pre-fix parser: 16KB->174MB/59ms, 32KB->707MB/322ms, 64KB->2.82GB/1.24s,
+// 96KB->6.62GB (OOM territory); Parse returned success in every case.
+//
+// CWE-400 (uncontrolled resource consumption), CWE-405 (asymmetric resource
+// consumption / amplification), CWE-834 (excessive iteration).
+//
+// Fix: traverseBudget caps two independent dimensions of the traversal, for
+// the lifetime of a single traverse/traverseWithArena/traverseBigTIFF call
+// or — when the caller shares one traverseBudget value across sibling calls
+// within the same Parse invocation (IFD0's own chain plus the ExifIFD/
+// GPSIFD/InteropIFD sub-IFD lookups) — across all of them combined:
+//
+//   - entries: cumulative IFD entries retained across every IFD visited.
+//     Bounded to len(b)/traverseEntryBudgetDivisor (floored at
+//     traverseEntryBudgetFloor) — roughly twice the maximum number of
+//     non-overlapping 12-byte entries the buffer could legitimately hold.
+//     Every legitimate camera/scanner file chains at most a handful of
+//     IFDs with a few dozen entries each, so this is enormously generous
+//     while still killing the K~C amplification above.
+//   - ifds: cumulative number of IFDs followed. Bounded to the fixed
+//     ceiling maxTraverseChainIFDs (512, CWE-834) — real files chain
+//     IFD0->IFD1 and rarely more.
+//
+// The budget is checked once per IFD, BEFORE that IFD is parsed, so a
+// single IFD's own (buffer-clamped) entry count may cause a one-time
+// overshoot beyond the nominal ceiling; that overshoot is itself bounded by
+// the existing per-IFD buffer-fit clamp in parseSingleIFD/
+// parseSingleIFDBigTIFF (at most ~len(b)/12 entries), so total worst-case
+// work stays O(len(b)) — linear, never quadratic — regardless of how an
+// attacker shapes the chain.
+//
+// traverseBudget is two plain ints — no allocation, no pointer chasing — so
+// threading *traverseBudget through the traversal loop costs nothing beyond
+// a couple of register-resident field reads/writes per IFD. Passing a nil
+// *traverseBudget is safe and means "size a fresh budget from this call's
+// own buffer length"; callers that want a Parse-wide shared allowance
+// (Parse, for the classic-TIFF and BigTIFF main paths) construct one
+// traverseBudget and pass its address to every traverse call in that Parse
+// invocation. MakerNote parsers (makernote_parse.go) each operate on an
+// independent, generally much smaller blob and pass nil — every such call
+// is still individually bounded to O(len(blob)), so the aggregate remains
+// a small constant multiple of the file size, never quadratic.
+// ---------------------------------------------------------------------------
+
+// maxTraverseChainIFDs caps the number of IFDs followed within a single
+// next-IFD chain traversal (or, when a traverseBudget is shared across
+// sibling calls within one Parse invocation, across all of them combined).
+// EXIF-IFDCHAIN-01 (CWE-834): real TIFF/EXIF files chain at most IFD0->IFD1;
+// 512 is a generous, fixed ceiling that no legitimate file approaches.
+const maxTraverseChainIFDs = 512
+
+// traverseEntryBudgetDivisor and traverseEntryBudgetFloor bound the
+// cumulative entry count permitted across an entire chain traversal.
+// len(b)/traverseEntryBudgetDivisor is roughly twice the maximum number of
+// non-overlapping 12-byte IFD entries the buffer could legitimately hold,
+// which stays generous for legitimate multi-IFD files while preventing the
+// overlapping-chain amplification described above (EXIF-IFDCHAIN-01).
+// traverseEntryBudgetFloor guarantees a usable budget for tiny buffers,
+// where it never binds in practice because parseSingleIFD's own per-IFD
+// buffer-fit clamp already caps the entries any single IFD can declare.
+const (
+	traverseEntryBudgetDivisor = 6
+	traverseEntryBudgetFloor   = 64
+)
+
+// traverseBudget bounds the cumulative resource cost of following an IFD
+// next-chain. See "IFD chain traversal budget" above for the full
+// rationale (EXIF-IFDCHAIN-01; CWE-400/CWE-405/CWE-834). Both fields are
+// decremented as IFDs are visited; the traversal stops (gracefully,
+// returning what has been parsed so far) once either reaches zero.
+type traverseBudget struct {
+	entries int // remaining cumulative entry budget
+	ifds    int // remaining cumulative chain-length budget
+}
+
+// newTraverseBudget returns a traverseBudget sized for a buffer of length n.
+// EXIF-IFDCHAIN-01; CWE-400/CWE-405/CWE-834.
+func newTraverseBudget(n int) traverseBudget {
+	entries := max(n/traverseEntryBudgetDivisor, traverseEntryBudgetFloor)
+	return traverseBudget{entries: entries, ifds: maxTraverseChainIFDs}
+}
+
+// exhausted reports whether the budget has no capacity left to visit
+// another IFD. Called once per loop iteration, before parsing the
+// candidate IFD at the current offset. A nil budget is treated as
+// exhausted defensively; traverse/traverseWithArena/traverseBigTIFF always
+// substitute a freshly sized budget before entering the loop, so this
+// branch is never actually taken on the hot path — it exists purely as a
+// safety net against future callers that might invoke the loop body with a
+// nil budget directly.
+func (bud *traverseBudget) exhausted() bool {
+	return bud == nil || bud.ifds <= 0 || bud.entries <= 0
+}
+
+// spend records that an IFD with n entries has just been parsed and
+// accepted into the chain, decrementing both budget dimensions.
+func (bud *traverseBudget) spend(n int) {
+	if bud == nil {
+		return
+	}
+	bud.ifds--
+	bud.entries -= n
+}
+
 // traverse walks the IFD chain starting at offset within b, using the given
 // byte order. It returns the root IFD and any diagnostic warnings accumulated
 // during traversal.
@@ -1016,12 +1216,27 @@ func extractJPEGThumbnail(b []byte, ifd *IFD) []byte { //nolint:gocyclo,cyclop /
 // regardless of offset, and then stop only when the *returned* next-IFD
 // pointer is 0 (i.e., end-of-chain) or a cycle is detected.
 // task #200: returns []parseWarn for deferred string materialisation at Parse boundary.
-func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, []parseWarn, error) { //nolint:gocyclo,cyclop // IFD chain traversal with per-finding warning paths; branches are inherent in the spec-driven logic
+//
+// EXIF-IFDCHAIN-01: budget bounds the cumulative resource cost of the chain
+// (see "IFD chain traversal budget" above). Pass nil to size a fresh budget
+// from len(b) for this call alone; pass a shared *traverseBudget to pool the
+// allowance across sibling calls within the same Parse invocation.
+func traverse(b []byte, offset uint32, order binary.ByteOrder, budget *traverseBudget) (*IFD, []parseWarn, error) { //nolint:gocyclo,cyclop // IFD chain traversal with per-finding warning paths; branches are inherent in the spec-driven logic
 	if uint64(offset)+2 > uint64(len(b)) {
 		return nil, nil, &metaerr.CorruptMetadataError{
 			Format: "EXIF",
 			Reason: fmt.Sprintf("IFD offset %d out of bounds (buf len %d)", offset, len(b)),
 		}
+	}
+
+	// EXIF-IFDCHAIN-01: a nil budget means the caller has no Parse-wide
+	// allowance to share, so size one from this call's own buffer. localBudget
+	// does not escape (only its address is taken, and only for arithmetic
+	// within this function and its callees, none of which retain the
+	// pointer), so it stays stack-allocated.
+	if budget == nil {
+		localBudget := newTraverseBudget(len(b))
+		budget = &localBudget
 	}
 
 	// visited tracks offsets we have already started parsing to detect cycles.
@@ -1041,12 +1256,29 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, []parseWar
 	first := true
 	for cur != 0 || first {
 		first = false
+
+		// EXIF-IFDCHAIN-01: stop following the chain once the shared budget is
+		// exhausted, rather than trusting the file to terminate the chain
+		// itself. This is the primary defence against the overlapping-IFD
+		// amplification attack described above; cycle detection alone does
+		// not catch it because every offset in the malicious chain is distinct.
+		if budget.exhausted() {
+			if root != nil {
+				warnings = append(warnings, parseWarn{
+					kind: warnTraverseBudgetExceeded,
+					val1: cur,
+					val2: uint32(len(b)), //nolint:gosec // G115: buffer length bounded by JPEG APP1 ≤ 65535 or file size; safe
+				})
+			}
+			break
+		}
+
 		if visited[cur] {
 			break // cycle detected — stop following the chain
 		}
 		visited[cur] = true
 
-		ifd, next, ok, ifdWarnings := parseSingleIFD(b, cur, order)
+		ifd, next, ok, parsedCount, ifdWarnings := parseSingleIFD(b, cur, order)
 		warnings = append(warnings, ifdWarnings...)
 		if !ok {
 			// Audit finding #131 (TIFF 6.0 §2): a non-zero next-IFD pointer that
@@ -1070,6 +1302,13 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, []parseWar
 			current.Next = ifd
 		}
 		current = ifd
+		// EXIF-IFDCHAIN-01 residual (round 2): charge the pre-dedup parsed
+		// count, not len(ifd.Entries) — the duplicate-tag dedup pass can
+		// collapse thousands of identical-tag entries down to a handful of
+		// retained IFDEntry structs while the CPU cost and transient
+		// backing-array growth already happened. See parseSingleIFD's doc
+		// comment for the amplification this closes.
+		budget.spend(parsedCount)
 
 		// Audit finding #131: if the next pointer is non-zero but falls outside the
 		// buffer, record a warning and stop following the chain. parseSingleIFD will
@@ -1123,7 +1362,15 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder) (*IFD, []parseWar
 // DJI, Samsung, Casio and Leica Type-0 MakerNotes are valid plain IFDs at
 // file offset 0). The `first` flag ensures we enter the loop exactly once.
 // task #200: returns []parseWarn for deferred string materialisation at Parse boundary.
-func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *parseArena) (*IFD, []parseWarn, error) { //nolint:gocyclo,cyclop,funlen // IFD chain traversal with per-finding warning paths; branches are inherent in the spec-driven logic
+//
+// EXIF-IFDCHAIN-01: budget bounds the cumulative resource cost of the chain
+// (see "IFD chain traversal budget" above traverse()). Pass nil to size a
+// fresh budget from len(b) for this call alone; pass a shared
+// *traverseBudget to pool the allowance across sibling calls within the
+// same Parse invocation — Parse does this for IFD0 plus the ExifIFD/GPSIFD/
+// InteropIFD sub-IFD lookups so an attacker cannot obtain a fresh full
+// allowance per sub-IFD pointer.
+func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *parseArena, budget *traverseBudget) (*IFD, []parseWarn, error) { //nolint:gocyclo,cyclop,funlen // IFD chain traversal with per-finding warning paths; branches are inherent in the spec-driven logic
 	// Use uint64 arithmetic to avoid int truncation on 32-bit platforms
 	// (GOARCH=386/arm): int(uint32 >= 2^31) is negative, which would cause the
 	// guard to pass while the subsequent slice panics. Performing the comparison
@@ -1133,6 +1380,12 @@ func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *p
 			Format: "EXIF",
 			Reason: fmt.Sprintf("IFD offset %d out of bounds (buf len %d)", offset, len(b)),
 		}
+	}
+
+	// EXIF-IFDCHAIN-01: see traverse() for the rationale behind this default.
+	if budget == nil {
+		localBudget := newTraverseBudget(len(b))
+		budget = &localBudget
 	}
 
 	// visited tracks offsets we have already started parsing to detect cycles.
@@ -1152,6 +1405,20 @@ func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *p
 	first := true
 	for cur != 0 || first {
 		first = false
+
+		// EXIF-IFDCHAIN-01: stop the chain once the shared budget is exhausted.
+		// See traverse() for the full rationale.
+		if budget.exhausted() {
+			if root != nil {
+				warnings = append(warnings, parseWarn{
+					kind: warnTraverseBudgetExceeded,
+					val1: cur,
+					val2: uint32(len(b)), //nolint:gosec // G115: buffer length bounded; safe
+				})
+			}
+			break
+		}
+
 		if visited[cur] {
 			break // cycle detected — stop following the chain
 		}
@@ -1160,6 +1427,11 @@ func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *p
 		var ifd *IFD
 		var next uint32
 		var ok bool
+		// EXIF-IFDCHAIN-01 residual (round 2): parsedCount is the pre-dedup
+		// clamped entry count for whichever branch below actually parses
+		// this IFD. Charged against budget after linking (see parseSingleIFD's
+		// doc comment for why len(ifd.Entries) is unsafe to charge instead).
+		var parsedCount int
 		var ifdWarnings []parseWarn
 
 		// Arena path: attempt to allocate IFD slot and entry backing from the
@@ -1188,7 +1460,7 @@ func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *p
 
 			if entrySlice := arena.allocEntries(slotCount); entrySlice != nil {
 				// Both IFD slot and entry backing are available from the arena.
-				next, ok, ifdWarnings = parseSingleIFDInto(b, ifdPtr, entrySlice, cur, order)
+				next, ok, parsedCount, ifdWarnings = parseSingleIFDInto(b, ifdPtr, entrySlice, cur, order)
 				if !ok {
 					// Arena slot was consumed but not usable; undo the IFD alloc.
 					// Entry alloc cannot be undone, but that region will just be unused.
@@ -1209,7 +1481,7 @@ func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *p
 				// individual alloc so no partial state is left in the arena.
 				arena.ifdN--
 				var parsedIFD *IFD
-				parsedIFD, next, ok, ifdWarnings = parseSingleIFD(b, cur, order)
+				parsedIFD, next, ok, parsedCount, ifdWarnings = parseSingleIFD(b, cur, order)
 				if !ok {
 					// task #200: record compact parseWarn instead of fmt.Sprintf.
 					if root != nil {
@@ -1227,7 +1499,7 @@ func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *p
 			// Arena nil or IFD batch exhausted: allocate individually (MakerNote
 			// parsers, ParseIFDAt, and any chain IFD beyond the pre-scan count).
 			var parsedIFD *IFD
-			parsedIFD, next, ok, ifdWarnings = parseSingleIFD(b, cur, order)
+			parsedIFD, next, ok, parsedCount, ifdWarnings = parseSingleIFD(b, cur, order)
 			if !ok {
 				// task #200: record compact parseWarn instead of fmt.Sprintf.
 				if root != nil && cur != 0 {
@@ -1251,6 +1523,10 @@ func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *p
 			current.Next = ifd
 		}
 		current = ifd
+		// EXIF-IFDCHAIN-01 residual (round 2): charge the pre-dedup parsed
+		// count, not len(ifd.Entries) — see traverse()'s equivalent comment
+		// and parseSingleIFD's doc comment for the amplification this closes.
+		budget.spend(parsedCount)
 
 		// Audit finding #131: if the next pointer is non-zero but falls outside the
 		// buffer, record a warning and stop following the chain. parseSingleIFD will
@@ -1418,10 +1694,14 @@ func parseIFDEntryBigTIFF(b []byte, e int, order binary.ByteOrder) (IFDEntry, bo
 // Applies the same duplicate-tag dedup logic as parseSingleIFD (audit
 // finding #126): first occurrence wins, a warning is appended for each drop.
 // task #200: returns []parseWarn for deferred string materialisation at Parse boundary.
-func parseSingleIFDBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IFD, uint64, bool, []parseWarn) {
+//
+// EXIF-IFDCHAIN-01 residual (round 2): the 4th return value is parsedCount —
+// see parseSingleIFD's doc comment (classic-TIFF counterpart) for why
+// callers must charge traverseBudget with this value, not len(ifd.Entries).
+func parseSingleIFDBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IFD, uint64, bool, uint64, []parseWarn) {
 	// Guard: IFD offset + 8-byte count field must fit in b.
 	if offset > uint64(len(b)) || uint64(len(b))-offset < 8 {
-		return nil, 0, false, nil
+		return nil, 0, false, 0, nil
 	}
 
 	count := order.Uint64(b[offset:])
@@ -1445,7 +1725,12 @@ func parseSingleIFDBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IF
 // ifd.Entries must already be initialised (len==0, correct cap) before this
 // function is called.
 // task #200: warnings is now []parseWarn; materialised to []string at Parse boundary.
-func fillIFDBigTIFF(b []byte, ifd *IFD, offset, pos, count uint64, order binary.ByteOrder, warnings []parseWarn) (*IFD, uint64, bool, []parseWarn) { //nolint:cyclop // BigTIFF sort+dedup mirrors fillIFD; inherent complexity
+//
+// EXIF-IFDCHAIN-01 residual (round 2): the 4th return value is parsedCount,
+// equal to the count parameter — see fillIFD's doc comment (classic-TIFF
+// counterpart) for why this must be returned verbatim rather than derived
+// from the post-dedup len(ifd.Entries).
+func fillIFDBigTIFF(b []byte, ifd *IFD, offset, pos, count uint64, order binary.ByteOrder, warnings []parseWarn) (*IFD, uint64, bool, uint64, []parseWarn) { //nolint:cyclop // BigTIFF sort+dedup mirrors fillIFD; inherent complexity
 	const bigTIFFEntrySize = uint64(20)
 
 	for i := uint64(0); i < count; i++ { //nolint:intrange,modernize // BigTIFF parser: loop variable is a byte-slice offset multiplier
@@ -1467,6 +1752,7 @@ func fillIFDBigTIFF(b []byte, ifd *IFD, offset, pos, count uint64, order binary.
 	// Arena safety (task #198): cap-clamped slice; compaction stays within own cap.
 	// task #200: record compact parseWarn instead of fmt.Sprintf.
 	if len(ifd.Entries) > 1 {
+		preDedupLen := len(ifd.Entries)
 		out := ifd.Entries[:1]
 		for i := 1; i < len(ifd.Entries); i++ {
 			if ifd.Entries[i].Tag == ifd.Entries[i-1].Tag {
@@ -1480,6 +1766,17 @@ func fillIFDBigTIFF(b []byte, ifd *IFD, offset, pos, count uint64, order binary.
 				out = append(out, ifd.Entries[i])
 			}
 		}
+		// EXIF-IFDCHAIN-01 residual (round 2): see fillIFD's analogous block
+		// (classic-TIFF counterpart) — the in-place compaction above shrinks
+		// len(out) but not cap(out), which can retain up to bigTIFFMaxEntries
+		// (65535) IFDEntry slots if the IFD was filled with identical-tag
+		// entries. Re-copy to drop that retention; only reached when a
+		// duplicate was actually found (cold path).
+		if len(out) < preDedupLen {
+			tight := make([]IFDEntry, len(out))
+			copy(tight, out)
+			out = tight
+		}
 		ifd.Entries = out
 	}
 
@@ -1491,9 +1788,9 @@ func fillIFDBigTIFF(b []byte, ifd *IFD, offset, pos, count uint64, order binary.
 	// Read the next-IFD pointer (8 bytes after the last entry, BigTIFF spec §2).
 	nextPtrPos := pos + count*bigTIFFEntrySize
 	if nextPtrPos+8 > uint64(len(b)) {
-		return ifd, 0, true, warnings
+		return ifd, 0, true, count, warnings
 	}
-	return ifd, order.Uint64(b[nextPtrPos:]), true, warnings
+	return ifd, order.Uint64(b[nextPtrPos:]), true, count, warnings
 }
 
 // traverseBigTIFF walks the BigTIFF IFD chain starting at offset within b,
@@ -1509,12 +1806,25 @@ func fillIFDBigTIFF(b []byte, ifd *IFD, offset, pos, count uint64, order binary.
 // Audit finding #131: non-zero next-IFD pointers that are out of bounds
 // generate a ParseWarning but do not abort parsing of already-parsed IFDs.
 // task #200: returns []parseWarn for deferred string materialisation at Parse boundary.
-func traverseBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IFD, []parseWarn, error) { //nolint:gocyclo,cyclop // BigTIFF IFD chain traversal; same inherent branching as classic-TIFF traverse
+//
+// EXIF-IFDCHAIN-01: budget bounds the cumulative resource cost of the chain
+// (see "IFD chain traversal budget" above traverse()). Pass nil to size a
+// fresh budget from len(b) for this call alone; pass a shared
+// *traverseBudget to pool the allowance across sibling calls within the
+// same Parse invocation (Parse does this for the BigTIFF IFD0 chain plus
+// the ExifIFD/GPSIFD/InteropIFD sub-IFD lookups).
+func traverseBigTIFF(b []byte, offset uint64, order binary.ByteOrder, budget *traverseBudget) (*IFD, []parseWarn, error) { //nolint:gocyclo,cyclop // BigTIFF IFD chain traversal; same inherent branching as classic-TIFF traverse
 	if offset > uint64(len(b)) || uint64(len(b))-offset < 8 {
 		return nil, nil, &metaerr.CorruptMetadataError{
 			Format: "EXIF",
 			Reason: fmt.Sprintf("BigTIFF IFD offset %d out of bounds (buf len %d)", offset, len(b)),
 		}
+	}
+
+	// EXIF-IFDCHAIN-01: see traverse() for the rationale behind this default.
+	if budget == nil {
+		localBudget := newTraverseBudget(len(b))
+		budget = &localBudget
 	}
 
 	// Recycle the visited map from the pool to avoid per-call allocation.
@@ -1531,12 +1841,26 @@ func traverseBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IFD, []p
 	cur := offset
 
 	for cur != 0 {
+		// EXIF-IFDCHAIN-01: stop the chain once the shared budget is exhausted.
+		// See traverse() for the full rationale.
+		if budget.exhausted() {
+			if root != nil {
+				warnings = append(warnings, parseWarn{
+					kind: warnBigTIFFTraverseBudgetExceeded,
+					val1: uint32(cur >> 32), // high 32 bits of BigTIFF pointer
+					val2: uint32(cur),       // low 32 bits of BigTIFF pointer
+					val3: uint32(len(b)),    //nolint:gosec // G115: buffer length bounded by read buffer; safe narrowing
+				})
+			}
+			break
+		}
+
 		if visited[cur] {
 			break // cycle detected
 		}
 		visited[cur] = true
 
-		ifd, next, ok, ifdWarnings := parseSingleIFDBigTIFF(b, cur, order)
+		ifd, next, ok, parsedCount, ifdWarnings := parseSingleIFDBigTIFF(b, cur, order)
 		if !ok {
 			// task #200: record compact parseWarn instead of fmt.Sprintf.
 			// val1=offHi32, val2=offLo32 for BigTIFF 64-bit offset (hi/lo split).
@@ -1559,6 +1883,11 @@ func traverseBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IFD, []p
 			current.Next = ifd
 		}
 		current = ifd
+		// EXIF-IFDCHAIN-01 residual (round 2): charge the pre-dedup parsed
+		// count, not len(ifd.Entries) — see traverse()'s equivalent comment
+		// and parseSingleIFD's doc comment for the amplification this closes.
+		// parsedCount ≤ bigTIFFMaxEntries (65535) so narrowing to int is safe.
+		budget.spend(int(parsedCount)) //nolint:gosec // G115: parsedCount ≤ bigTIFFMaxEntries (65535); safe narrowing
 
 		// Audit finding #131: next pointer OOB → warn and stop.
 		// task #200: val1=offHi32, val2=offLo32 for 64-bit offset; val3=bufLen.

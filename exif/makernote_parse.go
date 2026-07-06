@@ -65,7 +65,7 @@ var makerNoteParsers = map[string]func([]byte, binary.ByteOrder) *IFD{
 // The per-Parse lazy sub-IFD arena (parseArena in Parse) does NOT extend to
 // MakerNote IFDs.  There are three reasons:
 //
-//  1. Buffer origin: every manufacturer parser calls traverse(mn.Value, off, order)
+//  1. Buffer origin: every manufacturer parser calls traverse(mn.Value, off, order, nil)
 //     where mn.Value is the raw MakerNote blob.  Some parsers (Nikon Type 3,
 //     Fujifilm) further sub-slice that blob (e.g. tiff := b[tiffStart:]).
 //     IFDEntry.Value fields in MakerNote IFDs alias a different buffer origin
@@ -151,7 +151,7 @@ func parseCanonMakerNote(b []byte, order binary.ByteOrder) *IFD {
 	if len(b) < 6 {
 		return nil
 	}
-	ifd, _, err := traverse(b, 0, order)
+	ifd, _, err := traverse(b, 0, order, nil)
 	if err != nil {
 		return nil
 	}
@@ -239,7 +239,7 @@ func parseNikonType3(b []byte, _ binary.ByteOrder) *IFD {
 	}
 
 	ifdOffset := order.Uint32(tiff[4:])
-	ifd, _, err := traverse(tiff, ifdOffset, order)
+	ifd, _, err := traverse(tiff, ifdOffset, order, nil)
 	if err != nil {
 		return nil
 	}
@@ -259,7 +259,7 @@ func parseNikonType1(b []byte, _ binary.ByteOrder) *IFD {
 	if count == 0 || count >= 256 {
 		return nil
 	}
-	ifd, _, err := traverse(b, 0, binary.BigEndian)
+	ifd, _, err := traverse(b, 0, binary.BigEndian, nil)
 	if err != nil {
 		return nil
 	}
@@ -298,7 +298,7 @@ func parseSonyMakerNote(b []byte, order binary.ByteOrder) *IFD {
 	if len(b) < 6 {
 		return nil
 	}
-	ifd, _, err := traverse(b, 0, order)
+	ifd, _, err := traverse(b, 0, order, nil)
 	if err != nil {
 		return nil
 	}
@@ -323,7 +323,7 @@ func parseFujifilmMakerNote(b []byte) *IFD {
 		return nil
 	}
 	ifdOffset := binary.LittleEndian.Uint32(b[12:16])
-	ifd, _, err := traverse(b, ifdOffset, binary.LittleEndian)
+	ifd, _, err := traverse(b, ifdOffset, binary.LittleEndian, nil)
 	if err != nil {
 		return nil
 	}
@@ -355,7 +355,7 @@ func parseOlympusMakerNote(b []byte) *IFD {
 	default:
 		return nil
 	}
-	ifd, _, err := traverse(b, 12, order)
+	ifd, _, err := traverse(b, 12, order, nil)
 	if err != nil {
 		return nil
 	}
@@ -367,7 +367,7 @@ func parseOlympusMakerNote(b []byte) *IFD {
 // AOC format ("AOC\x00" prefix): big-endian IFD at offset 6.
 // Used by all modern K-series and 645-series DSLRs (ExifTool Pentax.pm).
 func parsePentaxAOC(b []byte) *IFD {
-	ifd, _, err := traverse(b, 6, binary.BigEndian)
+	ifd, _, err := traverse(b, 6, binary.BigEndian, nil)
 	if err != nil {
 		return nil
 	}
@@ -395,7 +395,7 @@ func parsePentaxPENTAX(b []byte) *IFD {
 	default:
 		return nil
 	}
-	ifd, _, err := traverse(b, 12, order)
+	ifd, _, err := traverse(b, 12, order, nil)
 	if err != nil {
 		return nil
 	}
@@ -435,7 +435,7 @@ func parsePanasonicMakerNote(b []byte) *IFD {
 	if !bytes.HasPrefix(b, []byte(magic)) {
 		return nil
 	}
-	ifd, _, err := traverse(b, 12, binary.LittleEndian)
+	ifd, _, err := traverse(b, 12, binary.LittleEndian, nil)
 	if err != nil {
 		return nil
 	}
@@ -448,7 +448,7 @@ func parsePanasonicMakerNote(b []byte) *IFD {
 // followed by a little-endian IFD at offset 8. Used by S2, M Monochrom, and
 // later S-series cameras.
 func parseLeicaWithPrefix(b []byte) *IFD {
-	ifd, _, err := traverse(b, 8, binary.LittleEndian)
+	ifd, _, err := traverse(b, 8, binary.LittleEndian, nil)
 	if err != nil {
 		return nil
 	}
@@ -474,7 +474,7 @@ func parseLeicaMakerNote(b []byte, parentOrder binary.ByteOrder) *IFD {
 		return parseLeicaWithPrefix(b)
 	}
 	// Type 0: plain IFD at offset 0, parent byte order.
-	ifd, _, err := traverse(b, 0, parentOrder)
+	ifd, _, err := traverse(b, 0, parentOrder, nil)
 	if err != nil {
 		return nil
 	}
@@ -490,9 +490,9 @@ func parseDJIMakerNote(b []byte, parentOrder binary.ByteOrder) *IFD {
 		return nil
 	}
 	// DJI cameras use little-endian; fall back to parent order.
-	ifd, _, err := traverse(b, 0, binary.LittleEndian)
+	ifd, _, err := traverse(b, 0, binary.LittleEndian, nil)
 	if err != nil {
-		ifd, _, err = traverse(b, 0, parentOrder)
+		ifd, _, err = traverse(b, 0, parentOrder, nil)
 		if err != nil {
 			return nil
 		}
@@ -508,7 +508,7 @@ func parseSamsungMakerNote(b []byte, parentOrder binary.ByteOrder) *IFD {
 	if len(b) < 6 {
 		return nil
 	}
-	ifd, _, err := traverse(b, 0, parentOrder)
+	ifd, _, err := traverse(b, 0, parentOrder, nil)
 	if err != nil {
 		return nil
 	}
@@ -532,7 +532,7 @@ func parseSigmaMakerNote(b []byte) *IFD {
 	default:
 		return nil
 	}
-	ifd, _, err := traverse(b, 10, binary.LittleEndian)
+	ifd, _, err := traverse(b, 10, binary.LittleEndian, nil)
 	if err != nil {
 		return nil
 	}
@@ -560,14 +560,14 @@ func parseCasioMakerNote(b []byte, parentOrder binary.ByteOrder) *IFD {
 		if len(b) < 8 {
 			return nil
 		}
-		ifd, _, err := traverse(b, 6, binary.BigEndian)
+		ifd, _, err := traverse(b, 6, binary.BigEndian, nil)
 		if err != nil {
 			return nil
 		}
 		return ifd
 	}
 	// Format 2: plain IFD at offset 0, parent byte order.
-	ifd, _, err := traverse(b, 0, parentOrder)
+	ifd, _, err := traverse(b, 0, parentOrder, nil)
 	if err != nil {
 		return nil
 	}
