@@ -59,6 +59,15 @@ var injectors = map[format.FormatID]func(io.ReadSeeker, io.Writer, []byte, []byt
 //
 // Write calls m.Validate before performing any I/O. A non-nil error from
 // Validate is returned unchanged so callers can inspect it with errors.Is.
+//
+// Trust boundary (#259): Write streams directly to w as it encodes; it does
+// not buffer the complete result before writing. If an error occurs after
+// some bytes have already been written, w may already contain partial or
+// inconsistent output. Callers that need all-or-nothing semantics — the
+// destination is either the complete, correct result or is left untouched —
+// must use WriteFile, which stages output in a temporary file and only
+// replaces the target via an atomic rename after a complete, synced write
+// succeeds.
 func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error { //nolint:cyclop,gocyclo // format dispatch requires per-format branches; adding NEF (#102) incremented complexity by 1; splitting would reduce clarity
 	// Validate structural consistency before any I/O. This covers nil IFD0,
 	// nil XMP.Properties, and unknown format, replacing the previous inline guard.
@@ -193,6 +202,18 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 // successful WriteFile on a symlink, the symlink still points at the same
 // real path and that real file contains the updated metadata.
 //
+// Trust boundary (#259): symlink resolution above is intentional and is not
+// a vulnerability to be fixed — it is the correct behavior for the common
+// case of rewriting metadata on a file reached through a symlink. It does
+// mean that WriteFile will follow a symlink to wherever it points, including
+// outside any directory tree the caller may have intended to restrict
+// writes to. WriteFile performs no path-safety validation of its own:
+// callers that pass a path derived from an untrusted source (user input, a
+// web request parameter, an archive entry name, etc.) must validate or
+// reject symlinks and other unsafe path constructions themselves before
+// calling WriteFile, exactly as they would before any other path-based file
+// operation such as os.OpenFile.
+//
 // Durability (#124): WriteFile calls Sync on the temp file after all data has
 // been written and before Close/Rename. If Sync fails the function aborts,
 // removes the temp file, and returns the error so the original file is left
@@ -203,6 +224,12 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 // Ownership preservation (#125): on Unix, WriteFile attempts to chown the
 // temp file to the uid/gid of the original file before the rename. This is
 // best-effort: EPERM and unsupported-filesystem errors are silently ignored.
+//
+// Privilege-bit masking (#259): the replacement file's ordinary permission
+// bits (owner/group/other read-write-execute) are preserved, but setuid,
+// setgid, and the sticky bit are always cleared on the replacement, even
+// when the original file carried them. A metadata rewrite must never
+// (re)create a privilege-escalation surface.
 func WriteFile(path string, m *Metadata, opts ...WriteOption) error { //nolint:cyclop,gocyclo // linear sequence of OS calls with early-exit error handling; splitting would reduce clarity
 	// Resolve symlinks so that the rename target is the real file, not the
 	// symlink itself. filepath.EvalSymlinks returns the original path unchanged
@@ -247,8 +274,16 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error { //nolint:c
 		}
 	}()
 
-	// Preserve original file permissions before writing any data.
-	if err := tmp.Chmod(fi.Mode()); err != nil {
+	// Preserve original file permissions before writing any data, but mask off
+	// setuid/setgid/sticky (#259): (*os.File).Chmod maps os.ModeSetuid,
+	// os.ModeSetgid, and os.ModeSticky straight through to S_ISUID/S_ISGID/
+	// S_ISVTX, so a source file that happened to carry any of these bits would
+	// otherwise cause the re-encoded replacement to carry them too. This is
+	// CWE-732-adjacent hardening: a metadata rewrite must never (re)create a
+	// privilege-escalation surface, even when it is preservation-only and no
+	// worse than the bit already present on the original file.
+	safeMode := fi.Mode() &^ (os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
+	if err := tmp.Chmod(safeMode); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("gometadata: chmod temp file: %w", err)
 	}

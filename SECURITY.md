@@ -45,6 +45,14 @@ GoMetadata is a parsing library. Its primary attack surface is **untrusted bytes
 - **No external network access.** The library reads only from the `io.ReadSeeker` or file path the caller provides. It never initiates network connections.
 - **No file-system side effects.** Read operations are read-only. Write operations are scoped strictly to the output path provided by the caller.
 
+### Write trust boundary
+
+Write operations have a narrower, explicitly documented trust boundary that is distinct from the read-path guarantees above:
+
+- **Symlink following is intentional.** `WriteFile` resolves the target path with `filepath.EvalSymlinks` and rewrites the *resolved* real file, not the symlink itself (decision #125). This is correct for the common case — rewriting metadata on a file reached through a symlink — but it means `WriteFile` follows a symlink to wherever it points, including outside any directory tree the caller may have intended to restrict writes to. `WriteFile` performs no path-safety validation of its own. **Path validation is the caller's responsibility**: an application that accepts a path from an untrusted source (user input, a web request parameter, an archive entry name, etc.) must validate or reject symlinks before calling `WriteFile`, exactly as it would before calling `os.OpenFile` or any other path-based standard library function.
+- **The streaming `Write(r, w, m)` API may emit partial output on error.** `Write` writes directly to the caller's `io.Writer` as it encodes; it does not buffer the complete result first. If encoding fails partway through, `w` may already contain a truncated or inconsistent byte sequence. Callers that require all-or-nothing semantics — the destination is either the complete, correct result or is left untouched — must use `WriteFile`, which isolates all output in a temporary file created in the target directory and removed on any error, only replacing the original file via an atomic `os.Rename` after a full, synced write succeeds.
+- **Privilege bits are never propagated to rewritten output.** `WriteFile` preserves the original file's ordinary permission bits (e.g. `0644`, `0755`) but always clears `setuid`, `setgid`, and the sticky bit on the replacement file, even if the original file carried them (#259). A metadata rewrite must never (re)create a privilege-escalation surface, even preservation-only.
+
 ---
 
 ## Fuzz test coverage
