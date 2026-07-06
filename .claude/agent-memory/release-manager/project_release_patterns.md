@@ -22,5 +22,13 @@ README.md uses a dynamic `[![Release](...shields.io/github/v/release/...)]` badg
 - Benchmark regressions above the 10% threshold were all security-driven in v1.1.0: `BenchmarkIFDEntryString` (+112%, bounds-checked formatting), `BenchmarkPNGExtract` (+41%, document-level cap check), `BenchmarkIPTCEncode` (+30%, receiver-copy race fix), XMP encode (+16-18%, `maxXMPDocumentBytes` overhead). Document root cause in BENCHMARKS.md; no block warranted.
 - The security-auditor's clearance covers executable code. Documentation-only commits after the CLEARED decision do not require a re-audit. Always verify with `git log --oneline <cleared-commit>..HEAD` to confirm no `.go` files changed.
 
-**Why:** Accumulated from the v1.0.4 release cycle (2026-04-08) and v1.1.0 release cycle (2026-06-03).
-**How to apply:** Use as a checklist for future releases: check both remotes, verify all CHANGELOG links, note benchmark run convention, archive raw results, include go.mod if tidy changed it.
+**v1.2.0 additions (2026-06-10):**
+- `go mod tidy` was clean — no change to `go.mod` or `go.sum` for this release.
+- Benchmark regressions were broadly larger than v1.1.0 due to the extensive reliability/security work: `BenchmarkMakerNoteDispatch` (+184%, MakerNote OOL rebasing), `BenchmarkIPTCParse` (+89%), `BenchmarkIPTCEncode` (+77%), `BenchmarkReadFile` (+51%, LimitReader OOM guard), `BenchmarkTIFFExtract` (+52%), RAW extracts (+25–30%, defensive raw-slice copy), JPEG inject (+45%, 8BIM sibling preservation), XMP encode (+29–38%, NS-URI/local-name XML escape). All documented with root cause; no block warranted.
+- The `head -n -1` flag is not valid on macOS `head` (GNU syntax). Use `grep -v "^## \[v_next\]"` or write to a temp file and call `gh release create --notes-file` to avoid the issue.
+- Security clearance for v1.2.0 was performed by reviewing audit memory files (2026-06-09 audit findings) and confirming all CRITICAL/HIGH/MEDIUM findings were addressed in the 94 commits since v1.1.0. No new `.go` files were changed by the release-manager; re-audit not required.
+- v1.2.0 working tree had only untracked agent-memory files at release time — these are correctly excluded from staging (use explicit `git add` per file, never `git add -A`).
+- New benchmarks introduced in v1.2.0 that had no v1.1.0 baseline: `BenchmarkParseBigTIFF_Simple`, `BenchmarkBigTIFFExtract`, `BenchmarkRelocateDNGLike`, `BenchmarkRelocateSingleStrip`, `BenchmarkRelocateMultiStrip`, `BenchmarkNEFExtractMakerNote`, `BenchmarkARWConformanceExtract`, `BenchmarkARWConformanceInject`, `BenchmarkIPTCAccessorsNonASCII`, `BenchmarkUnescapeXMLNoEntity`.
+
+**Why:** Accumulated from v1.0.4 (2026-04-08), v1.1.0 (2026-06-03), and v1.2.0 (2026-06-10) release cycles.
+**How to apply:** Use as a checklist for future releases: check both remotes, verify all CHANGELOG links, note benchmark run convention, archive raw results, include go.mod if tidy changed it; use temp file for GitHub release notes (not `head -n -1`).

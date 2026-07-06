@@ -1,5 +1,10 @@
 # Memory Index
 
+- [JPEG #262 maxFileSize cap via pooled countingReader](project_task262_jpeg_maxfilesize.md) — countingReader resets budget per-Seek; io.WriterTo fast-path bug found via benchmarking (376B→1017B/op), fixed with remainingFitsBudget guard
+- [GM-W1 TIFF write-path imageBlockBudget fix (task #261)](project_gmw1_imageblock_budget.md) — per-entry caps (65536 strips, 1024 SubIFDs) + fixed 262144 aggregate budget mirroring traverseBudget; ErrTooManyImageBlocks
+- [FuzzXxxInject write-path coverage (task #258)](project_task258_inject_fuzz_coverage.md) — 9 new targets jpeg/png/7-RAW; rawEXIF semantics diverge (TIFF-base vs container-payload vs ORF/RW2-nil); CR3 seeds reuse extended_size_test.go helpers
+- [EXIF-IFDCHAIN-01 traversal budget fix (task #255, round 2)](project_ifdchain01_traversal_budget.md) — traverseBudget entries/chain caps; round2: charge budget with PRE-dedup parsedCount not len(ifd.Entries), else identical-tag dedup-undercount gives ~4000x amplification
+- [CR3-EXTSIZE-01 extended-size box write fix (task #256)](project_cr3_extsize01_fix.md) — injectIntoMoov/rebuildMoovContent recompute headerLen via parseCR3BoxHeader instead of hardcoded +8/24; flatUUIDBoxRange size>=headerLen+16 guard added
 - [HEIF iloc off-by-one panic (task #243)](project_heif_iloc_offbyone_243.md) — parseIloc AND parseIlocFull guard widened 5→6; 5-byte iloc body panic fixed in both read+write paths
 - [exif sub-IFD lazy arena (task #198)](project_task198_arena.md) — lazy arena for sub-IFDs only; -25% allocs Camera; hint order: ExifIFD→InteropIFD→GPSIFD; cap-clamped safety
 - [format.Detect magic-byte pool (task #203)](project_task203_magic_pool.md) — magicPool *[36]byte; -11% allocs/op BenchmarkRead_JPEG; -8.4% B/op; TestDetect_ZeroAllocs gate
