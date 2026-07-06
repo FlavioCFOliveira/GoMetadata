@@ -1277,3 +1277,165 @@ EXIFParse_Camera-10    9.000       8.000    -11.11% (p=0.000 n=10)
 | Output EXIF struct | 1 | `Parse` |
 | ~~makeEntry.String() heap string~~ | ~~1~~ | **eliminated by task #202** |
 | **Total** | **8** | |
+
+---
+
+## [main — BigTIFF write + security-hardening wave] — 2026-07-06 (HEAD 0ebf5d4)
+
+### Context
+
+This section captures a **time-boxed, representative subset** of the suite at HEAD `0ebf5d4`
+(tag `v1.2.0` is `1c3b7a6`), covering the read/write fast paths plus the new BigTIFF write
+benchmark, after two waves of work landed since the tasks above:
+
+1. **BigTIFF write** (tasks #264/#270/#271, commits `aa24232`/`ef9041e`/`0ebf5d4`): a native
+   BigTIFF encoder in `exif.Encode` and a container-width-aware relocator in `format/tiff`,
+   wired into the public `Write`/`WriteFile`. `BenchmarkEXIFEncode_BigTIFF` is a **new**
+   benchmark with no prior baseline in this file.
+2. **Security-hardening wave** (audit findings #243–#262): 16 fixes, almost all of which are
+   correctness/DoS-bound fixes on cold or already-bounded paths. Most commit messages assert
+   "no regression" / "byte-identical alloc profile" for the specific benchmark they touched;
+   this section independently re-measures the broader top-level/exif/tiff/iptc/xmp surface to
+   confirm that claim holistically and to catch anything the per-commit benchmarking missed.
+
+Run with `go test -run '^$' -bench='<names>' -benchmem -count=3 <pkg>` (not the full `-bench=.`
+sweep — this is a targeted, time-boxed subset, not an exhaustive run). Same machine as the
+`task #198`–`#203`/`#240` entries above (Apple M4, darwin/arm64), but Go **1.26.4** (the
+`task #198`–`#203` entries above were captured on 1.26.1; the toolchain has moved forward
+between sessions). Figures below are the median of 3 runs (`-count=3`); "Last recorded" pulls
+the most recent value for that exact benchmark name from elsewhere in this file (or, where this
+file never recorded it, from `benchmarks/BENCHMARKS.md`'s `v1.2.0` column) — not necessarily
+the immediately-preceding task's own baseline, since this file's per-task sections are diffed
+against each other out of strict chronological order (see the project's own release-manager
+notes on this file's two run conventions).
+
+### github.com/FlavioCFOliveira/GoMetadata (top-level)
+
+| Benchmark | ns/op | Last recorded | B/op | Last recorded | allocs/op | Last recorded |
+|---|---|---|---|---|---|---|
+| BenchmarkRead_JPEG | 269.3 | 269.7 (task #203) | 521 | 521 (task #203) | 8 | 8 (task #203) |
+| BenchmarkRead_PNG | 187.2 | 157.9 (task #198, stale — predates #199–#240) | 288 | 224 (task #198, stale) | 10 | 11 (task #198, stale) |
+| BenchmarkReadFile | 2298 | 2543 (v1.2.0, `benchmarks/BENCHMARKS.md`) | 6329 | 6224 (v1.2.0) | 15 | 17 (v1.2.0) |
+| BenchmarkWrite_JPEG | 430.8 | 378.4 (task #201) | 240 | 288 (task #201) | 11 | 12 (task #201) |
+| BenchmarkWrite_PNG | 275.5 | 280.1 (task #201) | 136 | 184 (task #201) | 15 | 16 (task #201) |
+
+Notes:
+- `BenchmarkRead_JPEG`: flat. Confirms `bacfa46`'s (#262) own claim that the JPEG 256 MiB
+  aggregate-cap addition left the hot-path allocation profile unchanged.
+- `BenchmarkRead_PNG`: the "last recorded" figure in *this file* is stale (task #198, before
+  five later perf tasks touched shared code such as `format.Detect`); the current allocs/op
+  (10, down from 11) is consistent with task #203's magic-byte pooling. No PNG-specific commit
+  landed in the security wave, so this is simply the first re-measurement since task #198.
+- `BenchmarkReadFile`: **−9.6% ns/op** vs the v1.2.0 baseline recorded in
+  `benchmarks/BENCHMARKS.md`, with allocs down from 17 to 15. `readAllCapped` (#251) adds a
+  `LimitReader`-style wrapper on the six TIFF-family write paths, not on `ReadFile`'s own
+  `io.ReadAll` (already capped since v1.1.0/#140), so the net improvement here is attributable
+  to the accumulated exif/format perf work (tasks #198–#203, #240) rather than the security wave.
+- `BenchmarkWrite_JPEG`: **+13.8% ns/op**, but **−16.7% B/op** and **−1 alloc/op**, vs the task
+  #201 baseline. `bacfa46` (#262) introduced a pooled `countingReader` wrapper around the JPEG
+  Inject write path to enforce the new 256 MiB aggregate cap; pooling explains the alloc/B
+  *reduction*, and the per-call budget bookkeeping (a running byte counter checked on every
+  read/seek) explains the small ns/op increase. Both are within this project's established
+  "security overhead, accepted" pattern (see the v1.1.0/v1.2.0 sections of
+  `benchmarks/BENCHMARKS.md`) and the absolute cost (≈430 ns) remains negligible.
+- `BenchmarkWrite_PNG`: flat-to-improved (no PNG-specific security-wave commit; consistent
+  with continued benefit from the shared `exif` encode-path pooling in task #240).
+
+### exif/
+
+| Benchmark | ns/op | Last recorded | B/op | Last recorded | allocs/op | Last recorded |
+|---|---|---|---|---|---|---|
+| BenchmarkMakerNoteDispatch | 119.7 | 123 (task #200, regression-fixed) | 208 | 208 (task #200) | 4 | 4 (task #200) |
+| BenchmarkEXIFParse | 165.7 | 172.1 (task #200) | 337 | 337 (task #200) | 4 | 4 (task #200) |
+| BenchmarkEXIFParse_Camera | 1532 | 1521–1543 avg ≈1532 vs 1518 (task #202) | 2594 | 2533 (task #202, `2.533Ki`) | 8 | 8 (task #202) |
+| BenchmarkEXIFEncode | 127.9 | 122.5 (task #201) | 80 | 80 (task #201) | 2 | 2 (task #201) |
+| BenchmarkEXIFEncode_Camera | 1097 | 1065 (task #201) | 1618 | 1619 (task #201) | 14 | 14 (task #201) |
+| BenchmarkParseBigTIFF_Simple | 184.9 | 195 (v1.2.0, `benchmarks/BENCHMARKS.md`) | 337 | 369 (v1.2.0) | 4 | 4 (v1.2.0) |
+| **BenchmarkEXIFEncode_BigTIFF** (new) | **976.7** | — (no prior baseline; new since task #264) | **7750** | — | **6** | — |
+
+Notes:
+- All classic-path exif benchmarks are flat within ±5% of their last-recorded value in *this*
+  file — direct confirmation of the "0% delta" / "byte-identical" claims made in the #246/#252
+  (byte-order correction) and #255 (IFD-chain budget) commit messages: neither adds measurable
+  overhead to well-formed files, only to the pathological-input paths their regression tests
+  target. (`BenchmarkEXIFParse_Camera`: task #202's own baseline was 1518 ns/2533 B; this
+  session measures 1532 ns/2594 B, +0.9%/+2.4% — flat. Note that `benchmarks/BENCHMARKS.md`
+  instead compares against the older, pre-perf-wave v1.2.0 baseline of 1427 ns, which shows a
+  larger nominal delta for the same reason task #198–#203/#240 already explain: those tasks
+  landed between the v1.2.0 tag and this measurement.)
+- `BenchmarkParseBigTIFF_Simple`'s B/op drop (369 → 337, exactly −32 B) is the *same* delta task
+  #199 measured on classic `BenchmarkEXIFParse` for a 4-entry IFD0 (4 × 8 B saved per entry from
+  replacing the `binary.ByteOrder` interface field with a 1-byte flag) — confirming the BigTIFF
+  read path shares the same `IFDEntry` struct and benefits identically, even though it was not
+  re-measured when task #199 originally landed.
+- `BenchmarkEXIFEncode_BigTIFF` establishes the first baseline for the new BigTIFF encode path:
+  977 ns/op, 7750 B/op, 6 allocs/op for a minimal BigTIFF IFD0. This is ~7.6× the B/op of the
+  classic `BenchmarkEXIFEncode` (80 B) and 3× the allocs, which is expected — every IFD entry,
+  offset, and header field is twice the width (8-byte IFD8/LONG8/SLONG8 vs 4-byte LONG/SLONG),
+  and the output buffer itself is proportionally larger.
+
+### format/tiff
+
+| Benchmark | ns/op | Last recorded | B/op | Last recorded | allocs/op | Last recorded |
+|---|---|---|---|---|---|---|
+| BenchmarkTIFFExtract | 109.9 | 143.9 (v1.2.0) | 584 | 584 (v1.2.0) | 3 | 3 (v1.2.0) |
+| BenchmarkBigTIFFExtract | 116.1 | 145 (v1.2.0) | 584 | 584 (v1.2.0) | 3 | 3 (v1.2.0) |
+| BenchmarkRelocateSingleStrip | 1520 | 1933 (task #240) | 7430 | 7462 (task #240) | 22 | 28 (task #240) |
+| BenchmarkRelocateMultiStrip | 1836 | 2442 (task #240) | 10246 | 10265 (task #240) | 28 | 34 (task #240) |
+| BenchmarkRelocateDNGLike | 2444 | 3128 (task #240) | 13443 | 13457 (task #240) | 37 | 42 (task #240) |
+
+Notes:
+- `BenchmarkTIFFExtract`/`BenchmarkBigTIFFExtract`: **−23.6% / −19.9% ns/op**, flat B/op and
+  allocs/op. Consistent with the accumulated `exif`/`format` perf work (tasks #198–#203). #253's
+  `findExifIFDOffset` fix (comparing in `uint64` before narrowing to `int`) does touch this exact
+  extract path, but adds a single comparison — below this benchmark's measurement noise floor.
+- **All three `BenchmarkRelocateXxx` benchmarks improved by 6 allocs/op (−21.1% to −27.1% ns/op),
+  flat B/op**, vs their task #240 baseline. This is directly attributable to `202e34a` (#261,
+  GM-W1): the same files (`relocate.go`, `relocate_arw.go`, `relocate_nef.go`, `relocate_orf.go`,
+  `relocate_rw2.go`) that introduced the `maxImageBlocksPerOffsetEntry`/`maxSubIFDsPerEntry`/
+  `maxAggregateImageBlocks` caps also restructured `extractParallelOffsetBlocks` and
+  `enumerateSubIFDsAt` around a shared `imageBlockBudget`, which — for these benchmarks'
+  well-formed, non-adversarial fixtures — allocates fewer intermediate objects than the
+  pre-#261 code while still closing the DoS. **This is a genuine improvement, not a
+  regression**; it is called out explicitly because it is a positive side effect of a security
+  fix, which is the reverse of every other regression documented in this file so far.
+
+### iptc/
+
+| Benchmark | ns/op | Last recorded (v1.2.0) | B/op | Last recorded | allocs/op | Last recorded |
+|---|---|---|---|---|---|---|
+| BenchmarkIPTCParse | 183.8 | 197 | 1024 | 1024 | 6 | 6 |
+| BenchmarkIPTCEncode | 159.8 | 163 | 304 | 304 | 2 | 2 |
+| BenchmarkIPTCAccessors | 21.00 | 21.6 | 48 | 48 | 1 | 1 |
+
+Flat-to-slightly-improved across the board. The `e092770` extended-length overflow guard adds a
+single `uint64` comparison against `maxDatasetValueLen` on the encode path — below this
+benchmark's noise floor, confirming the fix is effectively free for well-formed input.
+
+### xmp/
+
+| Benchmark | ns/op | Last recorded (v1.2.0) | B/op | Last recorded | allocs/op | Last recorded |
+|---|---|---|---|---|---|---|
+| BenchmarkRDFParse | 3251 | 3294 | 2208 | 2208 | 45 | 45 |
+| BenchmarkXMPEncodeFullPacket | 1628 | 1561 | 3573 | 3188 | 4 | 4 |
+| BenchmarkXMPParse | 1333 | 1357 | 1160 | 1160 | 20 | 20 |
+| BenchmarkXMPEncode | 1030 | 1028 | 3155 | 3156 | 3 | 3 |
+
+Notes:
+- `BenchmarkRDFParse`/`BenchmarkXMPParse`/`BenchmarkXMPEncode`: flat.
+- **`BenchmarkXMPEncodeFullPacket`: +4.3% ns/op, +12.1% B/op (3188 → 3573), flat allocs/op.**
+  Root cause: `e81d364`'s XMP encoder fix (see `CHANGELOG.md`) now wraps every array-typed
+  property (`dc:creator`, `dc:subject`, `dc:description`, `dc:rights`, `dc:title`, the `xmpMM`
+  ordered-array set) in its `<rdf:Seq>`/`<rdf:Bag>`/`<rdf:Alt>` collection container even when it
+  holds exactly one value — this benchmark's "full packet" fixture sets several array-typed
+  properties, each of which now emits an extra pair of collection-container tags. `allocs/op` is
+  unchanged because the output buffer is pre-sized from a single measurement pass (existing
+  two-pass sizing from the 2026-04-07 post-audit optimisation); only the byte count grows.
+  `BenchmarkXMPEncode` (a single scalar-property encode, unaffected by the array-wrapping fix) is
+  flat, which independently confirms this attribution — the B/op increase is isolated to the
+  benchmark that actually exercises array-typed properties.
+
+### Raw output
+
+Full `-count=3` output for every benchmark in this section is archived at
+`benchmarks/results/HEAD-0ebf5d4-2026-07-06.txt`.

@@ -275,7 +275,7 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 | Priority resolution | Each getter documents its source order (e.g., EXIF > XMP); the caller always gets one answer |
 | Lazy parsing | `WithoutEXIF()`, `WithoutIPTC()`, `WithoutXMP()`, `WithoutMakerNote()` skip unwanted work |
 | Allocation budget | Zero/near-zero heap allocation in parsing fast paths; `sync.Pool` for reusable buffers |
-| Fuzz testing | 27 fuzz targets covering all parsers and format extractors |
+| Fuzz testing | 29 fuzz targets covering all parsers and format extractors/injectors (see `SECURITY.md`) |
 | Race safety | Clean under `go test -race ./...` |
 | Corpus coverage | 3,000+ real-world images tested, 0 failures |
 
