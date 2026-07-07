@@ -103,4 +103,15 @@ from this assessment: gates are already green, security clearance is already on
 file (don't redo it), the only remaining work is CHANGELOG authorship,
 SECURITY.md fuzz-table correction, and a fresh benchmark run/update.
 
-Related: [[project_release_patterns]], [[project_v120_release]], [[feedback-changelog-verify-constants]]
+## Update — 2026-07-06: the three documentation gaps are now closed
+
+A follow-up docs-only task closed all three gaps listed above, at HEAD `0ebf5d4`, in commit
+`3de8d2f` ("docs: changelog, security fuzz inventory, benchmarks for v1.3.0 readiness"). See
+[[project_v130_docs_gap_closure]] for what was found and fixed (SECURITY.md was more broadly
+wrong than just the "27" count) and for corrections to this assessment's own claims. **The repo
+is now release-READY for a v1.3.0 cut** — only Phases 6-9 of the standard workflow (verify
+nothing changed since `3de8d2f`, tag, push with confirmation, GitHub release) remain, plus a
+final full `-bench=. -benchmem -count=3 ./...` sweep if a completist benchmark record is desired
+(the docs-gap-closure commit intentionally used a time-boxed subset, not the full suite).
+
+Related: [[project_release_patterns]], [[project_v120_release]], [[feedback-changelog-verify-constants]], [[project_v130_docs_gap_closure]]

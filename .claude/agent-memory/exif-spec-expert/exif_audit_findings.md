@@ -77,28 +77,78 @@ violations found at the time it was written (task #156).
   `maxAggregateImageBlocks = 262144` — see go-performance-architect's
   `project_gmw1_imageblock_budget.md`.
 
-## Current known gap (NOT a corruption risk, but a real scope gap)
+## BigTIFF write gap — CLOSED 2026-07-06 (was the sole caveat; re-verified same day)
 
-**BigTIFF write is not implemented.** `exif.Encode` on an `EXIF` parsed from a BigTIFF
-source (`e.BigTIFF == true`) returns `ErrBigTIFFEncodeNotSupported` and emits **zero
-bytes** rather than silently downgrading to classic TIFF (which used to truncate all
-64-bit offsets to 32 bits — audit finding #107, now gated/fixed). BigTIFF **read** is
-fully supported (`project_bigtiff_read.md`, task #54): magic 0x002B, 16-byte header,
-20-byte/64-bit IFD entries, LONG8/SLONG8/IFD8 types, all correctly parsed for both
-classic-JPEG-with-EXIF and true BigTIFF-container files.
+**Superseded.** As of HEAD `3de8d2f` (commits `aa24232` task #264, `ef9041e` task
+#270, `0ebf5d4` task #271), BigTIFF write is fully implemented end to end and the
+prior GO-WITH-CAVEATS verdict is upgraded to **CLEAN GO**. Verified by direct
+reading of `exif/write.go`/`exif/ifd.go` (`serialiseBigTIFF`, `writeIFDBigTIFF`,
+`ifdTotalSizeBigTIFF`, `typeSizeBigTIFF`), `format/tiff/relocate.go` +
+`relocate_bigtiff.go` (64-bit-aware copy-and-relocate), the root `write.go` gate
+removal, and `docs/conformance/exif-tiff.md` §2.7/§2.8 (rules S-34..S-43, V-12..V-15,
+R-14..R-19 — all present with spec citations).
 
-This is documented in `README.md` ("BigTIFF write is not yet supported
-(`ErrWriteNotSupported`)") and gate-tested in `exif/bigtiff_encode_guard_test.go`
-(`TestEncodeBigTIFFSourceReturnsError`). It is a genuine gap against the literal
-"100% ... read AND write" mandate for one specific sub-format (BigTIFF is essentially
-never produced by real cameras — it's a large-file/GIS use case), but it does NOT
-violate the "never corrupt" guarantee: the library fails loudly and safely (explicit
-sentinel error, no output) instead of producing a corrupt file. Classic TIFF (0x002A)
-EXIF write — the format every real camera and virtually all RAW files use — is fully
-implemented and covered by the round-trip evidence above.
+Test-to-rule traceability confirmed by exact function-name grep (not executed —
+this agent has no Bash/shell tool in this environment, only Read/Grep/Glob/Edit;
+static/logical verification only, go-performance-architect or CI must be the
+final execution gate):
+- exif package: `TestConformance_S34..S39_*` (6), `TestConformance_V12..V14_*` (3),
+  `TestConformance_R14..R17_*` (4) — all 13 exif-side rule IDs have exactly one
+  dedicated named sub-test, 1:1.
+- format/tiff package: `TestConformance_S40..S43_*` (S-42/S-43 each have a
+  real-fixture + a synthetic variant), `TestConformance_R18_*` (curated + corpus),
+  `TestConformance_R19_*`.
+- Minor traceability nit (not a functional/corruption caveat): **V-15** (uint64
+  arithmetic throughout `format/tiff`'s relocation offset math) has no test
+  literally named after it — the invariant is enforced by the Go type system
+  (`imageBlock.srcOffset/newOffset`, `subIFDInfo.srcOffset/newOffset` are `uint64`,
+  confirmed by reading the struct defs at `format/tiff/relocate.go:234-282`) and is
+  exercised indirectly by S-41/S-42/R-18's real-LONG8-value round trips. Worth
+  flagging if asked to audit test-naming hygiene, but does not affect correctness.
 
-**How to apply:** When asked to certify "100% EXIF/TIFF write compliance," always
-name this BigTIFF-write gap explicitly. It is the correct basis for a
-GO-WITH-CAVEATS verdict rather than an unqualified GO, but does not by itself
-justify a NO-GO given it is documented, safely gated, and out of scope for
-virtually all real-world camera-originated files.
+Key design facts worth remembering for future BigTIFF questions:
+- **S-39 alignment decision**: BigTIFF write uses word (2-byte) alignment for
+  OOL value areas, NOT the BigTIFF design doc's literal 8-byte-alignment text —
+  deliberately matches libtiff `tif_dirwrite.c`'s actual behavior and this
+  project's own tiffcp-generated fixtures. Directly tested
+  (`TestConformance_S39_bigtiff_alignment_encode` forces an odd-length ASCII
+  value then asserts the next OOL entry's offset is even).
+- Sub-IFD/thumbnail pointer tags (0x8769/0x8825/0xA005/0x0201/0x0202) stay
+  `TypeLong` even in BigTIFF (never promoted to LONG8/IFD8) — matches EXIF
+  §4.6.3/§4.5.5 and the libtiff/tiffcp convention. `ErrBigTIFFPointerOverflow`
+  fires instead of truncating if a target offset would exceed 32 bits.
+- `ErrBigTIFFEncodeSizeExceeded` + test-overridable `maxBigTIFFEncodeSize` (4 GiB
+  default) replace classic TIFF's implicit `MaxUint32`-saturation ceiling, since
+  BigTIFF's 64-bit fields have no natural overflow point of their own.
+- `format/tiff`'s `assignNewOffsets` still saturates at `math.MaxUint32` even for
+  BigTIFF sources — deliberate and harmless, NOT a real limitation: this project's
+  own pre-existing, independently-security-audited `maxFileSize` = 256 MiB
+  aggregate-read cap (applied on every `io.ReadAll` across every format package,
+  predates this task) means no file this library will ever actually process can
+  approach the 4 GiB `MaxUint32` threshold regardless of container. This is
+  explicitly disclosed in V-15's own doc text in `docs/conformance/exif-tiff.md`,
+  not a hidden gap.
+- `rebaseGenericMakerNote` explicitly no-ops (`if e.BigTIFF { return }`) for
+  BigTIFF sources — a documented, tested (`TestConformance_R19_*`) fail-safe
+  deferral, not a corruption risk, because no known real-world file combines a
+  Sony-plain-IFD/Olympus-OLYMP MakerNote with a genuinely BigTIFF container (both
+  maker conventions predate BigTIFF). Same category as the pre-existing classic-
+  TIFF R-11 "preserve-in-place, fully rebase, or document" allowance, extended to
+  BigTIFF. Full BigTIFF-aware outer-container MakerNote rebasing remains a tracked
+  (non-blocking) follow-up.
+- `exif.ErrBigTIFFEncodeNotSupported` is kept, `// Deprecated:`-tagged, for API
+  compatibility; the stale guard test (`TestEncodeBigTIFFSourceReturnsError`) was
+  properly retired and replaced by `TestEncodeBigTIFFSourceSucceeds` — not left as
+  a surprise regression, confirming the go-performance-architect followed the
+  test-migration instruction from `bigtiff_write_spec.md` exactly.
+- Public API proof: `bigtiff_write_e2e_test.go::TestWriteBigTIFFEndToEnd` drives
+  real `testdata/fixtures/BigTIFF_{LE,BE}.tif` (tiffcp -8 fixtures) through
+  `Read → SetCopyright → Write → Read`, asserting magic preservation (no silent
+  downgrade to 0x002A), unmodified-field byte-fidelity, and byte-for-byte strip
+  image-data preservation despite the strip's absolute offset changing.
+
+**How to apply:** The EXIF/TIFF/BigTIFF dimension of GoMetadata is CLEAN GO as of
+2026-07-06 (HEAD 3de8d2f). If a future audit is requested, re-verify HEAD has not
+regressed (check `exif.ErrBigTIFFEncodeNotSupported` is not being returned again,
+check the root `write.go` gate has not been reintroduced) rather than assuming this
+finding is still current — it is a snapshot, not a permanent guarantee.
