@@ -1202,7 +1202,27 @@ func unescapeXML(b []byte) string {
 
 // decodeCharRef decodes a numeric XML character reference (&#N; or &#xHH;).
 // ref is the content after '#' (e.g., []byte("65") or []byte("x41")).
-// Returns true and writes the rune if the reference is valid.
+// Returns true and writes a rune if the reference is a valid numeric
+// character reference syntax; returns false (writing nothing) only when
+// parseHex/parseDec reject the digits outright (surrogate or > U+10FFFF).
+//
+// Task #274 / XML 1.0 §2.2, §4.1: a numeric character reference is only
+// well-formed when its referent matches the production
+// Char ::= #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF].
+// parseHex/parseDec already reject surrogates and values above U+10FFFF (a
+// Unicode-scalar-value check), but a value CAN be a legal Unicode scalar
+// value and still fall in one of the §2.2 forbidden ranges — the C0 control
+// block (except the three whitespace exceptions #x9/#xA/#xD) and the two
+// BMP non-characters U+FFFE/U+FFFF. Admitting such a code point verbatim is
+// doubly wrong: it accepts ill-formed XML, AND — for U+001E specifically —
+// it hands a caller this library's INTERNAL multi-value sentinel byte (see
+// the '\x1e' dispatch in write.go's Encode), which would later cause a
+// genuinely scalar/Simple property to be spuriously re-serialised as an
+// rdf:Bag. isForbiddenXMLCharRef guards against the whole forbidden set and
+// substitutes U+FFFD — the identical replacement policy writeXMLEscaped
+// already applies on the output side (xmp/write.go) for the same set — so a
+// forbidden code point can never enter a parsed property value regardless of
+// how the source document spelled it.
 func decodeCharRef(ref []byte, bld *strings.Builder) bool {
 	if len(ref) == 0 {
 		return false
@@ -1214,10 +1234,42 @@ func decodeCharRef(ref []byte, bld *strings.Builder) bool {
 	} else {
 		r, ok = parseDec(ref)
 	}
-	if ok {
-		bld.WriteRune(r)
+	if !ok {
+		return false
 	}
-	return ok
+	if isForbiddenXMLCharRef(r) {
+		r = '�' // REPLACEMENT CHARACTER; Unicode §5.22 "Best Practice for U+FFFD Substitution".
+	}
+	bld.WriteRune(r)
+	return true
+}
+
+// isForbiddenXMLCharRef reports whether r — already confirmed by the caller
+// (decodeCharRef) to be a valid Unicode scalar value that is not a
+// surrogate — is nonetheless outside the XML 1.0 §2.2 Char production and
+// therefore MUST NOT appear in a well-formed XML document:
+//
+//	Char ::= #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+//
+// Equivalently, r is forbidden when it falls in the C0 control block
+// (#x0-#x1F) other than the three whitespace exceptions TAB/LF/CR, or is one
+// of the two BMP non-characters U+FFFE/U+FFFF. This mirrors, byte-for-byte,
+// the forbidden set writeXMLEscaped (xmp/write.go) already replaces with
+// U+FFFD on the output side, so the parser and serialiser apply one
+// consistent policy in both directions.
+func isForbiddenXMLCharRef(r rune) bool {
+	switch {
+	case r <= 0x08:
+		return true
+	case r == 0x0B || r == 0x0C:
+		return true
+	case r >= 0x0E && r <= 0x1F:
+		return true
+	case r == 0xFFFE || r == 0xFFFF:
+		return true
+	default:
+		return false
+	}
 }
 
 // decodeEntity writes the character(s) for the XML entity reference ref into
@@ -1273,12 +1325,17 @@ func decodeNamedEntity(ref []byte, bld *strings.Builder) bool {
 
 // parseHex parses a hexadecimal rune reference (without the leading "x").
 //
-// XML 1.0 §4.1: a numeric character reference is only valid when the code
-// point is a legal XML character and a Unicode scalar value (≤ U+10FFFF,
-// not a surrogate U+D800–U+DFFF). References outside this range are rejected
-// by returning (0, false), which causes decodeCharRef to return false and
-// decodeEntity to emit the original &ref; literal — a safe, spec-conformant
-// fallback. This mirrors the guard in decodeUTF32 (encoding.go).
+// XML 1.0 §4.1 / Unicode §3.9: a numeric character reference must be a
+// Unicode scalar value (≤ U+10FFFF, not a surrogate U+D800–U+DFFF). A
+// reference outside this range is rejected by returning (0, false); the
+// caller (decodeCharRef) then returns false without writing anything, so
+// decodeEntity silently drops the reference — the "&ref; literal" fallback
+// only applies to unrecognised NAMED entities (decodeNamedEntity), not
+// out-of-range numeric ones. This mirrors the guard in decodeUTF32
+// (encoding.go). Note: a value that PASSES this check is a valid Unicode
+// scalar value but may still be an XML 1.0 §2.2 forbidden Char (e.g. a C0
+// control) — that narrower check is decodeCharRef's isForbiddenXMLCharRef,
+// applied after this function returns ok=true.
 //
 //nolint:gocyclo // switch on hex digit range is inherently > 10 complexity; refactoring would reduce readability without correctness benefit
 func parseHex(b []byte) (rune, bool) {
@@ -1311,12 +1368,17 @@ func parseHex(b []byte) (rune, bool) {
 
 // parseDec parses a decimal rune reference.
 //
-// XML 1.0 §4.1: a numeric character reference is only valid when the code
-// point is a legal XML character and a Unicode scalar value (≤ U+10FFFF,
-// not a surrogate U+D800–U+DFFF). References outside this range are rejected
-// by returning (0, false), which causes decodeCharRef to return false and
-// decodeEntity to emit the original &ref; literal — a safe, spec-conformant
-// fallback. This mirrors the guard in decodeUTF32 (encoding.go).
+// XML 1.0 §4.1 / Unicode §3.9: a numeric character reference must be a
+// Unicode scalar value (≤ U+10FFFF, not a surrogate U+D800–U+DFFF). A
+// reference outside this range is rejected by returning (0, false); the
+// caller (decodeCharRef) then returns false without writing anything, so
+// decodeEntity silently drops the reference — the "&ref; literal" fallback
+// only applies to unrecognised NAMED entities (decodeNamedEntity), not
+// out-of-range numeric ones. This mirrors the guard in decodeUTF32
+// (encoding.go). Note: a value that PASSES this check is a valid Unicode
+// scalar value but may still be an XML 1.0 §2.2 forbidden Char (e.g. a C0
+// control) — that narrower check is decodeCharRef's isForbiddenXMLCharRef,
+// applied after this function returns ok=true.
 func parseDec(b []byte) (rune, bool) {
 	// Reject inputs that are obviously too long to represent a valid Unicode
 	// scalar value (U+10FFFF = 1114111 = 7 decimal digits). More than 7 digits

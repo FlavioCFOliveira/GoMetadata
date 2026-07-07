@@ -1,5 +1,8 @@
 # Memory Index
 
+- [Task #274 XMP numeric char-ref forbidden-Char fix](project_task274_xmp_charref_forbidden_chars.md) — isForbiddenXMLCharRef closes U+001E-via-&#x1e; corruption; write.go defense-in-depth assessed+rejected; raw-literal-byte vector left open by design
+- [Task #273 XMP round-trip container preservation (commit 39144d3)](project_task273_xmp_container_preservation.md) — containerTypes field fixes allowlist-scoped corruption class; arrayProperties table consolidation; Lang-Alt leak fixed as side effect
+- [WebFetch unreliable for large HTML reference tables](feedback_webfetch_html_tables_unreliable.md) — use curl+regex parse instead; AI summarization drops/garbles rows in big tag tables
 - [Task #272 Clean-GO final polish (commits 3b72a26, 8890788)](project_task272_clean_go_polish.md) — DC array allowlist +6 props; IPTC doc hygiene; V-15 named test (primitive+fixture)
 - [Width claims need a primitive-level test, not just fixtures](feedback_width_claims_need_primitive_test.md) — bounded real fixtures can't detect uint32-truncation regressions in "uint64 throughout" claims; verified via bug injection
 - [BigTIFF write support in exif.Encode (task #264, commit aa24232)](project_bigtiff_write.md) — serialiseBigTIFF dispatch; typeSizeBigTIFF #1 rule; word-alignment decision; ErrBigTIFFPointerOverflow/ErrBigTIFFEncodeSizeExceeded; #270 tracks container relocation separately

@@ -122,6 +122,27 @@ func serialise(x *XMP) ([]byte, error) { //nolint:gocyclo,cyclop // complexity i
 			// array-ness. effectiveContainerType carries that knowledge (from the
 			// source document's own container, when x was parsed, or else the
 			// spec-sourced table) independently of value count.
+			//
+			// Task #274 defense-in-depth assessment: could this dispatch defer to
+			// effectiveContainerType ENTIRELY — i.e. treat isColl==false as proof
+			// the property is scalar and ignore \x1e presence — so a stray sentinel
+			// byte can never misclassify a Simple property as an array? Assessed
+			// and rejected as unclean: effectiveContainerType has no "confirmed
+			// scalar" signal, only "confirmed collection" (from parse-time
+			// containerTypes) or "unknown" (isColl==false covers BOTH a
+			// spec-known Simple property AND a brand-new custom property with no
+			// spec-table entry at all). The ctype=="" branch immediately below
+			// exists precisely for that second case — a caller joining values
+			// manually via Set() on an unrecognised property — and deferring
+			// blindly to isColl==false would silently downgrade that legitimate
+			// multi-value property to a Simple element, replacing its \x1e
+			// separators with U+FFFD on output (writeXMLEscaped) and losing the
+			// list structure entirely: a new corruption, not a fix. Closing this
+			// narrower residual (a raw, un-encoded U+001E byte copied verbatim
+			// from ill-formed XML text — decodeCharRef's numeric-character-reference
+			// vector is closed by isForbiddenXMLCharRef in rdf.go) would require a
+			// new "confirmed Simple at parse time" record, which is disproportionate
+			// given the primary vector is already closed at the input boundary.
 			ctype, isColl := x.effectiveContainerType(ns, local)
 			if strings.IndexByte(val, '\x1e') < 0 && !isColl {
 				writeSimpleProperty(buf, prefix, local, val)

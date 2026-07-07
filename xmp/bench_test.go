@@ -175,6 +175,23 @@ func BenchmarkUnescapeXMLNoEntity(b *testing.B) {
 	}
 }
 
+// BenchmarkNumericCharRefDecode measures unescapeXML for input containing
+// numeric character references (&#N; and &#xHH;), the cold path that now
+// also runs isForbiddenXMLCharRef's range check (task #274). A mix of legal
+// (decoded normally) and forbidden (substituted with U+FFFD) references is
+// included so the benchmark reflects both branches of the new check. This is
+// NOT the hot path — BenchmarkUnescapeXMLNoEntity covers that and must show
+// zero delta from this fix — but is tracked so a future change that adds
+// real cost to numeric char-ref decoding is visible here.
+func BenchmarkNumericCharRefDecode(b *testing.B) {
+	input := []byte("Model &#65;&#x2603; forbidden &#x1e;&#x1f; end")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = unescapeXML(input)
+	}
+}
+
 // BenchmarkPacketScan measures Scan() on a realistic-sized XMP packet.
 func BenchmarkPacketScan(b *testing.B) {
 	// Embed the representative XMP inside a larger byte slice to simulate
