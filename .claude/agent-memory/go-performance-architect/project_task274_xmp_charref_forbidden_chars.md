@@ -71,4 +71,5 @@ bench_test.go for the cold path this fix touches.
 **Benchmark delta: zero.** BenchmarkRDFParse, BenchmarkEntityDecode,
 BenchmarkUnescapeXMLNoEntity, BenchmarkXMPParse all identical ns/op, B/op, allocs/op
 before/after (measured via git stash of rdf.go+write.go with count=3) — structurally
-guaranteed since decodeCharRef is unreachable from the entity-free fast path.
+guaranteed since decodeCharRef is unreachable from the entity-free fast path. Commit
+05e0b73.
