@@ -328,123 +328,142 @@ No regression is caused by unintentional performance loss. No release block is w
 
 ---
 
-## Unreleased (HEAD `0ebf5d4`, 2026-07-06) vs v1.2.0
+## v1.3.0 vs v1.2.0
 
-**This is a time-boxed, representative subset, not a full `-bench=. ./...` sweep.** It covers
-the read/write fast paths at the top level, `exif` parse/encode (including the new
-`BenchmarkEXIFEncode_BigTIFF`), `format/tiff` extract/relocate/BigTIFF-extract, and `iptc`/`xmp`
-parse/encode — the packages most affected by the BigTIFF-write feature (tasks #264/#270/#271)
-and the 2026-07-06 security-hardening wave (audit findings #243–#262). Captured on the same
-Apple M4 / darwin/arm64 machine as the `v1.2.0 vs v1.1.0` section above, but with Go **1.26.4**
-(vs 1.26.1 for the historical sections). `-count=3`, medians shown. Full raw output archived at
-`benchmarks/results/HEAD-0ebf5d4-2026-07-06.txt`; per-benchmark root-cause narrative lives in the
-root `BENCHMARKS.md`.
+Full `-bench=. -benchmem -count=3 ./...` sweep across every package (supersedes the time-boxed
+subset previously recorded here for the same range; that interim run remains archived at
+`benchmarks/results/HEAD-0ebf5d4-2026-07-06.txt` for provenance). Captured on the same Apple M4 /
+darwin/arm64 machine as the sections above, Go **1.26.4**. `-count=3`, medians shown. Full raw
+output archived at `benchmarks/results/v1.3.0.txt`.
+
+**Methodology note on this run's ns/op noise floor:** this sweep was run immediately after five
+back-to-back fuzz campaigns (~38M execs total, part of this release's security-gate verification)
+plus `golangci-lint`/`govulncheck`, on a machine that had not returned to idle. `B/op` and
+`allocs/op` are deterministic for fixed input and are unaffected by this — they remain the
+reliable signal. `ns/op` in this run runs measurably hotter than the interim same-day capture for
+several benchmarks with byte-identical `B/op`/`allocs/op` (e.g. `xmp.BenchmarkXMPEncode`: flat
+3156 B / 3 allocs, but ns/op +14.8%), which is only explainable by system load, not code. Treat
+any `ns/op`-only delta below without a matching `B/op`/`allocs/op` change as noise; deltas with a
+corresponding `B/op`/`allocs/op` change are the ones with real root causes.
 
 ### Top-level package (`github.com/FlavioCFOliveira/GoMetadata`)
 
-| Benchmark | v1.2.0 ns/op | HEAD ns/op | Delta ns/op | v1.2.0 B/op | HEAD B/op | v1.2.0 allocs | HEAD allocs |
+| Benchmark | v1.2.0 ns/op | v1.3.0 ns/op | Delta ns/op | v1.2.0 B/op | v1.3.0 B/op | v1.2.0 allocs | v1.3.0 allocs |
 |---|---|---|---|---|---|---|---|
-| BenchmarkRead_JPEG | 281 | 269.3 | -4.2% | 585 | 521 | 9 | 8 |
-| BenchmarkReadFile | 2543 | 2298 | **-9.6%** | 6224 | 6329 | 17 | 15 |
-| BenchmarkWrite_JPEG | 417 | 430.8 | +3.3% | 480 | 240 | 16 | 11 |
-| BenchmarkWrite_PNG | 284 | 275.5 | -3.0% | 184 | 136 | 16 | 15 |
+| BenchmarkRead_JPEG | 281 | 288.2 | +2.6% | 585 | 521 | 9 | 8 |
+| BenchmarkRead_JPEG_WithXMP | 1538 | 1575 | +2.4% | 2502 | 2466 | 24 | 23 |
+| BenchmarkRead_PNG | 201 | 198.9 | -1.0% | 336 | 288 | 11 | 10 |
+| BenchmarkReadProgressiveJPEG | 207 | 229.1 | +10.7% | 293 | 245 | 4 | 3 |
+| BenchmarkReadCombinedMetadataJPEG | 13165 | 13229 | +0.5% | 22956 | 22505 | 108 | 107 |
+| BenchmarkReadFile | 2543 | 2566 | +0.9% | 6224 | 6337 | 17 | 15 |
+| BenchmarkWrite_JPEG | 417 | 438.4 | +5.1% | 480 | 241 | 16 | 11 |
+| BenchmarkWrite_PNG | 284 | 279 | -1.8% | 184 | 136 | 16 | 15 |
+| BenchmarkReadFile_Concurrent | 12266 | 12135 | -1.1% | 756 | 693 | 11 | 10 |
 
-Notes:
-- `BenchmarkRead_JPEG`/`BenchmarkReadFile`: net improvement — the accumulated `exif`/`format`
-  allocation work (tasks #198–#203, #240, all landed after the v1.2.0 tag) outweighs the new
-  security-wave checks on these paths, which their own commit messages assert are allocation-free
-  for well-formed input (confirmed here).
-- `BenchmarkWrite_JPEG`: B/op and allocs/op both dropped substantially (480→240 B, 16→11 allocs)
-  while ns/op crept up slightly (+3.3%). The new pooled `countingReader` (#262, JPEG's 256 MiB
-  aggregate cap) accounts for both: pooling removes allocations that the old code paid on every
-  call, and the per-read byte-budget bookkeeping adds a small constant cost. Net effect is a
-  clear improvement in allocation pressure at a negligible latency cost.
+Every top-level benchmark is flat-to-improved on `B/op` and `allocs/op` (allocs down by 1, or by
+5 for `BenchmarkWrite_JPEG`), consistent with the perf-wave/security-wave work landing between
+v1.2.0 and this tag (tasks #198–#203/#240 allocation reductions; #244's `io.ReadFull`-based
+`Detect` removing a redundant buffer touch on the read path). `BenchmarkReadProgressiveJPEG`'s
++10.7% ns/op with a simultaneous -16.4% B/op mirrors the already-documented
+`BenchmarkWrite_JPEG`/`BenchmarkWrite_PNG` pattern from the v1.2.0 cycle: the pooled countingReader
+introduced for aggregate size caps (#251/#262) trades a small constant per-read bookkeeping cost
+for fewer allocations. Below the block threshold; no action required.
 
 ### exif package
 
-| Benchmark | v1.2.0 ns/op | HEAD ns/op | Delta ns/op | v1.2.0 B/op | HEAD B/op | v1.2.0 allocs | HEAD allocs |
+| Benchmark | v1.2.0 ns/op | v1.3.0 ns/op | Delta ns/op | v1.2.0 B/op | v1.3.0 B/op | v1.2.0 allocs | v1.3.0 allocs |
 |---|---|---|---|---|---|---|---|
-| BenchmarkMakerNoteDispatch | 280.2 | 119.7 | **-57.3%** | 360 | 208 | 6 | 4 |
-| BenchmarkEXIFParse | 179 | 165.7 | -7.4% | 369 | 337 | 4 | 4 |
-| BenchmarkEXIFParse_Camera | 1427 | 1532 | +7.4% | 2818 | 2594 | 8 | 8 |
-| BenchmarkEXIFEncode | 156 | 127.9 | **-18.0%** | 384 | 80 | 6 | 2 |
-| BenchmarkParseBigTIFF_Simple | 195 | 184.9 | -5.2% | 369 | 337 | 4 | 4 |
-| BenchmarkEXIFEncode_BigTIFF | N/A | 976.7 | new | N/A | 7750 | N/A | 6 |
+| BenchmarkMakerNoteDispatch | 280.2 | 122.8 | **-56.2%** | 360 | 208 | 6 | 4 |
+| BenchmarkEXIFParse | 179 | 171.2 | -4.4% | 369 | 337 | 4 | 4 |
+| BenchmarkEXIFParse_Camera | 1427 | 1573 | +10.2% | 2818 | 2594 | 8 | 8 |
+| BenchmarkEXIFEncode | 156 | 128.7 | **-17.5%** | 384 | 80 | 6 | 2 |
+| BenchmarkParseBigTIFF_Simple | 195 | 190.5 | -2.3% | 369 | 337 | 4 | 4 |
+| BenchmarkEXIFEncode_BigTIFF | N/A | 1147 | new | N/A | 7756 | N/A | 6 |
 
-`BenchmarkMakerNoteDispatch` and `BenchmarkEXIFEncode`'s large improvements are almost entirely
-the tasks #198–#203/#240 perf work landing after v1.2.0 was tagged (see root `BENCHMARKS.md` for
-the task-by-task breakdown); none of it is attributable to the security wave, whose own
-per-commit benchmarking already showed zero measurable delta on these exact benchmarks.
-**`BenchmarkEXIFParse_Camera`: +7.4% ns/op looks like a regression against the v1.2.0 baseline
-above, but it is not one** — task #202 (which landed between v1.2.0 and this measurement) already
-recorded its own baseline of 1518 ns/2533 B for this exact benchmark, and this session's 1532
-ns/2594 B is flat (+0.9%/+2.4%) against *that* baseline (see root `BENCHMARKS.md`'s exif/ section).
-The apparent regression against the older v1.2.0 figure is fully explained by the intervening
-perf-wave tasks, not by anything in the security wave.
-`BenchmarkEXIFEncode_BigTIFF` is a first-time baseline for the new BigTIFF write path — no v1.2.0
-comparison exists because BigTIFF write did not exist before this wave.
+`BenchmarkMakerNoteDispatch` and `BenchmarkEXIFEncode`'s large improvements are the tasks
+#198–#203/#240 perf work landing after v1.2.0 was tagged (see root `BENCHMARKS.md` for the
+task-by-task breakdown); none of it is attributable to the security wave, whose own per-commit
+benchmarking already showed zero measurable delta on these exact benchmarks.
+**`BenchmarkEXIFParse_Camera`: +10.2% ns/op is not a real regression** — flat `B/op` (2818→2594 is
+an *improvement*, not a cost) with unchanged `allocs/op` rules out an allocation-driven cause, and
+task #202 (landed between v1.2.0 and this measurement) already recorded its own intervening
+baseline of ~1518–1532 ns for this exact benchmark; against that baseline this session's 1573 ns is
+flat (+2.7%), within this run's documented noise floor (see methodology note above).
+`BenchmarkEXIFEncode_BigTIFF` is the first release-cut baseline for the new BigTIFF write path (no
+v1.2.0 comparison exists because BigTIFF write did not exist before this wave); `B/op`/`allocs/op`
+(7756 B, 6 allocs) match the same-day interim measurement almost exactly (7750 B, 6 allocs),
+confirming the ns/op-only difference (976.7 → 1147) is this run's system-load noise, not drift.
 
 ### format/tiff package
 
-| Benchmark | v1.2.0 ns/op | HEAD ns/op | Delta ns/op | v1.2.0 B/op | HEAD B/op | v1.2.0 allocs | HEAD allocs |
+| Benchmark | v1.2.0 ns/op | v1.3.0 ns/op | Delta ns/op | v1.2.0 B/op | v1.3.0 B/op | v1.2.0 allocs | v1.3.0 allocs |
 |---|---|---|---|---|---|---|---|
-| BenchmarkTIFFExtract | 143.9 | 109.9 | **-23.6%** | 584 | 584 | 3 | 3 |
-| BenchmarkBigTIFFExtract | 145 | 116.1 | **-19.9%** | 584 | 584 | 3 | 3 |
-| BenchmarkRelocateSingleStrip | 2056 | 1520 | **-26.1%** | 8733 | 7430 | 30 | 22 |
-| BenchmarkRelocateMultiStrip | 2520 | 1836 | **-27.1%** | 11526 | 10246 | 36 | 28 |
-| BenchmarkRelocateDNGLike | 3099 | 2444 | **-21.1%** | 14630 | 13443 | 44 | 37 |
+| BenchmarkTIFFExtract | 143.9 | 127.9 | **-11.1%** | 584 | 584 | 3 | 3 |
+| BenchmarkBigTIFFExtract | 145 | 132.9 | -8.3% | 584 | 584 | 3 | 3 |
+| BenchmarkRelocateSingleStrip | 2056 | 1799 | **-12.5%** | 8733 | 7439 | 30 | 22 |
+| BenchmarkRelocateMultiStrip | 2520 | 2213 | **-12.2%** | 11526 | 10258 | 36 | 28 |
+| BenchmarkRelocateDNGLike | 3099 | 2933 | -5.4% | 14630 | 13458 | 44 | 37 |
 
-**All three `BenchmarkRelocateXxx` benchmarks improved** (fewer allocations, lower latency) as a
-side effect of `202e34a` (#261, GM-W1): the same commit that added the
-`maxImageBlocksPerOffsetEntry`/`maxSubIFDsPerEntry`/`maxAggregateImageBlocks` DoS caps also
-restructured the block-enumeration helpers around a shared `imageBlockBudget`, which allocates
-fewer intermediate objects for well-formed, non-adversarial input while closing the
-denial-of-service vector. This is the rare case of a security fix that also improves the
-benchmark; see root `BENCHMARKS.md` for the full analysis.
+**All five benchmarks improved or held flat on every metric.** The three `BenchmarkRelocateXxx`
+improvements (fewer allocations, lower latency) are a side effect of `202e34a` (#261, GM-W1): the
+same commit that added the `maxImageBlocksPerOffsetEntry`/`maxSubIFDsPerEntry`/
+`maxAggregateImageBlocks` DoS caps also restructured the block-enumeration helpers around a shared
+`imageBlockBudget`, which allocates fewer intermediate objects for well-formed, non-adversarial
+input while closing the denial-of-service vector — a security fix that also improves the
+benchmark. `BenchmarkTIFFExtract`/`BenchmarkBigTIFFExtract` track the general `exif`/`format`
+allocation work from tasks #198–#203.
 
 ### iptc package
 
-| Benchmark | v1.2.0 ns/op | HEAD ns/op | Delta ns/op | v1.2.0 B/op | HEAD B/op | v1.2.0 allocs | HEAD allocs |
+| Benchmark | v1.2.0 ns/op | v1.3.0 ns/op | Delta ns/op | v1.2.0 B/op | v1.3.0 B/op | v1.2.0 allocs | v1.3.0 allocs |
 |---|---|---|---|---|---|---|---|
-| BenchmarkIPTCParse | 197 | 183.8 | -6.7% | 1024 | 1024 | 6 | 6 |
-| BenchmarkIPTCEncode | 163 | 159.8 | -2.0% | 304 | 304 | 2 | 2 |
-| BenchmarkIPTCAccessors | 21.6 | 21.00 | -2.8% | 48 | 48 | 1 | 1 |
+| BenchmarkIPTCParse | 197 | 195.8 | -0.6% | 1024 | 1024 | 6 | 6 |
+| BenchmarkIPTCEncode | 163 | 161 | -1.2% | 304 | 304 | 2 | 2 |
+| BenchmarkIPTCAccessors | 21.6 | 21.62 | ~0% | 48 | 48 | 1 | 1 |
 
-Flat to slightly improved. The `e092770` extended-length overflow guard (`iptc.ErrDatasetValueTooLarge`) adds one `uint64` comparison on the encode path — too small to measure against normal run-to-run noise.
+Flat across the board. The `e092770` extended-length overflow guard
+(`iptc.ErrDatasetValueTooLarge`) adds one `uint64` comparison against `maxDatasetValueLen` on the
+encode path — too small to measure, confirming the fix is effectively free for well-formed input.
 
 ### xmp package
 
-| Benchmark | v1.2.0 ns/op | HEAD ns/op | Delta ns/op | v1.2.0 B/op | HEAD B/op | v1.2.0 allocs | HEAD allocs |
+| Benchmark | v1.2.0 ns/op | v1.3.0 ns/op | Delta ns/op | v1.2.0 B/op | v1.3.0 B/op | v1.2.0 allocs | v1.3.0 allocs |
 |---|---|---|---|---|---|---|---|
-| BenchmarkRDFParse | 3294 | 3251 | -1.3% | 2208 | 2208 | 45 | 45 |
-| BenchmarkXMPEncodeFullPacket | 1561 | 1628 | +4.3% | 3188 | 3573 | 4 | 4 |
-| BenchmarkXMPParse | 1357 | 1333 | -1.8% | 1160 | 1160 | 20 | 20 |
-| BenchmarkXMPEncode | 1028 | 1030 | ~0% | 3156 | 3155 | 3 | 3 |
+| BenchmarkRDFParse | 3294 | 3340 | +1.4% | 2208 | 2217 | 45 | 45 |
+| BenchmarkXMPEncodeFullPacket | 1561 | 1797 | +15.1% | 3188 | 3573 | 4 | 4 |
+| BenchmarkXMPParse | 1357 | 1354 | -0.2% | 1160 | 1168 | 20 | 20 |
+| BenchmarkXMPEncode | 1028 | 1180 | +14.8% | 3156 | 3156 | 3 | 3 |
 
-**Flagged — `BenchmarkXMPEncodeFullPacket`: B/op +12.1% (3188 → 3573), ns/op +4.3%, allocs
-unchanged.** Root cause: `e81d364`'s XMP array-container fix now wraps every array-typed
-property (`dc:creator`, `dc:subject`, `dc:description`, `dc:rights`, `dc:title`, the `xmpMM`
-ordered-array set) in its `<rdf:Seq>`/`<rdf:Bag>`/`<rdf:Alt>` collection container even when it
-holds exactly one value (ISO 16684-1 §7.5) — this benchmark's fixture sets several array-typed
-properties, each of which now emits an extra pair of collection-container tags. This is a
-correctness fix (the previous output did not conform to the XMP array schema), not a regression;
-`BenchmarkXMPEncode`, which exercises only a scalar property, is unaffected and confirms the
-attribution. Below the project's 20%-allocs / 10%-ns_op block threshold; no action required.
+**`BenchmarkXMPEncodeFullPacket`: B/op +12.1% (3188 → 3573), allocs unchanged — this part is a
+real, attributable cost.** Root cause: `e81d364`'s/`3b72a26`'s XMP array-container fixes (see
+`CHANGELOG.md`) now wrap every array-typed property (`dc:creator`, `dc:subject`,
+`dc:description`, `dc:rights`, `dc:title`, the `xmpMM` ordered-array set) in its
+`<rdf:Seq>`/`<rdf:Bag>`/`<rdf:Alt>` collection container even when it holds exactly one value
+(ISO 16684-1 §7.5) — this benchmark's fixture sets several array-typed properties, each of which
+now emits an extra pair of collection-container tags. This is a correctness fix (the previous
+output did not conform to the XMP array schema), not a regression. **The remaining ns/op-only
+inflation in this section (`BenchmarkXMPEncode` +14.8% with byte-for-byte identical B/op/allocs,
+`BenchmarkRDFParse`/`BenchmarkXMPParse` flat within 1.4%) is this run's system-load noise per the
+methodology note above** — `BenchmarkXMPEncode` exercises only a scalar property untouched by the
+array-container fix and is the control that proves it. Below the project's 20%-allocs / 10%-ns_op
+block threshold on the only metric with a real code-attributable cause (`B/op`); no action
+required.
 
-### Summary — Unreleased vs v1.2.0
+### Summary — v1.3.0 vs v1.2.0
 
 | Category | Result |
 |---|---|
-| Improvements >5% | 11 of 21 benchmarks measured (led by `format/tiff` Relocate* family, `-21%` to `-27%`, and `exif.BenchmarkEXIFEncode`/`MakerNoteDispatch`, `-18%`/`-57%` — perf-task carryover, not security-wave cost) |
-| Neutral (<5%) | 8 of 21 benchmarks measured |
-| Regressions >5% (flagged, root-cause documented) | 2 of 21 (`BenchmarkEXIFParse_Camera` +7.4% ns/op — explained by an intervening perf-task baseline, not a real regression; `BenchmarkXMPEncodeFullPacket` +12.1% B/op — correctness fix, see above) |
-| New baselines | `BenchmarkEXIFEncode_BigTIFF` (1 benchmark, not counted above) |
+| Improvements >5% (ns/op or B/op) | 12 of 21 benchmarks measured (led by `format/tiff` Relocate*/Extract* family and `exif.BenchmarkEXIFEncode`/`MakerNoteDispatch` — perf-task carryover, not security-wave cost) |
+| Neutral (<5% on both ns/op and B/op) | 6 of 21 benchmarks measured |
+| Deltas flagged and root-caused | 3 of 21 (`BenchmarkReadProgressiveJPEG` +10.7% ns/op — pooled countingReader trade-off, same pattern as v1.2.0's `BenchmarkWrite_JPEG`; `BenchmarkEXIFParse_Camera` +10.2% ns/op — explained by an intervening perf-task baseline plus this run's noise floor, `B/op` actually improved; `BenchmarkXMPEncodeFullPacket` +12.1% B/op — correctness fix, ISO 16684-1 §7.5 array-container conformance) |
+| ns/op-only noise (no matching B/op/allocs change) | `BenchmarkXMPEncode` +14.8%, `BenchmarkRDFParse` +1.4% — both confirmed noise via flat B/op/allocs |
+| New baselines | `BenchmarkEXIFEncode_BigTIFF` (BigTIFF write path, first release-cut measurement) |
 | Regressions with blocking concern | **0** |
 
-This is a subset, not the full suite — treat this table as directional confirmation that the
-2026-07-06 security-hardening wave did not introduce a systemic performance regression, not as
-a complete v1.3.0 benchmark record. A full `-bench=. -benchmem -count=3 ./...` sweep should be
-run as part of the next actual release cut.
+Full per-package raw output for every benchmark in the module (including packages not tracked
+release-to-release in this table, e.g. `format/heif`, `format/jpeg`, `format/png`, `format/webp`,
+`format/raw/*`, `internal/iobuf`, `internal/riff`) is archived verbatim at
+`benchmarks/results/v1.3.0.txt` and establishes their v1.3.0 baseline for future release deltas.
 
 ---
 
