@@ -772,14 +772,19 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	mainBlocks = filterNonNilIFDBlocks(mainBlocks)
 	removeImageOffsetEntries(mainBlocks)
 
-	// Step 6: re-insert placeholder entries and encode to learn the structure size.
+	// Step 6: re-insert placeholder entries and learn the exact IFD structure
+	// size without a full encode.
+	//
+	// #285: exif.EncodedSize replays exif.Encode's own layout arithmetic
+	// (exif/exif.go), so it agrees byte-for-byte with the length Encode would
+	// produce for the same *EXIF state, at a fraction of the cost.
 	offsetValueSlices := insertPlaceholders(mainBlocks)
 
-	skeleton, skelErr := exif.Encode(e)
+	ifdEndInt, skelErr := exif.EncodedSize(e)
 	if skelErr != nil {
 		return nil, fmt.Errorf("nef: encode placeholder: %w", skelErr)
 	}
-	ifdEnd := uint64(len(skeleton))
+	ifdEnd := uint64(ifdEndInt) //nolint:gosec // G115: EncodedSize never returns a negative length
 
 	// Step 7: assign new absolute offsets.
 	subIFDsSize := computeSubIFDsSize(subIFDs)
@@ -797,8 +802,14 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	// Step 8b: patch SubIFD raw bytes.
 	patchSubIFDImageOffsets(subIFDs, false, order)
 
-	// Step 9: re-encode → finalTIFF.
-	finalTIFF, finalErr := exif.Encode(e)
+	// Step 9: re-encode → finalTIFF. The buffer is allocated once with the
+	// exact final length (IFD structure + SubIFD blocks + image blocks,
+	// including the injected PreviewIFD block already folded into allBlocks),
+	// so steps 11 and 12 below never regrow it.
+	// #285: eliminates the append-driven doubling-growth reallocations that
+	// used to dominate NEF write CPU on large (tens-of-MB) files.
+	finalLen := relocatedLen(ifdEnd, subIFDs, allBlocks)
+	finalTIFF, finalErr := exif.EncodeInto(make([]byte, 0, finalCap(finalLen)), e)
 	if finalErr != nil {
 		return nil, fmt.Errorf("nef: encode final: %w", finalErr)
 	}
@@ -837,6 +848,9 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 		finalTIFF = append(finalTIFF, base[blk.srcOffset:end]...)
 	}
 
+	if uint64(len(finalTIFF)) != finalLen {
+		return nil, fmt.Errorf("nef: relocated length %d, computed %d: %w", len(finalTIFF), finalLen, errRelocateLayout)
+	}
 	return finalTIFF, nil
 }
 

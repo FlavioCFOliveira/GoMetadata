@@ -414,12 +414,18 @@ func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclo
 	// the entire TIFF stream in m.rawEXIF; use it when available to avoid a
 	// second full-file read.
 	//
-	// #139: use a defensive copy of m.rawEXIF so that caller mutations of the
-	// slice returned by RawEXIF() do not affect the relocation base. This is
-	// consistent with writeTIFFORF/writeTIFFRW2 which already copy m.rawEXIF.
+	// #285: m.rawEXIF is used directly, with no defensive clone. RawEXIF()
+	// (the only way an external caller can observe this field) already
+	// returns a clone, and nothing downstream of this point — relocateTIFF /
+	// relocateTIFFFromParsed and every format-specific variant in this file —
+	// ever mutates the "base"/"originalBytes" argument's contents in place
+	// (confirmed: the sole such mutations were the ORF/RW2 magic patches in
+	// relocate_orf.go/relocate_rw2.go, both removed by #286 in favour of
+	// exif.AcceptRAWMagic). Aliasing here is therefore safe and avoids a
+	// full-file-sized allocation+copy on every TIFF/DNG write.
 	var originalBytes []byte
 	if m.rawEXIF != nil {
-		originalBytes = bytes.Clone(m.rawEXIF)
+		originalBytes = m.rawEXIF
 	} else {
 		if _, err := r.Seek(0, io.SeekStart); err != nil {
 			return fmt.Errorf("gometadata: tiff seek: %w", err)
@@ -482,10 +488,11 @@ func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclo
 // containers.md §8(e): "CR2: preserve CR 02 00 at offset 8."
 // Validated against real Canon EOS 350D/70D/7D corpus files.
 func writeTIFFCR2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // mirrors writeTIFF; CR2-specific marker-restore call; splitting reduces clarity
-	// #139: defensive copy of m.rawEXIF (consistent with writeTIFF, writeTIFFORF, writeTIFFRW2).
+	// #285: m.rawEXIF is used directly (see writeTIFF's comment above for the
+	// full "no relocator mutates originalBytes" rationale).
 	var originalBytes []byte
 	if m.rawEXIF != nil {
-		originalBytes = bytes.Clone(m.rawEXIF)
+		originalBytes = m.rawEXIF
 	} else {
 		if _, err := r.Seek(0, io.SeekStart); err != nil {
 			return fmt.Errorf("gometadata: cr2 seek: %w", err)
@@ -542,10 +549,11 @@ func writeTIFFCR2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 // Validated against real.arw (Sony DSLR-A500, 13 MB): ImageDataHash IN==OUT,
 // all metadata including 52 MakerNote tags and SR2Private block preserved.
 func writeTIFFARW(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // conditional logic mirrors writeTIFF; splitting reduces clarity
-	// #139: defensive copy of m.rawEXIF (consistent with writeTIFF, writeTIFFORF, writeTIFFRW2).
+	// #285: m.rawEXIF is used directly (see writeTIFF's comment above for the
+	// full "no relocator mutates originalBytes" rationale).
 	var originalBytes []byte
 	if m.rawEXIF != nil {
-		originalBytes = bytes.Clone(m.rawEXIF)
+		originalBytes = m.rawEXIF
 	} else {
 		if _, err := r.Seek(0, io.SeekStart); err != nil {
 			return fmt.Errorf("gometadata: arw seek: %w", err)
@@ -600,28 +608,21 @@ func writeTIFFARW(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 // Un-gated in task #104 after real-corpus validation (Olympus E-M10 IIRO,
 // Olympus C5050Z IIRS): ImageDataHash IN==OUT, all metadata preserved.
 func writeTIFFORF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // conditional logic mirrors writeTIFF; splitting reduces clarity
-	// Recover the original ORF magic from r (bytes 0-3 of the file).
-	// m.rawEXIF carries patched magic (0x2A 0x00 at bytes [2:4]) because
-	// orf.Extract patches in-place before returning rawEXIF.
-	if _, err := r.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("gometadata: orf seek for magic: %w", err)
-	}
-	var origMagicBuf [4]byte
-	if _, err := io.ReadFull(r, origMagicBuf[:]); err != nil {
-		return fmt.Errorf("gometadata: orf read magic: %w", err)
-	}
-
 	// Obtain the original ORF bytes for use as the image-data relocation base.
-	// Use m.rawEXIF when available (orf.Extract stores the full ORF stream there);
-	// fall back to a full read from r.
+	// Use m.rawEXIF when available (orf.Extract stores the full ORF stream
+	// there); fall back to a full read from r.
+	//
+	// #117: orf.Extract stores rawEXIF with the ORIGINAL ORF magic preserved
+	// (bytes[0:4]) — it never patches in place. #285/#286: no clone and no
+	// separate read-from-r for the magic bytes are needed here any more:
+	// relocateTIFFFromParsedORF derives and restores the magic itself
+	// (isORFMagic / origMagic) and, following the #286 fix that replaced its
+	// in-place base[2:4] patch with exif.AcceptRAWMagic, never mutates the
+	// bytes it is given. m.rawEXIF can therefore be aliased directly, exactly
+	// like the other writeTIFF* variants.
 	var originalBytes []byte
 	if m.rawEXIF != nil {
-		originalBytes = make([]byte, len(m.rawEXIF))
-		copy(originalBytes, m.rawEXIF)
-		// Restore the real ORF magic (m.rawEXIF has patched bytes [2:4] = 0x2A 0x00).
-		if len(originalBytes) >= 4 {
-			copy(originalBytes[0:4], origMagicBuf[:])
-		}
+		originalBytes = m.rawEXIF
 	} else {
 		if _, err := r.Seek(0, io.SeekStart); err != nil {
 			return fmt.Errorf("gometadata: orf seek: %w", err)
@@ -684,25 +685,19 @@ func writeTIFFORF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 // Un-gated in task #104 after real-corpus validation (Panasonic DMC-GF1):
 // ImageDataHash IN==OUT, JpgFromRaw (0x002E) and raw sensor data preserved.
 func writeTIFFRW2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // conditional logic mirrors writeTIFF; splitting reduces clarity
-	// Recover the original RW2 magic from r.
-	// m.rawEXIF carries patched magic (0x2A 0x00 at bytes [2:4]).
-	if _, err := r.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("gometadata: rw2 seek for magic: %w", err)
-	}
-	var origMagicBuf [4]byte
-	if _, err := io.ReadFull(r, origMagicBuf[:]); err != nil {
-		return fmt.Errorf("gometadata: rw2 read magic: %w", err)
-	}
-
 	// Obtain the original RW2 bytes for use as the image-data relocation base.
+	//
+	// #117: rw2.Extract stores rawEXIF with the ORIGINAL RW2 magic preserved
+	// — it never patches in place. #285/#286: no clone and no separate
+	// read-from-r for the magic bytes are needed here any more:
+	// relocateTIFFFromParsedRW2 derives and restores the magic itself and,
+	// following the #286 fix that replaced its in-place base[2:4] patch with
+	// exif.AcceptRAWMagic, never mutates the bytes it is given. m.rawEXIF can
+	// therefore be aliased directly, exactly like the other writeTIFF*
+	// variants.
 	var originalBytes []byte
 	if m.rawEXIF != nil {
-		originalBytes = make([]byte, len(m.rawEXIF))
-		copy(originalBytes, m.rawEXIF)
-		// Restore the real RW2 magic (m.rawEXIF has patched bytes [2:4] = 0x2A 0x00).
-		if len(originalBytes) >= 4 {
-			copy(originalBytes[0:4], origMagicBuf[:])
-		}
+		originalBytes = m.rawEXIF
 	} else {
 		if _, err := r.Seek(0, io.SeekStart); err != nil {
 			return fmt.Errorf("gometadata: rw2 seek: %w", err)
@@ -960,10 +955,11 @@ func cloneIFD(ifd *exif.IFD) *exif.IFD {
 // Validated against real.nef (Nikon D70): ImageDataHash IN==OUT, all metadata
 // including PreviewIFD and NikonScanIFD preserved, file size unchanged.
 func writeTIFFNEF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // conditional logic mirrors writeTIFF; splitting reduces clarity
-	// #139: defensive copy of m.rawEXIF (consistent with writeTIFF, writeTIFFORF, writeTIFFRW2).
+	// #285: m.rawEXIF is used directly (see writeTIFF's comment above for the
+	// full "no relocator mutates originalBytes" rationale).
 	var originalBytes []byte
 	if m.rawEXIF != nil {
-		originalBytes = bytes.Clone(m.rawEXIF)
+		originalBytes = m.rawEXIF
 	} else {
 		if _, err := r.Seek(0, io.SeekStart); err != nil {
 			return fmt.Errorf("gometadata: nef seek: %w", err)

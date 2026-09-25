@@ -402,12 +402,13 @@ func rebaseOlympMNEntry(
 //
 // This separation (internal relocator + thin tiff.go wrapper) matches the
 // InjectWithEXIFNEF / InjectWithEXIFARW pattern.
+//
+// #285/#286: relocateTIFFFromParsedORF no longer mutates originalBytes (it
+// used to patch bytes[2:4] to standard TIFF magic in place, via
+// exif.AcceptRAWMagic instead — see that function's doc comment), so the
+// defensive working copy this function used to make is no longer needed.
 func relocateTIFFAsORF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte) ([]byte, error) {
-	// Make a working copy so we can patch bytes [2:4] in-place without
-	// mutating the caller's buffer (rawEXIF may be shared).
-	workBytes := make([]byte, len(originalBytes))
-	copy(workBytes, originalBytes)
-	return relocateTIFFFromParsedORF(workBytes, modifiedEXIF, rawIPTC, rawXMP)
+	return relocateTIFFFromParsedORF(originalBytes, modifiedEXIF, rawIPTC, rawXMP)
 }
 
 // relocateTIFFFromParsedORF patches the ORF magic, runs the TIFF copy-and-relocate
@@ -426,6 +427,14 @@ func relocateTIFFAsORF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, r
 // uses TIFF-file-absolute offsets; the function uses the ORF-specific ARW-analogous
 // path: it registers the external ThumbnailImage as a standalone imageBlock and
 // rebases all MakerNote OOL pointers in the output.
+//
+// #285/#286: base is never mutated. This function used to patch bytes[2:4] to
+// standard TIFF magic (0x2A 0x00) in place before the exif.Parse fallback
+// below, which forced every caller to pass a defensive working copy of the
+// (potentially tens-of-MB) original file. exif.AcceptRAWMagic tells Parse to
+// treat base's own ORF magic exactly like classic TIFF, so base can be parsed
+// (and later read from, in enumerateImageBlocks/enumerateSubIFDs) completely
+// unmodified.
 func relocateTIFFFromParsedORF(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte) ([]byte, error) {
 	if !isORFMagic(base) {
 		return nil, fmt.Errorf("orf: %w", ErrORFInvalidMagic)
@@ -435,17 +444,14 @@ func relocateTIFFFromParsedORF(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 	var origMagic [4]byte
 	copy(origMagic[:], base[0:4])
 
-	// Patch bytes [2:4] to standard TIFF LE magic (0x2A 0x00).
-	//
-	// TIFF 6.0 §2: magic must be 0x002A for classic TIFF. exif.Parse requires
-	// this. The IFD0 offset at bytes [4:8] is already a valid standard TIFF offset.
-	base[2] = 0x2A
-	base[3] = 0x00
-
-	// Parse the magic-patched base when no pre-parsed struct is provided.
+	// Parse base directly when no pre-parsed struct is provided. ORF is always
+	// little-endian (isORFMagic already confirmed bytes[0:2] == "II"); the
+	// magic value at bytes[2:4] is passed to exif.AcceptRAWMagic so Parse
+	// dispatches it through the classic-TIFF path without requiring base's
+	// magic to already be 0x2A 0x00.
 	if e == nil {
 		var parseErr error
-		e, parseErr = exif.Parse(base)
+		e, parseErr = exif.Parse(base, exif.AcceptRAWMagic(binary.LittleEndian.Uint16(base[2:4])))
 		if parseErr != nil {
 			return nil, fmt.Errorf("orf: parse for relocation: %w", parseErr)
 		}
@@ -587,14 +593,19 @@ func orfRelocateWithOLYMP(
 	mainBlocks = filterNonNilIFDBlocks(mainBlocks) // exclude thumbBlock (ifdPtr=nil)
 	removeImageOffsetEntries(mainBlocks)
 
-	// Step 6: re-insert placeholder entries and encode to learn the IFD size.
+	// Step 6: re-insert placeholder entries and learn the exact IFD structure
+	// size without a full encode.
+	//
+	// #285: exif.EncodedSize replays exif.Encode's own layout arithmetic
+	// (exif/exif.go), so it agrees byte-for-byte with the length Encode would
+	// produce for the same *EXIF state, at a fraction of the cost.
 	offsetValueSlices := insertPlaceholders(mainBlocks)
 
-	skeleton, skelErr := exif.Encode(e)
+	ifdEndInt, skelErr := exif.EncodedSize(e)
 	if skelErr != nil {
 		return nil, fmt.Errorf("encode placeholder: %w", skelErr)
 	}
-	ifdEnd := uint64(len(skeleton))
+	ifdEnd := uint64(ifdEndInt) //nolint:gosec // G115: EncodedSize never returns a negative length
 
 	// Step 7: assign new absolute offsets.
 	subIFDsSize := computeSubIFDsSize(subIFDs)
@@ -613,8 +624,14 @@ func orfRelocateWithOLYMP(
 	// Step 8b: patch SubIFD raw bytes.
 	patchSubIFDImageOffsets(subIFDs, false, order)
 
-	// Step 9: re-encode → finalTIFF.
-	finalTIFF, finalErr := exif.Encode(e)
+	// Step 9: re-encode → finalTIFF. The buffer is allocated once with the
+	// exact final length (IFD structure + SubIFD blocks + image blocks,
+	// including the standalone MakerNote ThumbnailImage block folded into
+	// allBlocks above), so steps 11 and 12 below never regrow it.
+	// #285: eliminates the append-driven doubling-growth reallocations that
+	// used to dominate ORF write CPU (measured 83-95% memmove on large files).
+	finalLen := relocatedLen(ifdEnd, subIFDs, allBlocks)
+	finalTIFF, finalErr := exif.EncodeInto(make([]byte, 0, finalCap(finalLen)), e)
 	if finalErr != nil {
 		return nil, fmt.Errorf("encode final: %w", finalErr)
 	}
@@ -656,5 +673,8 @@ func orfRelocateWithOLYMP(
 		finalTIFF = append(finalTIFF, base[blk.srcOffset:end]...)
 	}
 
+	if uint64(len(finalTIFF)) != finalLen {
+		return nil, fmt.Errorf("orf: relocated length %d, computed %d: %w", len(finalTIFF), finalLen, errRelocateLayout)
+	}
 	return finalTIFF, nil
 }

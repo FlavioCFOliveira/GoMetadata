@@ -376,10 +376,31 @@ func insertCR2MarkerAndShiftOffsets(finalTIFF, originalBytes []byte) ([]byte, er
 	//   [0:8]   original TIFF header slot (II/MM + 0x2A 0x00 + IFD0_off=8 → 16)
 	//   [8:16]  CR2 marker (4-byte CR signature + 4 zero bytes)
 	//   [16:]   finalTIFF[8:] (IFD block + image data)
-	out := make([]byte, len(finalTIFF)+cr2MarkerLen)
-	copy(out[0:8], finalTIFF[0:8])            // preserve BOM + magic
-	copy(out[8:8+cr2MarkerLen], marker[:])    // insert CR2 marker
-	copy(out[8+cr2MarkerLen:], finalTIFF[8:]) // IFD block + image data
+	//
+	// #285: relocateTIFFFromParsed reserves cr2MarkerLen extra bytes of spare
+	// CAPACITY in finalTIFF specifically for this insertion (see that
+	// function's step 9 doc comment). When present, the marker is inserted IN
+	// PLACE: finalTIFF is extended into its own spare capacity and bytes [8:]
+	// are shifted right by cr2MarkerLen with a single overlap-safe copy() —
+	// the Go spec guarantees copy() behaves correctly for overlapping slices
+	// ("The source and destination may overlap"), so this shift-right is safe
+	// regardless of copy order. This eliminates the second whole-file-sized
+	// allocation this function used to require on every CR2 write; bytes
+	// [0:8] are already correct after the reslice (out shares finalTIFF's
+	// backing array and starting offset) and are left untouched by both
+	// copies below. A caller that supplies finalTIFF without the reserved
+	// capacity still gets a correct result via the fallback branch.
+	var out []byte
+	if cap(finalTIFF) >= len(finalTIFF)+cr2MarkerLen {
+		out = finalTIFF[:len(finalTIFF)+cr2MarkerLen]
+		copy(out[8+cr2MarkerLen:], finalTIFF[8:]) // shift IFD block + image data right by cr2MarkerLen
+		copy(out[8:8+cr2MarkerLen], marker[:])    // insert CR2 marker into the vacated gap
+	} else {
+		out = make([]byte, len(finalTIFF)+cr2MarkerLen)
+		copy(out[0:8], finalTIFF[0:8])            // preserve BOM + magic
+		copy(out[8:8+cr2MarkerLen], marker[:])    // insert CR2 marker
+		copy(out[8+cr2MarkerLen:], finalTIFF[8:]) // IFD block + image data
+	}
 
 	// Step 2: update IFD0 offset in TIFF header from 8 to 16.
 	// TIFF 6.0 §2: bytes [4:8] = IFD0 offset. exif.Encode wrote 8; we write 16.

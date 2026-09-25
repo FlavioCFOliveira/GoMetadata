@@ -1010,17 +1010,37 @@ func scanName(b []byte, pos int) (prefix, local []byte, end int) {
 	return prefix, local, pos
 }
 
-// isNameTerminator reports whether c is a byte that terminates an XML name
-// token in the context of attribute/tag parsing.
+// nameTerminatorLUT is a 256-entry lookup table indexed by byte value,
+// true for every byte that terminates an XML name token in the context of
+// attribute/tag parsing: ' ', '\t', '\n', '\r', '>', '/', '=', '<'.
+//
+// #287: scanName/isNameTerminator was measured at 28.8% of Read's self time
+// on a representative Canon 7D JPEG (dominated by attribute/tag name
+// scanning in scanAttrs). Replacing the eight-way branch chain with a single
+// array index turns per-byte dispatch into a predictable, branch-free memory
+// load, which the CPU can pipeline far more effectively than a chain of
+// data-dependent comparisons evaluated in sequence for every byte of every
+// name in the document.
 //
 // XML 1.0 §2.3 (NameStartChar, NameChar): '<' is not a legal XML name character.
 // Including it as a name terminator prevents a crafted document from smuggling
 // '<' into a stored local name, which would allow XML injection when that name
 // is later emitted unescaped in Encode (#171).
-func isNameTerminator(c byte) bool {
-	return c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
-		c == '>' || c == '/' || c == '=' || c == '<'
+var nameTerminatorLUT = [256]bool{ //nolint:gochecknoglobals // read-only table; global avoids per-call allocation
+	' ':  true,
+	'\t': true,
+	'\n': true,
+	'\r': true,
+	'>':  true,
+	'/':  true,
+	'=':  true,
+	'<':  true,
 }
+
+// isNameTerminator reports whether c is a byte that terminates an XML name
+// token in the context of attribute/tag parsing. See nameTerminatorLUT for
+// the exact set of terminators and the rationale for the table form.
+func isNameTerminator(c byte) bool { return nameTerminatorLUT[c] }
 
 // advancePastEquals skips optional whitespace at b[pos], then expects '=' and
 // advances past it. Returns the updated position and true on success; returns

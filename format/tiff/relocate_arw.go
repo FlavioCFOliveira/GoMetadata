@@ -1056,14 +1056,19 @@ func arwRelocateWithSR2(
 	mainBlocks := filterMainBlocks(blocks, subIFDs)
 	removeImageOffsetEntries(mainBlocks)
 
-	// Step 6: re-insert placeholder entries and encode to learn the structure size.
+	// Step 6: re-insert placeholder entries and learn the exact IFD structure
+	// size without a full encode.
+	//
+	// #285: exif.EncodedSize replays exif.Encode's own layout arithmetic
+	// (exif/exif.go), so it agrees byte-for-byte with the length Encode would
+	// produce for the same *EXIF state, at a fraction of the cost.
 	offsetValueSlices := insertPlaceholders(mainBlocks)
 
-	skeleton, skelErr := exif.Encode(e)
+	ifdEndInt, skelErr := exif.EncodedSize(e)
 	if skelErr != nil {
 		return nil, fmt.Errorf("arw: encode placeholder: %w", skelErr)
 	}
-	ifdEnd := uint64(len(skeleton))
+	ifdEnd := uint64(ifdEndInt) //nolint:gosec // G115: EncodedSize never returns a negative length
 
 	// Step 7: assign new absolute offsets.
 	// SubIFD blocks come first, then the SR2 block, then image data.
@@ -1115,6 +1120,29 @@ func arwRelocateWithSR2(
 	patchSubIFDImageOffsets(subIFDs, false, order)
 
 	// Step 9: re-encode → finalTIFF.
+	//
+	// #285 measurement note: unlike NEF/ORF/RW2 (and the shared
+	// relocateTIFFFromParsed), pre-sizing this buffer with
+	// exif.EncodeInto(make([]byte, 0, finalCap(finalLen)), e) was measured to
+	// be SLOWER here, not faster, despite allocating less total memory.
+	// Interleaved benchstat (n=8, p=0.000) isolating ONLY this one call site
+	// on the same Sony ILCE-7M3.arw fixture: natural growth via plain
+	// exif.Encode(e) → 1.529m-1.537m ns/op; pre-sized EncodeInto → 1.726m
+	// ns/op (+12–13%). samply profiling attributes the difference to
+	// runtime.memclrNoHeapPointers: a single ~25 MB make([]byte, 0, N) call
+	// forces an immediate, unconditional zero-fill of the whole backing
+	// array (11.45% of samples), whereas the same total bytes reached via
+	// append's incremental doubling growth are zeroed in smaller pieces that
+	// this workload's allocator/GC state handles more cheaply (0.20% of
+	// samples) — the reverse of the outcome on the formats where pre-sizing
+	// helps. exif.EncodedSize (step 6 above) is still a clean, unconditional
+	// win here (fewer allocations, no measurable slowdown): it is Encode's
+	// own layout arithmetic without writing any bytes, so this file keeps
+	// EncodedSize for the skeleton pass while leaving the final pass on
+	// plain exif.Encode(e). finalLen is still computed, via arwRelocatedLen,
+	// purely as a cheap (metadata-sized, not file-sized) post-hoc invariant
+	// check below — it no longer sizes any allocation.
+	finalLen := arwRelocatedLen(ifdEnd, subIFDs, uint64(len(info.sr2RawBytes)), blocks)
 	finalTIFF, finalErr := exif.Encode(e)
 	if finalErr != nil {
 		return nil, fmt.Errorf("arw: encode final: %w", finalErr)
@@ -1175,5 +1203,46 @@ func arwRelocateWithSR2(
 		finalTIFF = append(finalTIFF, base[blk.srcOffset:end]...)
 	}
 
+	if uint64(len(finalTIFF)) != finalLen {
+		return nil, fmt.Errorf("arw: relocated length %d, computed %d: %w", len(finalTIFF), finalLen, errRelocateLayout)
+	}
 	return finalTIFF, nil
+}
+
+// arwRelocatedLen returns the exact length of arwRelocateWithSR2's output: the
+// encoded IFD structure (ifdEnd bytes), then each SubIFD block, then the
+// SR2Private block (when present), then every image block — each of the
+// first three word-aligned with a 0x00 pad when the running length is odd,
+// mirroring steps 11, 11.5, and 12 exactly.
+//
+// This is deliberately independent of computeSubIFDsSize/sr2ActualSize (used
+// earlier, in step 7, only to derive the pointer VALUES written into the
+// output) so the computed length always matches what the append sequence
+// actually writes, byte for byte, even in the edge case where ifdEnd is odd
+// (see relocatedLen in relocate.go for the general form this mirrors).
+//
+// #285: unlike relocatedLen's own use in relocate.go/relocate_nef.go/
+// relocate_orf.go/relocate_rw2.go, this value is NOT used to pre-size
+// arwRelocateWithSR2's step-9 output buffer — pre-sizing was measured to be
+// slower for this format (see step 9's own doc comment for the benchmark
+// evidence). arwRelocatedLen's result is used only for the cheap,
+// metadata-sized post-hoc invariant check after step 12.
+func arwRelocatedLen(ifdEnd uint64, subIFDs []*subIFDInfo, sr2Len uint64, blocks []*imageBlock) uint64 {
+	n := ifdEnd
+	for _, si := range subIFDs {
+		if n&1 == 1 {
+			n++
+		}
+		n += uint64(len(si.rawBytes))
+	}
+	if sr2Len > 0 {
+		if n&1 == 1 {
+			n++
+		}
+		n += sr2Len
+	}
+	for _, blk := range blocks {
+		n += blk.size
+	}
+	return n
 }

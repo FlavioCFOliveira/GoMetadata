@@ -1,5 +1,6 @@
 # Memory Index
 
+- [Sprint 44 Batch E (2026-09-25)](project_sprint44_batchE_285_287.md) — tiff/raw write clone removal+presizing, cr3 moov-only Extract + exif.AcceptRAWMagic, xmp name-terminator LUT; found large make(cap=N) can be SLOWER than natural append growth (ARW), + fidelity-improving 1-byte RW2 POC divergence
 - [HEIF-ILOC-DUPBOX-01 iterative security fix (2026-09-25)](feedback_heif_ilocdupbox_iterative_fix.md) — "sum all matching boxes" fix was incomplete; fuzzing found a 2nd trigger; shared traversal (nonIlocBoxesLen) closes the class
 - [Sprint 44 Batch D (2026-09-25)](project_sprint44_batchD_228_234.md) — heif [4]byte types + single-pass iloc/meta; png writeChunk/zlib pooling; webp/riff seek-free Extract
 - [PNG chunkType escape/pool pitfalls (#232)](feedback_png_chunktype_escape.md) — control-flow-insensitive escape via error-path %q; sync.Pool can be slower than a plain tiny escape

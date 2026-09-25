@@ -6,9 +6,12 @@ package cr3
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+
+	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 )
 
 // Canon UUID: {85C0B687-820F-11E0-8111-F4CE462B6A48} stored as raw bytes.
@@ -80,6 +83,123 @@ func parseCR3BoxHeader(data []byte, pos int) (size uint64, typ [4]byte, headerLe
 	return size, typ, headerLen, true
 }
 
+// maxCR3TopLevelBoxScans bounds the number of top-level ISOBMFF box headers
+// readTopLevelBox will read while searching for moov before giving up.
+//
+// #286: a defence-in-depth guard against a crafted file that pads itself with
+// an excessive number of minimal (8-byte) top-level boxes ahead of any moov
+// box, which would otherwise force one Read+Seek round trip per box — up to
+// maxFileSize/8 iterations, each a real syscall for an os.File-backed
+// io.ReadSeeker. Real CR3 files carry a handful of top-level boxes (ftyp,
+// moov, mdat, rarely a few more); this ceiling is generous headroom, not a
+// real-world limit.
+const maxCR3TopLevelBoxScans = 4096
+
+// seekFileLen returns the total length of r without reading any of its
+// content, by seeking to the end and back to the start. r's position after a
+// successful call is 0.
+func seekFileLen(r io.ReadSeeker) (int64, error) {
+	end, err := r.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, fmt.Errorf("cr3: seek to end: %w", err)
+	}
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return 0, fmt.Errorf("cr3: seek to start: %w", err)
+	}
+	return end, nil
+}
+
+// cr3BoxHeaderAt reads the top-level ISOBMFF box header at r's current
+// position (which must equal pos) into hdr, and resolves its size — including
+// the ISO 14496-12 §4.2 size==1 extended-size and size==0 "extends to EOF"
+// cases — and 4-byte type, without reading the box's payload.
+//
+// ok is false whenever the header is truncated, extends past fileLen, or
+// declares an internally inconsistent size (size < headerLen or size beyond
+// the remaining file length). This is never reported as an error: a
+// truncated trailing box degrades gracefully to "no more boxes", mirroring
+// the in-memory parser's (parseCR3BoxHeader's) handling of the same
+// conditions.
+func cr3BoxHeaderAt(r io.ReadSeeker, hdr *[16]byte, pos, fileLen int64) (size uint64, typ [4]byte, headerLen int64, ok bool) {
+	if _, err := io.ReadFull(r, hdr[:8]); err != nil {
+		return 0, [4]byte{}, 0, false
+	}
+	size = uint64(binary.BigEndian.Uint32(hdr[:4]))
+	typ = [4]byte{hdr[4], hdr[5], hdr[6], hdr[7]}
+	headerLen = 8
+
+	if size == 1 {
+		// ISO 14496-12 §4.2: extended 64-bit size immediately follows the
+		// 8-byte base header.
+		if pos+16 > fileLen {
+			return 0, [4]byte{}, 0, false
+		}
+		if _, err := io.ReadFull(r, hdr[8:16]); err != nil {
+			return 0, [4]byte{}, 0, false
+		}
+		size = binary.BigEndian.Uint64(hdr[8:16])
+		headerLen = 16
+	}
+	if size == 0 {
+		// ISO 14496-12 §4.2: size==0 means "extends to EOF" — only valid for
+		// the last box in the stream.
+		size = uint64(fileLen - pos) //nolint:gosec // G115: fileLen-pos >= 8 > 0, guarded by the caller's loop condition
+	}
+
+	// Bounds/consistency check, done as a single int64 subtraction (proven
+	// non-negative by the caller's loop invariant pos+8<=fileLen) converted
+	// once to uint64, so a crafted 64-bit size can never overflow the
+	// subsequent int64 arithmetic in readTopLevelBox (mirrors
+	// parseCR3BoxHeader's in-memory guards).
+	if size < uint64(headerLen) || size > uint64(fileLen-pos) { //nolint:gosec // G115: fileLen-pos >= 8 > 0, guarded by the caller's loop condition
+		return 0, [4]byte{}, 0, false
+	}
+	return size, typ, headerLen, true
+}
+
+// readTopLevelBox scans top-level ISOBMFF boxes starting at r's current
+// position (assumed 0) for the first box of type want, and returns its
+// payload (header excluded) as a freshly allocated, exactly-sized slice.
+// r's position after the call is unspecified.
+//
+// Every box before the match has only its header (8 bytes, or 16 for the
+// ISO 14496-12 §4.2 extended-size encoding) read; its payload is skipped via
+// Seek without ever being read into memory. This keeps the read volume
+// proportional to the metadata actually present — ftyp's header plus moov's
+// full payload — rather than the whole file, which in a CR3 is almost
+// entirely raw sensor data in the mdat box (#286).
+//
+// Returns (nil, nil) if no matching box is found before EOF or the scan cap
+// is reached; a non-nil error is returned only for a genuine I/O failure on
+// the matched box's payload read or on the seek past a skipped box.
+func readTopLevelBox(r io.ReadSeeker, want [4]byte, fileLen int64) ([]byte, error) {
+	var hdr [16]byte
+	pos := int64(0)
+	for scans := 0; scans < maxCR3TopLevelBoxScans && pos+8 <= fileLen; scans++ {
+		size, typ, headerLen, ok := cr3BoxHeaderAt(r, &hdr, pos, fileLen)
+		if !ok {
+			return nil, nil
+		}
+
+		if typ == want {
+			payloadLen := int64(size) - headerLen //nolint:gosec // G115: size <= fileLen-pos <= maxFileSize, fits int64
+			payload := make([]byte, payloadLen)
+			if _, err := io.ReadFull(r, payload); err != nil {
+				return nil, fmt.Errorf("cr3: read %s box payload: %w", typ, err)
+			}
+			return payload, nil
+		}
+
+		// Skip the rest of this box (its payload) without reading it.
+		next := pos + int64(size) //nolint:gosec // G115: size <= fileLen-pos, fits int64
+		if _, err := r.Seek(next, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("cr3: seek past %s box: %w", typ, err)
+		}
+		pos = next
+	}
+	return nil, nil
+}
+
 // Extract reads metadata from a CR3 file by navigating the ISOBMFF box tree.
 // CMT1 contains IFD0 (TIFF header + entries); CMT2 contains the Exif IFD that
 // IFD0's ExifIFD pointer (tag 0x8769) addresses. Both are merged into rawEXIF
@@ -93,23 +213,30 @@ func parseCR3BoxHeader(data []byte, pos int) (size uint64, typ [4]byte, headerLe
 //
 // ErrNoCMT1Box lets callers distinguish "no EXIF" from a broken container parse.
 // lclevy canon_cr3: CMT1 carries IFD0; its absence means no EXIF is present.
+//
+// #286: Extract reads only the ftyp and moov boxes from r — typically tens of
+// KB combined — instead of the whole file, which for a real Canon CR3 is
+// mostly raw sensor data (the mdat box) that Extract never touches; a 12-37 MB
+// source file used to be read and retained in full for a few hundred bytes of
+// actual EXIF. The returned rawEXIF/rawXMP are freshly cloned so that neither
+// retains moov's (or the Canon UUID box's) full backing array — bounding
+// per-Metadata retention to the size of the EXIF/XMP payloads themselves,
+// regardless of what else (e.g. an embedded preview) moov may also carry.
 func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
-	if _, err = r.Seek(0, io.SeekStart); err != nil {
-		return nil, nil, nil, fmt.Errorf("cr3: seek: %w", err)
-	}
-	// #140 fix: cap the full-file read to maxFileSize+1 bytes so that an
-	// oversized or infinite streaming reader cannot trigger unbounded heap
-	// allocation. ErrFileTooLarge is returned when the limit is exceeded,
-	// before any ISOBMFF parsing takes place.
-	data, err := io.ReadAll(io.LimitReader(r, maxFileSize+1))
+	fileLen, err := seekFileLen(r)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("cr3: read: %w", err)
+		return nil, nil, nil, err
 	}
-	if int64(len(data)) > maxFileSize {
+	// #140: reject an oversized input before any content is read, exactly as
+	// the previous whole-file-read implementation did.
+	if fileLen > maxFileSize {
 		return nil, nil, nil, fmt.Errorf("cr3: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
 	}
 
-	moovData := findBox(data, boxMoov, 0)
+	moovData, err := readTopLevelBox(r, boxMoov, fileLen)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	if moovData == nil {
 		return nil, nil, nil, ErrNoMoovBox
 	}
@@ -119,23 +246,23 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		// Fall back: search for CMT1/CMT2 anywhere in the moov box.
 		cmt1 := findBox(moovData, boxCMT1, 0)
 		cmt2 := findBox(moovData, boxCMT2, 0)
-		rawXMP = findBox(moovData, boxXMP, 0)
+		rawXMP = bytes.Clone(findBox(moovData, boxXMP, 0))
 		// audit #138: surface missing CMT1 as a sentinel error so callers can
 		// distinguish no-EXIF from a broken container.
 		if cmt1 == nil {
 			return nil, nil, rawXMP, ErrNoCMT1Box
 		}
-		return mergeCMT(cmt1, cmt2), nil, rawXMP, nil
+		return bytes.Clone(mergeCMT(cmt1, cmt2)), nil, rawXMP, nil
 	}
 
 	cmt1 := findBox(uuidData, boxCMT1, 0)
 	cmt2 := findBox(uuidData, boxCMT2, 0)
-	rawXMP = findBox(uuidData, boxXMP, 0)
+	rawXMP = bytes.Clone(findBox(uuidData, boxXMP, 0))
 	// audit #138: surface missing CMT1 as a sentinel error.
 	if cmt1 == nil {
 		return nil, nil, rawXMP, ErrNoCMT1Box
 	}
-	return mergeCMT(cmt1, cmt2), nil, rawXMP, nil
+	return bytes.Clone(mergeCMT(cmt1, cmt2)), nil, rawXMP, nil
 }
 
 // getExifIFDOffset detects byte order from cmt1's TIFF header and returns the
@@ -517,16 +644,21 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("cr3: seek: %w", err)
 	}
-	// #140 fix: cap the full-file read to maxFileSize+1 bytes so that an
-	// oversized or infinite streaming reader cannot trigger unbounded heap
-	// allocation. ErrFileTooLarge is returned when the limit is exceeded,
-	// before any ISOBMFF parsing takes place.
-	data, readErr := io.ReadAll(io.LimitReader(r, maxFileSize+1))
+	// #140/#286: cap the full-file read to maxFileSize so that an oversized or
+	// infinite streaming reader cannot trigger unbounded heap allocation.
+	// iobuf.ReadAll allocates exactly the input's size in one shot (via Seek)
+	// for a seekable reader instead of io.ReadAll's geometric-growth scratch
+	// buffer, halving Inject's transient allocation for the common case.
+	// ErrFileTooLarge is returned when the limit is exceeded, before any
+	// ISOBMFF parsing takes place. Unlike Extract, Inject genuinely needs the
+	// whole file: every byte not touched by the moov rebuild is copied
+	// through verbatim in injectIntoMoov's reassembly.
+	data, readErr := iobuf.ReadAll(r, maxFileSize)
 	if readErr != nil {
+		if errors.Is(readErr, iobuf.ErrTooLarge) {
+			return fmt.Errorf("cr3: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
+		}
 		return fmt.Errorf("cr3: read: %w", readErr)
-	}
-	if int64(len(data)) > maxFileSize {
-		return fmt.Errorf("cr3: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
 	}
 
 	// All payloads nil: pass through unchanged.

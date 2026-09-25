@@ -94,6 +94,7 @@ type ParseOption func(*parseConfig)
 
 type parseConfig struct {
 	skipMakerNote bool
+	extraMagic    uint16
 }
 
 // SkipMakerNote skips parsing the manufacturer-specific MakerNote IFD.
@@ -101,6 +102,31 @@ type parseConfig struct {
 // writes; only the decoded MakerNoteIFD is omitted. Use this when you do not
 // need manufacturer extension tags and want to minimise parse cost on camera files.
 func SkipMakerNote() ParseOption { return func(c *parseConfig) { c.skipMakerNote = true } }
+
+// AcceptRAWMagic configures Parse to additionally dispatch the given 16-bit
+// magic value — b[2:4] read in the file's own byte order — exactly like
+// classic TIFF (0x002A).
+//
+// This exists solely so that camera RAW containers with a non-standard
+// classic-TIFF magic can be parsed directly off their original file bytes,
+// without first cloning the whole buffer merely to overwrite 2 magic bytes.
+// Two known cases in this module: Olympus ORF ("IIRO" 0x4F52 / "IIRS" 0x5352,
+// ExifTool Olympus.pm) and Panasonic RW2 ("IIU\x00" 0x0055, ExifTool
+// Panasonic.pm). In both formats only bytes[2:4] (the magic field) diverge
+// from standard classic TIFF; the byte-order marker, the IFD0 offset at
+// bytes[4:8], and all downstream IFD structure are byte-for-byte standard
+// TIFF 6.0 §2.
+//
+// Parse's behaviour without this option is completely unchanged: any magic
+// other than 0x002A (classic TIFF) or 0x002B (BigTIFF) is still rejected.
+// This option is for format/tiff and format/raw/{orf,rw2}'s internal use when
+// parsing their own RAW containers; it is not useful for general EXIF
+// payloads (JPEG APP1, PNG eXIf, standard TIFF, etc.) and passing a magic
+// value that does not correspond to a real, otherwise-standard classic-TIFF
+// stream will simply cause Parse to misinterpret the input.
+func AcceptRAWMagic(magic uint16) ParseOption {
+	return func(c *parseConfig) { c.extraMagic = magic }
+}
 
 // parseByteOrder reads the two-byte byte-order marker at b[0:2] and returns
 // the corresponding binary.ByteOrder. Returns a CorruptMetadataError for any
@@ -340,8 +366,15 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 	}
 
 	magic := order.Uint16(b[2:])
-	switch magic {
-	case 0x002A:
+	switch {
+	// #286: cfg.extraMagic (set only via the internal AcceptRAWMagic option)
+	// lets format/tiff and format/raw/{orf,rw2} dispatch their non-standard
+	// RAW-container magic through the classic-TIFF path below without ever
+	// touching b. The explicit != 0 guard ensures that when no caller opts
+	// in (the overwhelming majority of Parse calls, where extraMagic is the
+	// zero value), a corrupt file whose magic field happens to be 0x0000
+	// still falls through to the default case exactly as before.
+	case magic == 0x002A || (cfg.extraMagic != 0 && magic == cfg.extraMagic):
 		// Classic TIFF path: 8-byte header, 32-bit IFD offsets (TIFF §2).
 		ifd0Off := order.Uint32(b[4:])
 		e := &EXIF{ByteOrder: order}
@@ -427,7 +460,7 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 		e.Warnings = materializeWarnings(warnRecs)
 		return e, nil
 
-	case 0x002B:
+	case magic == 0x002B:
 		// BigTIFF path: 16-byte header, 64-bit IFD offsets (BigTIFF spec §2).
 		// Validate the header length and offset-bytesize before proceeding.
 		if len(b) < bigTIFFMinHeader {

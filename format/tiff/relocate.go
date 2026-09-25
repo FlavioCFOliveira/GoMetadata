@@ -492,8 +492,20 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte) (
 	// Step 9: encode → finalTIFF. Same IFD layout as step 6. The buffer is
 	// allocated once with the exact final length (IFD structure + SubIFD
 	// blocks + image blocks), so steps 11 and 12 never regrow it.
+	//
+	// #285: cr2TrailingReserve extra bytes of SPARE CAPACITY (not length) are
+	// reserved here unconditionally. This function is also the relocation
+	// core for CR2 (via InjectWithEXIFCR2 → this function →
+	// insertCR2MarkerAndShiftOffsets): that final step needs to shift every
+	// byte from offset 8 onward right by cr2MarkerLen to make room for the
+	// proprietary CR2 marker, and does so with an in-place, overlap-safe
+	// copy() within finalTIFF's own backing array when spare capacity allows
+	// it — avoiding a second whole-file-sized allocation. The extra bytes are
+	// silently unused capacity (not wasted allocation-wise: `make`'s size
+	// class rounding usually absorbs a few extra bytes anyway) for the
+	// non-CR2 (TIFF/DNG) callers of this function.
 	finalLen := relocatedLen(ifdEnd, subIFDs, blocks)
-	finalTIFF, finalErr := exif.EncodeInto(make([]byte, 0, finalCap(finalLen)), e)
+	finalTIFF, finalErr := exif.EncodeInto(make([]byte, 0, finalCap(finalLen)+cr2MarkerLen), e)
 	if finalErr != nil {
 		return nil, fmt.Errorf("tiff: encode final: %w", finalErr)
 	}
