@@ -3,6 +3,7 @@ package rw2
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"testing"
 )
 
@@ -471,5 +472,40 @@ func TestRW2RawEXIFPreservesOriginalMagic(t *testing.T) {
 	if rawEXIF[2] != 0x55 || rawEXIF[3] != 0x00 {
 		t.Errorf("#117 regression: rawEXIF[2:4] = %02X %02X, want 55 00 (original RW2 magic)",
 			rawEXIF[2], rawEXIF[3])
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Benchmarks (task #235: close the cr3/orf/rw2 observability gap)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// BenchmarkRW2Extract measures the cost of extracting metadata from a minimal
+// RW2 (magic-patched TIFF) byte stream.
+//
+// #236: the reader is constructed once outside the loop and rewound via Seek
+// per iteration so the artificial bytes.Reader allocation does not inflate
+// the allocs/op reported for Extract itself.
+func BenchmarkRW2Extract(b *testing.B) {
+	data := buildRW2()
+	r := bytes.NewReader(data)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
+	}
+}
+
+// BenchmarkRW2Inject measures the pass-through Inject path (RW2 magic
+// save/patch/restore around the TIFF delegate) on a minimal RW2 byte stream.
+func BenchmarkRW2Inject(b *testing.B) {
+	data := buildRW2()
+	r := bytes.NewReader(data)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_, _ = r.Seek(0, io.SeekStart)
+		var out bytes.Buffer
+		_ = Inject(r, &out, nil, nil, nil, true)
 	}
 }

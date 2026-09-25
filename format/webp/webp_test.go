@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
 	"testing"
 )
 
@@ -161,11 +162,16 @@ func TestInjectRoundTrip(t *testing.T) {
 func BenchmarkWebPExtract(b *testing.B) {
 	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00}
 	webp := buildWebP(exifData, nil, 0x08, 1920, 1080)
+	// #236: reader constructed once outside the loop and rewound via Seek per
+	// iteration so the artificial bytes.Reader allocation does not inflate
+	// the allocs/op reported for Extract itself.
+	r := bytes.NewReader(webp)
 	b.SetBytes(int64(len(webp)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		_, _, _, _ = Extract(bytes.NewReader(webp))
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
 	}
 }
 
@@ -178,11 +184,14 @@ func BenchmarkWebPExtractWithXMP(b *testing.B) {
 	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00}
 	xmpData := []byte(`<?xpacket begin=""?><x:xmpmeta xmlns:x="adobe:ns:meta/"/><?xpacket end="w"?>`)
 	webp := buildWebP(exifData, xmpData, 0x0C, 1920, 1080)
+	// #236: reader hoisted outside the loop; see BenchmarkWebPExtract.
+	r := bytes.NewReader(webp)
 	b.SetBytes(int64(len(webp)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		_, _, _, _ = Extract(bytes.NewReader(webp))
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
 	}
 }
 
@@ -602,12 +611,15 @@ func BenchmarkWebPInject(b *testing.B) {
 	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00}
 	xmpData := []byte("<?xpacket begin='' uid='x'?><x:xmpmeta xmlns:x='adobe:ns:meta/'></x:xmpmeta><?xpacket end='r'?>")
 	webp := buildWebP(exifData, nil, 0x08, 1920, 1080)
+	// #236: reader hoisted outside the loop; see BenchmarkWebPExtract.
+	r := bytes.NewReader(webp)
 	b.SetBytes(int64(len(webp)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
+		_, _ = r.Seek(0, io.SeekStart)
 		var out bytes.Buffer
-		_ = Inject(bytes.NewReader(webp), &out, exifData, nil, xmpData, true)
+		_ = Inject(r, &out, exifData, nil, xmpData, true)
 	}
 }
 

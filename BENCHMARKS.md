@@ -286,6 +286,77 @@ trade-off as the exif sub-IFD arena (task #198, see below). AC ("Parse loses
 2 allocs/op") met exactly. `go build -gcflags="-m -m" ./iptc/...` shows zero
 "moved to heap" lines anywhere in the package after this change.
 
+### Batch A (tasks #236, #235, #210, #211, #212, #213) — 2026-09-25
+
+Go version go1.27.1, `cpu: Apple M4`.
+
+#### #236 — hoist `bytes.NewReader` out of benchmark loops
+
+| Benchmark | allocs/op before → after | B/op before → after |
+|---|---|---|
+| HEIFExtract | 15 → 14 | 629 → 580 |
+| PNGExtract | 16 → 15 | 232 → 184 |
+| WebPExtract | 4 → 3 | 80 → 32 |
+
+Same −1 allocs/op pattern in every other hoisted benchmark (WebPExtractWithXMP,
+PNGInject, WebPInject, TIFFExtract, BigTIFFExtract, CR2/NEF/DNG/ARWExtract,
+ARWConformanceExtract/Inject, NEFExtractMakerNote).
+
+#### #235 — new cr3/orf/rw2 Extract/Inject benchmarks (no prior baseline)
+
+| Benchmark | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| CR3Extract | 142.9n | 560 | 8 |
+| CR3Inject | 236.2n | 1028 | 16 |
+| ORFExtract | 84.97n | 552 | 3 |
+| ORFInject | 191.9n | 1344 | 9 |
+| RW2Extract | 80.53n | 552 | 3 |
+| RW2Inject | 189.7n | 1344 | 9 |
+
+#### #210/#211/#212/#213 — `xmp/` RDF-parse allocation reduction
+
+- #210: `Parse` interns each stored value/key into `XMP.arena` (`xmp/xmp.go`,
+  `xmp/rdf.go`); values/keys alias the arena instead of independent copies.
+- #211: `xmpAttr.loc` is `[]byte`, converted to `string` only at the point of storage.
+- #212: `closeProp` stores a single-item collection directly, skipping `strings.Join`.
+- #213: `storeProperty`/`Parse` pre-size the `Properties` maps to 8.
+
+| Benchmark | ns/op orig→final | B/op orig→final | allocs/op orig→final |
+|---|---|---|---|
+| RDFParse | 3.259µ→3.119µ (−4.31%) | 2.164Ki→2.407Ki (+11.24%) | 45→14 (−68.89%) |
+| XMPParse | 1.339µ→1.260µ (−5.94%) | 1.141Ki→1.203Ki (+5.48%) | 20→8 (−60.00%) |
+| Read_JPEG_WithXMP | 1.378µ→1.324µ | 1.801Ki→1.934Ki | 20→13 |
+| ReadCombinedMetadataJPEG | 12.20µ→11.67µ (−4.38%) | 20.78Ki→20.05Ki (−3.49%) | 83→41 (−50.60%) |
+| Read_JPEG (control, no XMP) | 235.2n→236.6n | 466→466 | 6→6 |
+
+Every other `xmp/` benchmark unaffected (≤2% noise, no allocation change).
+
+#### XMPARENA-NS-REINTERN-01 (fixed) — `recordContainerType`
+
+`ns`/`local` interned only the first time a given `(ns, local)` pair is
+recorded (mirrors `storeProperty`'s guard). Auditor repro: 794x → 0.87x.
+`TestXMPArenaNSReintern{ContainerSiblings,SimpleProperties,
+ShorthandAttributes,StructFields}` measure 0.04x–0.37x (bound 8x); guard
+removed → 71.91x (fails as expected).
+
+#### BUG #277 (backlog) — `buildStructInListKey` truncation reverted
+
+A 256-byte truncation cap on `propLocal`/`fieldLocal` closed a
+document-size amplification but corrupted (round-trip) or dropped
+(collision) legal long struct-in-list names — reverted, tracked as #277
+(unbounded again). `TestBug277StructInListLongFieldNameRoundTrip` (300-byte
+name) and `TestBug277StructInListPrefixCollisionNoDataLoss` (256-byte
+shared prefix) both round-trip Parse→Encode→Parse byte-exact; both fail if
+truncation is reintroduced. `FuzzParseXMP`'s arena-ratio invariant now
+computes the struct-in-list contribution in-test (`structInListKeyBytes`,
+via `parseStructKey`) and excludes it before checking the 8x bound.
+
+#### Gate (final)
+
+`go build`/`go vet` clean; `go test ./...` and `go test -race ./...` green;
+`golangci-lint run ./...` 0 new issues; `staticcheck ./...` clean;
+`govulncheck ./...` 0 reachable vulnerabilities; `FuzzParseXMP` 60s,
+~19.3M execs, 0 crashes, 0 invariant violations.
 
 ## [main — perf task #198] — 2026-06-10 (exif: parse-level arena for sub-IFDs)
 

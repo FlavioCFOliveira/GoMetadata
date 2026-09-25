@@ -221,6 +221,13 @@ func appendUTF8Rune(dst []byte, cp uint32) []byte {
 // Returns b unchanged for UTF-8 input (zero-copy fast path).
 // Returns nil if transcoding fails.
 //
+// The returned slice (whether b itself or a freshly transcoded buffer) is
+// read directly, transiently, and synchronously by parseRDF — see
+// transientAliasString's doc (rdf.go) and the XMP.arena field doc (xmp.go)
+// for why Parse no longer needs to know or care whether this call
+// transcoded: nothing retains a reference to the returned slice beyond the
+// single synchronous Parse call regardless of its provenance.
+//
 // This is the entry point called by Scan and Parse before any parsing.
 func normaliseToUTF8(b []byte) []byte {
 	enc := detectEncoding(b)

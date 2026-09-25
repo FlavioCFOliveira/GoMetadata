@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -376,11 +377,16 @@ func BenchmarkPNGExtract(b *testing.B) {
 	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00}
 	xmpData := []byte("<?xpacket begin='' uid='x'?><xmpmeta xmlns:x=\"adobe:ns:meta/\"/><?xpacket end='r'?>")
 	png := buildPNG(exifData, xmpData)
+	// #236: reader constructed once outside the loop and rewound via Seek per
+	// iteration so the artificial bytes.Reader allocation does not inflate
+	// the allocs/op reported for Extract itself.
+	r := bytes.NewReader(png)
 	b.SetBytes(int64(len(png)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		_, _, _, _ = Extract(bytes.NewReader(png))
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
 	}
 }
 
@@ -414,11 +420,14 @@ func BenchmarkPNGExtractCompressedXMP(b *testing.B) {
 	writeChunkTo(&buf, "IEND", nil)
 
 	pngBytes := buf.Bytes()
+	// #236: reader hoisted outside the loop; see BenchmarkPNGExtract.
+	r := bytes.NewReader(pngBytes)
 	b.SetBytes(int64(len(pngBytes)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		_, _, _, _ = Extract(bytes.NewReader(pngBytes))
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
 	}
 }
 
@@ -428,12 +437,15 @@ func BenchmarkPNGInject(b *testing.B) {
 	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00}
 	xmpData := []byte("<?xpacket begin='' uid='x'?><xmpmeta xmlns:x=\"adobe:ns:meta/\"/><?xpacket end='r'?>")
 	png := buildPNG(nil, nil)
+	// #236: reader hoisted outside the loop; see BenchmarkPNGExtract.
+	r := bytes.NewReader(png)
 	b.SetBytes(int64(len(png)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
+		_, _ = r.Seek(0, io.SeekStart)
 		var out bytes.Buffer
-		_ = Inject(bytes.NewReader(png), &out, exifData, nil, xmpData, true)
+		_ = Inject(r, &out, exifData, nil, xmpData, true)
 	}
 }
 

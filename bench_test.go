@@ -2,6 +2,7 @@ package gometadata
 
 import (
 	"bytes"
+	"io"
 	"testing"
 )
 
@@ -13,12 +14,17 @@ import (
 // slice that is constructed once outside the measured loop.
 func BenchmarkRead_JPEG(b *testing.B) {
 	data := buildMinimalJPEG(minimalTIFFPayload())
+	// #236: the reader is constructed once outside the loop and rewound via
+	// Seek per iteration so that b.N artificial bytes.Reader allocations do
+	// not inflate the allocs/op reported for the library's own Read path.
+	r := bytes.NewReader(data)
 	b.SetBytes(int64(len(data)))
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for range b.N {
-		_, _ = Read(bytes.NewReader(data))
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _ = Read(r)
 	}
 }
 
@@ -27,12 +33,15 @@ func BenchmarkRead_JPEG(b *testing.B) {
 // This variant covers the multi-segment dispatch and the XMP packet scanner.
 func BenchmarkRead_JPEG_WithXMP(b *testing.B) {
 	data := buildJPEGWithIPTCAndXMP("A benchmark IPTC caption", "A benchmark XMP caption")
+	// #236: reader hoisted outside the loop; see BenchmarkRead_JPEG.
+	r := bytes.NewReader(data)
 	b.SetBytes(int64(len(data)))
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for range b.N {
-		_, _ = Read(bytes.NewReader(data))
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _ = Read(r)
 	}
 }
 
@@ -43,12 +52,15 @@ func BenchmarkRead_JPEG_WithXMP(b *testing.B) {
 // traversal is isolated.
 func BenchmarkRead_PNG(b *testing.B) {
 	data := buildMinimalPNG()
+	// #236: reader hoisted outside the loop; see BenchmarkRead_JPEG.
+	r := bytes.NewReader(data)
 	b.SetBytes(int64(len(data)))
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for range b.N {
-		_, _ = Read(bytes.NewReader(data))
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _ = Read(r)
 	}
 }
 

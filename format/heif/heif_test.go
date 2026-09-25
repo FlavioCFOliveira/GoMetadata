@@ -3,6 +3,7 @@ package heif
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"math"
 	"testing"
 	"time"
@@ -399,11 +400,16 @@ func TestInjectPassThroughNilPayloads(t *testing.T) {
 
 func BenchmarkHEIFExtract(b *testing.B) {
 	data := buildHEIF(minimalTIFFExif(), nil)
+	// #236: reader constructed once outside the loop and rewound via Seek per
+	// iteration so the artificial bytes.Reader allocation does not inflate
+	// the allocs/op reported for Extract itself.
+	r := bytes.NewReader(data)
 	b.SetBytes(int64(len(data)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		_, _, _, _ = Extract(bytes.NewReader(data))
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
 	}
 }
 
@@ -584,11 +590,14 @@ func BenchmarkHEIFInject(b *testing.B) {
 	exifData := minimalTIFFExif()
 	data := buildHEIF(exifData, nil)
 	newEXIF := append(exifData[:len(exifData)-4:len(exifData)-4], 'B', 'E', 'N', 'C')
+	// #236: reader hoisted outside the loop; see BenchmarkHEIFExtract.
+	r := bytes.NewReader(data)
 	b.SetBytes(int64(len(data)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		_ = Inject(bytes.NewReader(data), nopWriter{}, newEXIF, nil, nil, true)
+		_, _ = r.Seek(0, io.SeekStart)
+		_ = Inject(r, nopWriter{}, newEXIF, nil, nil, true)
 	}
 }
 

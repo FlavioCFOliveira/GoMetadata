@@ -17,25 +17,31 @@ both in the same step.
 
 ---
 
-## Node labels (13)
+## Node labels (14)
 
 | Label | Key | Count* | Properties |
 |---|---|---|---|
 | `Package` | `name` | 29 | `name, path, module, layer, description, testCount, entryReachable, gitCommit, gitDate` |
 | `File` | `path` | 75 | `path, name, package, gitCommit, gitDate` |
 | `Type` | `name`+`package` | 34 | `name, package, file, kind, exported, gitCommit, gitDate` |
-| `Function` | `name`+`package` | 11 | `name, package, file, signature, kind, gitCommit, gitDate` |
-| `Feature` | `name` | 34 | `name, description, domain, package, file, spec_ref, type, commit_introduced, commit_fixed, gitCommit, gitDate` |
-| `FuzzTarget` | `name` | 27 | `name, package, file, gitCommit, gitDate` |
-| `Benchmark` | `name` | 60 | `name, package, file, gitCommit, gitDate` |
+| `Function` | `name`+`package` | 11 | `name, package, file, line, signature, kind, gitCommit, gitDate` |
+| `Feature` | `name` | 34 | `name, id, description, domain, package, file, spec_ref, type, task, sprint, commit_introduced, commit_fixed, gitCommit, gitDate` |
+| `FuzzTarget` | `name` | 27 | `name, package, file, invariant, gitCommit, gitDate` |
+| `Benchmark` | `name` | 60 | `name, package, file, commit_introduced, gitCommit, gitDate` |
 | `Spec` | `name` | 9 | `name, standard, ref, domain, gitCommit, gitDate` |
-| `Commit` | `hash` | 12 | `hash, short_hash, message, author, date, scope, gitCommit, gitDate` |
+| `Commit` | `hash` | 12 | `hash, short_hash, message, author, date, scope, sprint, branch, parent, fixes_tasks, gates, gitCommit, gitDate` |
 | `Test` | `name` | ~4 | `name, package, file, type, description, commit_introduced, gitCommit, gitDate` |
 | `FormatCapability` | `format` | 13 | `format, extensions, read, write, exif, iptc, xmp, container, gitCommit, gitDate` |
 | `Audit` | `key` | 4 | `key, date, scope, method, baseline, prior_audit, critical, high, medium, low, findings_new, new_tasks, sprints, status, remediation_commits, remediation_date, confirmed_live, closed_verified_fixed, headlines, gitCommit, gitDate` |
 | `ConformanceBattery` | `name` | 1 | `name, id, package, file, ruleCount, ruleSections, defectsFixed, status, commitHash, completedDate` |
+| `Milestone` | `name` | 1 | `name, kind, verdict, date, head, sprint, dimensions, note, release_*, released, pushed_remotes` — a project-level checkpoint (e.g. production-readiness verdict) |
 
 \* approximate at bootstrap (`402a067`, 2026-06-01).
+
+### Property conventions (added 2026-09-25)
+- `Commit.fixes_tasks` — comma-separated rmp task ids the commit closes (the task↔commit link; rmp tasks are not graph nodes). `Commit.sprint` — rmp sprint id. `Commit.parent` — short hash of the git parent.
+- `Feature.type` values include `capability`, `feature`, `fix`, `bug_fix`, `security_cap`, `internal_field`, `struct_field`, and `perf` (an allocation/latency optimisation; `task` = rmp task id; evidence in `BENCHMARKS.md`).
+- `Function.kind`: `api` (public entry point), `exported` (exported non-root symbol), `internal` (unexported symbol, modelled only when it implements a tracked `Feature`). `Function.line` = declaration line.
 
 ### `layer` values for `Package`
 `entry` (root `gometadata`) · `exif` · `format` · `format-container`
@@ -86,7 +92,7 @@ NOT modelled as `FormatCapability` nodes: the module returns `UnsupportedFormatE
 
 ---
 
-## Edge types (14)
+## Edge types (18)
 
 **Structural**
 
@@ -105,12 +111,17 @@ NOT modelled as `FormatCapability` nodes: the module returns `UnsupportedFormatE
 | `FUZZES` | `FuzzTarget → {Package, Feature}` | robustness surface under test |
 | `TESTS` | `Test → {Feature, Package}` | test verifies the target |
 | `HAS_TEST` | `Package → Test` | package owns the (feature-linked) test |
-| `INTRODUCED` | `Commit → Feature` | commit that introduced the feature |
+| `INTRODUCED` | `Commit → {Feature, Test, Benchmark, FuzzTarget}` | commit that introduced the element |
 | `FIXED` | `Commit → Feature` | commit that fixed/hardened the feature |
 | `RESOLVES` | `Commit → Audit` | commit that remediates an audit finding/sprint (×19) |
 | `FOLLOWS` | `Audit → Audit` | an audit pass that succeeds a prior one (×2) |
 | `ENABLES` | `Feature → Feature` | one feature unlocks another (×1) |
 | `HAS_CONFORMANCE_BATTERY` | `Package → ConformanceBattery` | package owns a spec-conformance test battery (×1) |
+| `TARGETS` | `Audit → Package` | package in the scope of an audit |
+| `FOLLOWS` | `Commit → Commit` | a tracked commit that succeeds another tracked commit in the same remediation chain |
+| `IMPLEMENTS` | `Function → Feature` | function realises (part of) the feature |
+| `MEASURES` | `Benchmark → Feature` | benchmark provides the performance evidence for the feature |
+| `OPTIMISES` | `Feature → Feature` | a `perf` feature optimises an existing capability without changing its behaviour |
 
 ---
 

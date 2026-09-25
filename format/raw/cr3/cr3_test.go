@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
 	"testing"
 )
 
@@ -1328,5 +1329,44 @@ func TestCR3RelocateInContainerDepthGuard(t *testing.T) {
 	// Any result (nil error or ErrStcoOverflow) is acceptable; no crash is the requirement.
 	if err != nil && !errors.Is(err, ErrStcoOverflow) {
 		t.Errorf("Inject on deeply-nested container returned unexpected error: %v", err)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Benchmarks (task #235: close the cr3/orf/rw2 observability gap)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// BenchmarkCR3Extract measures the cost of extracting metadata from a minimal
+// CR3 (ftyp/moov/Canon-uuid/CMT1) byte stream.
+//
+// #236: the reader is constructed once outside the loop and rewound via Seek
+// per iteration so the artificial bytes.Reader allocation does not inflate
+// the allocs/op reported for Extract itself.
+func BenchmarkCR3Extract(b *testing.B) {
+	data := buildMinimalCR3(minimalTIFF(), nil)
+	r := bytes.NewReader(data)
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
+	}
+}
+
+// BenchmarkCR3Inject measures the cost of replacing the CMT1 (EXIF) sub-box
+// of a minimal CR3 stream.
+func BenchmarkCR3Inject(b *testing.B) {
+	exif := minimalTIFF()
+	data := buildMinimalCR3(exif, nil)
+	newExif := append(exif[:len(exif):len(exif)], 0x00, 0x01, 0x02, 0x03) // different size than original
+	r := bytes.NewReader(data)
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_, _ = r.Seek(0, io.SeekStart)
+		var out bytes.Buffer
+		_ = Inject(r, &out, newExif, nil, nil, true)
 	}
 }
