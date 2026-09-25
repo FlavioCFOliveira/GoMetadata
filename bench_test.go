@@ -51,3 +51,33 @@ func BenchmarkRead_PNG(b *testing.B) {
 		_, _ = Read(bytes.NewReader(data))
 	}
 }
+
+// BenchmarkMWGAccessors measures the cost of repeatedly calling the four
+// MWG-02 digest-conditioned accessors (Copyright, Caption, Keywords, Creator)
+// on a Metadata whose IPTC digest resource (Photoshop 0x0425) is present and
+// mismatches the current IPTC block. Before task #208 every one of these
+// four calls independently recomputed an MD5 digest of the entire raw IPTC
+// IIM stream (via iptcTrustElevated → iptc.DigestMatch); after #208 the
+// digest-elevation decision is computed once, by Read, and cached, so all
+// four calls (times b.N) perform at most one MD5 in total for the whole
+// benchmark run.
+func BenchmarkMWGAccessors(b *testing.B) {
+	wrongDigest := make([]byte, 16)
+	for idx := range wrongDigest {
+		wrongDigest[idx] = 0xAB
+	}
+	jpegBytes := buildMWG02JPEG("IPTC caption", "XMP caption", wrongDigest)
+	m, err := Read(bytes.NewReader(jpegBytes))
+	if err != nil {
+		b.Fatalf("Read: %v", err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = m.Copyright()
+		_ = m.Caption()
+		_ = m.Keywords()
+		_ = m.Creator()
+	}
+}

@@ -37,8 +37,38 @@ func (c *Chunk) Equal(v [4]byte) bool {
 // caller must handle it explicitly. This contract is intentional: the RIFF
 // package is a thin, zero-copy header decoder; policy decisions (size limits,
 // maximum depth) belong in the consumer (e.g. format/webp).
+//
+// ReadChunk allocates its own 8-byte scratch header on every call (see
+// ReadChunkBuf's doc comment for why this is unavoidable for a single,
+// stateless call). Callers that read many chunks from the same stream in a
+// loop should use ReadChunkBuf with a buffer declared once outside the loop
+// to amortise that allocation across the whole scan (task #209).
 func ReadChunk(r io.ReadSeeker) (Chunk, error) {
 	var hdr [8]byte
+	return ReadChunkBuf(r, &hdr)
+}
+
+// ReadChunkBuf reads the next RIFF chunk header from r using hdr as scratch
+// space, avoiding an internal allocation on every call.
+//
+// Rationale: io.ReadFull(r, hdr[:]) passes hdr's address through the
+// io.Reader interface method call. Because r's concrete type is unknown at
+// compile time, the Go compiler cannot prove that the callee does not retain
+// the slice beyond the call, so it conservatively heap-allocates hdr — this
+// holds regardless of whether hdr is declared inside ReadChunk itself or by
+// its caller; the allocation is inherent to passing a stack buffer through an
+// interface-typed Read call (verified with `go build -gcflags=-m`).
+//
+// The one available mitigation is amortisation: a caller that reads N chunks
+// from the same stream (e.g. format/webp's readWebPChunks) can declare a
+// single [8]byte buffer before the loop and pass its address to ReadChunkBuf
+// on every iteration, paying the heap allocation once for the whole scan
+// instead of once per chunk. ReadChunk itself cannot do this because it is
+// stateless between calls; use ReadChunkBuf directly when scanning a chunk
+// list.
+//
+// hdr must not be nil.
+func ReadChunkBuf(r io.ReadSeeker, hdr *[8]byte) (Chunk, error) {
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return Chunk{}, err
 	}

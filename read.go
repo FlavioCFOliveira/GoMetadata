@@ -58,9 +58,18 @@ var extractors = map[format.FormatID]func(io.ReadSeeker) ([]byte, []byte, []byte
 // m.EXIF, m.IPTC, and m.XMP directly — a nil value means that type was absent
 // (or failed to parse in best-effort mode).
 func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
-	cfg := &readConfig{}
-	for _, o := range opts {
-		o(cfg)
+	// #204: cfg is a stack value, not a heap-allocated *readConfig. Applying
+	// opts is confined to the out-of-line, non-inlined applyReadOptions so
+	// that the escape this indirection forces (see that function's doc
+	// comment) is paid only when the caller actually supplies options. The
+	// overwhelming majority of Read calls pass zero options, and for those,
+	// cfg here never has its address taken by anything the compiler cannot
+	// prove non-escaping (parseParsedMetadata and its helpers all take
+	// *readConfig read-only and are confirmed non-leaking via
+	// `go build -gcflags=-m`).
+	var cfg readConfig
+	if len(opts) > 0 {
+		cfg = applyReadOptions(opts)
 	}
 
 	// Detect container format from magic bytes.
@@ -101,6 +110,13 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 		rawIPTCDigest: rawIPTCDigest,
 	}
 
+	// #208: compute the MWG §3.3.1 IPTC-trust-elevation decision exactly once,
+	// here, and cache it. rawIPTC and rawIPTCDigest are already final at this
+	// point and never change for the rest of m's lifetime, so every later
+	// iptcTrustElevated() call (Copyright, Caption, Keywords, Creator) becomes
+	// a plain field read instead of re-hashing rawIPTC with MD5 each time.
+	m.iptcTrustElev = computeIPTCTrustElevated(m.rawIPTC, m.rawIPTCDigest)
+
 	// #134: surface extended XMP truncation as a ParseWarning so the caller
 	// can inspect it without aborting parsing. rawXMP still contains the main
 	// (standard) XMP packet, which may be fully usable.
@@ -123,11 +139,33 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 		})
 	}
 
-	if err := parseParsedMetadata(m, rawEXIF, rawIPTC, rawXMP, cfg); err != nil {
+	if err := parseParsedMetadata(m, rawEXIF, rawIPTC, rawXMP, &cfg); err != nil {
 		return nil, err
 	}
 
 	return m, nil
+}
+
+// applyReadOptions builds a readConfig by applying opts and returns it by
+// value.
+//
+// #204: kept out-of-line via go:noinline and called only when len(opts) > 0.
+// ReadOption is a func(*readConfig) invoked indirectly (o(cfg)); the Go
+// compiler cannot see through an indirect call to confirm the callee does
+// not retain the pointer, so any *readConfig passed to an indirect call is
+// conservatively heap-allocated (verified with `go build -gcflags=-m`, which
+// reports "leaking param: c" for the loop body below). Confining that leak to
+// this dedicated, never-inlined function means Read's own readConfig local
+// stays on the stack for the zero-option fast path — the heap allocation
+// here is paid only by callers who actually supply options.
+//
+//go:noinline
+func applyReadOptions(opts []ReadOption) readConfig {
+	var cfg readConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
+	return cfg
 }
 
 // applyOrWarn is the single dispatch point for a segment parse result.

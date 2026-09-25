@@ -37,12 +37,30 @@ const maxWebPChunkSize = 256 << 20 // 256 MiB
 // The leading 0x00 is unambiguous: no valid XMP packet starts with a null byte.
 var xmpWireFrameMagic = [8]byte{0x00, 'X', 'M', 'P', 'E', 'X', 'T', 0x00} //nolint:gochecknoglobals // package-level constant bytes
 
+// fourCCEXIF and fourCCXMP are the two metadata chunk identifiers this
+// package dispatches on. Comparing chunk.FourCC ([4]byte) directly against
+// these constants is allocation-free, unlike the former
+// `switch chunk.FourCCString()` dispatch, which allocated a new string via
+// string(c.FourCC[:]) on every chunk — not just the EXIF/XMP ones — because
+// the conversion happens inside the (*Chunk).FourCCString method rather than
+// directly in a switch expression, so the compiler's allocation-free
+// switch/map-on-string(byteSlice) special case cannot apply (task #209).
+var (
+	fourCCEXIF = [4]byte{'E', 'X', 'I', 'F'} //nolint:gochecknoglobals // immutable comparison constant
+	fourCCXMP  = [4]byte{'X', 'M', 'P', ' '} //nolint:gochecknoglobals // immutable comparison constant
+)
+
 // readWebPChunks iterates over the RIFF chunk list in r, accumulating EXIF and
 // XMP payloads. r must be positioned immediately after the 12-byte RIFF/WEBP
 // header. All non-metadata chunks are skipped.
 func readWebPChunks(r io.ReadSeeker) (rawEXIF, rawXMP []byte, err error) {
+	// #209: a single 8-byte header buffer is reused for every chunk in the
+	// stream via riff.ReadChunkBuf, so the interface-call-forced heap
+	// allocation (see ReadChunkBuf's doc comment) is paid once per Extract
+	// call instead of once per chunk.
+	var hdrBuf [8]byte
 	for {
-		chunk, rerr := riff.ReadChunk(r)
+		chunk, rerr := riff.ReadChunkBuf(r, &hdrBuf)
 		if rerr != nil {
 			if errors.Is(rerr, io.EOF) {
 				return rawEXIF, rawXMP, nil
@@ -50,13 +68,13 @@ func readWebPChunks(r io.ReadSeeker) (rawEXIF, rawXMP []byte, err error) {
 			return nil, nil, fmt.Errorf("webp: read chunk: %w", rerr)
 		}
 
-		switch chunk.FourCCString() {
-		case "EXIF":
+		switch chunk.FourCC {
+		case fourCCEXIF:
 			rawEXIF, err = readPaddedChunk(r, chunk)
 			if err != nil {
 				return nil, nil, fmt.Errorf("webp: read EXIF chunk: %w", err)
 			}
-		case "XMP ":
+		case fourCCXMP:
 			rawXMP, err = readPaddedChunk(r, chunk)
 			if err != nil {
 				return nil, nil, fmt.Errorf("webp: read XMP chunk: %w", err)

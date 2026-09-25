@@ -169,6 +169,23 @@ func BenchmarkWebPExtract(b *testing.B) {
 	}
 }
 
+// BenchmarkWebPExtractWithXMP exercises Extract with both EXIF and XMP chunks
+// present (VP8X, VP8, EXIF, XMP — 4 chunks total per call), so the per-chunk
+// dispatch cost fixed by task #209 (switch chunk.FourCCString() allocation,
+// and the ReadChunk header-buffer escape) is exercised on every chunk kind,
+// not just a single EXIF chunk.
+func BenchmarkWebPExtractWithXMP(b *testing.B) {
+	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00}
+	xmpData := []byte(`<?xpacket begin=""?><x:xmpmeta xmlns:x="adobe:ns:meta/"/><?xpacket end="w"?>`)
+	webp := buildWebP(exifData, xmpData, 0x0C, 1920, 1080)
+	b.SetBytes(int64(len(webp)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_, _, _, _ = Extract(bytes.NewReader(webp))
+	}
+}
+
 // TestExtractNotWebP verifies that Extract returns ErrNotWebP for a non-WebP file.
 func TestExtractNotWebP(t *testing.T) {
 	t.Parallel()

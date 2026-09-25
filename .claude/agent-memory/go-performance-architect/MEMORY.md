@@ -1,5 +1,6 @@
 # Memory Index
 
+- [Sprint 44 perf tasks #204-#209,#241 (2026-09-25)](project_sprint44_perf_204_209_241.md) — escape-analysis-safe config pattern (noinline split), hand-rolled ISO-8859-1 decode, IPTC pre-count/sort-skip, MWG-02 digest cache, WebP/RIFF alloc-free dispatch; #206 embedded-fixed-size-storage follow-up (zero new allocation sites, Records[0] shape unchanged)
 - [Task #274 XMP numeric char-ref forbidden-Char fix](project_task274_xmp_charref_forbidden_chars.md) — isForbiddenXMLCharRef closes U+001E-via-&#x1e; corruption; write.go defense-in-depth assessed+rejected; raw-literal-byte vector left open by design
 - [Task #273 XMP round-trip container preservation (commit 39144d3)](project_task273_xmp_container_preservation.md) — containerTypes field fixes allowlist-scoped corruption class; arrayProperties table consolidation; Lang-Alt leak fixed as side effect
 - [WebFetch unreliable for large HTML reference tables](feedback_webfetch_html_tables_unreliable.md) — use curl+regex parse instead; AI summarization drops/garbles rows in big tag tables

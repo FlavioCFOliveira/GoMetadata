@@ -20,6 +20,273 @@ go test -bench=. -benchmem -benchtime=3s ./...
 
 ---
 
+## [feature/44 — sprint 44 perf tasks #204–#209, #241] — 2026-09-25
+
+Sprint 44 "Performance and Efficiency Laboratory": optimisation-only pass over
+the root package, `iptc/`, `internal/riff/`, and `format/webp/`, driven by
+`go build -gcflags=-m` escape analysis and `go test -bench -benchmem`
+evidence. All eight tasks below implemented in one merged pass. #206 was
+initially assessed against its literal wording ("unexported bool") and
+stopped as API-breaking; a follow-up, API-neutral approach (fixed-size
+storage embedded in `*IPTC`, preserving the exact `Records[0]` shape) was
+then specified and implemented — see its entry below. Go version go1.27.1,
+`cpu: Apple M4` (`sysctl -n machdep.cpu.brand_string`).
+
+### Optimisations applied
+
+- **#204 (root: zero-alloc `readConfig`/`writeConfig` for zero-option callers)**:
+  `Read`/`Write` now declare `cfg` as a stack value (`var cfg readConfig` /
+  `cfg := writeConfig{...}`) and only call a new, `//go:noinline`
+  `applyReadOptions`/`applyWriteOptions` helper when `len(opts) > 0`.
+  `ReadOption`/`WriteOption` are `func(*readConfig)`/`func(*writeConfig)`
+  invoked indirectly; passing `&cfg` to an indirect call forces the Go
+  compiler to heap-allocate the pointee unconditionally, even inside an `if`
+  guard that is never taken at runtime — escape analysis is not
+  value-sensitive to runtime branch conditions, only to the static call
+  graph. Confining that indirect call to a dedicated, non-inlined function
+  isolates the forced escape to the (rare) opts-supplied path; the zero-option
+  fast path's `cfg` now stays on the stack, confirmed with
+  `go build -gcflags="-m -m"` (no "moved to heap: cfg" for `Read`/`Write`
+  themselves; only inside `applyReadOptions`/`applyWriteOptions`). Option
+  function signatures are unchanged — no public API impact.
+- **#205 (iptc: `decodeString` hand-rolled ISO-8859-1 decode, no x/text)**:
+  Replaced the `golang.org/x/text/encoding/charmap` pooled decoder with a
+  direct byte-to-UTF-8 transcoder. ISO-8859-1's code point equals its byte
+  value for the full 0x00-0xFF range (verified byte-for-byte against
+  `charmap.ISO8859_1` for all 256 values plus a combined 256-byte buffer —
+  zero mismatches), so no decode table is needed: a single pre-pass counts
+  bytes ≥0x80, then either returns `string(b)` directly (pure ASCII, the
+  common case) or writes into a `strings.Builder` sized with `Grow` up front.
+  Collapses 2-3 allocations (decoder-internal + `dec.Bytes` result +
+  `string()` conversion) into 1 (ASCII) or a single `Builder`-backed
+  allocation (non-ASCII).
+- **#206 (iptc: `Records[0]` UTF-8 flag backed by fixed-size embedded storage,
+  API-neutral revision)**: the original "unexported bool" wording was rejected
+  (see the superseded note that used to live here) because `Records[0]` is
+  observable/mutable through the exported `Records [10][]Dataset` field, not
+  internal-only. The revised, implemented approach keeps `Records[0]`'s
+  observable shape byte-for-byte identical — exactly one
+  `Dataset{Record:0, DataSet:0, Value:[]byte{1}}` — while eliminating both of
+  its allocations: two new unexported fields, `utf8Slot [1]Dataset` and
+  `utf8Val [1]byte`, are embedded directly in `IPTC` (i.e. already part of
+  whatever single allocation produced `*IPTC`, e.g. `new(IPTC)` in `Parse`).
+  A new `(*IPTC).setUTF8Flag` method sets `utf8Val[0] = 1`, points
+  `utf8Slot[0].Value` at `utf8Val[:1:1]`, and assigns
+  `Records[0] = utf8Slot[:1:1]` — a cap-clamped (`[:1:1]`) slice, so an
+  external caller appending to the exported `Records[0]` always reallocates
+  into a fresh backing array instead of writing into `IPTC`'s own struct
+  memory (matching the growth behaviour of the former single-element
+  `append`-produced slice, whose backing array was already at `cap==len==1`).
+  Both former call sites (`Parse`, `setUTF8IfNeeded`) now call
+  `i.setUTF8Flag()`. No `Clone`/copy-by-value path for `*IPTC` exists anywhere
+  in this module (repository-wide grep); documented as an invariant any future
+  `Clone` must uphold (re-point the clone's `Records[0]` at the clone's own
+  arrays rather than copying the slice header verbatim). Verified with
+  `go build -gcflags="-m -m"`: zero "moved to heap" lines anywhere in the
+  `iptc` package after this change — `setUTF8Flag` introduces no new
+  allocation site at all, piggy-backing entirely on `*IPTC`'s existing
+  allocation. Three new regression tests
+  (`iptc/iptc_task206_test.go`) assert the unchanged `Records[0]` shape from
+  both entry points and that an external `append` to `Records[0]` does not
+  corrupt the internal flag (nor leak across two independent `*IPTC`
+  instances).
+- **#207 (iptc: `Encode` skip clone+sort when already sorted; encBufPool cap
+  guard)**: `Encode` now checks `slices.IsSortedFunc(datasets, compareDataSetNum)`
+  before cloning; when true (the common case — `*IPTC` from `Parse` stores
+  datasets in wire order, and `slices.IsSortedFunc` treats equal-key runs as
+  sorted, matching `SortStableFunc`'s own tie-stability) it iterates the
+  receiver's slice read-only, skipping `slices.Clone` + `slices.SortStableFunc`
+  entirely. When not sorted, the clone is still mandatory (Encode must not
+  mutate the receiver, FINDING-002). `putEncBuf` now discards buffers with
+  `Cap() > 65536` instead of returning them to `encBufPool`, mirroring
+  `internal/iobuf.Put`'s discard policy.
+- **#208 (root: cache MWG-02 IPTC-trust-elevation decision)**:
+  `computeIPTCTrustElevated` (renamed from the old per-call `iptcTrustElevated`
+  logic) is now called exactly once, at the end of `Read`, and cached in a new
+  unexported `Metadata.iptcTrustElev bool` field. `iptcTrustElevated()` is now
+  a plain field read. `rawIPTC`/`rawIPTCDigest` are set once at construction
+  and never reassigned afterward (verified by grep across the whole
+  repository), so the cached decision is valid for the object's entire
+  lifetime; a `digestMatchFn` test seam (`var digestMatchFn = iptc.DigestMatch`)
+  lets `TestIPTCTrustElevatedCachedSingleMD5` prove the underlying MD5 runs
+  exactly once regardless of how many times Copyright/Caption/Keywords/Creator
+  are called afterward.
+- **#209 (internal/riff + format/webp: allocation-free chunk dispatch)**:
+  `readWebPChunks`'s `switch chunk.FourCCString()` (an unconditional
+  `string(c.FourCC[:])` allocation per chunk — the compiler's allocation-free
+  `switch string(byteSlice)` special case does not apply because the
+  conversion happens inside the `FourCCString` method, not directly in the
+  switch expression) is replaced with a `switch chunk.FourCC` against two
+  `[4]byte` package-level constants. Added `riff.ReadChunkBuf(r, hdr *[8]byte)`
+  so a caller scanning many chunks (`readWebPChunks`) can hoist a single
+  `[8]byte` header buffer outside its loop instead of paying the
+  interface-call-forced heap allocation (`io.ReadFull(r, hdr[:])` through an
+  `io.Reader` — the Go compiler cannot prove an unknown concrete `Reader`
+  implementation does not retain the slice, so it always heap-allocates the
+  buffer regardless of where it is declared) once per chunk; `ReadChunk`
+  itself is now a thin wrapper over `ReadChunkBuf` with an internal
+  once-per-call buffer, unchanged for existing single-shot callers.
+- **#241 (iptc: `Parse` exact pre-sizing via allocation-free pre-count pass)**:
+  New `preCountDatasets(b []byte) [10]int` mirrors `Parse`'s own scanner and
+  `storeDataset`'s skip/recovery semantics byte-for-byte (standard/extended
+  length decoding, malformed-length recovery, the 1 MiB/`maxIPTCTotalBytes`/
+  `maxIPTCDatasets` DoS guards, the non-storing 1:90/1:00/2:00 skips) without
+  allocating or constructing `Dataset` structs. `Parse` uses its result to
+  `make([]Dataset, 0, counts[rec])` each non-empty record exactly once,
+  replacing the former hard-coded `make([]Dataset, 0, 12)` for record 2 only
+  (and no pre-sizing at all for the other eight records). Verified invariant
+  (fuzzed 14.8M+ execs, zero failures): `len(Records[rec]) <= counts[rec]`
+  always, and `cap(Records[rec]) == counts[rec]` whenever `counts[rec] > 0`
+  (i.e. no regrowth ever occurs).
+
+### Validation gate
+
+| Check | Result |
+|---|---|
+| `go build ./...` | clean |
+| `go vet ./...` | clean |
+| `go test ./...` | all packages pass (includes the `docs/conformance/` battery) |
+| `go test -race ./...` | all packages pass, no races |
+| `golangci-lint run ./...` | 0 issues in every touched package (`.`, `./iptc/...`, `./format/webp/...`, `./internal/riff/...`); 9 pre-existing issues remain in untouched files (`exif/`, `examples/`, `format/tiff/relocate_bigtiff.go`) — out of scope for this sprint |
+| `staticcheck ./...` | clean |
+| `govulncheck ./...` | 0 vulnerabilities reachable from this module's code; 1 informational finding (`GO-2026-5970`, `golang.org/x/text@v0.35.0`, not called by any code path) — pre-existing, unrelated to this sprint, not fixed |
+| `go test -fuzz=FuzzParseIPTC -fuzztime=30s ./iptc/...` | 14.8M execs, 0 failures (initial pass); 10.9M execs, 0 failures (#206 follow-up re-run) |
+| `go test -fuzz=FuzzRIFFRead -fuzztime=30s ./internal/riff/...` | 16.0M execs, 0 failures |
+| `go test -fuzz=FuzzWebPExtract -fuzztime=30s ./format/webp/...` | 8.2M execs, 0 failures |
+| `go test -fuzz=FuzzWebPInject -fuzztime=30s ./format/webp/...` | 2.5M execs, 0 failures |
+
+**#206 follow-up gate** (re-run for the touched package only, after the
+API-neutral revision): `go build ./...` clean · `go vet ./...` clean ·
+`go test ./...` all green · `go test -race ./iptc/... .` clean, no races ·
+`golangci-lint run ./iptc/... .` 0 issues · `staticcheck ./iptc/... .` clean ·
+`FuzzParseIPTC` 30s, 10.9M execs, 0 failures.
+
+### Benchmark results (`-count=10`, `benchstat before → after`)
+
+Before/after captured with `git stash` isolating the production-code and
+internal-API-dependent test changes from the pure benchmark additions, so
+both sides compile and measure the identical benchmark set. Two "after" runs
+were taken; the first overlapped with concurrent `golangci-lint`/`staticcheck`
+CPU load and showed implausibly high variance (±30-40%) on two `ns/op`
+figures (`Write_PNG`, `Write_JPEG`) — those two are reported from the second,
+isolated run (`after2`); every other row is consistent across both runs.
+
+**Root package** (`go test -bench . -benchmem -count 10 .`)
+
+| Benchmark | ns/op before → after | Δ ns/op | B/op before → after | Δ B/op | allocs/op before → after | Δ allocs |
+|---|---|---|---|---|---|---|
+| Read_JPEG | 246.5n → 243.6n | −1.16% (p=0.001) | 521 → 514 | −1.34% | 8 → 7 | **−12.50%** |
+| Read_JPEG_WithXMP | 1.480µ → 1.364µ | −7.84% (p=0.000) | 2.405Ki → 1.785Ki | −25.78% | 23 → 21 | −8.70% |
+| Read_PNG | 172.1n → 178.6n | +3.84% (p=0.000) | 288 → 280 | −2.78% | 10 → 9 | −10.00% |
+| MWGAccessors (new, #208) | 391.4n → 43.5n | **−88.87%** (p=0.000) | 0 → 0 | ~ | 0 → 0 | ~ |
+| ReadProgressiveJPEG | 214.9n → 214.7n | ~ (p=0.515) | 245 → 240 | −2.04% | 3 → 2 | −33.33% |
+| ReadCombinedMetadataJPEG | 12.72µ → 12.00µ | −5.68% (p=0.000) | 21.93Ki → 20.76Ki | −5.31% | 107 → 84 | −21.50% |
+| ReadFile | 2.299µ → 2.308µ | ~ (p=0.361) | 6.181Ki → 6.174Ki | −0.11% | 15 → 14 | −6.67% |
+| Write_JPEG | 401.6n → 380.3n | **−5.30%** (p=0.000) | 240 → 192 | **−20.00%** | 11 → 9 | **−18.18%** |
+| Write_PNG | 249.3n → 248.5n | ~ (p=0.128) | 136 → 136 | ~ | 15 → 14 | −6.67% |
+| ReadFile_Concurrent | 12.73µ → 12.11µ | −4.80% (p=0.003) | 692 → 686 | −0.87% | 10 → 9 | −10.00% |
+| **geomean** | 849.9n → 667.6n | **−21.45%** | — | −6.27% | — | −13.25% |
+
+`Write_JPEG`'s 2-allocation drop is #204 (1 alloc, `writeConfig`) + #207 (1
+alloc, `Encode`'s single-dataset record skips clone+sort). `MWGAccessors`
+(4 accessors × N, digest-mismatch scenario) is the direct #208 evidence:
+0 MD5 computations after the first `Read`, vs. 4 before per accessor round.
+
+**`format/webp`**
+
+| Benchmark | ns/op before → after | Δ ns/op | B/op before → after | Δ B/op | allocs/op before → after | Δ allocs |
+|---|---|---|---|---|---|---|
+| WebPExtract | 93.90n → 81.51n | **−13.20%** (p=0.000) | 104 → 80 | −23.08% | 7 → 4 | **−42.86%** |
+| WebPExtractWithXMP (new) | 125.1n → 113.3n | −9.43% (p=0.000) | 192 → 160 | −16.67% | 9 → 5 | **−44.44%** |
+| WebPInject | 220.3n → 222.7n | +1.11% (p=0.018) | 947 → 947 | ~ | 11 → 11 | ~ |
+
+`WebPInject` is untouched by #209 (it does not call `readWebPChunks`); the
++1.11% is noise (0.4 ns absolute, likely inlining-boundary jitter from the new
+`fourCCEXIF`/`fourCCXMP` package vars being resolved into the same
+compilation unit) and is not a regression in any code path Inject exercises.
+
+**`internal/riff`**
+
+| Benchmark | ns/op before → after | Δ ns/op | B/op | allocs/op |
+|---|---|---|---|---|
+| ReadChunk (single call) | 18.03n → 18.48n | +2.52% (p=0.000) | 56 → 56 (~) | 2 → 2 (~) |
+
+`ReadChunk` (the single-shot wrapper) is expected to be flat: it still
+allocates its own `[8]byte` internally on every call, identical to before —
+the win is only realised by callers that hoist a `ReadChunkBuf` buffer across
+a multi-chunk loop (`WebPExtract`, above). +2.52% here is one extra call
+frame (`ReadChunk` → `ReadChunkBuf`); noise-level in absolute terms (0.45 ns).
+
+**`iptc`**
+
+| Benchmark | ns/op before → after | Δ ns/op | B/op before → after | Δ B/op | allocs/op before → after | Δ allocs |
+|---|---|---|---|---|---|---|
+| DecodeString (non-ASCII) | 95.60n → 38.10n | **−60.15%** (p=0.000) | 96 → 16 | **−83.33%** | 3 → 1 | **−66.67%** |
+| DecodeStringASCII (new) | 85.80n → 22.48n | **−73.79%** (p=0.000) | 96 → 48 | −50.00% | 2 → 1 | −50.00% |
+| IPTCAccessorsNonASCII | 6.707n → 7.070n | +5.40% (p=0.000) | 0 → 0 | ~ | 0 → 0 | ~ |
+| IPTCParse | 240.3n → 101.3n | **−57.85%** (p=0.000) | 1024 → 416 | **−59.38%** | 6 → 4 | **−33.33%** |
+| IPTCEncode | 160.3n → 165.3n | +3.06% (p=0.000) | 304 → 304 | ~ | 2 → 2 | ~ |
+| IPTCAccessors | 17.52n → 17.07n | −2.51% (p=0.001) | 48 → 48 | ~ | 1 → 1 | ~ |
+| IPTCParseFewDatasets (new, 5 ds) | — → 154.1n | n/a | — → 512 | n/a | — → 7 | n/a |
+| IPTCParseManyDatasets (new, 20 ds) | — → 471.4n | n/a | — → 1.320Ki | n/a | — → 22 | n/a |
+| IPTCParseUTF8Declared (new) | — → 108.3n | n/a | — → 464 | n/a | — → 6 | n/a |
+| IPTCEncodeSorted (new) | — → 99.76n | n/a | — → 112 | n/a | — → 1 | n/a |
+| **geomean** (rows present on both sides) | 57.76n → 65.06n | −40.01% | — | −43.12% | — | −30.66% |
+
+`IPTCAccessorsNonASCII` (+5.40%, 0.36 ns absolute) and `IPTCEncode`/`IPTCEncode`
+(+3.06%, +1.78% across runs) are noise-level, sub-nanosecond deltas on
+already-tiny benchmarks; not regressions in any observable sense.
+
+### Task #241 net-win analysis (isolated before/after with #205 already applied)
+
+Because `#241`'s pre-count pass trades one extra O(len(b)) scan for one exact
+allocation, its own AC demanded isolated evidence, not just the combined
+number above (which is dominated by #205). Isolated comparison — `iptc.go`
+with `preCountDatasets` temporarily reverted to the old
+`i.Records[2] = make([]Dataset, 0, 12)` vs. the real #241 code, #205 applied
+identically on both sides:
+
+| Benchmark | ns/op without #241 → with #241 | Δ ns/op | B/op | Δ B/op | allocs/op | Δ allocs |
+|---|---|---|---|---|---|---|
+| IPTCParseFewDatasets (5 ds, < 12) | 144.9n → 152.5n | +5.21% (p=0.000) | 912 → 512 | **−43.86%** | 7 → 7 | ~ |
+| IPTCParseManyDatasets (20 ds, > 12) | 495.9n → 470.6n | **−5.10%** (p=0.000) | 2.195Ki → 1.320Ki | **−39.86%** | 23 → 22 | −4.35% |
+| IPTCParseUTF8Declared (3 ds, < 12) | 127.0n → 106.6n | **−16.06%** (p=0.000) | 1008 → 464 | **−53.97%** | 6 → 6 | ~ |
+| IPTCParse (2 ds, < 12) | 119.1n → 103.9n | ~ (p=0.117) | 960 → 416 | **−56.67%** | 4 → 4 | ~ |
+| **geomean** | 181.6n → 167.9n | **−7.53%** | — | **−49.06%** | — | −1.11% |
+
+Verdict: net win. The only regression is +5.21% ns/op on the 5-dataset case,
+fully compensated by a −43.86% B/op reduction in the same scenario (smaller
+`make` requests are cheaper for the allocator even without changing the
+allocation *count* — this is why 3 of 4 buckets improve in both ns/op and
+B/op despite none but the 20-dataset case avoiding an actual `growslice`
+regrowth). The scenario #241 specifically targets — a record exceeding the
+old fixed guess of 12 — improves on every axis (ns/op, B/op, allocs/op).
+Aggregate geomean across all four buckets is a net win on both time and
+space. Kept as implemented; no revert warranted.
+
+### Task #206 follow-up: isolated before/after (fixed-size embedded storage)
+
+`BenchmarkIPTCParseUTF8Declared` (a genuine 1:90 stream: one Record-1 UTF-8
+declaration + two Record-2 datasets), `-count=10`, `setUTF8Flag` temporarily
+reverted to the original `append(i.Records[0], Dataset{..., Value: []byte{1}})`
+implementation vs. the fixed-size-array implementation actually shipped,
+with #205/#207/#241 already applied identically on both sides:
+
+| Benchmark | ns/op before → after | Δ ns/op | B/op before → after | Δ B/op | allocs/op before → after | Δ allocs |
+|---|---|---|---|---|---|---|
+| IPTCParseUTF8Declared | 111.0n → 104.8n | **−5.58%** (p=0.000) | 464 → 480 | +3.45% | 6 → 4 | **−33.33% (exactly −2, AC met)** |
+
+The small B/op increase (+16 B, 464→480) is the expected trade-off of
+embedding `utf8Slot [1]Dataset` + `utf8Val [1]byte` directly in `IPTC`: the
+single `new(IPTC)` allocation in `Parse` grows by those fields' size, while
+the two allocations it replaces (the `[]byte{1}` literal and the
+`append`-triggered `growslice` for `Records[0]`) are removed entirely — same
+"pay once, unconditionally, to save an unconditional allocation elsewhere"
+trade-off as the exif sub-IFD arena (task #198, see below). AC ("Parse loses
+2 allocs/op") met exactly. `go build -gcflags="-m -m" ./iptc/...` shows zero
+"moved to heap" lines anywhere in the package after this change.
+
+
 ## [main — perf task #198] — 2026-06-10 (exif: parse-level arena for sub-IFDs)
 
 ### Optimisations applied in this version

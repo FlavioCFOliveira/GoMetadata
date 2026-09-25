@@ -74,9 +74,14 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 		return err
 	}
 
-	cfg := &writeConfig{preserveUnknownSegments: true}
-	for _, o := range opts {
-		o(cfg)
+	// #204: cfg is a stack value; see applyWriteOptions for why applying opts
+	// is confined to a dedicated, non-inlined function instead of a bare loop
+	// here. cfg's only downstream use is the plain field read
+	// cfg.preserveUnknownSegments below, so — unlike readConfig — no pointer
+	// to it ever needs to be threaded further into the call graph.
+	cfg := writeConfig{preserveUnknownSegments: true}
+	if len(opts) > 0 {
+		cfg = applyWriteOptions(opts)
 	}
 
 	// Detect container format.
@@ -182,6 +187,25 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	}
 
 	return injectByFormat(r, w, fmtID, rawEXIF, rawIPTC, rawXMP, cfg.preserveUnknownSegments)
+}
+
+// applyWriteOptions builds a writeConfig (starting from the documented
+// preserveUnknownSegments=true default) by applying opts and returns it by
+// value.
+//
+// #204: kept out-of-line via go:noinline and called only when len(opts) > 0,
+// for the same reason as read.go's applyReadOptions: WriteOption is a
+// func(*writeConfig) invoked indirectly, which forces the Go compiler to
+// heap-allocate any *writeConfig passed to it. Isolating that call here keeps
+// Write's own writeConfig local on the stack for the zero-option fast path.
+//
+//go:noinline
+func applyWriteOptions(opts []WriteOption) writeConfig {
+	cfg := writeConfig{preserveUnknownSegments: true}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	return cfg
 }
 
 // WriteFile reads the image at path, applies the metadata in m, and writes

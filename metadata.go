@@ -117,6 +117,24 @@ type Metadata struct {
 	// in that case encodeMetadata re-encodes from the struct and the extended
 	// split path uses a freshly generated GUID.
 	rawXMPWire []byte
+
+	// iptcTrustElev caches the result of computeIPTCTrustElevated(rawIPTC,
+	// rawIPTCDigest), computed once by Read (see read.go) immediately after
+	// rawIPTC and rawIPTCDigest are known. iptcTrustElevated() below reads
+	// this field directly instead of recomputing an MD5 digest of rawIPTC on
+	// every call (task #208).
+	//
+	// Correctness: rawIPTC and rawIPTCDigest are set exactly once, at
+	// construction (either by Read's struct literal or left at their nil zero
+	// value by NewMetadata / a caller-built literal), and are never
+	// reassigned afterward — grep confirms the only production write sites
+	// are the Read() struct literal. Set* methods mutate m.IPTC (the parsed
+	// *iptc.IPTC), never m.rawIPTC, so the cached decision remains valid for
+	// the entire lifetime of a *Metadata. For any *Metadata not constructed
+	// via Read (NewMetadata, or a struct literal in tests), rawIPTCDigest is
+	// nil and iptcTrustElev correctly keeps its zero value (false), matching
+	// computeIPTCTrustElevated's own nil-digest fast path exactly.
+	iptcTrustElev bool
 }
 
 // Format returns the detected container format ID of the image.
@@ -146,6 +164,25 @@ func (m *Metadata) RawXMP() []byte { return bytes.Clone(m.rawXMP) }
 // iptcTrustElevated reports whether IPTC should take read priority over XMP
 // for fields where both are present and carry different values.
 //
+// The decision is computed once, by Read, and cached in m.iptcTrustElev
+// (task #208); this method is a plain field read so that the four MWG-02
+// accessors (Copyright, Caption, Keywords, Creator) never each pay their own
+// MD5 hash of the raw IPTC stream. See computeIPTCTrustElevated for the full
+// MWG §3.3.1 policy this value encodes.
+func (m *Metadata) iptcTrustElevated() bool {
+	return m.iptcTrustElev
+}
+
+// digestMatchFn is a seam over iptc.DigestMatch. computeIPTCTrustElevated
+// calls it instead of iptc.DigestMatch directly so that tests can verify how
+// many times the underlying MD5 computation runs (task #208). Production
+// behaviour is unchanged: the var is initialised to iptc.DigestMatch itself
+// and is never reassigned outside test code.
+var digestMatchFn = iptc.DigestMatch //nolint:gochecknoglobals // test seam; identical to calling iptc.DigestMatch directly in production
+
+// computeIPTCTrustElevated reports whether IPTC should take read priority
+// over XMP for fields where both are present and carry different values.
+//
 // MWG Guidelines v2.0 §3.3.1: the Photoshop resource 0x0425 stores an MD5
 // digest of the raw 0x0404 IIM block at the time XMP was last written. If the
 // digest matches the current IIM block, XMP was written after the last IPTC
@@ -156,15 +193,21 @@ func (m *Metadata) RawXMP() []byte { return bytes.Clone(m.rawXMP) }
 //
 // When rawIPTCDigest is nil (the resource was absent), the default XMP-over-
 // IPTC priority (MWG-01) is preserved unchanged.
-func (m *Metadata) iptcTrustElevated() bool {
-	if len(m.rawIPTCDigest) != 16 {
+//
+// Called exactly once, by Read, immediately after rawIPTC and rawIPTCDigest
+// are final; the result is cached in m.iptcTrustElev (task #208). This
+// function performs at most one MD5 computation (via digestMatchFn), unlike
+// the former per-accessor-call implementation, which hashed the entire raw
+// IPTC stream again on every single Copyright/Caption/Keywords/Creator call.
+func computeIPTCTrustElevated(rawIPTC, rawIPTCDigest []byte) bool {
+	if len(rawIPTCDigest) != 16 {
 		// No digest resource in the IRB — use default MWG-01 (XMP priority).
 		return false
 	}
 	var stored [16]byte
-	copy(stored[:], m.rawIPTCDigest)
-	// DigestMatch handles the all-zero sentinel case (returns unknown=true).
-	match, unknown := iptc.DigestMatch(m.rawIPTC, stored)
+	copy(stored[:], rawIPTCDigest)
+	// digestMatchFn handles the all-zero sentinel case (returns unknown=true).
+	match, unknown := digestMatchFn(rawIPTC, stored)
 	// Elevate IPTC when: all-zero sentinel OR computed hash ≠ stored hash.
 	return unknown || !match
 }
