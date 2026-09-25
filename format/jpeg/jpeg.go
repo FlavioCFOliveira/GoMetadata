@@ -318,7 +318,16 @@ type xmpResult struct {
 //
 // extTruncated is forwarded to the returned xmpResult.truncated field.
 // extFullLens carries the wire-declared total size per GUID for validation (#122).
-func buildXMPResult(rawXMP []byte, extended map[string][]extChunk, extFullLens map[string]uint64, extTruncated bool) xmpResult {
+//
+// wantXMP controls whether the expensive reassembly (parse both packets,
+// merge properties, re-encode) is performed at all (#238). When false (the
+// caller opted out via WithoutXMP), rawXMP degrades to the main packet only;
+// rawXMPWire — computed before reassembly either way — still carries the
+// original main+extended payload, so a JPEG round-trip write stays byte
+// stable (encodeXMP prefers rawXMPWire for JPEG destinations). extTruncated
+// is still computed and returned regardless of wantXMP, so warnings for
+// wanted segments are unaffected.
+func buildXMPResult(rawXMP []byte, extended map[string][]extChunk, extFullLens map[string]uint64, extTruncated, wantXMP bool) xmpResult {
 	if rawXMP == nil || len(extended) == 0 {
 		return xmpResult{rawXMP: rawXMP, truncated: extTruncated}
 	}
@@ -352,6 +361,13 @@ func buildXMPResult(rawXMP []byte, extended map[string][]extChunk, extFullLens m
 	// Build wire-frame BEFORE any reassembly, so that the original raw bytes
 	// are preserved verbatim for passthrough writes.
 	wire := encodeXMPWire(rawXMP, extBytes)
+
+	if !wantXMP {
+		// #238: skip the reassembly parse/merge/encode entirely when the
+		// caller does not want XMP. wire already carries the complete
+		// main+extended payload for a byte-stable JPEG round trip.
+		return xmpResult{rawXMP: rawXMP, rawXMPWire: wire, truncated: extTruncated}
+	}
 
 	// #123: Use xmp.Parse to merge the extended document into the main packet
 	// in a prefix-agnostic way. The extended XMP document is a full XMP packet
@@ -399,7 +415,14 @@ func readSOI(soi []byte) error {
 // read failures (EOF, malformed markers) are handled by the pre-existing
 // graceful-degradation policy — the function returns whatever metadata was
 // collected so far with err == nil, exactly as before this change.
-func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte) (rawEXIF, rawIPTC, iptcDigest []byte, xmp xmpResult, err error) {
+//
+// wantIPTC and wantXMP (#238) let the caller skip work that only feeds a
+// segment it has opted out of via WithoutIPTC/WithoutXMP: the 0x0425 IPTC
+// digest extraction and the extended-XMP reassembly, respectively. rawEXIF
+// and rawIPTC themselves are always extracted regardless of these flags —
+// they must remain available so an unmodified Write can pass them through
+// byte-for-byte (CLAUDE.md §5).
+func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte, wantIPTC, wantXMP bool) (rawEXIF, rawIPTC, iptcDigest []byte, xmp xmpResult, err error) {
 	// extended collects chunks from extended XMP APP1 segments, keyed by GUID.
 	// Adobe XMP Specification Part 3 §1.1.4.
 	// Lazily initialised: most JPEGs do not contain extended XMP, so we avoid
@@ -472,13 +495,13 @@ func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte) (rawEXIF, raw
 			}
 		case markerSOS, markerEOI:
 			// SOS/EOI: no more metadata segments follow.
-			rawIPTC, iptcDigest = extractIPTCAndDigestFromIRBPayloads(app13Payloads)
-			return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, extended, extFullLens, extTruncated), nil
+			rawIPTC, iptcDigest = extractIPTCAndDigestFromIRBPayloads(app13Payloads, wantIPTC)
+			return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, extended, extFullLens, extTruncated, wantXMP), nil
 		}
 	}
 
-	rawIPTC, iptcDigest = extractIPTCAndDigestFromIRBPayloads(app13Payloads)
-	return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, extended, extFullLens, extTruncated), nil
+	rawIPTC, iptcDigest = extractIPTCAndDigestFromIRBPayloads(app13Payloads, wantIPTC)
+	return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, extended, extFullLens, extTruncated, wantXMP), nil
 }
 
 // parseIRBForIPTCAndDigest scans a single contiguous Photoshop IRB byte block
@@ -521,20 +544,32 @@ func parseIRBForIPTCAndDigest(b []byte) (iptcData, digestData []byte) {
 // payloads for resource 0x0404 (IPTC-NAA IIM) and resource 0x0425 (IPTC
 // Digest) and returns both. Either return value may be nil when absent.
 //
+// wantDigest controls whether the 0x0425 digest resource is copied out at
+// all (#238): when the caller has opted out of IPTC (WithoutIPTC), the digest
+// is only ever consumed by the MWG-02 trust-elevation computation, which is
+// itself a no-op when there is no parsed IPTC to prioritise — so extracting
+// it would be pure waste.
+//
 // IRB-APP13-09: all APP13 Photoshop 3.0 payloads are treated as a single
 // logical IRB stream; both resources may appear in any segment.
 // MWG §3.3.1: the digest enables IPTC/XMP precedence reconciliation.
-func extractIPTCAndDigestFromIRBPayloads(payloads [][]byte) (rawIPTC, iptcDigest []byte) {
+func extractIPTCAndDigestFromIRBPayloads(payloads [][]byte, wantDigest bool) (rawIPTC, iptcDigest []byte) {
 	if len(payloads) == 0 {
 		return nil, nil
 	}
 	// Fast path: single segment (the common case) — no concatenation needed.
 	if len(payloads) == 1 {
 		iptcData, digestData := parseIRBForIPTCAndDigest(payloads[0])
-		if iptcData != nil {
-			iptcData = bytes.Clone(iptcData)
-		}
-		if digestData != nil {
+		// #215: payloads[0] was already cloned from pooled scratch when
+		// accumulated (scanMetadataSegmentsWithWire) and is not retained
+		// anywhere else once this function returns, so the 0x0404 sub-slice
+		// it contains can be returned directly — cloning it again would be a
+		// second, redundant copy of the same bytes. This never aliases
+		// pooled scratch (bug #72 class): payloads[0] is an independently
+		// owned clone, not scratch itself.
+		if !wantDigest {
+			digestData = nil
+		} else if digestData != nil {
 			digestData = bytes.Clone(digestData)
 		}
 		return iptcData, digestData
@@ -552,7 +587,9 @@ func extractIPTCAndDigestFromIRBPayloads(payloads [][]byte) (rawIPTC, iptcDigest
 	if iptcData != nil {
 		iptcData = bytes.Clone(iptcData)
 	}
-	if digestData != nil {
+	if !wantDigest {
+		digestData = nil
+	} else if digestData != nil {
 		digestData = bytes.Clone(digestData)
 	}
 	return iptcData, digestData
@@ -569,7 +606,7 @@ func extractIPTCAndDigestFromIRBPayloads(payloads [][]byte) (rawIPTC, iptcDigest
 //	When the JPEG carries extended XMP, rawXMP is the reassembled
 //	(merged) XMP document. Use ExtractWithWire for lossless passthrough.
 func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
-	rawEXIF, rawIPTC, _, xmpRes, err := extractFullInternal(r)
+	rawEXIF, rawIPTC, _, xmpRes, err := extractFullInternal(r, true, true)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -587,7 +624,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 // Callers outside the format/jpeg package should use Extract unless they need
 // the wire-frame for passthrough writes.
 func ExtractWithWire(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP, rawXMPWire []byte, err error) {
-	rawEXIF, rawIPTC, _, xmpRes, err := extractFullInternal(r)
+	rawEXIF, rawIPTC, _, xmpRes, err := extractFullInternal(r, true, true)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -609,7 +646,25 @@ func ExtractWithWire(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP, rawXMPWire []by
 // Use Extract for callers that do not need the digest, the wire-frame, or the
 // truncation flag.
 func ExtractFull(r io.ReadSeeker) (rawEXIF, rawIPTC, iptcDigest, rawXMP, rawXMPWire []byte, xmpTruncated bool, err error) {
-	rawEXIF, rawIPTC, iptcDigest, xmpRes, err := extractFullInternal(r)
+	return ExtractFullSelective(r, true, true)
+}
+
+// ExtractFullSelective is the selective-extraction variant of ExtractFull
+// (#238). wantIPTC and wantXMP let a caller that will not parse a segment
+// (WithoutIPTC / WithoutXMP) skip the work that only feeds that segment:
+//   - wantIPTC=false: the 0x0425 IPTC digest is not extracted, so the
+//     downstream MWG-02 trust computation (a no-op when there is no parsed
+//     IPTC to prioritise) is also skipped.
+//   - wantXMP=false: the extended-XMP reassembly (parse both packets, merge
+//     properties, re-encode) is skipped; rawXMP degrades to the main packet
+//     only, while rawXMPWire still carries the full main+extended payload so
+//     a JPEG round-trip write remains byte-stable.
+//
+// rawEXIF and rawIPTC are always extracted regardless of the flags: both
+// must remain available so an unmodified Write can pass them through
+// byte-for-byte (CLAUDE.md §5). ExtractFull calls this with both flags true.
+func ExtractFullSelective(r io.ReadSeeker, wantIPTC, wantXMP bool) (rawEXIF, rawIPTC, iptcDigest, rawXMP, rawXMPWire []byte, xmpTruncated bool, err error) {
+	rawEXIF, rawIPTC, iptcDigest, xmpRes, err := extractFullInternal(r, wantIPTC, wantXMP)
 	if err != nil {
 		return nil, nil, nil, nil, nil, false, err
 	}
@@ -617,7 +672,7 @@ func ExtractFull(r io.ReadSeeker) (rawEXIF, rawIPTC, iptcDigest, rawXMP, rawXMPW
 }
 
 // extractFullInternal is the shared implementation of Extract, ExtractWithWire, and ExtractFull.
-func extractFullInternal(r io.ReadSeeker) (rawEXIF, rawIPTC, iptcDigest []byte, xmp xmpResult, err error) {
+func extractFullInternal(r io.ReadSeeker, wantIPTC, wantXMP bool) (rawEXIF, rawIPTC, iptcDigest []byte, xmp xmpResult, err error) {
 	if _, err = r.Seek(0, io.SeekStart); err != nil {
 		return nil, nil, nil, xmpResult{}, fmt.Errorf("jpeg: seek: %w", err)
 	}
@@ -645,7 +700,7 @@ func extractFullInternal(r io.ReadSeeker) (rawEXIF, rawIPTC, iptcDigest []byte, 
 		return nil, nil, nil, xmpResult{}, soiErr
 	}
 
-	rawEXIF, rawIPTC, iptcDigest, xmp, err = scanMetadataSegmentsWithWire(cr, scratchPtr)
+	rawEXIF, rawIPTC, iptcDigest, xmp, err = scanMetadataSegmentsWithWire(cr, scratchPtr, wantIPTC, wantXMP)
 	if err != nil {
 		return nil, nil, nil, xmpResult{}, err
 	}
@@ -654,16 +709,18 @@ func extractFullInternal(r io.ReadSeeker) (rawEXIF, rawIPTC, iptcDigest []byte, 
 
 // writeEXIFSegment writes the EXIF APP1 segment to w.
 // APP1 length field is 16-bit; JPEG ISO/IEC 10918-1 and EXIF §4.5.4.
+//
+// #216: the segment header, "Exif\x00\x00" prefix, and rawEXIF bytes are all
+// built in one pooled buffer so the whole segment leaves in a single w.Write.
 func writeEXIFSegment(w io.Writer, rawEXIF []byte) error {
 	if len(identExif)+len(rawEXIF)+2 > 65535 {
 		return fmt.Errorf("jpeg: EXIF payload %d bytes exceeds APP1 segment limit; EXIF cannot be split: %w", len(rawEXIF), ErrEXIFPayloadTooLarge)
 	}
-	exifBuf := iobuf.Get(len(identExif) + len(rawEXIF))
-	copy(*exifBuf, identExif)
-	copy((*exifBuf)[len(identExif):], rawEXIF)
-	writeErr := writeSegment(w, markerAPP1, *exifBuf)
-	iobuf.Put(exifBuf)
-	return writeErr
+	bufPtr := iobuf.Get(segHeaderSize + len(identExif) + len(rawEXIF))
+	b := *bufPtr
+	copy(b[segHeaderSize:], identExif)
+	copy(b[segHeaderSize+len(identExif):], rawEXIF)
+	return writeHeaderedBuf(w, markerAPP1, bufPtr)
 }
 
 // writeXMPSegments writes a standard XMP APP1 when the payload fits within
@@ -684,13 +741,13 @@ func writeXMPSegments(w io.Writer, rawXMP []byte) error {
 	}
 
 	if len(rawXMP) <= maxXMPPayload {
-		// Fast path: XMP fits in a single APP1 segment.
-		xmpBuf := iobuf.Get(len(identXMP) + len(rawXMP))
-		copy(*xmpBuf, identXMP)
-		copy((*xmpBuf)[len(identXMP):], rawXMP)
-		writeErr := writeSegment(w, markerAPP1, *xmpBuf)
-		iobuf.Put(xmpBuf)
-		return writeErr
+		// Fast path: XMP fits in a single APP1 segment. #216: header + prefix
+		// + payload built in one pooled buffer, one w.Write.
+		bufPtr := iobuf.Get(segHeaderSize + len(identXMP) + len(rawXMP))
+		b := *bufPtr
+		copy(b[segHeaderSize:], identXMP)
+		copy(b[segHeaderSize+len(identXMP):], rawXMP)
+		return writeHeaderedBuf(w, markerAPP1, bufPtr)
 	}
 	// Slow path: split into extended XMP segments.
 	return writeExtendedXMP(w, rawXMP)
@@ -734,12 +791,11 @@ func writeRawXMPSegment(w io.Writer, main []byte) error {
 		return fmt.Errorf("jpeg: XMP wire passthrough: main packet (%d bytes) exceeds APP1 limit: %w",
 			len(main), ErrXMPStubTooLarge)
 	}
-	xmpBuf := iobuf.Get(totalLen)
-	copy(*xmpBuf, identXMP)
-	copy((*xmpBuf)[len(identXMP):], main)
-	err := writeSegment(w, markerAPP1, *xmpBuf)
-	iobuf.Put(xmpBuf)
-	return err
+	bufPtr := iobuf.Get(segHeaderSize + totalLen)
+	b := *bufPtr
+	copy(b[segHeaderSize:], identXMP)
+	copy(b[segHeaderSize+len(identXMP):], main)
+	return writeHeaderedBuf(w, markerAPP1, bufPtr)
 }
 
 // writeExtendedChunks splits ext into extended APP1 chunks and writes them.
@@ -758,24 +814,27 @@ func writeExtendedChunks(w io.Writer, guidBytes, ext []byte) error {
 		}
 		chunk := ext[offset:chunkEnd]
 
-		extBuf := iobuf.Get(extHdrSize + len(chunk))
-		b := *extBuf
+		// #216: segment header + extended-XMP header + chunk data built in
+		// one pooled buffer, one w.Write. base is the offset of the
+		// extended-XMP header within the buffer, after the 4-byte segment
+		// header reserved at the front.
+		bufPtr := iobuf.Get(segHeaderSize + extHdrSize + len(chunk))
+		b := *bufPtr
+		const base = segHeaderSize
 
 		// identXMPNote (35 bytes: "http://ns.adobe.com/xmp/extension/\x00")
-		copy(b, identXMPNote)
+		copy(b[base:], identXMPNote)
 		// GUID (32 bytes) immediately after identifier
-		copy(b[len(identXMPNote):], guidBytes)
-		// fullLength (4 bytes BE) at offset 67 = 35 + 32
-		binary.BigEndian.PutUint32(b[67:71], fullLen)
-		// offset (4 bytes BE) at offset 71 = 35 + 32 + 4
-		binary.BigEndian.PutUint32(b[71:75], offset)
-		// chunk data starts at offset 75 = 35 + 32 + 4 + 4
-		copy(b[75:], chunk)
+		copy(b[base+len(identXMPNote):], guidBytes)
+		// fullLength (4 bytes BE) at offset base+67 = base+35+32
+		binary.BigEndian.PutUint32(b[base+67:base+71], fullLen)
+		// offset (4 bytes BE) at offset base+71 = base+35+32+4
+		binary.BigEndian.PutUint32(b[base+71:base+75], offset)
+		// chunk data starts at offset base+75 = base+35+32+4+4
+		copy(b[base+75:], chunk)
 
-		writeErr := writeSegment(w, markerAPP1, b)
-		iobuf.Put(extBuf)
-		if writeErr != nil {
-			return writeErr
+		if err := writeHeaderedBuf(w, markerAPP1, bufPtr); err != nil {
+			return err
 		}
 
 		offset = chunkEnd
@@ -783,21 +842,33 @@ func writeExtendedChunks(w io.Writer, guidBytes, ext []byte) error {
 	return nil
 }
 
-// writeIPTCSegmentRaw writes a pre-built IRB byte slice as an APP13 segment.
-// The irb parameter is the complete IRB payload (without the "Photoshop 3.0\x00"
-// header); the function prepends identPS and emits the segment.
-// Used by writeNewMetadataSegments when rawIPTC is nil but sibling resources
-// must be preserved (#174).
-func writeIPTCSegmentRaw(w io.Writer, irb []byte) error {
-	if len(identPS)+len(irb)+2 > 65535 {
-		return fmt.Errorf("jpeg: IRB sibling payload %d bytes exceeds APP13 segment limit: %w", len(irb), ErrIPTCPayloadTooLarge)
+// writeIPTCSegmentRaw strips the 0x0404 (IPTC-NAA) resource from origIRB
+// while preserving every other 8BIM sibling resource verbatim, and writes the
+// result as an APP13 segment when any sibling resource remains (#174). No
+// segment is emitted when the strip leaves nothing behind (origIRB carried
+// only the 0x0404 block).
+//
+// #216, #218: the segment header, "Photoshop 3.0\x00" prefix, and the
+// spliced IRB bytes are all built directly in one pooled buffer, so the
+// whole segment leaves in a single w.Write with no single-use intermediate
+// allocation for the IRB bytes themselves.
+func writeIPTCSegmentRaw(w io.Writer, origIRB []byte) error {
+	bufPtr := iobuf.Get(segHeaderSize + len(identPS) + len(origIRB))
+	b := (*bufPtr)[:segHeaderSize+len(identPS)]
+	copy(b[segHeaderSize:], identPS)
+	b = appendSplicedIRB(b, origIRB, nil) // strip 0x0404, keep siblings
+	if len(b) == segHeaderSize+len(identPS) {
+		// Nothing survived the strip: no APP13 segment should be emitted.
+		iobuf.Put(bufPtr)
+		return nil
 	}
-	iptcBuf := iobuf.Get(len(identPS) + len(irb))
-	copy(*iptcBuf, identPS)
-	copy((*iptcBuf)[len(identPS):], irb)
-	writeErr := writeSegment(w, markerAPP13, *iptcBuf)
-	iobuf.Put(iptcBuf)
-	return writeErr
+	bodyLen := len(b) - segHeaderSize
+	if bodyLen+2 > 65535 {
+		iobuf.Put(bufPtr)
+		return fmt.Errorf("jpeg: IRB sibling payload %d bytes exceeds APP13 segment limit: %w", bodyLen-len(identPS), ErrIPTCPayloadTooLarge)
+	}
+	*bufPtr = b
+	return writeHeaderedBuf(w, markerAPP13, bufPtr)
 }
 
 // writeIPTCSegment wraps the IPTC IIM stream in a Photoshop IRB block and
@@ -808,28 +879,63 @@ func writeIPTCSegmentRaw(w io.Writer, irb []byte) error {
 // 8BIM resource in origIRB is copied verbatim (CLAUDE.md §5: write operations
 // must preserve all existing metadata not explicitly modified). When origIRB is
 // nil a bare 0x0404-only IRB is built from rawIPTC.
+//
+// #216, #218: the segment header, "Photoshop 3.0\x00" prefix, and the
+// spliced/built IRB bytes are all appended directly into one pooled buffer,
+// so the whole segment leaves in a single w.Write.
 func writeIPTCSegment(w io.Writer, rawIPTC, origIRB []byte) error {
-	var irb []byte
+	// Upper-bound estimate: identPS + origIRB (block replaced in place, not
+	// grown) + the new 0x0404 wrapper (12-byte header + rawIPTC + 1 pad byte).
+	bufPtr := iobuf.Get(segHeaderSize + len(identPS) + len(origIRB) + len(rawIPTC) + 13)
+	b := (*bufPtr)[:segHeaderSize+len(identPS)]
+	copy(b[segHeaderSize:], identPS)
 	if origIRB != nil {
-		irb = spliceIPTCIntoIRB(origIRB, rawIPTC)
+		b = appendSplicedIRB(b, origIRB, rawIPTC)
 	} else {
-		irb = buildIRB(rawIPTC)
+		b = appendIRBBlock(b, rawIPTC)
 	}
-	if len(identPS)+len(irb)+2 > 65535 {
-		return fmt.Errorf("jpeg: IPTC IRB payload %d bytes exceeds APP13 segment limit: %w", len(irb), ErrIPTCPayloadTooLarge)
+	bodyLen := len(b) - segHeaderSize
+	if bodyLen+2 > 65535 {
+		iobuf.Put(bufPtr)
+		return fmt.Errorf("jpeg: IPTC IRB payload %d bytes exceeds APP13 segment limit: %w", bodyLen-len(identPS), ErrIPTCPayloadTooLarge)
 	}
-	iptcBuf := iobuf.Get(len(identPS) + len(irb))
-	copy(*iptcBuf, identPS)
-	copy((*iptcBuf)[len(identPS):], irb)
-	writeErr := writeSegment(w, markerAPP13, *iptcBuf)
-	iobuf.Put(iptcBuf)
-	return writeErr
+	*bufPtr = b
+	return writeHeaderedBuf(w, markerAPP13, bufPtr)
 }
 
-// spliceIPTCIntoIRB returns a new IRB byte slice that is identical to origIRB
-// except the 0x0404 (IPTC-NAA) resource block is replaced with a freshly built
-// block wrapping newIPTCData. All other 8BIM blocks are appended verbatim in
-// their original order and with their original padding.
+// appendIRBBlock appends a minimal Photoshop IRB block (resource ID 0x0404,
+// empty Pascal name) wrapping iptcData onto dst and returns the extended
+// slice. Produces the same bytes as buildIRB without a single-use allocation
+// when dst already has spare capacity (#218).
+func appendIRBBlock(dst, iptcData []byte) []byte {
+	size := len(iptcData)
+	//nolint:gosec // G115: byte extraction from int size value; shifts are safe bit extractions
+	dst = append(dst,
+		'8', 'B', 'I', 'M', // 8BIM marker
+		0x04, 0x04, // resource ID 0x0404
+		0x00, 0x00, // empty pascal name (length 0 + padding byte)
+		byte(size>>24), byte(size>>16), byte(size>>8), byte(size), // data length
+	)
+	dst = append(dst, iptcData...)
+	if size%2 != 0 {
+		dst = append(dst, 0x00) // pad data to even boundary
+	}
+	return dst
+}
+
+// buildIRB wraps a raw IPTC IIM stream in a minimal Photoshop IRB block
+// (resource ID 0x0404) ready for embedding in APP13.
+func buildIRB(iptcData []byte) []byte {
+	size := len(iptcData)
+	// 4 (8BIM) + 2 (ID) + 2 (empty pascal name) + 4 (data size) + data [+ padding]
+	return appendIRBBlock(make([]byte, 0, 12+size+(size%2)), iptcData)
+}
+
+// appendSplicedIRB appends to dst an IRB byte sequence identical to origIRB
+// except the 0x0404 (IPTC-NAA) resource block is replaced with a freshly
+// built block wrapping newIPTCData; every other 8BIM block is copied
+// verbatim in its original order and with its original padding. Returns the
+// extended slice.
 //
 // When newIPTCData is nil the 0x0404 block is removed rather than replaced.
 // All sibling resources are preserved in both cases. This behaviour is
@@ -837,23 +943,15 @@ func writeIPTCSegment(w io.Writer, rawIPTC, origIRB []byte) error {
 // while keeping Photoshop siblings such as the 0x0425 digest resource.
 //
 // If origIRB contains no 0x0404 block and newIPTCData is non-nil, the new
-// block is appended at the end. If origIRB is malformed and newIPTCData is
-// non-nil, the function falls back to buildIRB(newIPTCData) to ensure the
-// essential IPTC data is never lost.
+// block is appended at the end.
 //
 // EXIF §4.5.6: each 8BIM block is 4 ('8BIM') + 2 (ID) + pascal-name + 4 (size)
 // + data [+ 1 padding if data size is odd].
-func spliceIPTCIntoIRB(origIRB, newIPTCData []byte) []byte {
-	// When newIPTCData is nil the 0x0404 block is removed; no replacement is built.
-	var newBlock []byte
-	if newIPTCData != nil {
-		newBlock = buildIRB(newIPTCData) // the replacement 0x0404 block
-	}
-
-	// Pre-allocate a conservative capacity. The result is at most
-	// len(origIRB) + len(newBlock) (old 0x0404 replaced, not just appended).
-	out := make([]byte, 0, len(origIRB)+len(newBlock))
-
+//
+// #218: appends directly onto the caller's buffer (typically a pooled
+// segment buffer) instead of allocating a new one, eliminating the
+// single-use intermediate that spliceIPTCIntoIRB otherwise requires.
+func appendSplicedIRB(dst, origIRB, newIPTCData []byte) []byte {
 	replaced := false
 	pos := 0
 	for pos < len(origIRB) {
@@ -878,8 +976,11 @@ func spliceIPTCIntoIRB(origIRB, newIPTCData []byte) []byte {
 		}
 
 		if resourceID == 0x0404 {
-			// Replace the IPTC block with the freshly built one.
-			out = append(out, newBlock...)
+			// Replace the IPTC block with a freshly built one, or drop it
+			// entirely when newIPTCData is nil (strip-only mode).
+			if newIPTCData != nil {
+				dst = appendIRBBlock(dst, newIPTCData)
+			}
 			replaced = true
 		} else {
 			// Copy the block verbatim — 8BIM header + data + any padding byte.
@@ -887,19 +988,33 @@ func spliceIPTCIntoIRB(origIRB, newIPTCData []byte) []byte {
 			if blockEnd > len(origIRB) {
 				blockEnd = len(origIRB)
 			}
-			out = append(out, origIRB[entryStart:blockEnd]...)
+			dst = append(dst, origIRB[entryStart:blockEnd]...)
 		}
 
 		pos = blockEnd
 	}
 
-	if !replaced && newBlock != nil {
-		// No 0x0404 block was found in the original IRB and we have a replacement:
-		// append the new one at the end. When newIPTCData is nil (remove-only mode)
-		// there is nothing to append; we just return the siblings-only result.
-		out = append(out, newBlock...)
+	if !replaced && newIPTCData != nil {
+		// No 0x0404 block was found in the original IRB and we have a
+		// replacement: append the new one at the end. When newIPTCData is
+		// nil (remove-only mode) there is nothing to append; dst already
+		// holds the siblings-only result.
+		dst = appendIRBBlock(dst, newIPTCData)
 	}
-	return out
+	return dst
+}
+
+// spliceIPTCIntoIRB returns a new IRB byte slice built by appendSplicedIRB;
+// see that function for the full replacement/removal semantics. Kept as a
+// standalone, freshly-allocated entry point for callers (and tests) that do
+// not have a pooled destination buffer to append into.
+func spliceIPTCIntoIRB(origIRB, newIPTCData []byte) []byte {
+	var newBlockLen int
+	if newIPTCData != nil {
+		newBlockLen = 12 + len(newIPTCData) + len(newIPTCData)%2
+	}
+	out := make([]byte, 0, len(origIRB)+newBlockLen)
+	return appendSplicedIRB(out, origIRB, newIPTCData)
 }
 
 // writeNewMetadataSegments writes EXIF APP1, XMP APP1 (with extended-XMP
@@ -949,15 +1064,11 @@ func writeIPTCOrSiblings(w io.Writer, rawIPTC, origIRB []byte) error {
 		return nil
 	}
 	// rawIPTC is nil but the source had Photoshop siblings: strip only 0x0404
-	// and preserve the rest. spliceIPTCIntoIRB with nil newIPTCData removes
-	// the 0x0404 block and returns the remaining sibling blocks verbatim.
+	// and preserve the rest. writeIPTCSegmentRaw strips the 0x0404 block
+	// internally and emits nothing when no sibling resources remain.
 	// Adobe Photoshop IRB spec §"Image Resources": all non-IPTC resources must
 	// survive a nil-IPTC write (#174).
-	stripped := spliceIPTCIntoIRB(origIRB, nil)
-	if len(stripped) > 0 {
-		return writeIPTCSegmentRaw(w, stripped)
-	}
-	return nil
+	return writeIPTCSegmentRaw(w, origIRB)
 }
 
 // isOldMetadataSegment reports whether a marker+data pair is a metadata
@@ -976,8 +1087,17 @@ func isOldMetadataSegment(marker byte, data []byte) bool {
 }
 
 // writeMarker writes a standalone JPEG marker (FF <marker>) to w.
+//
+// #216: the 2-byte marker is written into a pooled buffer instead of a stack
+// composite literal, which would otherwise escape to the heap on every call
+// through the io.Writer interface boundary.
 func writeMarker(w io.Writer, marker byte) error {
-	if _, err := w.Write([]byte{0xFF, marker}); err != nil {
+	bufPtr := iobuf.Get(2)
+	b := *bufPtr
+	b[0], b[1] = 0xFF, marker
+	_, err := w.Write(b)
+	iobuf.Put(bufPtr)
+	if err != nil {
 		return fmt.Errorf("jpeg: write marker: %w", err)
 	}
 	return nil
@@ -990,13 +1110,13 @@ func writePassThroughSegment(w io.Writer, marker byte, data []byte) error {
 	if data == nil {
 		return writeMarker(w, marker)
 	}
-	return writeSegment(w, marker, data)
+	return writeSegmentCopy(w, marker, data)
 }
 
 // writeSOS writes the SOS segment and then copies the remaining compressed
 // image data from r to w verbatim.
 func writeSOS(r io.Reader, w io.Writer, data []byte) error {
-	if err := writeSegment(w, markerSOS, data); err != nil {
+	if err := writeSegmentCopy(w, markerSOS, data); err != nil {
 		return err
 	}
 	if _, err := io.Copy(w, r); err != nil {
@@ -1061,6 +1181,71 @@ func copyNonMetadataSegments(r io.Reader, w io.Writer, scratch *[]byte, preserve
 			if err := writePassThroughSegment(w, marker, data); err != nil {
 				return err
 			}
+		}
+	}
+}
+
+// irbHasSibling reports whether an IRB payload contains any 8BIM resource
+// other than 0x0404 (IPTC-NAA). It performs no allocation. Used by
+// probeIRBHasSiblings (#217) to decide whether extractOriginalIRB's
+// preserving clone pass is actually necessary.
+func irbHasSibling(b []byte) bool {
+	pos := 0
+	for pos < len(b) {
+		resourceID, data, newPos, ok := parseIRBEntry(b, pos)
+		if !ok {
+			if newPos == pos {
+				pos++
+				continue
+			}
+			break
+		}
+		if resourceID != 0x0404 {
+			return true
+		}
+		pos = newPos
+		if len(data)%2 != 0 {
+			pos++
+		}
+	}
+	return false
+}
+
+// probeIRBHasSiblings performs a single zero-copy read pass over the JPEG's
+// Photoshop APP13 segments to determine whether any of them carries an 8BIM
+// resource besides 0x0404 (a sibling that must survive #174, e.g. the 0x0425
+// IPTC digest, a 0x040C thumbnail, or a 0x040F clipping path).
+//
+// #217: Inject's pre-scan exists solely to preserve such siblings when
+// rawIPTC replaces the 0x0404 block; when no sibling is present the
+// preserving clone pass (extractOriginalIRB) would produce exactly the bytes
+// a bare buildIRB(rawIPTC) already produces, so it is skipped entirely. This
+// probe answers that question with no allocation beyond the caller's
+// existing scratch buffer: each segment's payload is inspected in place and
+// discarded before the next readSegment call.
+//
+// The caller is responsible for seeking r back to the desired position after
+// this call. err is non-nil only for a Seek failure or ErrFileTooLarge (task
+// #262), mirroring extractOriginalIRB.
+func probeIRBHasSiblings(r io.ReadSeeker, scratch *[]byte) (hasSiblings bool, err error) {
+	if _, err := r.Seek(2, io.SeekStart); err != nil {
+		return false, fmt.Errorf("jpeg: seek: %w", err)
+	}
+	for {
+		marker, data, rerr := readSegment(r, scratch)
+		if rerr != nil {
+			if errors.Is(rerr, ErrFileTooLarge) {
+				return false, rerr
+			}
+			return false, nil
+		}
+		switch marker {
+		case markerAPP13:
+			if bytes.HasPrefix(data, identPS) && irbHasSibling(data[len(identPS):]) {
+				return true, nil
+			}
+		case markerSOS, markerEOI:
+			return false, nil
 		}
 	}
 }
@@ -1147,6 +1332,34 @@ done:
 	return combined, nil
 }
 
+// resolveOrigIRB determines the original Photoshop IRB bytes that Inject
+// should use to preserve sibling 8BIM resources (#174) when rawIPTC replaces
+// or removes the 0x0404 block. r must be positioned so that Seek(2,
+// io.SeekStart) lands just past the SOI marker (extractOriginalIRB and
+// probeIRBHasSiblings both seek there themselves).
+//
+// #217: when rawIPTC is a replacement (non-nil), the full preserving clone
+// pass (extractOriginalIRB) is only necessary if the source IRB actually
+// carries a resource besides 0x0404 — otherwise splicing would produce
+// exactly the bytes buildIRB(rawIPTC) already produces on its own.
+// probeIRBHasSiblings answers that question with a single zero-copy pass, so
+// the clone pass runs only when it is actually needed. When rawIPTC is nil
+// (remove-or-strip mode) the clone pass always runs: the stripped result
+// must be known to decide whether any APP13 survives at all.
+func resolveOrigIRB(r io.ReadSeeker, scratch *[]byte, rawIPTC []byte) ([]byte, error) {
+	if rawIPTC == nil {
+		return extractOriginalIRB(r, scratch)
+	}
+	hasSiblings, err := probeIRBHasSiblings(r, scratch)
+	if err != nil {
+		return nil, err
+	}
+	if !hasSiblings {
+		return nil, nil
+	}
+	return extractOriginalIRB(r, scratch)
+}
+
 // Inject reads the JPEG marker stream from r, replaces the relevant APP
 // segments with the provided payloads, and writes the result to w.
 // A nil payload means the corresponding segment is removed.
@@ -1186,18 +1399,20 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 		return fmt.Errorf("jpeg: seek: %w", err)
 	}
 
-	// Pre-scan to capture the original Photoshop IRB (all 8BIM blocks) so that
-	// sibling resources are preserved when we write the new APP13 below.
-	// We use a pooled buffer for this scan only; it is returned before the
-	// second seek so that the main copy loop can reuse its own buffer cleanly.
-	//
-	// #174: always extract origIRB regardless of rawIPTC, so that a nil rawIPTC
-	// can still strip 0x0404 while preserving sibling resources (e.g. 0x0425
-	// IPTC digest). Without this pre-scan the nil-IPTC path drops the whole
-	// APP13, destroying all Photoshop siblings.
-	preScratch := iobuf.Get(4096)
-	origIRB, err := extractOriginalIRB(cr, preScratch)
-	iobuf.Put(preScratch)
+	// #216: acquire one pooled scratch buffer up front and reuse it across
+	// the pre-scan, the SOI read, and the main copy pass. Each phase fully
+	// consumes whatever it reads from scratch before the next phase begins,
+	// so a single buffer is safely reused throughout, eliminating both the
+	// separate stack-allocated SOI array and the extra Get/Put pair two
+	// independently scoped scratch buffers would require.
+	scratch := iobuf.Get(4096)
+	defer iobuf.Put(scratch)
+
+	// #174, #217: determine the original Photoshop IRB so sibling 8BIM
+	// resources survive when rawIPTC replaces or removes the 0x0404 block,
+	// skipping the preserving clone pass when it provably cannot be needed.
+	// See resolveOrigIRB for the full rationale.
+	origIRB, err := resolveOrigIRB(cr, scratch, rawIPTC)
 	if err != nil {
 		return err
 	}
@@ -1207,15 +1422,17 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 		return fmt.Errorf("jpeg: seek: %w", err)
 	}
 
-	// Read and write SOI.
-	soi := [2]byte{}
-	if _, err := io.ReadFull(cr, soi[:]); err != nil {
+	// Read and write SOI using the pooled scratch buffer (#216): avoids the
+	// stack-array escape that occurs when a fixed-size array is passed to
+	// io.Reader/io.Writer through the interface boundary.
+	soi := (*scratch)[:2]
+	if _, err := io.ReadFull(cr, soi); err != nil {
 		return fmt.Errorf("jpeg: read SOI: %w", err)
 	}
 	if soi[0] != 0xFF || soi[1] != markerSOI {
 		return ErrNotJPEG
 	}
-	if _, err := w.Write(soi[:]); err != nil {
+	if _, err := w.Write(soi); err != nil {
 		return fmt.Errorf("jpeg: write segment: %w", err)
 	}
 
@@ -1225,12 +1442,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	}
 
 	// Copy remaining segments, skipping old metadata APP segments.
-	// Use a pooled scratch buffer: data is consumed immediately within each
-	// loop iteration and never stored, so no copying is needed here.
-	injectScratch := iobuf.Get(4096)
-	defer iobuf.Put(injectScratch)
-
-	return copyNonMetadataSegments(cr, w, injectScratch, preserveUnknownSegments)
+	return copyNonMetadataSegments(cr, w, scratch, preserveUnknownSegments)
 }
 
 // writeExtendedXMP splits rawXMP across a main APP1 and one or more extended
@@ -1278,14 +1490,14 @@ func writeExtendedXMP(w io.Writer, rawXMP []byte) error {
 		return fmt.Errorf("jpeg: extended XMP: main XMP stub (%d bytes) exceeds APP1 limit: %w", len(mainXMP), ErrXMPStubTooLarge)
 	}
 
-	// Step 3: write main APP1.
-	mainBuf := iobuf.Get(len(identXMP) + len(mainXMP))
-	copy(*mainBuf, identXMP)
-	copy((*mainBuf)[len(identXMP):], mainXMP)
-	writeErr := writeSegment(w, markerAPP1, *mainBuf)
-	iobuf.Put(mainBuf)
-	if writeErr != nil {
-		return writeErr
+	// Step 3: write main APP1. #216: header + prefix + stub built in one
+	// pooled buffer, one w.Write.
+	bufPtr := iobuf.Get(segHeaderSize + len(identXMP) + len(mainXMP))
+	b := *bufPtr
+	copy(b[segHeaderSize:], identXMP)
+	copy(b[segHeaderSize+len(identXMP):], mainXMP)
+	if err := writeHeaderedBuf(w, markerAPP1, bufPtr); err != nil {
+		return err
 	}
 
 	// Step 4: split rawXMP into extended APP1 chunks.
@@ -1428,28 +1640,6 @@ func parseIRB(b []byte) []byte {
 	return nil
 }
 
-// buildIRB wraps a raw IPTC IIM stream in a minimal Photoshop IRB block
-// (resource ID 0x0404) ready for embedding in APP13.
-func buildIRB(iptcData []byte) []byte {
-	size := len(iptcData)
-	// 4 (8BIM) + 2 (ID) + 2 (empty pascal name) + 4 (data size) + data [+ padding]
-	buf := make([]byte, 0, 12+size+(size%2))
-	// Photoshop IRB header: 8BIM marker, resource ID 0x0404, empty pascal name,
-	// then 4-byte big-endian data length. G115: byte shifts are safe bit extractions.
-	//nolint:gosec // G115: byte extraction from int size value; shifts are safe bit extractions
-	buf = append(buf,
-		'8', 'B', 'I', 'M', // 8BIM marker
-		0x04, 0x04, // resource ID 0x0404
-		0x00, 0x00, // empty pascal name (length 0 + padding byte)
-		byte(size>>24), byte(size>>16), byte(size>>8), byte(size), // data length
-	)
-	buf = append(buf, iptcData...)
-	if size%2 != 0 {
-		buf = append(buf, 0x00) // pad data to even boundary
-	}
-	return buf
-}
-
 // skipFillBytes reads consecutive 0xFF fill bytes from r into hdr[1], advancing
 // past padding bytes until hdr[1] holds a non-0xFF marker byte.
 // JPEG ISO/IEC 10918-1 §B.1.1.2: fill bytes are allowed before any marker.
@@ -1513,9 +1703,16 @@ func readSegment(r io.Reader, scratch *[]byte) (marker byte, data []byte, err er
 		// valid reference to the old backing array until the next Get recycles it.
 		// Without this Put the original 4096-byte pooled buffer is silently
 		// abandoned, depleting the pool under sustained load. (#77)
+		//
+		// #214: the replacement buffer is drawn from iobuf's large pool
+		// instead of a bare make([]byte, need). Every APP1/APP13/APP2 segment
+		// over 4 KiB (EXIF, XMP, ICC profiles — common in real-world photos)
+		// grows scratch on every readSegment call; sourcing the growth from
+		// the pool lets that buffer be reused across calls instead of
+		// allocating fresh heap memory each time.
 		old := *scratch
 		iobuf.Put(&old)
-		*scratch = make([]byte, need)
+		*scratch = *iobuf.Get(need)
 	}
 	data = (*scratch)[:need]
 	if _, err = io.ReadFull(r, data); err != nil {
@@ -1527,6 +1724,8 @@ func readSegment(r io.Reader, scratch *[]byte) (marker byte, data []byte, err er
 // writeSegment writes a JPEG marker segment to w.
 // Returns an error if the total segment length (data + 2-byte length field)
 // would exceed the 16-bit field maximum of 65535. JPEG ISO/IEC 10918-1 §B.1.1.4.
+//
+//nolint:unparam // #216 moved every production hot-path caller to writeHeaderedBuf/writeSegmentCopy; writeSegment remains a correct, spec-tested two-write generic segment writer, exercised only by fixed-marker tests today.
 func writeSegment(w io.Writer, marker byte, data []byte) error {
 	length := len(data) + 2 // length field includes its own 2 bytes
 	if length > 65535 {
@@ -1542,6 +1741,61 @@ func writeSegment(w io.Writer, marker byte, data []byte) error {
 		}
 	}
 	return nil
+}
+
+// segHeaderSize is the length in bytes of a JPEG marker segment header
+// (0xFF, marker, 2-byte length). JPEG ISO/IEC 10918-1 §B.1.1.4.
+const segHeaderSize = 4
+
+// stampSegmentHeader writes the 4-byte JPEG segment header into buf[0:4].
+// buf must be at least segHeaderSize bytes; buf[segHeaderSize:] is treated as
+// the segment body for the purpose of the length calculation. Returns
+// ErrSegmentTooLarge if the encoded length would exceed the 16-bit JPEG
+// segment length field. JPEG ISO/IEC 10918-1 §B.1.1.4.
+func stampSegmentHeader(buf []byte, marker byte) error {
+	bodyLen := len(buf) - segHeaderSize
+	length := bodyLen + 2 // length field includes its own 2 bytes
+	if length > 65535 {
+		return fmt.Errorf("jpeg: segment 0x%02X payload %d bytes exceeds 65535-byte APP segment limit: %w", marker, bodyLen, ErrSegmentTooLarge)
+	}
+	buf[0] = 0xFF
+	buf[1] = marker
+	buf[2] = byte(length >> 8)
+	buf[3] = byte(length) //nolint:gosec // G115: length <= 65535, fits in a byte after the shift/truncation above
+	return nil
+}
+
+// writeHeaderedBuf stamps the JPEG segment header into (*bufPtr)[0:segHeaderSize]
+// and writes the entire buffer (header + body) to w in a single Write call,
+// then returns bufPtr to the pool exactly once regardless of outcome.
+//
+// #216: callers that already hold a pooled buffer with segHeaderSize bytes of
+// head-room reserved before the body use this instead of writeSegment, which
+// otherwise requires a second, stack-allocated header array that escapes to
+// the heap on every call through the io.Writer interface boundary.
+func writeHeaderedBuf(w io.Writer, marker byte, bufPtr *[]byte) error {
+	buf := *bufPtr
+	if err := stampSegmentHeader(buf, marker); err != nil {
+		iobuf.Put(bufPtr)
+		return err
+	}
+	_, err := w.Write(buf)
+	iobuf.Put(bufPtr)
+	if err != nil {
+		return fmt.Errorf("jpeg: write segment: %w", err)
+	}
+	return nil
+}
+
+// writeSegmentCopy writes marker+data as a single JPEG segment, copying data
+// into a freshly pooled header+body buffer so the header and body leave in
+// one w.Write call. Used for pass-through segments (#216) where data aliases
+// the caller's scratch buffer and was not originally built with head-room for
+// the header.
+func writeSegmentCopy(w io.Writer, marker byte, data []byte) error {
+	bufPtr := iobuf.Get(segHeaderSize + len(data))
+	copy((*bufPtr)[segHeaderSize:], data)
+	return writeHeaderedBuf(w, marker, bufPtr)
 }
 
 // extractGUIDFromMain locates the HasExtendedXMP attribute in the main XMP

@@ -358,6 +358,98 @@ via `parseStructKey`) and excludes it before checking the 8x bound.
 `govulncheck ./...` 0 reachable vulnerabilities; `FuzzParseXMP` 60s,
 ~19.3M execs, 0 crashes, 0 invariant violations.
 
+### Batch B (tasks #214, #215, #216, #217, #218, #238, #239) — 2026-09-25
+
+Go version go1.27.1, `cpu: Apple M4`. `format/jpeg/` read/write hot path plus
+the root `extractByFormat` dispatch and a new zero-copy `Metadata` accessor.
+
+#### Benchstat — `format/jpeg` (-count=10)
+
+| Benchmark | ns/op before → after | B/op before → after | allocs/op before → after |
+|---|---|---|---|
+| JPEGExtract | 140.3n → 129.4n (**−7.80%**) | 120 → 104 (**−13.33%**) | 4 → 3 (**−25.00%**) |
+| JPEGInject | 327.6n → 289.9n (**−11.49%**) | 376 → 288 (**−23.40%**) | 10 → 4 (**−60.00%**) |
+| JPEGInject_NoAPP13 | 257.3n → 243.6n (**−5.33%**) | 304 → 288 (**−5.26%**) | 8 → 4 (**−50.00%**) |
+| JPEGExtract_Real | 2.120µ → 1.616µ (**−23.78%**) | 15.38Ki → 9.03Ki (**−41.30%**) | 8 → 6 (**−25.00%**) |
+
+All four `p=0.000, n=10`; geomean −12.40% ns/op, −22.05% B/op, −42.09% allocs/op.
+
+#### Benchstat — root package, `Read_JPEG_ExtendedXMP*` (-count=10)
+
+New synthetic fixture (`buildJPEGWithExtendedXMP`) carrying an attribute-form
+`xmpNote:HasExtendedXMP` GUID and a full, independently parseable extended
+XMP document, so the benchmark actually exercises
+`reassembleExtendedXMPByParse` (parse + merge + re-encode) rather than the
+byte-splice fallback.
+
+| Benchmark | ns/op before → after | B/op before → after | allocs/op before → after |
+|---|---|---|---|
+| Read_JPEG_ExtendedXMP (default) | 5.526µ → 5.605µ (+1.43%, noise) | 9.351Ki → 9.352Ki (~) | 40 → 40 (~) |
+| Read_JPEG_ExtendedXMP_WithoutXMP | 3805n → 682n (**−82.08%**) | 8.144Ki → 2.985Ki (**−63.34%**) | 33 → 16 (**−51.52%**) |
+
+Default read unchanged (p=0.043 but within noise band; B/op and allocs/op
+identical); `WithoutXMP` drops sharply once extraction itself skips the
+reassembly, on top of the pre-existing parse skip.
+
+#### #239 — `Metadata.RawSegments` (new accessor, no prior baseline)
+
+`BenchmarkRawSegments`, -count=10: **0.26 ns/op, 0 B/op, 0 allocs/op** (AC: 0 allocs/op — met).
+
+#### Per-task notes
+
+- **#214** (`readSegment` scratch growth via `iobuf.Get`): every segment over
+  4 KiB (EXIF/XMP/ICC) now grows from the large pool instead of a bare
+  `make`. Evidenced by `JPEGExtract_Real` (real corpus file with large
+  segments): −41.30% B/op, −25.00% allocs/op.
+- **#215** (drop the redundant IPTC clone): the single-payload IRB read path
+  returns the 0x0404 sub-slice of the already-cloned `app13Payloads[0]`
+  directly instead of cloning it again — 1 clone fewer per file, folded into
+  the `JPEGExtract`/`JPEGExtract_Real` deltas above. `RawIPTC()` round-trips
+  byte-identically; #174 sibling tests pass.
+- **#216** (stop fixed-array heap escapes in the write helpers): SOI now reads
+  into `Inject`'s pooled scratch; every segment header (new or pass-through)
+  is stamped directly into a pooled buffer and written in one `w.Write`
+  (`writeHeaderedBuf`/`writeSegmentCopy`); `writeMarker` uses a pooled 2-byte
+  buffer. `writeSegment` itself is untouched and remains covered by its
+  existing direct tests. Reflected in the `JPEGInject`/`JPEGInject_NoAPP13`
+  allocs/op drop above.
+- **#217** (skip the Inject pre-scan clone when nothing needs preserving):
+  `probeIRBHasSiblings` performs one zero-copy pass; the cloning
+  `extractOriginalIRB` pass now only runs when a sibling 8BIM resource is
+  actually present or `rawIPTC` is nil. `JPEGInject_NoAPP13` (no source
+  APP13 at all) shows the full effect; #174 sibling-preservation tests
+  (`jpeg_task77`, `jpeg_irb_task52`, 0x0425 survival) still pass.
+- **#218** (build the spliced IRB directly in the pooled output buffer):
+  `appendSplicedIRB`/`appendIRBBlock` append straight into the segment
+  buffer reserved by `writeIPTCSegment`/`writeIPTCSegmentRaw` instead of
+  allocating a single-use IRB buffer that is then copied again;
+  `spliceIPTCIntoIRB`/`buildIRB` remain as thin, freshly-allocating wrappers
+  for their existing direct unit tests. Folded into the `JPEGInject` allocs/op
+  drop (10 → 4) above; IRB output byte-identical.
+- **#238** (skip extraction of segments excluded by Without{EXIF,IPTC,XMP}):
+  `jpeg.ExtractFullSelective(r, wantIPTC, wantXMP)` (thin-wrapped by the
+  unchanged `ExtractFull`) skips the 0x0425 IPTC digest clone when IPTC is
+  unwanted and the extended-XMP reassembly when XMP is unwanted; `rawEXIF`
+  and `rawIPTC` are always extracted (required for unmodified-Write
+  pass-through). Scope note: only the JPEG path was changed — the other
+  format packages' `Extract` functions have no comparable reassembly cost to
+  skip. See the `Read_JPEG_ExtendedXMP*` table above for the effect.
+- **#239** (zero-copy read-only raw segment accessor, additive/user-authorised):
+  `Metadata.RawSegments()` returns `(rawEXIF, rawIPTC, rawXMP)` aliasing `m`'s
+  own storage with a documented must-not-mutate contract; existing
+  `RawEXIF`/`RawIPTC`/`RawXMP` and the #139 mutation-safety tests unchanged.
+
+#### Gate
+
+`go build`/`go vet` clean; `go test ./...` and `go test -race ./...` green
+(all packages); `golangci-lint run ./...` 0 new issues (6 pre-existing
+issues remain, all in files untouched by this batch); `staticcheck ./...`
+clean; `govulncheck ./...` could not run in this environment (govulncheck
+binary built against an older Go source-processing API than the installed
+go1.27.1 toolchain — pre-existing environment mismatch, unrelated to this
+batch); `FuzzJPEGExtract` and `FuzzJPEGInject` both ran 60s clean (0
+crashes).
+
 ## [main — perf task #198] — 2026-06-10 (exif: parse-level arena for sub-IFDs)
 
 ### Optimisations applied in this version

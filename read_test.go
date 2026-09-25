@@ -84,6 +84,34 @@ func TestRawAccessors(t *testing.T) {
 	}
 }
 
+// TestRawSegments verifies the additive #239 zero-copy accessor: it must
+// return the same bytes as the cloning RawEXIF/RawIPTC/RawXMP accessors
+// without allocating, and must not disturb them.
+func TestRawSegments(t *testing.T) {
+	t.Parallel()
+	tiff := minimalTIFFPayload()
+	jpeg := buildMinimalJPEG(tiff)
+
+	m, err := Read(bytes.NewReader(jpeg))
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+
+	rawEXIF, rawIPTC, rawXMP := m.RawSegments()
+	if !bytes.Equal(rawEXIF, m.RawEXIF()) {
+		t.Errorf("RawSegments() EXIF = %v, want equal to RawEXIF()", rawEXIF)
+	}
+	if !bytes.Equal(rawIPTC, m.RawIPTC()) {
+		t.Errorf("RawSegments() IPTC = %v, want equal to RawIPTC()", rawIPTC)
+	}
+	if !bytes.Equal(rawXMP, m.RawXMP()) {
+		t.Errorf("RawSegments() XMP = %v, want equal to RawXMP()", rawXMP)
+	}
+	if rawEXIF == nil {
+		t.Error("RawSegments() EXIF = nil, want non-nil")
+	}
+}
+
 func TestRawAccessorsNoMetadata(t *testing.T) {
 	t.Parallel()
 	jpeg := buildMinimalJPEG(nil)

@@ -161,6 +161,25 @@ func (m *Metadata) RawIPTC() []byte { return bytes.Clone(m.rawIPTC) }
 // #139: returns bytes.Clone(m.rawXMP) for the same defensive-copy rationale as RawEXIF.
 func (m *Metadata) RawXMP() []byte { return bytes.Clone(m.rawXMP) }
 
+// RawSegments returns read-only, zero-copy views of the raw EXIF, IPTC, and
+// XMP segment bytes exactly as stored on m. Any of the three may be nil when
+// that segment is absent from the container.
+//
+// Unlike RawEXIF, RawIPTC, and RawXMP, the returned slices alias m's own
+// internal storage and perform no allocation. The caller MUST NOT modify,
+// append to, or retain them past any subsequent mutation of m (a Set* call,
+// or passing m to Write) — doing so is undefined behaviour and may corrupt
+// m's internal relocation state or a concurrent Write call (see the #139
+// mutation-safety rationale on RawEXIF).
+//
+// Use this accessor for read-only, allocation-sensitive callers (e.g.
+// hashing or comparing raw bytes across many images in a loop). Use RawEXIF,
+// RawIPTC, and RawXMP when you need an owned copy safe to mutate or retain
+// independently of m.
+func (m *Metadata) RawSegments() (rawEXIF, rawIPTC, rawXMP []byte) {
+	return m.rawEXIF, m.rawIPTC, m.rawXMP
+}
+
 // iptcTrustElevated reports whether IPTC should take read priority over XMP
 // for fields where both are present and carry different values.
 //

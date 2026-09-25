@@ -25,14 +25,14 @@ both in the same step.
 | `File` | `path` | 75 | `path, name, package, gitCommit, gitDate` |
 | `Type` | `name`+`package` | 34 | `name, package, file, kind, exported, gitCommit, gitDate` |
 | `Function` | `name`+`package` | 11 | `name, package, file, line, signature, kind, gitCommit, gitDate` |
-| `Feature` | `name` | 34 | `name, id, description, domain, package, file, spec_ref, type, task, sprint, commit_introduced, commit_fixed, gitCommit, gitDate` |
+| `Feature` | `name` | 34 | `name, id, description, domain, package, file, spec_ref, type, status, task, sprint, commit_introduced, commit_fixed, gitCommit, gitDate` |
 | `FuzzTarget` | `name` | 27 | `name, package, file, invariant, gitCommit, gitDate` |
 | `Benchmark` | `name` | 60 | `name, package, file, commit_introduced, gitCommit, gitDate` |
 | `Spec` | `name` | 9 | `name, standard, ref, domain, gitCommit, gitDate` |
-| `Commit` | `hash` | 12 | `hash, short_hash, message, author, date, scope, sprint, branch, parent, fixes_tasks, gates, gitCommit, gitDate` |
+| `Commit` | `hash` | 12 | `hash, short_hash, message, author, date, scope, sprint, branch, parent, fixes_tasks, tasks_verified_closed, tasks_still_open, verified_date, gates, gitCommit, gitDate` |
 | `Test` | `name` | ~4 | `name, package, file, type, description, commit_introduced, gitCommit, gitDate` |
 | `FormatCapability` | `format` | 13 | `format, extensions, read, write, exif, iptc, xmp, container, gitCommit, gitDate` |
-| `Audit` | `key` | 4 | `key, date, scope, method, baseline, prior_audit, critical, high, medium, low, findings_new, new_tasks, sprints, status, remediation_commits, remediation_date, confirmed_live, closed_verified_fixed, headlines, gitCommit, gitDate` |
+| `Audit` | `key` | 4 | `key, date, scope, method, baseline, prior_audit, critical, high, medium, low, findings_new, new_tasks, sprints, status, remediation_commits, remediation_date, confirmed_live, closed_verified_fixed, open_tasks, headlines, gitCommit, gitDate` |
 | `ConformanceBattery` | `name` | 1 | `name, id, package, file, ruleCount, ruleSections, defectsFixed, status, commitHash, completedDate` |
 | `Milestone` | `name` | 1 | `name, kind, verdict, date, head, sprint, dimensions, note, release_*, released, pushed_remotes` — a project-level checkpoint (e.g. production-readiness verdict) |
 
@@ -41,6 +41,8 @@ both in the same step.
 ### Property conventions (added 2026-09-25)
 - `Commit.fixes_tasks` — comma-separated rmp task ids the commit closes (the task↔commit link; rmp tasks are not graph nodes). `Commit.sprint` — rmp sprint id. `Commit.parent` — short hash of the git parent.
 - `Feature.type` values include `capability`, `feature`, `fix`, `bug_fix`, `security_cap`, `internal_field`, `struct_field`, and `perf` (an allocation/latency optimisation; `task` = rmp task id; evidence in `BENCHMARKS.md`).
+- `Feature.type = known_bug` — an open defect tracked as an rmp backlog task (`task` = its id); `Feature.status` = `open` | `fixed`. Tests guarding it link via `TESTS`.
+- `Commit.tasks_verified_closed` / `Commit.tasks_still_open` — comma-separated rmp task ids confirmed closed / still open after post-hoc verification of the commit's claimed fixes; `Commit.verified_date` — ISO date of that verification. `Audit.open_tasks` — remediation task ids of the audit still open.
 - `Function.kind`: `api` (public entry point), `exported` (exported non-root symbol), `internal` (unexported symbol, modelled only when it implements a tracked `Feature`). `Function.line` = declaration line.
 
 ### `layer` values for `Package`

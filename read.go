@@ -93,7 +93,13 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 	// present (JPEG only; nil for all other formats). MWG §3.3.1.
 	// xmpTruncated is set when extended XMP was capped or had invalid layout (#134).
 	// noCMT1Box is set when a CR3 file has no CMT1 sub-box (audit #138).
-	rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, noCMT1Box, err := extractByFormat(r, fmtID)
+	// #238: pass the wanted-segments mask so extraction can skip work that
+	// only feeds a segment the caller opted out of via WithoutIPTC/WithoutXMP
+	// (currently meaningful for JPEG only: the 0x0425 IPTC digest and the
+	// extended-XMP reassembly). rawEXIF and rawIPTC are always extracted
+	// regardless — they must remain available for an unmodified Write to
+	// pass through byte-for-byte.
+	rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, noCMT1Box, err := extractByFormat(r, fmtID, !cfg.lazyIPTC, !cfg.lazyXMP)
 	if err != nil {
 		return nil, err
 	}
@@ -322,9 +328,15 @@ func ReadFile(path string, opts ...ReadOption) (*Metadata, error) {
 // noCMT1Box is true when a CR3 file has a valid moov/UUID structure but no
 // CMT1 sub-box (audit #138). rawEXIF is nil; rawXMP is still returned when
 // an "XMP " sub-box was present. The caller converts it to a ParseWarning.
-func extractByFormat(r io.ReadSeeker, fmtID format.FormatID) (rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire []byte, xmpTruncated, noCMT1Box bool, err error) {
+//
+// wantIPTC and wantXMP (#238) are forwarded to jpeg.ExtractFullSelective so
+// the JPEG extractor can skip the 0x0425 IPTC digest and/or the extended-XMP
+// reassembly when the caller has opted out of that segment. Other formats do
+// not yet have an equivalent selective-extraction path (their raw-segment
+// extraction has no comparable reassembly cost) and are unaffected.
+func extractByFormat(r io.ReadSeeker, fmtID format.FormatID, wantIPTC, wantXMP bool) (rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire []byte, xmpTruncated, noCMT1Box bool, err error) {
 	if fmtID == format.FormatJPEG {
-		rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, err = jpeg.ExtractFull(r)
+		rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, err = jpeg.ExtractFullSelective(r, wantIPTC, wantXMP)
 		if err != nil {
 			return nil, nil, nil, nil, nil, false, false, fmt.Errorf("gometadata: %w", err)
 		}
