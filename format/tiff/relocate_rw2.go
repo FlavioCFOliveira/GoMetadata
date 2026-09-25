@@ -264,7 +264,7 @@ func relocateTIFFFromParsedRW2(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 	updatePlaceholders(mainBlocks, offsetValueSlices, order)
 
 	// ── Step 8b: patch SubIFD raw bytes ──────────────────────────────────────
-	patchSubIFDImageOffsets(subIFDs, allBlocks, false, order)
+	patchSubIFDImageOffsets(subIFDs, false, order)
 
 	// ── Step 9: re-encode → finalTIFF ────────────────────────────────────────
 	// exif.Encode produces: "II" + 0x2A 0x00 + IFD0_off=8 + IFD block.

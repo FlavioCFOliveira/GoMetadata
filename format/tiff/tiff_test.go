@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"math"
+	"os"
 	"testing"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
@@ -212,9 +213,31 @@ func BenchmarkTIFFExtract(b *testing.B) {
 	iptc := []byte("some-iptc-payload-data-for-benchmarking")
 	xmp := []byte("<xmpmeta xmlns:x=\"adobe:ns:meta/\"/>")
 	data := buildMinimalTIFF(binary.LittleEndian, iptc, xmp)
-	// #236: reader constructed once outside the loop and rewound via Seek per
-	// iteration so the artificial bytes.Reader allocation does not inflate
-	// the allocs/op reported for Extract itself.
+	// The reader is built once and rewound per iteration so its allocation
+	// is not counted against Extract.
+	r := bytes.NewReader(data)
+	b.SetBytes(int64(len(data)))
+	b.ResetTimer()
+	for range b.N {
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
+	}
+}
+
+// realFileForBenchmark is the multi-megabyte corpus TIFF used by
+// BenchmarkTIFFExtractRealFile, where per-byte read costs dominate.
+const realFileForBenchmark = "../../testdata/corpus/tiff/metadata-extractor/Nikon D300.tif"
+
+// BenchmarkTIFFExtractRealFile measures Extract on a real, multi-megabyte TIFF
+// file. Skips when the corpus file is not present (corpus files are
+// downloaded separately; see internal/testutil.CorpusFiles).
+func BenchmarkTIFFExtractRealFile(b *testing.B) {
+	data, err := os.ReadFile(realFileForBenchmark)
+	if err != nil {
+		b.Skipf("corpus file %s not present: %v", realFileForBenchmark, err)
+	}
+	// The reader is built once and rewound per iteration so its allocation
+	// is not counted against Extract.
 	r := bytes.NewReader(data)
 	b.SetBytes(int64(len(data)))
 	b.ResetTimer()

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"os"
 	"testing"
 )
 
@@ -440,5 +441,25 @@ func BenchmarkORFInject(b *testing.B) {
 		_, _ = r.Seek(0, io.SeekStart)
 		var out bytes.Buffer
 		_ = Inject(r, &out, nil, nil, nil, true)
+	}
+}
+
+// realORFForBenchmark is a real, multi-megabyte ORF file for
+// BenchmarkORFExtractRealFile, where per-byte costs dominate.
+const realORFForBenchmark = "../../../testdata/corpus/raw/metadata-extractor/Olympus TG-4.orf"
+
+// BenchmarkORFExtractRealFile measures Extract on a real ORF file. Skips when
+// the corpus file is not present (corpus files are downloaded separately).
+func BenchmarkORFExtractRealFile(b *testing.B) {
+	data, err := os.ReadFile(realORFForBenchmark)
+	if err != nil {
+		b.Skipf("corpus file %s not present: %v", realORFForBenchmark, err)
+	}
+	r := bytes.NewReader(data)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
 	}
 }

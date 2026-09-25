@@ -5,12 +5,15 @@ package tiff
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"slices"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/tiffscan"
 )
 
 // xmpWireFrameMagic is the 8-byte sentinel that identifies a JPEG extended-XMP
@@ -38,6 +41,22 @@ func rejectWireFrameXMP(rawXMP []byte) error {
 	return nil
 }
 
+// readInput reads the whole of r from its current position. The read is
+// capped at maxFileSize bytes (#140) so that an oversized or infinite
+// reader cannot trigger unbounded heap allocation; ErrFileTooLarge is
+// returned before any parsing takes place. A seekable reader is read with a
+// single allocation of its exact size (iobuf.ReadAll).
+func readInput(r io.ReadSeeker) ([]byte, error) {
+	data, err := iobuf.ReadAll(r, maxFileSize)
+	if err != nil {
+		if errors.Is(err, iobuf.ErrTooLarge) {
+			return nil, fmt.Errorf("tiff: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
+		}
+		return nil, fmt.Errorf("tiff: read: %w", err)
+	}
+	return data, nil
+}
+
 // Extract reads metadata payloads from a TIFF container.
 // rawEXIF is the entire TIFF byte stream (TIFF itself is the EXIF container).
 // rawIPTC and rawXMP are read from the respective IFD0 tags.
@@ -46,16 +65,9 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, fmt.Errorf("tiff: seek: %w", err)
 	}
 
-	// #140 fix: cap the read to maxFileSize+1 bytes so that an oversized or
-	// infinite streaming reader cannot trigger unbounded heap allocation.
-	// If the reader delivers more than maxFileSize bytes the file is rejected
-	// with ErrFileTooLarge before any further parsing takes place.
-	data, err := io.ReadAll(io.LimitReader(r, maxFileSize+1))
+	data, err := readInput(r)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("tiff: read: %w", err)
-	}
-	if int64(len(data)) > maxFileSize {
-		return nil, nil, nil, fmt.Errorf("tiff: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
+		return nil, nil, nil, err
 	}
 	if len(data) < 8 {
 		return nil, nil, nil, ErrFileTooShort
@@ -132,7 +144,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 // blocks), image block enumeration will fail with ErrBlockOutOfBounds. Callers
 // that hold the original TIFF bytes AND a modified *exif.EXIF struct (e.g. the
 // gometadata.Write path) must use InjectWithEXIF instead.
-func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ bool) error { //nolint:gocyclo,cyclop // LimitReader guard added by #140 pushed complexity to 11; inherent nil-dispatch logic
+func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ bool) error { //nolint:cyclop // inherent nil-dispatch logic
 	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads before
 	// proceeding. The wire-frame encoding (magic 0x00XMPEXT\x00) is specific to
 	// JPEG APP1 and cannot be stored in TIFF tag 0x02BC. Writing it verbatim
@@ -151,15 +163,10 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ boo
 	if rawEXIF != nil {
 		base = rawEXIF
 	} else {
-		// #140 fix: cap the read to maxFileSize+1 bytes so that an oversized or
-		// infinite streaming reader cannot trigger unbounded heap allocation.
 		var err error
-		base, err = io.ReadAll(io.LimitReader(r, maxFileSize+1))
+		base, err = readInput(r)
 		if err != nil {
-			return fmt.Errorf("tiff: read: %w", err)
-		}
-		if int64(len(base)) > maxFileSize {
-			return fmt.Errorf("tiff: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
+			return err
 		}
 	}
 
@@ -704,94 +711,11 @@ func byteOrder(b []byte) (binary.ByteOrder, error) {
 	return nil, fmt.Errorf("tiff: invalid byte order marker %q: %w", b[:2], ErrInvalidByteOrder)
 }
 
-// extractTagValues scans IFD0 for IPTC (0x83BB) and XMP (0x02BC) tags
-// and returns their raw byte values.
-func extractTagValues(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawIPTC, rawXMP []byte) { //nolint:gocyclo // IPTC trimming branch is inherent to TypeLong-vs-TypeUndefined handling; extracting a helper would reduce clarity
-	// Security audit FIX 5 (CWE-681/190): compare in uint64, not int, before
-	// converting ifd0Off to int. On a 32-bit platform (GOARCH=386/arm),
-	// int(ifd0Off) for ifd0Off >= 2^31 is negative, which would let a bad
-	// offset pass an int-typed bound check and then panic on data[ifd0Off:].
-	// Mirrors the #74 fix in format/detect.go's parseClassicTIFFIFD0 and the
-	// #45 fix in format/jpeg's parseIRBEntry.
-	if uint64(ifd0Off)+2 > uint64(len(data)) {
-		return nil, nil
-	}
-	count := int(order.Uint16(data[ifd0Off:]))
-	// ifd0Off ≤ uint64(len(data))-2, and len(data) is a valid int on this
-	// platform, so ifd0Off < len(data) fits int safely here.
-	pos := int(ifd0Off) + 2
-
-	for i := 0; i < count; i++ { //nolint:intrange,modernize // binary parser: loop variable is a byte-slice offset multiplier
-		e := pos + i*12
-		if e+12 > len(data) {
-			break
-		}
-		tag := order.Uint16(data[e:])
-		typ := order.Uint16(data[e+2:])
-		cnt := order.Uint32(data[e+4:])
-
-		var v []byte
-		sz := typeSize(typ)
-		if sz == 0 {
-			continue
-		}
-		total := uint64(sz) * uint64(cnt)
-		if total <= 4 {
-			v = data[e+8 : e+8+int(total)]
-		} else {
-			off := order.Uint32(data[e+8:])
-			// Guard against integer overflow: check before computing end.
-			if uint64(off) > uint64(len(data)) || total > uint64(len(data))-uint64(off) {
-				continue
-			}
-			v = data[uint64(off) : uint64(off)+total]
-		}
-
-		switch tag {
-		case 0x83BB: // IPTC-NAA
-			// ROBUST-16 (iptc.md §5): strip trailing 0x00 bytes ONLY for TypeLong
-			// (typ == 4) because TypeLong IPTC is padded to a 4-byte boundary by
-			// the writer (TIFF 6.0 §2: Count = number of uint32 elements). Those
-			// padding bytes are structural artefacts, not IPTC data.
-			//
-			// For TypeByte (1) and TypeUndefined (7) do NOT strip: a valid IPTC
-			// payload may legitimately end in 0x00 (e.g. a NUL-terminated text
-			// field value). bytes.TrimRight on those types silently corrupted
-			// payloads whose last dataset value ended with 0x00 (task #153).
-			//
-			// The IIM scanner naturally skips non-0x1C bytes (IIM §1.6), so any
-			// residual TypeLong padding bytes are harmless after trimming only
-			// the known structural zeros.
-			if len(v) > 0 {
-				if typ == 4 { // TypeLong: trim structural alignment padding
-					rawIPTC = trimIPTCLongPadding(v)
-				} else {
-					rawIPTC = v // TypeByte / TypeUndefined: no trim (ROBUST-16)
-				}
-				if len(rawIPTC) == 0 {
-					rawIPTC = nil
-				}
-			}
-		case 0x02BC: // XMP
-			rawXMP = v
-		}
-	}
-	return rawIPTC, rawXMP
-}
-
-// trimIPTCLongPadding trims trailing 0x00 alignment-padding bytes from an IPTC
-// payload stored as TypeLong. TypeLong pads the value to the next 4-byte
-// boundary; those trailing zeros are never valid IIM dataset prefixes (0x1C)
-// and are safe to remove. This function is ONLY called for TypeLong (typ == 4);
-// TypeByte and TypeUndefined payloads are not trimmed (ROBUST-16, task #153).
-func trimIPTCLongPadding(v []byte) []byte {
-	// Walk backwards from the end of v, stripping zero bytes until we hit a
-	// non-zero byte or exhaust the slice.
-	end := len(v)
-	for end > 0 && v[end-1] == 0x00 {
-		end--
-	}
-	return v[:end]
+// extractTagValues scans IFD0 for the IPTC (0x83BB) and XMP (0x02BC) tags
+// and returns their raw byte values, using the shared tiffscan scanner with
+// this package's type table (type 13 is the 4-byte TIFF Extensions IFD type).
+func extractTagValues(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawIPTC, rawXMP []byte) {
+	return tiffscan.ExtractTagValues(data, ifd0Off, order, true)
 }
 
 // typeSize returns the byte size of a single value for the given TIFF type.
@@ -1021,7 +945,7 @@ func extractTagValuesBigTIFF(data []byte, ifd0Off uint64, order binary.ByteOrder
 			// as-is. Same logic as the classic-TIFF path. Task #153.
 			if len(v) > 0 {
 				if typ == 4 { // TypeLong: trim structural alignment padding
-					rawIPTC = trimIPTCLongPadding(v)
+					rawIPTC = tiffscan.TrimIPTCLongPadding(v)
 				} else {
 					rawIPTC = v // TypeByte / TypeUndefined: no trim (ROBUST-16)
 				}

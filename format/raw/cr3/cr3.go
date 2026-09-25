@@ -17,26 +17,44 @@ var canonUUID = []byte{ //nolint:gochecknoglobals // package-level constant byte
 	0x81, 0x11, 0xF4, 0xCE, 0x46, 0x2B, 0x6A, 0x48,
 }
 
+// ISOBMFF box types compared against parseCR3BoxHeader's [4]byte result
+// (ISO 14496-12 §4.2: the box type is a 4-byte code). Never mutated.
+var (
+	boxMoov = [4]byte{'m', 'o', 'o', 'v'} //nolint:gochecknoglobals // package-level constant box type; never mutated
+	boxTrak = [4]byte{'t', 'r', 'a', 'k'} //nolint:gochecknoglobals // package-level constant box type; never mutated
+	boxMdia = [4]byte{'m', 'd', 'i', 'a'} //nolint:gochecknoglobals // package-level constant box type; never mutated
+	boxMinf = [4]byte{'m', 'i', 'n', 'f'} //nolint:gochecknoglobals // package-level constant box type; never mutated
+	boxStbl = [4]byte{'s', 't', 'b', 'l'} //nolint:gochecknoglobals // package-level constant box type; never mutated
+	boxUdta = [4]byte{'u', 'd', 't', 'a'} //nolint:gochecknoglobals // package-level constant box type; never mutated
+	boxStco = [4]byte{'s', 't', 'c', 'o'} //nolint:gochecknoglobals // package-level constant box type; never mutated
+	boxCo64 = [4]byte{'c', 'o', '6', '4'} //nolint:gochecknoglobals // package-level constant box type; never mutated
+	boxUUID = [4]byte{'u', 'u', 'i', 'd'} //nolint:gochecknoglobals // package-level constant box type; never mutated
+	boxCMT1 = [4]byte{'C', 'M', 'T', '1'} //nolint:gochecknoglobals // package-level constant box type; never mutated
+	boxCMT2 = [4]byte{'C', 'M', 'T', '2'} //nolint:gochecknoglobals // package-level constant box type; never mutated
+	boxXMP  = [4]byte{'X', 'M', 'P', ' '} //nolint:gochecknoglobals // package-level constant box type; never mutated
+)
+
 // parseCR3BoxHeader reads an ISOBMFF box header at data[pos:] and returns the
-// resolved box size, 4-byte type string, header length in bytes, and whether
-// the parse succeeded.
+// resolved box size, 4-byte box type, header length in bytes, and whether
+// the parse succeeded. The box type is returned by value, so parsing a header
+// never allocates.
 //
 // ISOBMFF (ISO 14496-12) §4.2:
 //   - Normal box:   4-byte size + 4-byte type          → headerLen = 8
 //   - Extended box: size==1, followed by 8-byte largesize → headerLen = 16
 //   - size==0 means the box extends to end-of-container → size = len(data)-pos
-func parseCR3BoxHeader(data []byte, pos int) (size uint64, typ string, headerLen uint64, ok bool) {
+func parseCR3BoxHeader(data []byte, pos int) (size uint64, typ [4]byte, headerLen uint64, ok bool) {
 	if pos+8 > len(data) {
-		return 0, "", 0, false
+		return 0, [4]byte{}, 0, false
 	}
 	size = uint64(binary.BigEndian.Uint32(data[pos:]))
-	typ = string(data[pos+4 : pos+8])
+	typ = [4]byte(data[pos+4 : pos+8])
 	headerLen = 8
 
 	if size == 1 {
 		// Extended 64-bit size immediately follows the 8-byte base header.
 		if pos+16 > len(data) {
-			return 0, "", 0, false
+			return 0, [4]byte{}, 0, false
 		}
 		size = binary.BigEndian.Uint64(data[pos+8:])
 		headerLen = 16
@@ -51,12 +69,12 @@ func parseCR3BoxHeader(data []byte, pos int) (size uint64, typ string, headerLen
 	// contain its own header. If size < headerLen the box is malformed — slicing
 	// data[pos+headerLen : pos+size] would panic (bounds out of range).
 	if size < headerLen {
-		return 0, "", 0, false
+		return 0, [4]byte{}, 0, false
 	}
 
 	// Bounds check: box must not extend beyond the containing slice.
 	if size > uint64(len(data)-pos) { //nolint:gosec // G115: len(data)-pos is non-negative (guarded above)
-		return 0, "", 0, false
+		return 0, [4]byte{}, 0, false
 	}
 
 	return size, typ, headerLen, true
@@ -91,7 +109,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, fmt.Errorf("cr3: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
 	}
 
-	moovData := findBox(data, "moov", 0)
+	moovData := findBox(data, boxMoov, 0)
 	if moovData == nil {
 		return nil, nil, nil, ErrNoMoovBox
 	}
@@ -99,9 +117,9 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	uuidData := findUUIDBox(moovData, canonUUID)
 	if uuidData == nil {
 		// Fall back: search for CMT1/CMT2 anywhere in the moov box.
-		cmt1 := findBox(moovData, "CMT1", 0)
-		cmt2 := findBox(moovData, "CMT2", 0)
-		rawXMP = findBox(moovData, "XMP ", 0)
+		cmt1 := findBox(moovData, boxCMT1, 0)
+		cmt2 := findBox(moovData, boxCMT2, 0)
+		rawXMP = findBox(moovData, boxXMP, 0)
 		// audit #138: surface missing CMT1 as a sentinel error so callers can
 		// distinguish no-EXIF from a broken container.
 		if cmt1 == nil {
@@ -110,9 +128,9 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return mergeCMT(cmt1, cmt2), nil, rawXMP, nil
 	}
 
-	cmt1 := findBox(uuidData, "CMT1", 0)
-	cmt2 := findBox(uuidData, "CMT2", 0)
-	rawXMP = findBox(uuidData, "XMP ", 0)
+	cmt1 := findBox(uuidData, boxCMT1, 0)
+	cmt2 := findBox(uuidData, boxCMT2, 0)
+	rawXMP = findBox(uuidData, boxXMP, 0)
 	// audit #138: surface missing CMT1 as a sentinel error.
 	if cmt1 == nil {
 		return nil, nil, rawXMP, ErrNoCMT1Box
@@ -227,14 +245,14 @@ func rebuildUUIDContent(uuidContent, rawEXIF, rawXMP []byte) (newContent []byte,
 			break
 		}
 		switch typ {
-		case "CMT1":
+		case boxCMT1:
 			hadCMT1 = true
 			if rawEXIF != nil {
 				buf.Write(buildBox("CMT1", rawEXIF))
 			} else {
 				buf.Write(uuidContent[pos : pos+int(size)]) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 			}
-		case "XMP ":
+		case boxXMP:
 			hadXMP = true
 			if rawXMP != nil {
 				buf.Write(buildBox("XMP ", rawXMP))
@@ -265,7 +283,7 @@ func findMoovRange(data []byte) (start, end int, found bool) {
 		if !ok {
 			break
 		}
-		if typ == "moov" {
+		if typ == boxMoov {
 			return pos, pos + int(size), true //nolint:gosec // G115: ISOBMFF box size bounded by file size
 		}
 		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
@@ -335,19 +353,19 @@ func relocateInContainer(data []byte, oldMoovEnd int64, delta int64, depth int) 
 		content := data[pos+int(headerLen) : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by slice length
 
 		switch typ {
-		case "trak", "mdia", "minf", "stbl":
+		case boxTrak, boxMdia, boxMinf, boxStbl:
 			// Recurse into container boxes using the box payload slice only.
 			// This ensures the recursive scan is strictly bounded within this box.
 			if err := relocateInContainer(content, oldMoovEnd, delta, depth+1); err != nil {
 				return err
 			}
-		case "stco":
+		case boxStco:
 			// ISO 14496-12 §8.7.3: FullBox (version 1B + flags 3B) + entry_count (4B) + entries (N×4B).
 			// Pass content (the stco payload after the box header) for in-place patching.
 			if err := relocateStco(content, oldMoovEnd, delta); err != nil {
 				return err
 			}
-		case "co64":
+		case boxCo64:
 			// ISO 14496-12 §8.7.5: FullBox (version 1B + flags 3B) + entry_count (4B) + entries (N×8B).
 			if err := relocateCo64(content, oldMoovEnd, delta); err != nil {
 				return err
@@ -632,7 +650,7 @@ func flatUUIDBoxRange(data []byte, uuid []byte) (start, end int, found bool) {
 		// without it, rebuildMoovContent's slice
 		// (moovContent[uuidStart+headerLen+16 : uuidEnd]) could underflow on a
 		// box whose declared size is smaller than headerLen+16.
-		if typ == "uuid" && size >= headerLen+16 && pos+int(headerLen)+16 <= len(data) { //nolint:gosec // G115: headerLen is 8 or 16
+		if typ == boxUUID && size >= headerLen+16 && pos+int(headerLen)+16 <= len(data) { //nolint:gosec // G115: headerLen is 8 or 16
 			if matchesUUID(data[pos+int(headerLen):], uuid) { //nolint:gosec // G115: headerLen is 8 or 16
 				return pos, pos + int(size), true //nolint:gosec // G115: ISOBMFF box size bounded by file size
 			}
@@ -645,7 +663,7 @@ func flatUUIDBoxRange(data []byte, uuid []byte) (start, end int, found bool) {
 // findBox performs a search for the first box of the given type in data,
 // recursing into container boxes up to depth levels deep (max 32) to
 // prevent stack exhaustion on crafted ISOBMFF input.
-func findBox(data []byte, boxType string, depth int) []byte {
+func findBox(data []byte, boxType [4]byte, depth int) []byte {
 	if depth > 32 {
 		return nil
 	}
@@ -660,7 +678,7 @@ func findBox(data []byte, boxType string, depth int) []byte {
 			return boxData
 		}
 		// Recurse into container boxes.
-		if typ == "moov" || typ == "trak" || typ == "udta" || typ == "mdia" {
+		if typ == boxMoov || typ == boxTrak || typ == boxUdta || typ == boxMdia {
 			if inner := findBox(boxData, boxType, depth+1); inner != nil {
 				return inner
 			}
@@ -682,7 +700,7 @@ func findUUIDBox(data []byte, uuid []byte) []byte {
 		// both the header and the 16-byte UUID field before the content slice.
 		// size >= headerLen is guaranteed by parseCR3BoxHeader; also require
 		// size >= headerLen+16 so that data[pos+headerLen+16 : pos+size] is safe.
-		if typ == "uuid" && size >= headerLen+16 && pos+int(headerLen)+16 <= len(data) { //nolint:gosec // G115: headerLen is 8 or 16
+		if typ == boxUUID && size >= headerLen+16 && pos+int(headerLen)+16 <= len(data) { //nolint:gosec // G115: headerLen is 8 or 16
 			if matchesUUID(data[pos+int(headerLen):], uuid) { //nolint:gosec // G115: headerLen is 8 or 16
 				return data[pos+int(headerLen)+16 : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by file size
 			}

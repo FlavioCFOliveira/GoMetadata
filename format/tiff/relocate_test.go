@@ -1094,3 +1094,23 @@ func BenchmarkRelocateMultiStrip(b *testing.B) {
 		_, _ = relocateTIFF(original, newIPTC, newXMP)
 	}
 }
+
+// BenchmarkRelocateTiled measures the relocateTIFF cost for a tiled TIFF
+// (TileOffsets/TileByteCounts, count=2) with 2 KiB tiles.
+func BenchmarkRelocateTiled(b *testing.B) {
+	tile0 := make([]byte, 2048)
+	tile1 := make([]byte, 2048)
+	for i := range tile0 {
+		tile0[i] = byte(i)
+		tile1[i] = byte(255 - i)
+	}
+	original := buildTiledTIFF(tile0, tile1)
+	newIPTC := []byte("benchmark-iptc-tiled")
+	newXMP := []byte("<xmpmeta/>")
+
+	b.SetBytes(int64(len(original)))
+	b.ResetTimer()
+	for range b.N {
+		_, _ = relocateTIFF(original, newIPTC, newXMP)
+	}
+}

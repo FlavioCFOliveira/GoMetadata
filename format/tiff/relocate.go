@@ -55,6 +55,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
@@ -280,6 +281,9 @@ type subIFDInfo struct {
 	ifd       *exif.IFD // parsed SubIFD (for block enumeration)
 	rawBytes  []byte    // verbatim copy of source SubIFD bytes
 	newOffset uint64    // filled in when SubIFD is appended to output
+	// blocks holds this SubIFD's own image blocks in enumeration order; each
+	// offset tag's blocks are contiguous and ordered by index.
+	blocks []*imageBlock
 	// Note: the 0x014A pointer array is patched via patchSubIFDPointers which
 	// scans the re-encoded finalTIFF — no per-SubIFD pointer slot is tracked here.
 }
@@ -450,11 +454,11 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte) (
 	// to learn the exact IFD structure size.
 	offsetValueSlices := insertPlaceholders(mainBlocks)
 
-	skeleton, skelErr := exif.Encode(e)
+	ifdEndInt, skelErr := exif.EncodedSize(e)
 	if skelErr != nil {
 		return nil, fmt.Errorf("tiff: encode placeholder: %w", skelErr)
 	}
-	ifdEnd := uint64(len(skeleton))
+	ifdEnd := uint64(ifdEndInt) //nolint:gosec // G115: EncodedSize never returns a negative length
 
 	// Step 7: assign new absolute offsets.
 	// SubIFD blocks are placed first (SubIFD structures after the main EXIF
@@ -483,10 +487,13 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte) (
 
 	// Step 8b: patch SubIFD raw bytes — update strip/tile offset entries in
 	// each SubIFD's rawBytes to point at the newly assigned image-block offsets.
-	patchSubIFDImageOffsets(subIFDs, blocks, bigTIFF, order)
+	patchSubIFDImageOffsets(subIFDs, bigTIFF, order)
 
-	// Step 9: re-encode → finalTIFF. Same IFD layout as step 6.
-	finalTIFF, finalErr := exif.Encode(e)
+	// Step 9: encode → finalTIFF. Same IFD layout as step 6. The buffer is
+	// allocated once with the exact final length (IFD structure + SubIFD
+	// blocks + image blocks), so steps 11 and 12 never regrow it.
+	finalLen := relocatedLen(ifdEnd, subIFDs, blocks)
+	finalTIFF, finalErr := exif.EncodeInto(make([]byte, 0, finalCap(finalLen)), e)
 	if finalErr != nil {
 		return nil, fmt.Errorf("tiff: encode final: %w", finalErr)
 	}
@@ -543,7 +550,47 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte) (
 		finalTIFF = append(finalTIFF, base[blk.srcOffset:end]...)
 	}
 
+	if uint64(len(finalTIFF)) != finalLen {
+		return nil, fmt.Errorf("tiff: relocated length %d, computed %d: %w", len(finalTIFF), finalLen, errRelocateLayout)
+	}
 	return finalTIFF, nil
+}
+
+// errRelocateLayout reports an internal inconsistency between the computed
+// and the produced relocate output length. It is never expected to occur.
+var errRelocateLayout = errors.New("tiff: relocate layout mismatch")
+
+// relocatedLen returns the exact length of the relocate output: the encoded
+// IFD structure (ifdEnd bytes), then each SubIFD block preceded by a 0x00
+// pad when the running length is odd (TIFF 6.0 §2 word alignment, as in
+// step 11), then every image block (step 12).
+func relocatedLen(ifdEnd uint64, subIFDs []*subIFDInfo, blocks []*imageBlock) uint64 {
+	n := ifdEnd
+	for _, si := range subIFDs {
+		if n&1 == 1 {
+			n++
+		}
+		n += uint64(len(si.rawBytes))
+	}
+	for _, blk := range blocks {
+		n += blk.size
+	}
+	return n
+}
+
+// maxPresizedOutput bounds the capacity finalCap pre-allocates. A classic TIFF
+// output cannot address more than 4 GiB (TIFF 6.0 §2: 32-bit offsets); a
+// larger computed length comes from duplicated block references and is left
+// to grow on demand rather than allocated up front.
+const maxPresizedOutput = math.MaxUint32
+
+// finalCap returns the capacity to pre-allocate for a relocate output of
+// finalLen bytes: finalLen itself, or 0 above maxPresizedOutput.
+func finalCap(finalLen uint64) uint64 {
+	if finalLen > maxPresizedOutput {
+		return 0
+	}
+	return finalLen
 }
 
 // filterMainBlocks returns only the blocks whose owning IFD is NOT one of the
@@ -555,20 +602,42 @@ func filterMainBlocks(blocks []*imageBlock, subIFDs []*subIFDInfo) []*imageBlock
 	if len(subIFDs) == 0 {
 		return blocks
 	}
-	// Build a set of sub-IFD pointers for O(1) lookup.
+	out := make([]*imageBlock, 0, len(blocks))
+	if len(subIFDs) <= smallSetMax {
+		// Small set: a linear scan is cheaper than building a map.
+		for _, blk := range blocks {
+			if !ownedBySubIFD(blk.ifdPtr, subIFDs) {
+				out = append(out, blk)
+			}
+		}
+		return out
+	}
 	subIFDSet := make(map[*exif.IFD]struct{}, len(subIFDs))
 	for _, si := range subIFDs {
 		if si.ifd != nil {
 			subIFDSet[si.ifd] = struct{}{}
 		}
 	}
-	out := make([]*imageBlock, 0, len(blocks))
 	for _, blk := range blocks {
 		if _, isSubIFD := subIFDSet[blk.ifdPtr]; !isSubIFD {
 			out = append(out, blk)
 		}
 	}
 	return out
+}
+
+// smallSetMax is the set size up to which linear scans replace maps in the
+// relocate helpers.
+const smallSetMax = 16
+
+// ownedBySubIFD reports whether ifd is the parsed IFD of one of subIFDs.
+func ownedBySubIFD(ifd *exif.IFD, subIFDs []*subIFDInfo) bool {
+	for _, si := range subIFDs {
+		if si.ifd != nil && si.ifd == ifd {
+			return true
+		}
+	}
+	return false
 }
 
 // enumerateImageBlocks scans IFD0 and the IFD1 chain for image-data blocks
@@ -589,7 +658,7 @@ func enumerateImageBlocks(base []byte, e *exif.EXIF, order binary.ByteOrder, big
 		if err != nil {
 			return nil, err
 		}
-		blocks = append(blocks, iblocks...)
+		blocks = appendBlocks(blocks, iblocks)
 	}
 	return blocks, nil
 }
@@ -616,7 +685,7 @@ func enumerateIFDBlocks(base []byte, ifd *exif.IFD, order binary.ByteOrder, bigT
 		if err != nil {
 			return nil, err
 		}
-		blocks = append(blocks, sb...)
+		blocks = sb
 	}
 
 	tileOff := ifd.Get(exif.TagTileOffsets)
@@ -626,7 +695,7 @@ func enumerateIFDBlocks(base []byte, ifd *exif.IFD, order binary.ByteOrder, bigT
 		if err != nil {
 			return nil, err
 		}
-		blocks = append(blocks, tb...)
+		blocks = appendBlocks(blocks, tb)
 	}
 
 	// JPEGInterchangeFormat: skip when ThumbnailData is non-nil (exif.Encode handles it).
@@ -635,6 +704,21 @@ func enumerateIFDBlocks(base []byte, ifd *exif.IFD, order binary.ByteOrder, bigT
 	}
 
 	return blocks, nil
+}
+
+// appendBlocks returns dst followed by src. When dst is empty src is returned
+// as is, so the common single-source case copies nothing. The pointer slices
+// may be shared this way because callers only append to them; the imageBlock
+// values they point to are never moved.
+func appendBlocks(dst, src []*imageBlock) []*imageBlock {
+	if len(dst) == 0 {
+		return src
+	}
+	if len(src) == 0 {
+		return dst
+	}
+	// Full-slice expression: never write into spare capacity dst may share.
+	return append(slices.Clip(dst), src...)
 }
 
 // appendJPEGBlock appends a JPEGInterchangeFormat block to blocks if present.
@@ -666,7 +750,9 @@ func appendJPEGBlock(baseLen int, ifd *exif.IFD, blocks []*imageBlock, bigTIFF b
 	if end > uint64(baseLen) { //nolint:gosec // G115: baseLen = len([]byte), always non-negative
 		return blocks
 	}
-	return append(blocks, &imageBlock{
+	// Full-slice expression: blocks may alias a slice returned by
+	// extractParallelOffsetBlocks; never write into its spare capacity.
+	return append(slices.Clip(blocks), &imageBlock{
 		srcOffset: off,
 		size:      size,
 		ifdPtr:    ifd,
@@ -735,6 +821,11 @@ func extractParallelOffsetBlocks( //nolint:cyclop,gocyclo // bounds-checking on 
 		return nil, fmt.Errorf("tiff: bytecount for tag 0x%04X: %w", offsetTag, ErrTruncatedOffsetArray)
 	}
 
+	// One backing array for all n blocks instead of n separate allocations.
+	// arr is fully sized here and never appended to, so &arr[i] stays valid
+	// for the lifetime of the relocate call (insertPlaceholders and
+	// patchSubIFDImageOffsets rely on pointer identity).
+	arr := make([]imageBlock, n)
 	blocks := make([]*imageBlock, 0, n)
 	for i := range n {
 		off, err := readUint(offsetEntry.Value[i*offElemSz:], offElemSz, order)
@@ -746,7 +837,8 @@ func extractParallelOffsetBlocks( //nolint:cyclop,gocyclo // bounds-checking on 
 			return nil, fmt.Errorf("tiff: read bytecount[%d] tag 0x%04X: %w", i, offsetTag, err)
 		}
 
-		blk := &imageBlock{
+		blk := &arr[i]
+		*blk = imageBlock{
 			srcOffset: off,
 			size:      0,
 			ifdPtr:    ifd,
@@ -805,20 +897,24 @@ func readUint(b []byte, elemSz int, order binary.ByteOrder) (uint64, error) {
 // The entries are removed so that exif.Encode can produce the skeleton.
 // They are re-inserted with corrected values by insertPlaceholders.
 func removeImageOffsetEntries(blocks []*imageBlock) {
-	// Build a set of (ifd, tag) pairs to remove.
-	type ifdTagKey struct {
-		ifd *exif.IFD
-		tag exif.TagID
-	}
-	toRemove := make(map[ifdTagKey]struct{}, len(blocks)*2)
+	// Distinct (ifd, offset tag) groups, in first-seen order. Blocks of one
+	// group are contiguous, so the linear lookup runs only when the group
+	// changes. Removal is per (ifd, tag) and order-independent.
+	var groups []groupKey
 	for _, blk := range blocks {
-		toRemove[ifdTagKey{blk.ifdPtr, blk.entryTag}] = struct{}{}
-		if countTag := bytecountTagFor(blk.entryTag); countTag != 0 {
-			toRemove[ifdTagKey{blk.ifdPtr, countTag}] = struct{}{}
+		k := groupKey{blk.ifdPtr, blk.entryTag}
+		if n := len(groups); n > 0 && groups[n-1] == k {
+			continue
+		}
+		if !slices.Contains(groups, k) {
+			groups = append(groups, k)
 		}
 	}
-	for key := range toRemove {
-		removeEntryFromIFD(key.ifd, key.tag)
+	for _, k := range groups {
+		removeEntryFromIFD(k.ifd, k.tag)
+		if countTag := bytecountTagFor(k.tag); countTag != 0 {
+			removeEntryFromIFD(k.ifd, countTag)
+		}
 	}
 }
 
@@ -888,55 +984,75 @@ func widthToType(w uint8) exif.DataType {
 	}
 }
 
+// placeholderGroup holds the placeholder value bytes of one (IFD, offset
+// tag) group: off backs the offset entry's Value and cnt the bytecount
+// entry's Value. Both are sub-slices of one allocation.
+type placeholderGroup struct {
+	key      groupKey
+	n        int   // number of blocks (elements) in the group
+	offW     uint8 // offset element width in bytes
+	cntW     uint8 // bytecount element width in bytes
+	off, cnt []byte
+}
+
 // insertPlaceholders inserts image-data offset and bytecount entries with
 // zeroed value bytes into each owning IFD. The placeholder Count = N
 // (number of elements) and Type match the SOURCE entry's declared width
 // (widthToType), so that exif.Encode accounts for the exact final
 // value-area space and preserves the source's SHORT/LONG/LONG8 type choice.
 //
-// Returns a map from groupKey to the pair of value slices [offVals, cntVals].
-// updatePlaceholders writes the real values into these slices in-place;
-// since IFDEntry.Value points to the same backing arrays, the updated values
-// are visible to exif.Encode without re-insertion.
-func insertPlaceholders(blocks []*imageBlock) map[groupKey][2][]byte {
-	// Collect unique groups in stable insertion order, along with the first
-	// block seen for each group (its offElemSz/cntElemSz apply to the whole
-	// group, since all blocks in a group came from the same source entry).
-	seen := make(map[groupKey]int)
-	var keys []groupKey
-	var widths []*imageBlock
+// Returns one placeholderGroup per group in first-seen order.
+// updatePlaceholders writes the real values into the groups' value slices
+// in-place; since IFDEntry.Value is the same backing array, the updated
+// values are visible to exif.Encode without re-insertion.
+func insertPlaceholders(blocks []*imageBlock) []placeholderGroup {
+	// Collect unique groups in stable insertion order. The first block of a
+	// group supplies its widths: all blocks of a group come from the same
+	// source entry.
+	var groups []placeholderGroup
 	for _, blk := range blocks {
-		k := groupKey{blk.ifdPtr, blk.entryTag}
-		if _, ok := seen[k]; !ok {
-			seen[k] = len(keys)
-			keys = append(keys, k)
-			widths = append(widths, blk)
+		if g := findGroup(groups, groupKey{blk.ifdPtr, blk.entryTag}); g != nil {
+			g.n++
+			continue
 		}
+		groups = append(groups, placeholderGroup{
+			key:  groupKey{blk.ifdPtr, blk.entryTag},
+			n:    1,
+			offW: blk.offElemSz,
+			cntW: blk.cntElemSz,
+		})
 	}
 
-	counts := make([]int, len(keys))
-	for _, blk := range blocks {
-		k := groupKey{blk.ifdPtr, blk.entryTag}
-		counts[seen[k]]++
-	}
-
-	result := make(map[groupKey][2][]byte, len(keys))
-	for i, k := range keys {
-		n := counts[i]
-		offW := int(widths[i].offElemSz)
-		cntW := int(widths[i].cntElemSz)
-		offVals := make([]byte, n*offW)
-		cntVals := make([]byte, n*cntW)
+	for i := range groups {
+		g := &groups[i]
+		offLen := g.n * int(g.offW)
+		vals := make([]byte, offLen+g.n*int(g.cntW))
+		// Full-slice expressions keep the two values from overlapping even if
+		// a later append were applied to one of them.
+		g.off = vals[:offLen:offLen]
+		g.cnt = vals[offLen:]
 
 		// TIFF 6.0 §2 / BigTIFF spec §2: Count = number of values (not bytes).
-		upsertIFDEntryWithCount(k.ifd, k.tag, widthToType(widths[i].offElemSz), uint32(n), offVals) //nolint:gosec // G115: n bounded by strip/tile count, < 2^32
-		if countTag := bytecountTagFor(k.tag); countTag != 0 {
-			upsertIFDEntryWithCount(k.ifd, countTag, widthToType(widths[i].cntElemSz), uint32(n), cntVals) //nolint:gosec // G115: same
+		upsertIFDEntryWithCount(g.key.ifd, g.key.tag, widthToType(g.offW), uint32(g.n), g.off) //nolint:gosec // G115: n bounded by strip/tile count, < 2^32
+		if countTag := bytecountTagFor(g.key.tag); countTag != 0 {
+			upsertIFDEntryWithCount(g.key.ifd, countTag, widthToType(g.cntW), uint32(g.n), g.cnt) //nolint:gosec // G115: same
 		}
-
-		result[k] = [2][]byte{offVals, cntVals}
 	}
-	return result
+	return groups
+}
+
+// findGroup returns the group with key k, or nil. Blocks of one group are
+// contiguous, so the last group is checked first.
+func findGroup(groups []placeholderGroup, k groupKey) *placeholderGroup {
+	if n := len(groups); n > 0 && groups[n-1].key == k {
+		return &groups[n-1]
+	}
+	for i := range groups {
+		if groups[i].key == k {
+			return &groups[i]
+		}
+	}
+	return nil
 }
 
 // updatePlaceholders writes the real new offsets and block sizes into the
@@ -948,15 +1064,14 @@ func insertPlaceholders(blocks []*imageBlock) map[groupKey][2][]byte {
 //
 // TIFF 6.0 §2: StripOffsets values are absolute byte offsets from byte 0 of
 // the TIFF stream, encoded in the TIFF file byte order.
-func updatePlaceholders(blocks []*imageBlock, slices map[groupKey][2][]byte, order binary.ByteOrder) {
+func updatePlaceholders(blocks []*imageBlock, groups []placeholderGroup, order binary.ByteOrder) {
 	for _, blk := range blocks {
-		k := groupKey{blk.ifdPtr, blk.entryTag}
-		pair, ok := slices[k]
-		if !ok {
+		g := findGroup(groups, groupKey{blk.ifdPtr, blk.entryTag})
+		if g == nil {
 			continue
 		}
-		putWidth(pair[0][blk.index*int(blk.offElemSz):], blk.offElemSz, order, blk.newOffset)
-		putWidth(pair[1][blk.index*int(blk.cntElemSz):], blk.cntElemSz, order, blk.size)
+		putWidth(g.off[blk.index*int(blk.offElemSz):], blk.offElemSz, order, blk.newOffset)
+		putWidth(g.cnt[blk.index*int(blk.cntElemSz):], blk.cntElemSz, order, blk.size)
 	}
 }
 
@@ -1125,21 +1240,31 @@ func enumerateSubIFDsAt( //nolint:cyclop,gocyclo,funlen // SubIFD recursion, cyc
 	var subIFDs []*subIFDInfo
 	var allBlocks []*imageBlock
 
-	// Belt-and-suspenders (task convention: see extractRawIFD): the map hint is
-	// clamped independently of the per-entry cap above, so a future change to
-	// that cap cannot silently reintroduce an oversized map pre-allocation. n
-	// is already ≤ maxSubIFDsPerEntry at this point, so min() is a no-op on
-	// the hot path.
-	visited := make(map[uint64]bool, min(n, maxSubIFDsPerEntry))
+	// One backing array for this level's subIFDInfo values: at most one per
+	// offset, so appends never exceed the capacity and &infos[i] stays valid.
+	// The capacity is clamped independently of the per-entry cap above (task
+	// convention: see extractRawIFD).
+	infos := make([]subIFDInfo, 0, min(n, maxSubIFDsPerEntry))
 
-	for _, off := range offsets {
+	// Cycle guard: an offset already seen in this array is skipped. Small
+	// arrays use a linear scan of the preceding offsets; larger ones a map.
+	var visited map[uint64]bool
+	if n > smallSetMax {
+		visited = make(map[uint64]bool, min(n, maxSubIFDsPerEntry))
+	}
+
+	for i, off := range offsets {
 		if off == 0 {
 			continue
 		}
-		if visited[off] {
+		if visited != nil {
+			if visited[off] {
+				continue // cycle guard
+			}
+			visited[off] = true
+		} else if slices.Contains(offsets[:i], off) {
 			continue // cycle guard
 		}
-		visited[off] = true
 
 		// Parse the SubIFD at this offset.
 		rawIFD := extractRawIFD(base, off, bigTIFF, order)
@@ -1185,11 +1310,12 @@ func enumerateSubIFDsAt( //nolint:cyclop,gocyclo,funlen // SubIFD recursion, cyc
 		// and is copied verbatim in step 12.
 		parsedIFD.ThumbnailData = nil
 
-		si := &subIFDInfo{
+		infos = append(infos, subIFDInfo{
 			srcOffset: off,
 			ifd:       parsedIFD,
 			rawBytes:  rawIFD,
-		}
+		})
+		si := &infos[len(infos)-1]
 		subIFDs = append(subIFDs, si)
 
 		// Enumerate image blocks from this SubIFD.
@@ -1201,7 +1327,8 @@ func enumerateSubIFDsAt( //nolint:cyclop,gocyclo,funlen // SubIFD recursion, cyc
 		for _, blk := range iblocks {
 			blk.ifdPtr = parsedIFD
 		}
-		allBlocks = append(allBlocks, iblocks...)
+		si.blocks = iblocks
+		allBlocks = appendBlocks(allBlocks, iblocks)
 
 		// Recurse into any nested SubIFDs (0x014A) within this SubIFD, using the
 		// SAME raw-rescan approach (re-reading from base at this SubIFD's own
@@ -1233,7 +1360,7 @@ func enumerateSubIFDsAt( //nolint:cyclop,gocyclo,funlen // SubIFD recursion, cyc
 			return nil, nil, nestErr
 		}
 		subIFDs = append(subIFDs, nestSubs...)
-		allBlocks = append(allBlocks, nestBlocks...)
+		allBlocks = appendBlocks(allBlocks, nestBlocks)
 	}
 
 	return subIFDs, allBlocks, nil
@@ -1383,25 +1510,17 @@ func assignSubIFDOffsets(subIFDs []*subIFDInfo, ifdEnd uint64) {
 //	    updated to reflect the new absolute position of the array in the output
 //	    (= si.newOffset + relOff).
 //
+// Each SubIFD's own blocks are taken from subIFDInfo.blocks, recorded during
+// enumeration.
+//
 // This function must be called after assignNewOffsets and assignSubIFDOffsets
 // have filled blk.newOffset and si.newOffset respectively.
-func patchSubIFDImageOffsets(subIFDs []*subIFDInfo, blocks []*imageBlock, bigTIFF bool, order binary.ByteOrder) {
-	if len(subIFDs) == 0 || len(blocks) == 0 {
-		return
-	}
-
-	// Build a lookup: parsedIFD → list of blocks owned by that SubIFD.
-	blocksByIFD := make(map[*exif.IFD][]*imageBlock, len(subIFDs))
-	for _, blk := range blocks {
-		blocksByIFD[blk.ifdPtr] = append(blocksByIFD[blk.ifdPtr], blk)
-	}
-
+func patchSubIFDImageOffsets(subIFDs []*subIFDInfo, bigTIFF bool, order binary.ByteOrder) {
 	for _, si := range subIFDs {
-		ifdBlocks := blocksByIFD[si.ifd]
-		if len(ifdBlocks) == 0 {
+		if len(si.blocks) == 0 {
 			continue
 		}
-		patchRawIFDOffsets(si.rawBytes, ifdBlocks, si.srcOffset, si.newOffset, bigTIFF, order)
+		patchRawIFDOffsets(si.rawBytes, si.blocks, si.srcOffset, si.newOffset, bigTIFF, order)
 	}
 }
 
@@ -1448,17 +1567,9 @@ func patchRawIFDOffsets(rawBytes []byte, blocks []*imageBlock, srcOff, newSubIFD
 		return
 	}
 
-	// Group blocks by (offsetTag, index) for fast lookup.
-	// Key: the OFFSET tag (not bytecount tag) so both the offset and bytecount
-	// entries can look up the same block record.
-	type blockKey struct {
-		tag   exif.TagID
-		index int
-	}
-	blkMap := make(map[blockKey]*imageBlock, len(blocks))
-	for _, blk := range blocks {
-		blkMap[blockKey{blk.entryTag, blk.index}] = blk
-	}
+	// Blocks are looked up by (OFFSET tag, index), so both the offset and the
+	// bytecount entry resolve to the same block record.
+	idx := newBlockIndex(blocks)
 
 	threshold := inlineThreshold(bigTIFF)
 	for i := range count {
@@ -1501,7 +1612,7 @@ func patchRawIFDOffsets(rawBytes []byte, blocks []*imageBlock, srcOff, newSubIFD
 					offsetTag = exif.TagJPEGInterchangeFormat
 				}
 			}
-			blk := blkMap[blockKey{offsetTag, 0}]
+			blk := idx.find(offsetTag, 0)
 			if blk == nil {
 				continue
 			}
@@ -1555,7 +1666,7 @@ func patchRawIFDOffsets(rawBytes []byte, blocks []*imageBlock, srcOff, newSubIFD
 		}
 
 		for j := range entry.count {
-			blk := blkMap[blockKey{offsetTag, int(j)}]
+			blk := idx.find(offsetTag, int(j))
 			if blk == nil {
 				continue
 			}
@@ -1582,6 +1693,65 @@ func patchRawIFDOffsets(rawBytes []byte, blocks []*imageBlock, srcOff, newSubIFD
 			}
 		}
 	}
+}
+
+// blockIndex finds the image block of one IFD by (offset tag, index) in
+// O(1) without a map.
+//
+// Contiguity invariant: blocks is subIFDInfo.blocks, the result of a single
+// enumerateIFDBlocks call for one IFD. That call yields at most one run per
+// offset tag, in this order: the StripOffsets run and the TileOffsets run
+// (each one extractParallelOffsetBlocks call, which appends every index
+// 0..n-1 in ascending order, including zero-size blocks), then at most one
+// JPEGInterchangeFormat block with index 0. Hence the block with index i of a
+// tag, if it exists, is exactly at the tag's run start + i, and a miss at
+// that position means no such block exists.
+type blockIndex struct {
+	blocks                         []*imageBlock
+	stripStart, tileStart, jpegPos int
+}
+
+// newBlockIndex records the start of each offset tag's run in blocks.
+func newBlockIndex(blocks []*imageBlock) blockIndex {
+	x := blockIndex{blocks: blocks, stripStart: -1, tileStart: -1, jpegPos: -1}
+	for i, blk := range blocks {
+		switch {
+		case blk.entryTag == exif.TagStripOffsets && x.stripStart < 0:
+			x.stripStart = i
+		case blk.entryTag == exif.TagTileOffsets && x.tileStart < 0:
+			x.tileStart = i
+		case blk.entryTag == exif.TagJPEGInterchangeFormat && x.jpegPos < 0:
+			x.jpegPos = i
+		}
+	}
+	return x
+}
+
+// runStart returns the index in x.blocks of the first block of tag, or -1.
+func (x blockIndex) runStart(tag exif.TagID) int {
+	switch tag {
+	case exif.TagStripOffsets:
+		return x.stripStart
+	case exif.TagTileOffsets:
+		return x.tileStart
+	case exif.TagJPEGInterchangeFormat:
+		return x.jpegPos
+	}
+	return -1
+}
+
+// find returns the block with the given offset tag and index, or nil.
+func (x blockIndex) find(tag exif.TagID, index int) *imageBlock {
+	if start := x.runStart(tag); start >= 0 && index >= 0 && index < len(x.blocks)-start {
+		if blk := x.blocks[start+index]; blk.entryTag == tag && blk.index == index {
+			return blk
+		}
+	}
+	// By the contiguity invariant (see blockIndex) no other position can
+	// hold the block, so a miss is definitive. Never scan: a crafted entry
+	// with a large Count and no matching blocks would make patchRawIFDOffsets
+	// quadratic.
+	return nil
 }
 
 // patchSubIFDPointers locates the 0x014A SubIFDs entry in the final TIFF

@@ -1112,7 +1112,7 @@ func arwRelocateWithSR2(
 	updatePlaceholders(mainBlocks, offsetValueSlices, order)
 
 	// Step 8b: patch SubIFD raw bytes.
-	patchSubIFDImageOffsets(subIFDs, blocks, false, order)
+	patchSubIFDImageOffsets(subIFDs, false, order)
 
 	// Step 9: re-encode → finalTIFF.
 	finalTIFF, finalErr := exif.Encode(e)

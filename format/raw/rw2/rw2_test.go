@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"os"
 	"testing"
 )
 
@@ -487,6 +488,26 @@ func TestRW2RawEXIFPreservesOriginalMagic(t *testing.T) {
 // the allocs/op reported for Extract itself.
 func BenchmarkRW2Extract(b *testing.B) {
 	data := buildRW2()
+	r := bytes.NewReader(data)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
+	}
+}
+
+// realRW2ForBenchmark is a real, multi-megabyte RW2 file for
+// BenchmarkRW2ExtractRealFile, where per-byte costs dominate.
+const realRW2ForBenchmark = "../../../testdata/corpus/raw/metadata-extractor/Panasonic DMC-GF7.rw2"
+
+// BenchmarkRW2ExtractRealFile measures Extract on a real RW2 file. Skips when
+// the corpus file is not present (corpus files are downloaded separately).
+func BenchmarkRW2ExtractRealFile(b *testing.B) {
+	data, err := os.ReadFile(realRW2ForBenchmark)
+	if err != nil {
+		b.Skipf("corpus file %s not present: %v", realRW2ForBenchmark, err)
+	}
 	r := bytes.NewReader(data)
 	b.ReportAllocs()
 	b.ResetTimer()

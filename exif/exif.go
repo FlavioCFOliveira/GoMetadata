@@ -7,6 +7,7 @@ package exif
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -507,7 +508,41 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 // unknown type codes must re-inject that data into the stream after calling Encode.
 // Task #84 pins this behaviour; any change to it is a conscious, tested decision.
 func Encode(e *EXIF) ([]byte, error) {
-	return serialise(e)
+	out, _, err := serialise(nil, e, false)
+	return out, err
+}
+
+// EncodeInto encodes e exactly like Encode, reusing dst's storage.
+//
+// The stream is written into dst's backing array starting at index 0 when
+// cap(dst) >= EncodedSize(e); the contents of dst are overwritten and the
+// returned slice aliases dst. Otherwise a new buffer is allocated and dst is
+// left untouched. The returned bytes are identical to Encode(e) in both
+// cases. A caller that appends more data after the encoded stream can size
+// dst for the whole output up front and avoid any regrowth.
+func EncodeInto(dst []byte, e *EXIF) ([]byte, error) {
+	out, _, err := serialise(dst, e, false)
+	return out, err
+}
+
+// errEncodedSizeOverflow is returned by EncodedSize when the encoded length
+// does not fit in an int on the current platform.
+var errEncodedSizeOverflow = errors.New("exif: encoded size exceeds the addressable memory size")
+
+// EncodedSize returns len(Encode(e)) without encoding e. It returns the same
+// error Encode would return for e.
+//
+// The size is computed by the same layout arithmetic Encode uses to place
+// every IFD, so it is exact, and it costs a fraction of an encode.
+func EncodedSize(e *EXIF) (int, error) {
+	_, total, err := serialise(nil, e, true)
+	if err != nil {
+		return 0, err
+	}
+	if total > math.MaxInt {
+		return 0, fmt.Errorf("%w: %d bytes", errEncodedSizeOverflow, total)
+	}
+	return int(total), nil
 }
 
 // ParseIFDAt parses the IFD starting at offset within b using the given byte

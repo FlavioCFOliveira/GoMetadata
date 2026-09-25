@@ -450,6 +450,48 @@ go1.27.1 toolchain — pre-existing environment mismatch, unrelated to this
 batch); `FuzzJPEGExtract` and `FuzzJPEGInject` both ran 60s clean (0
 crashes).
 
+### Batch C (tasks #219–#227, #237) — 2026-09-25
+
+Go version go1.27.1, `cpu: Apple M4`, `-count=10` (EXIFEncode after: `-count=20`), all
+changes `p=0.000` unless marked `~` or noted. `format/tiff` relocate and extract, `format/raw/{orf,rw2,cr3}`,
+`exif` encode. Relocate and inject output is byte-identical (SHA-256 of the
+`Read`+`SetCopyright`+`Write` output unchanged for all 578 TIFF/DNG/RAW
+corpus and fixture files).
+
+| Benchmark | ns/op before → after | B/op before → after | allocs/op before → after |
+|---|---|---|---|
+| RelocateSingleStrip | 1.505µ → 1.155µ (**−23.23%**) | 7.271Ki → 6.198Ki (**−14.76%**) | 23 → 14 (**−39.13%**) |
+| RelocateMultiStrip | 1.791µ → 1.202µ (**−32.87%**) | 10.022Ki → 6.237Ki (**−37.77%**) | 29 → 16 (**−44.83%**) |
+| RelocateTiled | 1.854µ → 1.257µ (**−32.18%**) | 10.179Ki → 6.362Ki (**−37.49%**) | 29 → 16 (**−44.83%**) |
+| RelocateDNGLike | 2.358µ → 1.849µ (**−21.61%**) | 13.14Ki → 11.01Ki (**−16.22%**) | 38 → 24 (**−36.84%**) |
+| RelocateMakerNote | 657.9n → 655.5n (~) | 1.473Ki → 1.473Ki (~) | 14 → 14 (~) |
+| TIFFExtract | 87.27n → 42.32n (**−51.51%**) | 536 → 112 (**−79.10%**) | 2 → 1 (**−50.00%**) |
+| TIFFExtractRealFile (36.6 MiB) | 2.794m → 1.286m (**−53.98%**) | 78.24Mi → 36.57Mi (**−53.26%**) | 34 → 1 (**−97.06%**) |
+| ORFExtract | 71.94n → 19.94n (**−72.28%**) | 552 → 16 (**−97.10%**) | 3 → 1 (**−66.67%**) |
+| ORFExtractRealFile (23.1 MiB) | 2651.6µ → 828.4µ (**−68.76%**) | 74.08Mi → 23.14Mi (**−68.76%**) | 34 → 1 (**−97.06%**) |
+| ORFInject | 172.90n → 79.09n (**−54.25%**) | 1344 → 240 (**−82.14%**) | 9 → 6 (**−33.33%**) |
+| RW2Extract | 72.90n → 21.10n (**−71.05%**) | 552 → 16 (**−97.10%**) | 3 → 1 (**−66.67%**) |
+| RW2ExtractRealFile (18.8 MiB) | 2031.6µ → 675.6µ (**−66.75%**) | 65.42Mi → 18.81Mi (**−71.24%**) | 34 → 1 (**−97.06%**) |
+| RW2Inject | 173.00n → 78.58n (**−54.58%**) | 1344 → 240 (**−82.14%**) | 9 → 6 (**−33.33%**) |
+| CR3Extract | 132.05n → 87.83n (**−33.49%**) | 560 → 536 (**−4.29%**) | 8 → 2 (**−75.00%**) |
+| CR3Inject | 223.6n → 177.4n (**−20.67%**) | 1028 → 1000 (**−2.72%**) | 16 → 9 (**−43.75%**) |
+| EXIFEncode | 119.5n → 118.0n (**−1.17%**, p=0.001) | 80 → 80 (~) | 2 → 2 (~) |
+| EXIFEncode_Camera | 1.076µ → 1.016µ (**−5.49%**) | 1.580Ki → 1.580Ki (~) | 14 → 14 (~) |
+| EXIFEncode_BigTIFF | 959.6n → 953.1n (**−0.68%**) | 7.568Ki → 7.568Ki (~) | 6 → 6 (~) |
+
+#### Per-task notes
+
+- **#219**: `relocateTIFFFromParsed` allocates `finalTIFF` once at its exact length (`relocatedLen`) and checks `len(finalTIFF) == finalLen`; no regrowth.
+- **#220**: additive `exif.EncodedSize` and `exif.EncodeInto` share one exact length computation (`encodedLen`/`ifdWrittenLen`); relocate uses `EncodedSize` instead of the skeleton encode. A plain `Encode` sizes its buffer from the layout offsets and skips the exact pass. `EncodedSize(e) == len(Encode(e))` is tested on every corpus file.
+- **#221**: `extractParallelOffsetBlocks` backs all blocks of a source with one `[]imageBlock`; aggregation reuses single-source slices (`appendBlocks`).
+- **#222**: `insertPlaceholders` returns a `[]placeholderGroup` with one value buffer per group, scanned linearly, instead of a map of boxed pairs. SubIFD block lookup (`blockIndex`) is O(1) with no scan fallback, relying on the per-tag contiguity of enumerated blocks.
+- **#223**: linear scans replace the `subIFDSet`, `toRemove`, `visited` (≤16 offsets), `blocksByIFD` and `blkMap` maps; `subIFDInfo` is backed by one slice per level; the MakerNote prefix table is package-level. `RelocateMakerNote` is unchanged: the compiler already kept the prefix literal on the stack.
+- **#224**: `iobuf.ReadAll` reads a seekable input with one exact-size allocation and rejects oversized input before allocating; used by `tiff`, `orf`, and `rw2` `Extract`/`Inject`.
+- **#225**: `orf.Extract`/`rw2.Extract` scan the original bytes; the full-file copy is gone.
+- **#226**: `orf.Inject`/`rw2.Inject` stream through `iobuf.MagicWriter` instead of buffering the output. `relocateTIFFAsORF`/`relocateTIFFAsRW2` keep their copy: their input is caller-owned (exported `InjectWithEXIFORF`/`InjectWithEXIFRW2`).
+- **#227**: `parseCR3BoxHeader` returns a `[4]byte` box type.
+- **#237**: `internal/tiffscan.ExtractTagValues` is the single IFD0 IPTC/XMP scanner for `tiff`, `orf`, and `rw2`.
+
 ## [main — perf task #198] — 2026-06-10 (exif: parse-level arena for sub-IFDs)
 
 ### Optimisations applied in this version

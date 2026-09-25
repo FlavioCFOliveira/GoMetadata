@@ -328,8 +328,8 @@ func TestParseCR3BoxHeader(t *testing.T) {
 		if size != 16 {
 			t.Errorf("size = %d, want 16", size)
 		}
-		if typ != "test" {
-			t.Errorf("typ = %q, want test", typ)
+		if string(typ[:]) != "test" {
+			t.Errorf("typ = %q, want test", typ[:])
 		}
 		if headerLen != 8 {
 			t.Errorf("headerLen = %d, want 8", headerLen)
@@ -350,8 +350,8 @@ func TestParseCR3BoxHeader(t *testing.T) {
 		if size != 24 {
 			t.Errorf("size = %d, want 24", size)
 		}
-		if typ != "uuid" {
-			t.Errorf("typ = %q, want uuid", typ)
+		if string(typ[:]) != "uuid" {
+			t.Errorf("typ = %q, want uuid", typ[:])
 		}
 		if headerLen != 16 {
 			t.Errorf("headerLen = %d, want 16", headerLen)
@@ -1118,7 +1118,7 @@ func readFirstOffsetInContainer(t *testing.T, data []byte, boxType string) int64
 		}
 		contentOff := pos + int(headerLen) //nolint:gosec // G115: headerLen is 8 or 16
 		boxEnd := pos + int(size)          //nolint:gosec // G115: ISOBMFF box size bounded by file size
-		if typ == boxType {
+		if string(typ[:]) == boxType {
 			// FullBox: version(1)+flags(3) = 4 bytes; entry_count at +4.
 			if contentOff+8 > len(data) {
 				t.Fatalf("readFirstOffsetInContainer: %s box too small", boxType)
@@ -1138,7 +1138,7 @@ func readFirstOffsetInContainer(t *testing.T, data []byte, boxType string) int64
 			}
 		}
 		// Recurse into container boxes.
-		switch typ {
+		switch string(typ[:]) {
 		case "trak", "mdia", "minf", "stbl":
 			if val := readFirstOffsetInContainer(t, data[contentOff:boxEnd], boxType); val != 0 {
 				return val
@@ -1162,7 +1162,7 @@ func readTwoTrakOffsets(t *testing.T, moovContent []byte, boxType string) (int64
 		}
 		contentOff := pos + int(headerLen) //nolint:gosec // G115: headerLen is 8 or 16
 		boxEnd := pos + int(size)          //nolint:gosec // G115: ISOBMFF box size bounded by file size
-		if typ == "trak" {
+		if string(typ[:]) == "trak" {
 			val := readFirstOffsetInContainer(t, moovContent[contentOff:boxEnd], boxType)
 			offsets = append(offsets, val)
 		}

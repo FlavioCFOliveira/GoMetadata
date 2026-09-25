@@ -2475,6 +2475,53 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 	return out
 }
 
+// ifdWrittenLen returns the exact number of bytes writeIFD (bigTIFF false)
+// or writeIFDBigTIFF (bigTIFF true) appends for entries when the output
+// already holds startOff bytes. It replays their layout rules: a 0x00 pad
+// before each out-of-line value whose running offset is odd, the full
+// len(Value) bytes (zero-filled up to Count × type size), and a trailing pad
+// when the block ends at an odd output length. thumbPatched mirrors
+// patchThumbnailEntries: the JPEGInterchangeFormat and
+// JPEGInterchangeFormatLength values are 4 bytes long.
+func ifdWrittenLen(entries []IFDEntry, startOff uint64, bigTIFF, thumbPatched bool) uint64 { //nolint:gocyclo // mirrors writeIFD/writeIFDBigTIFF layout rules branch for branch
+	fixed, threshold := uint64(2+len(entries)*12+4), uint64(4)
+	if bigTIFF {
+		fixed, threshold = uint64(8+len(entries)*20+8), 8
+	}
+	// curOff is the running value offset writeIFD tracks (advanced by the
+	// declared size); written counts the bytes actually appended.
+	curOff := startOff + fixed
+	written := uint64(0)
+	for i := range entries {
+		e := &entries[i]
+		var ts uint64
+		if bigTIFF {
+			ts = typeSizeBigTIFF(e.Type)
+		} else {
+			ts = uint64(typeSize(e.Type))
+		}
+		total := ts * uint64(e.Count)
+		if ts == 0 || total <= threshold {
+			continue // inline: occupies only the fixed entry field
+		}
+		if curOff&1 == 1 {
+			written++
+			curOff++
+		}
+		vlen := uint64(len(e.Value))
+		if thumbPatched && (e.Tag == TagJPEGInterchangeFormat || e.Tag == TagJPEGInterchangeFormatLength) {
+			vlen = 4
+		}
+		written += max(vlen, total)
+		curOff += total
+	}
+	end := startOff + fixed + written
+	if end&1 == 1 {
+		end++
+	}
+	return end - startOff
+}
+
 // ---------------------------------------------------------------------------
 // BigTIFF IFD encoding (BigTIFF spec §2, Aware Systems / libtiff; task #264)
 // ---------------------------------------------------------------------------

@@ -3,10 +3,11 @@ package rw2
 import "errors"
 
 // maxFileSize is the upper bound on the total number of bytes this package will
-// read from an io.Reader in a single Extract or Inject call. Reads via
-// io.ReadAll are wrapped with io.LimitReader(r, maxFileSize+1); if the reader
-// delivers more bytes than this limit the operation is aborted with
-// ErrFileTooLarge before any allocation proportional to file size is retained.
+// read from an io.Reader in a single Extract or Inject call. Reads go through
+// iobuf.ReadAll: a seekable input larger than this limit is rejected with
+// ErrFileTooLarge before any buffer is allocated, and a non-seekable input is
+// read through io.LimitReader(r, maxFileSize+1) and rejected once it exceeds
+// the limit.
 //
 // Real-world Panasonic RW2 files are well under 100 MiB; 256 MiB gives ample
 // headroom for future camera improvements while bounding worst-case heap
