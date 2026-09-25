@@ -158,14 +158,14 @@ func TestAVIFExifItemInfeType(t *testing.T) {
 	exif := conformanceMinimalTIFF()
 	data := buildConformanceAVIF("avif", exif, nil)
 
-	metaContent, err := findBox(data, "meta", 0)
+	metaContent, err := findBox(data, boxTypeMeta, 0)
 	if err != nil || metaContent == nil {
 		t.Fatalf("AVIF-Exif-item-infe-type: meta box not found (err=%v)", err)
 	}
 	itemTypes := parseIinf(metaContent)
 	foundExif := false
 	for _, typ := range itemTypes {
-		if typ == "Exif" {
+		if typ == itemTypeExif {
 			foundExif = true
 		}
 	}
@@ -214,7 +214,7 @@ func TestAVIFExifItemPrefixIsWrittenOnInject(t *testing.T) {
 	}
 
 	outData := out.Bytes()
-	metaContent, err := findBox(outData, "meta", 0)
+	metaContent, err := findBox(outData, boxTypeMeta, 0)
 	if err != nil || metaContent == nil {
 		t.Fatalf("AVIF-Exif-item-prefix-written-on-inject: meta box not found (err=%v)", err)
 	}
@@ -325,7 +325,7 @@ func TestAVIFMetaBoxIlocOffsets(t *testing.T) {
 	xmp := conformanceXMPPacket()
 	data := buildConformanceAVIF("avif", exif, xmp)
 
-	metaContent, err := findBox(data, "meta", 0)
+	metaContent, err := findBox(data, boxTypeMeta, 0)
 	if err != nil || metaContent == nil {
 		t.Fatalf("AVIF-meta-iloc-offsets: meta box not found (err=%v)", err)
 	}
@@ -355,11 +355,11 @@ func TestAVIFMetaBoxIinfItemCount(t *testing.T) {
 	xmp := conformanceXMPPacket()
 	data := buildConformanceAVIF("avif", exif, xmp)
 
-	metaContent, err := findBox(data, "meta", 0)
+	metaContent, err := findBox(data, boxTypeMeta, 0)
 	if err != nil || metaContent == nil {
 		t.Fatalf("AVIF-meta-iinf-item-count: meta box not found (err=%v)", err)
 	}
-	iinfData := findInnerBox(metaContent, "iinf")
+	iinfData := findInnerBox(metaContent, boxTypeIinf)
 	if iinfData == nil {
 		t.Fatal("AVIF-meta-iinf-item-count: iinf box not found")
 	}
@@ -386,7 +386,7 @@ func TestAVIFMetaBoxIinfItemCount(t *testing.T) {
 		if !ok2 {
 			break
 		}
-		if typ == "infe" {
+		if typ == boxTypeInfe {
 			actualCount++
 		}
 		scanPos += int(sz) //nolint:gosec // G115: ISOBMFF box size bounded
@@ -417,7 +417,7 @@ func TestAVIFWriteIlocOffsetCorrect(t *testing.T) {
 	}
 
 	outData := out.Bytes()
-	metaContent, err := findBox(outData, "meta", 0)
+	metaContent, err := findBox(outData, boxTypeMeta, 0)
 	if err != nil || metaContent == nil {
 		t.Fatalf("AVIF-write-iloc-offset-correct: meta box not found in output (err=%v)", err)
 	}
@@ -452,7 +452,7 @@ func TestAVIFWritePreservesBrand(t *testing.T) {
 	outData := out.Bytes()
 	// ftyp major brand is at bytes [8:12] of the ftyp box.
 	// Locate ftyp box.
-	ftypStart, ftypEnd, ok := flatBoxRangeInFile(outData, "ftyp")
+	ftypStart, ftypEnd, ok := flatBoxRangeInFile(outData, fourCC("ftyp"))
 	if !ok || ftypEnd-ftypStart < 12 {
 		t.Fatal("AVIF-write-preserves-brand: ftyp box not found or too short in output")
 	}
@@ -706,7 +706,7 @@ func TestAVIFCorpusBrandCheck(t *testing.T) {
 				t.Fatalf("AVIF-corpus-brand-check: read %s: %v", path, err)
 			}
 			// Locate ftyp box and verify brand.
-			ftypStart, ftypEnd, ok := flatBoxRangeInFile(raw, "ftyp")
+			ftypStart, ftypEnd, ok := flatBoxRangeInFile(raw, fourCC("ftyp"))
 			if !ok {
 				t.Fatalf("AVIF-corpus-brand-check: no ftyp box in %s", filepath.Base(path))
 			}

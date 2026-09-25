@@ -39,6 +39,20 @@ var xmpWireFrameMagic = [8]byte{0x00, 'X', 'M', 'P', 'E', 'X', 'T', 0x00} //noli
 // xmpKeyword is the iTXt keyword used by Adobe XMP (XMP Part 3 §1.1.4).
 const xmpKeyword = "XML:com.adobe.xmp"
 
+// PNG chunk types compared against the [4]byte chunk type readChunk decodes
+// from the wire (PNG §5.3: the chunk type is a 4-byte code). Comparing
+// [4]byte values, and building one from a package-level constant, is
+// allocation-free — unlike the former string-keyed comparison, which
+// allocated a fresh string for every chunk read (task #232).
+var (
+	chunkEXIf = [4]byte{'e', 'X', 'I', 'f'} //nolint:gochecknoglobals // package-level constant chunk type; never mutated
+	chunkITXt = [4]byte{'i', 'T', 'X', 't'} //nolint:gochecknoglobals // package-level constant chunk type; never mutated
+	chunkTEXt = [4]byte{'t', 'E', 'X', 't'} //nolint:gochecknoglobals // package-level constant chunk type; never mutated
+	chunkZTXt = [4]byte{'z', 'T', 'X', 't'} //nolint:gochecknoglobals // package-level constant chunk type; never mutated
+	chunkIHDR = [4]byte{'I', 'H', 'D', 'R'} //nolint:gochecknoglobals // package-level constant chunk type; never mutated
+	chunkIEND = [4]byte{'I', 'E', 'N', 'D'} //nolint:gochecknoglobals // package-level constant chunk type; never mutated
+)
+
 // maxZlibDecompressSize is the upper bound on decompressed output from a single
 // PNG metadata chunk. Legitimate EXIF and XMP payloads are many orders of
 // magnitude smaller; exceeding this limit indicates a decompression bomb or
@@ -59,43 +73,76 @@ const maxPNGChunkSize = 256 << 20 // 256 MiB
 // allocation on every call to zlibDecompress.
 var zlibPool sync.Pool //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
 
+// bytesReaderPool stores reusable *bytes.Reader values, the io.Reader zlib
+// decompresses from. Pooling it (task #233) avoids a fresh allocation on
+// every zlibDecompress call, mirroring zlibPool's own reuse strategy.
+var bytesReaderPool = sync.Pool{ //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
+	New: func() any { return new(bytes.Reader) },
+}
+
 // crc32Pool stores reusable hash.Hash32 values (crc32.NewIEEE return type).
 // Reusing them via Reset avoids a small allocation on every writeChunk call.
 var crc32Pool = sync.Pool{ //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
 	New: func() any { return crc32.NewIEEE() },
 }
 
+// putBytesReader returns br to bytesReaderPool after clearing its internal
+// slice reference via Reset(nil).
+//
+// Security audit finding PNG-BYTESREADERPOOL-RETENTION-01: bytes.Reader.Reset
+// stores its argument in an unexported field that a plain bytesReaderPool.Put
+// does not clear, so a pooled reader keeps the CALLER'S input slice reachable
+// for as long as it sits in the pool — for zlibDecompress's callers, that
+// input is the compressed chunk payload, bounded by maxPNGChunkSize (256
+// MiB), not by the much smaller decompressed-output cap. Reset(nil) drops
+// the reference immediately, before the reader re-enters the pool, at
+// negligible cost (it only zeroes three fields).
+func putBytesReader(br *bytes.Reader) {
+	br.Reset(nil)
+	bytesReaderPool.Put(br)
+}
+
 // zlibDecompress decompresses a zlib-deflated payload. It gets a reader from
 // zlibPool (or allocates one) and returns it to the pool when done without
 // closing it, so the next caller can Reset it instead of allocating again.
+// The intermediate *bytes.Reader is likewise pooled (task #233); both pools
+// are released via explicit Put calls (putBytesReader for the *bytes.Reader)
+// on every return path rather than defer, so the function stays simple to
+// reason about at every exit point.
 func zlibDecompress(data []byte) ([]byte, error) {
-	r := bytes.NewReader(data)
+	br := bytesReaderPool.Get().(*bytes.Reader) //nolint:forcetypeassert,revive // bytesReaderPool.New always stores *bytes.Reader; pool invariant
+	br.Reset(data)
+
 	var zr io.ReadCloser
 	if v := zlibPool.Get(); v != nil {
-		zr = v.(io.ReadCloser)                                   //nolint:forcetypeassert,revive // zlibPool.New always stores io.ReadCloser; pool invariant
-		if err := zr.(zlib.Resetter).Reset(r, nil); err != nil { //nolint:forcetypeassert // zlib.NewReader always implements zlib.Resetter; Go stdlib guarantee
+		zr = v.(io.ReadCloser)                                    //nolint:forcetypeassert,revive // zlibPool.New always stores io.ReadCloser; pool invariant
+		if err := zr.(zlib.Resetter).Reset(br, nil); err != nil { //nolint:forcetypeassert // zlib.NewReader always implements zlib.Resetter; Go stdlib guarantee
+			putBytesReader(br)
 			return nil, fmt.Errorf("png: zlib reset: %w", err)
 		}
 	} else {
 		var err error
-		zr, err = zlib.NewReader(r)
+		zr, err = zlib.NewReader(br)
 		if err != nil {
+			putBytesReader(br)
 			return nil, fmt.Errorf("png: zlib open: %w", err)
 		}
 	}
-	// Return to pool without closing so it can be Reset on next use.
-	defer zlibPool.Put(zr)
 	// Cap decompressed output to prevent decompression bombs: a crafted zlib
 	// stream with a tiny compressed payload can expand to gigabytes of output.
 	// Reading one byte beyond the limit lets us detect overflow without reading it all.
-	data, err := io.ReadAll(io.LimitReader(zr, maxZlibDecompressSize+1))
+	out, err := io.ReadAll(io.LimitReader(zr, maxZlibDecompressSize+1))
+	// Return both pooled values now that reading has fully completed; zr is
+	// returned without closing so it can be Reset on next use.
+	zlibPool.Put(zr)
+	putBytesReader(br)
 	if err != nil {
 		return nil, fmt.Errorf("png: zlib decompress: %w", err)
 	}
-	if int64(len(data)) > maxZlibDecompressSize {
+	if int64(len(out)) > maxZlibDecompressSize {
 		return nil, errDecompressBomb
 	}
-	return data, nil
+	return out, nil
 }
 
 // processExtractChunk dispatches a single PNG chunk during Extract, updating
@@ -103,18 +150,18 @@ func zlibDecompress(data []byte) ([]byte, error) {
 // where done is true when IEND signals the end of the chunk stream.
 // data is backed by a pooled buffer; any slice that must outlive this call is
 // cloned here or in its callees before being returned as rawEXIF/rawXMP.
-func processExtractChunk(chunkType string, data, rawEXIF, rawXMP []byte) ([]byte, []byte, bool, error) {
+func processExtractChunk(chunkType [4]byte, data, rawEXIF, rawXMP []byte) ([]byte, []byte, bool, error) {
 	switch chunkType {
-	case "eXIf":
+	case chunkEXIf:
 		// Clone: data is pooled and will be returned to the pool after this call.
 		return bytes.Clone(data), rawXMP, false, nil
-	case "iTXt", "tEXt", "zTXt":
+	case chunkITXt, chunkTEXt, chunkZTXt:
 		xmp, err := handleXMPChunk(chunkType, data, rawXMP)
 		if err != nil {
 			return rawEXIF, rawXMP, false, err
 		}
 		return rawEXIF, xmp, false, nil
-	case "IEND":
+	case chunkIEND:
 		return rawEXIF, rawXMP, true, nil
 	}
 	return rawEXIF, rawXMP, false, nil
@@ -136,7 +183,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 
 	var done bool
 	for !done {
-		rerr := readChunk(r, func(chunkType string, data []byte) error {
+		rerr := readChunk(r, func(chunkType [4]byte, data []byte) error {
 			rawEXIF, rawXMP, done, err = processExtractChunk(chunkType, data, rawEXIF, rawXMP)
 			return err
 		})
@@ -161,8 +208,8 @@ func handleITXtXMP(data []byte) ([]byte, error) {
 
 // handleLegacyXMP extracts XMP from a tEXt or zTXt chunk only when existing
 // is nil (legacy chunks do not override a higher-priority iTXt source).
-func handleLegacyXMP(chunkType string, data []byte) ([]byte, error) {
-	if chunkType == "zTXt" {
+func handleLegacyXMP(chunkType [4]byte, data []byte) ([]byte, error) {
+	if chunkType == chunkZTXt {
 		return extractXMPFromZTxt(data)
 	}
 	return extractXMPFromTExt(data), nil
@@ -175,14 +222,14 @@ func handleLegacyXMP(chunkType string, data []byte) ([]byte, error) {
 // iTXt priority rule (XMP Part 3 §1.6 / PNG-04): "Exactly one XMP iTXt;
 // reader uses first." Once rawXMP is set from an iTXt, all subsequent iTXt
 // (and legacy tEXt/zTXt) XMP chunks are ignored.
-func handleXMPChunk(chunkType string, data []byte, existing []byte) ([]byte, error) {
+func handleXMPChunk(chunkType [4]byte, data []byte, existing []byte) ([]byte, error) {
 	// XMP Part 3 §1.6 (PNG-04): use the first XMP chunk encountered; never
 	// overwrite an already-found XMP with a later chunk of any type.
 	if existing != nil {
 		return existing, nil
 	}
 	switch chunkType {
-	case "iTXt":
+	case chunkITXt:
 		xmp, err := handleITXtXMP(data)
 		if err != nil {
 			return nil, err
@@ -190,7 +237,7 @@ func handleXMPChunk(chunkType string, data []byte, existing []byte) ([]byte, err
 		if xmp != nil {
 			return xmp, nil
 		}
-	case "tEXt", "zTXt":
+	case chunkTEXt, chunkZTXt:
 		xmp, err := handleLegacyXMP(chunkType, data)
 		if err != nil {
 			return nil, err
@@ -205,33 +252,33 @@ func handleXMPChunk(chunkType string, data []byte, existing []byte) ([]byte, err
 // shouldDropChunk reports whether the chunk should be dropped during Inject
 // because it is being replaced by a new metadata chunk. eXIf is always
 // dropped; iTXt is dropped only when it carries an XMP payload.
-func shouldDropChunk(chunkType string, data []byte) bool {
-	if chunkType == "eXIf" {
+func shouldDropChunk(chunkType [4]byte, data []byte) bool {
+	if chunkType == chunkEXIf {
 		return true
 	}
-	return chunkType == "iTXt" && isXMPChunk(data)
+	return chunkType == chunkITXt && isXMPChunk(data)
 }
 
 // writeInjectChunk writes chunkType/data to w and, if chunkType is "IHDR",
 // immediately writes the new metadata chunks. It returns (done=true) when
 // chunkType is "IEND". This helper extracts the per-chunk logic from Inject,
 // reducing that function's cyclomatic complexity.
-func writeInjectChunk(w io.Writer, chunkType string, data, rawEXIF, rawXMP []byte) (bool, error) {
+func writeInjectChunk(w io.Writer, chunkType [4]byte, data, rawEXIF, rawXMP []byte) (bool, error) {
 	if err := writeChunk(w, chunkType, data); err != nil {
 		return false, err
 	}
-	if chunkType == "IHDR" {
+	if chunkType == chunkIHDR {
 		if err := writeMetadataAfterIHDR(w, rawEXIF, rawXMP); err != nil {
 			return false, err
 		}
 	}
-	return chunkType == "IEND", nil
+	return chunkType == chunkIEND, nil
 }
 
 // injectChunk is the per-chunk callback used by Inject's readChunk loop.
 // It skips replacement targets, writes surviving chunks, and returns errPNGDone
 // when IEND has been written so the caller can break cleanly.
-func injectChunk(w io.Writer, chunkType string, data, rawEXIF, rawXMP []byte) error {
+func injectChunk(w io.Writer, chunkType [4]byte, data, rawEXIF, rawXMP []byte) error {
 	if shouldDropChunk(chunkType, data) {
 		return nil
 	}
@@ -297,7 +344,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	}
 
 	for {
-		err := readChunk(r, func(chunkType string, data []byte) error {
+		err := readChunk(r, func(chunkType [4]byte, data []byte) error {
 			return injectChunk(w, chunkType, data, rawEXIF, rawXMP)
 		})
 		if err != nil {
@@ -318,7 +365,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	// W3C PNG 3rd ed. §5.6: "The IEND chunk must appear LAST. It marks the end
 	// of the PNG datastream." Write a synthetic IEND so the output is always a
 	// structurally complete PNG regardless of whether the source was well-formed.
-	return writeChunk(w, "IEND", nil)
+	return writeChunk(w, chunkIEND, nil)
 }
 
 // xmpITXtOverhead is the fixed byte count prepended to the XMP data by
@@ -343,7 +390,7 @@ func writeMetadataAfterIHDR(w io.Writer, rawEXIF, rawXMP []byte) error {
 			return fmt.Errorf("png: EXIF payload (%d bytes) exceeds PNG chunk limit of 2^31-1: %w",
 				len(rawEXIF), ErrChunkTooLarge)
 		}
-		if err := writeChunk(w, "eXIf", rawEXIF); err != nil {
+		if err := writeChunk(w, chunkEXIf, rawEXIF); err != nil {
 			return err
 		}
 	}
@@ -356,7 +403,7 @@ func writeMetadataAfterIHDR(w io.Writer, rawEXIF, rawXMP []byte) error {
 				len(rawXMP), ErrXMPTooLarge)
 		}
 		xmpChunk := buildXMPChunk(rawXMP)
-		if err := writeChunk(w, "iTXt", xmpChunk); err != nil {
+		if err := writeChunk(w, chunkITXt, xmpChunk); err != nil {
 			return err
 		}
 	}
@@ -389,37 +436,61 @@ var errDecompressBomb = errors.New("png: decompressed metadata chunk exceeds siz
 // every chunk, and display decoders (e.g. libpng) routinely skip IDAT CRC
 // unless requested. The library documents this policy explicitly so callers
 // understand what the error ErrChunkCRCMismatch can and cannot signal.
-var metadataChunks = map[string]struct{}{ //nolint:gochecknoglobals // package-level lookup table; read-only after init
-	"eXIf": {},
-	"iTXt": {},
-	"tEXt": {},
-	"zTXt": {},
-	"IHDR": {},
+var metadataChunks = map[[4]byte]struct{}{ //nolint:gochecknoglobals // package-level lookup table; read-only after init
+	chunkEXIf: {},
+	chunkITXt: {},
+	chunkTEXt: {},
+	chunkZTXt: {},
+	chunkIHDR: {},
+}
+
+// chunkTypeStr converts chunkType to a string for use only in the cold,
+// rarely-taken error-message-construction paths of readChunk,
+// readNonEmptyChunk, readLargeChunk, and verifyCRC32.
+//
+// This exists because Go's escape analysis is control-flow-insensitive: a
+// [4]byte function PARAMETER whose address is taken anywhere in the
+// function body — even inside an `if err != nil` branch that runs on a tiny
+// fraction of calls — is marked as escaping for EVERY call, not just the
+// branch that actually executes. Slicing chunkType directly inline
+// (`chunkType[:]`) inside each function's own fmt.Errorf calls was measured
+// to force that function's own chunkType copy to the heap unconditionally,
+// which is worse than the single string(hdr[4:8]) allocation task #232 set
+// out to remove (confirmed via `go build -gcflags="-m -m"` and a benchmark
+// regression from 15 to 21 allocs/op on BenchmarkPNGExtract). Routing the
+// conversion through this small, `//go:noinline` helper isolates the
+// escaping copy to a call that only actually runs on the error path: passing
+// chunkType BY VALUE into a call does not, by itself, force the caller's own
+// copy to escape — only inlining the callee's body back into the caller
+// would do that, which //go:noinline forbids.
+//
+//go:noinline
+func chunkTypeStr(t [4]byte) string {
+	return string(t[:])
 }
 
 // shouldVerifyCRC reports whether the CRC of chunkType should be checked.
 // Only chunks whose data is interpreted by this library are checked; pixel-data
 // and other pass-through chunks are skipped to avoid burning CPU on bytes that
 // are never read by the metadata layer.
-func shouldVerifyCRC(chunkType string) bool {
+func shouldVerifyCRC(chunkType [4]byte) bool {
 	_, ok := metadataChunks[chunkType]
 	return ok
 }
 
-// verifyCRC32 checks the CRC-32/IEEE of (typeBytes + data) against stored.
-// typeBytes must be the 4-byte chunk-type field already in a caller-owned
-// stack buffer (avoids an allocation for the string→[]byte conversion).
-// Returns ErrChunkCRCMismatch on mismatch.
-func verifyCRC32(chunkType string, typeBytes, data []byte, stored uint32) error {
+// verifyCRC32 checks the CRC-32/IEEE of (chunkType + data) against stored.
+// Returns ErrChunkCRCMismatch on mismatch. chunkType is a [4]byte value (task
+// #232), so no string→[]byte conversion is needed to hash it.
+func verifyCRC32(chunkType [4]byte, data []byte, stored uint32) error {
 	h := crc32Pool.Get().(hash.Hash32) //nolint:forcetypeassert,revive // crc32Pool.New always stores hash.Hash32; pool invariant
 	h.Reset()
-	_, _ = h.Write(typeBytes) // chunk type (4 bytes from caller's stack buffer)
+	_, _ = h.Write(chunkType[:])
 	_, _ = h.Write(data)
 	computed := h.Sum32()
 	crc32Pool.Put(h)
 	if computed != stored {
 		return fmt.Errorf("png: chunk %q CRC mismatch (stored %08x, computed %08x): %w",
-			chunkType, stored, computed, ErrChunkCRCMismatch)
+			chunkTypeStr(chunkType), stored, computed, ErrChunkCRCMismatch)
 	}
 	return nil
 }
@@ -446,9 +517,9 @@ const largeChunkReadThreshold = 65536
 //     incrementally via io.ReadAll + io.LimitReader so that a crafted length
 //     field in a short stream does not pre-allocate proportionally to the
 //     declared length.
-func readNonEmptyChunk(r io.Reader, hdr []byte, chunkType string, length int, verifyCRC bool, fn func(string, []byte) error) error {
+func readNonEmptyChunk(r io.Reader, chunkType [4]byte, length int, verifyCRC bool, fn func([4]byte, []byte) error) error {
 	if length > largeChunkReadThreshold {
-		return readLargeChunk(r, hdr, chunkType, length, verifyCRC, fn)
+		return readLargeChunk(r, chunkType, length, verifyCRC, fn)
 	}
 
 	// Fast path: pool-backed buffer, no heap allocation for small chunks.
@@ -456,20 +527,27 @@ func readNonEmptyChunk(r io.Reader, hdr []byte, chunkType string, length int, ve
 	data := (*buf)[:length]
 	if _, err := io.ReadFull(r, data); err != nil {
 		iobuf.Put(buf)
-		return fmt.Errorf("png: truncated chunk %q: %w", chunkType, err)
+		return fmt.Errorf("png: truncated chunk %q: %w", chunkTypeStr(chunkType), err)
 	}
 
 	// Read the 4-byte CRC trailer (PNG §5.3) — always consumed to keep the
-	// stream position correct, even when CRC verification is skipped.
+	// stream position correct, even when CRC verification is skipped. A
+	// plain stack array is used rather than an iobuf-pooled one: measurement
+	// showed the sync.Pool round trip costs more in ns/op for an object this
+	// small than the single unavoidable heap escape it would replace (the
+	// address still crosses io.ReadFull's io.Reader interface call either
+	// way — see readChunk's doc comment) — pooling only pays off for the
+	// larger, size-variable buffers this function already pools (buf above).
 	var crcB [4]byte
 	if _, err := io.ReadFull(r, crcB[:]); err != nil {
 		iobuf.Put(buf)
-		return fmt.Errorf("png: read CRC for %q: %w", chunkType, err)
+		return fmt.Errorf("png: read CRC for %q: %w", chunkTypeStr(chunkType), err)
 	}
+	stored := binary.BigEndian.Uint32(crcB[:])
 
 	if verifyCRC {
 		// Verify CRC-32/IEEE over chunk type + chunk data (PNG §5.4).
-		if err := verifyCRC32(chunkType, hdr[4:8], data, binary.BigEndian.Uint32(crcB[:])); err != nil {
+		if err := verifyCRC32(chunkType, data, stored); err != nil {
 			iobuf.Put(buf)
 			return err
 		}
@@ -485,26 +563,28 @@ func readNonEmptyChunk(r io.Reader, hdr []byte, chunkType string, length int, ve
 // data incrementally: a stream with fewer bytes than length yields a short
 // slice without a proportional allocation, and the truncation check returns
 // an error immediately. An honest large chunk is read fully up to length bytes.
-func readLargeChunk(r io.Reader, hdr []byte, chunkType string, length int, verifyCRC bool, fn func(string, []byte) error) error {
+func readLargeChunk(r io.Reader, chunkType [4]byte, length int, verifyCRC bool, fn func([4]byte, []byte) error) error {
 	// length is bounded by maxPNGChunkSize (256 MiB) checked in readChunk.
 	// The int→int64 conversion is safe: length ≤ 256<<20 < math.MaxInt64.
 	data, err := io.ReadAll(io.LimitReader(r, int64(length)))
 	if err != nil {
-		return fmt.Errorf("png: read chunk %q: %w", chunkType, err)
+		return fmt.Errorf("png: read chunk %q: %w", chunkTypeStr(chunkType), err)
 	}
 	if len(data) != length {
 		return fmt.Errorf("png: truncated chunk %q: read %d of %d bytes: %w",
-			chunkType, len(data), length, io.ErrUnexpectedEOF)
+			chunkTypeStr(chunkType), len(data), length, io.ErrUnexpectedEOF)
 	}
 
-	// Read the 4-byte CRC trailer (PNG §5.3).
+	// Read the 4-byte CRC trailer (PNG §5.3). Plain stack array: see the
+	// identical rationale in readNonEmptyChunk above.
 	var crcB [4]byte
 	if _, err := io.ReadFull(r, crcB[:]); err != nil {
-		return fmt.Errorf("png: read CRC for %q: %w", chunkType, err)
+		return fmt.Errorf("png: read CRC for %q: %w", chunkTypeStr(chunkType), err)
 	}
+	stored := binary.BigEndian.Uint32(crcB[:])
 
 	if verifyCRC {
-		if err := verifyCRC32(chunkType, hdr[4:8], data, binary.BigEndian.Uint32(crcB[:])); err != nil {
+		if err := verifyCRC32(chunkType, data, stored); err != nil {
 			return err
 		}
 	}
@@ -516,6 +596,18 @@ func readLargeChunk(r io.Reader, hdr []byte, chunkType string, length int, verif
 // backed by a pooled buffer. fn must not retain data after returning; call
 // bytes.Clone inside fn if the data must outlive the call.
 //
+// chunkType is a [4]byte value (task #232), derived from the header via a
+// plain array copy instead of the former string(hdr[4:8]) conversion — the
+// dominant allocation this task removes, since it fired on every single
+// chunk (including large pass-through chunks like IDAT), not just metadata
+// ones. hdr and the CRC trailer stay plain stack arrays: their addresses
+// cross io.ReadFull's io.Reader interface call regardless (an unavoidable
+// heap escape — see internal/riff.ReadChunkBuf's doc comment for the general
+// rationale), but routing objects this small through iobuf's sync.Pool
+// measured slower in ns/op than paying that one escape directly, so pooling
+// is reserved for the size-variable chunk-data buffer, which genuinely
+// benefits from reuse.
+//
 // CRC verification policy: CRC-32/IEEE (PNG §5.3/§5.4) is verified only for
 // metadata chunks that this library interprets: eXIf, iTXt, tEXt, zTXt, and
 // IHDR. Pixel-data chunks (IDAT) and all other pass-through chunks are read
@@ -524,12 +616,13 @@ func readLargeChunk(r io.Reader, hdr []byte, chunkType string, length int, verif
 // library. ErrChunkCRCMismatch therefore signals corruption in metadata, not
 // in pixel data. Callers needing full-stream integrity must use a separate
 // tool (e.g. a display decoder with CRC checking enabled).
-func readChunk(r io.Reader, fn func(chunkType string, data []byte) error) error {
+func readChunk(r io.Reader, fn func(chunkType [4]byte, data []byte) error) error {
 	var hdr [8]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return fmt.Errorf("png: read chunk header: %w", err)
 	}
-	chunkType := string(hdr[4:8])
+	var chunkType [4]byte
+	copy(chunkType[:], hdr[4:8])
 
 	// Read the raw uint32 length BEFORE converting to int. On a 32-bit platform
 	// (GOARCH=386/arm, int=32 bits), a chunk length >= 2^31 would become negative
@@ -539,7 +632,7 @@ func readChunk(r io.Reader, fn func(chunkType string, data []byte) error) error 
 	// widths. PNG spec ISO 15948 §11.2.1 caps chunk length at 2^31−1 anyway (task #74).
 	rawLen := binary.BigEndian.Uint32(hdr[:4])
 	if rawLen > math.MaxInt32 {
-		return fmt.Errorf("png: chunk %q length %d exceeds 2^31-1: %w", chunkType, rawLen, ErrChunkTooLarge)
+		return fmt.Errorf("png: chunk %q length %d exceeds 2^31-1: %w", chunkTypeStr(chunkType), rawLen, ErrChunkTooLarge)
 	}
 	length := int(rawLen)
 
@@ -547,25 +640,26 @@ func readChunk(r io.Reader, fn func(chunkType string, data []byte) error) error 
 	// PNG spec ISO 15948 §11.2.1 permits up to 2^31−1 bytes, but that is
 	// pathological for metadata; enforce a tighter application-level limit here.
 	if length > maxPNGChunkSize {
-		return fmt.Errorf("png: chunk %q length %d exceeds limit: %w", chunkType, length, ErrChunkTooLarge)
+		return fmt.Errorf("png: chunk %q length %d exceeds limit: %w", chunkTypeStr(chunkType), length, ErrChunkTooLarge)
 	}
 
 	verifyCRC := shouldVerifyCRC(chunkType)
 
 	if length > 0 {
-		return readNonEmptyChunk(r, hdr[:], chunkType, length, verifyCRC, fn)
+		return readNonEmptyChunk(r, chunkType, length, verifyCRC, fn)
 	}
 
 	// Zero-length chunk: read the 4-byte CRC trailer to advance the stream,
 	// then verify only for metadata chunk types.
 	var crcB [4]byte
 	if _, err := io.ReadFull(r, crcB[:]); err != nil {
-		return fmt.Errorf("png: read CRC for %q: %w", chunkType, err)
+		return fmt.Errorf("png: read CRC for %q: %w", chunkTypeStr(chunkType), err)
 	}
+	stored := binary.BigEndian.Uint32(crcB[:])
 
 	if verifyCRC {
 		// PNG §5.4: CRC covers chunk type + data; for zero-length chunks, data is empty.
-		if err := verifyCRC32(chunkType, hdr[4:8], nil, binary.BigEndian.Uint32(crcB[:])); err != nil {
+		if err := verifyCRC32(chunkType, nil, stored); err != nil {
 			return err
 		}
 	}
@@ -574,27 +668,46 @@ func readChunk(r io.Reader, fn func(chunkType string, data []byte) error) error 
 }
 
 // writeChunk writes a PNG chunk with a correct CRC-32 checksum (PNG §5.4).
-func writeChunk(w io.Writer, chunkType string, data []byte) error {
-	var hdr [8]byte
+// The 8-byte header and 4-byte CRC trailer are obtained from the iobuf pool
+// (task #231) instead of fresh stack arrays: both addresses are passed
+// through w.Write's io.Writer interface call, which forces them to escape to
+// the heap regardless of how this function itself is compiled (the same
+// unavoidable-escape class documented on readChunk above) — a pooled buffer
+// pays that allocation once, amortised across every chunk written, instead of
+// once per call. crc32Pool.Put is called explicitly on every return path so
+// the function has no defer.
+func writeChunk(w io.Writer, chunkType [4]byte, data []byte) error {
+	hdrPtr := iobuf.Get(8)
+	hdr := *hdrPtr
 	binary.BigEndian.PutUint32(hdr[:4], uint32(len(data))) //nolint:gosec // G115: chunk data length bounded by input
-	copy(hdr[4:8], chunkType)
-	if _, err := w.Write(hdr[:]); err != nil {
+	copy(hdr[4:8], chunkType[:])
+	if _, err := w.Write(hdr); err != nil {
+		iobuf.Put(hdrPtr)
 		return fmt.Errorf("png: write chunk header: %w", err)
 	}
 	if len(data) > 0 {
 		if _, err := w.Write(data); err != nil {
+			iobuf.Put(hdrPtr)
 			return fmt.Errorf("png: write chunk data: %w", err)
 		}
 	}
-	// CRC covers chunk type + chunk data (PNG §5.4).
+	// CRC covers chunk type + chunk data (PNG §5.4). Hash the type bytes
+	// already sitting in hdr[4:8] rather than re-deriving them from chunkType,
+	// avoiding a second copy.
 	h := crc32Pool.Get().(hash.Hash32) //nolint:forcetypeassert,revive // crc32Pool.New always stores hash.Hash32; pool invariant
 	h.Reset()
-	defer crc32Pool.Put(h)
-	_, _ = h.Write([]byte(chunkType))
+	_, _ = h.Write(hdr[4:8])
 	_, _ = h.Write(data)
-	var crcB [4]byte
-	binary.BigEndian.PutUint32(crcB[:], h.Sum32())
-	if _, err := w.Write(crcB[:]); err != nil {
+	sum := h.Sum32()
+	crc32Pool.Put(h)
+	iobuf.Put(hdrPtr)
+
+	crcPtr := iobuf.Get(4)
+	crcB := *crcPtr
+	binary.BigEndian.PutUint32(crcB, sum)
+	_, err := w.Write(crcB)
+	iobuf.Put(crcPtr)
+	if err != nil {
 		return fmt.Errorf("png: write chunk CRC: %w", err)
 	}
 	return nil
@@ -705,13 +818,14 @@ func isXMPChunk(data []byte) bool {
 // buildXMPChunk constructs an iTXt chunk payload for an XMP packet.
 func buildXMPChunk(xmpData []byte) []byte {
 	// keyword\x00 compFlag(0) compMethod(0) lang\x00 transKw\x00 text
-	var buf bytes.Buffer
-	buf.WriteString(xmpKeyword)
-	buf.WriteByte(0x00) // null terminator for keyword
-	buf.WriteByte(0x00) // compression flag: not compressed
-	buf.WriteByte(0x00) // compression method
-	buf.WriteByte(0x00) // empty language tag
-	buf.WriteByte(0x00) // empty translated keyword
-	buf.Write(xmpData)
-	return buf.Bytes()
+	// Pre-sized to its exact final length (xmpITWtOverhead + len(xmpData), the
+	// same quantity writeMetadataAfterIHDR already validates against the PNG
+	// chunk-length limit) instead of growing a zero-cap bytes.Buffer, which
+	// would reallocate at least twice for any non-trivial payload (task #231).
+	buf := make([]byte, 0, xmpITXtOverhead+len(xmpData))
+	buf = append(buf, xmpKeyword...)
+	// NUL(keyword) + compFlag(0=uncompressed) + compMethod(0) + NUL(lang) + NUL(transKw).
+	buf = append(buf, 0x00, 0x00, 0x00, 0x00, 0x00)
+	buf = append(buf, xmpData...)
+	return buf
 }

@@ -492,6 +492,37 @@ corpus and fixture files).
 - **#227**: `parseCR3BoxHeader` returns a `[4]byte` box type.
 - **#237**: `internal/tiffscan.ExtractTagValues` is the single IFD0 IPTC/XMP scanner for `tiff`, `orf`, and `rw2`.
 
+### Batch D (tasks #228–#234) — 2026-09-25
+
+Go version go1.27.1, `cpu: Apple M4`, `-count=10 -benchtime=2s`, all changes `p=0.000`
+unless noted. `format/heif`, `format/png`, `format/webp`, `internal/riff`. Golden
+SHA-256 identical: `gometadata.Read` + `SetCopyright` + `gometadata.Write` over every
+HEIF/PNG/WebP corpus and fixture file (992 files: 747 successful writes with matching
+hashes, 245 with matching error outcomes) is byte-for-byte unchanged before vs after.
+
+| Benchmark | ns/op before → after | B/op before → after | allocs/op before → after |
+|---|---|---|---|
+| HEIFExtract | 318.5n → 213.7n (**−32.92%**) | 580 → 400 (**−31.03%**) | 14 → 5 (**−64.29%**) |
+| HEIFInject | 559.9n → 316.9n (**−43.39%**) | 1768 → 812 (**−54.07%**) | 34 → 12 (**−64.71%**) |
+| PNGExtract | 285.8n → 259.2n (**−9.29%**) | 184 → 184 (~) | 15 → 14 (**−6.67%**) |
+| PNGExtractCompressedXMP | 487.6n → 466.6n (**−4.32%**) | 651 → 604 (**−7.22%**) | 14 → 12 (**−14.29%**) |
+| PNGInject | 456.8n → 391.6n (**−14.25%**) | 969 → 793 (**−18.16%**) | 25 → 11 (**−56.00%**) |
+| PNGWriteChunk | 59.80n → 52.05n (**−12.94%**) | 136 → 112 (**−17.65%**) | 5 → 2 (**−60.00%**) |
+| WebPExtract | 74.00n → 73.48n (**−0.70%**, p=0.009) | 32 → 32 (~) | 3 → 3 (~) |
+| WebPExtractWithXMP | 103.3n → 100.2n (**−2.96%**) | 112 → 112 (~) | 4 → 4 (~) |
+| WebPInject | 215.8n → 128.1n (**−40.63%**) | 899 → 320 (**−64.40%**) | 10 → 4 (**−60.00%**) |
+| riff.ReadChunk | 18.54n → 18.31n (**−1.21%**) | 56 → 56 (~) | 2 → 2 (~) |
+
+#### Per-task notes
+
+- **#228**: `parseHEIFBoxHeader` returns a `[4]byte` box type; `parseInfe`/`parseInfeV0V1`/`parseInfeV2V3` return a `[4]byte` item type plus an `ok bool` instead of a string; `parseIinf` returns `map[uint16][4]byte`. `selectBestItem`'s dead `"rdf+xml"` candidate (7 bytes; ISO 14496-12 §8.11.6 fixes `item_type` at exactly 4 bytes, so it could never match) is dropped, not carried forward as a `[4]byte`.
+- **#229**: `newMetaBoxLen`/`ilocBoxSize` compute the exact rebuilt-meta-box length from field widths and extent counts alone — no bytes are serialised to learn it — replacing the former placeholder-then-final double build. `updateIlocItemsInPlace` mutates `ilocInfo.items` (never aliased elsewhere) instead of copying the slice, and reuses each matched item's existing one-element extents backing array. `buildIlocBox`/`buildMetaBox` each write into one pre-sized buffer (header placeholder + body + patched size field) instead of separate body/hdr buffers. New regression gate: `TestInjectMultiExtentItemCollapsesToOne` (a 2-extent source item collapses to exactly 1 extent with correct offset/length after Inject). **Post-merge security fix (HEIF-ILOC-DUPBOX-01, 2026-09-25):** the initial `ilocSizeDelta` measured only the FIRST `iloc`-typed child box's size, while `buildMetaBox`'s own copy loop drops EVERY `iloc`-typed child — a meta box with two (or more) `iloc` boxes, or with trailing bytes that fail to parse as a box header at all (both silently dropped by `buildMetaBox`'s real walk), produced a `newMetaLen` estimate that didn't match `buildMetaBox`'s actual output, corrupting the injected item's extent offset. Fixed by extracting the shared traversal into `nonIlocBoxesLen` (used by both `buildMetaBox`'s size pre-computation and the new `newMetaBoxLen`), so the two can no longer drift apart. Regression gates: `TestInjectDuplicateIlocBoxesOffsetInBounds`, `TestInjectMetaWithTrailingUnparseableBytesOffsetInBounds`; `FuzzHEIFInject` strengthened with a within-output-bounds invariant for every Exif/mime-typed item's extent.
+- **#230**: `heif.Inject` and `webp.Inject` read their input via `iobuf.ReadAll` (task #224) instead of `io.ReadAll(io.LimitReader(...))`. New non-seekable-fallback regression tests in both packages' `oom_gate_test.go` (`seekStartOnlyReader`, allowing only the leading `Seek(0, SeekStart)` Inject itself performs).
+- **#231**: `writeChunk` obtains its 8-byte header and 4-byte CRC trailer from `iobuf`, hashes the chunk type directly from `hdr[4:8]` (no `[]byte(chunkType)` conversion), and calls `crc32Pool.Put` explicitly on every return instead of via `defer`. `buildXMPChunk` is pre-sized to its exact final length instead of growing a zero-cap `bytes.Buffer`.
+- **#232**: `readChunk`'s callback type is `[4]byte` (`copy(chunkType[:], hdr[4:8])` replaces `string(hdr[4:8])`), removing a string allocation on every chunk, metadata or not. The 8-byte header and 4-byte CRC trailer stay plain stack arrays: routing them through `iobuf` was measured to cost *more* in ns/op than the single unavoidable heap escape it would replace (a real, if smaller, PNGExtract regression was caught this way before being reverted — see `feedback_png_chunktype_escape.md`). `chunkTypeStr` (a `//go:noinline` `[4]byte`→`string` cold-path helper) is used at every `%q` error-formatting call site instead of slicing `chunkType` inline, because Go's escape analysis is control-flow-insensitive: slicing a `[4]byte` *parameter* inside even a rarely-taken `if err != nil` branch marks that parameter as escaping on **every** call.
+- **#233**: `zlibDecompress` pools its `*bytes.Reader` (`bytesReaderPool`, `Reset` on `Get`) alongside the existing `zlibPool`, with explicit `Put` calls instead of `defer`. **Post-merge security fix (PNG-BYTESREADERPOOL-RETENTION-01, 2026-09-25):** `bytes.Reader.Reset(data)` stores `data` in an unexported field that a plain `Put` never clears, so a pooled reader kept the caller's compressed input (up to `maxPNGChunkSize`, 256 MiB) reachable for as long as it sat in the pool. Fixed via `putBytesReader`, which calls `br.Reset(nil)` before every `Put`. Regression gate: `TestZlibDecompressDoesNotRetainInput` (drains the pool and asserts `Len()==0 && Size()==0` — both public methods, no reflection needed).
+- **#234**: `internal/riff.ReadChunkHeaderAt` takes a caller-supplied data offset instead of discovering it via `Seek(0, SeekCurrent)` (a plain `io.Reader` suffices — no seek at all). `webp.readWebPChunks` tracks its own running offset (start 12, advance `8+size+padding`) and measures the stream's total length at most once per `Extract` call, lazily, only when a metadata chunk is actually seen (`measureStreamEnd`) — `readPaddedChunk` itself no longer seeks; the odd-size padding byte is read and discarded rather than skipped via `Seek(SeekCurrent)`. `collectOriginalChunks`/`webpOriginalChunk`/`writeRIFFChunk`/`isEOFOrKnownFourCC` use `[4]byte` FourCC values throughout instead of converting to `string` per chunk. `buildWebPBody` writes the 12-byte RIFF header into the same pooled buffer as the chunk stream (header placeholder, body, patch size) instead of a separate `riffHdr` allocation plus a second `w.Write` call. New regression gate: `TestExtractNoPerChunkSeekCurrent` asserts the seek trace of a full `Extract` call (VP8X + EXIF + XMP + one non-metadata chunk) contains no `io.SeekCurrent` call at all.
+
 ## [main — perf task #198] — 2026-06-10 (exif: parse-level arena for sub-IFDs)
 
 ### Optimisations applied in this version

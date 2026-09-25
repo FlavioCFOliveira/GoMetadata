@@ -83,6 +83,37 @@ func ReadChunkBuf(r io.ReadSeeker, hdr *[8]byte) (Chunk, error) {
 	return c, nil
 }
 
+// ReadChunkHeaderAt reads the next RIFF chunk header from r (using hdr as
+// scratch space, exactly like ReadChunkBuf) and sets Chunk.Offset to offset
+// instead of discovering it via Seek.
+//
+// Unlike ReadChunkBuf, this variant takes a plain io.Reader and never calls
+// Seek: it trusts the caller to already know the byte position of the first
+// data byte (immediately after the 8-byte header this call is about to
+// consume) because the caller is reading the stream sequentially and tracking
+// its own running offset — the exact situation format/webp's readWebPChunks
+// is in. This removes the "1 Seek(SeekCurrent) per chunk" cost ReadChunkBuf
+// pays purely to populate a field the caller could compute for free (task
+// #234).
+//
+// offset must equal the true byte position of the first data byte for the
+// chunk about to be read (i.e. the position immediately after the 8-byte
+// header). Passing an incorrect value produces a Chunk with a wrong Offset
+// field but does not otherwise affect parsing: FourCC and Size are read
+// directly from r regardless.
+//
+// hdr must not be nil.
+func ReadChunkHeaderAt(r io.Reader, hdr *[8]byte, offset int64) (Chunk, error) {
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return Chunk{}, err
+	}
+	var c Chunk
+	copy(c.FourCC[:], hdr[:4])
+	c.Size = binary.LittleEndian.Uint32(hdr[4:])
+	c.Offset = offset
+	return c, nil
+}
+
 // SkipChunk advances r past the data (and any padding byte) of c.
 //
 // CONTRACT: SkipChunk performs NO bounds validation on c.Size. The caller must

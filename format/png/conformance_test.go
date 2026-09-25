@@ -204,7 +204,7 @@ func TestPNGChunkCRCPolynomial(t *testing.T) {
 
 	// writeChunk serialises the chunk via the library's own writeChunk.
 	var out bytes.Buffer
-	if err := writeChunk(&out, "eXIf", data); err != nil {
+	if err := writeChunk(&out, chunkEXIf, data); err != nil {
 		t.Fatalf("writeChunk: %v", err)
 	}
 	chunkBytes := out.Bytes()
@@ -232,7 +232,7 @@ func TestPNGChunkCRCCoversTypeAndData(t *testing.T) {
 	// PNG-chunk-CRC-0xEDB88320: §5.5 — CRC covers Type+Data, excludes Length.
 	t.Parallel()
 
-	chunkType := "eXIf"
+	chunkType := chunkEXIf
 	data := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00}
 
 	var out bytes.Buffer
@@ -245,12 +245,12 @@ func TestPNGChunkCRCCoversTypeAndData(t *testing.T) {
 	// CRC over Length+Type+Data must differ from CRC over Type+Data alone,
 	// proving the Length field is excluded.
 	h := crc32.NewIEEE()
-	_, _ = h.Write(raw[:4])           // just Length (4 bytes)
-	_, _ = h.Write([]byte(chunkType)) // Type
-	_, _ = h.Write(data)              // Data
+	_, _ = h.Write(raw[:4])      // just Length (4 bytes)
+	_, _ = h.Write(chunkType[:]) // Type
+	_, _ = h.Write(data)         // Data
 	crcWithLength := h.Sum32()
 
-	crcTypeDataOnly := computeCRC32(chunkType, data)
+	crcTypeDataOnly := computeCRC32(string(chunkType[:]), data)
 
 	if storedCRC == crcWithLength && storedCRC != crcTypeDataOnly {
 		t.Error("PNG-chunk-CRC-0xEDB88320: CRC appears to cover Length field; it must cover only Type+Data")

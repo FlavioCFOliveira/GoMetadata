@@ -499,7 +499,7 @@ func TestShouldDropChunk(t *testing.T) {
 
 	t.Run("drops eXIf chunk", func(t *testing.T) {
 		t.Parallel()
-		if !shouldDropChunk("eXIf", []byte("any data")) {
+		if !shouldDropChunk(chunkEXIf, []byte("any data")) {
 			t.Error("shouldDropChunk: expected true for eXIf")
 		}
 	})
@@ -508,7 +508,7 @@ func TestShouldDropChunk(t *testing.T) {
 		t.Parallel()
 		// Build a valid XMP iTXt payload.
 		data := append([]byte(xmpKeyword+"\x00"), []byte("xmp data")...)
-		if !shouldDropChunk("iTXt", data) {
+		if !shouldDropChunk(chunkITXt, data) {
 			t.Error("shouldDropChunk: expected true for iTXt XMP chunk")
 		}
 	})
@@ -516,21 +516,21 @@ func TestShouldDropChunk(t *testing.T) {
 	t.Run("keeps iTXt non-XMP chunk", func(t *testing.T) {
 		t.Parallel()
 		data := append([]byte("Comment\x00"), []byte("some text")...)
-		if shouldDropChunk("iTXt", data) {
+		if shouldDropChunk(chunkITXt, data) {
 			t.Error("shouldDropChunk: expected false for non-XMP iTXt")
 		}
 	})
 
 	t.Run("keeps tEXt chunk", func(t *testing.T) {
 		t.Parallel()
-		if shouldDropChunk("tEXt", []byte("Comment\x00text")) {
+		if shouldDropChunk(chunkTEXt, []byte("Comment\x00text")) {
 			t.Error("shouldDropChunk: expected false for tEXt")
 		}
 	})
 
 	t.Run("keeps IHDR chunk", func(t *testing.T) {
 		t.Parallel()
-		if shouldDropChunk("IHDR", make([]byte, 13)) {
+		if shouldDropChunk(chunkIHDR, make([]byte, 13)) {
 			t.Error("shouldDropChunk: expected false for IHDR")
 		}
 	})
@@ -581,6 +581,66 @@ func TestZlibDecompressBadData(t *testing.T) {
 	_, err := zlibDecompress([]byte("this is not zlib data"))
 	if err == nil {
 		t.Error("zlibDecompress: expected error for bad zlib data, got nil")
+	}
+}
+
+// TestZlibDecompressDoesNotRetainInput is the regression gate for security
+// audit finding PNG-BYTESREADERPOOL-RETENTION-01 (2026-09-25): bytesReaderPool
+// previously returned its *bytes.Reader to the pool without clearing the
+// unexported slice field bytes.Reader.Reset populates, so a pooled reader
+// kept the caller's (up-to-maxPNGChunkSize) compressed input reachable for as
+// long as it sat in the pool. putBytesReader now calls Reset(nil) before
+// every Put, which — with no reflection needed — makes both the exported
+// Len() (unread byte count) and Size() (original slice length) methods
+// report 0. Size() is the reliable discriminator here: it reports the
+// input's length regardless of how much of it was actually read, so a
+// pooled reader that still references a non-trivial compressed payload
+// would report a non-zero Size() if the fix were absent.
+//
+// This relies on the same Get-follows-Put determinism that
+// TestZlibDecompressPoolReuse (above) already assumes for sync.Pool's per-P
+// fast path — and, like that test, is still run with t.Parallel: every
+// reader drained from the pool must be clean regardless of which goroutine
+// put it there, since ALL of them go through the same putBytesReader.
+func TestZlibDecompressDoesNotRetainInput(t *testing.T) {
+	t.Parallel()
+	compress := func(data []byte) []byte {
+		var buf bytes.Buffer
+		zw := zlib.NewWriter(&buf)
+		_, _ = zw.Write(data)
+		_ = zw.Close()
+		return buf.Bytes()
+	}
+
+	// A non-trivial payload: if retained, its length would show up in Size().
+	input := bytes.Repeat([]byte("retain-me-not"), 1000)
+	comp := compress(input)
+
+	if _, err := zlibDecompress(comp); err != nil {
+		t.Fatalf("zlibDecompress: %v", err)
+	}
+
+	// Drain a handful of readers from the pool. Every one of them — whether
+	// it is the instance zlibDecompress just returned or a freshly
+	// New()-allocated one — must report Len()==0 and Size()==0 once the fix
+	// is in place.
+	const drainCount = 4
+	drained := make([]*bytes.Reader, 0, drainCount)
+	for range drainCount {
+		v := bytesReaderPool.Get()
+		br, ok := v.(*bytes.Reader)
+		if !ok {
+			t.Fatalf("bytesReaderPool.Get() returned %T, want *bytes.Reader", v)
+		}
+		drained = append(drained, br)
+		if br.Len() != 0 || br.Size() != 0 {
+			t.Errorf("PNG-BYTESREADERPOOL-RETENTION-01: pooled *bytes.Reader has Len()=%d Size()=%d, want 0, 0 (input slice still referenced)",
+				br.Len(), br.Size())
+		}
+	}
+	// Return every drained reader so the pool is left healthy for other tests.
+	for _, br := range drained {
+		bytesReaderPool.Put(br)
 	}
 }
 
@@ -792,7 +852,8 @@ func TestReadChunkLargeDeclaredSizeShortStream(t *testing.T) {
 }
 
 // BenchmarkPNGWriteChunk measures the hot inner loop: serialise one PNG chunk
-// (header + data + CRC) using the pooled crc32 hash and stack-allocated header.
+// (header + data + CRC) using the pooled crc32 hash and pooled header/CRC
+// scratch buffers (task #231).
 func BenchmarkPNGWriteChunk(b *testing.B) {
 	data := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00}
 	b.SetBytes(int64(8 + len(data) + 4)) // header + data + CRC
@@ -800,7 +861,7 @@ func BenchmarkPNGWriteChunk(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		var out bytes.Buffer
-		_ = writeChunk(&out, "eXIf", data)
+		_ = writeChunk(&out, chunkEXIf, data)
 	}
 }
 

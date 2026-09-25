@@ -30,18 +30,18 @@ func buildWebP(exifData, xmpData []byte, vp8xFlags uint32, canvasW, canvasH uint
 			vp8xPayload[8] = byte(h >> 8)  //nolint:gosec // G115: test helper, intentional type cast
 			vp8xPayload[9] = byte(h >> 16) //nolint:gosec // G115: test helper, intentional type cast
 		}
-		writeRIFFChunk(&body, "VP8X", vp8xPayload)
+		writeRIFFChunk(&body, fourCCVP8X, vp8xPayload)
 	}
 
 	// Minimal VP8 image data.
 	vp8Data := []byte{0x30, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x01, 0x00, 0x01, 0x00}
-	writeRIFFChunk(&body, "VP8 ", vp8Data)
+	writeRIFFChunk(&body, [4]byte{'V', 'P', '8', ' '}, vp8Data)
 
 	if exifData != nil {
-		writeRIFFChunk(&body, "EXIF", exifData)
+		writeRIFFChunk(&body, fourCCEXIF, exifData)
 	}
 	if xmpData != nil {
-		writeRIFFChunk(&body, "XMP ", xmpData)
+		writeRIFFChunk(&body, fourCCXMP, xmpData)
 	}
 
 	totalSize := 4 + body.Len()
@@ -90,6 +90,46 @@ func TestExtractXMP(t *testing.T) {
 	}
 	if !bytes.Equal(rawXMP, xmpData) {
 		t.Errorf("rawXMP = %v, want %v", rawXMP, xmpData)
+	}
+}
+
+// seekRecorder wraps a *bytes.Reader and records the whence argument of every
+// Seek call, for asserting on the seek pattern a code path actually performs.
+type seekRecorder struct {
+	*bytes.Reader
+	whences []int
+}
+
+func (s *seekRecorder) Seek(offset int64, whence int) (int64, error) {
+	s.whences = append(s.whences, whence)
+	return s.Reader.Seek(offset, whence) //nolint:wrapcheck // test helper: deliberate pass-through to record the seek trace
+}
+
+// TestExtractNoPerChunkSeekCurrent is the regression gate for task #234:
+// Extract must never call Seek(_, io.SeekCurrent) on a per-chunk basis.
+// riff.ReadChunkHeaderAt takes the chunk's data offset from the caller's own
+// running counter instead of discovering it via Seek, so io.SeekCurrent must
+// not appear at all in the seek trace, regardless of how many chunks
+// (metadata or not) the file contains.
+func TestExtractNoPerChunkSeekCurrent(t *testing.T) {
+	t.Parallel()
+	exifData := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00}
+	xmpData := []byte("<?xpacket begin='' uid='x'?><x:xmpmeta xmlns:x='adobe:ns:meta/'></x:xmpmeta><?xpacket end='r'?>")
+	data := buildWebP(exifData, xmpData, 0x0C, 100, 100)
+
+	rec := &seekRecorder{Reader: bytes.NewReader(data)}
+	rawEXIF, _, rawXMP, err := Extract(rec)
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if !bytes.Equal(rawEXIF, exifData) || !bytes.Equal(rawXMP, xmpData) {
+		t.Fatalf("Extract returned wrong payloads: EXIF=%v XMP=%v", rawEXIF, rawXMP)
+	}
+	for _, w := range rec.whences {
+		if w == io.SeekCurrent {
+			t.Errorf("Extract performed a Seek(_, io.SeekCurrent) call; seek trace: %v", rec.whences)
+			break
+		}
 	}
 }
 
@@ -235,7 +275,7 @@ func TestReadPaddedChunkOddSize(t *testing.T) {
 	// Manually write VP8X chunk (10 bytes, even).
 	vp8xPayload := make([]byte, 10)
 	binary.LittleEndian.PutUint32(vp8xPayload[0:], 0x08) // EXIF flag
-	writeRIFFChunk(&body, "VP8X", vp8xPayload)
+	writeRIFFChunk(&body, fourCCVP8X, vp8xPayload)
 
 	// Write EXIF chunk with odd size — RIFF padding byte follows.
 	chunkHdr := make([]byte, 8)
@@ -295,7 +335,7 @@ func TestReadPaddedChunkTooLarge(t *testing.T) {
 	// VP8X chunk (10 bytes, EXIF flag set) — gives the parser a valid first chunk.
 	vp8xPayload := make([]byte, 10)
 	binary.LittleEndian.PutUint32(vp8xPayload[0:], 0x08) // EXIF feature bit
-	writeRIFFChunk(&body, "VP8X", vp8xPayload)
+	writeRIFFChunk(&body, fourCCVP8X, vp8xPayload)
 
 	// EXIF chunk header with giant declared size; no payload bytes written.
 	var exifHdr [8]byte
@@ -346,7 +386,7 @@ func TestReadPaddedChunkSizeLargerThanStream(t *testing.T) {
 	// reaches the EXIF chunk header before encountering the oversized size.
 	vp8xPayload := make([]byte, 10)
 	binary.LittleEndian.PutUint32(vp8xPayload[0:], 0x08) // EXIF feature bit
-	writeRIFFChunk(&body, "VP8X", vp8xPayload)
+	writeRIFFChunk(&body, fourCCVP8X, vp8xPayload)
 
 	// EXIF chunk header with a large declared size; no payload bytes follow.
 	var exifHdr [8]byte
@@ -658,7 +698,7 @@ func TestCollectOriginalChunksLargeSize(t *testing.T) {
 			// Write a VP8X chunk (10 bytes payload, flags for EXIF).
 			vp8xPayload := make([]byte, 10)
 			binary.LittleEndian.PutUint32(vp8xPayload[0:], 0x08) // EXIF flag
-			writeRIFFChunk(&buf, "VP8X", vp8xPayload)
+			writeRIFFChunk(&buf, fourCCVP8X, vp8xPayload)
 			// Write a chunk with oversized declared size but no actual body bytes
 			// (simulates a truncated or adversarial stream).
 			var oversized [8]byte
