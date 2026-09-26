@@ -105,11 +105,12 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 	}
 
 	m := &Metadata{
-		format:     uint8(fmtID),
-		rawEXIF:    rawEXIF,
-		rawIPTC:    rawIPTC,
-		rawXMP:     rawXMP,
-		rawXMPWire: rawXMPWire,
+		format:             uint8(fmtID),
+		rawEXIF:            rawEXIF,
+		rawIPTC:            rawIPTC,
+		rawXMP:             rawXMP,
+		rawXMPWire:         rawXMPWire,
+		rawEXIFIsWholeFile: tiffFamilyRawEXIFIsWholeFile(r, fmtID, rawEXIF),
 		// rawIPTCDigest is populated only for JPEG (the only format whose IRB
 		// carries a Photoshop 0x0425 digest resource). TIFF stores IPTC in tag
 		// 0x83BB without an IRB wrapper, so no digest applies there.
@@ -334,6 +335,46 @@ func ReadFile(path string, opts ...ReadOption) (*Metadata, error) {
 // CMT1 sub-box (audit #138). rawEXIF is nil; rawXMP is still returned when
 // an "XMP " sub-box was present. The caller converts it to a ParseWarning.
 //
+// tiffFamilyRawEXIFIsWholeFile reports whether rawEXIF, as just extracted for
+// one of the five TIFF-family formats (TIFF, CR2, NEF, ARW, DNG — the ones
+// where the TIFF byte stream is itself the EXIF container), happens to equal
+// the ENTIRE source file rather than just format/tiff.Extract's metadata
+// prefix (#289). This can legitimately happen: the extent scanner's own
+// small-file whole-read bypass or large-fraction snap (see
+// format/tiff/extent.go) converges on the whole file for some inputs.
+//
+// For every other format, this always returns false without touching r: the
+// two extra Seek calls below are paid only by the five formats that can ever
+// benefit from the answer.
+//
+// r's position is restored to exactly what it was when this function was
+// called, so it never affects Read's own behaviour or any later use of r —
+// any failure restoring it is treated as "answer unknown" (false), never as
+// a fatal error: worst case, Write falls back to re-reading the source
+// itself, which is always correct, just not maximally fast.
+func tiffFamilyRawEXIFIsWholeFile(r io.ReadSeeker, fmtID format.FormatID, rawEXIF []byte) bool {
+	switch fmtID {
+	case format.FormatTIFF, format.FormatCR2, format.FormatNEF, format.FormatARW, format.FormatDNG:
+	default:
+		return false
+	}
+	if rawEXIF == nil {
+		return false
+	}
+	cur, err := r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return false
+	}
+	end, err := r.Seek(0, io.SeekEnd)
+	if err != nil {
+		return false
+	}
+	if _, err := r.Seek(cur, io.SeekStart); err != nil {
+		return false
+	}
+	return int64(len(rawEXIF)) == end
+}
+
 // wantIPTC and wantXMP (#238) are forwarded to jpeg.ExtractFullSelective so
 // the JPEG extractor can skip the 0x0425 IPTC digest and/or the extended-XMP
 // reassembly when the caller has opted out of that segment. Other formats do

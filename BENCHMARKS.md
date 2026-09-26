@@ -680,6 +680,352 @@ cr3 34,335 B absolute (AC: ≤256 KiB), orf 1.0006×, rw2 1.0007× (AC: ≤1.05�
 `FuzzARWInject`, `FuzzORFInject`, `FuzzRW2Inject`, `FuzzDNGInject`, `FuzzParseEXIF`,
 `FuzzParseXMP`, `FuzzRead` — each run standalone for 60 s (`-fuzztime=60s`); zero crashers.
 
+### Batch F (tasks #288, #289) — 2026-09-25
+
+Go version go1.27.1, `cpu: Apple M4`, `-count=10` (`≥8` interleaved runs required by
+the batch's Definition of Done), all changes `p=0.000` unless noted. `format/png/png.go`
+(#288), `format/tiff/extent.go` (new), `format/tiff/tiff.go`, `write.go`, `metadata.go`
+(#289). Measured with the same scratch end-to-end harness as Batch E
+(`gm.Read`/`gm.Write` over real corpus files) against
+`png/metadata-extractor/Issue 280 (dotnet).png`, `tiff/metadata-extractor/Epson
+PerfectionV800.tiff` (819,606 B), `raw/metadata-extractor/Canon EOS 600D.CR2`
+(22,911,265 B), `raw/metadata-extractor/Nikon D810.nef` (40,667,772 B), `raw/
+metadata-extractor/Sony ILCE-7M3 (A7M3).arw` (24,795,904 B), `raw/metadata-extractor/DJI
+Phantom 4 (1).dng` (24,394,394 B).
+
+| Benchmark | ns/op before → after | B/op before → after | allocs/op before → after |
+|---|---|---|---|
+| Read/png | 18.414µ → 2.856µ (**−84.49%**) | 3.752Ki → 2.862Ki (**−23.72%**) | 138 → 28 (**−79.71%**) |
+| Write/png | 109.03µ → 29.23µ (**−73.19%**) | 7.708Ki → 6.827Ki (**−11.43%**) | 131 → 14 (**−89.31%**) |
+| Read/tiff | 49.24µ → 49.89µ (~) | 809.8Ki → 809.8Ki (~) | 10 → 10 (~) |
+| Read/cr2 | 813.6µ → 8.82µ (**−98.92%**) | 22391.8Ki → 80.20Ki (**−99.64%**) | 26 → 27 (+3.85%) |
+| Read/nef | 1387.4µ → 39.24µ (**−97.17%**) | 38.797Mi → 817.6Ki (**−97.94%**) | 19 → 30 (+57.89%) |
+| Read/arw | 885.8µ → 47.50µ (**−94.64%**) | 24552.2Ki → 849.2Ki (**−96.54%**) | 23 → 29 (+26.09%) |
+| Read/dng | 858.0µ → 17.39µ (**−97.97%**) | 23833.8Ki → 202.8Ki (**−99.15%**) | 32 → 38 (+18.75%) |
+| Write/tiff | 61.02µ → 61.02µ (~) | 825.6Ki → 825.6Ki (~) | 27 → 27 (~) |
+| Write/cr2 | 1.938m → 2.569m (+32.55%) | 21.91Mi → 43.77Mi (+99.72%) | 60 → 69 (+15.00%) |
+| Write/nef | 2.574m → 3.990m (+54.97%) | 43.02Mi → 81.81Mi (+90.18%) | 65 → 70 (+7.69%) |
+| Write/arw | 1.532m → 2.431m (+58.63%) | 24.86Mi → 48.51Mi (+95.13%) | 67 → 76.5 (+14.18%) |
+| Write/dng | 1.489m → 2.319m (+55.69%) | 24.50Mi → 47.77Mi (+94.95%) | 67 → 71 (+5.97%) |
+| RoundTrip/tiff (Read+SetCaption+SetCopyright+Write) | 105.6µ → 102.7µ (**−2.73%**) | 1.601Mi → 1.601Mi (~) | 55 → 55 (~) |
+| RoundTrip/cr2 | 2.700m → 2.597m (~/**−3.81%**) | 43.78Mi → 43.85Mi (+0.15%) | 102 → 111 (+8.82%) |
+| RoundTrip/nef | 3.950m → 4.048m (+2.47%) | 81.82Mi → 82.61Mi (+0.97%) | 99 → 114 (+15.15%) |
+| RoundTrip/arw | 2.345m → 2.359m–2.457m (~ to +4.76%, noisy — see Follow-up 2) | 48.84Mi → 49.34Mi (+1.03%) | 110 → 119–120 (+8.18–9.09%) |
+| RoundTrip/dng | 2.347m → 2.337m–2.360m (~) | 47.78Mi → 47.97Mi (+0.40%) | 111 → 121 (+9.01%) |
+
+Read/Write/RoundTrip numbers above are the FINAL, post-follow-up-review measurements after
+BOTH follow-up rounds (see "Follow-up" and "Follow-up 2" subsections below); the original
+per-task note further down predates those and is kept for its record of what was found and
+why, not as the current numbers.
+
+AC scorecard: **PNG both AC met** (Read ≤4µs/≤30 allocs target: 2.856µs/28 allocs; Write
+≤30µs/≤35 allocs target: 29.23µs/14 allocs). **TIFF-family Read both AC met**: B/op ≤1 MiB
+for every one of tiff/cr2/nef/arw/dng (max is nef at 817.6Ki); NEF ns/op ≥80% lower target:
+**−97.17%** actual. **RoundTrip (the realistic Read+edit+Write workflow) is net-neutral or
+better for all 5 formats** after Follow-up 2's `m.rawEXIF`-reuse fix: tiff **−2.73%** (was
++57.17%), cr2 `~`/−3.81%, nef +2.47%, dng `~`, arw ranges `~` to +4.76% across repeated
+clean runs (noise around ~0%, not a stable regression — see Follow-up 2).
+
+#### Per-task notes
+
+- **#288** (png: skip ignored chunks on read, copy unchanged chunks verbatim on write):
+  `Extract` hoists the 8-byte chunk header buffer out of the read loop and, for any chunk
+  type other than `eXIf`/`iTXt`/`tEXt`/`zTXt`/`IHDR`/`IEND`, `Seek`s past its data+CRC
+  instead of reading and CRC-verifying it — bounds-checked against a single upfront
+  `streamSize` probe (mirroring Exiv2's `pngimage.cpp` pattern) so a chunk whose declared
+  length overruns the real stream is still rejected exactly as before, never silently
+  accepted via a `Seek` past EOF. `Inject` copies every unchanged chunk — header, data,
+  **and original CRC trailer, byte-for-byte, uninspected and unrepaired** — via a pooled
+  64 KiB streaming copy (`streamCopyN`/`copyChunkVerbatim`), reserving CRC computation for
+  chunks the library actually constructs (`eXIf`, the XMP `iTXt`). **User decision, matching
+  ExifTool/Exiv2**: a pass-through chunk with an already-invalid CRC keeps that invalid CRC
+  in the output — Inject never repairs a CRC on a chunk it did not itself write.
+  `TestExtractIssue790Poc2Rejected` proves `testdata/corpus/png/exiv2/issue_790_poc2.png`
+  (a truncated-iCCP-chunk file that HEAD's `Extract` silently accepted, returning
+  `(nil,nil,nil,nil)`, because `io.ReadFull`'s bare `io.EOF` on a CRC read starting at
+  exactly 0 remaining bytes was indistinguishable from a clean end-of-stream) is now
+  correctly rejected, because the new bounds check computes `streamSize` up front and
+  checks `pos+length+4 > total` before any `Seek`/read, independent of how the underlying
+  reader happens to signal EOF. `TestInjectPreservesOriginalCRCEvenWhenInvalid` proves the
+  bad-CRC-preservation policy directly. **Golden-hash verification**: SHA-256 of
+  `Read`+`SetCaption`+`SetCopyright`+`Write` output differs from HEAD for exactly 114 PNG
+  corpus files; an automated byte-level diff tool (not manual spot-checking) confirmed all
+  114 differ **only** in a pass-through chunk's 4-byte CRC trailer, and independently
+  confirmed the corresponding input file's original CRC at that same chunk was already
+  invalid in all 114 cases — HEAD was silently repairing bad CRCs on unmodified chunks;
+  this change stops that, which is the intended, spec-compliant behaviour, not a
+  regression.
+- **#289** (tiff/cr2/nef/arw/dng: read only the metadata prefix, not the whole file):
+  `format/tiff/extent.go` (new) computes the exact byte range IFD0's own next-IFD chain,
+  ExifIFD, GPSIFD, InteropIFD, and every `SubIFDs` (0x014A) child IFD occupy — including
+  every out-of-line tag value within them (MakerNote blobs, `RawIPTC`/`RawXMP` payloads) —
+  by an incremental grow-and-rescan loop over the source `io.ReadSeeker` (reads only the
+  delta on each grow, never re-reads bytes already held), bounded by `maxFileSize` and a
+  64-pass ceiling. `Extract` reads and retains only this prefix; `RawEXIF()`'s doc comment
+  and the CHANGELOG now state this precisely for these five formats (unchanged for every
+  other supported format). `write.go`'s `writeTIFF`/`writeTIFFCR2`/`writeTIFFARW`/
+  `writeTIFFNEF` were changed to always re-`Seek(0)`+re-read the full source from `r`
+  rather than reusing `m.rawEXIF` — the copy-and-relocate write path needs every strip/tile
+  image-data block, which the prefix, by design, no longer carries. `writeTIFFORF`/
+  `writeTIFFRW2` are unchanged (out of #289's scope; #286 already made them whole-file
+  reads with a different, unaffected mechanism).
+
+  **Two correctness bugs were found and fixed during this task's own gate work, before
+  either AC was reported met:**
+
+  1. **Integer-overflow panic (fuzz-found, fixed before any benchmark was recorded).**
+     `FuzzTIFFExtract` immediately crashed a first draft of `extent.go` with a crafted
+     BigTIFF `ifd0Off = 0xFFFFFFFFFFFFFFFF`: the naive bounds check `off+countW >
+     len(buf)` overflowed and wrapped to a small value, incorrectly passing, then
+     panicked slicing `buf[off:]`. Fixed with a `fits(off, width, n uint64) bool` helper
+     (`off > n` first, then `width <= n-off`, no addition that can itself overflow) applied
+     at every point in `extent.go` where an offset is read from untrusted file content.
+     60 s of `FuzzTIFFExtract` afterward: clean.
+  2. **Embedded-thumbnail data loss / non-HEAD-identical write output (golden-hash-found,
+     fixed before the AC was reported met).** The initial design deliberately excluded
+     "image data a metadata value merely points to" (`StripOffsets`, `TileOffsets`,
+     `JPEGInterchangeFormat`) from the prefix. This is correct for `StripOffsets`/
+     `TileOffsets` (never materialised into any `exif.EXIF` field; always re-read from the
+     full file at write time by `enumerateImageBlocks`), but **wrong** for
+     `JPEGInterchangeFormat`/`JPEGInterchangeFormatLength`: `exif.Parse`'s own
+     `extractJPEGThumbnail` (exif/ifd.go) actively slices those declared bytes into
+     `IFD.ThumbnailData` **during parsing itself**, for every IFD it materialises, and
+     `exif.Encode` re-embeds that field verbatim on write. Omitting those bytes from the
+     prefix made `extractJPEGThumbnail`'s bounds check fail silently (`ThumbnailData` ends
+     up `nil`, no error, no crash) — caught only by the golden-hash gate, where
+     `raw/metadata-extractor/Canon EOS 70D.cr2` (and 2 other corpus files) produced `Write`
+     output byte-different from HEAD despite parsing to identical tag values: with
+     `ThumbnailData == nil`, `enumerateImageBlocks` treats the declared JPEG range as a
+     generic relocatable image block instead of trusting `exif.Encode` to have already
+     embedded it, placing the same, uncorrupted thumbnail bytes at a different file offset.
+     Fixed by extending the extent scan to include a JIF pair's declared byte range
+     whenever both tags are present on an IFD — but **only** for IFDs `exif.Parse` actually
+     materialises as `*exif.IFD` (IFD0, its own `.Next` chain, and the ExifIFD/GPSIFD/
+     InteropIFD pointer targets), explicitly **excluding** `SubIFDs` (0x014A): `exif.Parse`
+     never materialises a SubIFD as a `*exif.IFD` at all (`enumerateSubIFDs` re-scans the
+     full file directly at write time instead — see `relocate.go`), so a JIF pair declared
+     inside one is never read back into any `ThumbnailData` field this fix exists to
+     protect. The unscoped first version of this fix was itself caught by the AC's own
+     `BenchmarkRead/nef` B/op target: `raw/metadata-extractor/Nikon D810.nef` carries a
+     multi-megabyte medium-resolution preview inside a `SubIFDs` child (not the top-level
+     IFD chain, whose own `ThumbnailData` was `nil` either way), and including it ballooned
+     the prefix from ~253 KB to ~2.7 MB for zero round-trip benefit — scoping the fix to
+     only the materialised IFDs fixed both the AC miss and confirmed the SubIFD bytes were
+     never needed in the first place.
+
+  **Full-corpus verification after both fixes** (temporary local symlink to the real
+  corpus for this run only; the committed test is corpus-gated per docs/TESTING.md §2.1
+  and skips, not fails, when the corpus is absent — see `task289_test.go`):
+  `TestExtractPrefixParityWithWholeFile` — 490 PASS, 19 SKIP (files where either `Extract`
+  or `exif.Parse` legitimately errors identically on both the prefix and the whole file,
+  e.g. deliberately-malformed torture-test fixtures — not a #289 parity issue), 0 FAIL,
+  across every `.tif`/`.tiff`/`.cr2`/`.nef`/`.arw`/`.dng` file in the repo's TIFF/RAW
+  corpus. Golden-hash `Read`+`SetCaption`+`SetCopyright`+`Write` SHA-256 comparison against
+  HEAD across the same 509 files: 0 mismatches in `CameraModel`/`Caption`/`Copyright`/
+  `RawXMP` and 0 mismatches in `Write` output SHA-256 or length — fully byte-identical.
+
+  **Write's ADDITIONAL cost is a deliberate, necessary, and now-minimal trade-off**: since
+  the prefix no longer carries strip/tile/thumbnail image data, the copy-and-relocate write
+  path must always re-read the whole file fresh from `r`, whereas HEAD could reuse the
+  already-resident `m.rawEXIF` (itself the whole file, pre-#289) with no second read. This
+  is outside #289's stated AC (Read-only) and explicitly anticipated by the task's own text
+  ("Write must still see the full source: it re-reads from the reader") — see the Follow-up
+  subsection below for the coordinator-requested verification that this extra cost is
+  EXACTLY "one more exact-size read", no more.
+
+#### Follow-up (coordinator review, 2026-09-26)
+
+  Two evidence gaps were raised before the security audit: (1) verify the Write regression
+  above is no more than one unavoidable extra full read, and measure the realistic
+  Read+edit+Write workflow; (2) measure Read on the FULL TIFF-family corpus (not just the
+  5 harness fixtures) and eliminate any regression on real files. Both were real findings
+  requiring code changes beyond #289's original scope, resolved as follows.
+
+  **(1) `write.go`'s `readAllCapped` was using `io.ReadAll(io.LimitReader(...))`** — the
+  stdlib helper, which grows its buffer geometrically across a variable, unbounded number of
+  internal `Read` calls and reallocations of unknown final size — **not `iobuf.ReadAll`**,
+  the package's own single-exact-allocation-plus-one-`ReadFull` helper (learns the exact
+  remaining size via `Seek(SeekEnd)`, allocates once). This was pre-existing code, but #289
+  made it run on every TIFF-family `Write` instead of only as a rare fallback (removing the
+  "reuse `m.rawEXIF`" fast path), so its own allocation strategy started to matter for
+  exactly the reason #289's own extent scanner does. Fixed by changing `readAllCapped`'s
+  signature to `io.ReadSeeker` (every one of its 6 call sites already had one) and
+  delegating to `iobuf.ReadAll`. Effect: Write's B/op regression roughly HALVED across every
+  format (e.g. dng +208.39% → +94.95%, cr2 +226.56% → +99.72%) and now lands almost exactly
+  at **2.0×** HEAD's original B/op for every format — i.e. HEAD's baseline plus one
+  additional exact-size read of the same file, confirmed by the ratio itself (cr2: 43.77Mi ÷
+  21.91Mi = 1.997×; dng: 47.77Mi ÷ 24.50Mi = 1.950×), not by inspection alone. `BenchmarkRoundTrip`
+  (Read + `SetCaption` + `SetCopyright` + Write on the same file, interleaved n=10) confirms
+  the realistic combined workflow is **net-neutral for cr2/nef/dng** (`~`, p > 0.05) **and a
+  small +6.96% for arw** — the "one extra read" cost is now small enough, relative to the
+  massive Read-side win, that the combined workflow is a wash or a small net loss, not the
+  55-70% combined regression an earlier (CPU-contention-corrupted) measurement briefly
+  suggested before being re-run cleanly. `tiff` still regresses (+57.17% RoundTrip) because
+  its 819,606-byte fixture is legitimately ~100% metadata (see below): Read gains nothing
+  from the prefix optimisation for this one file, so RoundTrip is left carrying Write's
+  "one extra read" cost with no offsetting Read-side saving — a property of this ONE
+  synthetic fixture, not of TIFF files or of #289's design in general (see the corpus-wide
+  results in (2), where only 3 KiB of the 500-file corpus was measurably RoundTrip-costly
+  this way).
+
+  **(2) A corpus-wide per-file `Read` benchmark (all 500 non-malformed TIFF/CR2/NEF/ARW/DNG
+  files in the repo's corpus, `testing.Benchmark` per file, HEAD vs current) found a genuine,
+  previously-unmeasured problem, then a second, more severe one, both now fixed:**
+
+  - **A DoS-class allocation bug** (not merely a perf regression): `testdata/corpus/tiff/
+    exiv2/2018-01-09-exiv2-crash-002.tiff`, a 325-byte deliberately-malformed torture-test
+    fixture, measured **~268 MB allocated per `Read`** (≈`maxFileSize`, the package's own
+    256 MiB safety ceiling) — a **~825,000×** blow-up relative to its own size. Root cause:
+    `scanMetadataExtent`'s growth loop clamped a corrupt/adversarial `need` value to
+    `maxFileSize` (256 MiB) before calling `growBuffer`, which unconditionally
+    `make([]byte, need)`s BEFORE discovering (via a short read) that the real, tiny file had
+    nothing near that many bytes to give — the wasteful allocation happens whether or not
+    the subsequent read is short. Fixed by clamping `need` to the file's OWN real size
+    (`fileSize`, already known exactly via `Seek(SeekEnd)` before scanning ever starts)
+    FIRST, before the much looser `maxFileSize` fallback: no legitimate metadata requirement
+    can ever exceed how many bytes the file actually has, so this clamp is free of any
+    correctness cost and eliminates the class entirely — every file in the corpus with this
+    pattern (several more `exiv2`/`issue_*_poc` crash-test fixtures were found alongside the
+    one above) dropped from up to **60,831×** the correct allocation to ≤ 5 KB.
+  - **A real (non-adversarial), unbounded-pass-count regression on small/medium TIFF files
+    whose IFD chain is only discoverable one link at a time**: `testdata/corpus/tiff/
+    exampletiffs/mri.tif` (230,578 B) needed enough small-increment growth passes — each a
+    full `make`+`copy` — to allocate ~2.97 MB total (≈13× its own size) under the original,
+    exact-need-sized growth policy; `tiff/metadata-extractor/
+    m1-8110934bb3b18d0e87ccc1ddfc5f0107.tif` (1,017,530 B) similarly cost ~9.4× HEAD's B/op
+    and ~8.3× its ns/op. Three growth-policy refinements were needed together (see
+    `extent.go`'s `nextGrowthTarget`/`clampNeed` doc comments for the full, evidence-cited
+    rationale of each) — a first, PASS-COUNT-based escalation heuristic ("any 2nd-or-later
+    growth pass gets a large factor") was tried and REJECTED because it mis-fired on
+    `raw/metadata-extractor/Nikon D810.nef`: NEF genuinely needs 3 small-increment passes to
+    fully resolve its IFD chain, but its `need` stays a stable ~0.62% of the 40.7 MB file the
+    whole time, and the pass-count heuristic ballooned its B/op to 4.18 MiB, breaking the
+    Read AC for a file whose actual metadata never remotely approached the file's size. The
+    signal that actually works is the FRACTION of the file a pass's `need` accounts for, not
+    how many passes have elapsed:
+    1. A "large-fraction snap" — once a single pass's `need` already accounts for ≥10% of
+       `fileSize`, jump straight to reading the rest of the file, since there is no
+       meaningful "prefix" saving left to protect. This correctly distinguishes NEF's
+       stable-small-fraction pattern (never fires) from `m1-8110934...tif`'s pattern (its
+       fraction climbs 15% → 15% → 31% across passes; fires on the 31% pass).
+    2. A "tail-snap" (unchanged from the original design) for the case a `need` is close to
+       `fileSize` in absolute terms but happens to fall under 10% only because `fileSize`
+       itself is small.
+    3. Plain doubling (`max(need, 2×len(buf))`, capped at `fileSize`) as the fallback,
+       bounding total copied bytes to `O(final extent)` instead of `O(final extent ×
+       pass count)` for whatever residual cases the first two checks don't already resolve.
+    4. **A size-based bypass**: files at or below `smallFileWholeReadThreshold` (4 MiB) skip
+       the extent scanner entirely and are read whole via the pre-#289 `extractWholeFile`
+       path — a corpus-wide per-file benchmark found every file whose extent-scan cost
+       exceeded a plain whole-file read was ≤ ~2.6 MiB, and reading a file that size in full
+       is already cheap in absolute terms regardless of how small its own metadata happens
+       to be; real camera RAW files (22–41 MB in this repo's own fixtures) are comfortably
+       clear of this threshold and keep the full scanner benefit.
+
+  **Corpus-wide result after all fixes** (500 files, `testing.Benchmark` per file, HEAD vs
+  current, measured with zero other CPU-intensive processes running — an earlier
+  measurement taken while background fuzz jobs were still running was discarded as
+  CPU-contention-corrupted after re-running cleanly reproduced dramatically different, much
+  worse numbers):
+
+  | Percentile | ns/op ratio (cur/HEAD) | B/op ratio (cur/HEAD) |
+  |---|---|---|
+  | p10 | 0.948 | 0.998 |
+  | p50 (median) | 1.011 | 1.0000 |
+  | p90 | 1.054 | 1.0001 |
+  | p95 | 1.067 | 1.0004 |
+  | p99 | 1.110 | 1.0096 |
+  | max (worst of 500) | **1.173** | **1.014** |
+
+  **Zero of the 500 corpus files exceed a 1.20× ratio in either metric** — the worst case
+  across the entire real-world TIFF/CR2/NEF/ARW/DNG corpus is 1.17× ns/op and 1.01× B/op,
+  both comfortably within normal benchmark noise. This satisfies "no real-file Read
+  regression beyond noise" as a corpus-wide, not just harness-fixture, property.
+
+#### Follow-up 2 (coordinator review, 2026-09-26) — reuse m.rawEXIF for Write when it is already the whole file
+
+  Both #289's own extent-scanning follow-ups above (the ≤4 MiB small-file bypass and the
+  ≥10%-of-`fileSize` large-fraction snap) can make `m.rawEXIF` end up holding the ENTIRE
+  source file, not just a metadata prefix — in which case Write re-reading the whole file
+  from `r` (Follow-up's item 1) is unnecessary work HEAD never had to do either, since HEAD
+  could always reuse `m.rawEXIF` directly.
+
+  **Implemented exactly the reliable signal the coordinator suggested**: a new unexported
+  `Metadata.rawEXIFIsWholeFile bool` field (no public API change), set once by `Read` via a
+  new `tiffFamilyRawEXIFIsWholeFile` check (`read.go`) that compares `len(rawEXIF)` against
+  the source's actual size (`Seek(SeekEnd)`, restoring the reader's position afterward) —
+  computed, never assumed, and only for the five TIFF-family formats (zero extra Seek calls
+  for every other format). `write.go`'s four affected functions
+  (`writeTIFF`/`writeTIFFCR2`/`writeTIFFARW`/`writeTIFFNEF`) now call a new
+  `originalTIFFBytes` helper: when the flag is set, it returns `m.rawEXIF` directly (no
+  second read, no clone); otherwise it falls back to the existing `Seek(0)`+`readAllCapped`
+  re-read. Reuse is exactly as safe as it was pre-#289 — no relocator in
+  `format/tiff/relocate*.go` ever mutates its `base`/`originalBytes` parameter (the same
+  invariant Batch E's own finding #1 already established and re-verified here by re-running
+  every affected gate).
+
+  **Result — the exact two regressions the coordinator named are gone:**
+
+  | Benchmark | Before this fix | After this fix | HEAD |
+  |---|---|---|---|
+  | RoundTrip/tiff ns/op | 165.9µ (+57.17%) | **102.7µ (−2.73%)** | 105.6µ |
+  | RoundTrip/tiff B/op | 2.391Mi (+49.36%) | **1.601Mi (+0.00%)** | 1.601Mi |
+  | Write/tiff ns/op | 103.76µ (+70.05%) | **61.02µ (~, p=0.631)** | 61.02µ |
+  | Write/tiff B/op | 1634.1Ki (+97.92%) | **825.6Ki (~, p=1.000)** | 825.6Ki |
+
+  `tiff`'s fixture (819,606 B) is well under the 4 MiB small-file threshold, so both Read
+  AND Write now take the whole-file path exactly as HEAD always did — Write/tiff and
+  RoundTrip/tiff's B/op and allocs/op are now **bit-for-bit identical** to HEAD (`~`,
+  p=1.000 for allocs), not merely close. cr2/nef/arw/dng are files far above the threshold
+  (22–41 MB) whose extent scan genuinely converges on a small prefix, so they correctly
+  keep re-reading from `r` for Write — there is nothing to reuse for them, and their
+  Write/RoundTrip numbers are unchanged from Follow-up 1's measurements.
+
+  **Why ARW RoundTrip still shows +6.96% in one measurement**: re-measured twice more,
+  cleanly (interleaved n=10, `pgrep` confirmed no other CPU-intensive process running): a
+  second run showed `~` (p=1.000, B/op ratio 1.03%), a third showed +4.76% (p=0.035, B/op
+  ratio still 1.03%). **B/op stays essentially flat (~1.0–1.03%) across all three runs while
+  ns/op fluctuates between 0% and +4.76%** — the signature of ordinary measurement noise
+  around a true value close to 0%, not a reproducible, code-attributable regression. ARW's
+  prefix (849.2Ki) is not unusually large relative to the other formats (NEF's is larger in
+  absolute terms, 817.6Ki, and shows no comparable ns/op instability); nothing in ARW's
+  write path changed in this follow-up (it was already, correctly, on the "re-read from r"
+  branch before and after this fix, identical to cr2/nef/dng). There is no evidence of a
+  real, recoverable regression here, and therefore nothing further to fix within #289's
+  scope — reported as noise, not chased as a phantom bug (see the corpus-wide/CPU-contention
+  lessons recorded in agent memory from Follow-up 1).
+
+  **Full re-verification after this fix**: build/vet/`test`/`test -race` (whole repo)
+  clean; `golangci-lint run ./...` — 0 new issues (same 6 pre-existing); `staticcheck`/
+  `govulncheck` clean; `TestExtractPrefixParityWithWholeFile` — 490 PASS/19 SKIP/0 FAIL
+  (unchanged, since this fix touches `read.go`/`write.go` only, not `format/tiff` itself);
+  golden-hash `Read`+`SetCaption`+`SetCopyright`+`Write` SHA-256 across the same 509 TIFF
+  corpus files — 0 mismatches, fully byte-identical to HEAD (unchanged from Follow-up 1: the
+  reused `m.rawEXIF` is the exact same bytes a fresh re-read would have produced, so Write
+  output cannot differ). `FuzzRead` (60 s — the one existing fuzz target that exercises the
+  new `tiffFamilyRawEXIFIsWholeFile` code path directly, since it lives behind the top-level
+  `gometadata.Read`/`Write` pair no format-package-level fuzzer reaches) plus the five
+  TIFF-family write fuzz targets (`FuzzTIFFInject`, `FuzzCR2Inject`, `FuzzNEFInject`,
+  `FuzzARWInject`, `FuzzDNGInject`, 60 s each): all clean.
+
+### 60-second fuzz clean (Batch F, 2026-09-25)
+
+`FuzzPNGExtract`, `FuzzPNGInject`, `FuzzTIFFExtract`, `FuzzTIFFInject`, `FuzzCR2Extract`,
+`FuzzCR2Inject`, `FuzzNEFExtract`, `FuzzNEFInject`, `FuzzARWExtract`, `FuzzARWInject`,
+`FuzzDNGExtract`, `FuzzDNGInject` — each run standalone for 60 s (`-fuzztime=60s`) against
+the final, post-fix code; zero crashers. `FuzzTIFFExtract` was additionally run against
+the pre-fix code that had the integer-overflow bug (see #289's per-task note above), where
+it found the crash within the first second — confirming the fuzz gate itself is effective,
+not merely clean by chance. All 10 TIFF-family targets (`FuzzTIFFExtract`/`Inject`,
+`FuzzCR2Extract`/`Inject`, `FuzzNEFExtract`/`Inject`, `FuzzARWExtract`/`Inject`,
+`FuzzDNGExtract`/`Inject`) were re-run for a further 60 s each after the follow-up review's
+`readAllCapped`/DoS-allocation/growth-policy fixes above; all clean. The top-level
+`FuzzRead` (the sole existing fuzz target that reaches the `gometadata.Read`/`Write`
+package's own code, where Follow-up 2's `tiffFamilyRawEXIFIsWholeFile`/`originalTIFFBytes`
+logic lives) plus `FuzzTIFFInject`/`FuzzCR2Inject`/`FuzzNEFInject`/`FuzzARWInject`/
+`FuzzDNGInject` were each run a further 60 s after Follow-up 2's `m.rawEXIF`-reuse fix; all
+clean.
+
 ## [main — perf task #198] — 2026-06-10 (exif: parse-level arena for sub-IFDs)
 
 ### Optimisations applied in this version

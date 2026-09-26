@@ -57,14 +57,39 @@ func readInput(r io.ReadSeeker) ([]byte, error) {
 	return data, nil
 }
 
-// Extract reads metadata payloads from a TIFF container.
-// rawEXIF is the entire TIFF byte stream (TIFF itself is the EXIF container).
-// rawIPTC and rawXMP are read from the respective IFD0 tags.
-func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
-	if _, err = r.Seek(0, io.SeekStart); err != nil {
-		return nil, nil, nil, fmt.Errorf("tiff: seek: %w", err)
+// seekFileSize returns r's total length via Seek(0, io.SeekEnd), restoring
+// the current position (assumed 0) before returning, or (-1, nil) if r does
+// not support seeking to its end. -1 tells Extract to fall back to
+// extractWholeFile, so correctness never depends on Seek(SeekEnd) support.
+func seekFileSize(r io.ReadSeeker) (int64, error) {
+	end, err := r.Seek(0, io.SeekEnd)
+	if err != nil {
+		return -1, nil //nolint:nilerr // non-seekable-to-end reader: disable the prefix fast path, not fatal
 	}
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return 0, fmt.Errorf("tiff: seek: %w", err)
+	}
+	return end, nil
+}
 
+// readInitialPrefix reads min(fileSize, extentInitialPrefixSize) bytes from
+// r's current position (assumed 0). fileSize is only used to avoid
+// allocating more than the file actually contains; a short read for any
+// other reason is a genuine I/O error.
+func readInitialPrefix(r io.Reader, fileSize int64) ([]byte, error) {
+	buf := make([]byte, min(fileSize, extentInitialPrefixSize))
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, fmt.Errorf("tiff: read: %w", err)
+	}
+	return buf, nil
+}
+
+// extractWholeFile is Extract's pre-#289 behaviour: read the entire file and
+// scan IFD0 directly. Used only when r cannot report its own size (so the
+// prefix/growth machinery in scanMetadataExtent has no reliable maxFileSize
+// bound to grow toward) — correctness must never depend on Seek(SeekEnd)
+// support, only performance does.
+func extractWholeFile(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	data, err := readInput(r)
 	if err != nil {
 		return nil, nil, nil, err
@@ -72,8 +97,85 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if len(data) < 8 {
 		return nil, nil, nil, ErrFileTooShort
 	}
-
 	order, err := byteOrder(data)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	magic := order.Uint16(data[2:])
+	switch magic {
+	case 0x002A:
+		ifd0Off := order.Uint32(data[4:])
+		rawIPTC, rawXMP = extractTagValues(data, ifd0Off, order)
+		return data, rawIPTC, rawXMP, nil
+	case 0x002B:
+		return extractBigTIFF(data, order)
+	default:
+		return nil, nil, nil, fmt.Errorf("tiff: unsupported magic 0x%04X (expected 0x002A classic TIFF or 0x002B BigTIFF): %w",
+			magic, ErrUnsupportedMagic)
+	}
+}
+
+// Extract reads metadata payloads from a TIFF container.
+//
+// #289: rawEXIF is the metadata PREFIX of the TIFF byte stream — every IFD in
+// IFD0's next-IFD chain, ExifIFD, GPSIFD, InteropIFD, and SubIFDs, and every
+// out-of-line tag value within them (see extent.go) — not the whole file.
+// Strip/tile image data and embedded thumbnails/previews are excluded; a
+// caller that needs the original file bytes verbatim (e.g. to re-embed a
+// thumbnail this package never reads) must keep its own copy of the source.
+// rawIPTC and rawXMP are read from the respective IFD0 tags, which are
+// always within the returned prefix.
+func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+	if _, err = r.Seek(0, io.SeekStart); err != nil {
+		return nil, nil, nil, fmt.Errorf("tiff: seek: %w", err)
+	}
+
+	fileSize, sizeErr := seekFileSize(r)
+	if sizeErr != nil {
+		return nil, nil, nil, sizeErr
+	}
+	if fileSize < 0 {
+		return extractWholeFile(r)
+	}
+	if fileSize > maxFileSize {
+		return nil, nil, nil, fmt.Errorf("tiff: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
+	}
+	if fileSize <= smallFileWholeReadThreshold {
+		// #289 follow-up: the prefix optimization exists to avoid reading
+		// tens of megabytes of strip/tile image data a real camera RAW file
+		// spends the overwhelming majority of its bytes on. Below this
+		// threshold, reading the WHOLE file is already cheap in absolute
+		// terms, and scanMetadataExtent's own incremental-growth machinery
+		// (see extent.go) costs MORE than it saves for files this size: a
+		// corpus-wide per-file Read benchmark (500 real TIFF/CR2/NEF/ARW/DNG
+		// files) found every file whose extent scan cost more than a plain
+		// whole-file read bounded at ~2.6 MiB; real camera RAW files, tens
+		// of MB, are unaffected either way and keep the >90% Read cost
+		// reduction the scanner exists for. Reusing extractWholeFile here
+		// matches HEAD's exact Read cost for every such file instead of
+		// merely bounding the scanner's worst case. See
+		// smallFileWholeReadThreshold's own doc comment (extent.go) for the
+		// exact threshold and its headroom above that measured bound.
+		return extractWholeFile(r)
+	}
+	return extractPrefixed(r, fileSize)
+}
+
+// extractPrefixed implements Extract's prefix-scanning path (files above
+// smallFileWholeReadThreshold): read the initial chunk, determine byte order
+// and container variant, and dispatch to the matching prefix scanner. Split
+// out of Extract to keep its cyclomatic complexity within the project's
+// gocyclo threshold.
+func extractPrefixed(r io.ReadSeeker, fileSize int64) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+	initial, err := readInitialPrefix(r, fileSize)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(initial) < 8 {
+		return nil, nil, nil, ErrFileTooShort
+	}
+
+	order, err := byteOrder(initial)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -81,27 +183,54 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	// TIFF 6.0 §2: magic number is 42 (0x002A) for classic TIFF.
 	// BigTIFF spec (Aware Systems / libtiff) §2: magic 43 (0x002B) for BigTIFF,
 	// which uses a 16-byte header with 8-byte IFD offsets.
-	magic := order.Uint16(data[2:])
+	magic := order.Uint16(initial[2:])
 	switch magic {
 	case 0x002A:
-		// Classic TIFF: 8-byte header, 32-bit IFD offsets, 12-byte entries.
-		// The whole TIFF data IS the EXIF payload (TIFF §2).
-		rawEXIF = data
-		ifd0Off := order.Uint32(data[4:])
-		rawIPTC, rawXMP = extractTagValues(data, ifd0Off, order)
-		return rawEXIF, rawIPTC, rawXMP, nil
-
+		return extractClassicPrefix(r, initial, order, uint64(fileSize)) //nolint:gosec // G115: Extract validates 0 <= fileSize <= maxFileSize before calling extractPrefixed
 	case 0x002B:
-		// BigTIFF: 16-byte header, 64-bit IFD offsets, 20-byte entries.
-		// BigTIFF spec §2: bytes [4:6] = offset bytesize (must be 8),
-		// bytes [6:8] = constant 0, bytes [8:16] = IFD0 offset (uint64).
-		rawEXIF, rawIPTC, rawXMP, err = extractBigTIFF(data, order)
-		return rawEXIF, rawIPTC, rawXMP, err
-
+		return extractBigTIFFPrefix(r, initial, order, uint64(fileSize)) //nolint:gosec // G115: same rationale
 	default:
 		return nil, nil, nil, fmt.Errorf("tiff: unsupported magic 0x%04X (expected 0x002A classic TIFF or 0x002B BigTIFF): %w",
 			magic, ErrUnsupportedMagic)
 	}
+}
+
+// extractClassicPrefix implements Extract's classic-TIFF (magic 0x002A)
+// branch: 8-byte header, 32-bit IFD offsets, 12-byte entries. fileSize is the
+// total size of the source file (already known from Extract's own
+// seekFileSize call), passed through so scanMetadataExtent can avoid a
+// wasteful trailing growth pass when only a small remainder of the file is
+// left unread (see scanMetadataExtent's doc comment).
+func extractClassicPrefix(r io.ReadSeeker, initial []byte, order binary.ByteOrder, fileSize uint64) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+	ifd0Off := order.Uint32(initial[4:])
+	buf, serr := scanMetadataExtent(r, initial, uint64(ifd0Off), order, false, fileSize)
+	if serr != nil {
+		return nil, nil, nil, serr
+	}
+	rawIPTC, rawXMP = extractTagValues(buf, ifd0Off, order)
+	return buf, rawIPTC, rawXMP, nil
+}
+
+// extractBigTIFFPrefix implements Extract's BigTIFF (magic 0x002B) branch:
+// 16-byte header, 64-bit IFD offsets, 20-byte entries. BigTIFF spec §2:
+// bytes [4:6] = offset bytesize (must be 8), bytes [6:8] = constant 0,
+// bytes [8:16] = IFD0 offset (uint64). fileSize: see extractClassicPrefix.
+func extractBigTIFFPrefix(r io.ReadSeeker, initial []byte, order binary.ByteOrder, fileSize uint64) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+	if len(initial) < bigTIFFMinHeaderLen {
+		return nil, nil, nil, ErrFileTooShort
+	}
+	offsetBytesize := order.Uint16(initial[4:])
+	if offsetBytesize != bigTIFFOffsetBytesize {
+		return nil, nil, nil, fmt.Errorf("tiff: BigTIFF offset bytesize = %d, must be 8: %w",
+			offsetBytesize, ErrUnsupportedMagic)
+	}
+	ifd0Off := order.Uint64(initial[8:])
+	buf, serr := scanMetadataExtent(r, initial, ifd0Off, order, true, fileSize)
+	if serr != nil {
+		return nil, nil, nil, serr
+	}
+	rawIPTC, rawXMP = extractTagValuesBigTIFF(buf, ifd0Off, order)
+	return buf, rawIPTC, rawXMP, nil
 }
 
 // Inject writes a modified TIFF stream to w, replacing the metadata tags.

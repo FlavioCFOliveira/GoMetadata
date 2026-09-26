@@ -167,6 +167,72 @@ func processExtractChunk(chunkType [4]byte, data, rawEXIF, rawXMP []byte) ([]byt
 	return rawEXIF, rawXMP, false, nil
 }
 
+// extractIgnores reports whether Extract's chunk-scanning loop can skip a
+// chunk's payload and CRC trailer entirely via Seek, without reading them.
+// Extract only ever looks at eXIf, iTXt/tEXt/zTXt (candidate XMP carriers),
+// and IEND (end-of-stream signal); IHDR is also read, even though Extract
+// never inspects its fields, to preserve today's behaviour of validating its
+// CRC (IHDR is part of metadataChunks, shared with the verification policy
+// documented there).
+//
+// #288: every other chunk type — IDAT (pixel data, routinely megabytes per
+// chunk), PLTE, gAMA, cHRM, sRGB, pHYs, tIME, bKGD, and any private or
+// ancillary chunk — carries no metadata this library reads, so allocating a
+// buffer, reading it, and (for IDAT especially) discarding it immediately
+// was pure waste: round-1 profiling attributed 47.5% of PNG Read CPU to the
+// resulting memmove traffic and the bulk of its allocations to these
+// discarded reads.
+func extractIgnores(chunkType [4]byte) bool {
+	switch chunkType {
+	case chunkEXIf, chunkITXt, chunkTEXt, chunkZTXt, chunkIEND, chunkIHDR:
+		return false
+	}
+	return true
+}
+
+// streamSize returns the total length of r as seen from its current
+// position, restoring that position before returning, or (-1, nil) if r does
+// not support seeking to its end. -1 disables the bounds-checked chunk-skip
+// fast path in Extract/Inject; callers fall back to the natural read-based
+// truncation detection that was already in place for every chunk they
+// actually read, so correctness never depends on Seek(SeekEnd) support.
+//
+// #288: computed once per Extract/Inject call (two Seek calls, no I/O to
+// speak of), not per chunk. A chunk that IS skipped still needs its declared
+// length checked against the remaining stream before Seek-ing past it: most
+// io.ReadSeeker implementations (bytes.Reader, os.File) allow seeking past
+// EOF without error, so an unchecked skip would silently tolerate a
+// truncated file instead of reporting it — mirroring the bounds check
+// Exiv2's pngimage.cpp performs before every chunk skip (~L414/L473).
+func streamSize(r io.ReadSeeker) (int64, error) {
+	cur, err := r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return -1, nil //nolint:nilerr // non-seekable-position reader: disable the bounds-checked fast path, not fatal
+	}
+	end, err := r.Seek(0, io.SeekEnd)
+	if err != nil {
+		return -1, nil //nolint:nilerr // same rationale: degrade gracefully, do not fail the caller
+	}
+	if _, err := r.Seek(cur, io.SeekStart); err != nil {
+		return 0, fmt.Errorf("png: seek restore: %w", err)
+	}
+	return end, nil
+}
+
+// checkChunkTruncation returns a "truncated chunk" error when total is known
+// (>= 0) and the chunk beginning at pos (the position immediately after its
+// 8-byte header) with the given declared data length would extend past the
+// end of the stream. Shared by Extract's readOrSkipChunk and Inject's
+// injectOneChunk (#288) so both apply the identical bounds check documented
+// on streamSize.
+func checkChunkTruncation(chunkType [4]byte, pos, length, total int64) error {
+	if total >= 0 && pos+length+4 > total {
+		return fmt.Errorf("png: truncated chunk %q: declared length %d exceeds remaining stream: %w",
+			chunkTypeStr(chunkType), length, io.ErrUnexpectedEOF)
+	}
+	return nil
+}
+
 // Extract reads the PNG chunk stream from r and returns raw metadata payloads.
 func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if _, err = r.Seek(0, io.SeekStart); err != nil {
@@ -181,23 +247,101 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, ErrInvalidSignature
 	}
 
+	total, szErr := streamSize(r)
+	if szErr != nil {
+		return nil, nil, nil, fmt.Errorf("png: %w", szErr)
+	}
+
+	// #288: hdr is hoisted out of the loop and reused for every chunk header
+	// instead of being declared fresh per call.
+	var hdr [8]byte
+	pos := int64(len(pngSig))
 	var done bool
 	for !done {
-		rerr := readChunk(r, func(chunkType [4]byte, data []byte) error {
-			rawEXIF, rawXMP, done, err = processExtractChunk(chunkType, data, rawEXIF, rawXMP)
-			return err
+		var n int64
+		n, err = readOrSkipChunk(r, &hdr, pos, total, func(chunkType [4]byte, data []byte) error {
+			var perr error
+			rawEXIF, rawXMP, done, perr = processExtractChunk(chunkType, data, rawEXIF, rawXMP)
+			return perr
 		})
-		if rerr != nil {
-			if errors.Is(rerr, io.EOF) {
+		pos = n
+		if err != nil {
+			if errors.Is(err, io.EOF) {
 				break
 			}
-			return nil, nil, nil, rerr
-		}
-		if err != nil {
 			return nil, nil, nil, err
 		}
 	}
 	return rawEXIF, nil, rawXMP, nil
+}
+
+// readOrSkipChunk reads one PNG chunk header at the reader's current
+// position into hdr, then either skips the chunk's data and CRC trailer via
+// Seek (when extractIgnores reports Extract does not interpret it) or reads
+// it fully and calls fn — the same behaviour readChunk provided before
+// #288, including the same CRC verification policy (shouldVerifyCRC /
+// verifyCRC32).
+//
+// pos is the stream position immediately after the signature or the
+// previous chunk; total is streamSize's result (-1 if unknown). Every
+// chunk's declared length is checked against total via checkChunkTruncation
+// BEFORE it is skipped or read, so a chunk that overruns a truncated file is
+// rejected here rather than tolerated by a Seek landing past EOF or masked
+// by a later io.EOF indistinguishable from a clean end of stream.
+//
+// Returns the stream position after this chunk so the caller can pass it
+// back in on the next call.
+//
+//nolint:cyclop,gocyclo // straight-line header-parse-then-dispatch flow; splitting would scatter the shared bounds check across multiple functions
+func readOrSkipChunk(r io.ReadSeeker, hdr *[8]byte, pos, total int64, fn func(chunkType [4]byte, data []byte) error) (int64, error) {
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return pos, fmt.Errorf("png: read chunk header: %w", err)
+	}
+	pos += int64(len(hdr))
+
+	var chunkType [4]byte
+	copy(chunkType[:], hdr[4:8])
+
+	rawLen := binary.BigEndian.Uint32(hdr[:4])
+	if rawLen > math.MaxInt32 {
+		return pos, fmt.Errorf("png: chunk %q length %d exceeds 2^31-1: %w", chunkTypeStr(chunkType), rawLen, ErrChunkTooLarge)
+	}
+	length := int64(rawLen)
+	if length > maxPNGChunkSize {
+		return pos, fmt.Errorf("png: chunk %q length %d exceeds limit: %w", chunkTypeStr(chunkType), length, ErrChunkTooLarge)
+	}
+	if err := checkChunkTruncation(chunkType, pos, length, total); err != nil {
+		return pos, err
+	}
+
+	if extractIgnores(chunkType) {
+		if _, err := r.Seek(length+4, io.SeekCurrent); err != nil {
+			return pos, fmt.Errorf("png: skip chunk %q: %w", chunkTypeStr(chunkType), err)
+		}
+		return pos + length + 4, nil
+	}
+
+	verifyCRC := shouldVerifyCRC(chunkType)
+	if length > 0 {
+		if err := readNonEmptyChunk(r, chunkType, int(length), verifyCRC, fn); err != nil {
+			return pos, err
+		}
+		return pos + length + 4, nil
+	}
+
+	var crcB [4]byte
+	if _, err := io.ReadFull(r, crcB[:]); err != nil {
+		return pos, fmt.Errorf("png: read CRC for %q: %w", chunkTypeStr(chunkType), err)
+	}
+	if verifyCRC {
+		if err := verifyCRC32(chunkType, nil, binary.BigEndian.Uint32(crcB[:])); err != nil {
+			return pos, err
+		}
+	}
+	if err := fn(chunkType, nil); err != nil {
+		return pos, err
+	}
+	return pos + 4, nil
 }
 
 // handleITXtXMP extracts XMP from an iTXt chunk. Returns (xmp, nil) on
@@ -259,37 +403,192 @@ func shouldDropChunk(chunkType [4]byte, data []byte) bool {
 	return chunkType == chunkITXt && isXMPChunk(data)
 }
 
-// writeInjectChunk writes chunkType/data to w and, if chunkType is "IHDR",
-// immediately writes the new metadata chunks. It returns (done=true) when
-// chunkType is "IEND". This helper extracts the per-chunk logic from Inject,
-// reducing that function's cyclomatic complexity.
-func writeInjectChunk(w io.Writer, chunkType [4]byte, data, rawEXIF, rawXMP []byte) (bool, error) {
-	if err := writeChunk(w, chunkType, data); err != nil {
-		return false, err
-	}
-	if chunkType == chunkIHDR {
-		if err := writeMetadataAfterIHDR(w, rawEXIF, rawXMP); err != nil {
-			return false, err
-		}
-	}
-	return chunkType == chunkIEND, nil
-}
+// pngCopyBufSize is the fixed size of the reusable buffer streamCopyN uses to
+// move pass-through chunk bytes from r to w. Chosen to equal iobuf's own
+// largePool tier ceiling (largeSize = 65536) so the buffer is served from
+// that existing pool instead of a dedicated one.
+const pngCopyBufSize = 65536
 
-// injectChunk is the per-chunk callback used by Inject's readChunk loop.
-// It skips replacement targets, writes surviving chunks, and returns errPNGDone
-// when IEND has been written so the caller can break cleanly.
-func injectChunk(w io.Writer, chunkType [4]byte, data, rawEXIF, rawXMP []byte) error {
-	if shouldDropChunk(chunkType, data) {
+// streamCopyN copies exactly n bytes from r to w using one pooled, fixed-size
+// buffer, reused across every chunk of the call — never allocating
+// proportionally to n and never paying the per-call io.LimitReader /
+// io.CopyN allocation a naive io.CopyN(w, r, n) would add on every chunk
+// (#288). n is always length+4 (chunk data plus its CRC trailer), so n == 0
+// never occurs in practice, but is handled defensively.
+func streamCopyN(r io.Reader, w io.Writer, n int64) error {
+	if n <= 0 {
 		return nil
 	}
-	done, err := writeInjectChunk(w, chunkType, data, rawEXIF, rawXMP)
-	if err != nil {
-		return err
+	bufPtr := iobuf.Get(pngCopyBufSize)
+	buf := *bufPtr
+	for n > 0 {
+		chunk := buf
+		if int64(len(chunk)) > n {
+			chunk = chunk[:n]
+		}
+		if _, err := io.ReadFull(r, chunk); err != nil {
+			iobuf.Put(bufPtr)
+			return fmt.Errorf("png: read chunk data: %w", err)
+		}
+		if _, err := w.Write(chunk); err != nil {
+			iobuf.Put(bufPtr)
+			return fmt.Errorf("png: write chunk data: %w", err)
+		}
+		n -= int64(len(chunk))
 	}
-	if done {
-		return errPNGDone
+	iobuf.Put(bufPtr)
+	return nil
+}
+
+// copyChunkVerbatim writes hdr to w, then streams length data bytes plus the
+// 4-byte CRC trailer from r to w unchanged: no CRC is computed or verified,
+// and — unlike readChunkBody — no buffer proportional to length is ever
+// allocated. This is the path for every PNG chunk Inject does not need to
+// inspect (IDAT, PLTE, gAMA, tEXt, zTXt, IHDR, and any other ancillary or
+// private chunk): IDAT alone is routinely megabytes per chunk, and round-1
+// profiling attributed the bulk of PNG Write's CPU to needlessly
+// recomputing CRC-32 over bytes the library never interprets (#288).
+func copyChunkVerbatim(r io.Reader, w io.Writer, hdr *[8]byte, length int64) error {
+	if _, err := w.Write(hdr[:]); err != nil {
+		return fmt.Errorf("png: write chunk header: %w", err)
+	}
+	return streamCopyN(r, w, length+4)
+}
+
+// readChunkBody reads a chunk's data (length bytes) and its 4-byte CRC
+// trailer, without verifying the CRC. It mirrors readNonEmptyChunk's
+// pooled-vs-exact-allocation size threshold, so a caller that decides, after
+// inspecting data, to copy the chunk through unchanged (writeVerbatimChunk)
+// never pays for a second read.
+//
+// release must be called exactly once when the caller is done with data, to
+// return any pooled buffer; it is nil (never call it) whenever err != nil.
+func readChunkBody(r io.Reader, length int64) (data []byte, crcB [4]byte, release func(), err error) {
+	if length <= largeChunkReadThreshold {
+		buf := iobuf.Get(int(length))
+		data = (*buf)[:length]
+		if _, ferr := io.ReadFull(r, data); ferr != nil {
+			iobuf.Put(buf)
+			return nil, crcB, nil, fmt.Errorf("png: truncated chunk: %w", ferr)
+		}
+		release = func() { iobuf.Put(buf) }
+	} else {
+		data, err = io.ReadAll(io.LimitReader(r, length))
+		if err != nil {
+			return nil, crcB, nil, fmt.Errorf("png: read chunk: %w", err)
+		}
+		if int64(len(data)) != length {
+			return nil, crcB, nil, fmt.Errorf("png: truncated chunk: read %d of %d bytes: %w", len(data), length, io.ErrUnexpectedEOF)
+		}
+		release = func() {}
+	}
+	if _, ferr := io.ReadFull(r, crcB[:]); ferr != nil {
+		release()
+		return nil, crcB, nil, fmt.Errorf("png: read CRC: %w", ferr)
+	}
+	return data, crcB, release, nil
+}
+
+// writeVerbatimChunk writes hdr, data, and crcB to w unchanged: no CRC is
+// computed. Used for an iTXt chunk that Inject inspected but decided to
+// preserve (it does not carry the XMP payload being replaced).
+func writeVerbatimChunk(w io.Writer, hdr *[8]byte, data []byte, crcB [4]byte) error {
+	if _, err := w.Write(hdr[:]); err != nil {
+		return fmt.Errorf("png: write chunk header: %w", err)
+	}
+	if len(data) > 0 {
+		if _, err := w.Write(data); err != nil {
+			return fmt.Errorf("png: write chunk data: %w", err)
+		}
+	}
+	if _, err := w.Write(crcB[:]); err != nil {
+		return fmt.Errorf("png: write chunk CRC: %w", err)
 	}
 	return nil
+}
+
+// injectOneChunk reads one PNG chunk header from r and either:
+//   - skips the existing eXIf chunk (always replaced, dropped without ever
+//     being read);
+//   - reads an iTXt chunk's payload to decide whether it is the XMP chunk
+//     being replaced — dropping it if so, or copying it through
+//     byte-identical (including its original CRC) if not;
+//   - copies every other chunk through byte-identical, verbatim, including
+//     its original CRC — writing the library's own eXIf/XMP chunks
+//     immediately after IHDR, and signalling errPNGDone after IEND.
+//
+// #288 / USER DECISION: a chunk that is copied through is NEVER "repaired" —
+// its original CRC trailer is written back exactly as read, even when that
+// CRC does not match the chunk's data (matches ExifTool/Exiv2's documented
+// behaviour; see TestInjectPreservesOriginalCRCEvenWhenInvalid). CRC is
+// computed only for the eXIf and XMP-iTXt chunks the library itself
+// constructs (writeChunk, called from writeMetadataAfterIHDR).
+//
+// pos/total mirror readOrSkipChunk's bounds-checking contract (see
+// checkChunkTruncation): every chunk's declared length is checked against
+// the remaining stream before any Seek or read, so a truncated source PNG is
+// rejected here rather than silently accepted.
+//
+//nolint:cyclop,gocyclo // straight-line chunk-type dispatch; splitting would obscure the shared bounds check every branch needs
+func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64, rawEXIF, rawXMP []byte) (int64, error) {
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return pos, fmt.Errorf("png: read chunk header: %w", err)
+	}
+	pos += int64(len(hdr))
+
+	var chunkType [4]byte
+	copy(chunkType[:], hdr[4:8])
+
+	rawLen := binary.BigEndian.Uint32(hdr[:4])
+	if rawLen > math.MaxInt32 {
+		return pos, fmt.Errorf("png: chunk %q length %d exceeds 2^31-1: %w", chunkTypeStr(chunkType), rawLen, ErrChunkTooLarge)
+	}
+	length := int64(rawLen)
+	if length > maxPNGChunkSize {
+		return pos, fmt.Errorf("png: chunk %q length %d exceeds limit: %w", chunkTypeStr(chunkType), length, ErrChunkTooLarge)
+	}
+	if err := checkChunkTruncation(chunkType, pos, length, total); err != nil {
+		return pos, err
+	}
+
+	if shouldDropChunk(chunkType, nil) {
+		// Only eXIf can be identified as a drop target without its data
+		// (shouldDropChunk's iTXt branch always returns false for nil data);
+		// skip it without ever reading its payload (#288).
+		if _, err := r.Seek(length+4, io.SeekCurrent); err != nil {
+			return pos, fmt.Errorf("png: skip chunk %q: %w", chunkTypeStr(chunkType), err)
+		}
+		return pos + length + 4, nil
+	}
+
+	if chunkType == chunkITXt {
+		data, crcB, release, err := readChunkBody(r, length)
+		if err != nil {
+			return pos, fmt.Errorf("png: chunk %q: %w", chunkTypeStr(chunkType), err)
+		}
+		var werr error
+		if !shouldDropChunk(chunkType, data) {
+			werr = writeVerbatimChunk(w, hdr, data, crcB)
+		}
+		release()
+		if werr != nil {
+			return pos, werr
+		}
+		return pos + length + 4, nil
+	}
+
+	if err := copyChunkVerbatim(r, w, hdr, length); err != nil {
+		return pos, err
+	}
+	switch chunkType {
+	case chunkIHDR:
+		if err := writeMetadataAfterIHDR(w, rawEXIF, rawXMP); err != nil {
+			return pos, err
+		}
+	case chunkIEND:
+		return pos + length + 4, errPNGDone
+	}
+	return pos + length + 4, nil
 }
 
 // Inject reads the PNG chunk stream from r, replaces or inserts the eXIf and
@@ -338,23 +637,30 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 		return ErrInvalidSignature
 	}
 
+	total, szErr := streamSize(r)
+	if szErr != nil {
+		return fmt.Errorf("png: %w", szErr)
+	}
+
 	// Input is a valid PNG; write the signature to w.
 	if _, err := w.Write(pngSig[:]); err != nil {
 		return fmt.Errorf("png: write signature: %w", err)
 	}
 
+	var hdr [8]byte
+	pos := int64(len(pngSig))
 	for {
-		err := readChunk(r, func(chunkType [4]byte, data []byte) error {
-			return injectChunk(w, chunkType, data, rawEXIF, rawXMP)
-		})
+		var err error
+		pos, err = injectOneChunk(r, w, &hdr, pos, total, rawEXIF, rawXMP)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break
 			}
 			if errors.Is(err, errPNGDone) {
-				// Source PNG had an IEND chunk; it has already been written by
-				// injectChunk → writeInjectChunk. Return immediately so we do not
-				// write a second IEND (W3C PNG 3rd ed. §5.6: IEND is unique).
+				// Source PNG had an IEND chunk; it has already been copied
+				// through verbatim by injectOneChunk. Return immediately so
+				// we do not write a second IEND (W3C PNG 3rd ed. §5.6: IEND
+				// is unique).
 				return nil
 			}
 			return err
@@ -590,81 +896,6 @@ func readLargeChunk(r io.Reader, chunkType [4]byte, length int, verifyCRC bool, 
 	}
 
 	return fn(chunkType, data)
-}
-
-// readChunk reads one PNG chunk and calls fn(chunkType, data) with a slice
-// backed by a pooled buffer. fn must not retain data after returning; call
-// bytes.Clone inside fn if the data must outlive the call.
-//
-// chunkType is a [4]byte value (task #232), derived from the header via a
-// plain array copy instead of the former string(hdr[4:8]) conversion — the
-// dominant allocation this task removes, since it fired on every single
-// chunk (including large pass-through chunks like IDAT), not just metadata
-// ones. hdr and the CRC trailer stay plain stack arrays: their addresses
-// cross io.ReadFull's io.Reader interface call regardless (an unavoidable
-// heap escape — see internal/riff.ReadChunkBuf's doc comment for the general
-// rationale), but routing objects this small through iobuf's sync.Pool
-// measured slower in ns/op than paying that one escape directly, so pooling
-// is reserved for the size-variable chunk-data buffer, which genuinely
-// benefits from reuse.
-//
-// CRC verification policy: CRC-32/IEEE (PNG §5.3/§5.4) is verified only for
-// metadata chunks that this library interprets: eXIf, iTXt, tEXt, zTXt, and
-// IHDR. Pixel-data chunks (IDAT) and all other pass-through chunks are read
-// and forwarded without CRC computation. This is intentional — computing CRC
-// over IDAT adds +35% latency with no correctness benefit for a metadata-only
-// library. ErrChunkCRCMismatch therefore signals corruption in metadata, not
-// in pixel data. Callers needing full-stream integrity must use a separate
-// tool (e.g. a display decoder with CRC checking enabled).
-func readChunk(r io.Reader, fn func(chunkType [4]byte, data []byte) error) error {
-	var hdr [8]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return fmt.Errorf("png: read chunk header: %w", err)
-	}
-	var chunkType [4]byte
-	copy(chunkType[:], hdr[4:8])
-
-	// Read the raw uint32 length BEFORE converting to int. On a 32-bit platform
-	// (GOARCH=386/arm, int=32 bits), a chunk length >= 2^31 would become negative
-	// after int(uint32), silently passing the maxPNGChunkSize guard and causing
-	// the chunk to be processed as zero-length — wrong behaviour. Checking the
-	// uint32 value against math.MaxInt32 first ensures correctness on all platform
-	// widths. PNG spec ISO 15948 §11.2.1 caps chunk length at 2^31−1 anyway (task #74).
-	rawLen := binary.BigEndian.Uint32(hdr[:4])
-	if rawLen > math.MaxInt32 {
-		return fmt.Errorf("png: chunk %q length %d exceeds 2^31-1: %w", chunkTypeStr(chunkType), rawLen, ErrChunkTooLarge)
-	}
-	length := int(rawLen)
-
-	// Guard against adversarial or malformed chunk lengths before any allocation.
-	// PNG spec ISO 15948 §11.2.1 permits up to 2^31−1 bytes, but that is
-	// pathological for metadata; enforce a tighter application-level limit here.
-	if length > maxPNGChunkSize {
-		return fmt.Errorf("png: chunk %q length %d exceeds limit: %w", chunkTypeStr(chunkType), length, ErrChunkTooLarge)
-	}
-
-	verifyCRC := shouldVerifyCRC(chunkType)
-
-	if length > 0 {
-		return readNonEmptyChunk(r, chunkType, length, verifyCRC, fn)
-	}
-
-	// Zero-length chunk: read the 4-byte CRC trailer to advance the stream,
-	// then verify only for metadata chunk types.
-	var crcB [4]byte
-	if _, err := io.ReadFull(r, crcB[:]); err != nil {
-		return fmt.Errorf("png: read CRC for %q: %w", chunkTypeStr(chunkType), err)
-	}
-	stored := binary.BigEndian.Uint32(crcB[:])
-
-	if verifyCRC {
-		// PNG §5.4: CRC covers chunk type + data; for zero-length chunks, data is empty.
-		if err := verifyCRC32(chunkType, nil, stored); err != nil {
-			return err
-		}
-	}
-
-	return fn(chunkType, nil)
 }
 
 // writeChunk writes a PNG chunk with a correct CRC-32 checksum (PNG §5.4).

@@ -1,5 +1,7 @@
 # Memory Index
 
+- [Corpus-wide bench + CPU contention + pgrep -f rules](feedback_corpuswide_bench_and_cpu_contention.md) — data-dependent changes need a full corpus sweep; check for contention before trusting a surprising number; pgrep -f self-matches its own wait-loop, use pgrep -x or a captured PID
+- [Sprint 44 Batch F (2026-09-25/26)](project_sprint44_batchF_288_289.md) — png skip-ignored/copy-verbatim+CRC-preservation, tiff/raw metadata-prefix extent scanner; overflow panic + JIF-thumbnail bugs, THEN coordinator follow-up found DoS 268MB-alloc bug + real corpus-wide Read regression a 5-fixture harness missed entirely — fixed via fraction-based growth + 4MiB whole-read bypass; readAllCapped now iobuf.ReadAll (exact one-read)
 - [Sprint 44 Batch E (2026-09-25)](project_sprint44_batchE_285_287.md) — tiff/raw write clone removal+presizing, cr3 moov-only Extract + exif.AcceptRAWMagic, xmp name-terminator LUT; found large make(cap=N) can be SLOWER than natural append growth (ARW), + fidelity-improving 1-byte RW2 POC divergence
 - [HEIF-ILOC-DUPBOX-01 iterative security fix (2026-09-25)](feedback_heif_ilocdupbox_iterative_fix.md) — "sum all matching boxes" fix was incomplete; fuzzing found a 2nd trigger; shared traversal (nonIlocBoxesLen) closes the class
 - [Sprint 44 Batch D (2026-09-25)](project_sprint44_batchD_228_234.md) — heif [4]byte types + single-pass iloc/meta; png writeChunk/zlib pooling; webp/riff seek-free Extract

@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
+### Changed
+
+- **`Metadata.RawEXIF()` returns a metadata prefix, not the whole file, for TIFF/CR2/NEF/ARW/DNG** (`format/tiff/extent.go`, `metadata.go`, #289): for these five formats — the ones where the TIFF byte stream is itself the EXIF container — `Read` now reads and `RawEXIF()` now returns only the portion of the file needed to describe metadata (every IFD in IFD0's next-IFD chain, `ExifIFD`, `GPSIFD`, `InteropIFD`, and `SubIFDs`, plus every out-of-line tag value within them, including MakerNote blobs and the tag payloads `RawIPTC()`/`RawXMP()` read from), not the strip/tile image-data blocks or embedded thumbnails/previews that make up the overwhelming majority of a real file's bytes. `m.EXIF`, `RawIPTC()`, and `RawXMP()` are unaffected: every tag they report is identical to a whole-file read. `Write`/`WriteFile` are unaffected: the TIFF-family write paths already re-read the full source from the original `io.ReadSeeker` for image-data relocation, independent of `RawEXIF()`'s content. Formats other than these five (JPEG, PNG, WebP, HEIF/AVIF, CR3, ORF, RW2) are unaffected — `RawEXIF()` already returned just the EXIF segment/box/chunk for those, never the whole file.
+
 ## [1.3.0] - 2026-07-07
 
 ### Added

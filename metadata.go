@@ -94,6 +94,27 @@ type Metadata struct {
 	rawIPTC []byte
 	rawXMP  []byte
 
+	// rawEXIFIsWholeFile is true when rawEXIF, as extracted by Read, happens
+	// to equal the ENTIRE source file rather than just a metadata prefix.
+	// It is only ever set for the five TIFF-family formats where the TIFF
+	// byte stream is itself the EXIF container (TIFF, CR2, NEF, ARW, DNG):
+	// format/tiff.Extract's metadata-prefix scanner (#289) can converge on
+	// reading the whole file for some inputs (a small file below its own
+	// whole-read threshold, or one whose declared metadata legitimately
+	// spans a large fraction of it), in which case rawEXIF is exactly as
+	// complete as a pre-#289 whole-file read would have been. Computed once,
+	// cheaply, by comparing len(rawEXIF) against the source's actual size
+	// (see tiffFamilyRawEXIFIsWholeFile in read.go) — never assumed.
+	//
+	// Write's copy-and-relocate path (writeTIFF/writeTIFFCR2/writeTIFFARW/
+	// writeTIFFNEF) checks this flag to decide whether it can reuse rawEXIF
+	// directly as its relocation base instead of re-reading the full source
+	// from r: reusing is exactly as safe as it was before #289 removed the
+	// general-case fast path, since no relocator ever mutates its base
+	// buffer (see Batch E's finding recorded in project agent memory) —
+	// false only means "re-read to be safe", never "this write is unsafe".
+	rawEXIFIsWholeFile bool
+
 	// rawIPTCDigest is the 16-byte MD5 value stored in Photoshop resource
 	// 0x0425 ("IPTC Digest") inside the APP13 IRB, or nil when absent.
 	// MWG Guidelines v2.0 §3.3.1: the digest is used at read time to determine
@@ -142,11 +163,30 @@ func (m *Metadata) Format() format.FormatID { return format.FormatID(m.format) }
 
 // RawEXIF returns a copy of the raw EXIF segment bytes as read from the container.
 //
+// For TIFF, CR2, NEF, ARW, and DNG — formats where the TIFF byte stream is
+// itself the EXIF container — RawEXIF returns only the METADATA PREFIX of
+// that stream (#289): every IFD in IFD0's next-IFD chain, ExifIFD, GPSIFD,
+// InteropIFD, and SubIFDs, and every out-of-line tag value within them
+// (including MakerNote blobs, and the IPTC/XMP tag payloads RawIPTC/RawXMP
+// also read from) — not strip/tile image-data blocks or embedded thumbnails/
+// previews. This is a byte-for-byte prefix of the original file starting at
+// offset 0, sized to whatever the file's own metadata occupies (typically a
+// small fraction of a percent of real-world files); it is sufficient to
+// reconstruct every field exif.Parse would report from the whole file, but
+// it is NOT the whole file. A caller that needs the original bytes verbatim
+// — for example to re-embed a thumbnail this package never reads — must keep
+// its own copy of the source rather than relying on RawEXIF.
+//
+// For every other supported format (JPEG, PNG, WebP, HEIF/AVIF, CR3, ORF,
+// RW2), RawEXIF already returned just the EXIF segment/box/chunk rather than
+// the whole file, so this changes nothing for those formats.
+//
 // #139: returns bytes.Clone(m.rawEXIF) so that caller mutations of the returned
 // slice cannot corrupt the internal relocation base used by subsequent Write calls.
 // The raw EXIF bytes in TIFF-based formats share their backing array with every
 // parsed IFDEntry.Value; an in-place mutation by the caller would silently corrupt
-// all parsed EXIF values AND the image-data source used during write relocation.
+// all parsed EXIF values AND (for ORF/RW2, which are unaffected by #289 and still
+// carry the whole file here) the image-data source used during write relocation.
 func (m *Metadata) RawEXIF() []byte { return bytes.Clone(m.rawEXIF) }
 
 // RawIPTC returns a copy of the raw IPTC IIM segment bytes as read from the container.
