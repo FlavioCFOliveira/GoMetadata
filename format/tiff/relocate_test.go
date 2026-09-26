@@ -482,6 +482,26 @@ func findOriginalBlock(t *testing.T, original, newBlockData []byte, offsetTag, c
 	return false
 }
 
+// assembleRelocated reconstructs the single contiguous buffer a pre-#291
+// relocateTIFFFromParsed*/relocateTIFFAsRW2/relocateTIFFAsORF caller used to
+// receive directly: header, followed by each block's bytes (sliced from base,
+// which callers of these low-level test-only helpers always supply as the
+// WHOLE original file) in slice order. Mirrors writeRelocated's own wholeFile
+// fast path (relocate_stream.go) so tests that assert byte-for-byte content
+// on the assembled result exercise the same layout a real Write produces.
+func assembleRelocated(t *testing.T, base, header []byte, blocks []*imageBlock) []byte {
+	t.Helper()
+	out := append([]byte(nil), header...)
+	for _, blk := range blocks {
+		end := blk.srcOffset + blk.size
+		if end > uint64(len(base)) {
+			t.Fatalf("assembleRelocated: block offset=%d size=%d exceeds base length %d", blk.srcOffset, blk.size, len(base))
+		}
+		out = append(out, base[blk.srcOffset:end]...)
+	}
+	return out
+}
+
 // ---------------------------------------------------------------------------
 // Test (a): single-strip TIFF
 // ---------------------------------------------------------------------------
@@ -1026,7 +1046,7 @@ func TestRelocateBigTIFFReturnsError(t *testing.T) {
 	binary.LittleEndian.PutUint16(big[6:], 0)
 	binary.LittleEndian.PutUint64(big[8:], 16)
 
-	_, err := relocateTIFF(big, []byte("iptc"), nil)
+	_, _, err := relocateTIFF(big, []byte("iptc"), nil)
 	if err == nil {
 		t.Error("expected error for BigTIFF input, got nil")
 	}
@@ -1037,7 +1057,7 @@ func TestRelocateBigTIFFReturnsError(t *testing.T) {
 func TestRelocateInvalidHeaderReturnsError(t *testing.T) {
 	t.Parallel()
 
-	_, err := relocateTIFF([]byte("not-a-tiff"), []byte("iptc"), nil)
+	_, _, err := relocateTIFF([]byte("not-a-tiff"), []byte("iptc"), nil)
 	if err == nil {
 		t.Error("expected error for invalid TIFF, got nil")
 	}
@@ -1047,7 +1067,7 @@ func TestRelocateInvalidHeaderReturnsError(t *testing.T) {
 func TestRelocateTooShortReturnsError(t *testing.T) {
 	t.Parallel()
 
-	_, err := relocateTIFF([]byte{0x49, 0x49, 0x2A, 0x00}, []byte("iptc"), nil)
+	_, _, err := relocateTIFF([]byte{0x49, 0x49, 0x2A, 0x00}, []byte("iptc"), nil)
 	if err == nil {
 		t.Error("expected error for truncated input, got nil")
 	}
@@ -1071,7 +1091,7 @@ func BenchmarkRelocateSingleStrip(b *testing.B) {
 	b.SetBytes(int64(len(original)))
 	b.ResetTimer()
 	for range b.N {
-		_, _ = relocateTIFF(original, newIPTC, newXMP)
+		_, _, _ = relocateTIFF(original, newIPTC, newXMP)
 	}
 }
 
@@ -1091,6 +1111,26 @@ func BenchmarkRelocateMultiStrip(b *testing.B) {
 	b.SetBytes(int64(len(original)))
 	b.ResetTimer()
 	for range b.N {
-		_, _ = relocateTIFF(original, newIPTC, newXMP)
+		_, _, _ = relocateTIFF(original, newIPTC, newXMP)
+	}
+}
+
+// BenchmarkRelocateTiled measures the relocateTIFF cost for a tiled TIFF
+// (TileOffsets/TileByteCounts, count=2) with 2 KiB tiles.
+func BenchmarkRelocateTiled(b *testing.B) {
+	tile0 := make([]byte, 2048)
+	tile1 := make([]byte, 2048)
+	for i := range tile0 {
+		tile0[i] = byte(i)
+		tile1[i] = byte(255 - i)
+	}
+	original := buildTiledTIFF(tile0, tile1)
+	newIPTC := []byte("benchmark-iptc-tiled")
+	newXMP := []byte("<xmpmeta/>")
+
+	b.SetBytes(int64(len(original)))
+	b.ResetTimer()
+	for range b.N {
+		_, _, _ = relocateTIFF(original, newIPTC, newXMP)
 	}
 }

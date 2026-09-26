@@ -66,8 +66,8 @@ import (
 // to a different absolute offset — triggering the rebasing code path.
 //
 // TIFF 6.0 §2: IFD entries sorted by tag number.
-func makerNoteTestTIFF(t *testing.T, makerNoteBlob []byte) []byte {
-	t.Helper()
+func makerNoteTestTIFF(tb testing.TB, makerNoteBlob []byte) []byte {
+	tb.Helper()
 
 	order := binary.LittleEndian
 
@@ -152,8 +152,8 @@ func makerNoteTestTIFF(t *testing.T, makerNoteBlob []byte) []byte {
 // there are no image blocks and no SubIFDs).  A minimal XMP packet ensures the
 // metadata-bearing IFD section always changes, causing the MakerNote blob to
 // move to a new absolute offset.
-func injectTIFF(t *testing.T, src []byte) []byte {
-	t.Helper()
+func injectTIFF(tb testing.TB, src []byte) []byte {
+	tb.Helper()
 
 	const dummyXMPStr = `<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"/></x:xmpmeta><?xpacket end='w'?>`
 	dummyXMP := []byte(dummyXMPStr)
@@ -161,7 +161,7 @@ func injectTIFF(t *testing.T, src []byte) []byte {
 	var out bytes.Buffer
 	err := Inject(bytes.NewReader(src), &out, src, nil, dummyXMP, false)
 	if err != nil {
-		t.Fatalf("Inject: %v", err)
+		tb.Fatalf("Inject: %v", err)
 	}
 	return out.Bytes()
 }
@@ -706,4 +706,46 @@ func TestNikonType1DocumentedLimitation(t *testing.T) {
 		"Sony plain-IFD structure; rebaseGenericMakerNote applies correctly. " +
 		"True opaque/encrypted blobs (e.g. proprietary encryption) are not rebased " +
 		"but image data and non-MakerNote EXIF are always preserved.")
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark
+// ---------------------------------------------------------------------------
+
+// BenchmarkRelocateMakerNote measures the Inject (relocateTIFFFromParsed) cost
+// for a TIFF carrying a Sony plain-IFD MakerNote blob. Every call exercises
+// rebaseGenericMakerNote and isSonyPlainIFDMakerNote's known-prefix check.
+func BenchmarkRelocateMakerNote(b *testing.B) {
+	order := binary.LittleEndian
+
+	wantOOLValue := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
+	const (
+		mnBlobTIFFAbs = 56
+		oolBlobOffset = 18
+	)
+	blobLen := oolBlobOffset + len(wantOOLValue)
+	mnBlob := make([]byte, blobLen)
+
+	// Sony plain IFD at offset 0 (see TestSonyMakerNoteOOLRoundtrip).
+	order.PutUint16(mnBlob[0:], 1)
+	ep := 2
+	order.PutUint16(mnBlob[ep:], 0x0102)
+	order.PutUint16(mnBlob[ep+2:], 7)
+	order.PutUint32(mnBlob[ep+4:], 8)
+	oolAbsInSrc := uint32(mnBlobTIFFAbs + oolBlobOffset)
+	order.PutUint32(mnBlob[ep+8:], oolAbsInSrc)
+	copy(mnBlob[oolBlobOffset:], wantOOLValue)
+
+	src := makerNoteTestTIFF(b, mnBlob)
+
+	const dummyXMPStr = `<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"/></x:xmpmeta><?xpacket end='w'?>`
+	dummyXMP := []byte(dummyXMPStr)
+
+	b.ReportAllocs()
+	for range b.N {
+		var out bytes.Buffer
+		if err := Inject(bytes.NewReader(src), &out, src, nil, dummyXMP, false); err != nil {
+			b.Fatalf("Inject: %v", err)
+		}
+	}
 }

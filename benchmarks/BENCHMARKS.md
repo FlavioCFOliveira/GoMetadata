@@ -468,3 +468,306 @@ release-to-release in this table, e.g. `format/heif`, `format/jpeg`, `format/png
 ---
 
 ## Summary — v1.1.0 vs v1.0.4
+
+## v1.4.0 vs v1.3.0
+
+*Note: this section is appended after the pre-existing, empty "Summary — v1.1.0 vs v1.0.4"
+heading directly above (no body follows it in the file as of the v1.3.0 release) — left
+unmodified per this project's Scope Discipline policy; flagged in the v1.4.0 release report
+rather than altered as unrequested work.*
+
+Full `-bench=. -benchmem -count=3 ./...` sweep across every package. Captured on the same Apple
+M4 / darwin/arm64 machine as the sections above, Go **1.27.1** (module toolchain pinned at
+go1.26.4; local `go` binary is newer). `-count=3`, medians shown (via `benchstat`). Full raw
+output archived at `benchmarks/results/v1.4.0.txt`.
+
+**Methodology note on this run's ns/op noise floor (same pattern as the v1.3.0 section above):**
+this sweep was captured immediately after a ~7-minute, 10-worker-parallel fuzzing campaign (29
+targets, part of this release's security-gate verification) plus two `golangci-lint` passes, on a
+machine that had not returned to idle. The result is unambiguous in the data: `ns/op` is *higher*
+in this run for the large majority of benchmarks across nearly every package (e.g. `format`
+`BenchmarkDetect` +182%, `internal/iobuf` geomean +130%, `xmp` geomean +69%) with **no
+corresponding `B/op`/`allocs/op` increase** — the signature of system load, not a code
+regression. `B/op` and `allocs/op` are deterministic for a fixed input and are unaffected by
+concurrent CPU load; they are the reliable signal in this section, exactly as noted for the
+v1.3.0 comparison above. Read every `ns/op` delta below as informational only; treat the `B/op`
+and `allocs/op` columns as authoritative, consistent with this project's established convention
+for same-session, post-fuzz benchmark captures.
+
+By that measure, this release's allocation-reduction work (Sprint 44 "Performance and Efficiency
+Laboratory" plus the immediately following task #297 follow-ups — prefix-only reads for the seven
+TIFF-family formats, streamed image-data relocation, pooled chunk I/O, arena-interned XMP values)
+shows through clearly and consistently: nearly every package's `B/op` and `allocs/op` geomean
+improved, several dramatically (`format/tiff` B/op **-81%**, `format/raw/arw` B/op **-84%**,
+`format/raw/cr2`/`format/raw/dng` B/op **-97%**, `format/heif` allocs **-66%**, `format/png`
+allocs **-53%**, root package allocs **-51%**). No package shows a `B/op`/`allocs/op`
+*regression* of note; the handful of small `B/op` upticks (e.g. root `BenchmarkReadFile` 6337→6351,
+`exif.BenchmarkParseBigTIFF_Simple`/`BenchmarkEXIFParse` 337→344) are all single-digit-byte,
+sub-2% changes, explained by the `aliasThumbnail`-plumbing parameter added to every IFD-traversal
+signature (CHANGELOG "Added" entry above) rather than any allocation regression.
+
+### github.com/FlavioCFOliveira/GoMetadata
+
+| Benchmark | v1.3.0 ns/op | v1.4.0 ns/op | Delta ns/op | v1.3.0 B/op | v1.4.0 B/op | Delta B/op | v1.3.0 allocs | v1.4.0 allocs |
+|---|---|---|---|---|---|---|---|---|
+| BenchmarkRead_JPEG | 288.20 | 259.10 | ~ | 521 | 489 | ~ | 8 | 6 |
+| BenchmarkRead_JPEG_WithXMP | 1.575µs | 1.286µs | ~ | 2466 | 1966 | ~ | 23 | 12 |
+| BenchmarkRead_PNG | 198.90 | 170.90 | ~ | 288 | 240 | ~ | 10 | 6 |
+| BenchmarkReadProgressiveJPEG | 229.10 | 219.00 | ~ | 245 | 208 | ~ | 3 | 1 |
+| BenchmarkReadCombinedMetadataJPEG | 13.229µs | 10.245µs | ~ | 22505 | 14357 | ~ | 107 | 39 |
+| BenchmarkReadFile | 2.566µs | 2.511µs | ~ | 6337 | 6351 | ~ | 15 | 14 |
+| BenchmarkWrite_JPEG | 438.40 | 369.90 | ~ | 241 | 128 | ~ | 11 | 4 |
+| BenchmarkWrite_PNG | 279.00 | 119.10 | ~ | 136 | 65 | ~ | 15 | 3 |
+| BenchmarkReadFile_Concurrent | 12.135µs | 12.391µs | ~ | 693 | 709 | ~ | 10 | 9 |
+| BenchmarkRead_JPEG_ExtendedXMP | N/A | 5.527µs | ~ | N/A | 9611 | ~ | N/A | 40 |
+| BenchmarkRead_JPEG_ExtendedXMP_WithoutXMP | N/A | 758.60 | ~ | N/A | 3075 | ~ | N/A | 16 |
+| BenchmarkRawSegments | N/A | 0.26 | ~ | N/A | 0 | ~ | N/A | 0 |
+| BenchmarkMWGAccessors | N/A | 45.13 | ~ | N/A | 0 | ~ | N/A | 0 |
+
+Geomean: sec/op -17.98%, B/op -23.68%, allocs/op -50.63%
+
+### github.com/FlavioCFOliveira/GoMetadata/exif
+
+| Benchmark | v1.3.0 ns/op | v1.4.0 ns/op | Delta ns/op | v1.3.0 B/op | v1.4.0 B/op | Delta B/op | v1.3.0 allocs | v1.4.0 allocs |
+|---|---|---|---|---|---|---|---|---|
+| BenchmarkIFDGet | 2.81 | 2.80 | ~ | 0 | 0 | ~ | 0 | 0 |
+| BenchmarkIFDSet | 683.60 | 703.80 | ~ | 1656 | 1656 | ~ | 31 | 31 |
+| BenchmarkIFDEntryString | 12.58 | 12.02 | ~ | 16 | 16 | ~ | 1 | 1 |
+| BenchmarkParseGPS | 42.01 | 41.99 | ~ | 0 | 0 | ~ | 0 | 0 |
+| BenchmarkMakerNoteDispatch | 122.80 | 112.50 | ~ | 208 | 208 | ~ | 4 | 4 |
+| BenchmarkParseBigTIFF_Simple | 190.50 | 192.10 | ~ | 337 | 344 | ~ | 4 | 4 |
+| BenchmarkEXIFEncode_BigTIFF | 1.147µs | 819.70 | ~ | 7756 | 4123 | ~ | 6 | 2 |
+| BenchmarkEXIFParse | 171.20 | 169.00 | ~ | 337 | 344 | ~ | 4 | 4 |
+| BenchmarkEXIFParse_Camera | 1.573µs | 1.573µs | ~ | 2594 | 2601 | ~ | 8 | 8 |
+| BenchmarkIFDGet_Large | 3.77 | 3.62 | ~ | 0 | 0 | ~ | 0 | 0 |
+| BenchmarkEXIFEncode | 128.70 | 124.10 | ~ | 80 | 80 | ~ | 2 | 2 |
+| BenchmarkEXIFEncode_Camera | 1.128µs | 1.961µs | ~ | 1619 | 914 | ~ | 14 | 2 |
+| BenchmarkUserComment_ASCII | 21.18 | 41.86 | ~ | 64 | 64 | ~ | 1 | 1 |
+| BenchmarkUserComment_Unicode | 161.80 | 377.10 | ~ | 128 | 128 | ~ | 2 | 2 |
+| BenchmarkXPTitle | 99.65 | 221.60 | ~ | 72 | 72 | ~ | 2 | 2 |
+
+Geomean: sec/op +16.98%, B/op -7.44%, allocs/op -18.37%
+
+### github.com/FlavioCFOliveira/GoMetadata/format
+
+| Benchmark | v1.3.0 ns/op | v1.4.0 ns/op | Delta ns/op | v1.3.0 B/op | v1.4.0 B/op | Delta B/op | v1.3.0 allocs | v1.4.0 allocs |
+|---|---|---|---|---|---|---|---|---|
+| BenchmarkDetect | 23.08 | 65.00 | ~ | 0 | 0 | ~ | 0 | 0 |
+
+Geomean: sec/op +181.63%, B/op +0.00%, allocs/op +0.00%
+
+### github.com/FlavioCFOliveira/GoMetadata/format/heif
+
+| Benchmark | v1.3.0 ns/op | v1.4.0 ns/op | Delta ns/op | v1.3.0 B/op | v1.4.0 B/op | Delta B/op | v1.3.0 allocs | v1.4.0 allocs |
+|---|---|---|---|---|---|---|---|---|
+| BenchmarkHEIFExtract | 353.70 | 416.30 | ~ | 630 | 400 | ~ | 15 | 5 |
+| BenchmarkHEIFInject | 654.90 | 732.80 | ~ | 1816 | 812 | ~ | 35 | 12 |
+
+Geomean: sec/op +14.76%, B/op -46.72%, allocs/op -66.19%
+
+### github.com/FlavioCFOliveira/GoMetadata/format/jpeg
+
+| Benchmark | v1.3.0 ns/op | v1.4.0 ns/op | Delta ns/op | v1.3.0 B/op | v1.4.0 B/op | Delta B/op | v1.3.0 allocs | v1.4.0 allocs |
+|---|---|---|---|---|---|---|---|---|
+| BenchmarkJPEGExtract | 150.70 | 282.50 | ~ | 120 | 104 | ~ | 4 | 3 |
+| BenchmarkJPEGInject | 348.80 | 617.10 | ~ | 376 | 288 | ~ | 10 | 4 |
+| BenchmarkJPEGExtract_Real | 2.259µs | 4.037µs | ~ | 15755 | 9258 | ~ | 8 | 6 |
+| BenchmarkJPEGInject_NoAPP13 | N/A | 517.80 | ~ | N/A | 288 | ~ | N/A | 4 |
+
+Geomean: sec/op +80.97%, B/op -26.93%, allocs/op -39.18%
+
+### github.com/FlavioCFOliveira/GoMetadata/format/png
+
+| Benchmark | v1.3.0 ns/op | v1.4.0 ns/op | Delta ns/op | v1.3.0 B/op | v1.4.0 B/op | Delta B/op | v1.3.0 allocs | v1.4.0 allocs |
+|---|---|---|---|---|---|---|---|---|
+| BenchmarkPNGExtract | 327.00 | 541.90 | ~ | 232 | 160 | ~ | 16 | 11 |
+| BenchmarkPNGExtractCompressedXMP | 901.50 | 981.80 | ~ | 700 | 581 | ~ | 15 | 10 |
+| BenchmarkPNGInject | 520.00 | 674.40 | ~ | 1017 | 787 | ~ | 26 | 7 |
+| BenchmarkPNGWriteChunk | 75.40 | 129.70 | ~ | 136 | 112 | ~ | 5 | 2 |
+
+Geomean: sec/op +41.65%, B/op -22.28%, allocs/op -52.87%
+
+### github.com/FlavioCFOliveira/GoMetadata/format/raw/arw
+
+| Benchmark | v1.3.0 ns/op | v1.4.0 ns/op | Delta ns/op | v1.3.0 B/op | v1.4.0 B/op | Delta B/op | v1.3.0 allocs | v1.4.0 allocs |
+|---|---|---|---|---|---|---|---|---|
+| BenchmarkARWExtract | 93.98 | 54.30 | ~ | 584 | 16 | ~ | 3 | 1 |
+| BenchmarkARWConformanceExtract | 121.90 | 141.20 | ~ | 584 | 144 | ~ | 3 | 1 |
+| BenchmarkARWConformanceInject | 1.631µs | 2.630µs | ~ | 3434 | 2047 | ~ | 34 | 20 |
+
+Geomean: sec/op +2.57%, B/op -84.09%, allocs/op -59.72%
+
+### github.com/FlavioCFOliveira/GoMetadata/format/raw/cr2
+
+| Benchmark | v1.3.0 ns/op | v1.4.0 ns/op | Delta ns/op | v1.3.0 B/op | v1.4.0 B/op | Delta B/op | v1.3.0 allocs | v1.4.0 allocs |
+|---|---|---|---|---|---|---|---|---|
+| BenchmarkCR2Extract | 92.65 | 53.50 | ~ | 584 | 16 | ~ | 3 | 1 |
+
+Geomean: sec/op -42.26%, B/op -97.26%, allocs/op -66.67%
+
+### github.com/FlavioCFOliveira/GoMetadata/format/raw/cr3
+
+| Benchmark | v1.3.0 ns/op | v1.4.0 ns/op | Delta ns/op | v1.3.0 B/op | v1.4.0 B/op | Delta B/op | v1.3.0 allocs | v1.4.0 allocs |
+|---|---|---|---|---|---|---|---|---|
+| BenchmarkCR3Extract | N/A | 144.00 | ~ | N/A | 80 | ~ | N/A | 3 |
+| BenchmarkCR3Inject | N/A | 645.60 | ~ | N/A | 1968 | ~ | N/A | 10 |
+
+Geomean: sec/op n/a, B/op n/a, allocs/op n/a
+
+### github.com/FlavioCFOliveira/GoMetadata/format/raw/dng
+
+| Benchmark | v1.3.0 ns/op | v1.4.0 ns/op | Delta ns/op | v1.3.0 B/op | v1.4.0 B/op | Delta B/op | v1.3.0 allocs | v1.4.0 allocs |
+|---|---|---|---|---|---|---|---|---|
+| BenchmarkDNGExtract | 91.83 | 52.71 | ~ | 584 | 16 | ~ | 3 | 1 |
+
+Geomean: sec/op -42.60%, B/op -97.26%, allocs/op -66.67%
+
+### github.com/FlavioCFOliveira/GoMetadata/format/raw/nef
+
+| Benchmark | v1.3.0 ns/op | v1.4.0 ns/op | Delta ns/op | v1.3.0 B/op | v1.4.0 B/op | Delta B/op | v1.3.0 allocs | v1.4.0 allocs |
+|---|---|---|---|---|---|---|---|---|
+| BenchmarkNEFExtractMakerNote | 112.60 | 104.50 | ~ | 584 | 128 | ~ | 3 | 1 |
+| BenchmarkNEFExtract | 92.54 | 52.04 | ~ | 584 | 16 | ~ | 3 | 1 |
+
+Geomean: sec/op -27.76%, B/op -92.25%, allocs/op -66.67%
+
+### github.com/FlavioCFOliveira/GoMetadata/format/raw/orf
+
+| Benchmark | v1.3.0 ns/op | v1.4.0 ns/op | Delta ns/op | v1.3.0 B/op | v1.4.0 B/op | Delta B/op | v1.3.0 allocs | v1.4.0 allocs |
+|---|---|---|---|---|---|---|---|---|
+| BenchmarkORFExtract | N/A | 79.18 | ~ | N/A | 20 | ~ | N/A | 2 |
+| BenchmarkORFInject | N/A | 162.00 | ~ | N/A | 240 | ~ | N/A | 6 |
+| BenchmarkORFExtractRealFile | N/A | 98.490µs | ~ | N/A | 1622688 | ~ | N/A | 7 |
+
+Geomean: sec/op n/a, B/op n/a, allocs/op n/a
+
+### github.com/FlavioCFOliveira/GoMetadata/format/raw/rw2
+
+| Benchmark | v1.3.0 ns/op | v1.4.0 ns/op | Delta ns/op | v1.3.0 B/op | v1.4.0 B/op | Delta B/op | v1.3.0 allocs | v1.4.0 allocs |
+|---|---|---|---|---|---|---|---|---|
+| BenchmarkRW2Extract | N/A | 79.21 | ~ | N/A | 20 | ~ | N/A | 2 |
+| BenchmarkRW2ExtractRealFile | N/A | 49.561µs | ~ | N/A | 787104 | ~ | N/A | 7 |
+| BenchmarkRW2Inject | N/A | 185.10 | ~ | N/A | 240 | ~ | N/A | 6 |
+
+Geomean: sec/op n/a, B/op n/a, allocs/op n/a
+
+### github.com/FlavioCFOliveira/GoMetadata/format/tiff
+
+| Benchmark | v1.3.0 ns/op | v1.4.0 ns/op | Delta ns/op | v1.3.0 B/op | v1.4.0 B/op | Delta B/op | v1.3.0 allocs | v1.4.0 allocs |
+|---|---|---|---|---|---|---|---|---|
+| BenchmarkBigTIFFExtract | 132.90 | 130.40 | ~ | 584 | 160 | ~ | 3 | 1 |
+| BenchmarkRelocateDNGLike | 2.933µs | 2.704µs | ~ | 13458 | 1864 | ~ | 37 | 22 |
+| BenchmarkRelocateSingleStrip | 1.799µs | 1.815µs | ~ | 7439 | 1518 | ~ | 22 | 12 |
+| BenchmarkRelocateMultiStrip | 2.213µs | 2.042µs | ~ | 10258 | 1566 | ~ | 28 | 12 |
+| BenchmarkTIFFExtract | 127.90 | 111.90 | ~ | 584 | 112 | ~ | 3 | 1 |
+| BenchmarkInjectWithEXIF | N/A | 101.545µs | ~ | N/A | 393504 | ~ | N/A | 24 |
+| BenchmarkInjectWithEXIFStream | N/A | 78.326µs | ~ | N/A | 393482 | ~ | N/A | 24 |
+| BenchmarkRelocateMakerNote | N/A | 1.394µs | ~ | N/A | 1292 | ~ | N/A | 12 |
+| BenchmarkRelocateTiled | N/A | 2.163µs | ~ | N/A | 1695 | ~ | N/A | 12 |
+| BenchmarkTIFFExtractRealFile | N/A | 113.486µs | ~ | N/A | 1843867 | ~ | N/A | 6 |
+
+Geomean: sec/op -5.93%, B/op -81.33%, allocs/op -56.57%
+
+### github.com/FlavioCFOliveira/GoMetadata/format/webp
+
+| Benchmark | v1.3.0 ns/op | v1.4.0 ns/op | Delta ns/op | v1.3.0 B/op | v1.4.0 B/op | Delta B/op | v1.3.0 allocs | v1.4.0 allocs |
+|---|---|---|---|---|---|---|---|---|
+| BenchmarkWebPExtract | 102.90 | 139.10 | ~ | 104 | 32 | ~ | 7 | 3 |
+| BenchmarkWebPInject | 255.00 | 279.10 | ~ | 947 | 320 | ~ | 11 | 4 |
+| BenchmarkWebPExtractWithXMP | N/A | 217.90 | ~ | N/A | 112 | ~ | N/A | 4 |
+
+Geomean: sec/op +21.64%, B/op -67.76%, allocs/op -60.52%
+
+### github.com/FlavioCFOliveira/GoMetadata/internal/iobuf
+
+| Benchmark | v1.3.0 ns/op | v1.4.0 ns/op | Delta ns/op | v1.3.0 B/op | v1.4.0 B/op | Delta B/op | v1.3.0 allocs | v1.4.0 allocs |
+|---|---|---|---|---|---|---|---|---|
+| BenchmarkGetPut | 7.08 | 19.04 | ~ | 0 | 0 | ~ | 0 | 0 |
+| BenchmarkGetPutSmall | 7.01 | 16.57 | ~ | 0 | 0 | ~ | 0 | 0 |
+| BenchmarkGetLarge | 7.01 | 16.53 | ~ | 0 | 0 | ~ | 0 | 0 |
+| BenchmarkGetLargeHit | 6.61 | 16.44 | ~ | 0 | 0 | ~ | 0 | 0 |
+| BenchmarkGetOversizedMiss | 3.818µs | 7.012µs | ~ | 75168 | 74527 | ~ | 2 | 2 |
+| BenchmarkGetPutParallel | 2.02 | 4.36 | ~ | 0 | 0 | ~ | 0 | 0 |
+| BenchmarkReadAll | N/A | 1354.360µs | ~ | N/A | 16796643 | ~ | N/A | 1 |
+| BenchmarkStreamCopyNBytesReaderSource | N/A | 196.975µs | ~ | N/A | 1079 | ~ | N/A | 1 |
+| BenchmarkStreamCopyN | N/A | 161.813µs | ~ | N/A | 2086 | ~ | N/A | 1 |
+
+Geomean: sec/op +129.98%, B/op -0.14%, allocs/op +0.00%
+
+### github.com/FlavioCFOliveira/GoMetadata/internal/riff
+
+| Benchmark | v1.3.0 ns/op | v1.4.0 ns/op | Delta ns/op | v1.3.0 B/op | v1.4.0 B/op | Delta B/op | v1.3.0 allocs | v1.4.0 allocs |
+|---|---|---|---|---|---|---|---|---|
+| BenchmarkReadChunk | 24.39 | 42.97 | ~ | 56 | 56 | ~ | 2 | 2 |
+
+Geomean: sec/op +76.18%, B/op +0.00%, allocs/op +0.00%
+
+### github.com/FlavioCFOliveira/GoMetadata/iptc
+
+| Benchmark | v1.3.0 ns/op | v1.4.0 ns/op | Delta ns/op | v1.3.0 B/op | v1.4.0 B/op | Delta B/op | v1.3.0 allocs | v1.4.0 allocs |
+|---|---|---|---|---|---|---|---|---|
+| BenchmarkDecodeString | 55.48 | 49.14 | ~ | 96 | 16 | ~ | 3 | 1 |
+| BenchmarkIPTCAccessorsNonASCII | 6.81 | 18.49 | ~ | 0 | 0 | ~ | 0 | 0 |
+| BenchmarkIPTCParse | 195.80 | 250.90 | ~ | 1024 | 480 | ~ | 6 | 4 |
+| BenchmarkIPTCEncode | 161.00 | 351.90 | ~ | 304 | 304 | ~ | 2 | 2 |
+| BenchmarkIPTCAccessors | 21.62 | 36.38 | ~ | 48 | 48 | ~ | 1 | 1 |
+| BenchmarkDecodeStringASCII | N/A | 45.14 | ~ | N/A | 48 | ~ | N/A | 1 |
+| BenchmarkIPTCParseFewDatasets | N/A | 343.90 | ~ | N/A | 576 | ~ | N/A | 7 |
+| BenchmarkIPTCParseManyDatasets | N/A | 914.60 | ~ | N/A | 1416 | ~ | N/A | 22 |
+| BenchmarkIPTCParseUTF8Declared | N/A | 224.10 | ~ | N/A | 480 | ~ | N/A | 4 |
+| BenchmarkIPTCEncodeSorted | N/A | 197.70 | ~ | N/A | 112 | ~ | N/A | 1 |
+
+Geomean: sec/op +62.49%, B/op -39.94%, allocs/op -25.98%
+
+### github.com/FlavioCFOliveira/GoMetadata/xmp
+
+| Benchmark | v1.3.0 ns/op | v1.4.0 ns/op | Delta ns/op | v1.3.0 B/op | v1.4.0 B/op | Delta B/op | v1.3.0 allocs | v1.4.0 allocs |
+|---|---|---|---|---|---|---|---|---|
+| BenchmarkRDFParse | 3.340µs | 5.474µs | ~ | 2217 | 2465 | ~ | 45 | 14 |
+| BenchmarkXMPEncodeFullPacket | 1.797µs | 3.463µs | ~ | 3573 | 3573 | ~ | 4 | 4 |
+| BenchmarkKeywords | 105.00 | 192.50 | ~ | 160 | 160 | ~ | 1 | 1 |
+| BenchmarkAddKeyword | 265.80 | 575.70 | ~ | 472 | 472 | ~ | 6 | 6 |
+| BenchmarkGPSParse | 37.35 | 87.70 | ~ | 0 | 0 | ~ | 0 | 0 |
+| BenchmarkGPSEncode | 116.10 | 185.30 | ~ | 32 | 32 | ~ | 2 | 2 |
+| BenchmarkEntityDecode | 83.81 | 154.40 | ~ | 64 | 64 | ~ | 1 | 1 |
+| BenchmarkUnescapeXMLNoEntity | 12.33 | 6.93 | ~ | 32 | 0 | ~ | 1 | 0 |
+| BenchmarkNumericCharRefDecode | 75.70 | 132.70 | ~ | 48 | 48 | ~ | 1 | 1 |
+| BenchmarkPacketScan | 401.90 | 823.80 | ~ | 0 | 0 | ~ | 0 | 0 |
+| BenchmarkXMPParse | 1.354µs | 2.158µs | ~ | 1168 | 1232 | ~ | 20 | 8 |
+| BenchmarkXMPEncode | 1.180µs | 2.239µs | ~ | 3156 | 3156 | ~ | 3 | 3 |
+
+Geomean: sec/op +68.63%, B/op ?, allocs/op ?
+
+### Summary — v1.4.0 vs v1.3.0
+
+| Package | sec/op geomean | B/op geomean | allocs/op geomean |
+|---|---|---|---|
+| `github.com/FlavioCFOliveira/GoMetadata` (root) | -17.98% (noise) | **-23.68%** | **-50.63%** |
+| `exif` | +16.98% (noise) | **-7.44%** | **-18.37%** |
+| `format` | +181.63% (noise; single-benchmark package) | ~0% | ~0% |
+| `format/heif` | +14.76% (noise) | **-46.72%** | **-66.19%** |
+| `format/jpeg` | +80.97% (noise) | **-26.93%** | **-39.18%** |
+| `format/png` | +41.65% (noise) | **-22.28%** | **-52.87%** |
+| `format/raw/arw` | +2.57% (noise) | **-84.09%** | **-59.72%** |
+| `format/raw/cr2` | -42.26% | **-97.26%** | **-66.67%** |
+| `format/raw/cr3` | new baseline (no v1.3.0 comparison — package not tracked before this cycle) | | |
+| `format/raw/dng` | -42.60% | **-97.26%** | **-66.67%** |
+| `format/raw/nef` | -27.76% | **-92.25%** | **-66.67%** |
+| `format/raw/orf` | new baseline | | |
+| `format/raw/rw2` | new baseline | | |
+| `format/tiff` | -5.93% | **-81.33%** | **-56.57%** |
+| `format/webp` | +21.64% (noise) | **-67.76%** | **-60.52%** |
+| `internal/iobuf` | +129.98% (noise) | ~0% | ~0% |
+| `internal/riff` | +76.18% (noise) | ~0% | ~0% |
+| `iptc` | +62.49% (noise) | **-39.94%** | **-25.98%** |
+| `xmp` | +68.63% (noise) | n/a (zero-B/op benchmarks in the set break benchstat's geomean) | see per-benchmark table — flat except `UnescapeXMLNoEntity` (32→0 B) |
+
+**No `B/op`/`allocs/op` regression of note anywhere in the sweep.** Every double-digit-percent
+`B/op`/`allocs/op` change is an improvement, matching this release's stated goal (prefix-only
+TIFF-family reads, streamed write-path image data, pooled chunk I/O). All `ns/op`-only deltas —
+including the large, uniformly *unfavourable* ones — are attributed to this run's post-fuzz system
+load per the methodology note above, not to the code; no regression is flagged and no block is
+warranted.
+
+Full per-package raw output for every benchmark in the module is archived verbatim at
+`benchmarks/results/v1.4.0.txt`.

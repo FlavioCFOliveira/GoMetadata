@@ -3,6 +3,8 @@ package orf
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
+	"os"
 	"testing"
 )
 
@@ -405,4 +407,59 @@ func TestORFRawEXIFPreservesOriginalMagic(t *testing.T) {
 				rawEXIF[2], rawEXIF[3])
 		}
 	})
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Benchmarks (task #235: close the cr3/orf/rw2 observability gap)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// BenchmarkORFExtract measures the cost of extracting metadata from a minimal
+// ORF (magic-patched TIFF) byte stream.
+//
+// #236: the reader is constructed once outside the loop and rewound via Seek
+// per iteration so the artificial bytes.Reader allocation does not inflate
+// the allocs/op reported for Extract itself.
+func BenchmarkORFExtract(b *testing.B) {
+	data := buildORF()
+	r := bytes.NewReader(data)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
+	}
+}
+
+// BenchmarkORFInject measures the pass-through Inject path (ORF magic
+// save/patch/restore around the TIFF delegate) on a minimal ORF byte stream.
+func BenchmarkORFInject(b *testing.B) {
+	data := buildORF()
+	r := bytes.NewReader(data)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_, _ = r.Seek(0, io.SeekStart)
+		var out bytes.Buffer
+		_ = Inject(r, &out, nil, nil, nil, true)
+	}
+}
+
+// realORFForBenchmark is a real, multi-megabyte ORF file for
+// BenchmarkORFExtractRealFile, where per-byte costs dominate.
+const realORFForBenchmark = "../../../testdata/corpus/raw/metadata-extractor/Olympus TG-4.orf"
+
+// BenchmarkORFExtractRealFile measures Extract on a real ORF file. Skips when
+// the corpus file is not present (corpus files are downloaded separately).
+func BenchmarkORFExtractRealFile(b *testing.B) {
+	data, err := os.ReadFile(realORFForBenchmark)
+	if err != nil {
+		b.Skipf("corpus file %s not present: %v", realORFForBenchmark, err)
+	}
+	r := bytes.NewReader(data)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
+	}
 }

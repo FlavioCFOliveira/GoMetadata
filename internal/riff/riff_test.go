@@ -44,6 +44,78 @@ func TestReadChunkBasic(t *testing.T) {
 	}
 }
 
+// TestReadChunkHeaderAtBasic verifies that ReadChunkHeaderAt parses FourCC and
+// Size identically to ReadChunk, and sets Offset to the caller-supplied value
+// rather than discovering it via Seek (task #234).
+func TestReadChunkHeaderAtBasic(t *testing.T) {
+	t.Parallel()
+	fourcc := [4]byte{'V', 'P', '8', ' '}
+	const dataSize = 42
+
+	raw := buildChunkHeader(fourcc, dataSize)
+	raw = append(raw, make([]byte, dataSize)...)
+
+	r := bytes.NewReader(raw)
+	var hdr [8]byte
+	// Pass a deliberately distinctive offset (not 8, the value ReadChunkBuf
+	// would have derived via Seek) to prove Offset comes from the parameter,
+	// not from the stream position.
+	const callerOffset = 1000
+	c, err := ReadChunkHeaderAt(r, &hdr, callerOffset)
+	if err != nil {
+		t.Fatalf("ReadChunkHeaderAt: %v", err)
+	}
+	if c.FourCC != fourcc {
+		t.Errorf("FourCC = %v, want %v", c.FourCC, fourcc)
+	}
+	if c.Size != dataSize {
+		t.Errorf("Size = %d, want %d", c.Size, dataSize)
+	}
+	if c.Offset != callerOffset {
+		t.Errorf("Offset = %d, want %d (caller-supplied)", c.Offset, callerOffset)
+	}
+	// The stream must have advanced by exactly 8 bytes (the header) — no Seek
+	// call means the reader's own position tracking is untouched beyond the
+	// plain sequential read.
+	pos, _ := r.Seek(0, io.SeekCurrent)
+	if pos != 8 {
+		t.Errorf("reader position after ReadChunkHeaderAt = %d, want 8", pos)
+	}
+}
+
+// TestReadChunkHeaderAtTruncated verifies that ReadChunkHeaderAt returns an
+// error when fewer than 8 bytes are available, matching ReadChunk's contract.
+func TestReadChunkHeaderAtTruncated(t *testing.T) {
+	t.Parallel()
+	r := bytes.NewReader([]byte{0x52, 0x49, 0x46})
+	var hdr [8]byte
+	if _, err := ReadChunkHeaderAt(r, &hdr, 0); err == nil {
+		t.Fatal("expected error for truncated header, got nil")
+	}
+}
+
+// TestReadChunkHeaderAtNoSeekRequired verifies that ReadChunkHeaderAt works
+// with a plain io.Reader that does not implement io.Seeker at all — proving
+// the function never calls Seek (task #234's core guarantee).
+func TestReadChunkHeaderAtNoSeekRequired(t *testing.T) {
+	t.Parallel()
+	fourcc := [4]byte{'E', 'X', 'I', 'F'}
+	raw := buildChunkHeader(fourcc, 4)
+	raw = append(raw, 0xDE, 0xAD, 0xBE, 0xEF)
+
+	// bytes.Reader implements io.Seeker; wrap it to strip that capability and
+	// confirm ReadChunkHeaderAt still succeeds via plain io.Reader semantics.
+	var plain io.Reader = struct{ io.Reader }{bytes.NewReader(raw)}
+	var hdr [8]byte
+	c, err := ReadChunkHeaderAt(plain, &hdr, 8)
+	if err != nil {
+		t.Fatalf("ReadChunkHeaderAt on non-seekable reader: %v", err)
+	}
+	if c.FourCC != fourcc || c.Size != 4 || c.Offset != 8 {
+		t.Errorf("ReadChunkHeaderAt = %+v, want FourCC=%v Size=4 Offset=8", c, fourcc)
+	}
+}
+
 // TestFourCCString verifies that FourCCString returns the ASCII representation.
 func TestFourCCString(t *testing.T) {
 	t.Parallel()

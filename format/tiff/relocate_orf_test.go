@@ -236,7 +236,10 @@ func TestExtractOlympMakerNoteInfo_OLYMPDetected(t *testing.T) { //nolint:parall
 		e.MakerNoteOffset = mnBlobOff
 	}
 
-	info := extractOlympMakerNoteInfo(base, e, binary.LittleEndian)
+	info, _, err := extractOlympMakerNoteInfo(base, nil, uint64(len(base)), e, binary.LittleEndian)
+	if err != nil {
+		t.Fatalf("extractOlympMakerNoteInfo: unexpected error: %v", err)
+	}
 	if info == nil {
 		t.Fatal("extractOlympMakerNoteInfo: expected non-nil info for OLYMP-type MakerNote")
 	}
@@ -253,7 +256,10 @@ func TestExtractOlympMakerNoteInfo_OLYMPDetected(t *testing.T) { //nolint:parall
 func TestExtractOlympMakerNoteInfo_NilEXIF(t *testing.T) {
 	t.Parallel()
 
-	info := extractOlympMakerNoteInfo(make([]byte, 100), nil, binary.LittleEndian)
+	info, _, err := extractOlympMakerNoteInfo(make([]byte, 100), nil, 100, nil, binary.LittleEndian)
+	if err != nil {
+		t.Fatalf("extractOlympMakerNoteInfo: unexpected error: %v", err)
+	}
 	if info != nil {
 		t.Errorf("nil EXIF: expected nil info, got %+v", info)
 	}
@@ -283,7 +289,10 @@ func TestExtractOlympMakerNoteInfo_NonOLYMPMakerNote(t *testing.T) {
 		}
 	}
 
-	info := extractOlympMakerNoteInfo(base, e, order)
+	info, _, err := extractOlympMakerNoteInfo(base, nil, uint64(len(base)), e, order)
+	if err != nil {
+		t.Fatalf("extractOlympMakerNoteInfo: unexpected error: %v", err)
+	}
 	if info != nil {
 		t.Error("extractOlympMakerNoteInfo: expected nil for Nikon MakerNote")
 	}
@@ -312,7 +321,7 @@ func TestORFRelocateWithOLYMP_OOLBytesPreserved(t *testing.T) { //nolint:paralle
 	wantOOLData := baseTIFF[oolAbsOff : oolAbsOff+8]
 
 	order := binary.LittleEndian
-	out, err := relocateTIFFFromParsedORF(orfBase, nil, nil, nil)
+	out, _, err := relocateTIFFFromParsedORF(orfBase, nil, uint64(len(orfBase)), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("relocateTIFFFromParsedORF: %v", err)
 	}
@@ -378,10 +387,11 @@ func TestORFRelocateWithOLYMP_ThumbBlockIncluded(t *testing.T) { //nolint:parall
 	orfBase[2] = 0x52
 	orfBase[3] = 0x4F // "IIRO"
 
-	out, err := relocateTIFFFromParsedORF(orfBase, nil, nil, nil)
+	header, blocks, err := relocateTIFFFromParsedORF(orfBase, nil, uint64(len(orfBase)), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("relocateTIFFFromParsedORF (thumb): %v", err)
 	}
+	out := assembleRelocated(t, orfBase, header, blocks)
 
 	if !bytes.Contains(out, thumbData) {
 		t.Error("thumbnail data bytes not found in ORF output")
@@ -403,7 +413,7 @@ func TestRelocateTIFFFromParsedORF_InvalidMagic(t *testing.T) {
 	binary.LittleEndian.PutUint16(buf[2:], 0x002A)
 	binary.LittleEndian.PutUint32(buf[4:], 8)
 
-	_, err := relocateTIFFFromParsedORF(buf, nil, nil, nil)
+	_, _, err := relocateTIFFFromParsedORF(buf, nil, uint64(len(buf)), nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for non-ORF magic but got nil")
 	}
@@ -428,7 +438,7 @@ func TestRelocateTIFFFromParsedORF_NewerOlympus(t *testing.T) { //nolint:paralle
 	order.PutUint32(buf[18:], 100)
 	// nextIFD = 0.
 
-	out, err := relocateTIFFFromParsedORF(buf, nil, nil, nil)
+	out, _, err := relocateTIFFFromParsedORF(buf, nil, uint64(len(buf)), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("relocateTIFFFromParsedORF (newer Olympus no-MN): %v", err)
 	}

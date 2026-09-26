@@ -387,7 +387,7 @@ func TestNEFRelocateNikonPreviewIFD(t *testing.T) { //nolint:paralleltest // mod
 
 	// Call the NEF-specific relocator.
 	var out bytes.Buffer
-	if err := InjectWithEXIFNEF(base, e, nil, nil, &out); err != nil {
+	if err := InjectWithEXIFNEFStream(bytes.NewReader(base), base, true, e, nil, nil, &out); err != nil {
 		t.Fatalf("InjectWithEXIFNEF: %v", err)
 	}
 

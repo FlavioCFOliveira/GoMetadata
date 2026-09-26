@@ -3,7 +3,6 @@ package heif
 import (
 	"bytes"
 	"encoding/binary"
-	"io"
 	"testing"
 )
 
@@ -267,10 +266,92 @@ func FuzzHEIFInject(f *testing.F) {
 	// parser. See TestHEIFIlocZeroFieldSizeAmplificationBounded.
 	f.Add(buildIlocZeroFieldAmplification(5, 0xFFFF, 1))
 
+	// Seed: security audit finding HEIF-ILOC-DUPBOX-01 (2026-09-25) — a meta
+	// box carrying two well-formed 'iloc' children. See
+	// buildHEIFDuplicateIloc / TestInjectDuplicateIlocBoxesOffsetInBounds in
+	// heif_test.go for the full writeup.
+	f.Add(buildHEIFDuplicateIloc())
+
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic regardless of input. Inject must return an error or
 		// write valid output — a panic is always a bug in the Inject path.
-		err := Inject(bytes.NewReader(data), io.Discard, rawEXIF, nil, rawXMP, true)
-		_ = err
+		//
+		// Security audit finding HEIF-ILOC-DUPBOX-01 (2026-09-25): the
+		// no-panic contract alone cannot catch a wrong-but-non-crashing iloc
+		// extent offset (buildInjectComponents' size accounting silently
+		// computing an offset that lands past the end of the output). Write
+		// to a buffer (instead of io.Discard) and, on success, assert the
+		// self-consistency invariant that every extent Inject itself
+		// COMPUTED lies within the output's own bounds.
+		var out bytes.Buffer
+		if err := Inject(bytes.NewReader(data), &out, rawEXIF, nil, rawXMP, true); err != nil {
+			return
+		}
+		if bytes.Equal(out.Bytes(), data) {
+			// Pass-through: buildInjectComponents declined to rebuild the
+			// file at all (e.g. no matching item, or — as found while
+			// developing this very invariant — an iloc box whose
+			// offset_size is 0, which buildInjectComponents explicitly
+			// rejects because there is no field width to encode a new
+			// absolute offset into). Whatever the (possibly malformed)
+			// input's iloc box already declared, including for Exif/mime
+			// typed items, is not something Inject computed in this case —
+			// nothing to check.
+			return
+		}
+		assertHEIFExtentsWithinBounds(t, out.Bytes())
 	})
+}
+
+// assertHEIFExtentsWithinBounds parses output's meta/iloc box, if present,
+// and fails t if any Exif- or mime-typed item's recorded extent
+// [offset, offset+length) exceeds len(output). Absence of a meta or iloc
+// box, or of any Exif/mime-typed item, is not a failure: many fuzz inputs
+// have no parseable iloc/iinf structure. The caller must have already
+// excluded the pass-through case (output == input) — see FuzzHEIFInject.
+//
+// Deliberately scoped to Exif/mime-typed items only, not every item the
+// (possibly malformed) input's iloc box happens to declare: a garbage input
+// can legally contain OTHER items (no recognised type, or a type Inject
+// never touches) whose iloc entry the input itself already declared with an
+// out-of-bounds offset — Inject copies those through completely unchanged
+// when it does rebuild the file (non-pending items are never touched by
+// updateIlocItemsInPlace/assignItemOffsets), so an out-of-bounds offset
+// there reflects the INPUT's own malformation, not anything Inject computed.
+// Only Exif/mime-typed items are ones assignItemOffsets ever writes a NEW
+// offset/length for (since rawEXIF/rawXMP are always non-nil in this fuzz
+// target, every such item is unconditionally added to pendingByID) — those
+// are the only extents this invariant can meaningfully attribute to
+// Inject's own size accounting.
+//
+// Regression gate for security audit finding HEIF-ILOC-DUPBOX-01
+// (2026-09-25): buildInjectComponents' arithmetic size accounting must never
+// produce an offset/length pair that a conformant reader would resolve
+// outside the actual file — regardless of how many iloc boxes, items, or
+// extents the (possibly malformed) input happened to declare.
+func assertHEIFExtentsWithinBounds(t *testing.T, output []byte) {
+	t.Helper()
+	metaAbsStart, metaAbsEnd, _, found := findMetaBoxAbs(output)
+	if !found || metaAbsEnd > len(output) || metaAbsStart+metaFullBoxMinSize > metaAbsEnd {
+		return
+	}
+	metaContent := output[metaAbsStart+8+4 : metaAbsEnd]
+	itemTypes := parseIinf(metaContent)
+	ilocInfo, ok := parseIlocFull(metaContent)
+	if !ok {
+		return
+	}
+	for _, item := range ilocInfo.items {
+		typ, hasType := itemTypes[item.id]
+		if !hasType || (typ != itemTypeExif && typ != itemTypeMime) {
+			continue
+		}
+		for _, ext := range item.extents {
+			end := ext.offset + ext.length
+			if end > uint64(len(output)) {
+				t.Fatalf("HEIF-ILOC-DUPBOX-01 class: item %d (type %q) extent [%d,%d) exceeds output length %d",
+					item.id, typ[:], ext.offset, end, len(output))
+			}
+		}
+	}
 }

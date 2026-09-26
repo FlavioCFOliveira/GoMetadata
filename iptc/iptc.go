@@ -37,6 +37,48 @@ type IPTC struct {
 	// completeness can inspect this field. The DoS guard (aggregate byte cap)
 	// is the only condition that terminates parsing entirely.
 	Truncated bool
+
+	// utf8Slot and utf8Val back the single Dataset{Record:0, DataSet:0,
+	// Value:[1]byte{1}} pseudo-dataset that setUTF8Flag stores in Records[0]
+	// (task #206). Records[0] is an exported-field-observable but
+	// internal-only slot (see the Records doc comment above); its shape —
+	// exactly one Dataset with Value == []byte{1} — is part of the existing
+	// observable contract and is preserved exactly. Backing it with fixed-size
+	// arrays embedded directly in *IPTC means setting the flag costs zero
+	// additional heap allocations: both arrays are already part of whatever
+	// single allocation produced this *IPTC (e.g. Parse's new(IPTC)), instead
+	// of the former []byte{1} literal + append-triggered growslice (2 allocs).
+	//
+	// Not exported, not touched anywhere except setUTF8Flag. If a Clone/copy
+	// of *IPTC is ever added, it MUST re-point the clone's Records[0] at the
+	// clone's own utf8Slot/utf8Val arrays (via the clone calling setUTF8Flag
+	// again, or an equivalent re-slice) rather than copying the Records[0]
+	// slice header verbatim — copying the struct by value copies these arrays'
+	// contents but a previously-computed Records[0] slice header would still
+	// alias the ORIGINAL's memory. No such Clone/copy-by-value path exists
+	// anywhere in this module today (verified by repository-wide grep).
+	utf8Slot [1]Dataset
+	utf8Val  [1]byte
+}
+
+// setUTF8Flag marks i as UTF-8-declared by pointing i.Records[0] at the
+// fixed-size utf8Slot/utf8Val arrays embedded in i. This reproduces, byte for
+// byte, the pseudo-dataset shape that Parse and setUTF8IfNeeded have always
+// produced — exactly one Dataset{Record: 0, DataSet: 0, Value: []byte{1}} —
+// without allocating a new byte slice or a new Records[0] backing array
+// (task #206).
+//
+// The [:1:1] full slice expressions clamp cap to len (matching the cap==1
+// that a single-element append into a nil slice already produced under the
+// former implementation) so that if an external caller appends to the
+// exported Records[0] slice, the append always reallocates into a fresh
+// backing array instead of writing into memory owned by i's own struct.
+// Idempotent: calling it again re-derives the identical slice header from
+// the same underlying arrays.
+func (i *IPTC) setUTF8Flag() {
+	i.utf8Val[0] = 1
+	i.utf8Slot[0] = Dataset{Record: 0, DataSet: 0, Value: i.utf8Val[:1:1]}
+	i.Records[0] = i.utf8Slot[:1:1]
 }
 
 // Dataset is a single IPTC record:dataset value (IIM §1.6).
@@ -165,6 +207,78 @@ const maxIPTCDatasets = 65536
 // multi-gigabyte Dataset.Value. Production code must never mutate it.
 var maxDatasetValueLen uint64 = math.MaxUint32 //nolint:gochecknoglobals // test-overridable cap; never mutated in production paths
 
+// preCountDatasets performs an allocation-free scan of b that mirrors the
+// skip/recovery semantics of Parse's main loop and storeDataset exactly:
+// standard and extended dataset-length decoding, malformed-length recovery,
+// the per-dataset and aggregate DoS guards (1 MiB single-value cap,
+// maxIPTCTotalBytes, maxIPTCDatasets), and the non-storing skips for the 1:90
+// UTF-8 declaration and the 1:00/2:00 record-version markers. It counts, per
+// record, how many Dataset structs Parse will actually store there.
+//
+// The result lets Parse pre-size each i.Records[record] slice to its exact
+// final capacity in a single allocation instead of growing it via repeated
+// append (task #241).
+//
+// Invariant: counts[record] is always >= the number of Dataset values Parse
+// will store in that record for the same input b (over-counting is
+// impossible here because every skip/cap this function applies is identical
+// to, and reached at the same point as, Parse's own loop; under-counting
+// must never happen — this is enforced by FuzzParseIPTC).
+func preCountDatasets(b []byte) (counts [10]int) { //nolint:gocyclo,cyclop // mirrors Parse's scanner branch-for-branch by design; see doc comment
+	pos := 0
+	totalBytes := 0
+	datasetCount := 0
+
+	for pos < len(b) {
+		if b[pos] != 0x1C {
+			pos++
+			continue
+		}
+		if pos+5 > len(b) {
+			break
+		}
+
+		// Bounds guaranteed by the pos+5 guard above (IIM §1.6); unlike the
+		// equivalent reads in Parse's main loop, gosec's G602 does not flag
+		// these (different surrounding code shape), so no nolint is needed.
+		record := b[pos+1]
+		dataset := b[pos+2]
+
+		length, newPos, ok := decodeDatasetLength(b, pos)
+		if !ok {
+			pos++
+			continue
+		}
+		if length > 1<<20 || newPos+length > len(b) {
+			pos = newPos
+			continue
+		}
+
+		totalBytes += length
+		if totalBytes > maxIPTCTotalBytes {
+			break
+		}
+		pos = newPos + length
+
+		// Mirror storeDataset's non-storing skips exactly (see its doc comment).
+		if record < 1 || int(record) >= len(counts) {
+			continue
+		}
+		if record == 1 && dataset == 90 {
+			continue
+		}
+		if dataset == 0 && (record == 1 || record == 2) {
+			continue
+		}
+		datasetCount++
+		if datasetCount > maxIPTCDatasets {
+			break
+		}
+		counts[record]++
+	}
+	return counts
+}
+
 // Parse parses a raw IPTC IIM byte stream.
 // b must begin with (or contain) the IPTC tag marker 0x1C (IIM §1.6).
 //
@@ -179,9 +293,19 @@ var maxDatasetValueLen uint64 = math.MaxUint32 //nolint:gochecknoglobals // test
 // Callers that need to detect partial skips should inspect IPTC.Truncated.
 func Parse(b []byte) (*IPTC, error) { //nolint:gocyclo // IIM scanner has inherent branching (tag-marker scan, standard/extended length, per-dataset guards, aggregate cap); the post-parse decode pass adds one loop but extracting it reduces cohesion without reducing real complexity
 	i := new(IPTC)
-	// Pre-allocate record 2 (Application Record) — the most common record,
-	// typically containing 5–15 datasets in a production JPEG (IIM §2).
-	i.Records[2] = make([]Dataset, 0, 12)
+	// Task #241: pre-size every record's slice to its exact final capacity in
+	// one allocation, replacing the former fixed guess of 12 for record 2
+	// (Application Record — the most common record, typically containing
+	// 5-15 datasets in a production JPEG, IIM §2) and no pre-sizing at all
+	// for the other eight. preCountDatasets performs a byte-only scan (no
+	// Dataset structs, no appends) that mirrors this loop's own skip/recovery
+	// semantics, so the counts it returns are a safe, exact upper bound.
+	counts := preCountDatasets(b)
+	for rec := 1; rec < len(i.Records); rec++ {
+		if counts[rec] > 0 {
+			i.Records[rec] = make([]Dataset, 0, counts[rec])
+		}
+	}
 	utf8 := false
 	totalBytes := 0
 	datasetCount := 0 // tracks total Dataset structs stored; capped at maxIPTCDatasets (task #71)
@@ -253,9 +377,11 @@ func Parse(b []byte) (*IPTC, error) { //nolint:gocyclo // IIM scanner has inhere
 	}
 
 	// Store the UTF-8 flag as a pseudo-dataset in record 0 so convenience
-	// methods can retrieve it without re-scanning record 1.
+	// methods can retrieve it without re-scanning record 1. setUTF8Flag
+	// (task #206) reuses fixed-size storage embedded in i, so this costs zero
+	// additional heap allocations.
 	if utf8 {
-		i.Records[0] = append(i.Records[0], Dataset{Record: 0, DataSet: 0, Value: []byte{1}})
+		i.setUTF8Flag()
 	}
 
 	// Task #60: eager pre-decode pass. Now that the full stream has been scanned
@@ -305,6 +431,30 @@ func (i *IPTC) needsUTF8Declaration() bool {
 // The result is always a fresh bytes.Clone of the buffer contents, so the
 // returned slice is safe to use after the buffer is returned to the pool.
 var encBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }} //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
+
+// encBufMaxCap is the largest bytes.Buffer capacity that putEncBuf will
+// return to encBufPool. Mirrors the discard threshold in internal/iobuf.Put
+// (largeSize = 65536): retaining an oversized buffer would let a single
+// large Encode call permanently enlarge every buffer handed out by the pool
+// thereafter, defeating the memory-budget goal of pooling in the first place
+// (task #207).
+const encBufMaxCap = 65536
+
+// putEncBuf returns buf to encBufPool unless its capacity has grown beyond
+// encBufMaxCap, in which case it is left for the garbage collector instead.
+func putEncBuf(buf *bytes.Buffer) {
+	if buf.Cap() > encBufMaxCap {
+		return
+	}
+	encBufPool.Put(buf)
+}
+
+// compareDataSetNum orders two Dataset values by ascending DataSet number
+// (IIM §2.2 SHOULD). Shared by the already-sorted check and the fallback sort
+// in Encode below so both use byte-identical comparison semantics.
+func compareDataSetNum(a, b Dataset) int {
+	return int(a.DataSet) - int(b.DataSet)
+}
 
 // Encode serialises i back to an IPTC IIM byte stream.
 //
@@ -373,16 +523,29 @@ func Encode(i *IPTC) ([]byte, error) { //nolint:gocyclo,cyclop // complexity is 
 		}
 
 		// #146 fix: IIM §2.2 SHOULD — datasets within a record should be emitted
-		// in ascending DataSet-number order. Sort a local copy so that the receiver
-		// is never mutated (FINDING-002 constraint: Encode must be side-effect-free).
-		// slices.SortStableFunc preserves the relative order of equal DataSet numbers
-		// (important for repeatable datasets like 2:25 Keywords, 2:80 By-line).
-		// IPTC-NAA IIM 4.2 §2.2: the Application Record datasets shall be ordered
-		// by dataset number within the record (SHOULD).
-		sorted := slices.Clone(datasets) // clone is intentional: must not mutate receiver (FINDING-002)
-		slices.SortStableFunc(sorted, func(a, b Dataset) int {
-			return int(a.DataSet) - int(b.DataSet)
-		})
+		// in ascending DataSet-number order. IPTC-NAA IIM 4.2 §2.2: the
+		// Application Record datasets shall be ordered by dataset number
+		// within the record (SHOULD).
+		//
+		// #207: skip the defensive clone + stable sort when datasets is
+		// already in ascending DataSet order — the common case for an *IPTC
+		// produced by Parse (which stores datasets in wire order, and
+		// well-formed writers append in ascending order already).
+		// slices.IsSortedFunc treats a run of equal keys as sorted, which
+		// matches slices.SortStableFunc's own equal-key behaviour (a stable
+		// sort is a no-op reorder for ties), so iterating datasets read-only
+		// in that case is byte-identical to cloning and sorting it — this
+		// matters for repeatable datasets like 2:25 Keywords and 2:80
+		// By-line, whose relative order must be preserved.
+		//
+		// When datasets is NOT already sorted, the clone is still mandatory:
+		// SortStableFunc reorders in place, and Encode must never mutate the
+		// receiver (FINDING-002 constraint: Encode must be side-effect-free).
+		sorted := datasets
+		if !slices.IsSortedFunc(datasets, compareDataSetNum) {
+			sorted = slices.Clone(datasets) // clone is intentional: must not mutate receiver (FINDING-002)
+			slices.SortStableFunc(sorted, compareDataSetNum)
+		}
 
 		// IIM-REC-02 / IIM §2.2.1: when Record 2 is present, 2:00
 		// ApplicationRecordVersion MUST be the first dataset, value = uint16 BE 4.
@@ -420,7 +583,7 @@ func Encode(i *IPTC) ([]byte, error) { //nolint:gocyclo,cyclop // complexity is 
 			// its actual content (corrupt output; a reader desynchronises on
 			// the next dataset marker).
 			if uint64(n) > maxDatasetValueLen {
-				encBufPool.Put(buf)
+				putEncBuf(buf)
 				return nil, ErrDatasetValueTooLarge
 			}
 			buf.WriteByte(0x1C)
@@ -447,7 +610,7 @@ func Encode(i *IPTC) ([]byte, error) { //nolint:gocyclo,cyclop // complexity is 
 		}
 	}
 	result := bytes.Clone(buf.Bytes())
-	encBufPool.Put(buf)
+	putEncBuf(buf)
 	return result, nil
 }
 
@@ -679,7 +842,7 @@ func (i *IPTC) AddKeyword(kw string) {
 // need to be concurrent-safe (task #60 addresses that separately).
 func (i *IPTC) setUTF8IfNeeded(v []byte) {
 	if hasHighBytes(v) && !i.isUTF8() {
-		i.Records[0] = append(i.Records[0][:0], Dataset{Record: 0, DataSet: 0, Value: []byte{1}})
+		i.setUTF8Flag()
 	}
 }
 

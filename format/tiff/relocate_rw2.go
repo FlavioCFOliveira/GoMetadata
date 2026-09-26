@@ -133,24 +133,34 @@ func isRW2Magic(b []byte) bool {
 //
 // This separation (internal relocator + thin tiff.go wrapper) matches the
 // InjectWithEXIFNEF / InjectWithEXIFARW pattern.
-func relocateTIFFAsRW2(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte) ([]byte, error) {
-	// Make a working copy so we can mutate bytes [2:4] in-place without
-	// touching the caller's buffer (rawEXIF may be shared).
-	workBytes := make([]byte, len(originalBytes))
-	copy(workBytes, originalBytes)
-	return relocateTIFFFromParsedRW2(workBytes, modifiedEXIF, rawIPTC, rawXMP)
+//
+// #285/#286: relocateTIFFFromParsedRW2 no longer mutates originalBytes (it
+// used to patch bytes[2:4] to standard TIFF magic in place, via
+// exif.AcceptRAWMagic instead — see that function's doc comment), so the
+// defensive working copy this function used to make is no longer needed.
+func relocateTIFFAsRW2(originalBytes []byte, fileLen uint64, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte) (header []byte, blocks []*imageBlock, err error) {
+	return relocateTIFFFromParsedRW2(originalBytes, fileLen, modifiedEXIF, rawIPTC, rawXMP)
 }
 
 // relocateTIFFFromParsedRW2 is the RW2-specific TIFF copy-and-relocate implementation.
 //
 // base must carry valid RW2 magic at bytes [0:4] (isRW2Magic must be true).
-// base is mutated in-place (bytes [2:4] are patched to 0x2A 0x00 for parsing).
-// Callers must pass a writable copy.
+// base is never mutated.
+//
+// #291 follow-up: fileLen is the TRUE total length of the original source —
+// NOT necessarily len(base), which may be only a metadata PREFIX (#289/#293).
+// RW2's RawDataOffset (0x0118) convention means the raw sensor block extends
+// from its declared offset to EOF, a size only ever computable from fileLen
+// (see extractRW2RawDataBlock's own doc comment) — this was true even when
+// base always happened to be the whole file; fileLen simply makes it correct
+// unconditionally. Everything else RW2-specific (the 16-byte GUID at bytes
+// [8:24], the RW2 magic check) lives in the file's own header, always within
+// reach of a metadata prefix.
 //
 //nolint:cyclop,gocyclo,funlen // RW2-specific algorithm requires GUID handling, standalone block, and IFD patching; inherent complexity
-func relocateTIFFFromParsedRW2(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte) ([]byte, error) {
+func relocateTIFFFromParsedRW2(base []byte, fileLen uint64, e *exif.EXIF, rawIPTC, rawXMP []byte) (header []byte, blocks []*imageBlock, err error) {
 	if !isRW2Magic(base) {
-		return nil, fmt.Errorf("rw2: %w", ErrRW2InvalidMagic)
+		return nil, nil, fmt.Errorf("rw2: %w", ErrRW2InvalidMagic)
 	}
 
 	// ── Step A1: save 16-byte GUID ───────────────────────────────────────────
@@ -159,23 +169,22 @@ func relocateTIFFFromParsedRW2(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 	//
 	// ExifTool Panasonic.pm: GUID = 16-byte device identifier at file offset 8.
 	if len(base) < rw2GUIDOffset+rw2GUIDLen {
-		return nil, fmt.Errorf("rw2: %w (%d bytes)", ErrRW2OutputTooShort, len(base))
+		return nil, nil, fmt.Errorf("rw2: %w (%d bytes)", ErrRW2OutputTooShort, len(base))
 	}
 	var guid [rw2GUIDLen]byte
 	copy(guid[:], base[rw2GUIDOffset:rw2GUIDOffset+rw2GUIDLen])
 
-	// ── Step A2: patch bytes [2:4] to standard TIFF magic ────────────────────
-	// TIFF 6.0 §2: magic must be 0x002A for classic TIFF. exif.Parse requires
-	// this.  The IFD0 offset at bytes [4:8] = 24 is a valid TIFF offset value.
-	base[2] = 0x2A
-	base[3] = 0x00
-
-	// Parse the magic-patched base when no pre-parsed struct is provided.
+	// Parse base directly when no pre-parsed struct is provided. RW2 is always
+	// little-endian (isRW2Magic already confirmed bytes[0:4] == "IIU\x00"); the
+	// magic value at bytes[2:4] is passed to exif.AcceptRAWMagic so Parse
+	// dispatches it through the classic-TIFF path without requiring base's
+	// magic to already be 0x2A 0x00 (#285/#286: base is never mutated, so the
+	// caller no longer needs to pass a defensive working copy).
 	if e == nil {
 		var parseErr error
-		e, parseErr = exif.Parse(base)
+		e, parseErr = exif.Parse(base, exif.AcceptRAWMagic(binary.LittleEndian.Uint16(base[2:4])))
 		if parseErr != nil {
-			return nil, fmt.Errorf("rw2: parse for relocation: %w", parseErr)
+			return nil, nil, fmt.Errorf("rw2: parse for relocation: %w", parseErr)
 		}
 	}
 
@@ -211,15 +220,15 @@ func relocateTIFFFromParsedRW2(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 	// tag 0x0118 is TypeLong Count=1 inline; its VALUE is the absolute file offset
 	// of the raw sensor data (extends to EOF).  Register as a standalone block
 	// (ifdPtr=nil) so assignNewOffsets assigns it a new absolute position.
-	rawDataBlock := extractRW2RawDataBlock(base, e.IFD0, order)
+	rawDataBlock := extractRW2RawDataBlock(e.IFD0, order, fileLen)
 
 	// ── Step 3: enumerate image blocks from the main IFD chain ───────────────
 	// GM-W1: budget is shared with the SubIFD enumeration below so the
 	// cumulative image-block + SubIFD count for this write is bounded.
 	budget := newImageBlockBudget()
-	mainIFDBlocks, err := enumerateImageBlocks(base, e, order, false, budget)
+	mainIFDBlocks, err := enumerateImageBlocks(e, order, false, budget, fileLen)
 	if err != nil {
-		return nil, fmt.Errorf("rw2: enumerate image blocks: %w", err)
+		return nil, nil, fmt.Errorf("rw2: enumerate image blocks: %w", err)
 	}
 
 	// Collect all blocks: main IFD + raw sensor data standalone.
@@ -230,9 +239,9 @@ func relocateTIFFFromParsedRW2(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 	}
 
 	// ── Step 4: enumerate SubIFDs ────────────────────────────────────────────
-	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget)
+	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget, fileLen)
 	if subErr != nil {
-		return nil, fmt.Errorf("rw2: enumerate SubIFDs: %w", subErr)
+		return nil, nil, fmt.Errorf("rw2: enumerate SubIFDs: %w", subErr)
 	}
 	allBlocks = append(allBlocks, subBlocks...)
 
@@ -241,14 +250,17 @@ func relocateTIFFFromParsedRW2(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 	mainBlocks = filterNonNilIFDBlocks(mainBlocks) // exclude rawDataBlock (ifdPtr=nil)
 	removeImageOffsetEntries(mainBlocks)
 
-	// ── Step 6: insert placeholders and encode to learn the IFD size ─────────
+	// ── Step 6: insert placeholders and learn the exact IFD structure size ───
+	// #285: exif.EncodedSize replays exif.Encode's own layout arithmetic, so
+	// it agrees byte-for-byte with the length Encode would produce, without
+	// paying for a full encode.
 	offsetValueSlices := insertPlaceholders(mainBlocks)
 
-	skeleton, skelErr := exif.Encode(e)
+	ifdEndInt, skelErr := exif.EncodedSize(e)
 	if skelErr != nil {
-		return nil, fmt.Errorf("rw2: encode placeholder: %w", skelErr)
+		return nil, nil, fmt.Errorf("rw2: encode placeholder: %w", skelErr)
 	}
-	ifdEnd := uint64(len(skeleton))
+	ifdEnd := uint64(ifdEndInt) //nolint:gosec // G115: EncodedSize never returns a negative length
 
 	// ── Step 7: assign new absolute offsets ──────────────────────────────────
 	subIFDsSize := computeSubIFDsSize(subIFDs)
@@ -257,20 +269,33 @@ func relocateTIFFFromParsedRW2(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 	assignSubIFDOffsets(subIFDs, ifdEnd)
 
 	if rawDataBlock != nil && rawDataBlock.newOffset == math.MaxUint32 {
-		return nil, fmt.Errorf("rw2: %w", ErrRW2RawDataOffsetOverflow)
+		return nil, nil, fmt.Errorf("rw2: %w", ErrRW2RawDataOffsetOverflow)
 	}
 
 	// ── Step 8a: update placeholder value bytes ───────────────────────────────
 	updatePlaceholders(mainBlocks, offsetValueSlices, order)
 
 	// ── Step 8b: patch SubIFD raw bytes ──────────────────────────────────────
-	patchSubIFDImageOffsets(subIFDs, allBlocks, false, order)
+	patchSubIFDImageOffsets(subIFDs, false, order)
 
 	// ── Step 9: re-encode → finalTIFF ────────────────────────────────────────
-	// exif.Encode produces: "II" + 0x2A 0x00 + IFD0_off=8 + IFD block.
-	finalTIFF, finalErr := exif.Encode(e)
+	// exif.EncodeInto produces: "II" + 0x2A 0x00 + IFD0_off=8 + IFD block,
+	// written directly into a buffer pre-sized for the IFD structure + SubIFD
+	// blocks (task #291: no longer image blocks — see step 12's own comment
+	// below), so step 11 never regrows it (#285).
+	//
+	// rw2GUIDLen extra bytes of SPARE CAPACITY (not length) are reserved here
+	// too: insertRW2GUIDAndShiftOffsets (Step B2 below) needs to shift every
+	// byte from offset rw2GUIDOffset onward right by rw2GUIDLen to make room
+	// for the device GUID, and does so with an in-place, overlap-safe copy()
+	// within finalTIFF's own backing array when this spare capacity is
+	// present — avoiding a second whole-file-sized allocation on every RW2
+	// write (mirrors the identical CR2 marker-insertion optimisation in
+	// relocate.go/tiff.go).
+	headerLen := relocatedLen(ifdEnd, subIFDs)
+	finalTIFF, finalErr := exif.EncodeInto(make([]byte, 0, finalCap(headerLen)+rw2GUIDLen), e)
 	if finalErr != nil {
-		return nil, fmt.Errorf("rw2: encode final: %w", finalErr)
+		return nil, nil, fmt.Errorf("rw2: encode final: %w", finalErr)
 	}
 
 	// ── Step B1: patch 0x0118 inline val_or_off in finalTIFF ─────────────────
@@ -283,14 +308,14 @@ func relocateTIFFFromParsedRW2(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 	// overwrite it here before GUID insertion.  The GUID insertion step adds +16.
 	if rawDataBlock != nil {
 		if err := patchRW2RawDataOffsetInFinalTIFF(finalTIFF, rawDataBlock, order); err != nil {
-			return nil, fmt.Errorf("rw2: patch RawDataOffset in finalTIFF: %w", err)
+			return nil, nil, fmt.Errorf("rw2: patch RawDataOffset in finalTIFF: %w", err)
 		}
 	}
 
 	// ── Step 10: patch the 0x014A SubIFDs pointer array ──────────────────────
 	if len(subIFDs) > 0 {
 		if pErr := patchSubIFDPointers(finalTIFF, subIFDs, false, order); pErr != nil {
-			return nil, fmt.Errorf("rw2: patch SubIFD pointers: %w", pErr)
+			return nil, nil, fmt.Errorf("rw2: patch SubIFD pointers: %w", pErr)
 		}
 	}
 
@@ -302,18 +327,27 @@ func relocateTIFFFromParsedRW2(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 		finalTIFF = append(finalTIFF, si.rawBytes...)
 	}
 
-	// ── Step 12: append image block bytes from source ─────────────────────────
-	for _, blk := range allBlocks {
-		end := blk.srcOffset + blk.size
-		if end > uint64(len(base)) {
-			return nil, fmt.Errorf("rw2: image block offset=%d size=%d: %w",
-				blk.srcOffset, blk.size, ErrBlockOutOfBounds)
-		}
-		finalTIFF = append(finalTIFF, base[blk.srcOffset:end]...)
+	// #291: step 12 (append image block bytes) is no longer performed here —
+	// allBlocks (main IFD blocks + rawDataBlock) is returned to the caller,
+	// which streams each block's bytes from the original source. finalTIFF is
+	// now the complete HEADER.
+	if uint64(len(finalTIFF)) != headerLen {
+		return nil, nil, fmt.Errorf("rw2: relocated header length %d, computed %d: %w", len(finalTIFF), headerLen, errRelocateLayout)
 	}
 
 	// ── Step B2-B6: insert GUID, update header, shift offsets, restore magic ──
-	return insertRW2GUIDAndShiftOffsets(finalTIFF, guid, rawDataBlock, order)
+	// #291: insertRW2GUIDAndShiftOffsets only ever rewrites offset VALUES
+	// stored within finalTIFF's own IFD entries (including the 0x0118
+	// RawDataOffset inline field — Step B5); it never reads or writes a byte
+	// beyond the header it is given, so operating on the HEADER alone (blocks
+	// excluded — see this function's own doc comment) reproduces exactly the
+	// same header bytes as operating on the old combined header+blocks buffer
+	// used to.
+	finalHeader, guidErr := insertRW2GUIDAndShiftOffsets(finalTIFF, guid, rawDataBlock, order)
+	if guidErr != nil {
+		return nil, nil, guidErr
+	}
+	return finalHeader, allBlocks, nil
 }
 
 // removeRW2SentinelStrips removes the sentinel StripOffsets/StripByteCounts from
@@ -345,22 +379,33 @@ func removeRW2SentinelStrips(ifd0 *exif.IFD, order binary.ByteOrder) {
 // Tag 0x0118 is TypeLong Count=1 inline; its value is the absolute file offset
 // to the raw sensor data.  The raw data extends from this offset to EOF.
 //
+// #291 follow-up: sized against fileLen (the TRUE total source length), not
+// len(base) — base may be only a metadata prefix, and RawDataOffset's own
+// "extends to EOF" convention means its size can ONLY ever be computed from
+// the true file length in the first place (this was not actually a
+// prefix-vs-whole-file distinction: len(base) was simply the wrong value to
+// use here even when base happened to already be the whole file, since a
+// coincidentally-correct answer is not the same as a correct computation).
+// The returned block streams via the shared imageBlock/writeRelocated
+// mechanism exactly like a StripOffsets block — RW2's raw sensor data was
+// already never buffered in memory beyond that.
+//
 // Returns nil when the 0x0118 entry is absent or its offset is 0.
 // The val_or_off position within base is not returned; patching uses IFD scan
 // (patchRW2RawDataOffsetInFinalTIFF).
-func extractRW2RawDataBlock(base []byte, ifd0 *exif.IFD, order binary.ByteOrder) *imageBlock {
+func extractRW2RawDataBlock(ifd0 *exif.IFD, order binary.ByteOrder, fileLen uint64) *imageBlock {
 	rawEntry := ifd0.Get(rw2TagRawDataOffset)
 	if rawEntry == nil || len(rawEntry.Value) < 4 {
 		return nil
 	}
 	rawOff := order.Uint32(rawEntry.Value[:4])
-	if rawOff == 0 || uint64(rawOff) >= uint64(len(base)) {
+	if rawOff == 0 || uint64(rawOff) >= fileLen {
 		return nil
 	}
-	rawSize := uint32(len(base)) - rawOff //nolint:gosec // G115: len(base) < 2^32
+	rawSize := fileLen - uint64(rawOff)
 	return &imageBlock{
 		srcOffset: uint64(rawOff),
-		size:      uint64(rawSize),
+		size:      rawSize,
 		ifdPtr:    nil, // standalone (not owned by any exif.IFD entry)
 		entryTag:  rw2TagRawDataOffset,
 		index:     0,
@@ -461,10 +506,29 @@ func insertRW2GUIDAndShiftOffsets(
 	//   [0:8]   RW2 header slot (rewritten below)
 	//   [8:24]  16-byte GUID
 	//   [24:]   IFD block + image data (all absolute offsets += 16)
-	out := make([]byte, len(finalTIFF)+rw2GUIDLen)
-	copy(out[0:8], finalTIFF[0:8])                             // copy original 8-byte header slot
-	copy(out[rw2GUIDOffset:rw2GUIDOffset+rw2GUIDLen], guid[:]) // insert GUID
-	copy(out[rw2GUIDOffset+rw2GUIDLen:], finalTIFF[8:])        // copy rest
+	//
+	// #285: relocateTIFFFromParsedRW2 reserves rw2GUIDLen extra bytes of
+	// spare CAPACITY in finalTIFF specifically for this insertion. When
+	// present, the GUID is inserted IN PLACE: finalTIFF is extended into its
+	// own spare capacity and bytes [rw2GUIDOffset:] are shifted right by
+	// rw2GUIDLen with a single overlap-safe copy() (Go's copy() is
+	// memmove-based and explicitly documented to support overlapping
+	// source/destination), eliminating the second whole-file-sized
+	// allocation this function used to require on every RW2 write. Bytes
+	// [0:rw2GUIDOffset] are already correct after the reslice (out shares
+	// finalTIFF's backing array and starting offset) and are left untouched
+	// by both copies below.
+	var out []byte
+	if cap(finalTIFF) >= len(finalTIFF)+rw2GUIDLen {
+		out = finalTIFF[:len(finalTIFF)+rw2GUIDLen]
+		copy(out[rw2GUIDOffset+rw2GUIDLen:], finalTIFF[rw2GUIDOffset:]) // shift IFD block + image data right by rw2GUIDLen
+		copy(out[rw2GUIDOffset:rw2GUIDOffset+rw2GUIDLen], guid[:])      // insert GUID into the vacated gap
+	} else {
+		out = make([]byte, len(finalTIFF)+rw2GUIDLen)
+		copy(out[0:8], finalTIFF[0:8])                             // copy original 8-byte header slot
+		copy(out[rw2GUIDOffset:rw2GUIDOffset+rw2GUIDLen], guid[:]) // insert GUID
+		copy(out[rw2GUIDOffset+rw2GUIDLen:], finalTIFF[8:])        // copy rest
+	}
 
 	// ── Step B3: update IFD0 offset in header to 24 ──────────────────────────
 	// exif.Encode wrote IFD0 at offset 8.  After inserting 16 bytes, IFD0 is now

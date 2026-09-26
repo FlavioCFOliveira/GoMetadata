@@ -3,6 +3,7 @@ package arw
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"testing"
 )
 
@@ -82,9 +83,14 @@ func TestInjectError(t *testing.T) {
 // TIFF/ARW byte stream.
 func BenchmarkARWExtract(b *testing.B) {
 	data := minimalTIFF()
+	// #236: reader constructed once outside the loop and rewound via Seek per
+	// iteration so the artificial bytes.Reader allocation does not inflate
+	// the allocs/op reported for Extract itself.
+	r := bytes.NewReader(data)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		_, _, _, _ = Extract(bytes.NewReader(data))
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
 	}
 }

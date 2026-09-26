@@ -94,6 +94,30 @@ type Metadata struct {
 	rawIPTC []byte
 	rawXMP  []byte
 
+	// rawEXIFIsWholeFile is true when rawEXIF, as extracted by Read, happens
+	// to equal the ENTIRE source file rather than just a metadata prefix.
+	// It is only ever set for the seven TIFF-family formats where the TIFF
+	// byte stream is itself the EXIF container (TIFF, CR2, NEF, ARW, DNG,
+	// ORF, RW2 — ORF/RW2 added by #293, which routed them through the same
+	// scanner TIFF/CR2/NEF/ARW/DNG already used): format/tiff.Extract's
+	// metadata-prefix scanner (#289) can converge on reading the whole file
+	// for some inputs (a small file below its own whole-read threshold, or
+	// one whose declared metadata legitimately spans a large fraction of
+	// it), in which case rawEXIF is exactly as complete as a pre-#289/#293
+	// whole-file read would have been. Computed once, cheaply, by comparing
+	// len(rawEXIF) against the source's actual size (see
+	// tiffFamilyRawEXIFIsWholeFile in read.go) — never assumed.
+	//
+	// Write's copy-and-relocate path (writeTIFF/writeTIFFCR2/writeTIFFARW/
+	// writeTIFFNEF/writeTIFFORF/writeTIFFRW2) checks this flag to decide
+	// whether it can reuse rawEXIF directly as its relocation base instead
+	// of re-reading the full source from r: reusing is exactly as safe as
+	// it was before #289/#293 removed the
+	// general-case fast path, since no relocator ever mutates its base
+	// buffer (see Batch E's finding recorded in project agent memory) —
+	// false only means "re-read to be safe", never "this write is unsafe".
+	rawEXIFIsWholeFile bool
+
 	// rawIPTCDigest is the 16-byte MD5 value stored in Photoshop resource
 	// 0x0425 ("IPTC Digest") inside the APP13 IRB, or nil when absent.
 	// MWG Guidelines v2.0 §3.3.1: the digest is used at read time to determine
@@ -117,6 +141,24 @@ type Metadata struct {
 	// in that case encodeMetadata re-encodes from the struct and the extended
 	// split path uses a freshly generated GUID.
 	rawXMPWire []byte
+
+	// iptcTrustElev caches the result of computeIPTCTrustElevated(rawIPTC,
+	// rawIPTCDigest), computed once by Read (see read.go) immediately after
+	// rawIPTC and rawIPTCDigest are known. iptcTrustElevated() below reads
+	// this field directly instead of recomputing an MD5 digest of rawIPTC on
+	// every call (task #208).
+	//
+	// Correctness: rawIPTC and rawIPTCDigest are set exactly once, at
+	// construction (either by Read's struct literal or left at their nil zero
+	// value by NewMetadata / a caller-built literal), and are never
+	// reassigned afterward — grep confirms the only production write sites
+	// are the Read() struct literal. Set* methods mutate m.IPTC (the parsed
+	// *iptc.IPTC), never m.rawIPTC, so the cached decision remains valid for
+	// the entire lifetime of a *Metadata. For any *Metadata not constructed
+	// via Read (NewMetadata, or a struct literal in tests), rawIPTCDigest is
+	// nil and iptcTrustElev correctly keeps its zero value (false), matching
+	// computeIPTCTrustElevated's own nil-digest fast path exactly.
+	iptcTrustElev bool
 }
 
 // Format returns the detected container format ID of the image.
@@ -124,11 +166,33 @@ func (m *Metadata) Format() format.FormatID { return format.FormatID(m.format) }
 
 // RawEXIF returns a copy of the raw EXIF segment bytes as read from the container.
 //
+// For TIFF, CR2, NEF, ARW, DNG, ORF, and RW2 — formats where the TIFF byte
+// stream is itself the EXIF container — RawEXIF returns only the METADATA
+// PREFIX of that stream (#289 for TIFF/CR2/NEF/ARW/DNG; #293 for ORF/RW2):
+// every IFD in IFD0's next-IFD chain, ExifIFD, GPSIFD, InteropIFD, and
+// SubIFDs, and every out-of-line tag value within them (including MakerNote
+// blobs, and the IPTC/XMP tag payloads RawIPTC/RawXMP also read from) — not
+// strip/tile image-data blocks or embedded thumbnails/previews. This is a
+// byte-for-byte prefix of the original file starting at offset 0, sized to
+// whatever the file's own metadata occupies (typically a small fraction of
+// a percent of real-world files); it is sufficient to reconstruct every
+// field exif.Parse would report from the whole file, but it is NOT the
+// whole file. A caller that needs the original bytes verbatim — for example
+// to re-embed a thumbnail this package never reads — must keep its own copy
+// of the source rather than relying on RawEXIF.
+//
+// For every other supported format (JPEG, PNG, WebP, HEIF/AVIF, CR3),
+// RawEXIF already returned just the EXIF segment/box/chunk rather than the
+// whole file, so this changes nothing for those formats.
+//
 // #139: returns bytes.Clone(m.rawEXIF) so that caller mutations of the returned
 // slice cannot corrupt the internal relocation base used by subsequent Write calls.
 // The raw EXIF bytes in TIFF-based formats share their backing array with every
 // parsed IFDEntry.Value; an in-place mutation by the caller would silently corrupt
-// all parsed EXIF values AND the image-data source used during write relocation.
+// all parsed EXIF values and, for any of these seven formats whose extent scan
+// happened to read the whole file for this particular input (see
+// rawEXIFIsWholeFile's own doc comment), the image-data source used during write
+// relocation too.
 func (m *Metadata) RawEXIF() []byte { return bytes.Clone(m.rawEXIF) }
 
 // RawIPTC returns a copy of the raw IPTC IIM segment bytes as read from the container.
@@ -143,8 +207,46 @@ func (m *Metadata) RawIPTC() []byte { return bytes.Clone(m.rawIPTC) }
 // #139: returns bytes.Clone(m.rawXMP) for the same defensive-copy rationale as RawEXIF.
 func (m *Metadata) RawXMP() []byte { return bytes.Clone(m.rawXMP) }
 
+// RawSegments returns read-only, zero-copy views of the raw EXIF, IPTC, and
+// XMP segment bytes exactly as stored on m. Any of the three may be nil when
+// that segment is absent from the container.
+//
+// Unlike RawEXIF, RawIPTC, and RawXMP, the returned slices alias m's own
+// internal storage and perform no allocation. The caller MUST NOT modify,
+// append to, or retain them past any subsequent mutation of m (a Set* call,
+// or passing m to Write) — doing so is undefined behaviour and may corrupt
+// m's internal relocation state or a concurrent Write call (see the #139
+// mutation-safety rationale on RawEXIF).
+//
+// Use this accessor for read-only, allocation-sensitive callers (e.g.
+// hashing or comparing raw bytes across many images in a loop). Use RawEXIF,
+// RawIPTC, and RawXMP when you need an owned copy safe to mutate or retain
+// independently of m.
+func (m *Metadata) RawSegments() (rawEXIF, rawIPTC, rawXMP []byte) {
+	return m.rawEXIF, m.rawIPTC, m.rawXMP
+}
+
 // iptcTrustElevated reports whether IPTC should take read priority over XMP
 // for fields where both are present and carry different values.
+//
+// The decision is computed once, by Read, and cached in m.iptcTrustElev
+// (task #208); this method is a plain field read so that the four MWG-02
+// accessors (Copyright, Caption, Keywords, Creator) never each pay their own
+// MD5 hash of the raw IPTC stream. See computeIPTCTrustElevated for the full
+// MWG §3.3.1 policy this value encodes.
+func (m *Metadata) iptcTrustElevated() bool {
+	return m.iptcTrustElev
+}
+
+// digestMatchFn is a seam over iptc.DigestMatch. computeIPTCTrustElevated
+// calls it instead of iptc.DigestMatch directly so that tests can verify how
+// many times the underlying MD5 computation runs (task #208). Production
+// behaviour is unchanged: the var is initialised to iptc.DigestMatch itself
+// and is never reassigned outside test code.
+var digestMatchFn = iptc.DigestMatch //nolint:gochecknoglobals // test seam; identical to calling iptc.DigestMatch directly in production
+
+// computeIPTCTrustElevated reports whether IPTC should take read priority
+// over XMP for fields where both are present and carry different values.
 //
 // MWG Guidelines v2.0 §3.3.1: the Photoshop resource 0x0425 stores an MD5
 // digest of the raw 0x0404 IIM block at the time XMP was last written. If the
@@ -156,15 +258,21 @@ func (m *Metadata) RawXMP() []byte { return bytes.Clone(m.rawXMP) }
 //
 // When rawIPTCDigest is nil (the resource was absent), the default XMP-over-
 // IPTC priority (MWG-01) is preserved unchanged.
-func (m *Metadata) iptcTrustElevated() bool {
-	if len(m.rawIPTCDigest) != 16 {
+//
+// Called exactly once, by Read, immediately after rawIPTC and rawIPTCDigest
+// are final; the result is cached in m.iptcTrustElev (task #208). This
+// function performs at most one MD5 computation (via digestMatchFn), unlike
+// the former per-accessor-call implementation, which hashed the entire raw
+// IPTC stream again on every single Copyright/Caption/Keywords/Creator call.
+func computeIPTCTrustElevated(rawIPTC, rawIPTCDigest []byte) bool {
+	if len(rawIPTCDigest) != 16 {
 		// No digest resource in the IRB — use default MWG-01 (XMP priority).
 		return false
 	}
 	var stored [16]byte
-	copy(stored[:], m.rawIPTCDigest)
-	// DigestMatch handles the all-zero sentinel case (returns unknown=true).
-	match, unknown := iptc.DigestMatch(m.rawIPTC, stored)
+	copy(stored[:], rawIPTCDigest)
+	// digestMatchFn handles the all-zero sentinel case (returns unknown=true).
+	match, unknown := digestMatchFn(rawIPTC, stored)
 	// Elevate IPTC when: all-zero sentinel OR computed hash ≠ stored hash.
 	return unknown || !match
 }

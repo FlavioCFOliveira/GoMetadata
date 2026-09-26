@@ -3,10 +3,20 @@ package heif
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"math"
 	"testing"
 	"time"
 )
+
+// fourCC copies s (which must be exactly 4 bytes) into a [4]byte value, for
+// building ad hoc box/item type literals in tests that need a type not
+// already exposed as a package-level boxTypeXxx/itemTypeXxx constant.
+func fourCC(s string) [4]byte {
+	var b [4]byte
+	copy(b[:], s)
+	return b
+}
 
 // buildHEIF assembles a minimal ISOBMFF/HEIF stream containing optional EXIF
 // and XMP items. The file structure is:
@@ -399,11 +409,16 @@ func TestInjectPassThroughNilPayloads(t *testing.T) {
 
 func BenchmarkHEIFExtract(b *testing.B) {
 	data := buildHEIF(minimalTIFFExif(), nil)
+	// #236: reader constructed once outside the loop and rewound via Seek per
+	// iteration so the artificial bytes.Reader allocation does not inflate
+	// the allocs/op reported for Extract itself.
+	r := bytes.NewReader(data)
 	b.SetBytes(int64(len(data)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		_, _, _, _ = Extract(bytes.NewReader(data))
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
 	}
 }
 
@@ -422,12 +437,12 @@ func TestParseInfeV0V1(t *testing.T) {
 		// protection index = 0 (already zero)
 		copy(data[4:], name)
 		copy(data[4+len(name):], contentType)
-		id, typ := parseInfeV0V1(data, 0)
+		id, typ, ok := parseInfeV0V1(data, 0)
 		if id != 42 {
 			t.Errorf("id = %d, want 42", id)
 		}
-		if typ != "mime" {
-			t.Errorf("type = %q, want %q", typ, "mime")
+		if !ok || typ != itemTypeMime {
+			t.Errorf("type = %v ok=%v, want %v true", typ, ok, itemTypeMime)
 		}
 	})
 	t.Run("other content-type returns empty type", func(t *testing.T) {
@@ -438,19 +453,19 @@ func TestParseInfeV0V1(t *testing.T) {
 		binary.BigEndian.PutUint16(data[0:], 7)
 		copy(data[4:], name)
 		copy(data[4+len(name):], contentType)
-		id, typ := parseInfeV0V1(data, 0)
+		id, _, ok := parseInfeV0V1(data, 0)
 		if id != 7 {
 			t.Errorf("id = %d, want 7", id)
 		}
-		if typ != "" {
-			t.Errorf("type = %q, want empty", typ)
+		if ok {
+			t.Error("ok = true, want false")
 		}
 	})
 	t.Run("too short returns zero", func(t *testing.T) {
 		t.Parallel()
-		id, typ := parseInfeV0V1([]byte{0x00}, 0)
-		if id != 0 || typ != "" {
-			t.Errorf("too short: id=%d type=%q, want 0 and empty", id, typ)
+		id, _, ok := parseInfeV0V1([]byte{0x00}, 0)
+		if id != 0 || ok {
+			t.Errorf("too short: id=%d ok=%v, want 0 and false", id, ok)
 		}
 	})
 	t.Run("no NUL in item_name returns id with empty type", func(t *testing.T) {
@@ -458,12 +473,12 @@ func TestParseInfeV0V1(t *testing.T) {
 		data := make([]byte, 4+5) // id(2)+prot(2)+5 bytes with no NUL
 		binary.BigEndian.PutUint16(data[0:], 3)
 		copy(data[4:], "noNUL")
-		id, typ := parseInfeV0V1(data, 0)
+		id, _, ok := parseInfeV0V1(data, 0)
 		if id != 3 {
 			t.Errorf("id = %d, want 3", id)
 		}
-		if typ != "" {
-			t.Errorf("type = %q, want empty", typ)
+		if ok {
+			t.Error("ok = true, want false")
 		}
 	})
 	t.Run("content type without NUL (EOF)", func(t *testing.T) {
@@ -474,14 +489,14 @@ func TestParseInfeV0V1(t *testing.T) {
 		binary.BigEndian.PutUint16(data[0:], 9)
 		copy(data[4:], name)
 		copy(data[4+len(name):], contentType)
-		id, typ := parseInfeV0V1(data, 0)
+		id, typ, ok := parseInfeV0V1(data, 0)
 		if id != 9 {
 			t.Errorf("id = %d, want 9", id)
 		}
 		// Without the NUL we fall into the contentType = string(data[pos:]) branch,
-		// which returns "mime" for "application/rdf+xml".
-		if typ != "mime" {
-			t.Errorf("type = %q, want mime", typ)
+		// which returns itemTypeMime for "application/rdf+xml".
+		if !ok || typ != itemTypeMime {
+			t.Errorf("type = %v ok=%v, want %v true", typ, ok, itemTypeMime)
 		}
 	})
 }
@@ -584,11 +599,14 @@ func BenchmarkHEIFInject(b *testing.B) {
 	exifData := minimalTIFFExif()
 	data := buildHEIF(exifData, nil)
 	newEXIF := append(exifData[:len(exifData)-4:len(exifData)-4], 'B', 'E', 'N', 'C')
+	// #236: reader hoisted outside the loop; see BenchmarkHEIFExtract.
+	r := bytes.NewReader(data)
 	b.SetBytes(int64(len(data)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		_ = Inject(bytes.NewReader(data), nopWriter{}, newEXIF, nil, nil, true)
+		_, _ = r.Seek(0, io.SeekStart)
+		_ = Inject(r, nopWriter{}, newEXIF, nil, nil, true)
 	}
 }
 
@@ -710,20 +728,20 @@ func TestParseInfeV2V3(t *testing.T) {
 	t.Run("version 2 valid", func(t *testing.T) {
 		t.Parallel()
 		data := makeV2(42, "Exif")
-		id, typ := parseInfeV2V3(data, 0, 2)
+		id, typ, ok := parseInfeV2V3(data, 0, 2)
 		if id != 42 {
 			t.Errorf("id = %d, want 42", id)
 		}
-		if typ != "Exif" {
-			t.Errorf("type = %q, want Exif", typ)
+		if !ok || typ != itemTypeExif {
+			t.Errorf("type = %v ok=%v, want %v true", typ, ok, itemTypeExif)
 		}
 	})
 
 	t.Run("version 2 too short for ID", func(t *testing.T) {
 		t.Parallel()
-		id, typ := parseInfeV2V3([]byte{0x00}, 0, 2)
-		if id != 0 || typ != "" {
-			t.Errorf("expected (0,'') for too-short v2, got (%d,%q)", id, typ)
+		id, _, ok := parseInfeV2V3([]byte{0x00}, 0, 2)
+		if id != 0 || ok {
+			t.Errorf("expected (0,false) for too-short v2, got (%d,%v)", id, ok)
 		}
 	})
 
@@ -733,20 +751,20 @@ func TestParseInfeV2V3(t *testing.T) {
 		binary.BigEndian.PutUint32(data[0:], 5) // uint32 ID = 5
 		// protection index = 0 at [4:6]
 		copy(data[6:], "mime")
-		id, typ := parseInfeV2V3(data, 0, 3)
+		id, typ, ok := parseInfeV2V3(data, 0, 3)
 		if id != 5 {
 			t.Errorf("id = %d, want 5", id)
 		}
-		if typ != "mime" {
-			t.Errorf("type = %q, want mime", typ)
+		if !ok || typ != itemTypeMime {
+			t.Errorf("type = %v ok=%v, want %v true", typ, ok, itemTypeMime)
 		}
 	})
 
 	t.Run("version 3 too short for ID", func(t *testing.T) {
 		t.Parallel()
-		id, typ := parseInfeV2V3([]byte{0x00, 0x00}, 0, 3)
-		if id != 0 || typ != "" {
-			t.Errorf("expected (0,'') for too-short v3, got (%d,%q)", id, typ)
+		id, _, ok := parseInfeV2V3([]byte{0x00, 0x00}, 0, 3)
+		if id != 0 || ok {
+			t.Errorf("expected (0,false) for too-short v3, got (%d,%v)", id, ok)
 		}
 	})
 
@@ -754,9 +772,9 @@ func TestParseInfeV2V3(t *testing.T) {
 		t.Parallel()
 		data := make([]byte, 10)
 		binary.BigEndian.PutUint32(data[0:], 0x00020000)
-		id, typ := parseInfeV2V3(data, 0, 3)
-		if id != 0 || typ != "" {
-			t.Errorf("expected (0,'') for oversized v3 ID, got (%d,%q)", id, typ)
+		id, _, ok := parseInfeV2V3(data, 0, 3)
+		if id != 0 || ok {
+			t.Errorf("expected (0,false) for oversized v3 ID, got (%d,%v)", id, ok)
 		}
 	})
 
@@ -765,9 +783,9 @@ func TestParseInfeV2V3(t *testing.T) {
 		// only 4 bytes: ID(2)+prot(2), no room for item_type(4)
 		data := make([]byte, 4)
 		binary.BigEndian.PutUint16(data[0:], 1)
-		id, typ := parseInfeV2V3(data, 0, 2)
-		if id != 0 || typ != "" {
-			t.Errorf("expected (0,'') when item_type field truncated, got (%d,%q)", id, typ)
+		id, _, ok := parseInfeV2V3(data, 0, 2)
+		if id != 0 || ok {
+			t.Errorf("expected (0,false) when item_type field truncated, got (%d,%v)", id, ok)
 		}
 	})
 }
@@ -885,7 +903,7 @@ func TestParseHEIFBoxHeader(t *testing.T) {
 		binary.BigEndian.PutUint32(data[0:], 12)
 		copy(data[4:], "ftyp")
 		sz, typ, hdrLen, ok := parseHEIFBoxHeader(data, 0)
-		if !ok || sz != 12 || typ != "ftyp" || hdrLen != 8 {
+		if !ok || sz != 12 || typ != fourCC("ftyp") || hdrLen != 8 {
 			t.Errorf("normal: sz=%d typ=%q hdrLen=%d ok=%v", sz, typ, hdrLen, ok)
 		}
 	})
@@ -897,7 +915,7 @@ func TestParseHEIFBoxHeader(t *testing.T) {
 		copy(data[4:], "mdat")
 		binary.BigEndian.PutUint64(data[8:], 24) // actual size in next 8 bytes
 		sz, typ, hdrLen, ok := parseHEIFBoxHeader(data, 0)
-		if !ok || sz != 24 || typ != "mdat" || hdrLen != 16 {
+		if !ok || sz != 24 || typ != fourCC("mdat") || hdrLen != 16 {
 			t.Errorf("extended: sz=%d typ=%q hdrLen=%d ok=%v", sz, typ, hdrLen, ok)
 		}
 	})
@@ -919,7 +937,7 @@ func TestParseHEIFBoxHeader(t *testing.T) {
 		binary.BigEndian.PutUint32(data[0:], 0) // size=0: extends to EOF
 		copy(data[4:], "mdat")
 		sz, typ, hdrLen, ok := parseHEIFBoxHeader(data, 0)
-		if !ok || sz != 16 || typ != "mdat" || hdrLen != 8 {
+		if !ok || sz != 16 || typ != fourCC("mdat") || hdrLen != 8 {
 			t.Errorf("size=0: sz=%d typ=%q hdrLen=%d ok=%v", sz, typ, hdrLen, ok)
 		}
 	})
@@ -1321,7 +1339,7 @@ func TestInjectNormalizesConstructionMethod(t *testing.T) {
 	// Verify that the input really does encode construction_method=1.
 	// findBox returns meta box content with version+flags stripped (per its contract).
 	{
-		metaContent, err := findBox(input, "meta", 0)
+		metaContent, err := findBox(input, boxTypeMeta, 0)
 		if err != nil || len(metaContent) == 0 {
 			t.Fatalf("setup: meta box not found in synthetic input (err=%v)", err)
 		}
@@ -1344,7 +1362,7 @@ func TestInjectNormalizesConstructionMethod(t *testing.T) {
 	// Parse the output iloc and assert:
 	// 1. construction_method of the XMP item is 0 (file offset).
 	// 2. The extent_offset points at the appended XMP payload.
-	outMetaContent, err := findBox(output, "meta", 0)
+	outMetaContent, err := findBox(output, boxTypeMeta, 0)
 	if err != nil || len(outMetaContent) == 0 {
 		t.Fatalf("output: meta box not found (err=%v)", err)
 	}
@@ -1384,6 +1402,454 @@ func TestInjectNormalizesConstructionMethod(t *testing.T) {
 	}
 	if !bytes.Equal(extractedXMP, newXMP) {
 		t.Errorf("Extract XMP mismatch after Inject:\ngot  %q\nwant %q", extractedXMP, newXMP)
+	}
+}
+
+// buildHEIFTwoExtentEXIF assembles a minimal HEIF stream whose Exif item has
+// TWO iloc extents (rather than the usual one), for task #229's regression
+// gate: updateIlocItemsInPlace must collapse a multi-extent item to exactly
+// one extent, and the analytically-computed size (newMetaBoxLen) must
+// account for the extents actually removed. ISO 14496-12 §8.11.3 permits any
+// positive extent_count; splitting the payload across two extents is a
+// legal, if unusual, encoding.
+func buildHEIFTwoExtentEXIF(exifPart1, exifPart2 []byte) []byte {
+	const exifItemID uint16 = 1
+
+	infeBody := make([]byte, 4+2+2+4+1)
+	infeBody[0] = 2 // version 2
+	binary.BigEndian.PutUint16(infeBody[4:], exifItemID)
+	copy(infeBody[8:], "Exif")
+	infeHdr := make([]byte, 0, 8+len(infeBody))
+	infeHdr = append(infeHdr, 0, 0, 0, 0, 'i', 'n', 'f', 'e')
+	binary.BigEndian.PutUint32(infeHdr, uint32(8+len(infeBody))) //nolint:gosec // G115: test helper, bounded size
+	infeBox := append(infeHdr, infeBody...)
+
+	iinfBody := make([]byte, 0, 6+len(infeBox))
+	iinfBody = append(iinfBody, 0, 0, 0, 0, 0, 1) // version 0 + flags, item_count=1
+	iinfBody = append(iinfBody, infeBox...)
+	iinfHdr := make([]byte, 0, 8+len(iinfBody))
+	iinfHdr = append(iinfHdr, 0, 0, 0, 0, 'i', 'i', 'n', 'f')
+	binary.BigEndian.PutUint32(iinfHdr, uint32(8+len(iinfBody))) //nolint:gosec // G115: test helper, bounded size
+	iinfBox := append(iinfHdr, iinfBody...)
+
+	// iloc v0, offset_size=4, length_size=4, base_offset_size=0, item_count=1,
+	// with the single item carrying extent_count=2.
+	makeIloc := func(off1, len1, off2, len2 uint32) []byte {
+		body := make([]byte, 0, 6+2+2+2+4+4+4+4)
+		body = append(body,
+			0x00, 0x00, 0x00, 0x00, // version=0, flags=0
+			0x44, // offset_size=4, length_size=4
+			0x00, // base_offset_size=0, index_size=0
+		)
+		body = binary.BigEndian.AppendUint16(body, 1) // item_count = 1
+		body = binary.BigEndian.AppendUint16(body, exifItemID)
+		body = binary.BigEndian.AppendUint16(body, 2) // extent_count = 2
+		body = binary.BigEndian.AppendUint32(body, off1)
+		body = binary.BigEndian.AppendUint32(body, len1)
+		body = binary.BigEndian.AppendUint32(body, off2)
+		body = binary.BigEndian.AppendUint32(body, len2)
+		hdr := make([]byte, 0, 8+len(body))
+		hdr = append(hdr, 0, 0, 0, 0, 'i', 'l', 'o', 'c')
+		binary.BigEndian.PutUint32(hdr, uint32(8+len(body))) //nolint:gosec // G115: test helper, bounded size
+		return append(hdr, body...)
+	}
+
+	ftyp := make([]byte, 16)
+	binary.BigEndian.PutUint32(ftyp, 16)
+	copy(ftyp[4:], "ftyp")
+	copy(ftyp[8:], "heic")
+
+	buildMeta := func(ilocBox []byte) []byte {
+		metaBody := make([]byte, 0, 4+len(iinfBox)+len(ilocBox))
+		metaBody = append(metaBody, 0, 0, 0, 0)
+		metaBody = append(metaBody, iinfBox...)
+		metaBody = append(metaBody, ilocBox...)
+		hdr := make([]byte, 0, 8)
+		hdr = append(hdr, 0, 0, 0, 0, 'm', 'e', 't', 'a')
+		binary.BigEndian.PutUint32(hdr, uint32(8+len(metaBody))) //nolint:gosec // G115: test helper, bounded size
+		return append(hdr, metaBody...)
+	}
+
+	// The Exif item's real payload begins with a 4-byte TIFF-header offset
+	// prefix (ISO 23008-12 §6.6.1); split it across the two extents at an
+	// arbitrary boundary purely to exercise extent_count=2 parsing. All iloc
+	// numeric fields are fixed-width (4 bytes each here), so the box's length
+	// is identical whether built with placeholder or real offset values —
+	// one pass suffices to learn dataStart.
+	full := append(append([]byte{0, 0, 0, 0}, exifPart1...), exifPart2...)
+	splitAt := 4 + len(exifPart1)
+
+	meta := buildMeta(makeIloc(0, 0, 0, 0))
+	dataStart := uint32(len(ftyp)) + uint32(len(meta)) //nolint:gosec // G115: test helper, bounded size
+	meta = buildMeta(makeIloc(
+		dataStart, uint32(splitAt), //nolint:gosec // G115: test helper, bounded size
+		dataStart+uint32(splitAt), uint32(len(full)-splitAt), //nolint:gosec // G115: test helper, bounded size
+	))
+
+	result := make([]byte, 0, len(ftyp)+len(meta)+len(full))
+	result = append(result, ftyp...)
+	result = append(result, meta...)
+	result = append(result, full...)
+	return result
+}
+
+// TestInjectMultiExtentItemCollapsesToOne is the regression gate for task
+// #229: an iloc item that starts with MORE than one extent must still
+// collapse to exactly one extent after Inject, and the iloc/meta box sizes
+// computed analytically (newMetaBoxLen/ilocBoxSize) must exactly match what
+// buildIlocBox/buildMetaBox actually write — a mismatch would either corrupt
+// the file (ancestor size or item offset patched wrong) or panic.
+func TestInjectMultiExtentItemCollapsesToOne(t *testing.T) {
+	t.Parallel()
+
+	part1 := bytes.Repeat([]byte{0xAA}, 20)
+	part2 := bytes.Repeat([]byte{0xBB}, 30)
+	data := buildHEIFTwoExtentEXIF(part1, part2)
+
+	// Sanity: the input really does carry 2 extents for the Exif item.
+	metaContent, err := findBox(data, boxTypeMeta, 0)
+	if err != nil || metaContent == nil {
+		t.Fatalf("setup: meta box not found (err=%v)", err)
+	}
+	ilocInfo, ok := parseIlocFull(metaContent)
+	if !ok || len(ilocInfo.items) != 1 || len(ilocInfo.items[0].extents) != 2 {
+		t.Fatalf("setup: expected 1 item with 2 extents, got %+v", ilocInfo)
+	}
+
+	newEXIF := minimalTIFFExif()
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(data), &out, newEXIF, nil, nil, true); err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	output := out.Bytes()
+
+	outMetaContent, err := findBox(output, boxTypeMeta, 0)
+	if err != nil || outMetaContent == nil {
+		t.Fatalf("output: meta box not found (err=%v)", err)
+	}
+	outIlocInfo, ok := parseIlocFull(outMetaContent)
+	if !ok || len(outIlocInfo.items) != 1 {
+		t.Fatalf("output: expected exactly 1 iloc item, got %+v", outIlocInfo)
+	}
+	item := outIlocInfo.items[0]
+	if len(item.extents) != 1 {
+		t.Fatalf("output: extent count = %d, want 1 (multi-extent item must collapse)", len(item.extents))
+	}
+	if item.constructMethod != 0 {
+		t.Errorf("output: construction_method = %d, want 0", item.constructMethod)
+	}
+
+	// The single extent must point exactly at the appended EXIF payload,
+	// which Inject writes with a 4-byte zero TIFF-header-offset prefix.
+	wantLen := uint64(4 + len(newEXIF))
+	if item.extents[0].length != wantLen {
+		t.Errorf("output: extent length = %d, want %d", item.extents[0].length, wantLen)
+	}
+	end := item.extents[0].offset + item.extents[0].length
+	if end != uint64(len(output)) {
+		t.Errorf("output: extent end = %d, want file length %d (item payload must be the final bytes written)", end, len(output))
+	}
+
+	// End-to-end: Extract must recover the injected EXIF bytes, proving the
+	// analytically-computed box sizes produced a structurally valid file.
+	gotEXIF, _, _, err := Extract(bytes.NewReader(output))
+	if err != nil {
+		t.Fatalf("Extract on Inject output: %v", err)
+	}
+	if !bytes.Equal(gotEXIF, newEXIF) {
+		t.Errorf("round trip: got %d bytes, want %d bytes matching newEXIF", len(gotEXIF), len(newEXIF))
+	}
+}
+
+// buildHEIFDuplicateIloc assembles a minimal, spec-non-conformant HEIF stream
+// whose meta box carries TWO 'iloc' child boxes. ISO 14496-12 §8.11.1 permits
+// at most one, but neither parseIlocFull (via findInnerBox, which returns the
+// FIRST match) nor buildMetaBox (whose copy loop drops EVERY child box typed
+// 'iloc', not just the first) rejects the second one. Both iloc boxes are
+// well-formed and describe the same single Exif item.
+//
+// This is the minimal reproduction for security audit finding
+// HEIF-ILOC-DUPBOX-01 (2026-09-25): the meta box size computation must sum
+// the sizes of
+// EVERY 'iloc'-typed child it walks past, exactly mirroring buildMetaBox's
+// own removal loop — stopping at the first one (as an earlier version did)
+// under-counts how much buildMetaBox's real output shrinks the meta box by
+// whenever a second iloc box is present, corrupting the injected item's
+// recorded extent offset.
+func buildHEIFDuplicateIloc() []byte {
+	const exifItemID uint16 = 1
+
+	infeBody := make([]byte, 4+2+2+4+1)
+	infeBody[0] = 2 // version 2
+	binary.BigEndian.PutUint16(infeBody[4:], exifItemID)
+	copy(infeBody[8:], "Exif")
+	infeHdr := make([]byte, 0, 8+len(infeBody))
+	infeHdr = append(infeHdr, 0, 0, 0, 0, 'i', 'n', 'f', 'e')
+	binary.BigEndian.PutUint32(infeHdr, uint32(8+len(infeBody))) //nolint:gosec // G115: test helper, bounded size
+	infeBox := append(infeHdr, infeBody...)
+
+	iinfBody := make([]byte, 0, 6+len(infeBox))
+	iinfBody = append(iinfBody, 0, 0, 0, 0, 0, 1) // version 0 + flags, item_count=1
+	iinfBody = append(iinfBody, infeBox...)
+	iinfHdr := make([]byte, 0, 8+len(iinfBody))
+	iinfHdr = append(iinfHdr, 0, 0, 0, 0, 'i', 'i', 'n', 'f')
+	binary.BigEndian.PutUint32(iinfHdr, uint32(8+len(iinfBody))) //nolint:gosec // G115: test helper, bounded size
+	iinfBox := append(iinfHdr, iinfBody...)
+
+	// iloc v0, offset_size=4, length_size=4, base_offset_size=0, one item,
+	// one extent — a plain, well-formed iloc box, instantiated TWICE below.
+	makeIloc := func(off, ln uint32) []byte {
+		body := make([]byte, 0, 6+2+2+2+4+4)
+		body = append(body,
+			0x00, 0x00, 0x00, 0x00, // version=0, flags=0
+			0x44, // offset_size=4, length_size=4
+			0x00, // base_offset_size=0, index_size=0
+		)
+		body = binary.BigEndian.AppendUint16(body, 1) // item_count = 1
+		body = binary.BigEndian.AppendUint16(body, exifItemID)
+		body = binary.BigEndian.AppendUint16(body, 1) // extent_count = 1
+		body = binary.BigEndian.AppendUint32(body, off)
+		body = binary.BigEndian.AppendUint32(body, ln)
+		hdr := make([]byte, 0, 8+len(body))
+		hdr = append(hdr, 0, 0, 0, 0, 'i', 'l', 'o', 'c')
+		binary.BigEndian.PutUint32(hdr, uint32(8+len(body))) //nolint:gosec // G115: test helper, bounded size
+		return append(hdr, body...)
+	}
+
+	ftyp := make([]byte, 16)
+	binary.BigEndian.PutUint32(ftyp, 16)
+	copy(ftyp[4:], "ftyp")
+	copy(ftyp[8:], "heic")
+
+	buildMeta := func(iloc1, iloc2 []byte) []byte {
+		metaBody := make([]byte, 0, 4+len(iinfBox)+len(iloc1)+len(iloc2))
+		metaBody = append(metaBody, 0, 0, 0, 0) // version + flags
+		metaBody = append(metaBody, iinfBox...)
+		metaBody = append(metaBody, iloc1...)
+		metaBody = append(metaBody, iloc2...) // the second, spec-non-conformant iloc box
+		hdr := make([]byte, 0, 8+len(metaBody))
+		hdr = append(hdr, 0, 0, 0, 0, 'm', 'e', 't', 'a')
+		binary.BigEndian.PutUint32(hdr, uint32(8+len(metaBody))) //nolint:gosec // G115: test helper, bounded size
+		return append(hdr, metaBody...)
+	}
+
+	// Original Exif item payload: a 4-byte zero TIFF-header-offset prefix
+	// followed by a small placeholder body. Its exact bytes are irrelevant —
+	// Inject always replaces the item's payload and iloc entry entirely.
+	origPayload := append([]byte{0, 0, 0, 0}, bytes.Repeat([]byte{0xCC}, 8)...)
+
+	meta := buildMeta(makeIloc(0, uint32(len(origPayload))), makeIloc(0, uint32(len(origPayload)))) //nolint:gosec // G115: test helper, bounded size
+	dataStart := uint32(len(ftyp)) + uint32(len(meta))                                              //nolint:gosec // G115: test helper, bounded size
+	meta = buildMeta(
+		makeIloc(dataStart, uint32(len(origPayload))), //nolint:gosec // G115: test helper, bounded size
+		makeIloc(dataStart, uint32(len(origPayload))), //nolint:gosec // G115: test helper, bounded size
+	)
+
+	result := make([]byte, 0, len(ftyp)+len(meta)+len(origPayload))
+	result = append(result, ftyp...)
+	result = append(result, meta...)
+	result = append(result, origPayload...)
+	return result
+}
+
+// TestInjectDuplicateIlocBoxesOffsetInBounds is the regression gate for
+// security audit finding HEIF-ILOC-DUPBOX-01 (2026-09-25): a meta box
+// carrying two 'iloc' child boxes previously caused the meta box size
+// computation to
+// under-count how much buildMetaBox's removal loop actually shrinks the meta
+// box by (it drops EVERY 'iloc'-typed child, not just the first), so the
+// injected item's recorded iloc extent offset pointed past the true end of
+// the output file. This asserts the extent stays within bounds and its
+// bytes match the injected payload exactly, and that Extract round-trips it.
+func TestInjectDuplicateIlocBoxesOffsetInBounds(t *testing.T) {
+	t.Parallel()
+
+	data := buildHEIFDuplicateIloc()
+	newEXIF := minimalTIFFExif()
+
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(data), &out, newEXIF, nil, nil, true); err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	output := out.Bytes()
+
+	metaContent, err := findBox(output, boxTypeMeta, 0)
+	if err != nil || metaContent == nil {
+		t.Fatalf("output: meta box not found (err=%v)", err)
+	}
+	ilocInfo, ok := parseIlocFull(metaContent)
+	if !ok || len(ilocInfo.items) != 1 {
+		t.Fatalf("output: expected exactly 1 iloc item, got %+v", ilocInfo)
+	}
+	item := ilocInfo.items[0]
+	if len(item.extents) != 1 {
+		t.Fatalf("output: extent count = %d, want 1", len(item.extents))
+	}
+
+	end := item.extents[0].offset + item.extents[0].length
+	if end > uint64(len(output)) {
+		t.Fatalf("HEIF-ILOC-DUPBOX-01: extent [%d,%d) exceeds output length %d",
+			item.extents[0].offset, end, len(output))
+	}
+
+	wantLen := uint64(4 + len(newEXIF)) // Inject prepends a 4-byte zero TIFF-header-offset prefix.
+	if item.extents[0].length != wantLen {
+		t.Fatalf("output: extent length = %d, want %d", item.extents[0].length, wantLen)
+	}
+	got := output[item.extents[0].offset:end]
+	want := append([]byte{0, 0, 0, 0}, newEXIF...)
+	if !bytes.Equal(got, want) {
+		t.Errorf("output: extent bytes = %x, want %x (injected payload with 4-byte prefix)", got, want)
+	}
+
+	// End-to-end: Extract must recover exactly the injected EXIF bytes.
+	gotEXIF, _, _, err := Extract(bytes.NewReader(output))
+	if err != nil {
+		t.Fatalf("Extract on Inject output: %v", err)
+	}
+	if !bytes.Equal(gotEXIF, newEXIF) {
+		t.Errorf("round trip: got %d bytes, want %d bytes matching newEXIF", len(gotEXIF), len(newEXIF))
+	}
+}
+
+// buildHEIFMetaTrailingGarbage assembles a minimal HEIF stream whose meta
+// box's declared size includes a handful of TRAILING bytes that do not form
+// a parseable ISOBMFF box header at all (fewer than the 8-byte minimum for a
+// box header). This is the second minimal reproduction for security audit
+// finding HEIF-ILOC-DUPBOX-01 (2026-09-25), found while fuzzing after the
+// first (buildHEIFDuplicateIloc) was fixed: buildMetaBox's box-walk stops —
+// and silently drops the remainder — the instant it cannot parse the next
+// header, so any size computation that instead trusts the meta box's OWN
+// declared length must exclude those dropped trailing bytes too. See
+// nonIlocBoxesLen's doc comment in heif.go.
+func buildHEIFMetaTrailingGarbage() []byte {
+	const exifItemID uint16 = 1
+
+	infeBody := make([]byte, 4+2+2+4+1)
+	infeBody[0] = 2 // version 2
+	binary.BigEndian.PutUint16(infeBody[4:], exifItemID)
+	copy(infeBody[8:], "Exif")
+	infeHdr := make([]byte, 0, 8+len(infeBody))
+	infeHdr = append(infeHdr, 0, 0, 0, 0, 'i', 'n', 'f', 'e')
+	binary.BigEndian.PutUint32(infeHdr, uint32(8+len(infeBody))) //nolint:gosec // G115: test helper, bounded size
+	infeBox := append(infeHdr, infeBody...)
+
+	iinfBody := make([]byte, 0, 6+len(infeBox))
+	iinfBody = append(iinfBody, 0, 0, 0, 0, 0, 1) // version 0 + flags, item_count=1
+	iinfBody = append(iinfBody, infeBox...)
+	iinfHdr := make([]byte, 0, 8+len(iinfBody))
+	iinfHdr = append(iinfHdr, 0, 0, 0, 0, 'i', 'i', 'n', 'f')
+	binary.BigEndian.PutUint32(iinfHdr, uint32(8+len(iinfBody))) //nolint:gosec // G115: test helper, bounded size
+	iinfBox := append(iinfHdr, iinfBody...)
+
+	makeIloc := func(off, ln uint32) []byte {
+		body := make([]byte, 0, 6+2+2+2+4+4)
+		body = append(body,
+			0x00, 0x00, 0x00, 0x00, // version=0, flags=0
+			0x44, // offset_size=4, length_size=4
+			0x00, // base_offset_size=0, index_size=0
+		)
+		body = binary.BigEndian.AppendUint16(body, 1) // item_count = 1
+		body = binary.BigEndian.AppendUint16(body, exifItemID)
+		body = binary.BigEndian.AppendUint16(body, 1) // extent_count = 1
+		body = binary.BigEndian.AppendUint32(body, off)
+		body = binary.BigEndian.AppendUint32(body, ln)
+		hdr := make([]byte, 0, 8+len(body))
+		hdr = append(hdr, 0, 0, 0, 0, 'i', 'l', 'o', 'c')
+		binary.BigEndian.PutUint32(hdr, uint32(8+len(body))) //nolint:gosec // G115: test helper, bounded size
+		return append(hdr, body...)
+	}
+
+	// 5 trailing bytes: fewer than the 8-byte minimum box header, so
+	// parseHEIFBoxHeader cannot parse them as a box at all.
+	trailingGarbage := []byte{0xAA, 0xAA, 0xAA, 0xAA, 0xAA}
+
+	ftyp := make([]byte, 16)
+	binary.BigEndian.PutUint32(ftyp, 16)
+	copy(ftyp[4:], "ftyp")
+	copy(ftyp[8:], "heic")
+
+	buildMeta := func(iloc []byte) []byte {
+		metaBody := make([]byte, 0, 4+len(iinfBox)+len(iloc)+len(trailingGarbage))
+		metaBody = append(metaBody, 0, 0, 0, 0) // version + flags
+		metaBody = append(metaBody, iinfBox...)
+		metaBody = append(metaBody, iloc...)
+		metaBody = append(metaBody, trailingGarbage...) // unparseable trailing bytes
+		hdr := make([]byte, 0, 8+len(metaBody))
+		hdr = append(hdr, 0, 0, 0, 0, 'm', 'e', 't', 'a')
+		binary.BigEndian.PutUint32(hdr, uint32(8+len(metaBody))) //nolint:gosec // G115: test helper, bounded size
+		return append(hdr, metaBody...)
+	}
+
+	origPayload := append([]byte{0, 0, 0, 0}, bytes.Repeat([]byte{0xCC}, 8)...)
+
+	meta := buildMeta(makeIloc(0, uint32(len(origPayload))))        //nolint:gosec // G115: test helper, bounded size
+	dataStart := uint32(len(ftyp)) + uint32(len(meta))              //nolint:gosec // G115: test helper, bounded size
+	meta = buildMeta(makeIloc(dataStart, uint32(len(origPayload)))) //nolint:gosec // G115: test helper, bounded size
+
+	result := make([]byte, 0, len(ftyp)+len(meta)+len(origPayload))
+	result = append(result, ftyp...)
+	result = append(result, meta...)
+	result = append(result, origPayload...)
+	return result
+}
+
+// TestInjectMetaWithTrailingUnparseableBytesOffsetInBounds is the second
+// regression gate for security audit finding HEIF-ILOC-DUPBOX-01
+// (2026-09-25), found via the fuzz invariant added for that same finding: a
+// meta box whose declared size includes trailing bytes that do not parse as
+// an ISOBMFF box header at all must not desynchronise the analytically
+// computed meta box length from what buildMetaBox actually produces.
+func TestInjectMetaWithTrailingUnparseableBytesOffsetInBounds(t *testing.T) {
+	t.Parallel()
+
+	data := buildHEIFMetaTrailingGarbage()
+	newEXIF := minimalTIFFExif()
+
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(data), &out, newEXIF, nil, nil, true); err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	output := out.Bytes()
+
+	metaContent, err := findBox(output, boxTypeMeta, 0)
+	if err != nil || metaContent == nil {
+		t.Fatalf("output: meta box not found (err=%v)", err)
+	}
+	ilocInfo, ok := parseIlocFull(metaContent)
+	if !ok || len(ilocInfo.items) != 1 {
+		t.Fatalf("output: expected exactly 1 iloc item, got %+v", ilocInfo)
+	}
+	item := ilocInfo.items[0]
+	if len(item.extents) != 1 {
+		t.Fatalf("output: extent count = %d, want 1", len(item.extents))
+	}
+
+	end := item.extents[0].offset + item.extents[0].length
+	if end > uint64(len(output)) {
+		t.Fatalf("HEIF-ILOC-DUPBOX-01 (trailing-bytes variant): extent [%d,%d) exceeds output length %d",
+			item.extents[0].offset, end, len(output))
+	}
+	if end != uint64(len(output)) {
+		t.Errorf("output: extent end = %d, want file length %d (item payload must be the final bytes written)", end, len(output))
+	}
+
+	wantLen := uint64(4 + len(newEXIF))
+	if item.extents[0].length != wantLen {
+		t.Fatalf("output: extent length = %d, want %d", item.extents[0].length, wantLen)
+	}
+	got := output[item.extents[0].offset:end]
+	want := append([]byte{0, 0, 0, 0}, newEXIF...)
+	if !bytes.Equal(got, want) {
+		t.Errorf("output: extent bytes = %x, want %x (injected payload with 4-byte prefix)", got, want)
+	}
+
+	gotEXIF, _, _, err := Extract(bytes.NewReader(output))
+	if err != nil {
+		t.Fatalf("Extract on Inject output: %v", err)
+	}
+	if !bytes.Equal(gotEXIF, newEXIF) {
+		t.Errorf("round trip: got %d bytes, want %d bytes matching newEXIF", len(gotEXIF), len(newEXIF))
 	}
 }
 
@@ -1453,13 +1919,13 @@ func TestHEIFSlowPathMemory(t *testing.T) {
 
 	// Verify the file is large enough that meta is beyond 64 KB.
 	const headerWindow = 65536
-	metaData, err := findBox(fileData, "meta", 0)
+	metaData, err := findBox(fileData, boxTypeMeta, 0)
 	if err != nil || metaData == nil {
 		t.Fatalf("setup: meta box not found in slow-path synthetic HEIF")
 	}
 	// Confirm the meta box starts after headerWindow by checking that a quick
 	// scan of the first headerWindow bytes does NOT find the meta box.
-	quickMeta, _ := findBox(fileData[:headerWindow], "meta", 0)
+	quickMeta, _ := findBox(fileData[:headerWindow], boxTypeMeta, 0)
 	if quickMeta != nil {
 		t.Fatalf("setup: meta box found within first %d bytes — slow path will not be triggered", headerWindow)
 	}
@@ -1838,7 +2304,7 @@ func TestHEIFIlocZeroFieldSizeAmplificationBounded(t *testing.T) {
 		const ftypAndMetaHeaderLen = 20 + 8 + 4
 		data := buildIlocZeroFieldAmplification(4, 1, 2) // version 2 -> 4-byte item_count field
 		metaContent := data[ftypAndMetaHeaderLen:]
-		ilocData := findInnerBox(metaContent, "iloc")
+		ilocData := findInnerBox(metaContent, boxTypeIloc)
 		if ilocData == nil {
 			t.Fatal("test setup: could not locate iloc box in crafted data")
 		}
@@ -1856,7 +2322,7 @@ func TestHEIFIlocZeroFieldSizeAmplificationBounded(t *testing.T) {
 		const ftypAndMetaHeaderLen = 20 + 8 + 4
 		data := buildIlocZeroFieldAmplification(4, 1, 0) // version 0 -> 2-byte item_count field
 		metaContent := data[ftypAndMetaHeaderLen:]
-		ilocData := findInnerBox(metaContent, "iloc")
+		ilocData := findInnerBox(metaContent, boxTypeIloc)
 		if ilocData == nil {
 			t.Fatal("test setup: could not locate iloc box in crafted data")
 		}

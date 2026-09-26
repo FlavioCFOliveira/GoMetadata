@@ -132,7 +132,12 @@ type rawIFDEntry struct {
 func ifdEntryTable(buf []byte, ifdOff uint64, bigTIFF bool, order binary.ByteOrder) (count, entriesStart uint64, ok bool) {
 	countWidth, _, _ := ifdWidths(bigTIFF)
 	countWidth64 := uint64(countWidth) //nolint:gosec // G115: countWidth is the compile-time constant 2 or 8 from ifdWidths, never negative
-	if ifdOff+countWidth64 > uint64(len(buf)) {
+	// fits (extent.go), not a raw `ifdOff+countWidth64 > len(buf)`
+	// comparison: ifdOff is an attacker-controlled BigTIFF LONG8 offset (a
+	// next-IFD or SubIFD pointer), up to MaxUint64 — a raw addition can wrap
+	// to a small value and pass this check incorrectly (security audit
+	// finding, 2026-09-26).
+	if !fits(ifdOff, countWidth64, uint64(len(buf))) {
 		return 0, 0, false
 	}
 	if bigTIFF {
@@ -147,7 +152,12 @@ func ifdEntryTable(buf []byte, ifdOff uint64, bigTIFF bool, order binary.ByteOrd
 func readRawEntryAt(buf []byte, pos uint64, bigTIFF bool, order binary.ByteOrder) (rawIFDEntry, bool) {
 	_, entryWidth, valFieldWidth := ifdWidths(bigTIFF)
 	entryWidth64 := uint64(entryWidth) //nolint:gosec // G115: entryWidth is the compile-time constant 12 or 20 from ifdWidths, never negative
-	if pos+entryWidth64 > uint64(len(buf)) {
+	// fits (extent.go): pos is derived from ifdEntryTable/caller arithmetic
+	// that is itself bounded today, but this is the same class of
+	// off+width>n comparison flagged elsewhere in this file — guarded
+	// unconditionally rather than relying on every caller's own bound
+	// holding forever (security audit finding, 2026-09-26).
+	if !fits(pos, entryWidth64, uint64(len(buf))) {
 		return rawIFDEntry{}, false
 	}
 	e := buf[pos:]
@@ -237,13 +247,25 @@ func decodeOffsetArray(buf, valField []byte, count, elemSz uint64, bigTIFF bool,
 	if count == 0 || elemSz == 0 {
 		return nil, false
 	}
+	// Overflow-safe multiplication (mirrors extent.go's resolveEntryValue):
+	// count is an 8-byte BigTIFF LONG8 field, attacker-controlled up to
+	// MaxUint64, so count*elemSz itself can wrap before any bounds check
+	// runs (security audit finding, 2026-09-26).
+	const maxU64 = ^uint64(0)
+	if count > maxU64/elemSz {
+		return nil, false // corrupt/adversarial: count*elemSz would overflow uint64
+	}
 	total := count * elemSz
 	var src []byte
 	if total <= inlineThreshold(bigTIFF) {
 		src = valField
 	} else {
 		off := fieldAsU64(valField, bigTIFF, order)
-		if off+total > uint64(len(buf)) {
+		// fits (extent.go), not a raw `off+total > len(buf)` comparison —
+		// off can independently be near MaxUint64 from the same LONG8
+		// field, wrapping the addition to a small value that would
+		// incorrectly pass and then panic on buf[off:off+total] below.
+		if !fits(off, total, uint64(len(buf))) {
 			return nil, false
 		}
 		src = buf[off : off+total]
@@ -307,13 +329,27 @@ func parseIFDAtBigTIFF(base []byte, off uint64, order binary.ByteOrder) (*exif.I
 		if elemSz == 0 {
 			continue // unknown type: skip leniently (mirrors exif.Parse)
 		}
+		// Overflow-safe multiplication (mirrors extent.go's
+		// resolveEntryValue): entry.count is an 8-byte BigTIFF LONG8 field,
+		// attacker-controlled up to MaxUint64, so elemSz*entry.count itself
+		// can wrap before any bounds check runs (security audit finding,
+		// 2026-09-26).
+		const maxU64 = ^uint64(0)
+		if entry.count > maxU64/elemSz {
+			continue // corrupt/adversarial: elemSz*count would overflow uint64
+		}
 		total := elemSz * entry.count
 		var value []byte
 		if total <= bigTIFFInlineThreshold {
 			value = append([]byte(nil), entry.valField[:total]...)
 		} else {
 			valOff := fieldAsU64(entry.valField, true, order)
-			if valOff+total > uint64(len(base)) {
+			// fits (extent.go), not a raw `valOff+total > len(base)`
+			// comparison — valOff can independently be near MaxUint64 from
+			// the same LONG8 field, wrapping the addition to a small value
+			// that would incorrectly pass and then panic on
+			// base[valOff:valOff+total] below.
+			if !fits(valOff, total, uint64(len(base))) {
 				continue // OOL value out of bounds: skip leniently
 			}
 			value = append([]byte(nil), base[valOff:valOff+total]...)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
 	"testing"
 )
 
@@ -327,8 +328,8 @@ func TestParseCR3BoxHeader(t *testing.T) {
 		if size != 16 {
 			t.Errorf("size = %d, want 16", size)
 		}
-		if typ != "test" {
-			t.Errorf("typ = %q, want test", typ)
+		if string(typ[:]) != "test" {
+			t.Errorf("typ = %q, want test", typ[:])
 		}
 		if headerLen != 8 {
 			t.Errorf("headerLen = %d, want 8", headerLen)
@@ -349,8 +350,8 @@ func TestParseCR3BoxHeader(t *testing.T) {
 		if size != 24 {
 			t.Errorf("size = %d, want 24", size)
 		}
-		if typ != "uuid" {
-			t.Errorf("typ = %q, want uuid", typ)
+		if string(typ[:]) != "uuid" {
+			t.Errorf("typ = %q, want uuid", typ[:])
 		}
 		if headerLen != 16 {
 			t.Errorf("headerLen = %d, want 16", headerLen)
@@ -1117,7 +1118,7 @@ func readFirstOffsetInContainer(t *testing.T, data []byte, boxType string) int64
 		}
 		contentOff := pos + int(headerLen) //nolint:gosec // G115: headerLen is 8 or 16
 		boxEnd := pos + int(size)          //nolint:gosec // G115: ISOBMFF box size bounded by file size
-		if typ == boxType {
+		if string(typ[:]) == boxType {
 			// FullBox: version(1)+flags(3) = 4 bytes; entry_count at +4.
 			if contentOff+8 > len(data) {
 				t.Fatalf("readFirstOffsetInContainer: %s box too small", boxType)
@@ -1137,7 +1138,7 @@ func readFirstOffsetInContainer(t *testing.T, data []byte, boxType string) int64
 			}
 		}
 		// Recurse into container boxes.
-		switch typ {
+		switch string(typ[:]) {
 		case "trak", "mdia", "minf", "stbl":
 			if val := readFirstOffsetInContainer(t, data[contentOff:boxEnd], boxType); val != 0 {
 				return val
@@ -1161,7 +1162,7 @@ func readTwoTrakOffsets(t *testing.T, moovContent []byte, boxType string) (int64
 		}
 		contentOff := pos + int(headerLen) //nolint:gosec // G115: headerLen is 8 or 16
 		boxEnd := pos + int(size)          //nolint:gosec // G115: ISOBMFF box size bounded by file size
-		if typ == "trak" {
+		if string(typ[:]) == "trak" {
 			val := readFirstOffsetInContainer(t, moovContent[contentOff:boxEnd], boxType)
 			offsets = append(offsets, val)
 		}
@@ -1328,5 +1329,44 @@ func TestCR3RelocateInContainerDepthGuard(t *testing.T) {
 	// Any result (nil error or ErrStcoOverflow) is acceptable; no crash is the requirement.
 	if err != nil && !errors.Is(err, ErrStcoOverflow) {
 		t.Errorf("Inject on deeply-nested container returned unexpected error: %v", err)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Benchmarks (task #235: close the cr3/orf/rw2 observability gap)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// BenchmarkCR3Extract measures the cost of extracting metadata from a minimal
+// CR3 (ftyp/moov/Canon-uuid/CMT1) byte stream.
+//
+// #236: the reader is constructed once outside the loop and rewound via Seek
+// per iteration so the artificial bytes.Reader allocation does not inflate
+// the allocs/op reported for Extract itself.
+func BenchmarkCR3Extract(b *testing.B) {
+	data := buildMinimalCR3(minimalTIFF(), nil)
+	r := bytes.NewReader(data)
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
+	}
+}
+
+// BenchmarkCR3Inject measures the cost of replacing the CMT1 (EXIF) sub-box
+// of a minimal CR3 stream.
+func BenchmarkCR3Inject(b *testing.B) {
+	exif := minimalTIFF()
+	data := buildMinimalCR3(exif, nil)
+	newExif := append(exif[:len(exif):len(exif)], 0x00, 0x01, 0x02, 0x03) // different size than original
+	r := bytes.NewReader(data)
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_, _ = r.Seek(0, io.SeekStart)
+		var out bytes.Buffer
+		_ = Inject(r, &out, newExif, nil, nil, true)
 	}
 }

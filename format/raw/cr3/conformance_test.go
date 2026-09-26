@@ -114,7 +114,7 @@ func extractFirstOffset(moovContent []byte, boxType string) (int64, bool) {
 			break
 		}
 		content := moovContent[pos+int(headerLen) : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by slice length
-		switch typ {
+		switch string(typ[:]) {
 		case boxType:
 			// FullBox: version(1)+flags(3)+entry_count(4) = 8 bytes prefix.
 			if len(content) < 8 {
@@ -163,7 +163,7 @@ func TestBMFFBoxSizeNormal(t *testing.T) {
 	if sz != 16 {
 		t.Errorf("BMFF-box-size-normal: sz=%d, want 16", sz)
 	}
-	if typ != "moov" {
+	if string(typ[:]) != "moov" {
 		t.Errorf("BMFF-box-size-normal: typ=%q, want moov", typ)
 	}
 	if hdrLen != 8 {
@@ -191,7 +191,7 @@ func TestBMFFBoxSizeLargesize(t *testing.T) {
 	if sz != 24 {
 		t.Errorf("BMFF-box-size-largesize: sz=%d, want 24", sz)
 	}
-	if typ != "uuid" {
+	if string(typ[:]) != "uuid" {
 		t.Errorf("BMFF-box-size-largesize: typ=%q, want uuid", typ)
 	}
 	if hdrLen != 16 {
@@ -247,7 +247,7 @@ func TestBMFFBoxSize0ToEOF(t *testing.T) {
 	if sz != 20 {
 		t.Errorf("BMFF-box-size0-to-EOF: sz=%d, want 20 (full slice length)", sz)
 	}
-	if typ != "mdat" {
+	if string(typ[:]) != "mdat" {
 		t.Errorf("BMFF-box-size0-to-EOF: typ=%q, want mdat", typ)
 	}
 	if hdrLen != 8 {
@@ -307,7 +307,7 @@ func TestBMFFBoxSizeExactlyHeader(t *testing.T) {
 	if sz != 8 {
 		t.Errorf("BMFF-box-size-exactly-header: sz=%d, want 8", sz)
 	}
-	if typ != "free" {
+	if string(typ[:]) != "free" {
 		t.Errorf("BMFF-box-size-exactly-header: typ=%q, want free", typ)
 	}
 	if hdrLen != 8 {

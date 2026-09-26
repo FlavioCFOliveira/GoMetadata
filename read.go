@@ -58,9 +58,18 @@ var extractors = map[format.FormatID]func(io.ReadSeeker) ([]byte, []byte, []byte
 // m.EXIF, m.IPTC, and m.XMP directly — a nil value means that type was absent
 // (or failed to parse in best-effort mode).
 func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
-	cfg := &readConfig{}
-	for _, o := range opts {
-		o(cfg)
+	// #204: cfg is a stack value, not a heap-allocated *readConfig. Applying
+	// opts is confined to the out-of-line, non-inlined applyReadOptions so
+	// that the escape this indirection forces (see that function's doc
+	// comment) is paid only when the caller actually supplies options. The
+	// overwhelming majority of Read calls pass zero options, and for those,
+	// cfg here never has its address taken by anything the compiler cannot
+	// prove non-escaping (parseParsedMetadata and its helpers all take
+	// *readConfig read-only and are confirmed non-leaking via
+	// `go build -gcflags=-m`).
+	var cfg readConfig
+	if len(opts) > 0 {
+		cfg = applyReadOptions(opts)
 	}
 
 	// Detect container format from magic bytes.
@@ -84,22 +93,36 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 	// present (JPEG only; nil for all other formats). MWG §3.3.1.
 	// xmpTruncated is set when extended XMP was capped or had invalid layout (#134).
 	// noCMT1Box is set when a CR3 file has no CMT1 sub-box (audit #138).
-	rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, noCMT1Box, err := extractByFormat(r, fmtID)
+	// #238: pass the wanted-segments mask so extraction can skip work that
+	// only feeds a segment the caller opted out of via WithoutIPTC/WithoutXMP
+	// (currently meaningful for JPEG only: the 0x0425 IPTC digest and the
+	// extended-XMP reassembly). rawEXIF and rawIPTC are always extracted
+	// regardless — they must remain available for an unmodified Write to
+	// pass through byte-for-byte.
+	rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, noCMT1Box, err := extractByFormat(r, fmtID, !cfg.lazyIPTC, !cfg.lazyXMP)
 	if err != nil {
 		return nil, err
 	}
 
 	m := &Metadata{
-		format:     uint8(fmtID),
-		rawEXIF:    rawEXIF,
-		rawIPTC:    rawIPTC,
-		rawXMP:     rawXMP,
-		rawXMPWire: rawXMPWire,
+		format:             uint8(fmtID),
+		rawEXIF:            rawEXIF,
+		rawIPTC:            rawIPTC,
+		rawXMP:             rawXMP,
+		rawXMPWire:         rawXMPWire,
+		rawEXIFIsWholeFile: tiffFamilyRawEXIFIsWholeFile(r, fmtID, rawEXIF),
 		// rawIPTCDigest is populated only for JPEG (the only format whose IRB
 		// carries a Photoshop 0x0425 digest resource). TIFF stores IPTC in tag
 		// 0x83BB without an IRB wrapper, so no digest applies there.
 		rawIPTCDigest: rawIPTCDigest,
 	}
+
+	// #208: compute the MWG §3.3.1 IPTC-trust-elevation decision exactly once,
+	// here, and cache it. rawIPTC and rawIPTCDigest are already final at this
+	// point and never change for the rest of m's lifetime, so every later
+	// iptcTrustElevated() call (Copyright, Caption, Keywords, Creator) becomes
+	// a plain field read instead of re-hashing rawIPTC with MD5 each time.
+	m.iptcTrustElev = computeIPTCTrustElevated(m.rawIPTC, m.rawIPTCDigest)
 
 	// #134: surface extended XMP truncation as a ParseWarning so the caller
 	// can inspect it without aborting parsing. rawXMP still contains the main
@@ -123,11 +146,33 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 		})
 	}
 
-	if err := parseParsedMetadata(m, rawEXIF, rawIPTC, rawXMP, cfg); err != nil {
+	if err := parseParsedMetadata(m, rawEXIF, rawIPTC, rawXMP, &cfg); err != nil {
 		return nil, err
 	}
 
 	return m, nil
+}
+
+// applyReadOptions builds a readConfig by applying opts and returns it by
+// value.
+//
+// #204: kept out-of-line via go:noinline and called only when len(opts) > 0.
+// ReadOption is a func(*readConfig) invoked indirectly (o(cfg)); the Go
+// compiler cannot see through an indirect call to confirm the callee does
+// not retain the pointer, so any *readConfig passed to an indirect call is
+// conservatively heap-allocated (verified with `go build -gcflags=-m`, which
+// reports "leaking param: c" for the loop body below). Confining that leak to
+// this dedicated, never-inlined function means Read's own readConfig local
+// stays on the stack for the zero-option fast path — the heap allocation
+// here is paid only by callers who actually supply options.
+//
+//go:noinline
+func applyReadOptions(opts []ReadOption) readConfig {
+	var cfg readConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
+	return cfg
 }
 
 // applyOrWarn is the single dispatch point for a segment parse result.
@@ -166,36 +211,37 @@ func parseParsedMetadata(m *Metadata, rawEXIF, rawIPTC, rawXMP []byte, cfg *read
 	return applyOrWarn(m, parseXMP(m, rawXMP, cfg), cfg.strict)
 }
 
-// patchRawEXIFForParse returns a copy of raw with bytes[2:4] patched to
-// standard TIFF LE magic (0x2A 0x00) when the input carries a known
-// non-standard RAW-format magic that exif.Parse would reject.
+// nonStandardRAWMagic reports the RAW-container magic value at raw[2:4],
+// read as a little-endian uint16 (matching ORF/RW2's own byte order), when
+// raw carries a known non-standard classic-TIFF magic that exif.Parse would
+// otherwise reject. ok is false for any other input, including standard TIFF/
+// BigTIFF magic and big-endian files — those are parsed by exif.Parse without
+// any extra option.
 //
-// #117 fix: ORF/RW2 Extract functions return rawEXIF with the ORIGINAL magic
-// so callers can write the bytes back unmodified. exif.Parse requires the
-// standard TIFF magic (TIFF 6.0 §2). This helper patches only the transient
-// parse copy; m.rawEXIF is never modified.
+// #117: ORF/RW2 Extract functions return rawEXIF with the ORIGINAL magic so
+// callers can write the bytes back unmodified. #286: rather than cloning the
+// whole file to patch bytes[2:4] to standard TIFF magic (0x2A 0x00) before
+// parsing — which left that clone permanently retained via every out-of-line
+// IFDEntry.Value alias into it — parseEXIF passes the reported magic value to
+// exif.AcceptRAWMagic and parses raw directly, with zero extra allocation.
 //
 // Known non-standard magics (both little-endian, bytes[0:2] = "II"):
 //   - ORF IIRO: bytes[2:4] = 0x52 0x4F ('R', 'O') — Olympus DSLR / OM-D
 //   - ORF IIRS: bytes[2:4] = 0x52 0x53 ('R', 'S') — Olympus compact
 //   - RW2:      bytes[2:4] = 0x55 0x00             — Panasonic RAW
 //
-// ExifTool Olympus.pm / Panasonic RW2: patch bytes[2:4] for IFD traversal.
-func patchRawEXIFForParse(raw []byte) []byte {
+// ExifTool Olympus.pm / Panasonic RW2: these are the only bytes that diverge
+// from standard classic TIFF.
+func nonStandardRAWMagic(raw []byte) (magic uint16, ok bool) {
 	if len(raw) < 4 || raw[0] != 0x49 || raw[1] != 0x49 {
-		return raw // big-endian or standard magic: no patch needed
+		return 0, false // big-endian or too short: no non-standard magic possible
 	}
 	b2, b3 := raw[2], raw[3]
-	needsPatch := (b2 == 0x52 && (b3 == 0x4F || b3 == 0x53)) || // ORF IIRO/IIRS
-		(b2 == 0x55 && b3 == 0x00) // RW2 IIU\x00
-	if !needsPatch {
-		return raw
+	if (b2 == 0x52 && (b3 == 0x4F || b3 == 0x53)) || // ORF IIRO/IIRS
+		(b2 == 0x55 && b3 == 0x00) { // RW2 IIU\x00
+		return uint16(b2) | uint16(b3)<<8, true
 	}
-	patched := make([]byte, len(raw))
-	copy(patched, raw)
-	patched[2] = 0x2A
-	patched[3] = 0x00
-	return patched
+	return 0, false
 }
 
 // parseEXIF attempts to parse rawEXIF into m.EXIF when raw is non-nil and not lazy.
@@ -206,17 +252,43 @@ func patchRawEXIFForParse(raw []byte) []byte {
 // *ParseSegmentError entries so that callers can inspect them at the top-level
 // Metadata API without aborting parsing.
 //
-// #117: ORF/RW2 rawEXIF carries the original non-standard magic. patchRawEXIFForParse
-// provides a standard-magic copy for exif.Parse without modifying m.rawEXIF.
+// #117/#286: ORF/RW2 rawEXIF carries the original non-standard magic.
+// nonStandardRAWMagic detects it and exif.AcceptRAWMagic lets exif.Parse
+// consume raw directly — no clone, no retained copy of the whole file.
 func parseEXIF(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
 	if raw == nil || cfg.lazyEXIF {
 		return nil
 	}
-	var opts []exif.ParseOption
+	// Task #297: a fixed-size array assembled via direct indexed assignment,
+	// not append(nil, ...) — every EXIF Read previously paid +1 alloc/op for
+	// this construction. The three exif option constructors below
+	// (SkipMakerNote/AcceptRAWMagic/AliasThumbnail) are each a single
+	// non-capturing (AcceptRAWMagic captures its magic argument by value,
+	// the other two capture nothing) closure literal marked //go:noinline
+	// in exif/exif.go specifically so that inlining them here does not
+	// defeat the compiler's own "non-capturing closure is a static value"
+	// optimisation — confirmed via `go build -gcflags="-m -m"` that both the
+	// closures AND this array's own backing storage stay off the heap.
+	var optsArr [3]exif.ParseOption
+	n := 0
 	if cfg.skipMakerNote {
-		opts = []exif.ParseOption{exif.SkipMakerNote()}
+		optsArr[n] = exif.SkipMakerNote()
+		n++
 	}
-	e, err := exif.Parse(patchRawEXIFForParse(raw), opts...)
+	if magic, ok := nonStandardRAWMagic(raw); ok {
+		optsArr[n] = exif.AcceptRAWMagic(magic)
+		n++
+	}
+	// #293: raw is always m.rawEXIF here (see the call site in Read), a field
+	// retained unmodified for m's entire lifetime — exactly the safety
+	// contract exif.AliasThumbnail requires. Aliasing elides one make+copy
+	// per embedded JPEG thumbnail (EXIF §4.5.5), which can be several hundred
+	// KB for RAW files carrying a PreviewIFD JPEG (e.g. Nikon D810.nef:
+	// 151,236 B). See AliasThumbnail's own doc comment for the full contract.
+	optsArr[n] = exif.AliasThumbnail()
+	n++
+	opts := optsArr[:n]
+	e, err := exif.Parse(raw, opts...)
 	if err != nil {
 		return &ParseSegmentError{Segment: "EXIF", Err: err}
 	}
@@ -284,9 +356,64 @@ func ReadFile(path string, opts ...ReadOption) (*Metadata, error) {
 // noCMT1Box is true when a CR3 file has a valid moov/UUID structure but no
 // CMT1 sub-box (audit #138). rawEXIF is nil; rawXMP is still returned when
 // an "XMP " sub-box was present. The caller converts it to a ParseWarning.
-func extractByFormat(r io.ReadSeeker, fmtID format.FormatID) (rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire []byte, xmpTruncated, noCMT1Box bool, err error) {
+//
+// tiffFamilyRawEXIFIsWholeFile reports whether rawEXIF, as just extracted for
+// one of the five TIFF-family formats (TIFF, CR2, NEF, ARW, DNG — the ones
+// where the TIFF byte stream is itself the EXIF container), happens to equal
+// the ENTIRE source file rather than just format/tiff.Extract's metadata
+// prefix (#289). This can legitimately happen: the extent scanner's own
+// small-file whole-read bypass or large-fraction snap (see
+// format/tiff/extent.go) converges on the whole file for some inputs.
+//
+// For every other format, this always returns false without touching r: the
+// two extra Seek calls below are paid only by the five formats that can ever
+// benefit from the answer.
+//
+// r's position is restored to exactly what it was when this function was
+// called, so it never affects Read's own behaviour or any later use of r —
+// any failure restoring it is treated as "answer unknown" (false), never as
+// a fatal error: worst case, Write falls back to re-reading the source
+// itself, which is always correct, just not maximally fast.
+func tiffFamilyRawEXIFIsWholeFile(r io.ReadSeeker, fmtID format.FormatID, rawEXIF []byte) bool {
+	switch fmtID {
+	case format.FormatTIFF, format.FormatCR2, format.FormatNEF, format.FormatARW, format.FormatDNG,
+		format.FormatORF, format.FormatRW2:
+		// #293: orf.Extract/rw2.Extract now route through
+		// tiff.ExtractWithMagic (the same #289 metadata-prefix scanner), so
+		// their rawEXIF is subject to the identical "prefix, except when the
+		// scanner happened to read the whole file" contract as TIFF/CR2/NEF/
+		// ARW/DNG — this check must extend to them too, or writeTIFFORF/
+		// writeTIFFRW2 would keep assuming m.rawEXIF is always the whole
+		// file (their pre-#293 invariant) and fail image-block enumeration
+		// for any real ORF/RW2 file, whose prefix excludes the strip data.
+	default:
+		return false
+	}
+	if rawEXIF == nil {
+		return false
+	}
+	cur, err := r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return false
+	}
+	end, err := r.Seek(0, io.SeekEnd)
+	if err != nil {
+		return false
+	}
+	if _, err := r.Seek(cur, io.SeekStart); err != nil {
+		return false
+	}
+	return int64(len(rawEXIF)) == end
+}
+
+// wantIPTC and wantXMP (#238) are forwarded to jpeg.ExtractFullSelective so
+// the JPEG extractor can skip the 0x0425 IPTC digest and/or the extended-XMP
+// reassembly when the caller has opted out of that segment. Other formats do
+// not yet have an equivalent selective-extraction path (their raw-segment
+// extraction has no comparable reassembly cost) and are unaffected.
+func extractByFormat(r io.ReadSeeker, fmtID format.FormatID, wantIPTC, wantXMP bool) (rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire []byte, xmpTruncated, noCMT1Box bool, err error) {
 	if fmtID == format.FormatJPEG {
-		rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, err = jpeg.ExtractFull(r)
+		rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, err = jpeg.ExtractFullSelective(r, wantIPTC, wantXMP)
 		if err != nil {
 			return nil, nil, nil, nil, nil, false, false, fmt.Errorf("gometadata: %w", err)
 		}

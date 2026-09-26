@@ -24,6 +24,7 @@ package nef
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -1072,9 +1073,14 @@ func BenchmarkNEFExtractMakerNote(b *testing.B) {
 	)
 	data, _ := buildNEFWithMakerNote(binary.BigEndian, mnBlob)
 
+	// #236: reader constructed once outside the loop and rewound via Seek per
+	// iteration so the artificial bytes.Reader allocation does not inflate
+	// the allocs/op reported for Extract itself.
+	r := bytes.NewReader(data)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		_, _, _, _ = Extract(bytes.NewReader(data))
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
 	}
 }

@@ -14,6 +14,7 @@ package gometadata
 import (
 	"bytes"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -737,10 +738,15 @@ func BenchmarkReadProgressiveJPEG(b *testing.B) {
 	if err != nil {
 		b.Fatalf("read: %v", err)
 	}
+	// #236: reader constructed once outside the loop and rewound via Seek per
+	// iteration so the artificial bytes.Reader allocation does not inflate
+	// the allocs/op reported for the library's own Read path.
+	r := bytes.NewReader(data)
 	b.ResetTimer()
 	b.SetBytes(int64(len(data)))
 	for range b.N {
-		if _, err := Read(bytes.NewReader(data)); err != nil {
+		_, _ = r.Seek(0, io.SeekStart)
+		if _, err := Read(r); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -757,10 +763,13 @@ func BenchmarkReadCombinedMetadataJPEG(b *testing.B) {
 	if err != nil {
 		b.Fatalf("read: %v", err)
 	}
+	// #236: reader hoisted outside the loop; see BenchmarkReadProgressiveJPEG.
+	r := bytes.NewReader(data)
 	b.ResetTimer()
 	b.SetBytes(int64(len(data)))
 	for range b.N {
-		if _, err := Read(bytes.NewReader(data)); err != nil {
+		_, _ = r.Seek(0, io.SeekStart)
+		if _, err := Read(r); err != nil {
 			b.Fatal(err)
 		}
 	}

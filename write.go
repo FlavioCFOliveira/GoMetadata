@@ -2,6 +2,7 @@ package gometadata
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"github.com/FlavioCFOliveira/GoMetadata/format/raw/rw2"
 	"github.com/FlavioCFOliveira/GoMetadata/format/tiff"
 	"github.com/FlavioCFOliveira/GoMetadata/format/webp"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 	"github.com/FlavioCFOliveira/GoMetadata/iptc"
 	xmppkg "github.com/FlavioCFOliveira/GoMetadata/xmp"
 )
@@ -74,9 +76,14 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 		return err
 	}
 
-	cfg := &writeConfig{preserveUnknownSegments: true}
-	for _, o := range opts {
-		o(cfg)
+	// #204: cfg is a stack value; see applyWriteOptions for why applying opts
+	// is confined to a dedicated, non-inlined function instead of a bare loop
+	// here. cfg's only downstream use is the plain field read
+	// cfg.preserveUnknownSegments below, so — unlike readConfig — no pointer
+	// to it ever needs to be threaded further into the call graph.
+	cfg := writeConfig{preserveUnknownSegments: true}
+	if len(opts) > 0 {
+		cfg = applyWriteOptions(opts)
 	}
 
 	// Detect container format.
@@ -122,7 +129,7 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	//
 	// FormatTIFF, FormatDNG: standard copy-and-relocate (writeTIFF).
 	// FormatCR2: same relocation base, but bytes 8–11 (Canon "CR\02\00" marker)
-	//   must be restored after encoding — InjectWithEXIFCR2 handles this.
+	//   must be restored after encoding — InjectWithEXIFCR2Stream handles this.
 	// FormatNEF: Nikon MakerNote blob extension + PreviewIFD relocation (writeTIFFNEF, task #102).
 	// FormatARW: Sony MakerNote TIFF-absolute rebase + SR2Private block (writeTIFFARW, task #103).
 	// FormatORF: non-standard IIRO/IIRS magic patch-and-restore (writeTIFFORF, task #104).
@@ -182,6 +189,25 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	}
 
 	return injectByFormat(r, w, fmtID, rawEXIF, rawIPTC, rawXMP, cfg.preserveUnknownSegments)
+}
+
+// applyWriteOptions builds a writeConfig (starting from the documented
+// preserveUnknownSegments=true default) by applying opts and returns it by
+// value.
+//
+// #204: kept out-of-line via go:noinline and called only when len(opts) > 0,
+// for the same reason as read.go's applyReadOptions: WriteOption is a
+// func(*writeConfig) invoked indirectly, which forces the Go compiler to
+// heap-allocate any *writeConfig passed to it. Isolating that call here keeps
+// Write's own writeConfig local on the stack for the zero-option fast path.
+//
+//go:noinline
+func applyWriteOptions(opts []WriteOption) writeConfig {
+	cfg := writeConfig{preserveUnknownSegments: true}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	return cfg
 }
 
 // WriteFile reads the image at path, applies the metadata in m, and writes
@@ -336,13 +362,13 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error { //nolint:c
 // writeTIFF separates the two concerns:
 //   - originalBytes: the ORIGINAL TIFF bytes, read from r (or from
 //     m.rawEXIF which tiff.Extract already populated). Used as the image-data
-//     source in tiff.InjectWithEXIF → relocateTIFFFromParsed step 12.
+//     source in tiff.InjectWithEXIFStream → relocateTIFFFromParsed step 12.
 //   - modifiedEXIF: m.EXIF as-is (already mutated by Set* calls). Its IFDs
 //     carry both the edited metadata AND the original image-block offsets
 //     (StripOffsets/TileOffsets still point at originalBytes positions).
 //
 // IPTC and XMP are encoded the normal way and upserted into IFD0 by
-// tiff.InjectWithEXIF → relocateTIFFFromParsed step 2.
+// tiff.InjectWithEXIFStream → relocateTIFFFromParsed step 2.
 //
 // CR2 uses standard LE TIFF magic (II*\0) and parses via exif.Parse.
 // MakerNote blob is copied verbatim — per SPIKE #24, Canon MakerNotes use
@@ -363,48 +389,78 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error { //nolint:c
 // against real fixtures (task #271).
 // BigTIFF spec §2 (Aware Systems / libtiff).
 
-// readAllCapped reads all of r, capping the total to maxFileSize+1 bytes via
-// io.LimitReader so that an oversized or infinite streaming reader cannot
-// trigger unbounded heap allocation.
+// readAllCapped reads all of r into memory, capped at maxFileSize bytes.
 //
-// Security audit FIX 3 (CWE-770/400): every writeTIFF* entry point falls back
-// to a bare io.ReadAll(r) when m.rawEXIF is nil (the caller constructed
-// *Metadata via NewMetadata rather than Read). #140 already capped every
-// io.ReadAll in the format/* packages (format/tiff, format/heif, ...) with
-// this identical pattern; these six root-package call sites were missed.
-// tag identifies the calling write path (e.g. "tiff", "cr2") for the wrapped
-// error message.
-func readAllCapped(r io.Reader, tag string) ([]byte, error) {
-	data, err := io.ReadAll(io.LimitReader(r, maxFileSize+1))
+// Security audit FIX 3 (CWE-770/400): every writeTIFF* entry point must cap
+// its read of r so that an oversized or infinite streaming reader cannot
+// trigger unbounded heap allocation. tag identifies the calling write path
+// (e.g. "tiff", "cr2") for the wrapped error message.
+//
+// #289/#291 follow-up: r is always a seekable source in every call site
+// (each of the writeTIFF* functions receives an io.ReadSeeker), so this
+// delegates to iobuf.ReadAll, which learns the exact remaining size via
+// Seek(SeekEnd) and performs exactly ONE allocation (make([]byte, size))
+// plus ONE io.ReadFull — unlike the stdlib io.ReadAll(io.LimitReader(...))
+// this replaced, which grows its buffer geometrically across a variable
+// number of internal Read calls and reallocations of unknown final size.
+// tiffPrefixBytes's defensive fallback (when m.rawEXIF is nil) is now the
+// only caller: #291 follow-up made the metadata prefix sufficient as the
+// copy-and-relocate base for every TIFF-family format, so a full re-read is
+// no longer needed on the common path at all.
+func readAllCapped(r io.ReadSeeker, tag string) ([]byte, error) {
+	data, err := iobuf.ReadAll(r, maxFileSize)
 	if err != nil {
+		if errors.Is(err, iobuf.ErrTooLarge) {
+			return nil, fmt.Errorf("gometadata: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
+		}
 		return nil, fmt.Errorf("gometadata: %s read: %w", tag, err)
-	}
-	if int64(len(data)) > maxFileSize {
-		return nil, fmt.Errorf("gometadata: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
 	}
 	return data, nil
 }
 
-func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // conditional logic for originalBytes source + nil guards + three encode paths; splitting would reduce clarity
-	// Obtain the original TIFF bytes. tiff.Extract (called during Read) stores
-	// the entire TIFF stream in m.rawEXIF; use it when available to avoid a
-	// second full-file read.
-	//
-	// #139: use a defensive copy of m.rawEXIF so that caller mutations of the
-	// slice returned by RawEXIF() do not affect the relocation base. This is
-	// consistent with writeTIFFORF/writeTIFFRW2 which already copy m.rawEXIF.
-	var originalBytes []byte
+// tiffPrefixBytes returns the copy-and-relocate base for every TIFF-family
+// format — TIFF, DNG, CR2, NEF, ARW, ORF, and RW2 (task #291 follow-up: all
+// seven now operate on a metadata PREFIX alone. NEF/ARW/ORF's own
+// manufacturer-specific relocators fetch the small additional byte range
+// their private structures need directly from r on demand — see
+// extractNikonPreviewInfo/extractSonySR2Info/extractOlympMakerNoteInfo's own
+// doc comments in format/tiff/relocate_{nef,arw,orf}.go — and RW2's
+// RawDataOffset-to-EOF block is sized against the true file length rather
+// than len(prefix); every format's actual image-data blocks stream from r,
+// never buffered in prefix in the first place).
+//
+// The common case is a plain field read: m.rawEXIF (populated by Read) and
+// m.rawEXIFIsWholeFile are returned directly, with NO I/O at all — #289/#293's
+// metadata-prefix scanner already computed exactly what is needed.
+//
+// Defensive fallback: when m.rawEXIF is nil (e.g. a Metadata read with
+// WithoutEXIF(), or constructed without a prior Read), the whole file is read
+// fresh from r and treated as authoritative (wholeFile=true) — the same
+// safety net originalTIFFBytes has always provided for NEF/ARW/ORF/RW2.
+func tiffPrefixBytes(r io.ReadSeeker, m *Metadata, tag string) (prefix []byte, wholeFile bool, err error) {
 	if m.rawEXIF != nil {
-		originalBytes = bytes.Clone(m.rawEXIF)
-	} else {
-		if _, err := r.Seek(0, io.SeekStart); err != nil {
-			return fmt.Errorf("gometadata: tiff seek: %w", err)
-		}
-		var err error
-		originalBytes, err = readAllCapped(r, "tiff")
-		if err != nil {
-			return err
-		}
+		return m.rawEXIF, m.rawEXIFIsWholeFile, nil
+	}
+	if _, seekErr := r.Seek(0, io.SeekStart); seekErr != nil {
+		return nil, false, fmt.Errorf("gometadata: %s seek: %w", tag, seekErr)
+	}
+	data, err := readAllCapped(r, tag)
+	if err != nil {
+		return nil, false, err
+	}
+	return data, true, nil
+}
+
+func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error {
+	// #291: prefix is m.rawEXIF as-is — a metadata PREFIX for most real files
+	// (#289's scanner: every IFD and out-of-line tag value, never the strip/
+	// tile pixel data or embedded previews a real TIFF/DNG spends the
+	// overwhelming majority of its bytes on) or the whole file when
+	// wholeFile is true. tiff.InjectWithEXIFStream streams image-data blocks from r
+	// itself when prefix is not the whole file — no second full-file read.
+	prefix, wholeFile, err := tiffPrefixBytes(r, m, "tiff")
+	if err != nil {
+		return err
 	}
 
 	// Encode IPTC and XMP the normal way (nil → pass-through original bytes).
@@ -419,19 +475,11 @@ func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclo
 		return err
 	}
 
-	// If the caller did not modify IPTC or XMP AND did not modify EXIF either,
-	// perform a simple pass-through write — no relocation needed.
-	if rawIPTC == nil && rawXMP == nil && m.EXIF == nil {
-		if _, err := w.Write(originalBytes); err != nil {
-			return fmt.Errorf("gometadata: tiff write passthrough: %w", err)
-		}
-		return nil
-	}
-
-	// Delegate to tiff.InjectWithEXIF which calls relocateTIFFFromParsed with
-	// the original bytes as the image-data source and m.EXIF as the IFD model.
-	// m.EXIF may be nil (no EXIF modifications); InjectWithEXIF falls back to
-	// parsing originalBytes in that case, same behaviour as Inject.
+	// Delegate to tiff.InjectWithEXIFStream, which calls relocateTIFFFromParsed with
+	// prefix as the metadata source and m.EXIF as the IFD model. m.EXIF may be
+	// nil (no EXIF modifications) and rawIPTC/rawXMP may both be nil (no
+	// IPTC/XMP changes); InjectWithEXIFStream's own pass-through fast path handles
+	// that case — streaming prefix/r through unchanged, no relocation.
 	//
 	// #109: pass a deep clone of m.EXIF so that relocateTIFFFromParsed's
 	// structural mutations (ThumbnailData clear, Entries slice rewrite for
@@ -439,7 +487,7 @@ func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclo
 	// caller's *Metadata.  A second Write call on the same *Metadata would
 	// otherwise see a corrupted IFD0 (missing strip offsets, cleared thumbnail,
 	// altered entry count) and produce wrong output or an ErrBlockOutOfBounds.
-	if err := tiff.InjectWithEXIF(originalBytes, cloneEXIF(m.EXIF), rawIPTC, rawXMP, w); err != nil {
+	if err := tiff.InjectWithEXIFStream(r, prefix, wholeFile, cloneEXIF(m.EXIF), rawIPTC, rawXMP, w); err != nil {
 		return fmt.Errorf("gometadata: %w", err)
 	}
 	return nil
@@ -453,24 +501,15 @@ func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclo
 //   - bytes 10–11: 0x02 0x00           — CR2 version 2.0
 //
 // exif.Encode rebuilds the TIFF with IFD0 at offset 8, overwriting those bytes.
-// tiff.InjectWithEXIFCR2 restores them from the original file after relocation.
+// tiff.InjectWithEXIFCR2Stream restores them from the original file after relocation.
 //
 // containers.md §8(e): "CR2: preserve CR 02 00 at offset 8."
 // Validated against real Canon EOS 350D/70D/7D corpus files.
-func writeTIFFCR2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // mirrors writeTIFF; CR2-specific marker-restore call; splitting reduces clarity
-	// #139: defensive copy of m.rawEXIF (consistent with writeTIFF, writeTIFFORF, writeTIFFRW2).
-	var originalBytes []byte
-	if m.rawEXIF != nil {
-		originalBytes = bytes.Clone(m.rawEXIF)
-	} else {
-		if _, err := r.Seek(0, io.SeekStart); err != nil {
-			return fmt.Errorf("gometadata: cr2 seek: %w", err)
-		}
-		var err error
-		originalBytes, err = readAllCapped(r, "cr2")
-		if err != nil {
-			return err
-		}
+func writeTIFFCR2(r io.ReadSeeker, w io.Writer, m *Metadata) error {
+	// #291: see writeTIFF's own comment — identical rationale for CR2.
+	prefix, wholeFile, err := tiffPrefixBytes(r, m, "cr2")
+	if err != nil {
+		return err
 	}
 
 	rawIPTC, err := encodeIPTC(m)
@@ -482,15 +521,8 @@ func writeTIFFCR2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 		return err
 	}
 
-	if rawIPTC == nil && rawXMP == nil && m.EXIF == nil {
-		if _, err := w.Write(originalBytes); err != nil {
-			return fmt.Errorf("gometadata: cr2 write passthrough: %w", err)
-		}
-		return nil
-	}
-
 	// #109: pass a deep clone of m.EXIF (see writeTIFF for rationale).
-	if err := tiff.InjectWithEXIFCR2(originalBytes, cloneEXIF(m.EXIF), rawIPTC, rawXMP, w); err != nil {
+	if err := tiff.InjectWithEXIFCR2Stream(r, prefix, wholeFile, cloneEXIF(m.EXIF), rawIPTC, rawXMP, w); err != nil {
 		return fmt.Errorf("gometadata: %w", err)
 	}
 	return nil
@@ -511,26 +543,25 @@ func writeTIFFCR2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 //     appended to the output, and its internal TIFF-absolute pointers rebased.
 //     The 0xC634 inline value in IFD0 is patched post-encode.
 //
-// The ARW-specific path (tiff.InjectWithEXIFARW) handles both concerns.
+// The ARW-specific path (tiff.InjectWithEXIFARWStream) handles both concerns.
 // All other aspects (SubIFD relocation, OOL RATIONAL patching, etc.) are
 // identical to the standard writeTIFF path.
 //
 // Validated against real.arw (Sony DSLR-A500, 13 MB): ImageDataHash IN==OUT,
 // all metadata including 52 MakerNote tags and SR2Private block preserved.
-func writeTIFFARW(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // conditional logic mirrors writeTIFF; splitting reduces clarity
-	// #139: defensive copy of m.rawEXIF (consistent with writeTIFF, writeTIFFORF, writeTIFFRW2).
-	var originalBytes []byte
-	if m.rawEXIF != nil {
-		originalBytes = bytes.Clone(m.rawEXIF)
-	} else {
-		if _, err := r.Seek(0, io.SeekStart); err != nil {
-			return fmt.Errorf("gometadata: arw seek: %w", err)
-		}
-		var err error
-		originalBytes, err = readAllCapped(r, "arw")
-		if err != nil {
-			return err
-		}
+func writeTIFFARW(r io.ReadSeeker, w io.Writer, m *Metadata) error {
+	// #289: m.rawEXIF is only the metadata prefix for ARW too in the general
+	// case (see writeTIFF's comment above).
+	//
+	// #291 follow-up: prefix is now sufficient for ARW's write path too.
+	// Sony's SR2Private block (0xC634) lives past what the prefix covers
+	// (it is an inline pointer with no declared byte count for the scanner
+	// to extend into), but tiff.InjectWithEXIFARWStream's relocator fetches that
+	// small additional range directly from r on demand — see
+	// extractSonySR2Info's own doc comment in format/tiff/relocate_arw.go.
+	prefix, wholeFile, err := tiffPrefixBytes(r, m, "arw")
+	if err != nil {
+		return err
 	}
 
 	rawIPTC, err := encodeIPTC(m)
@@ -542,15 +573,11 @@ func writeTIFFARW(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 		return err
 	}
 
-	if rawIPTC == nil && rawXMP == nil && m.EXIF == nil {
-		if _, err := w.Write(originalBytes); err != nil {
-			return fmt.Errorf("gometadata: arw write passthrough: %w", err)
-		}
-		return nil
-	}
-
+	// InjectWithEXIFARWStream's own pass-through fast path handles the
+	// no-metadata-changes case (rawIPTC/rawXMP/m.EXIF all nil).
+	//
 	// #109: pass a deep clone of m.EXIF (see writeTIFF for rationale).
-	if err := tiff.InjectWithEXIFARW(originalBytes, cloneEXIF(m.EXIF), rawIPTC, rawXMP, w); err != nil {
+	if err := tiff.InjectWithEXIFARWStream(r, prefix, wholeFile, cloneEXIF(m.EXIF), rawIPTC, rawXMP, w); err != nil {
 		return fmt.Errorf("gometadata: %w", err)
 	}
 	return nil
@@ -564,7 +591,7 @@ func writeTIFFARW(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 //
 // #117 fix: orf.Extract now returns rawEXIF with the ORIGINAL magic preserved.
 // writeTIFFORF reads the original magic from r (which is authoritative) and
-// stores it into the working copy of m.rawEXIF so InjectWithEXIFORF can patch
+// stores it into the working copy of m.rawEXIF so InjectWithEXIFORFStream can patch
 // to standard TIFF magic for the relocation pass and restore the ORF magic after.
 //
 // All other aspects (strip/tile relocation, SubIFD relocation, OOL RATIONAL
@@ -575,38 +602,29 @@ func writeTIFFARW(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 //
 // Un-gated in task #104 after real-corpus validation (Olympus E-M10 IIRO,
 // Olympus C5050Z IIRS): ImageDataHash IN==OUT, all metadata preserved.
-func writeTIFFORF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // conditional logic mirrors writeTIFF; splitting reduces clarity
-	// Recover the original ORF magic from r (bytes 0-3 of the file).
-	// m.rawEXIF carries patched magic (0x2A 0x00 at bytes [2:4]) because
-	// orf.Extract patches in-place before returning rawEXIF.
-	if _, err := r.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("gometadata: orf seek for magic: %w", err)
-	}
-	var origMagicBuf [4]byte
-	if _, err := io.ReadFull(r, origMagicBuf[:]); err != nil {
-		return fmt.Errorf("gometadata: orf read magic: %w", err)
-	}
-
-	// Obtain the original ORF bytes for use as the image-data relocation base.
-	// Use m.rawEXIF when available (orf.Extract stores the full ORF stream there);
-	// fall back to a full read from r.
-	var originalBytes []byte
-	if m.rawEXIF != nil {
-		originalBytes = make([]byte, len(m.rawEXIF))
-		copy(originalBytes, m.rawEXIF)
-		// Restore the real ORF magic (m.rawEXIF has patched bytes [2:4] = 0x2A 0x00).
-		if len(originalBytes) >= 4 {
-			copy(originalBytes[0:4], origMagicBuf[:])
-		}
-	} else {
-		if _, err := r.Seek(0, io.SeekStart); err != nil {
-			return fmt.Errorf("gometadata: orf seek: %w", err)
-		}
-		var err error
-		originalBytes, err = readAllCapped(r, "orf")
-		if err != nil {
-			return err
-		}
+func writeTIFFORF(r io.ReadSeeker, w io.Writer, m *Metadata) error {
+	// #117: orf.Extract stores rawEXIF with the ORIGINAL ORF magic preserved
+	// (bytes[0:4]) — it never patches in place. #285/#286: no clone is needed
+	// here any more: relocateTIFFFromParsedORF derives and restores the magic
+	// itself (isORFMagic / origMagic) and, following the #286 fix that
+	// replaced its in-place base[2:4] patch with exif.AcceptRAWMagic, never
+	// mutates the bytes it is given.
+	//
+	// #293: orf.Extract now routes through tiff.ExtractWithMagic (#289's
+	// metadata-prefix scanner), so m.rawEXIF is usually only a PREFIX, not
+	// the whole file.
+	//
+	// #291 follow-up: prefix is now sufficient for ORF's write path too. The
+	// OLYMP-type MakerNote's external ThumbnailImage pointer lives inside the
+	// MakerNote's own internal IFD (past what the prefix covers in the rare
+	// case it is not already there), but tiff.InjectWithEXIFORFStream's relocator
+	// fetches that small additional range directly from r on demand — see
+	// extractOlympMakerNoteInfo's own doc comment in
+	// format/tiff/relocate_orf.go. The thumbnail JPEG data itself streams
+	// like any other image block; it is never buffered in base.
+	prefix, wholeFile, err := tiffPrefixBytes(r, m, "orf")
+	if err != nil {
+		return err
 	}
 
 	rawIPTC, err := encodeIPTC(m)
@@ -618,13 +636,9 @@ func writeTIFFORF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 		return err
 	}
 
-	if rawIPTC == nil && rawXMP == nil && m.EXIF == nil {
-		if _, err := w.Write(originalBytes); err != nil {
-			return fmt.Errorf("gometadata: orf write passthrough: %w", err)
-		}
-		return nil
-	}
-
+	// InjectWithEXIFORFStream's own pass-through fast path handles the
+	// no-metadata-changes case (rawIPTC/rawXMP/m.EXIF all nil).
+	//
 	// Security audit FIX 2: pass a clone, not m.EXIF directly.
 	// relocateTIFFFromParsedORF permanently mutates the *exif.EXIF it is given
 	// (clears ThumbnailData, rewrites StripOffsets/StripByteCounts/MakerNote
@@ -633,7 +647,7 @@ func writeTIFFORF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 	// fix); ORF was added later in #104 and missed the clone, so a second
 	// Write() call on the same *Metadata reused the already-mutated EXIF and
 	// silently corrupted the output image data.
-	if err := tiff.InjectWithEXIFORF(originalBytes, cloneEXIF(m.EXIF), rawIPTC, rawXMP, w); err != nil {
+	if err := tiff.InjectWithEXIFORFStream(r, prefix, wholeFile, cloneEXIF(m.EXIF), rawIPTC, rawXMP, w); err != nil {
 		return fmt.Errorf("gometadata: %w", err)
 	}
 	return nil
@@ -648,46 +662,40 @@ func writeTIFFORF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 //     parsing and restores the original magic in the output.
 //
 //  2. 16-byte Panasonic device GUID at bytes [8:24].
-//     IFD0 is at offset 24 (not the standard 8). After tiff.InjectWithEXIFRW2
+//     IFD0 is at offset 24 (not the standard 8). After tiff.InjectWithEXIFRW2Stream
 //     (which produces IFD0 at offset 8 via exif.Encode) the GUID is re-inserted
 //     at position 8 and all absolute IFD0 OOL pointers are rebased by +16.
 //
 // #117 fix: rw2.Extract now returns rawEXIF with the ORIGINAL magic preserved.
 // writeTIFFRW2 reads the original magic from r (which is authoritative) and
-// stores it into the working copy of m.rawEXIF so InjectWithEXIFRW2 can patch
+// stores it into the working copy of m.rawEXIF so InjectWithEXIFRW2Stream can patch
 // to standard TIFF magic for the relocation pass and restore the RW2 magic after.
 //
 // Un-gated in task #104 after real-corpus validation (Panasonic DMC-GF1):
 // ImageDataHash IN==OUT, JpgFromRaw (0x002E) and raw sensor data preserved.
-func writeTIFFRW2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // conditional logic mirrors writeTIFF; splitting reduces clarity
-	// Recover the original RW2 magic from r.
-	// m.rawEXIF carries patched magic (0x2A 0x00 at bytes [2:4]).
-	if _, err := r.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("gometadata: rw2 seek for magic: %w", err)
-	}
-	var origMagicBuf [4]byte
-	if _, err := io.ReadFull(r, origMagicBuf[:]); err != nil {
-		return fmt.Errorf("gometadata: rw2 read magic: %w", err)
-	}
-
+func writeTIFFRW2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop // conditional logic mirrors writeTIFF; splitting reduces clarity
 	// Obtain the original RW2 bytes for use as the image-data relocation base.
-	var originalBytes []byte
-	if m.rawEXIF != nil {
-		originalBytes = make([]byte, len(m.rawEXIF))
-		copy(originalBytes, m.rawEXIF)
-		// Restore the real RW2 magic (m.rawEXIF has patched bytes [2:4] = 0x2A 0x00).
-		if len(originalBytes) >= 4 {
-			copy(originalBytes[0:4], origMagicBuf[:])
-		}
-	} else {
-		if _, err := r.Seek(0, io.SeekStart); err != nil {
-			return fmt.Errorf("gometadata: rw2 seek: %w", err)
-		}
-		var err error
-		originalBytes, err = readAllCapped(r, "rw2")
-		if err != nil {
-			return err
-		}
+	//
+	// #117: rw2.Extract stores rawEXIF with the ORIGINAL RW2 magic preserved
+	// — it never patches in place. #285/#286: no clone is needed here any
+	// more: relocateTIFFFromParsedRW2 derives and restores the magic itself
+	// and, following the #286 fix that replaced its in-place base[2:4] patch
+	// with exif.AcceptRAWMagic, never mutates the bytes it is given.
+	//
+	// #293: rw2.Extract now routes through tiff.ExtractWithMagic (#289's
+	// metadata-prefix scanner), so m.rawEXIF is usually only a PREFIX, not
+	// the whole file.
+	//
+	// #291 follow-up: prefix is now sufficient for RW2's write path too.
+	// RawDataOffset's own raw sensor block is sized against the TRUE file
+	// length (fileLen, resolved by tiff.InjectWithEXIFRW2Stream itself) rather than
+	// len(prefix) — see extractRW2RawDataBlock's own doc comment in
+	// format/tiff/relocate_rw2.go — and streams from r like any other image
+	// block; nothing else RW2-specific needs bytes beyond the prefix (the
+	// 16-byte GUID lives in the fixed header, always within reach).
+	prefix, wholeFile, err := tiffPrefixBytes(r, m, "rw2")
+	if err != nil {
+		return err
 	}
 
 	rawIPTC, err := encodeIPTC(m)
@@ -699,17 +707,13 @@ func writeTIFFRW2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 		return err
 	}
 
-	if rawIPTC == nil && rawXMP == nil && m.EXIF == nil {
-		if _, err := w.Write(originalBytes); err != nil {
-			return fmt.Errorf("gometadata: rw2 write passthrough: %w", err)
-		}
-		return nil
-	}
-
+	// InjectWithEXIFRW2Stream's own pass-through fast path handles the
+	// no-metadata-changes case (rawIPTC/rawXMP/m.EXIF all nil).
+	//
 	// Security audit FIX 2: pass a clone, not m.EXIF directly. See the
 	// identical comment in writeTIFFORF above for the full rationale
 	// (relocateTIFFFromParsedRW2 permanently mutates its *exif.EXIF argument).
-	if err := tiff.InjectWithEXIFRW2(originalBytes, cloneEXIF(m.EXIF), rawIPTC, rawXMP, w); err != nil {
+	if err := tiff.InjectWithEXIFRW2Stream(r, prefix, wholeFile, cloneEXIF(m.EXIF), rawIPTC, rawXMP, w); err != nil {
 		return fmt.Errorf("gometadata: %w", err)
 	}
 	return nil
@@ -929,26 +933,27 @@ func cloneIFD(ifd *exif.IFD) *exif.IFD {
 //     MakerNote-TIFF-relative offset.  That image block must be enumerated and
 //     relocated, and the offset patched in the MakerNote after encoding.
 //
-// The NEF-specific path (tiff.InjectWithEXIFNEF) handles both concerns.
+// The NEF-specific path (tiff.InjectWithEXIFNEFStream) handles both concerns.
 // All other aspects (SubIFD relocation, OOL RATIONAL patching, etc.) are
 // identical to the standard writeTIFF path.
 //
 // Validated against real.nef (Nikon D70): ImageDataHash IN==OUT, all metadata
 // including PreviewIFD and NikonScanIFD preserved, file size unchanged.
-func writeTIFFNEF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop,gocyclo // conditional logic mirrors writeTIFF; splitting reduces clarity
-	// #139: defensive copy of m.rawEXIF (consistent with writeTIFF, writeTIFFORF, writeTIFFRW2).
-	var originalBytes []byte
-	if m.rawEXIF != nil {
-		originalBytes = bytes.Clone(m.rawEXIF)
-	} else {
-		if _, err := r.Seek(0, io.SeekStart); err != nil {
-			return fmt.Errorf("gometadata: nef seek: %w", err)
-		}
-		var err error
-		originalBytes, err = readAllCapped(r, "nef")
-		if err != nil {
-			return err
-		}
+func writeTIFFNEF(r io.ReadSeeker, w io.Writer, m *Metadata) error {
+	// #289: m.rawEXIF is only the metadata prefix for NEF too in the general
+	// case (see writeTIFF's comment above).
+	//
+	// #291 follow-up: prefix is now sufficient for NEF's write path too. The
+	// Nikon MakerNote's PreviewIFD/NikonScanIFD structure lives past what the
+	// prefix covers (it is nested one level inside the MakerNote's own
+	// internal IFD chain, which the scanner does not parse), but
+	// tiff.InjectWithEXIFNEFStream's relocator fetches that small additional range
+	// directly from r on demand — see extractNikonPreviewInfo's own doc
+	// comment in format/tiff/relocate_nef.go. The preview JPEG data itself
+	// streams like any other image block; it is never buffered in base.
+	prefix, wholeFile, err := tiffPrefixBytes(r, m, "nef")
+	if err != nil {
+		return err
 	}
 
 	rawIPTC, err := encodeIPTC(m)
@@ -960,15 +965,11 @@ func writeTIFFNEF(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 		return err
 	}
 
-	if rawIPTC == nil && rawXMP == nil && m.EXIF == nil {
-		if _, err := w.Write(originalBytes); err != nil {
-			return fmt.Errorf("gometadata: nef write passthrough: %w", err)
-		}
-		return nil
-	}
-
+	// InjectWithEXIFNEFStream's own pass-through fast path handles the
+	// no-metadata-changes case (rawIPTC/rawXMP/m.EXIF all nil).
+	//
 	// #109: pass a deep clone of m.EXIF (see writeTIFF for rationale).
-	if err := tiff.InjectWithEXIFNEF(originalBytes, cloneEXIF(m.EXIF), rawIPTC, rawXMP, w); err != nil {
+	if err := tiff.InjectWithEXIFNEFStream(r, prefix, wholeFile, cloneEXIF(m.EXIF), rawIPTC, rawXMP, w); err != nil {
 		return fmt.Errorf("gometadata: %w", err)
 	}
 	return nil

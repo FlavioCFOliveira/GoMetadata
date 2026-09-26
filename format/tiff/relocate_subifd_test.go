@@ -1302,6 +1302,6 @@ func BenchmarkRelocateDNGLike(b *testing.B) {
 	b.SetBytes(int64(len(original)))
 	b.ResetTimer()
 	for range b.N {
-		_, _ = relocateTIFF(original, newIPTC, newXMP)
+		_, _, _ = relocateTIFF(original, newIPTC, newXMP)
 	}
 }

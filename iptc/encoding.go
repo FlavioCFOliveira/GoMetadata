@@ -2,18 +2,8 @@ package iptc
 
 import (
 	"bytes"
-	"sync"
-
-	"golang.org/x/text/encoding"
-	"golang.org/x/text/encoding/charmap"
+	"strings"
 )
-
-// iso88591DecoderPool reuses ISO-8859-1 decoder instances across calls to
-// avoid per-call heap allocation. Each decoder is Reset before use so that
-// streaming state from a prior call cannot leak into the next.
-var iso88591DecoderPool = sync.Pool{ //nolint:gochecknoglobals // pool for perf
-	New: func() any { return charmap.ISO8859_1.NewDecoder() },
-}
 
 // decodeString converts a raw IPTC byte value to a UTF-8 string.
 // If the CodedCharacterSet dataset (1:90) declares UTF-8 (ESC % G),
@@ -23,16 +13,64 @@ func decodeString(b []byte, isUTF8 bool) string {
 	if isUTF8 {
 		return string(b)
 	}
-	// ISO-8859-1 → UTF-8 via golang.org/x/text; decoder is reused from pool.
-	dec := iso88591DecoderPool.Get().(*encoding.Decoder) //nolint:forcetypeassert,revive // pool always holds *encoding.Decoder
-	dec.Reset()
-	decoded, err := dec.Bytes(b)
-	iso88591DecoderPool.Put(dec)
-	if err != nil {
-		// Fallback: treat as raw bytes; non-ASCII becomes replacement chars.
+	return decodeISO88591(b)
+}
+
+// decodeISO88591 converts ISO-8859-1 (Latin-1) bytes to a UTF-8 string.
+//
+// IIM §1.5.1 defines ISO-8859-1 as the default coded character set when no
+// 1:90 UTF-8 declaration is present. ISO-8859-1 is unique among the common
+// 8-bit charsets in that its code point value equals its byte value across
+// the entire 0x00-0xFF range (unlike, e.g., Windows-1252, which remaps
+// 0x80-0x9F to non-Latin-1 code points). Consequently no decoding table is
+// required: every byte maps directly to the identically numbered Unicode
+// code point, and the corresponding UTF-8 encoding is produced with the
+// standard 1- or 2-byte rule (RFC 3629 §3):
+//
+//	code point 0x00-0x7F: 1 UTF-8 byte,  unchanged.
+//	code point 0x80-0xFF: 2 UTF-8 bytes, 0xC2|0xC3 lead byte + continuation.
+//
+// Task #205: this replaces a golang.org/x/text/encoding/charmap decoder
+// (pool-managed to amortise its own internal allocations) that still cost two
+// allocations per call — dec.Bytes' returned []byte, then the string(...)
+// conversion of that []byte. Computing the exact output length up front and
+// writing directly into a strings.Builder collapses this to a single
+// allocation (zero when the input is pure ASCII, since ISO-8859-1 bytes below
+// 0x80 are already byte-identical to UTF-8).
+func decodeISO88591(b []byte) string {
+	extra := 0
+	for _, c := range b {
+		if c >= 0x80 {
+			extra++
+		}
+	}
+	if extra == 0 {
+		// Pure ASCII (or empty) input: ISO-8859-1 and UTF-8 agree byte-for-byte
+		// below 0x80, so no transcoding is needed. This is the common case for
+		// real-world IPTC datasets.
 		return string(b)
 	}
-	return string(decoded)
+
+	var sb strings.Builder
+	sb.Grow(len(b) + extra)
+	for _, c := range b {
+		switch {
+		case c < 0x80:
+			sb.WriteByte(c)
+		case c < 0xC0:
+			// Code points 0x80-0xBF: UTF-8 lead byte is always 0xC2, and the
+			// continuation byte (0x80 | (c & 0x3F)) equals c itself because c's
+			// two high bits are already 0b10.
+			sb.WriteByte(0xC2)
+			sb.WriteByte(c)
+		default:
+			// Code points 0xC0-0xFF: UTF-8 lead byte is always 0xC3, and the
+			// continuation byte (0x80 | (c & 0x3F)) equals c-0x40.
+			sb.WriteByte(0xC3)
+			sb.WriteByte(c - 0x40)
+		}
+	}
+	return sb.String()
 }
 
 // setDecodedValue pre-populates d.decodedValue from d.Value using the stream's

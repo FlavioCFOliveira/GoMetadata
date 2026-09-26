@@ -617,7 +617,7 @@ func TestConformance_CR2_write_preserves_CR_marker(t *testing.T) {
 	e.SetCopyright(wantCopyright)
 
 	var out bytes.Buffer
-	if err := tiff.InjectWithEXIFCR2(original, e, nil, nil, &out); err != nil {
+	if err := tiff.InjectWithEXIFCR2Stream(bytes.NewReader(original), original, true, e, nil, nil, &out); err != nil {
 		t.Fatalf("CR2-write: InjectWithEXIFCR2: %v", err)
 	}
 	result := out.Bytes()
@@ -650,7 +650,7 @@ func TestConformance_CR2_write_preserves_version_bytes(t *testing.T) {
 	e.SetCopyright("version-preserve-test")
 
 	var out bytes.Buffer
-	if err := tiff.InjectWithEXIFCR2(original, e, nil, nil, &out); err != nil {
+	if err := tiff.InjectWithEXIFCR2Stream(bytes.NewReader(original), original, true, e, nil, nil, &out); err != nil {
 		t.Fatalf("CR2-write: InjectWithEXIFCR2: %v", err)
 	}
 	result := out.Bytes()
@@ -682,7 +682,7 @@ func TestConformance_CR2_write_image_block_preserved(t *testing.T) {
 	e.SetCopyright("strip-preservation-test-2026")
 
 	var out bytes.Buffer
-	if err := tiff.InjectWithEXIFCR2(original, e, nil, nil, &out); err != nil {
+	if err := tiff.InjectWithEXIFCR2Stream(bytes.NewReader(original), original, true, e, nil, nil, &out); err != nil {
 		t.Fatalf("CR2-write: InjectWithEXIFCR2: %v", err)
 	}
 	result := out.Bytes()
@@ -713,7 +713,7 @@ func TestConformance_CR2_write_TIFF_LE_magic_preserved(t *testing.T) {
 	e.SetCopyright("magic-preserve-test")
 
 	var out bytes.Buffer
-	if err := tiff.InjectWithEXIFCR2(original, e, nil, nil, &out); err != nil {
+	if err := tiff.InjectWithEXIFCR2Stream(bytes.NewReader(original), original, true, e, nil, nil, &out); err != nil {
 		t.Fatalf("CR2-write: InjectWithEXIFCR2: %v", err)
 	}
 	result := out.Bytes()
@@ -811,7 +811,7 @@ func TestConformance_CR2_write_copyright_survives_round_trip(t *testing.T) {
 	e.SetCopyright(wantCopyright)
 
 	var out bytes.Buffer
-	if err := tiff.InjectWithEXIFCR2(original, e, nil, nil, &out); err != nil {
+	if err := tiff.InjectWithEXIFCR2Stream(bytes.NewReader(original), original, true, e, nil, nil, &out); err != nil {
 		t.Fatalf("CR2-write: InjectWithEXIFCR2: %v", err)
 	}
 
@@ -944,7 +944,7 @@ func TestConformance_CR2_makernote_write_preserves_blob(t *testing.T) {
 	e.SetCopyright("makernote-blob-preservation-test")
 
 	var out bytes.Buffer
-	if err := tiff.InjectWithEXIFCR2(data, e, nil, nil, &out); err != nil {
+	if err := tiff.InjectWithEXIFCR2Stream(bytes.NewReader(data), data, true, e, nil, nil, &out); err != nil {
 		t.Fatalf("CR2-makernote: InjectWithEXIFCR2: %v", err)
 	}
 
@@ -1400,7 +1400,7 @@ func TestConformance_CR2_corpus_write_preserves_CR_marker(t *testing.T) {
 			e.SetCopyright("conformance-battery-2026")
 
 			var out bytes.Buffer
-			if writeErr := tiff.InjectWithEXIFCR2(original, e, nil, nil, &out); writeErr != nil {
+			if writeErr := tiff.InjectWithEXIFCR2Stream(bytes.NewReader(original), original, true, e, nil, nil, &out); writeErr != nil {
 				t.Skipf("CR2-corpus: %s: InjectWithEXIFCR2: %v", name, writeErr)
 			}
 			result := out.Bytes()
@@ -1456,7 +1456,7 @@ func TestConformance_CR2_corpus_write_strip_data_preserved(t *testing.T) {
 			// Write with a copyright change.
 			eOrig.SetCopyright("corpus-strip-guard-2026")
 			var out bytes.Buffer
-			if writeErr := tiff.InjectWithEXIFCR2(original, eOrig, nil, nil, &out); writeErr != nil {
+			if writeErr := tiff.InjectWithEXIFCR2Stream(bytes.NewReader(original), original, true, eOrig, nil, nil, &out); writeErr != nil {
 				t.Skipf("CR2-corpus: %s: InjectWithEXIFCR2: %v", name, writeErr)
 			}
 			result := out.Bytes()

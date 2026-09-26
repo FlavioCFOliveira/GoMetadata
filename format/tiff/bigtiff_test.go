@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
 	"os"
 	"testing"
 )
@@ -777,9 +778,12 @@ func BenchmarkBigTIFFExtract(b *testing.B) {
 	iptc := []byte("bigtiff-bench-iptc-payload-long-enough")
 	xmp := []byte("<xmpmeta xmlns:x=\"adobe:ns:meta/\"/>")
 	data := buildMinimalBigTIFF(binary.LittleEndian, iptc, xmp)
+	// #236: reader hoisted outside the loop; see BenchmarkTIFFExtract.
+	r := bytes.NewReader(data)
 	b.SetBytes(int64(len(data)))
 	b.ResetTimer()
 	for range b.N {
-		_, _, _, _ = Extract(bytes.NewReader(data))
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
 	}
 }

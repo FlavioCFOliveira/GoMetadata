@@ -204,7 +204,7 @@ func TestPNGChunkCRCPolynomial(t *testing.T) {
 
 	// writeChunk serialises the chunk via the library's own writeChunk.
 	var out bytes.Buffer
-	if err := writeChunk(&out, "eXIf", data); err != nil {
+	if err := writeChunk(&out, chunkEXIf, data); err != nil {
 		t.Fatalf("writeChunk: %v", err)
 	}
 	chunkBytes := out.Bytes()
@@ -232,7 +232,7 @@ func TestPNGChunkCRCCoversTypeAndData(t *testing.T) {
 	// PNG-chunk-CRC-0xEDB88320: §5.5 — CRC covers Type+Data, excludes Length.
 	t.Parallel()
 
-	chunkType := "eXIf"
+	chunkType := chunkEXIf
 	data := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00}
 
 	var out bytes.Buffer
@@ -245,12 +245,12 @@ func TestPNGChunkCRCCoversTypeAndData(t *testing.T) {
 	// CRC over Length+Type+Data must differ from CRC over Type+Data alone,
 	// proving the Length field is excluded.
 	h := crc32.NewIEEE()
-	_, _ = h.Write(raw[:4])           // just Length (4 bytes)
-	_, _ = h.Write([]byte(chunkType)) // Type
-	_, _ = h.Write(data)              // Data
+	_, _ = h.Write(raw[:4])      // just Length (4 bytes)
+	_, _ = h.Write(chunkType[:]) // Type
+	_, _ = h.Write(data)         // Data
 	crcWithLength := h.Sum32()
 
-	crcTypeDataOnly := computeCRC32(chunkType, data)
+	crcTypeDataOnly := computeCRC32(string(chunkType[:]), data)
 
 	if storedCRC == crcWithLength && storedCRC != crcTypeDataOnly {
 		t.Error("PNG-chunk-CRC-0xEDB88320: CRC appears to cover Length field; it must cover only Type+Data")
@@ -1078,14 +1078,16 @@ func TestPNGRobustLengthPastEOF(t *testing.T) {
 	copy(hdr[4:8], "eXIf")
 	buf.Write(hdr[:])
 
-	_, _, _, err := Extract(bytes.NewReader(buf.Bytes()))
-	if err == nil {
-		t.Fatal("PNG-robust-Length-past-EOF: expected error for declared length > stream, got nil")
+	rawEXIF, rawIPTC, rawXMP, err := Extract(bytes.NewReader(buf.Bytes()))
+	// #294: a declared length exceeding the remaining stream is no longer
+	// surfaced as an error — Extract stops scanning gracefully and returns
+	// whatever metadata was already collected (none precedes the truncated
+	// eXIf chunk here, so (nil,nil,nil)), matching ce1dc82 (pre-#288).
+	if err != nil {
+		t.Fatalf("PNG-robust-Length-past-EOF: expected nil error (graceful stop, #294) for declared length > stream, got %v", err)
 	}
-	// Must NOT be ErrChunkTooLarge — that is for spec violation (Length > 2^31-1).
-	// This is a truncation error.
-	if errors.Is(err, ErrChunkTooLarge) {
-		t.Errorf("PNG-robust-Length-past-EOF: got ErrChunkTooLarge; expected truncation error for valid length in short stream")
+	if rawEXIF != nil || rawIPTC != nil || rawXMP != nil {
+		t.Errorf("PNG-robust-Length-past-EOF: expected (nil,nil,nil), got rawEXIF=%v rawIPTC=%v rawXMP=%v", rawEXIF, rawIPTC, rawXMP)
 	}
 }
 
