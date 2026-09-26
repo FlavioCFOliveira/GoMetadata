@@ -102,6 +102,8 @@ type parseConfig struct {
 // The raw MakerNote bytes (EXIF.MakerNote) are still retained for round-trip
 // writes; only the decoded MakerNoteIFD is omitted. Use this when you do not
 // need manufacturer extension tags and want to minimise parse cost on camera files.
+//
+//go:noinline
 func SkipMakerNote() ParseOption { return func(c *parseConfig) { c.skipMakerNote = true } }
 
 // AcceptRAWMagic configures Parse to additionally dispatch the given 16-bit
@@ -125,6 +127,8 @@ func SkipMakerNote() ParseOption { return func(c *parseConfig) { c.skipMakerNote
 // payloads (JPEG APP1, PNG eXIf, standard TIFF, etc.) and passing a magic
 // value that does not correspond to a real, otherwise-standard classic-TIFF
 // stream will simply cause Parse to misinterpret the input.
+//
+//go:noinline
 func AcceptRAWMagic(magic uint16) ParseOption {
 	return func(c *parseConfig) { c.extraMagic = magic }
 }
@@ -149,6 +153,8 @@ func AcceptRAWMagic(magic uint16) ParseOption {
 // copied-on-read). Passing this option with a transient or mutable buffer
 // will corrupt or invalidate the returned ThumbnailData once that buffer is
 // released or modified.
+//
+//go:noinline
 func AliasThumbnail() ParseOption {
 	return func(c *parseConfig) { c.aliasThumbnail = true }
 }

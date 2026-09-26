@@ -259,12 +259,25 @@ func parseEXIF(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
 	if raw == nil || cfg.lazyEXIF {
 		return nil
 	}
-	var opts []exif.ParseOption
+	// Task #297: a fixed-size array assembled via direct indexed assignment,
+	// not append(nil, ...) — every EXIF Read previously paid +1 alloc/op for
+	// this construction. The three exif option constructors below
+	// (SkipMakerNote/AcceptRAWMagic/AliasThumbnail) are each a single
+	// non-capturing (AcceptRAWMagic captures its magic argument by value,
+	// the other two capture nothing) closure literal marked //go:noinline
+	// in exif/exif.go specifically so that inlining them here does not
+	// defeat the compiler's own "non-capturing closure is a static value"
+	// optimisation — confirmed via `go build -gcflags="-m -m"` that both the
+	// closures AND this array's own backing storage stay off the heap.
+	var optsArr [3]exif.ParseOption
+	n := 0
 	if cfg.skipMakerNote {
-		opts = append(opts, exif.SkipMakerNote())
+		optsArr[n] = exif.SkipMakerNote()
+		n++
 	}
 	if magic, ok := nonStandardRAWMagic(raw); ok {
-		opts = append(opts, exif.AcceptRAWMagic(magic))
+		optsArr[n] = exif.AcceptRAWMagic(magic)
+		n++
 	}
 	// #293: raw is always m.rawEXIF here (see the call site in Read), a field
 	// retained unmodified for m's entire lifetime — exactly the safety
@@ -272,7 +285,9 @@ func parseEXIF(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
 	// per embedded JPEG thumbnail (EXIF §4.5.5), which can be several hundred
 	// KB for RAW files carrying a PreviewIFD JPEG (e.g. Nikon D810.nef:
 	// 151,236 B). See AliasThumbnail's own doc comment for the full contract.
-	opts = append(opts, exif.AliasThumbnail())
+	optsArr[n] = exif.AliasThumbnail()
+	n++
+	opts := optsArr[:n]
 	e, err := exif.Parse(raw, opts...)
 	if err != nil {
 		return &ParseSegmentError{Segment: "EXIF", Err: err}

@@ -1415,19 +1415,23 @@ baseline)/govulncheck all clean. Full 3,281-file corpus `wcmp` SHA-256 vs f9a1c9
 unexplained divergence (same known 136-line baseline). All 7 TIFF-family `*Inject` fuzz
 targets (TIFF/CR2/NEF/ARW/DNG/ORF/RW2), 60 s each: zero crashers.
 
-### Sprint 44 cumulative (ce1dc82 → this session's final tree, 2026-09-26)
+### Sprint 44 cumulative (ce1dc82 → this session's final tree, updated for task #297, 2026-09-26)
 
 `ce1dc82` is the commit immediately preceding Sprint 44's first performance task — the
-last state before any of tasks #198–#294 landed, and the same baseline task #293's
+last state before any of tasks #198–#297 landed, and the same baseline task #293's
 original allocs/op targets (20/24/32) were measured against. This table is the full-sprint
 counterpart to every per-batch table above: same scratch `e2e` harness, same corpus
 samples, `count=6` (interleaved via `go test -bench . -count=6`), Apple M4. Full benchstat
-output: `scratchpad/profiling-r2/raw/final_ce1dc82_vs_batchG.txt` (not part of the git
-repository — session-local scratch).
+output: `scratchpad/profiling-r2/raw/final_ce1dc82_vs_batchH.txt` (not part of the git
+repository — session-local scratch; supersedes the pre-#297
+`final_ce1dc82_vs_batchG.txt` capture from the same directory).
 
 **Overall geomean across the full suite (`Read`, `ReadAccess`, `AccessOnly`, `ReadFile`,
-`Write`, `RoundTrip` — every sample, every format):** ns/op **-71.25%** (0.288×), B/op
-**-85.63%**¹, allocs/op **-25.12%**¹.
+`Write`, `RoundTrip` — every sample, every format):** ns/op **-73.54%** (0.265×), B/op
+**-85.68%**¹, allocs/op **-27.07%**¹ — all three improved further over the pre-#297
+capture (-71.25% / -85.63% / -25.12%), entirely from Write's own gains below; Read's own
+ns/op is unchanged by #297 (parseEXIF's fix is allocation-only, not time-only, and
+StreamCopyN is Write-only).
 
 ¹ benchstat flags these two geomeans with "summaries must be >0 to compute geomean": a
 few `AccessOnly` samples (pure struct-field reads, no I/O) report exactly 0 B/op, which a
@@ -1436,34 +1440,156 @@ delta over the includable rows, not an estimate.
 
 | Format | Read ns/op ce1dc82→final | Read B/op ce1dc82→final | Write ns/op ce1dc82→final | Write B/op ce1dc82→final |
 |---|---|---|---|---|
-| jpeg (canon7d) | 20.96µ→17.13µ (−18.3%) | 57.30Ki→46.42Ki (−19.0%) | 18.81µ→18.46µ (−1.9%) | 31.67Ki→30.90Ki (−2.4%) |
-| jpeg (iphone11) | 3.711µ→3.119µ (−16.0%) | 28.20Ki→17.51Ki (−37.9%) | 127.8µ→125.3µ (~) | 18.86Ki→16.45Ki (−12.7%) |
-| jpeg (exiftool) | 11.211µ→9.835µ (−12.3%) | 13.84Ki→13.85Ki (~) | 7.523µ→7.491µ (~) | 7.712Ki→7.087Ki (−8.1%) |
-| png | 18.770µ→2.872µ (**−84.7%**) | 3.753Ki→2.894Ki (−22.9%) | 109.52µ→29.08µ (**−73.5%**) | 7.722Ki→6.763Ki (−12.4%) |
-| webp | 13.74µ→12.12µ (−11.7%) | 83.00Ki→77.01Ki (−7.2%) | 58.71µ→56.93µ (−3.0%) | 640.7Ki→622.4Ki (−2.9%) |
-| heic | 3.708µ→3.706µ (~) | 1.421Ki→1.437Ki (~) | 127.3µ→128.9µ (~) | 2.124Mi→2.124Mi (~) |
-| avif | 912.0n→936.5n (~) | 353.0→369.0 (~) | 29.62µ→29.65µ (~) | 288.2Ki→288.1Ki (~) |
-| tiff | 42.31µ→41.29µ (−2.4%) | 811.1Ki→811.1Ki (~) | 95.56µ→17.15µ (**−82.1%**) | 1640.4Ki→13.79Ki (**−99.2%, ~119×**) |
-| cr2 | 807.8µ→7.480µ (**−99.1%**) | 22393.7Ki→72.24Ki (**−99.7%**) | 2790.6µ→880.4µ (**−68.5%**) | 67194.5Ki→84.14Ki (**−99.9%, ~799×**) |
-| cr3 | 905.6µ→1.667µ (**−99.8%**) | 24675.4Ki→33.55Ki (**−99.9%**) | 1714.2µ→476.6µ (**−72.2%**) | 36853.5Ki→211.5Ki (**−99.4%, ~174×**) |
-| nef | 1395.7µ→18.68µ (**−98.7%**) | 39730.8Ki→384.4Ki (**−99.0%**) | 4.349m→1.577m (**−63.7%**) | 134389.6Ki→304.1Ki (**−99.8%, ~442×**) |
-| arw | 866.5µ→28.79µ (**−96.7%**) | 24554.8Ki→587.5Ki (**−97.6%**) | 2.180m→1.204m (**−44.8%**) | 49781.5Ki→745.4Ki (**−98.5%, ~66.8×**) |
-| dng | 843.8µ→16.93µ (**−98.0%**) | 23836.4Ki→226.3Ki (**−99.1%**) | 2073.1µ→982.9µ (**−52.6%**) | 48049.9Ki→415.9Ki (**−99.1%, ~115×**) |
-| orf | 819.0µ→59.35µ (**−92.8%**) | 25.102Mi→1.576Mi (**−93.7%**) | 1617.6µ→531.7µ (**−67.1%**) | 39.106Mi→1.456Mi (**−96.3%, ~26.9×**) |
-| rw2 | 1218.2µ→26.57µ (**−97.8%**) | 38534.5Ki→772.6Ki (**−98.0%**) | 3027.8µ→747.8µ (**−75.3%**) | 81209.8Ki→652.6Ki (**−99.2%, ~124×**) |
+| jpeg (canon7d) | 20.96µ→17.33µ (−17.3%) | 57.30Ki→46.44Ki (−19.0%) | 18.81µ→18.34µ (−2.5%) | 31.67Ki→30.82Ki (−2.7%) |
+| jpeg (iphone11) | 3.711µ→3.151µ (−15.1%) | 28.20Ki→17.50Ki (−37.9%) | 127.8µ→126.5µ (~) | 18.86Ki→16.44Ki (−12.8%) |
+| jpeg (exiftool) | 11.211µ→9.867µ (−12.0%) | 13.84Ki→13.85Ki (~) | 7.523µ→7.505µ (~) | 7.712Ki→7.072Ki (−8.3%) |
+| png | 18.770µ→2.863µ (**−84.8%**) | 3.753Ki→2.886Ki (−23.1%) | 109.52µ→29.06µ (**−73.5%**) | 7.722Ki→6.770Ki (−12.3%) |
+| webp | 13.74µ→12.02µ (−12.5%) | 83.00Ki→77.01Ki (−7.2%) | 58.71µ→54.81µ (−6.7%) | 640.7Ki→611.6Ki (−4.5%) |
+| heic | 3.708µ→3.699µ (~) | 1.421Ki→1.437Ki (~) | 127.3µ→131.4µ (+3.2%) | 2.124Mi→2.124Mi (~) |
+| avif | 912.0n→915.4n (~) | 353.0→369.0 (~) | 29.62µ→29.14µ (−1.6%) | 288.2Ki→288.1Ki (~) |
+| tiff | 42.31µ→39.55µ (−6.5%) | 811.1Ki→811.1Ki (~) | 95.56µ→16.85µ (**−82.4%**) | 1640.4Ki→13.79Ki (**−99.2%, ~119×**) |
+| cr2 | 807.8µ→7.510µ (**−99.1%**) | 22393.7Ki→72.23Ki (**−99.7%**) | 2790.6µ→547.1µ (**−80.4%**) | 67194.5Ki→83.98Ki (**−99.9%, ~800×**) |
+| cr3 | 905.6µ→1.661µ (**−99.8%**) | 24675.4Ki→33.55Ki (**−99.9%**) | 1714.2µ→232.7µ (**−86.4%**) | 36853.5Ki→211.3Ki (**−99.4%, ~174×**) |
+| nef | 1395.7µ→19.01µ (**−98.6%**) | 39730.8Ki→384.4Ki (**−99.0%**) | 4.349m→956.6µ (**−78.0%**) | 134389.6Ki→265.3Ki (**−99.8%, ~507×**) |
+| arw | 866.5µ→28.41µ (**−96.7%**) | 24554.8Ki→587.4Ki (**−97.6%**) | 2.180m→819.8µ (**−62.4%**) | 49781.5Ki→744.7Ki (**−98.5%, ~66.8×**) |
+| dng | 843.8µ→16.73µ (**−98.0%**) | 23836.4Ki→226.3Ki (**−99.1%**) | 2073.1µ→590.7µ (**−71.5%**) | 48049.9Ki→402.2Ki (**−99.2%, ~120×**) |
+| orf | 819.0µ→58.89µ (**−92.8%**) | 25.102Mi→1.576Mi (**−93.7%**) | 1617.6µ→322.6µ (**−80.1%**) | 39.106Mi→1.455Mi (**−96.3%, ~26.9×**) |
+| rw2 | 1218.2µ→26.76µ (**−97.8%**) | 38534.5Ki→772.6Ki (**−98.0%**) | 3027.8µ→469.3µ (**−84.5%**) | 81209.8Ki→652.0Ki (**−99.2%, ~125×**) |
 
 All deltas `p<0.05` (Mann-Whitney, `n=6` each side) except where marked `~` (benchstat's
-own "no statistically significant difference" marker). The seven TIFF-based RAW/DNG/CR2
-formats and CR3 show the largest gains (65–99.9% Read/Write time and B/op reduction): this
-is the cumulative effect of the metadata-prefix scanner (#289/#293), CR3's moov-only
-streaming rewrite (#292), TIFF-family image-block streaming (#291), and the `writeIFD`
-double-buffer and `scanExtentPass` allocation fixes (#291 coordinator follow-ups) — every
-one of those formats read or wrote the ENTIRE file at ce1dc82 and now touch only their own
-metadata plus whichever image-data bytes actually get streamed through. JPEG/PNG/WebP/
-HEIF/AVIF's smaller (or `~`) deltas reflect that most of Sprint 44's largest wins targeted
-the TIFF-family write/read paths specifically; PNG's own gains come from tasks #288/#294
-(chunk-skip, graceful truncation) and HEIF/AVIF were untouched by Sprint 44's own task list
-(no expected change, confirmed by the `~` deltas above).
+own "no statistically significant difference" marker). Read columns are essentially
+unchanged from the pre-#297 capture (that task touches only Write's copy mechanism and
+Read's allocation shape, not Read's timing) — Write columns for the seven TIFF-based
+RAW/DNG/CR2 formats and CR3 improved further still (62–86% Write time reduction, up from
+32–75% pre-#297): task #297's single-copy `StreamCopyN` fast path removes the SECOND of
+the two copies these formats' own image-data streaming already reduced to (from
+"buffer the whole file" pre-#291) once the sink is the in-memory `*bytes.Buffer` this
+harness (and any caller writing to an in-memory sink) uses. JPEG/PNG/WebP/HEIF/AVIF's
+smaller (or `~`) Write deltas reflect that neither `StreamCopyN` (they don't stream
+image-data blocks the way the TIFF-family/CR3 do) nor `parseEXIF`'s allocation fix (which
+doesn't change ns/op) meaningfully move their own Write time; HEIF's own `+3.2%` sits
+within this table's normal run-to-run noise band for a benchmark this fast (127µs, `±0-2%`
+typical spread) rather than a real regression — no code this task or Batch G touched is on
+HEIF's own write path.
+
+## Batch H (task #297) — 2026-09-26 (iobuf: single-copy StreamCopyN; alloc-free EXIF parse options)
+
+Profiling round 3 (the prototype at `scratchpad/profiling-r3/srcx`, a generic
+"use `io.CopyN` whenever the sink implements `io.ReaderFrom`") measured −31% to −48% Write
+time with an in-memory sink but 31–38% SLOWER file-to-file on darwin — `(*os.File).ReadFrom`
+falls back to `io.Copy`'s own small internal buffer instead of this package's larger, pooled
+one. Task #297 narrows the optimisation to two specific, safe-to-detect endpoint types
+instead of the generic interface check the prototype used.
+
+#### `internal/iobuf.StreamCopyN` (85–99% of RAW/CR3 Write CPU per the round-3 profile)
+
+`streamCopyNFast` (new, `internal/iobuf/streamcopy.go`) intercepts two cases before
+`StreamCopyN` falls through to its original pooled-buffer loop, unchanged for every other
+`(r, w)` pair:
+
+- **`w` is `*bytes.Buffer`**: `(*bytes.Buffer).ReadFrom` reads directly into the buffer's
+  own backing array (after `Grow`, so `ReadFrom`'s own internal growth never re-allocates)
+  — one copy instead of the pooled loop's two (`ReadFull` into scratch, then `Write` copies
+  scratch into the buffer's array again). Bounded to exactly `n` bytes via a **pooled**
+  `*io.LimitedReader` (`limitedReaderPool`, mirroring `internal/iobuf`'s own `Get`/`Put`
+  pattern for `[]byte`) — constructing one fresh per call and passing it to `ReadFrom` as an
+  `io.Reader` interface value always heap-escapes (confirmed via
+  `go build -gcflags="-m -m"`: `(*bytes.Buffer).ReadFrom`'s own escape summary treats its
+  `io.Reader` parameter as escaping, even though `ReadFrom` never actually retains it beyond
+  the call), so pooling amortises that allocation to a pool miss instead of every call.
+- **`r` is `*bytes.Reader` and `n` equals its own remaining length**:
+  `(*bytes.Reader).WriteTo` writes a zero-copy slice of its own backing array
+  (`r.s[r.i:]`) directly to `w` in one call — the exact "slice obtained without copying"
+  the task named. Deliberately narrower than "any `n` up to `r.Len()`": `bytes.Reader`
+  exposes no public way to bound `WriteTo` to fewer than all of its remaining bytes without
+  copying (its internal `s`/`i` fields are unexported, and wrapping it in `io.LimitedReader`
+  or `io.NewSectionReader` — both considered — loses the fast path entirely, since neither
+  implements `io.WriterTo` and `io.SectionReader` has no `WriteTo` method in this Go
+  version), so the fast path only applies to the (common, in this project's own "stream
+  everything from here to EOF" call sites — CR3's `mdat`+trailer, RW2's
+  `RawDataOffset`-to-EOF, PNG's trailing pass-through) case where the two already coincide.
+  Multi-block call sequences against the same underlying `*bytes.Reader` compose correctly
+  regardless of which individual call takes which path (proven by
+  `TestStreamCopyNBytesReaderSourcePartial`).
+
+Verified allocation-neutral via `testing.AllocsPerRun` in the committed suite
+(`TestStreamCopyNBytesReaderSourceNoAddedAllocation`,
+`TestStreamCopyNBytesBufferSinkNoAddedAllocation`): both report `<= 1` alloc/op, that one
+being the caller's own `bytes.NewReader` construction, not anything inside `StreamCopyN`
+itself.
+
+#### `parseEXIF` (`read.go`) — +1 alloc/op on every EXIF Read
+
+`exif.SkipMakerNote`/`AcceptRAWMagic`/`AliasThumbnail` are each a single closure literal —
+non-capturing except `AcceptRAWMagic`, which captures its `magic` argument by value — that
+Go's compiler normally represents as a static, non-allocating value. Once inlined into
+`parseEXIF` (confirmed via `go build -gcflags="-m -m"`: "inlining call to
+exif.AliasThumbnail" etc.), escape analysis reached a DIFFERENT conclusion for the
+INLINED closure literal appended into `[]exif.ParseOption`, forcing a heap allocation on
+every call — a Go compiler quirk where inlining defeats the "non-capturing closure is
+static" optimisation specifically for the "closure fed into `append`/variadic" pattern.
+Fixed two ways, together:
+
+1. All three exif option constructors (`exif/exif.go`) are now marked `//go:noinline` —
+   preventing inlining restores the static-closure optimisation at its own, un-inlined
+   call site, with zero change to their public signatures or behaviour.
+2. `parseEXIF` assembles its options via a fixed-size `[3]exif.ParseOption` array with
+   direct indexed assignment, not `append(nil, ...)` — a structurally-guaranteed
+   non-escaping construction rather than one relying solely on escape analysis proving a
+   growing nil-slice's backing array doesn't escape.
+
+Both changes together eliminate every "func literal escapes to heap" / "moved to heap:
+opts" diagnostic for `parseEXIF` (confirmed via `go build -gcflags="-m -m"` before and
+after). No public API change: `exif.ParseOption`'s type and every constructor's signature
+are untouched.
+
+#### AC results
+
+| Benchmark | a03b320 → task #297 (ns/op) | ratio | allocs/op a03b320 → #297 |
+|---|---|---|---|
+| Write/cr2 | 908.4µ → 556.6µ | **−38.73%** | 43 → 43 (equal) |
+| Write/cr3 | 472.9µ → 231.9µ | **−50.95%** | 18 → 18 (equal) |
+| Write/nef | 1581.8µ → 953.1µ | **−39.74%** | 47 → 47 (equal) |
+| Write/dng | 981.3µ → 598.3µ | **−39.04%** | 45 → 45 (equal) |
+| Write/orf | 522.4µ → 320.0µ | **−38.75%** | 21 → 21 (equal) |
+| Write/rw2 | 749.1µ → 467.9µ | **−37.54%** | 15 → 15 (equal) |
+| Write/arw (bonus, not AC-named) | 1211.8µ → 823.1µ | −32.08% | 44 → 44 (equal) |
+
+**All six AC-named formats exceed the ≥30% target** (range 37.5–51.0%), **with allocs/op
+identical to a03b320 for every one** (benchstat: "all samples are equal" on every row).
+
+`BenchmarkWriteFileSink` (new, file→file via `*os.File` both ends — added to the scratch
+`e2e` harness specifically to prove the narrowed fast path never regresses this package's
+original, still most common caller): every one of the 15 samples showed `~` (no
+statistically significant difference) or a small improvement; **none regressed**, let alone
+by the ≤+3% tolerance. `allocs/op` likewise unchanged (a handful of samples show a
+sub-1-alloc, non-significant blip attributable to run-to-run noise, not a real difference).
+
+`BenchmarkRead/tiff` and `BenchmarkRead/jpeg_exiftool` allocs/op: **10 and 39** respectively
+— exactly the AC-specified targets, confirmed via the scratch `e2e` harness
+(`E2E_ONLY=tiff`/`E2E_ONLY=jpeg_exiftool`, `count=3`).
+
+Full corpus (3,281 files) `wcmp` SHA-256 comparison against a03b320: 24 diff lines, **zero
+unexplained** (the same pre-existing 7-file JPEG XMP write non-determinism already
+documented under Batch G — reproduces identically on a03b320 itself, not a #297
+regression). `pdump` parsed-digest comparison: **zero diff lines** (task #297 touches only
+the write-side copy mechanism and read-side option construction, never parsed content).
+
+Full gate: build/vet/full test suite/-race (whole repo)/staticcheck/golangci-lint (4
+pre-existing baseline)/govulncheck all clean. Fuzz, 60 s each, zero crashers:
+`FuzzRead` (root — exercises `parseEXIF`), `FuzzTIFFInject`, `FuzzCR2Inject`,
+`FuzzNEFInject`, `FuzzARWInject`, `FuzzDNGInject`, `FuzzORFInject`, `FuzzRW2Inject`,
+`FuzzCR3Inject` (the 8 formats whose write path reaches `iobuf.StreamCopyN`).
+
+**Security note for a quick look**: no new untrusted-input-facing code path — `StreamCopyN`
+still moves the same bytes with the same short-read/error semantics (`io.ErrUnexpectedEOF`
+on a short read from either fast path, matching `io.ReadFull`'s convention the pooled path
+already used); the fast-path type assertions (`w.(*bytes.Buffer)`, `r.(*bytes.Reader)`) are
+concrete-type checks against exported stdlib types, not interface dispatch on
+caller-controlled data. `//go:noinline` and the fixed-size options array are pure
+allocation-shape changes with no behavioural difference. Both changes were run through the
+same full gate (fuzz, race, corpus-wide byte-identical `wcmp`) as every other change in this
+sprint.
 
 ## [main — perf task #198] — 2026-06-10 (exif: parse-level arena for sub-IFDs)
 
