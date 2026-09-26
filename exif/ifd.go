@@ -1750,7 +1750,7 @@ func parseSingleIFDBigTIFF(b []byte, offset uint64, order binary.ByteOrder, alia
 	pos := offset + 8 // first entry starts after the 8-byte count field
 
 	const maxPrealloc = 1024
-	preallocCap := min(int(count), maxPrealloc)
+	preallocCap := min(int(count), maxPrealloc) //nolint:gosec // G115: count ≤ bigTIFFMaxEntries (65535) so fits int on all supported platforms
 	ifd := &IFD{Entries: make([]IFDEntry, 0, preallocCap)}
 	return fillIFDBigTIFF(b, ifd, offset, pos, count, order, nil, aliasThumbnail)
 }

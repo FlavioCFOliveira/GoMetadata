@@ -358,7 +358,7 @@ func parseIFDAtBigTIFF(base []byte, off uint64, order binary.ByteOrder) (*exif.I
 		entries = append(entries, exif.IFDEntry{
 			Tag:   exif.TagID(entry.tag),
 			Type:  exif.DataType(entry.typ),
-			Count: uint32(entryCount),
+			Count: uint32(entryCount), //nolint:gosec // G115: clamped to math.MaxUint32 above
 			Value: value,
 		})
 	}
