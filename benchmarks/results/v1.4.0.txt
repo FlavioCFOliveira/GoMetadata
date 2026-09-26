@@ -1,0 +1,426 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/FlavioCFOliveira/GoMetadata
+cpu: Apple M4
+BenchmarkRead_JPEG-10                           	 4634499	       258.7 ns/op	 170.09 MB/s	     489 B/op	       6 allocs/op
+BenchmarkRead_JPEG-10                           	 4647452	       259.1 ns/op	 169.80 MB/s	     489 B/op	       6 allocs/op
+BenchmarkRead_JPEG-10                           	 4540394	       262.5 ns/op	 167.65 MB/s	     489 B/op	       6 allocs/op
+BenchmarkRead_JPEG_WithXMP-10                   	  895962	      1285 ns/op	 387.50 MB/s	    1966 B/op	      12 allocs/op
+BenchmarkRead_JPEG_WithXMP-10                   	  940269	      1286 ns/op	 387.20 MB/s	    1966 B/op	      12 allocs/op
+BenchmarkRead_JPEG_WithXMP-10                   	  935286	      1292 ns/op	 385.31 MB/s	    1966 B/op	      12 allocs/op
+BenchmarkRead_JPEG_ExtendedXMP-10               	  216734	      5576 ns/op	 145.44 MB/s	    9614 B/op	      40 allocs/op
+BenchmarkRead_JPEG_ExtendedXMP-10               	  214797	      5527 ns/op	 146.73 MB/s	    9611 B/op	      40 allocs/op
+BenchmarkRead_JPEG_ExtendedXMP-10               	  218014	      5507 ns/op	 147.26 MB/s	    9611 B/op	      40 allocs/op
+BenchmarkRead_JPEG_ExtendedXMP_WithoutXMP-10    	 1566214	       758.6 ns/op	1069.01 MB/s	    3075 B/op	      16 allocs/op
+BenchmarkRead_JPEG_ExtendedXMP_WithoutXMP-10    	 1571487	       755.1 ns/op	1074.04 MB/s	    3075 B/op	      16 allocs/op
+BenchmarkRead_JPEG_ExtendedXMP_WithoutXMP-10    	 1573282	       762.2 ns/op	1063.99 MB/s	    3075 B/op	      16 allocs/op
+BenchmarkRawSegments-10                         	1000000000	         0.2625 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRawSegments-10                         	1000000000	         0.2629 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRawSegments-10                         	1000000000	         0.2668 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRead_PNG-10                            	 6907719	       172.5 ns/op	 260.81 MB/s	     240 B/op	       6 allocs/op
+BenchmarkRead_PNG-10                            	 6989998	       170.9 ns/op	 263.30 MB/s	     240 B/op	       6 allocs/op
+BenchmarkRead_PNG-10                            	 7009138	       170.3 ns/op	 264.19 MB/s	     240 B/op	       6 allocs/op
+BenchmarkMWGAccessors-10                        	24631784	        45.95 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMWGAccessors-10                        	28018807	        45.13 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMWGAccessors-10                        	27408992	        43.89 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadProgressiveJPEG-10                 	 5478681	       218.0 ns/op	384576.34 MB/s	     208 B/op	       1 allocs/op
+BenchmarkReadProgressiveJPEG-10                 	 5506968	       219.2 ns/op	382525.86 MB/s	     208 B/op	       1 allocs/op
+BenchmarkReadProgressiveJPEG-10                 	 5440911	       219.0 ns/op	382822.18 MB/s	     208 B/op	       1 allocs/op
+BenchmarkReadCombinedMetadataJPEG-10            	  118560	     10239 ns/op	2549.60 MB/s	   14357 B/op	      39 allocs/op
+BenchmarkReadCombinedMetadataJPEG-10            	  117418	     10245 ns/op	2548.26 MB/s	   14331 B/op	      39 allocs/op
+BenchmarkReadCombinedMetadataJPEG-10            	  116066	     10313 ns/op	2531.25 MB/s	   14365 B/op	      39 allocs/op
+BenchmarkReadFile-10                            	  475824	      2511 ns/op	94230.22 MB/s	    6351 B/op	      14 allocs/op
+BenchmarkReadFile-10                            	  481628	      2500 ns/op	94620.69 MB/s	    6351 B/op	      14 allocs/op
+BenchmarkReadFile-10                            	  479096	      2513 ns/op	94138.40 MB/s	    6352 B/op	      14 allocs/op
+BenchmarkWrite_JPEG-10                          	 3295208	       370.3 ns/op	 118.84 MB/s	     128 B/op	       4 allocs/op
+BenchmarkWrite_JPEG-10                          	 3205630	       369.9 ns/op	 118.94 MB/s	     128 B/op	       4 allocs/op
+BenchmarkWrite_JPEG-10                          	 3284151	       367.7 ns/op	 119.67 MB/s	     128 B/op	       4 allocs/op
+BenchmarkWrite_PNG-10                           	10107369	       119.1 ns/op	 377.82 MB/s	      65 B/op	       3 allocs/op
+BenchmarkWrite_PNG-10                           	 9939733	       120.3 ns/op	 374.12 MB/s	      65 B/op	       3 allocs/op
+BenchmarkWrite_PNG-10                           	10036125	       118.4 ns/op	 380.08 MB/s	      65 B/op	       3 allocs/op
+BenchmarkReadFile_Concurrent-10                 	   96339	     12272 ns/op	     709 B/op	       9 allocs/op
+BenchmarkReadFile_Concurrent-10                 	   95929	     12391 ns/op	     709 B/op	       9 allocs/op
+BenchmarkReadFile_Concurrent-10                 	   95923	     12556 ns/op	     709 B/op	       9 allocs/op
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata	54.656s
+?   	github.com/FlavioCFOliveira/GoMetadata/examples/batch-keywords	[no test files]
+?   	github.com/FlavioCFOliveira/GoMetadata/examples/copyright-stamp	[no test files]
+?   	github.com/FlavioCFOliveira/GoMetadata/examples/gallery-sidecar	[no test files]
+?   	github.com/FlavioCFOliveira/GoMetadata/examples/multi-format-roundtrip	[no test files]
+?   	github.com/FlavioCFOliveira/GoMetadata/examples/raw-inspector	[no test files]
+?   	github.com/FlavioCFOliveira/GoMetadata/examples/read-metadata	[no test files]
+?   	github.com/FlavioCFOliveira/GoMetadata/examples/stream-transcode	[no test files]
+?   	github.com/FlavioCFOliveira/GoMetadata/examples/write-metadata	[no test files]
+goos: darwin
+goarch: arm64
+pkg: github.com/FlavioCFOliveira/GoMetadata/exif
+cpu: Apple M4
+BenchmarkIFDGet-10                 	442446742	         2.872 ns/op	       0 B/op	       0 allocs/op
+BenchmarkIFDGet-10                 	425546754	         2.802 ns/op	       0 B/op	       0 allocs/op
+BenchmarkIFDGet-10                 	439880883	         2.763 ns/op	       0 B/op	       0 allocs/op
+BenchmarkIFDSet-10                 	 1797829	       704.0 ns/op	    1656 B/op	      31 allocs/op
+BenchmarkIFDSet-10                 	 1733488	       703.8 ns/op	    1656 B/op	      31 allocs/op
+BenchmarkIFDSet-10                 	 1746445	       675.1 ns/op	    1656 B/op	      31 allocs/op
+BenchmarkIFDEntryString-10         	100000000	        12.02 ns/op	      16 B/op	       1 allocs/op
+BenchmarkIFDEntryString-10         	100000000	        12.03 ns/op	      16 B/op	       1 allocs/op
+BenchmarkIFDEntryString-10         	99246002	        11.78 ns/op	      16 B/op	       1 allocs/op
+BenchmarkParseGPS-10               	28628970	        41.97 ns/op	       0 B/op	       0 allocs/op
+BenchmarkParseGPS-10               	28638250	        41.99 ns/op	       0 B/op	       0 allocs/op
+BenchmarkParseGPS-10               	28236871	        42.63 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMakerNoteDispatch-10      	10471915	       113.2 ns/op	     208 B/op	       4 allocs/op
+BenchmarkMakerNoteDispatch-10      	10725532	       112.5 ns/op	     208 B/op	       4 allocs/op
+BenchmarkMakerNoteDispatch-10      	10674138	       112.5 ns/op	     208 B/op	       4 allocs/op
+BenchmarkParseBigTIFF_Simple-10    	 6184701	       194.4 ns/op	 596.83 MB/s	     344 B/op	       4 allocs/op
+BenchmarkParseBigTIFF_Simple-10    	 6188017	       191.5 ns/op	 605.62 MB/s	     344 B/op	       4 allocs/op
+BenchmarkParseBigTIFF_Simple-10    	 6266300	       192.1 ns/op	 603.88 MB/s	     344 B/op	       4 allocs/op
+BenchmarkEXIFEncode_BigTIFF-10     	 1468386	       819.7 ns/op	    4123 B/op	       2 allocs/op
+BenchmarkEXIFEncode_BigTIFF-10     	 1495399	       820.1 ns/op	    4122 B/op	       2 allocs/op
+BenchmarkEXIFEncode_BigTIFF-10     	 1466246	       817.1 ns/op	    4123 B/op	       2 allocs/op
+BenchmarkEXIFParse-10              	 7047736	       170.3 ns/op	     344 B/op	       4 allocs/op
+BenchmarkEXIFParse-10              	 7147846	       168.3 ns/op	     344 B/op	       4 allocs/op
+BenchmarkEXIFParse-10              	 7123413	       169.0 ns/op	     344 B/op	       4 allocs/op
+BenchmarkEXIFParse_Camera-10       	  761386	      1573 ns/op	    2601 B/op	       8 allocs/op
+BenchmarkEXIFParse_Camera-10       	  750591	      1590 ns/op	    2601 B/op	       8 allocs/op
+BenchmarkEXIFParse_Camera-10       	  761658	      1571 ns/op	    2601 B/op	       8 allocs/op
+BenchmarkIFDGet_Large-10           	334031860	         3.585 ns/op	       0 B/op	       0 allocs/op
+BenchmarkIFDGet_Large-10           	335120486	         3.616 ns/op	       0 B/op	       0 allocs/op
+BenchmarkIFDGet_Large-10           	330100110	         3.632 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEXIFEncode-10             	 9951451	       119.0 ns/op	      80 B/op	       2 allocs/op
+BenchmarkEXIFEncode-10             	10045525	       124.1 ns/op	      80 B/op	       2 allocs/op
+BenchmarkEXIFEncode-10             	 9710292	       176.9 ns/op	      80 B/op	       2 allocs/op
+BenchmarkEXIFEncode_Camera-10      	  666021	      1961 ns/op	     914 B/op	       2 allocs/op
+BenchmarkEXIFEncode_Camera-10      	  599193	      1975 ns/op	     913 B/op	       2 allocs/op
+BenchmarkEXIFEncode_Camera-10      	  588586	      1947 ns/op	     914 B/op	       2 allocs/op
+BenchmarkUserComment_ASCII-10      	26944947	        43.60 ns/op	      64 B/op	       1 allocs/op
+BenchmarkUserComment_ASCII-10      	27437037	        41.48 ns/op	      64 B/op	       1 allocs/op
+BenchmarkUserComment_ASCII-10      	27065761	        41.86 ns/op	      64 B/op	       1 allocs/op
+BenchmarkUserComment_Unicode-10    	 3078432	       367.5 ns/op	     128 B/op	       2 allocs/op
+BenchmarkUserComment_Unicode-10    	 3280980	       382.5 ns/op	     128 B/op	       2 allocs/op
+BenchmarkUserComment_Unicode-10    	 3283351	       377.1 ns/op	     128 B/op	       2 allocs/op
+BenchmarkXPTitle-10                	 5338616	       222.3 ns/op	      72 B/op	       2 allocs/op
+BenchmarkXPTitle-10                	 5361961	       221.6 ns/op	      72 B/op	       2 allocs/op
+BenchmarkXPTitle-10                	11733592	       162.3 ns/op	      72 B/op	       2 allocs/op
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/exif	68.375s
+goos: darwin
+goarch: arm64
+pkg: github.com/FlavioCFOliveira/GoMetadata/format
+cpu: Apple M4
+BenchmarkDetect-10    	40275044	        65.00 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDetect-10    	25403925	        69.85 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDetect-10    	29850282	        62.84 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/format	6.791s
+goos: darwin
+goarch: arm64
+pkg: github.com/FlavioCFOliveira/GoMetadata/format/heif
+cpu: Apple M4
+BenchmarkHEIFExtract-10    	 3628400	       382.3 ns/op	 316.49 MB/s	     400 B/op	       5 allocs/op
+BenchmarkHEIFExtract-10    	 2909082	       416.3 ns/op	 290.68 MB/s	     400 B/op	       5 allocs/op
+BenchmarkHEIFExtract-10    	 2861053	       416.8 ns/op	 290.32 MB/s	     400 B/op	       5 allocs/op
+BenchmarkHEIFInject-10     	 3485562	       468.9 ns/op	 258.07 MB/s	     812 B/op	      12 allocs/op
+BenchmarkHEIFInject-10     	 1685818	       732.8 ns/op	 165.12 MB/s	     812 B/op	      12 allocs/op
+BenchmarkHEIFInject-10     	 1637914	       733.2 ns/op	 165.02 MB/s	     812 B/op	      12 allocs/op
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/format/heif	13.214s
+goos: darwin
+goarch: arm64
+pkg: github.com/FlavioCFOliveira/GoMetadata/format/jpeg
+cpu: Apple M4
+BenchmarkJPEGExtract-10           	 4316773	       284.8 ns/op	 294.91 MB/s	     104 B/op	       3 allocs/op
+BenchmarkJPEGExtract-10           	 4504750	       282.5 ns/op	 297.38 MB/s	     104 B/op	       3 allocs/op
+BenchmarkJPEGExtract-10           	 4176783	       282.0 ns/op	 297.85 MB/s	     104 B/op	       3 allocs/op
+BenchmarkJPEGInject-10            	 1951308	       617.1 ns/op	 136.12 MB/s	     288 B/op	       4 allocs/op
+BenchmarkJPEGInject-10            	 1885393	       600.6 ns/op	 139.87 MB/s	     288 B/op	       4 allocs/op
+BenchmarkJPEGInject-10            	 1988463	       626.1 ns/op	 134.16 MB/s	     288 B/op	       4 allocs/op
+BenchmarkJPEGInject_NoAPP13-10    	 2271832	       527.5 ns/op	  83.41 MB/s	     288 B/op	       4 allocs/op
+BenchmarkJPEGInject_NoAPP13-10    	 2330590	       514.9 ns/op	  85.45 MB/s	     288 B/op	       4 allocs/op
+BenchmarkJPEGInject_NoAPP13-10    	 2368887	       517.8 ns/op	  84.98 MB/s	     288 B/op	       4 allocs/op
+BenchmarkJPEGExtract_Real-10      	  663943	      3293 ns/op	7928.83 MB/s	    9257 B/op	       6 allocs/op
+BenchmarkJPEGExtract_Real-10      	  298080	      4052 ns/op	6442.38 MB/s	    9258 B/op	       6 allocs/op
+BenchmarkJPEGExtract_Real-10      	  307546	      4037 ns/op	6466.26 MB/s	    9258 B/op	       6 allocs/op
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/format/jpeg	21.891s
+goos: darwin
+goarch: arm64
+pkg: github.com/FlavioCFOliveira/GoMetadata/format/png
+cpu: Apple M4
+BenchmarkPNGExtract-10                 	 2106435	       545.0 ns/op	 335.79 MB/s	     160 B/op	      11 allocs/op
+BenchmarkPNGExtract-10                 	 2240066	       539.4 ns/op	 339.26 MB/s	     160 B/op	      11 allocs/op
+BenchmarkPNGExtract-10                 	 2181079	       541.9 ns/op	 337.70 MB/s	     160 B/op	      11 allocs/op
+BenchmarkPNGExtractCompressedXMP-10    	 1207311	      1004 ns/op	 173.38 MB/s	     581 B/op	      10 allocs/op
+BenchmarkPNGExtractCompressedXMP-10    	 1222986	       980.0 ns/op	 177.56 MB/s	     581 B/op	      10 allocs/op
+BenchmarkPNGExtractCompressedXMP-10    	 1226623	       981.8 ns/op	 177.23 MB/s	     581 B/op	      10 allocs/op
+BenchmarkPNGInject-10                  	 1815717	       674.4 ns/op	  66.73 MB/s	     787 B/op	       7 allocs/op
+BenchmarkPNGInject-10                  	 1798802	       662.4 ns/op	  67.93 MB/s	     787 B/op	       7 allocs/op
+BenchmarkPNGInject-10                  	 2551564	       683.5 ns/op	  65.83 MB/s	     787 B/op	       7 allocs/op
+BenchmarkPNGWriteChunk-10              	 9365551	       129.7 ns/op	 169.65 MB/s	     112 B/op	       2 allocs/op
+BenchmarkPNGWriteChunk-10              	 9191695	       127.9 ns/op	 172.04 MB/s	     112 B/op	       2 allocs/op
+BenchmarkPNGWriteChunk-10              	 8959978	       130.3 ns/op	 168.89 MB/s	     112 B/op	       2 allocs/op
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/format/png	23.400s
+goos: darwin
+goarch: arm64
+pkg: github.com/FlavioCFOliveira/GoMetadata/format/raw/arw
+cpu: Apple M4
+BenchmarkARWExtract-10               	21854240	        54.57 ns/op	      16 B/op	       1 allocs/op
+BenchmarkARWExtract-10               	21434998	        52.04 ns/op	      16 B/op	       1 allocs/op
+BenchmarkARWExtract-10               	21516301	        54.30 ns/op	      16 B/op	       1 allocs/op
+BenchmarkARWConformanceExtract-10    	 8721270	       142.3 ns/op	     144 B/op	       1 allocs/op
+BenchmarkARWConformanceExtract-10    	 8499591	       141.2 ns/op	     144 B/op	       1 allocs/op
+BenchmarkARWConformanceExtract-10    	 8299888	       141.1 ns/op	     144 B/op	       1 allocs/op
+BenchmarkARWConformanceInject-10     	  501121	      2596 ns/op	    2046 B/op	      20 allocs/op
+BenchmarkARWConformanceInject-10     	  496813	      2630 ns/op	    2047 B/op	      20 allocs/op
+BenchmarkARWConformanceInject-10     	  480525	      2652 ns/op	    2047 B/op	      20 allocs/op
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/format/raw/arw	11.953s
+goos: darwin
+goarch: arm64
+pkg: github.com/FlavioCFOliveira/GoMetadata/format/raw/cr2
+cpu: Apple M4
+BenchmarkCR2Extract-10    	21328466	        53.50 ns/op	      16 B/op	       1 allocs/op
+BenchmarkCR2Extract-10    	21604622	        54.61 ns/op	      16 B/op	       1 allocs/op
+BenchmarkCR2Extract-10    	36363956	        41.95 ns/op	      16 B/op	       1 allocs/op
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/format/raw/cr2	4.292s
+goos: darwin
+goarch: arm64
+pkg: github.com/FlavioCFOliveira/GoMetadata/format/raw/cr3
+cpu: Apple M4
+BenchmarkCR3Extract-10    	 8864865	       144.0 ns/op	 486.09 MB/s	      80 B/op	       3 allocs/op
+BenchmarkCR3Extract-10    	 8821129	       144.0 ns/op	 486.26 MB/s	      80 B/op	       3 allocs/op
+BenchmarkCR3Extract-10    	 8117523	       143.1 ns/op	 489.32 MB/s	      80 B/op	       3 allocs/op
+BenchmarkCR3Inject-10     	 1854295	       649.4 ns/op	 107.79 MB/s	    1968 B/op	      10 allocs/op
+BenchmarkCR3Inject-10     	 1889342	       645.6 ns/op	 108.43 MB/s	    1968 B/op	      10 allocs/op
+BenchmarkCR3Inject-10     	 1865266	       628.2 ns/op	 111.43 MB/s	    1968 B/op	      10 allocs/op
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/format/raw/cr3	9.994s
+goos: darwin
+goarch: arm64
+pkg: github.com/FlavioCFOliveira/GoMetadata/format/raw/dng
+cpu: Apple M4
+BenchmarkDNGExtract-10    	21499291	        53.05 ns/op	      16 B/op	       1 allocs/op
+BenchmarkDNGExtract-10    	20534378	        52.47 ns/op	      16 B/op	       1 allocs/op
+BenchmarkDNGExtract-10    	21562082	        52.71 ns/op	      16 B/op	       1 allocs/op
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/format/raw/dng	3.813s
+goos: darwin
+goarch: arm64
+pkg: github.com/FlavioCFOliveira/GoMetadata/format/raw/nef
+cpu: Apple M4
+BenchmarkNEFExtractMakerNote-10    	24603061	        90.93 ns/op	     128 B/op	       1 allocs/op
+BenchmarkNEFExtractMakerNote-10    	11644064	       104.7 ns/op	     128 B/op	       1 allocs/op
+BenchmarkNEFExtractMakerNote-10    	11319032	       104.5 ns/op	     128 B/op	       1 allocs/op
+BenchmarkNEFExtract-10             	24851086	        52.04 ns/op	      16 B/op	       1 allocs/op
+BenchmarkNEFExtract-10             	20853969	        53.14 ns/op	      16 B/op	       1 allocs/op
+BenchmarkNEFExtract-10             	20495535	        50.36 ns/op	      16 B/op	       1 allocs/op
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/format/raw/nef	8.788s
+goos: darwin
+goarch: arm64
+pkg: github.com/FlavioCFOliveira/GoMetadata/format/raw/orf
+cpu: Apple M4
+BenchmarkORFExtract-10            	13520790	        79.56 ns/op	      20 B/op	       2 allocs/op
+BenchmarkORFExtract-10            	16761415	        78.85 ns/op	      20 B/op	       2 allocs/op
+BenchmarkORFExtract-10            	17003679	        79.18 ns/op	      20 B/op	       2 allocs/op
+BenchmarkORFInject-10             	 6441842	       177.9 ns/op	     240 B/op	       6 allocs/op
+BenchmarkORFInject-10             	 6551071	       162.0 ns/op	     240 B/op	       6 allocs/op
+BenchmarkORFInject-10             	14597252	       143.6 ns/op	     240 B/op	       6 allocs/op
+BenchmarkORFExtractRealFile-10    	   11961	     97456 ns/op	 1622688 B/op	       7 allocs/op
+BenchmarkORFExtractRealFile-10    	   12124	     98490 ns/op	 1622688 B/op	       7 allocs/op
+BenchmarkORFExtractRealFile-10    	   10000	    100830 ns/op	 1622688 B/op	       7 allocs/op
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/format/raw/orf	14.437s
+goos: darwin
+goarch: arm64
+pkg: github.com/FlavioCFOliveira/GoMetadata/format/raw/rw2
+cpu: Apple M4
+BenchmarkRW2Extract-10            	13572682	        80.38 ns/op	      20 B/op	       2 allocs/op
+BenchmarkRW2Extract-10            	15505854	        79.21 ns/op	      20 B/op	       2 allocs/op
+BenchmarkRW2Extract-10            	14102665	        77.05 ns/op	      20 B/op	       2 allocs/op
+BenchmarkRW2ExtractRealFile-10    	   23150	     49021 ns/op	  787104 B/op	       7 allocs/op
+BenchmarkRW2ExtractRealFile-10    	   23443	     49561 ns/op	  787104 B/op	       7 allocs/op
+BenchmarkRW2ExtractRealFile-10    	   35030	     54469 ns/op	  787104 B/op	       7 allocs/op
+BenchmarkRW2Inject-10             	 6376090	       185.1 ns/op	     240 B/op	       6 allocs/op
+BenchmarkRW2Inject-10             	 6313746	       185.9 ns/op	     240 B/op	       6 allocs/op
+BenchmarkRW2Inject-10             	 6342422	       183.5 ns/op	     240 B/op	       6 allocs/op
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/format/raw/rw2	14.667s
+goos: darwin
+goarch: arm64
+pkg: github.com/FlavioCFOliveira/GoMetadata/format/tiff
+cpu: Apple M4
+BenchmarkBigTIFFExtract-10          	 8424762	       137.0 ns/op	1058.23 MB/s	     160 B/op	       1 allocs/op
+BenchmarkBigTIFFExtract-10          	 9338284	       130.4 ns/op	1111.63 MB/s	     160 B/op	       1 allocs/op
+BenchmarkBigTIFFExtract-10          	 9144165	       129.3 ns/op	1121.56 MB/s	     160 B/op	       1 allocs/op
+BenchmarkInjectWithEXIF-10          	   10000	    100837 ns/op	  393650 B/op	      24 allocs/op
+BenchmarkInjectWithEXIF-10          	   12452	    102747 ns/op	  393504 B/op	      24 allocs/op
+BenchmarkInjectWithEXIF-10          	   10000	    101545 ns/op	  393465 B/op	      24 allocs/op
+BenchmarkInjectWithEXIFStream-10    	   18940	     77982 ns/op	  393488 B/op	      24 allocs/op
+BenchmarkInjectWithEXIFStream-10    	   14935	     80385 ns/op	  393446 B/op	      24 allocs/op
+BenchmarkInjectWithEXIFStream-10    	   15652	     78326 ns/op	  393482 B/op	      24 allocs/op
+BenchmarkRelocateMakerNote-10       	  845416	      1425 ns/op	    1292 B/op	      12 allocs/op
+BenchmarkRelocateMakerNote-10       	  839838	      1374 ns/op	    1293 B/op	      12 allocs/op
+BenchmarkRelocateMakerNote-10       	  810242	      1394 ns/op	    1292 B/op	      12 allocs/op
+BenchmarkRelocateDNGLike-10         	  454473	      2672 ns/op	3305.52 MB/s	    1863 B/op	      22 allocs/op
+BenchmarkRelocateDNGLike-10         	  479378	      2730 ns/op	3235.65 MB/s	    1864 B/op	      22 allocs/op
+BenchmarkRelocateDNGLike-10         	  426422	      2704 ns/op	3266.81 MB/s	    1864 B/op	      22 allocs/op
+BenchmarkRelocateSingleStrip-10     	  610048	      1815 ns/op	2303.63 MB/s	    1518 B/op	      12 allocs/op
+BenchmarkRelocateSingleStrip-10     	  904137	      1765 ns/op	2369.06 MB/s	    1518 B/op	      12 allocs/op
+BenchmarkRelocateSingleStrip-10     	  595185	      1948 ns/op	2146.48 MB/s	    1518 B/op	      12 allocs/op
+BenchmarkRelocateMultiStrip-10      	  585349	      2069 ns/op	2028.83 MB/s	    1566 B/op	      12 allocs/op
+BenchmarkRelocateMultiStrip-10      	  571274	      2025 ns/op	2073.36 MB/s	    1566 B/op	      12 allocs/op
+BenchmarkRelocateMultiStrip-10      	  700287	      2042 ns/op	2055.78 MB/s	    1566 B/op	      12 allocs/op
+BenchmarkRelocateTiled-10           	  587409	      2215 ns/op	1900.63 MB/s	    1695 B/op	      12 allocs/op
+BenchmarkRelocateTiled-10           	  520777	      2156 ns/op	1952.88 MB/s	    1694 B/op	      12 allocs/op
+BenchmarkRelocateTiled-10           	  607677	      2163 ns/op	1945.98 MB/s	    1695 B/op	      12 allocs/op
+BenchmarkTIFFExtract-10             	10720128	       112.1 ns/op	 999.39 MB/s	     112 B/op	       1 allocs/op
+BenchmarkTIFFExtract-10             	10596076	       109.5 ns/op	1022.48 MB/s	     112 B/op	       1 allocs/op
+BenchmarkTIFFExtract-10             	10904898	       111.9 ns/op	1000.50 MB/s	     112 B/op	       1 allocs/op
+BenchmarkTIFFExtractRealFile-10     	    9380	    126717 ns/op	302600.22 MB/s	 1843867 B/op	       6 allocs/op
+BenchmarkTIFFExtractRealFile-10     	   14557	     89254 ns/op	429610.11 MB/s	 1843866 B/op	       6 allocs/op
+BenchmarkTIFFExtractRealFile-10     	    9213	    113486 ns/op	337876.84 MB/s	 1843867 B/op	       6 allocs/op
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/format/tiff	44.458s
+goos: darwin
+goarch: arm64
+pkg: github.com/FlavioCFOliveira/GoMetadata/format/webp
+cpu: Apple M4
+BenchmarkWebPExtract-10           	 8097698	       143.1 ns/op	 447.28 MB/s	      32 B/op	       3 allocs/op
+BenchmarkWebPExtract-10           	 8292783	       134.9 ns/op	 474.47 MB/s	      32 B/op	       3 allocs/op
+BenchmarkWebPExtract-10           	 8679584	       139.1 ns/op	 460.05 MB/s	      32 B/op	       3 allocs/op
+BenchmarkWebPExtractWithXMP-10    	 5586776	       219.1 ns/op	 675.41 MB/s	     112 B/op	       4 allocs/op
+BenchmarkWebPExtractWithXMP-10    	 5699629	       216.4 ns/op	 684.06 MB/s	     112 B/op	       4 allocs/op
+BenchmarkWebPExtractWithXMP-10    	 5447080	       217.9 ns/op	 679.24 MB/s	     112 B/op	       4 allocs/op
+BenchmarkWebPInject-10            	 4270549	       279.1 ns/op	 229.27 MB/s	     320 B/op	       4 allocs/op
+BenchmarkWebPInject-10            	 5669355	       273.3 ns/op	 234.14 MB/s	     320 B/op	       4 allocs/op
+BenchmarkWebPInject-10            	 4567579	       286.1 ns/op	 223.70 MB/s	     320 B/op	       4 allocs/op
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/format/webp	14.310s
+?   	github.com/FlavioCFOliveira/GoMetadata/internal/boundscheck	[no test files]
+goos: darwin
+goarch: arm64
+pkg: github.com/FlavioCFOliveira/GoMetadata/internal/iobuf
+cpu: Apple M4
+BenchmarkGetPut-10                          	88066930	        19.36 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetPut-10                          	90221886	        17.02 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetPut-10                          	81515973	        19.04 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetPutSmall-10                     	100000000	        22.66 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetPutSmall-10                     	85419132	        16.57 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetPutSmall-10                     	76987642	        13.48 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetLarge-10                        	100000000	        12.50 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetLarge-10                        	76864363	        16.61 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetLarge-10                        	80648320	        16.53 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetLargeHit-10                     	95875996	        16.15 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetLargeHit-10                     	96008002	        16.44 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetLargeHit-10                     	95497681	        16.72 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetOversizedMiss-10                	  189694	      7012 ns/op	   74527 B/op	       2 allocs/op
+BenchmarkGetOversizedMiss-10                	  177663	      6794 ns/op	   74531 B/op	       2 allocs/op
+BenchmarkGetOversizedMiss-10                	  188133	      7293 ns/op	   74520 B/op	       2 allocs/op
+BenchmarkGetPutParallel-10                  	366439579	         3.853 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetPutParallel-10                  	300688984	         4.357 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetPutParallel-10                  	314682356	         4.367 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadAll-10                         	     865	   1354360 ns/op	12387.56 MB/s	16796643 B/op	       1 allocs/op
+BenchmarkReadAll-10                         	     867	   1356986 ns/op	12363.59 MB/s	16796594 B/op	       1 allocs/op
+BenchmarkReadAll-10                         	     858	   1302920 ns/op	12876.63 MB/s	16796803 B/op	       1 allocs/op
+BenchmarkStreamCopyNBytesReaderSource-10    	    5544	    196975 ns/op	21293.64 MB/s	    1561 B/op	       1 allocs/op
+BenchmarkStreamCopyNBytesReaderSource-10    	    8136	    202229 ns/op	20740.37 MB/s	    1079 B/op	       1 allocs/op
+BenchmarkStreamCopyNBytesReaderSource-10    	   18993	    160063 ns/op	26204.06 MB/s	     489 B/op	       1 allocs/op
+BenchmarkStreamCopyN-10                     	    8233	    142229 ns/op	29489.89 MB/s	    2086 B/op	       1 allocs/op
+BenchmarkStreamCopyN-10                     	   10000	    161813 ns/op	25920.75 MB/s	    1726 B/op	       1 allocs/op
+BenchmarkStreamCopyN-10                     	    7228	    172609 ns/op	24299.40 MB/s	    2369 B/op	       1 allocs/op
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/internal/iobuf	45.296s
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/internal/metaerr	0.265s
+goos: darwin
+goarch: arm64
+pkg: github.com/FlavioCFOliveira/GoMetadata/internal/riff
+cpu: Apple M4
+BenchmarkReadChunk-10    	28134285	        42.97 ns/op	      56 B/op	       2 allocs/op
+BenchmarkReadChunk-10    	28921846	        42.33 ns/op	      56 B/op	       2 allocs/op
+BenchmarkReadChunk-10    	25890874	        43.04 ns/op	      56 B/op	       2 allocs/op
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/internal/riff	3.943s
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/internal/testutil	0.288s
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/internal/tiffscan	0.250s
+goos: darwin
+goarch: arm64
+pkg: github.com/FlavioCFOliveira/GoMetadata/iptc
+cpu: Apple M4
+BenchmarkDecodeString-10             	23715921	        46.17 ns/op	      16 B/op	       1 allocs/op
+BenchmarkDecodeString-10             	25516938	        49.14 ns/op	      16 B/op	       1 allocs/op
+BenchmarkDecodeString-10             	27263767	        49.99 ns/op	      16 B/op	       1 allocs/op
+BenchmarkDecodeStringASCII-10        	25707996	        45.14 ns/op	      48 B/op	       1 allocs/op
+BenchmarkDecodeStringASCII-10        	27652635	        45.49 ns/op	      48 B/op	       1 allocs/op
+BenchmarkDecodeStringASCII-10        	28163944	        44.65 ns/op	      48 B/op	       1 allocs/op
+BenchmarkIPTCParseFewDatasets-10     	 3208392	       341.4 ns/op	     576 B/op	       7 allocs/op
+BenchmarkIPTCParseFewDatasets-10     	 3487159	       350.0 ns/op	     576 B/op	       7 allocs/op
+BenchmarkIPTCParseFewDatasets-10     	 3507340	       343.9 ns/op	     576 B/op	       7 allocs/op
+BenchmarkIPTCParseManyDatasets-10    	 1938002	       873.8 ns/op	    1416 B/op	      22 allocs/op
+BenchmarkIPTCParseManyDatasets-10    	 1304460	       929.1 ns/op	    1416 B/op	      22 allocs/op
+BenchmarkIPTCParseManyDatasets-10    	 1309123	       914.6 ns/op	    1416 B/op	      22 allocs/op
+BenchmarkIPTCParseUTF8Declared-10    	 5390953	       224.1 ns/op	     480 B/op	       4 allocs/op
+BenchmarkIPTCParseUTF8Declared-10    	 5232865	       222.1 ns/op	     480 B/op	       4 allocs/op
+BenchmarkIPTCParseUTF8Declared-10    	 5284114	       224.4 ns/op	     480 B/op	       4 allocs/op
+BenchmarkIPTCEncodeSorted-10         	 5952700	       197.7 ns/op	     112 B/op	       1 allocs/op
+BenchmarkIPTCEncodeSorted-10         	 8515200	       187.6 ns/op	     112 B/op	       1 allocs/op
+BenchmarkIPTCEncodeSorted-10         	 5776363	       202.0 ns/op	     112 B/op	       1 allocs/op
+BenchmarkIPTCAccessorsNonASCII-10    	98354947	        17.86 ns/op	       0 B/op	       0 allocs/op
+BenchmarkIPTCAccessorsNonASCII-10    	93494044	        19.72 ns/op	       0 B/op	       0 allocs/op
+BenchmarkIPTCAccessorsNonASCII-10    	92533687	        18.49 ns/op	       0 B/op	       0 allocs/op
+BenchmarkIPTCParse-10                	 4862996	       257.2 ns/op	     480 B/op	       4 allocs/op
+BenchmarkIPTCParse-10                	 4761538	       250.9 ns/op	     480 B/op	       4 allocs/op
+BenchmarkIPTCParse-10                	 7242693	       181.3 ns/op	     480 B/op	       4 allocs/op
+BenchmarkIPTCEncode-10               	 3537470	       347.2 ns/op	     304 B/op	       2 allocs/op
+BenchmarkIPTCEncode-10               	 3512515	       353.9 ns/op	     304 B/op	       2 allocs/op
+BenchmarkIPTCEncode-10               	 3498279	       351.9 ns/op	     304 B/op	       2 allocs/op
+BenchmarkIPTCAccessors-10            	32405317	        36.26 ns/op	      48 B/op	       1 allocs/op
+BenchmarkIPTCAccessors-10            	33308929	        36.59 ns/op	      48 B/op	       1 allocs/op
+BenchmarkIPTCAccessors-10            	31992108	        36.38 ns/op	      48 B/op	       1 allocs/op
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/iptc	49.969s
+goos: darwin
+goarch: arm64
+pkg: github.com/FlavioCFOliveira/GoMetadata/xmp
+cpu: Apple M4
+BenchmarkRDFParse-10                	  212636	      5561 ns/op	    2465 B/op	      14 allocs/op
+BenchmarkRDFParse-10                	  220441	      5474 ns/op	    2465 B/op	      14 allocs/op
+BenchmarkRDFParse-10                	  215330	      5368 ns/op	    2465 B/op	      14 allocs/op
+BenchmarkXMPEncodeFullPacket-10     	  318550	      3463 ns/op	    3573 B/op	       4 allocs/op
+BenchmarkXMPEncodeFullPacket-10     	  345079	      3464 ns/op	    3573 B/op	       4 allocs/op
+BenchmarkXMPEncodeFullPacket-10     	  493840	      3431 ns/op	    3573 B/op	       4 allocs/op
+BenchmarkKeywords-10                	 6058146	       192.5 ns/op	     160 B/op	       1 allocs/op
+BenchmarkKeywords-10                	 5955027	       192.4 ns/op	     160 B/op	       1 allocs/op
+BenchmarkKeywords-10                	 6339405	       193.0 ns/op	     160 B/op	       1 allocs/op
+BenchmarkAddKeyword-10              	 2087265	       575.7 ns/op	     472 B/op	       6 allocs/op
+BenchmarkAddKeyword-10              	 2114090	       584.1 ns/op	     472 B/op	       6 allocs/op
+BenchmarkAddKeyword-10              	 2103366	       563.1 ns/op	     472 B/op	       6 allocs/op
+BenchmarkGPSParse-10                	16056554	        87.70 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGPSParse-10                	17906516	        94.76 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGPSParse-10                	26710912	        44.20 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGPSEncode-10               	 5936272	       182.6 ns/op	      32 B/op	       2 allocs/op
+BenchmarkGPSEncode-10               	 5843840	       185.3 ns/op	      32 B/op	       2 allocs/op
+BenchmarkGPSEncode-10               	 5943607	       186.8 ns/op	      32 B/op	       2 allocs/op
+BenchmarkEntityDecode-10            	 7639735	       154.4 ns/op	      64 B/op	       1 allocs/op
+BenchmarkEntityDecode-10            	 7818230	       152.6 ns/op	      64 B/op	       1 allocs/op
+BenchmarkEntityDecode-10            	 7507429	       156.3 ns/op	      64 B/op	       1 allocs/op
+BenchmarkUnescapeXMLNoEntity-10     	186470188	         6.928 ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnescapeXMLNoEntity-10     	170184019	         7.420 ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnescapeXMLNoEntity-10     	198427940	         6.212 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNumericCharRefDecode-10    	 9197648	       132.7 ns/op	      48 B/op	       1 allocs/op
+BenchmarkNumericCharRefDecode-10    	14025388	        98.54 ns/op	      48 B/op	       1 allocs/op
+BenchmarkNumericCharRefDecode-10    	 8292350	       145.6 ns/op	      48 B/op	       1 allocs/op
+BenchmarkPacketScan-10              	 1356860	       780.7 ns/op	2365.74 MB/s	       0 B/op	       0 allocs/op
+BenchmarkPacketScan-10              	 1551289	       823.8 ns/op	2242.11 MB/s	       0 B/op	       0 allocs/op
+BenchmarkPacketScan-10              	 1401040	       837.4 ns/op	2205.68 MB/s	       0 B/op	       0 allocs/op
+BenchmarkXMPParse-10                	  540793	      2158 ns/op	    1232 B/op	       8 allocs/op
+BenchmarkXMPParse-10                	  604284	      2163 ns/op	    1232 B/op	       8 allocs/op
+BenchmarkXMPParse-10                	  535584	      2146 ns/op	    1232 B/op	       8 allocs/op
+BenchmarkXMPEncode-10               	  517975	      2249 ns/op	    3156 B/op	       3 allocs/op
+BenchmarkXMPEncode-10               	  561807	      2239 ns/op	    3156 B/op	       3 allocs/op
+BenchmarkXMPEncode-10               	  538754	      1919 ns/op	    3156 B/op	       3 allocs/op
+PASS
+ok  	github.com/FlavioCFOliveira/GoMetadata/xmp	54.549s

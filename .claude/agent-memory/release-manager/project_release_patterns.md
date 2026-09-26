@@ -6,7 +6,7 @@ type: project
 
 Repository has two remotes: `origin` (wg32 private server) and `Github` (github.com:FlavioCFOliveira/GoMetadata.git). Both must receive the branch push and tag push on every release.
 
-Pre-commit hook runs `go test ./...` and `golangci-lint run` automatically — no need to add a separate lint step before commit; it is enforced by the hook.
+Pre-commit hook runs `go test ./...` and `golangci-lint run` automatically **when `core.hooksPath` actually resolves** — do NOT assume this. Discovered 2026-09-26 (v1.4.0 release): this repo's local `.git/config` has `core.hooksPath` pointing to a stale absolute path from before the repo moved to `/Users/flaviocfo/dev/xumiga/img-metadata` (it pointed at `/Users/flaviocfo/dev/img-metadata/.git/hooks`, a directory that no longer contains this repo). Git silently resolves a non-existent `hooksPath` to "no hooks configured" rather than erroring, so the release commit went through with **zero hook enforcement** even though `.git/hooks/pre-commit` exists and looks correct in the current checkout. Never fix `core.hooksPath` yourself (git config changes are off-limits per the Git Safety Protocol) — flag it to the user and rely on your own manual `go build`/`go vet`/`go test -race`/`golangci-lint` runs as the real gate, every release, regardless of what this note previously assumed.
 
 BENCHMARKS.md uses two inconsistent run conventions across historical entries: earlier sections used `-benchtime=3s`, later ones use `-count=3`. This means ns/op values are not directly comparable between sections. Always note the run convention in the section header and caveat delta values accordingly.
 

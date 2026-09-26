@@ -6,6 +6,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-26
+
+### Added
+
+- **`format/tiff` streaming `Inject` variants**: `InjectWithEXIFStream`, `InjectWithEXIFCR2Stream`, `InjectWithEXIFNEFStream`, `InjectWithEXIFARWStream`, `InjectWithEXIFORFStream`, and `InjectWithEXIFRW2Stream` expose the streaming image-data-relocation path introduced by #291 below (image blocks are fetched from an `io.ReadSeeker` instead of being buffered whole) under new, dedicated names. The pre-existing `InjectWithEXIF*` functions keep their exact v1.3.0 signature — an apidiff run against v1.3.0 caught that #291 had accidentally changed it, which would have been a breaking change in a minor release — and are now thin wrappers over their `*Stream` sibling (`bytes.NewReader(originalBytes)`, `wholeFile=true`). The root `Write` path already calls the `*Stream` variants directly, so none of the performance improvements documented below are affected.
+- **`(*Metadata).RawSegments()`**: returns zero-copy, read-only views of the raw EXIF, IPTC, and XMP segment bytes exactly as stored on `m`, for allocation-sensitive callers (e.g. hashing or comparing raw bytes across many images) that don't need an independently owned copy. Unlike `RawEXIF`/`RawIPTC`/`RawXMP`, the returned slices alias `m`'s own internal storage — the caller must not modify, append to, or retain them past any subsequent mutation of `m` (a `Set*` call or `Write`).
+- **`exif.AcceptRAWMagic`, `exif.AliasThumbnail`, `exif.EncodeInto`, `exif.EncodedSize`**: new `exif` package exports supporting the read/write performance work below — `AcceptRAWMagic` and `AliasThumbnail` are opt-in `ParseOption`s (the latter aliases `IFD.ThumbnailData` directly into the parse buffer instead of copying it, under a documented buffer-lifetime contract); `EncodeInto` and `EncodedSize` let a caller size and fill its own output buffer instead of receiving a freshly allocated one from `Encode`.
+- **`format/jpeg.ExtractFullSelective`, `format/tiff.ExtractWithMagic`**: new package-level entry points supporting selective (IPTC/XMP-only) extraction and RAW-magic-aware TIFF extraction, used internally by the top-level `Read` path.
+
+### Fixed
+
+- **`format/tiff` public API compatibility restored**: Sprint 44's streaming-write refactor (see the "Performance" items under Changed below) had inadvertently changed the signatures of the six exported `InjectWithEXIF*` functions in `format/tiff` — a breaking change that would have violated this project's SemVer commitment in a minor release. Caught by an `apidiff` comparison against v1.3.0 run as part of this release's pre-flight; fixed by restoring the original v1.3.0 signatures as thin wrappers over the new `*Stream` variants (see "Added" above). A follow-up commit also restored two `//nolint:gosec` (G115) suppression comments that the same refactor had dropped from `exif/ifd.go` and `format/tiff/relocate_bigtiff.go`; both underlying integer conversions remain provably bounds-safe (verified by code review) — this is a lint-hygiene restoration with no behavioural change.
+
 ### Changed
 
 - **`Metadata.RawEXIF()` returns a metadata prefix, not the whole file, for TIFF/CR2/NEF/ARW/DNG/ORF/RW2** (`format/tiff/extent.go`, `format/raw/orf/orf.go`, `format/raw/rw2/rw2.go`, `metadata.go`, #289 for TIFF/CR2/NEF/ARW/DNG; #293 for ORF/RW2): for these seven formats — the ones where the TIFF byte stream is itself the EXIF container — `Read` now reads and `RawEXIF()` now returns only the portion of the file needed to describe metadata (every IFD in IFD0's next-IFD chain, `ExifIFD`, `GPSIFD`, `InteropIFD`, and `SubIFDs`, plus every out-of-line tag value within them, including MakerNote blobs and the tag payloads `RawIPTC()`/`RawXMP()` read from), not the strip/tile image-data blocks or embedded thumbnails/previews that make up the overwhelming majority of a real file's bytes. `m.EXIF`, `RawIPTC()`, and `RawXMP()` are unaffected: every tag they report is identical to a whole-file read. `Write`/`WriteFile` are unaffected: the TIFF-family write paths transparently re-read the full source from the original `io.ReadSeeker` for image-data relocation whenever `RawEXIF()`'s content is only a prefix (reusing it directly, with no second read, on the inputs where the prefix scan happened to read the whole file anyway). Formats other than these seven (JPEG, PNG, WebP, HEIF/AVIF, CR3) are unaffected — `RawEXIF()` already returned just the EXIF segment/box/chunk for those, never the whole file.
@@ -325,7 +338,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ---
 
-[Unreleased]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/FlavioCFOliveira/GoMetadata/compare/v1.0.4...v1.1.0
