@@ -809,10 +809,16 @@ func TestReadChunkTooLarge(t *testing.T) {
 // length > largeSize (65536), allocating ~200 MiB before io.ReadFull detected
 // the truncation.
 //
-// After the fix, readNonEmptyChunk switches to io.ReadAll(io.LimitReader(...))
-// for length > largeChunkReadThreshold, which grows incrementally as bytes
-// arrive; a short stream yields a short slice without a proportional allocation,
-// and the subsequent truncation check returns an error immediately.
+// After the fix, readOrSkipChunk's checkChunkTruncation call rejects the
+// chunk's declared length against the known stream size BEFORE any read is
+// attempted (readNonEmptyChunk, and its own io.ReadAll(io.LimitReader(...))
+// incremental-read fallback, are never reached), so no proportional
+// allocation is possible regardless of the declared length. #294: the
+// truncation this test crafts is no longer surfaced as an error from
+// Extract — it is a graceful stop, exactly like a clean end of stream — but
+// the "no huge allocation" property this test exists to prove is
+// unaffected: the rejection still happens before any read of the chunk's
+// (fictional) 200 MiB payload is ever attempted.
 func TestReadChunkLargeDeclaredSizeShortStream(t *testing.T) {
 	t.Parallel()
 
@@ -840,15 +846,16 @@ func TestReadChunkLargeDeclaredSizeShortStream(t *testing.T) {
 	buf.Write(hdr[:])
 	// Deliberately write no payload — stream ends immediately after the header.
 
-	_, _, _, err := Extract(bytes.NewReader(buf.Bytes()))
-	if err == nil {
-		t.Fatal("Extract: expected error for chunk length > stream, got nil")
+	rawEXIF, rawIPTC, rawXMP, err := Extract(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("Extract: expected nil error (graceful stop, #294) for a chunk length exceeding the stream, got %v", err)
 	}
-	// The error must NOT be nil: a truncated read must be detected quickly
-	// without a proportional allocation. Any non-nil error is acceptable here
-	// (io.ErrUnexpectedEOF wrapped in the readNonEmptyChunk message). We do
-	// not assert a specific sentinel because the stream ends mid-chunk, which
-	// is a different condition from ErrChunkTooLarge.
+	// IHDR carries no EXIF/IPTC/XMP; the truncated eXIf chunk is never read
+	// (checkChunkTruncation rejects it before any payload read is attempted),
+	// so nothing is collected.
+	if rawEXIF != nil || rawIPTC != nil || rawXMP != nil {
+		t.Fatalf("Extract: expected (nil,nil,nil), got rawEXIF=%v rawIPTC=%v rawXMP=%v", rawEXIF, rawIPTC, rawXMP)
+	}
 }
 
 // BenchmarkPNGWriteChunk measures the hot inner loop: serialise one PNG chunk

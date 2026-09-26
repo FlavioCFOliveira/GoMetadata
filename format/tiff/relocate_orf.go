@@ -48,9 +48,24 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
 )
+
+// olympMNIFDFetchMargin is the generous, still-tiny extra range fetched
+// (task #291 follow-up) from the source past the OLYMP-type MakerNote's own
+// declared blob end before scanning its internal IFD for the ThumbnailImage
+// (0x0100) pointer. In well-formed files this scan should already be within
+// the declared blob (a standard out-of-line entry #289/#293's scanner
+// walks), but the scan reads absolute file positions directly rather than
+// mnEntry.Value, so this margin is a defensive safety net against a
+// declared-Count/true-internal-extent mismatch — real OLYMP MakerNote IFDs
+// have on the order of 10-30 entries (≈120-360 bytes), so 4 KiB gives
+// generous headroom while remaining negligible next to the tens-of-MB a
+// real ORF file spends on image data. The ThumbnailImage DATA itself is
+// never fetched here — it streams separately as an imageBlock.
+const olympMNIFDFetchMargin = 4096
 
 // Sentinel errors for the ORF-specific relocation subsystem.
 var (
@@ -161,29 +176,40 @@ func isOLYMPMakerNote(blob []byte) bool {
 // extractOlympMakerNoteInfo inspects the parsed EXIF for an OLYMP-type MakerNote
 // and returns an olympMakerNoteInfo when one is found.
 //
-// Returns nil (no error) when no OLYMP-type MakerNote is present — this is the
-// normal case for newer Olympus / OM SYSTEM cameras which use the blob-relative
-// "OLYMPUS\x00" format that is safe to copy verbatim.
+// base is the original TIFF byte stream — possibly only a metadata PREFIX
+// (#289/#293). r/fileLen let this function fetch the small additional range
+// (see olympMNIFDFetchMargin's own doc comment) needed to scan the MakerNote's
+// internal IFD directory for the ThumbnailImage pointer, in the rare case it
+// is not already within the prefix; r may be nil when base is already known
+// to be the whole file (fileLen == len(base)), since extendBase never
+// touches r in that case. The ThumbnailImage JPEG DATA itself is never
+// fetched into base — it streams separately as an imageBlock, like any
+// StripOffsets block.
+//
+// Returns the (possibly grown) base for the caller to use in place of its
+// own, and a nil info (no error) when no OLYMP-type MakerNote is present —
+// this is the normal case for newer Olympus / OM SYSTEM cameras which use
+// the blob-relative "OLYMPUS\x00" format that is safe to copy verbatim.
 //
 // Returns a non-nil olympMakerNoteInfo when an OLYMP-type MakerNote is detected.
 // The ThumbnailImage fields (thumbSrcOffset, thumbSize) are set only when the
 // MakerNote IFD contains tag 0x0100 with a valid external OOL value.
 //
 //nolint:cyclop,gocyclo // OLYMP MakerNote detection and thumbnail scanning require multiple range/spec checks; complexity is inherent
-func extractOlympMakerNoteInfo(base []byte, e *exif.EXIF, order binary.ByteOrder) *olympMakerNoteInfo {
+func extractOlympMakerNoteInfo(base []byte, r io.ReadSeeker, fileLen uint64, e *exif.EXIF, order binary.ByteOrder) (info *olympMakerNoteInfo, newBase []byte, err error) {
 	if e == nil || e.ExifIFD == nil {
-		return nil
+		return nil, base, nil
 	}
 
 	// Find the MakerNote entry (0x927C) in the ExifIFD.
 	mnEntry := e.ExifIFD.Get(exif.TagMakerNote)
 	if mnEntry == nil || len(mnEntry.Value) < olympMNHeaderLen {
-		return nil
+		return nil, base, nil
 	}
 
 	// Check if this is an OLYMP-type MakerNote (not "OLYMPUS\x00" or "OM SYSTEM\x00").
 	if !isOLYMPMakerNote(mnEntry.Value) {
-		return nil
+		return nil, base, nil
 	}
 
 	// MakerNoteOffset is set by exif.Parse when the MakerNote is OOL (count > 4).
@@ -196,10 +222,10 @@ func extractOlympMakerNoteInfo(base []byte, e *exif.EXIF, order binary.ByteOrder
 	if mnSrcOffset == 0 {
 		// Could not locate the blob in base; skip rebasing (safe: no rebasing =
 		// stale offsets, same as before the fix, but at least no crash).
-		return nil
+		return nil, base, nil
 	}
 
-	info := &olympMakerNoteInfo{
+	info = &olympMakerNoteInfo{
 		mnEntry:     mnEntry,
 		mnSrcOffset: mnSrcOffset,
 		mnBlobSize:  uint32(len(mnEntry.Value)), //nolint:gosec // G115: MakerNote blob size bounded by TIFF stream
@@ -215,8 +241,20 @@ func extractOlympMakerNoteInfo(base []byte, e *exif.EXIF, order binary.ByteOrder
 	// OUTSIDE the MakerNote blob itself (at an earlier file offset in the original
 	// C5050Z layout: [4096:15360]).
 	ifdStart := mnSrcOffset + olympMNHeaderLen
+
+	// #291 follow-up: this scan reads absolute file positions directly
+	// (rather than mnEntry.Value), so — defensively — extend base to cover
+	// the MakerNote's own declared blob end plus a generous margin (see
+	// olympMNIFDFetchMargin's own doc comment) before scanning; a no-op when
+	// base already covers this range.
+	declaredBlobEnd := uint64(mnSrcOffset) + uint64(info.mnBlobSize)
+	base, err = extendBase(base, r, fileLen, declaredBlobEnd+olympMNIFDFetchMargin)
+	if err != nil {
+		return nil, nil, fmt.Errorf("orf: extend for MakerNote IFD: %w", err)
+	}
+
 	if uint64(ifdStart)+2 > uint64(len(base)) {
-		return info // IFD is out of bounds; return info without thumbnail
+		return info, base, nil // IFD is out of bounds; return info without thumbnail
 	}
 	mnCount := int(order.Uint16(base[ifdStart:]))
 	pos := int(ifdStart) + 2
@@ -242,9 +280,12 @@ func extractOlympMakerNoteInfo(base []byte, e *exif.EXIF, order binary.ByteOrder
 		if total <= 4 {
 			break // inline — no external data block
 		}
-		// OOL value: val_or_off is a TIFF-file-absolute offset to the JPEG bytes.
+		// OOL value: val_or_off is a TIFF-file-absolute offset to the JPEG
+		// bytes. #291 follow-up: checked against fileLen, not len(base) — the
+		// thumbnail DATA is image data (an imageBlock, streamed separately),
+		// not metadata, and routinely lives beyond the prefix.
 		thumbOff := order.Uint32(base[ep+8:])
-		if thumbOff == 0 || uint64(thumbOff)+total > uint64(len(base)) {
+		if thumbOff == 0 || uint64(thumbOff)+total > fileLen {
 			break
 		}
 		// Verify it is OUTSIDE the MakerNote blob (otherwise delta-rebase handles it).
@@ -253,11 +294,11 @@ func extractOlympMakerNoteInfo(base []byte, e *exif.EXIF, order binary.ByteOrder
 			break // inside blob — regular OOL, no standalone block needed
 		}
 		info.thumbSrcOffset = thumbOff
-		info.thumbSize = uint32(total) //nolint:gosec // G115: total bounded by len(base)
+		info.thumbSize = uint32(total) //nolint:gosec // G115: total bounded by fileLen, itself bounded by maxFileSize
 		break
 	}
 
-	return info
+	return info, base, nil
 }
 
 // rebaseOlympMakerNote rebases all OLYMP-type MakerNote OOL val_or_off entries in
@@ -407,8 +448,8 @@ func rebaseOlympMNEntry(
 // used to patch bytes[2:4] to standard TIFF magic in place, via
 // exif.AcceptRAWMagic instead — see that function's doc comment), so the
 // defensive working copy this function used to make is no longer needed.
-func relocateTIFFAsORF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte) ([]byte, error) {
-	return relocateTIFFFromParsedORF(originalBytes, modifiedEXIF, rawIPTC, rawXMP)
+func relocateTIFFAsORF(originalBytes []byte, r io.ReadSeeker, fileLen uint64, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte) (header []byte, blocks []*imageBlock, err error) {
+	return relocateTIFFFromParsedORF(originalBytes, r, fileLen, modifiedEXIF, rawIPTC, rawXMP)
 }
 
 // relocateTIFFFromParsedORF patches the ORF magic, runs the TIFF copy-and-relocate
@@ -435,9 +476,15 @@ func relocateTIFFAsORF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, r
 // treat base's own ORF magic exactly like classic TIFF, so base can be parsed
 // (and later read from, in enumerateImageBlocks/enumerateSubIFDs) completely
 // unmodified.
-func relocateTIFFFromParsedORF(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte) ([]byte, error) {
+//
+// #291 follow-up: base may be only a metadata PREFIX (#289/#293); r/fileLen
+// let extractOlympMakerNoteInfo fetch the small additional range the OLYMP
+// MakerNote's internal IFD needs beyond it (see that function's own doc
+// comment). r may be nil only when fileLen == len(base) is already
+// guaranteed (base already the whole file).
+func relocateTIFFFromParsedORF(base []byte, r io.ReadSeeker, fileLen uint64, e *exif.EXIF, rawIPTC, rawXMP []byte) (header []byte, blocks []*imageBlock, err error) { //nolint:gocyclo // #291 follow-up: one additional error-checked step (extractOlympMakerNoteInfo's on-demand fetch); branches are inherent to the two-path (verbatim-blob vs OLYMP-rebase) dispatch
 	if !isORFMagic(base) {
-		return nil, fmt.Errorf("orf: %w", ErrORFInvalidMagic)
+		return nil, nil, fmt.Errorf("orf: %w", ErrORFInvalidMagic)
 	}
 
 	// Save the original 4-byte ORF magic for restoration in the output.
@@ -453,7 +500,7 @@ func relocateTIFFFromParsedORF(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 		var parseErr error
 		e, parseErr = exif.Parse(base, exif.AcceptRAWMagic(binary.LittleEndian.Uint16(base[2:4])))
 		if parseErr != nil {
-			return nil, fmt.Errorf("orf: parse for relocation: %w", parseErr)
+			return nil, nil, fmt.Errorf("orf: parse for relocation: %w", parseErr)
 		}
 	}
 
@@ -467,37 +514,42 @@ func relocateTIFFFromParsedORF(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 	// extractOlympMakerNoteInfo returns nil for newer OLYMPUS\x00 / OM SYSTEM\x00
 	// cameras whose MakerNotes use blob-relative offsets (safe to copy verbatim).
 	// It returns non-nil only for the older OLYMP\x00 format with file-absolute offsets.
-	mnInfo := extractOlympMakerNoteInfo(base, e, order)
+	mnInfo, base, err := extractOlympMakerNoteInfo(base, r, fileLen, e, order)
+	if err != nil {
+		return nil, nil, fmt.Errorf("orf: extract OLYMP MakerNote info: %w", err)
+	}
 	if mnInfo == nil {
 		// Newer Olympus or no MakerNote: standard path (verbatim blob copy is safe).
-		finalTIFF, err := relocateTIFFFromParsed(base, e, rawIPTC, rawXMP)
+		header, blocks, err = relocateTIFFFromParsed(base, e, rawIPTC, rawXMP, fileLen)
 		if err != nil {
-			return nil, fmt.Errorf("orf: relocate: %w", err)
+			return nil, nil, fmt.Errorf("orf: relocate: %w", err)
 		}
-		if len(finalTIFF) < 4 {
-			return nil, fmt.Errorf("orf: %w (%d bytes)", ErrORFOutputTooShort, len(finalTIFF))
+		if len(header) < 4 {
+			return nil, nil, fmt.Errorf("orf: %w (%d bytes)", ErrORFOutputTooShort, len(header))
 		}
-		copy(finalTIFF[0:4], origMagic[:])
-		return finalTIFF, nil
+		copy(header[0:4], origMagic[:])
+		return header, blocks, nil
 	}
 
 	// OLYMP-type MakerNote path: run the ARW-analogous relocation.
-	finalTIFF, err := orfRelocateWithOLYMP(base, e, rawIPTC, rawXMP, mnInfo, order)
+	header, blocks, err = orfRelocateWithOLYMP(base, e, rawIPTC, rawXMP, mnInfo, order, fileLen)
 	if err != nil {
-		return nil, fmt.Errorf("orf: %w", err)
+		return nil, nil, fmt.Errorf("orf: %w", err)
 	}
 
-	// Restore the original ORF magic in the output bytes [0:4].
+	// Restore the original ORF magic in the output bytes [0:4]. Bytes [0:4]
+	// are always within the HEADER (the standard TIFF header occupies bytes
+	// 0-7), so this restore is unaffected by #291's header/blocks split.
 	//
 	// exif.Encode produces a standard TIFF header: "II" + 0x2A 0x00 + IFD0_off.
 	// Replace bytes [0:4] with the saved ORF magic (IIRO or IIRS) so the output
 	// is recognised as a valid Olympus ORF by all ORF-aware tools and cameras.
-	if len(finalTIFF) < 4 {
-		return nil, fmt.Errorf("orf: %w (%d bytes)", ErrORFOutputTooShort, len(finalTIFF))
+	if len(header) < 4 {
+		return nil, nil, fmt.Errorf("orf: %w (%d bytes)", ErrORFOutputTooShort, len(header))
 	}
-	copy(finalTIFF[0:4], origMagic[:])
+	copy(header[0:4], origMagic[:])
 
-	return finalTIFF, nil
+	return header, blocks, nil
 }
 
 // orfRelocateWithOLYMP runs the TIFF copy-and-relocate algorithm with
@@ -524,7 +576,8 @@ func orfRelocateWithOLYMP(
 	rawIPTC, rawXMP []byte,
 	mnInfo *olympMakerNoteInfo,
 	order binary.ByteOrder,
-) ([]byte, error) {
+	fileLen uint64,
+) (header []byte, blocks []*imageBlock, err error) {
 	// Step 2: upsert metadata tags in IFD0.
 	if e.IFD0 == nil {
 		e.IFD0 = &exif.IFD{}
@@ -551,9 +604,9 @@ func orfRelocateWithOLYMP(
 	// GM-W1: budget is shared with the SubIFD enumeration below so the
 	// cumulative image-block + SubIFD count for this write is bounded.
 	budget := newImageBlockBudget()
-	blocks, err := enumerateImageBlocks(base, e, order, false, budget)
+	blocks, err = enumerateImageBlocks(e, order, false, budget, fileLen)
 	if err != nil {
-		return nil, fmt.Errorf("enumerate image blocks: %w", err)
+		return nil, nil, fmt.Errorf("enumerate image blocks: %w", err)
 	}
 
 	// Step 3.5: register the MakerNote ThumbnailImage as a standalone imageBlock.
@@ -582,9 +635,9 @@ func orfRelocateWithOLYMP(
 	}
 
 	// Step 4: enumerate SubIFDs (tag 0x014A).
-	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget)
+	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget, fileLen)
 	if subErr != nil {
-		return nil, fmt.Errorf("enumerate SubIFDs: %w", subErr)
+		return nil, nil, fmt.Errorf("enumerate SubIFDs: %w", subErr)
 	}
 	blocks = append(blocks, subBlocks...)
 
@@ -603,7 +656,7 @@ func orfRelocateWithOLYMP(
 
 	ifdEndInt, skelErr := exif.EncodedSize(e)
 	if skelErr != nil {
-		return nil, fmt.Errorf("encode placeholder: %w", skelErr)
+		return nil, nil, fmt.Errorf("encode placeholder: %w", skelErr)
 	}
 	ifdEnd := uint64(ifdEndInt) //nolint:gosec // G115: EncodedSize never returns a negative length
 
@@ -625,15 +678,15 @@ func orfRelocateWithOLYMP(
 	patchSubIFDImageOffsets(subIFDs, false, order)
 
 	// Step 9: re-encode → finalTIFF. The buffer is allocated once with the
-	// exact final length (IFD structure + SubIFD blocks + image blocks,
-	// including the standalone MakerNote ThumbnailImage block folded into
-	// allBlocks above), so steps 11 and 12 below never regrow it.
+	// exact HEADER length (IFD structure + SubIFD blocks — task #291 no
+	// longer includes image blocks here), so step 11 below never regrows it.
 	// #285: eliminates the append-driven doubling-growth reallocations that
 	// used to dominate ORF write CPU (measured 83-95% memmove on large files).
-	finalLen := relocatedLen(ifdEnd, subIFDs, allBlocks)
-	finalTIFF, finalErr := exif.EncodeInto(make([]byte, 0, finalCap(finalLen)), e)
+	// #291: capacity now scales with metadata size only, not file size.
+	headerLen := relocatedLen(ifdEnd, subIFDs)
+	finalTIFF, finalErr := exif.EncodeInto(make([]byte, 0, finalCap(headerLen)), e)
 	if finalErr != nil {
-		return nil, fmt.Errorf("encode final: %w", finalErr)
+		return nil, nil, fmt.Errorf("encode final: %w", finalErr)
 	}
 
 	// Step 9.5 (OLYMP-specific): rebase MakerNote OOL pointers in finalTIFF.
@@ -651,7 +704,7 @@ func orfRelocateWithOLYMP(
 	// Step 10: patch the 0x014A SubIFDs pointer array in finalTIFF.
 	if len(subIFDs) > 0 {
 		if pErr := patchSubIFDPointers(finalTIFF, subIFDs, false, order); pErr != nil {
-			return nil, fmt.Errorf("patch SubIFD pointers: %w", pErr)
+			return nil, nil, fmt.Errorf("patch SubIFD pointers: %w", pErr)
 		}
 	}
 
@@ -663,18 +716,12 @@ func orfRelocateWithOLYMP(
 		finalTIFF = append(finalTIFF, si.rawBytes...)
 	}
 
-	// Step 12: append all image block bytes from source (main IFD blocks + thumbBlock).
-	for _, blk := range allBlocks {
-		end := blk.srcOffset + blk.size
-		if end > uint64(len(base)) {
-			return nil, fmt.Errorf("image block offset=%d size=%d: %w",
-				blk.srcOffset, blk.size, ErrBlockOutOfBounds)
-		}
-		finalTIFF = append(finalTIFF, base[blk.srcOffset:end]...)
+	// #291: step 12 (append all image block bytes) is no longer performed
+	// here — allBlocks (main IFD blocks + thumbBlock) is returned to the
+	// caller, which streams each block's bytes from the original source.
+	// finalTIFF is now the complete HEADER.
+	if uint64(len(finalTIFF)) != headerLen {
+		return nil, nil, fmt.Errorf("orf: relocated header length %d, computed %d: %w", len(finalTIFF), headerLen, errRelocateLayout)
 	}
-
-	if uint64(len(finalTIFF)) != finalLen {
-		return nil, fmt.Errorf("orf: relocated length %d, computed %d: %w", len(finalTIFF), finalLen, errRelocateLayout)
-	}
-	return finalTIFF, nil
+	return finalTIFF, allBlocks, nil
 }

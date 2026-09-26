@@ -52,11 +52,11 @@ func TestInjectWithEXIFRawDoesNotMutateCallerInput(t *testing.T) {
 }
 
 func injectORF(in []byte, w io.Writer) error {
-	return InjectWithEXIFORF(in, nil, nil, []byte(testXMPPacket), w)
+	return InjectWithEXIFORF(bytes.NewReader(in), in, true, nil, nil, []byte(testXMPPacket), w)
 }
 
 func injectRW2(in []byte, w io.Writer) error {
-	return InjectWithEXIFRW2(in, nil, nil, []byte(testXMPPacket), w)
+	return InjectWithEXIFRW2(bytes.NewReader(in), in, true, nil, nil, []byte(testXMPPacket), w)
 }
 
 // corpusFile returns an input loader that skips the test when the corpus

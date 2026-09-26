@@ -67,7 +67,7 @@ func TestInjectWithEXIFRealFile_CrampsTIF(t *testing.T) {
 	// Step 4: inject using InjectWithEXIF (original bytes + modified struct).
 	// rawIPTC and rawXMP are nil to isolate the EXIF-struct write path.
 	var out bytes.Buffer
-	if err := InjectWithEXIF(original, e, nil, nil, &out); err != nil {
+	if err := InjectWithEXIF(bytes.NewReader(original), original, true, e, nil, nil, &out); err != nil {
 		t.Fatalf("InjectWithEXIF: %v", err)
 	}
 
@@ -105,7 +105,7 @@ func TestInjectWithEXIFRealFile_PassThrough(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := InjectWithEXIF(original, nil, nil, nil, &out); err != nil {
+	if err := InjectWithEXIF(bytes.NewReader(original), original, true, nil, nil, nil, &out); err != nil {
 		t.Fatalf("InjectWithEXIF pass-through: %v", err)
 	}
 

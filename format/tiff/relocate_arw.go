@@ -74,6 +74,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
@@ -131,6 +132,19 @@ const (
 	// idcIFDHeaderSize is the fixed size of the empty IDC_IFD:
 	// count(2) + entries(0×12) + nextIFD(4) = 6 bytes.
 	idcIFDHeaderSize = 6
+
+	// sonySR2IFDFetchMargin is the generous, still-tiny extra range fetched
+	// (task #291 follow-up) from the source past sr2IFDOffset before parsing
+	// the SR2 IFD's own fixed block (2-byte count + 10×12-byte entries + 4-byte
+	// next-IFD = 126 bytes, per this file's own doc comment) and its 3 small
+	// out-of-line value areas (0x7241, 0x7242, 0x7250). SR2Private (0xC634) is
+	// an INLINE 4-byte pointer with no declared byte count for #289/#293's
+	// extent.go scanner to extend into, so this region is never in the
+	// metadata prefix and must be fetched on demand. 4 KiB is >30x real Sony
+	// bodies' empirically-confirmed 126-byte fixed block plus headroom for the
+	// OOL areas — negligible next to the tens-of-MB a real ARW file spends on
+	// image data, but comfortably bounded rather than "read everything".
+	sonySR2IFDFetchMargin = 4096
 )
 
 // sonySR2Info collects the Sony SR2Private block info and MakerNote info needed
@@ -184,24 +198,31 @@ type sonySR2Info struct {
 // extractSonySR2Info inspects the parsed EXIF for a Sony ARW MakerNote and
 // SR2Private block, and returns a sonySR2Info describing both.
 //
-// base is the original TIFF byte stream.
+// base is the original TIFF byte stream — possibly only a metadata PREFIX
+// (#289/#293). r/fileLen let this function fetch the small additional range
+// the SR2Private block needs beyond that prefix (see sonySR2IFDFetchMargin);
+// r may be nil when base is already known to be the whole file (fileLen ==
+// len(base)), since extendBase never touches r in that case.
 // e is the parsed (and possibly mutated) EXIF struct.
 // order is the outer TIFF byte order (all Sony ARW files are little-endian).
 //
-// Returns nil when neither a Sony MakerNote nor an SR2Private block is found.
-// Returns a non-nil error only when the SR2 block is structurally unreadable or
-// out of bounds.
+// Returns the (possibly grown) base for the caller to use in place of its own,
+// a nil info when neither a Sony MakerNote nor an SR2Private block is found,
+// and a non-nil error only when the SR2 block is structurally unreadable, out
+// of bounds even after fetching, or a fetch itself fails.
 //
 //nolint:cyclop,gocyclo // Sony structure inspection; complexity is inherent to the multi-step spec lookup
-func extractSonySR2Info(base []byte, e *exif.EXIF, order binary.ByteOrder) (*sonySR2Info, error) {
+func extractSonySR2Info(base []byte, r io.ReadSeeker, fileLen uint64, e *exif.EXIF, order binary.ByteOrder) (info *sonySR2Info, newBase []byte, err error) {
 	if e == nil || e.IFD0 == nil {
-		return nil, nil //nolint:nilnil // nil info means "no Sony-specific block found"
+		return nil, base, nil // nil info means "no Sony-specific block found"
 	}
 
-	info := &sonySR2Info{makerNoteOrder: order}
+	info = &sonySR2Info{makerNoteOrder: order}
 
 	// ── Step A1: Sony MakerNote ──────────────────────────────────────────────
-	// Find the MakerNote entry (0x927C) in the ExifIFD.
+	// Find the MakerNote entry (0x927C) in the ExifIFD. This step reads only
+	// already-parsed entry metadata and searches within base for bytes it
+	// already holds (info.mnEntry.Value) — no extension needed.
 	if e.ExifIFD != nil {
 		info.mnEntry = e.ExifIFD.Get(sonyTagMakerNote)
 	}
@@ -227,9 +248,9 @@ func extractSonySR2Info(base []byte, e *exif.EXIF, order binary.ByteOrder) (*son
 		// No SR2Private; skip SR2 block relocation.
 		// Return info only if MakerNote relocation is needed.
 		if info.mnEntry == nil {
-			return nil, nil //nolint:nilnil // no Sony-specific structures found
+			return nil, base, nil // no Sony-specific structures found
 		}
-		return info, nil
+		return info, base, nil
 	}
 
 	// 0xC634 is type=Byte, count=4, total=4 → inline.
@@ -238,12 +259,23 @@ func extractSonySR2Info(base []byte, e *exif.EXIF, order binary.ByteOrder) (*son
 	// bytes; the LE uint32 interpretation gives the offset.
 	if len(sr2Entry.Value) < 4 {
 		// Malformed entry; skip SR2 relocation.
-		return info, nil
+		return info, base, nil
 	}
 	sr2IFDOffset := order.Uint32(sr2Entry.Value)
-	if sr2IFDOffset == 0 || uint64(sr2IFDOffset)+2 > uint64(len(base)) {
-		// Offset out of range; skip.
-		return info, nil
+	if sr2IFDOffset == 0 || uint64(sr2IFDOffset)+2 > fileLen {
+		// Offset out of range even against the true file length; skip.
+		return info, base, nil
+	}
+
+	// #291 follow-up: SR2Private (0xC634) is an INLINE 4-byte pointer with no
+	// declared byte count for #289/#293's extent.go scanner to extend into, so
+	// the SR2 IFD's own structure is never in the metadata prefix. Fetch a
+	// generous, still-tiny margin now (see sonySR2IFDFetchMargin's own doc
+	// comment) so the parse below has what it needs; a no-op when base
+	// already covers this range (e.g. base is already the whole file).
+	base, err = extendBase(base, r, fileLen, uint64(sr2IFDOffset)+sonySR2IFDFetchMargin)
+	if err != nil {
+		return nil, nil, fmt.Errorf("arw: extend for SR2 IFD: %w", err)
 	}
 
 	// Parse the SR2 IFD to find SR2SubIFDOffset (0x7200), SR2SubIFDLength (0x7201),
@@ -251,7 +283,7 @@ func extractSonySR2Info(base []byte, e *exif.EXIF, order binary.ByteOrder) (*son
 	sr2SubIFDOffset, sr2SubIFDLength, idcIFDOffset, ok := parseSR2IFDEntries(base, sr2IFDOffset, order)
 	if !ok {
 		// SR2 IFD is unreadable; skip.
-		return info, nil
+		return info, base, nil
 	}
 
 	// Compute the full extent of the SR2 block:
@@ -283,10 +315,21 @@ func extractSonySR2Info(base []byte, e *exif.EXIF, order binary.ByteOrder) (*son
 	}
 
 	if sr2BlockEnd <= uint64(sr2IFDOffset) {
-		return info, nil // degenerate block
+		return info, base, nil // degenerate block
+	}
+
+	// #291 follow-up: extend again to the EXACT computed block end — this is
+	// the "small buffer fetch" for the encrypted SR2SubIFD blob itself
+	// (~37 KB on real Sony bodies per this file's own doc comment), which is
+	// copied verbatim into the output header (like SubIFD rawBytes), not
+	// streamed as an imageBlock. The tens-of-MB of actual image data these
+	// files carry is streamed separately and never buffered this way.
+	base, err = extendBase(base, r, fileLen, sr2BlockEnd)
+	if err != nil {
+		return nil, nil, fmt.Errorf("arw: extend for SR2 block: %w", err)
 	}
 	if sr2BlockEnd > uint64(len(base)) {
-		return nil, fmt.Errorf("%w (sr2Start=%d blockEnd=%d baseLen=%d)",
+		return nil, base, fmt.Errorf("%w (sr2Start=%d blockEnd=%d baseLen=%d)",
 			ErrSonySR2BlockOutOfBounds, sr2IFDOffset, sr2BlockEnd, len(base))
 	}
 
@@ -301,7 +344,7 @@ func extractSonySR2Info(base []byte, e *exif.EXIF, order binary.ByteOrder) (*son
 	info.sr2IDCIFDOffset = idcIFDOffset
 	info.sr2SubIFDKey = readSR2SubIFDKey(base, sr2IFDOffset, order)
 
-	return info, nil
+	return info, base, nil
 }
 
 // parseSR2IFDEntries scans the SR2 IFD at sr2Off in base for the three key
@@ -953,12 +996,17 @@ func patchSR2Bytes(rawBytes []byte, info *sonySR2Info, order binary.ByteOrder) e
 //
 // When no Sony-specific structures are detected, it falls back to the standard
 // relocateTIFFFromParsed path.
-func relocateTIFFFromParsedARW(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte) ([]byte, error) {
+//
+// #291 follow-up: base may be only a metadata PREFIX (#289/#293); r/fileLen
+// let extractSonySR2Info fetch the small additional range SR2Private needs
+// beyond it (see that function's own doc comment). r may be nil only when
+// fileLen == len(base) is already guaranteed (base already the whole file).
+func relocateTIFFFromParsedARW(base []byte, r io.ReadSeeker, fileLen uint64, e *exif.EXIF, rawIPTC, rawXMP []byte) (header []byte, blocks []*imageBlock, err error) {
 	if e == nil {
 		var parseErr error
 		e, parseErr = exif.Parse(base)
 		if parseErr != nil {
-			return nil, fmt.Errorf("arw: parse for relocation: %w", parseErr)
+			return nil, nil, fmt.Errorf("arw: parse for relocation: %w", parseErr)
 		}
 	}
 
@@ -968,18 +1016,18 @@ func relocateTIFFFromParsedARW(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 	}
 
 	// Step A: extract Sony-specific info (MakerNote + SR2Private block).
-	info, err := extractSonySR2Info(base, e, order)
+	info, base, err := extractSonySR2Info(base, r, fileLen, e, order)
 	if err != nil {
-		return nil, fmt.Errorf("arw: extract Sony SR2 info: %w", err)
+		return nil, nil, fmt.Errorf("arw: extract Sony SR2 info: %w", err)
 	}
 
 	if info == nil || (info.mnEntry == nil && info.sr2RawBytes == nil) {
 		// No Sony-specific preprocessing needed; use the standard path.
-		return relocateTIFFFromParsed(base, e, rawIPTC, rawXMP)
+		return relocateTIFFFromParsed(base, e, rawIPTC, rawXMP, fileLen)
 	}
 
 	// Run the ARW-specific relocation with Sony post-encode patches.
-	return arwRelocateWithSR2(base, e, rawIPTC, rawXMP, info, order)
+	return arwRelocateWithSR2(base, e, rawIPTC, rawXMP, info, order, fileLen)
 }
 
 // arwRelocateWithSR2 runs the TIFF copy-and-relocate algorithm with Sony-specific
@@ -998,7 +1046,8 @@ func arwRelocateWithSR2(
 	rawIPTC, rawXMP []byte,
 	info *sonySR2Info,
 	order binary.ByteOrder,
-) ([]byte, error) {
+	fileLen uint64,
+) (header []byte, blocks []*imageBlock, err error) {
 	// Step 2: upsert metadata tags in IFD0.
 	if e.IFD0 == nil {
 		e.IFD0 = &exif.IFD{}
@@ -1040,15 +1089,15 @@ func arwRelocateWithSR2(
 	// GM-W1: budget is shared with the SubIFD enumeration below so the
 	// cumulative image-block + SubIFD count for this write is bounded.
 	budget := newImageBlockBudget()
-	blocks, err := enumerateImageBlocks(base, e, order, false, budget)
+	blocks, err = enumerateImageBlocks(e, order, false, budget, fileLen)
 	if err != nil {
-		return nil, fmt.Errorf("arw: enumerate image blocks: %w", err)
+		return nil, nil, fmt.Errorf("arw: enumerate image blocks: %w", err)
 	}
 
 	// Step 4: parse SubIFDs (tag 0x014A).
-	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget)
+	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget, fileLen)
 	if subErr != nil {
-		return nil, fmt.Errorf("arw: enumerate SubIFDs: %w", subErr)
+		return nil, nil, fmt.Errorf("arw: enumerate SubIFDs: %w", subErr)
 	}
 	blocks = append(blocks, subBlocks...)
 
@@ -1066,7 +1115,7 @@ func arwRelocateWithSR2(
 
 	ifdEndInt, skelErr := exif.EncodedSize(e)
 	if skelErr != nil {
-		return nil, fmt.Errorf("arw: encode placeholder: %w", skelErr)
+		return nil, nil, fmt.Errorf("arw: encode placeholder: %w", skelErr)
 	}
 	ifdEnd := uint64(ifdEndInt) //nolint:gosec // G115: EncodedSize never returns a negative length
 
@@ -1097,7 +1146,7 @@ func arwRelocateWithSR2(
 	// a real format limit here, not merely a defensive one.
 	imageStart := ifdEnd + subIFDsSize + sr2ActualSize
 	if imageStart > math.MaxUint32 {
-		return nil, fmt.Errorf("arw: ifdEnd=%d subIFDsSize=%d sr2ActualSize=%d: %w",
+		return nil, nil, fmt.Errorf("arw: ifdEnd=%d subIFDsSize=%d sr2ActualSize=%d: %w",
 			ifdEnd, subIFDsSize, sr2ActualSize, ErrOffsetOverflow)
 	}
 	assignNewOffsets(blocks, imageStart)
@@ -1109,7 +1158,7 @@ func arwRelocateWithSR2(
 	// Mirror of the guard in relocate_nef.go:771-773 and relocate_rw2.go:256-258.
 	for _, blk := range blocks {
 		if blk.newOffset == math.MaxUint32 {
-			return nil, fmt.Errorf("arw: %w", ErrImageBlockOverflow)
+			return nil, nil, fmt.Errorf("arw: %w", ErrImageBlockOverflow)
 		}
 	}
 
@@ -1139,26 +1188,28 @@ func arwRelocateWithSR2(
 	// win here (fewer allocations, no measurable slowdown): it is Encode's
 	// own layout arithmetic without writing any bytes, so this file keeps
 	// EncodedSize for the skeleton pass while leaving the final pass on
-	// plain exif.Encode(e). finalLen is still computed, via arwRelocatedLen,
+	// plain exif.Encode(e). headerLen is still computed, via arwRelocatedLen,
 	// purely as a cheap (metadata-sized, not file-sized) post-hoc invariant
 	// check below — it no longer sizes any allocation.
-	finalLen := arwRelocatedLen(ifdEnd, subIFDs, uint64(len(info.sr2RawBytes)), blocks)
+	// #291: passing nil blocks gives the HEADER-only length (image blocks are
+	// no longer appended here — see step 12's own comment below).
+	headerLen := arwRelocatedLen(ifdEnd, subIFDs, uint64(len(info.sr2RawBytes)))
 	finalTIFF, finalErr := exif.Encode(e)
 	if finalErr != nil {
-		return nil, fmt.Errorf("arw: encode final: %w", finalErr)
+		return nil, nil, fmt.Errorf("arw: encode final: %w", finalErr)
 	}
 
 	// Step 9.5 (Sony-specific): rebase Sony MakerNote OOL offsets.
 	// Must be done BEFORE appending the SR2 block so that finalTIFF length is
 	// correct for bounds checks.
 	if rebaseErr := rebaseSonyMakerNote(finalTIFF, info, order); rebaseErr != nil {
-		return nil, fmt.Errorf("arw: rebase Sony MakerNote offsets: %w", rebaseErr)
+		return nil, nil, fmt.Errorf("arw: rebase Sony MakerNote offsets: %w", rebaseErr)
 	}
 
 	// Step 10: patch the 0x014A SubIFDs pointer array in finalTIFF.
 	if len(subIFDs) > 0 {
 		if pErr := patchSubIFDPointers(finalTIFF, subIFDs, false, order); pErr != nil {
-			return nil, fmt.Errorf("arw: patch SubIFD pointers: %w", pErr)
+			return nil, nil, fmt.Errorf("arw: patch SubIFD pointers: %w", pErr)
 		}
 	}
 
@@ -1188,25 +1239,18 @@ func arwRelocateWithSR2(
 
 		// Patch 0xC634 in finalTIFF and rebase SR2 internal pointers.
 		if pErr := patchSonySR2InFinalTIFF(finalTIFF, sr2BytesForOutput, info, order); pErr != nil {
-			return nil, fmt.Errorf("arw: patch Sony SR2Private: %w", pErr)
+			return nil, nil, fmt.Errorf("arw: patch Sony SR2Private: %w", pErr)
 		}
 		finalTIFF = append(finalTIFF, sr2BytesForOutput...)
 	}
 
-	// Step 12: append image block bytes from source.
-	for _, blk := range blocks {
-		end := blk.srcOffset + blk.size
-		if end > uint64(len(base)) {
-			return nil, fmt.Errorf("arw: image block offset=%d size=%d: %w",
-				blk.srcOffset, blk.size, ErrBlockOutOfBounds)
-		}
-		finalTIFF = append(finalTIFF, base[blk.srcOffset:end]...)
+	// #291: step 12 (append image block bytes) is no longer performed here —
+	// blocks is returned to the caller, which streams each block's bytes from
+	// the original source. finalTIFF is now the complete HEADER.
+	if uint64(len(finalTIFF)) != headerLen {
+		return nil, nil, fmt.Errorf("arw: relocated header length %d, computed %d: %w", len(finalTIFF), headerLen, errRelocateLayout)
 	}
-
-	if uint64(len(finalTIFF)) != finalLen {
-		return nil, fmt.Errorf("arw: relocated length %d, computed %d: %w", len(finalTIFF), finalLen, errRelocateLayout)
-	}
-	return finalTIFF, nil
+	return finalTIFF, blocks, nil
 }
 
 // arwRelocatedLen returns the exact length of arwRelocateWithSR2's output: the
@@ -1226,8 +1270,12 @@ func arwRelocateWithSR2(
 // arwRelocateWithSR2's step-9 output buffer — pre-sizing was measured to be
 // slower for this format (see step 9's own doc comment for the benchmark
 // evidence). arwRelocatedLen's result is used only for the cheap,
-// metadata-sized post-hoc invariant check after step 12.
-func arwRelocatedLen(ifdEnd uint64, subIFDs []*subIFDInfo, sr2Len uint64, blocks []*imageBlock) uint64 {
+// metadata-sized post-hoc invariant check after step 11.5.
+//
+// #291: image blocks (the former step 12) are no longer part of this
+// function's result — they are streamed separately by the caller (see
+// writeRelocated in relocate_stream.go), so their sizes are never included.
+func arwRelocatedLen(ifdEnd uint64, subIFDs []*subIFDInfo, sr2Len uint64) uint64 {
 	n := ifdEnd
 	for _, si := range subIFDs {
 		if n&1 == 1 {
@@ -1240,9 +1288,6 @@ func arwRelocatedLen(ifdEnd uint64, subIFDs []*subIFDInfo, sr2Len uint64, blocks
 			n++
 		}
 		n += sr2Len
-	}
-	for _, blk := range blocks {
-		n += blk.size
 	}
 	return n
 }

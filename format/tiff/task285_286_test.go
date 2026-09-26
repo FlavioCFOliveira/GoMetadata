@@ -42,7 +42,7 @@ func TestRelocateTIFFFromParsedORF_DoesNotMutateBase(t *testing.T) {
 
 	before := bytes.Clone(buf)
 
-	if _, err := relocateTIFFFromParsedORF(buf, nil, nil, nil); err != nil {
+	if _, _, err := relocateTIFFFromParsedORF(buf, nil, uint64(len(buf)), nil, nil, nil); err != nil {
 		t.Fatalf("relocateTIFFFromParsedORF: %v", err)
 	}
 
@@ -65,7 +65,7 @@ func TestRelocateTIFFFromParsedRW2_DoesNotMutateBase(t *testing.T) { //nolint:pa
 	buf, _ := buildMinimalRW2TIFF(t)
 	before := bytes.Clone(buf)
 
-	if _, err := relocateTIFFFromParsedRW2(buf, nil, nil, nil); err != nil {
+	if _, _, err := relocateTIFFFromParsedRW2(buf, uint64(len(buf)), nil, nil, nil); err != nil {
 		t.Fatalf("relocateTIFFFromParsedRW2: %v", err)
 	}
 
@@ -102,7 +102,7 @@ func TestRelocateTIFFAsORF_NoDefensiveCloneNeeded(t *testing.T) {
 	order.PutUint32(buf[18:], 100)
 
 	before := bytes.Clone(buf)
-	out, err := relocateTIFFAsORF(buf, nil, nil, nil)
+	out, _, err := relocateTIFFAsORF(buf, nil, uint64(len(buf)), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("relocateTIFFAsORF: %v", err)
 	}

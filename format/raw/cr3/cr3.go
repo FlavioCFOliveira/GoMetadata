@@ -6,7 +6,6 @@ package cr3
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -169,35 +168,40 @@ func cr3BoxHeaderAt(r io.ReadSeeker, hdr *[16]byte, pos, fileLen int64) (size ui
 // full payload — rather than the whole file, which in a CR3 is almost
 // entirely raw sensor data in the mdat box (#286).
 //
-// Returns (nil, nil) if no matching box is found before EOF or the scan cap
-// is reached; a non-nil error is returned only for a genuine I/O failure on
-// the matched box's payload read or on the seek past a skipped box.
-func readTopLevelBox(r io.ReadSeeker, want [4]byte, fileLen int64) ([]byte, error) {
+// Returns (nil, 0, 0, nil) if no matching box is found before EOF or the scan
+// cap is reached; a non-nil error is returned only for a genuine I/O failure
+// on the matched box's payload read or on the seek past a skipped box.
+//
+// boxStart/boxEnd are the matched box's absolute byte range in the stream,
+// header included (boxEnd-boxStart == the box's own resolved size). #292:
+// Inject uses these to stream-copy the bytes surrounding the box (everything
+// NOT part of the matched box) verbatim, without ever buffering them.
+func readTopLevelBox(r io.ReadSeeker, want [4]byte, fileLen int64) (payload []byte, boxStart, boxEnd int64, err error) {
 	var hdr [16]byte
 	pos := int64(0)
 	for scans := 0; scans < maxCR3TopLevelBoxScans && pos+8 <= fileLen; scans++ {
 		size, typ, headerLen, ok := cr3BoxHeaderAt(r, &hdr, pos, fileLen)
 		if !ok {
-			return nil, nil
+			return nil, 0, 0, nil
 		}
 
 		if typ == want {
 			payloadLen := int64(size) - headerLen //nolint:gosec // G115: size <= fileLen-pos <= maxFileSize, fits int64
 			payload := make([]byte, payloadLen)
 			if _, err := io.ReadFull(r, payload); err != nil {
-				return nil, fmt.Errorf("cr3: read %s box payload: %w", typ, err)
+				return nil, 0, 0, fmt.Errorf("cr3: read %s box payload: %w", typ, err)
 			}
-			return payload, nil
+			return payload, pos, pos + int64(size), nil //nolint:gosec // G115: size <= fileLen-pos, fits int64
 		}
 
 		// Skip the rest of this box (its payload) without reading it.
 		next := pos + int64(size) //nolint:gosec // G115: size <= fileLen-pos, fits int64
 		if _, err := r.Seek(next, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("cr3: seek past %s box: %w", typ, err)
+			return nil, 0, 0, fmt.Errorf("cr3: seek past %s box: %w", typ, err)
 		}
 		pos = next
 	}
-	return nil, nil
+	return nil, 0, 0, nil
 }
 
 // Extract reads metadata from a CR3 file by navigating the ISOBMFF box tree.
@@ -233,7 +237,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, fmt.Errorf("cr3: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
 	}
 
-	moovData, err := readTopLevelBox(r, boxMoov, fileLen)
+	moovData, _, _, err := readTopLevelBox(r, boxMoov, fileLen)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -442,13 +446,13 @@ func findMoovRange(data []byte) (start, end int, found bool) {
 //
 // For stco: if the relocated value would exceed math.MaxUint32, the function
 // returns ErrStcoOverflow rather than silently truncating the offset.
-func relocateChunkOffsets(moovBytes []byte, oldMoovEnd int, delta int64) error {
+func relocateChunkOffsets(moovBytes []byte, oldMoovEnd int64, delta int64) error {
 	if len(moovBytes) < 8 {
 		return nil
 	}
 	// moovBytes includes the 8-byte moov box header; pass the content slice.
 	// audit #191: start at depth=0; cap recursion at 32 levels (mirrors findBox).
-	return relocateInContainer(moovBytes[8:], int64(oldMoovEnd), delta, 0)
+	return relocateInContainer(moovBytes[8:], oldMoovEnd, delta, 0)
 }
 
 // relocateInContainer recursively walks ISOBMFF boxes in the container content
@@ -614,9 +618,23 @@ func rebuildMoovContent(moovContent, rawEXIF, rawXMP []byte) []byte {
 // table entries to account for the change in moov size, and writes the result
 // to w.
 //
-// Offset relocation algorithm (ISO 14496-12 §8.7.3 / §8.7.5):
+// #292: only the moov box is rebuilt in memory; every other byte of the file
+// (ftyp and any other pre-moov boxes, plus mdat and anything after moov) is
+// streamed from r to w verbatim through a fixed-size pooled buffer
+// (iobuf.StreamCopyN), never buffered in full — mirroring ExifTool's
+// WriteQuickTime.pl model ("rewrite the moov atom, copy mdat straight
+// through"). A real Canon CR3 is routinely tens of megabytes, almost
+// entirely raw sensor data in mdat; the previous implementation read the
+// whole file into one buffer and built a second, equally large buffer for
+// the reassembled output. Peak retained memory is now bounded by the moov
+// box's own size (typically tens of KB) plus the fixed copy buffer,
+// regardless of file size.
 //
-//  1. Parse the flat ISOBMFF box stream to locate moovStart and moovEnd.
+// Offset relocation algorithm (ISO 14496-12 §8.7.3 / §8.7.5) is unchanged:
+//
+//  1. Locate moov's payload and its exact [moovStart, moovEnd) byte range by
+//     scanning top-level box headers (readTopLevelBox); every other
+//     top-level box's payload is skipped via Seek, never read.
 //  2. Rebuild the Canon UUID box and the enclosing moov box with the new CMTx
 //     payloads; compute delta = len(newMoovBox) - (moovEnd - moovStart).
 //  3. Walk every trak → mdia → minf → stbl → {stco, co64} box inside the
@@ -625,15 +643,15 @@ func rebuildMoovContent(moovContent, rawEXIF, rawXMP []byte) []byte {
 //     - If O < oldMoovEnd: leave unchanged    (points before the shifted region).
 //  4. stco entries are uint32; if O + delta > MaxUint32, return ErrStcoOverflow
 //     rather than truncate silently.
-//  5. Reassemble: data[:moovStart] + newMoovBox + data[moovEnd:].
+//  5. Stream: r[0:moovStart) + newMoovBox + r[moovEnd:fileLen).
 //
 // preserveUnknownSegments must be true; passing false returns
 // ErrPreserveUnknownSegmentsNotSupported because CR3 ISOBMFF boxes are
 // structurally mandatory and cannot be selectively stripped.
 //
-// If all payloads are nil the source is passed through unchanged (no moov
-// rebuild, no stco/co64 relocation needed).
-func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
+// If all payloads are nil, or no moov box is found, the source is streamed
+// through unchanged (no moov rebuild, no stco/co64 relocation needed).
+func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error { //nolint:gocyclo // #292: sequential error-checked streaming steps (size cap, pass-through, moov locate/rebuild, 3-part stream reassembly) are inherent in the streaming design; each branch is a distinct, independently-tested failure mode
 	// Reject PreserveUnknownSegments(false) for CR3: ISOBMFF boxes are
 	// structurally mandatory. There is no concept of "unknown optional segment"
 	// in ISOBMFF analogous to JPEG's APPn segments.
@@ -641,109 +659,110 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 		return ErrPreserveUnknownSegmentsNotSupported
 	}
 
-	if _, err := r.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("cr3: seek: %w", err)
-	}
-	// #140/#286: cap the full-file read to maxFileSize so that an oversized or
-	// infinite streaming reader cannot trigger unbounded heap allocation.
-	// iobuf.ReadAll allocates exactly the input's size in one shot (via Seek)
-	// for a seekable reader instead of io.ReadAll's geometric-growth scratch
-	// buffer, halving Inject's transient allocation for the common case.
-	// ErrFileTooLarge is returned when the limit is exceeded, before any
-	// ISOBMFF parsing takes place. Unlike Extract, Inject genuinely needs the
-	// whole file: every byte not touched by the moov rebuild is copied
-	// through verbatim in injectIntoMoov's reassembly.
-	data, readErr := iobuf.ReadAll(r, maxFileSize)
-	if readErr != nil {
-		if errors.Is(readErr, iobuf.ErrTooLarge) {
-			return fmt.Errorf("cr3: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
-		}
-		return fmt.Errorf("cr3: read: %w", readErr)
-	}
-
-	// All payloads nil: pass through unchanged.
-	// moov size does not change, so stco/co64 tables remain valid.
-	if rawEXIF == nil && rawIPTC == nil && rawXMP == nil {
-		return writeAll(w, data)
-	}
-
-	// Locate the moov box in the flat file stream.
-	moovStart, moovEnd, found := findMoovRange(data)
-	if !found {
-		// No moov box — file is corrupt/incomplete. Pass through unchanged.
-		return writeAll(w, data)
-	}
-
-	out, err := injectIntoMoov(data, moovStart, moovEnd, rawEXIF, rawXMP)
+	// #140/#286/#292: reject an oversized input before any content is read
+	// or streamed, exactly as the previous whole-file-read implementation
+	// did — seekFileLen never reads the file's content.
+	fileLen, err := seekFileLen(r)
 	if err != nil {
 		return err
 	}
-	return writeAll(w, out)
+	if fileLen > maxFileSize {
+		return fmt.Errorf("cr3: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
+	}
+
+	// All payloads nil: pass through unchanged. moov size does not change, so
+	// stco/co64 tables remain valid — no ISOBMFF parsing is needed at all.
+	// #292: streamed via a pooled buffer instead of buffering the whole file.
+	if rawEXIF == nil && rawIPTC == nil && rawXMP == nil {
+		return streamWholeFile(r, w, fileLen)
+	}
+
+	// #292: locate moov's payload and its exact byte range by scanning
+	// top-level box headers only. r's position after a successful match is
+	// immediately past moov's payload (moovEnd); readTopLevelBox's payload
+	// is moov's CONTENT only (header already consumed by its internal
+	// cr3BoxHeaderAt scan), so no re-derivation of moov's own header length
+	// is needed here — unlike the previous full-buffer implementation, which
+	// had to re-slice a flat byte array and therefore had to re-derive it
+	// (the CR3-EXTSIZE-01 fix this comment used to describe).
+	moovContent, moovStart, moovEnd, err := readTopLevelBox(r, boxMoov, fileLen)
+	if err != nil {
+		return err
+	}
+	if moovContent == nil {
+		// No moov box — file is corrupt/incomplete. Pass through unchanged.
+		return streamWholeFile(r, w, fileLen)
+	}
+
+	newMoovBox, err := injectIntoMoov(moovContent, rawEXIF, rawXMP, moovEnd, moovEnd-moovStart)
+	if err != nil {
+		return err
+	}
+
+	// #292: stream the reassembly — r[0:moovStart) verbatim, the rebuilt moov
+	// box (already fully in memory), then r[moovEnd:fileLen) (mdat and any
+	// trailing boxes) verbatim — instead of concatenating the whole file into
+	// one in-memory buffer.
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("cr3: seek: %w", err)
+	}
+	if err := iobuf.StreamCopyN(r, w, moovStart); err != nil {
+		return fmt.Errorf("cr3: copy pre-moov bytes: %w", err)
+	}
+	if _, err := w.Write(newMoovBox); err != nil {
+		return fmt.Errorf("cr3: write moov box: %w", err)
+	}
+	if _, err := r.Seek(moovEnd, io.SeekStart); err != nil {
+		return fmt.Errorf("cr3: seek past moov: %w", err)
+	}
+	if err := iobuf.StreamCopyN(r, w, fileLen-moovEnd); err != nil {
+		return fmt.Errorf("cr3: copy mdat and trailing bytes: %w", err)
+	}
+	return nil
 }
 
-// injectIntoMoov rebuilds the moov box at data[moovStart:moovEnd] with the new
-// metadata payloads, relocates stco/co64 offsets, and returns the reassembled
-// file bytes. rawIPTC is intentionally ignored: CR3 does not carry IPTC.
-func injectIntoMoov(data []byte, moovStart, moovEnd int, rawEXIF, rawXMP []byte) ([]byte, error) {
-	// CR3-EXTSIZE-01 fix: re-derive moov's ACTUAL header length instead of
-	// hardcoding +8. ISO 14496-12 §4.2: when the source moov box uses the
-	// extended box-size encoding (32-bit size field == 1, followed by an
-	// 8-byte largesize), the real header is 16 bytes, not 8. The previous code
-	// hardcoded +8, which — on such a file — sliced 8 bytes too early,
-	// embedding half of the largesize field as bogus leading "content" and
-	// corrupting the entire rebuilt box tree: Inject returned no error, but
-	// the new EXIF was silently discarded and a subsequent Extract on the
-	// "successfully written" output failed with ErrNoCMT1Box.
-	//
-	// findMoovRange already parsed a well-formed box header at moovStart (that
-	// is how it located this box), so re-parsing it here is a cheap, pure,
-	// side-effect-free re-derivation — not a hardcoded assumption — and is
-	// guaranteed to succeed.
-	_, _, moovHeaderLen, ok := parseCR3BoxHeader(data, moovStart)
-	if !ok {
-		// Unreachable in practice: findMoovRange already validated this exact
-		// header. Guarded defensively rather than assumed.
-		return nil, fmt.Errorf("cr3: moov box header at offset %d could not be re-parsed: %w", moovStart, ErrNoMoovBox)
+// streamWholeFile copies all fileLen bytes of r, from its current position
+// reset to 0, to w via a pooled buffer — never allocating memory
+// proportional to fileLen. Used by Inject's two pass-through paths (all
+// payloads nil; no moov box found).
+func streamWholeFile(r io.ReadSeeker, w io.Writer, fileLen int64) error {
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("cr3: seek: %w", err)
 	}
-	// moovContent is the moov box payload: everything after the header, which
-	// is 8 bytes for a normal box or 16 bytes for an extended-size box.
-	moovContent := data[moovStart+int(moovHeaderLen) : moovEnd] //nolint:gosec // G115: moovHeaderLen is 8 or 16; moovStart+moovHeaderLen <= moovEnd guaranteed by parseCR3BoxHeader's size>=headerLen check
+	if err := iobuf.StreamCopyN(r, w, fileLen); err != nil {
+		return fmt.Errorf("cr3: copy: %w", err)
+	}
+	return nil
+}
+
+// injectIntoMoov rebuilds the moov box whose payload is moovContent (the
+// box's header is NOT included — see readTopLevelBox) with the new metadata
+// payloads, relocates stco/co64 offsets, and returns the new, fully-encoded
+// moov box (header + rebuilt content). rawIPTC is intentionally ignored: CR3
+// does not carry IPTC.
+//
+// oldMoovEnd is the absolute file position where mdat begins (the original
+// moov box's end offset); oldMoovSize is the original moov box's total size
+// (header included). Both describe the SOURCE box being replaced, used only
+// to compute the relocation delta and the stco/co64 threshold — see
+// relocateChunkOffsets.
+func injectIntoMoov(moovContent, rawEXIF, rawXMP []byte, oldMoovEnd, oldMoovSize int64) ([]byte, error) {
 	newMoovContent := rebuildMoovContent(moovContent, rawEXIF, rawXMP)
 	newMoovBox := buildBox("moov", newMoovContent)
 
 	// Compute the size delta between the new and old moov boxes.
 	// delta > 0: moov grew; mdat shifted forward.
 	// delta < 0: moov shrank; mdat shifted backward.
-	oldMoovSize := moovEnd - moovStart
-	delta := int64(len(newMoovBox)) - int64(oldMoovSize)
+	delta := int64(len(newMoovBox)) - oldMoovSize
 
 	// Relocate stco/co64 offsets inside newMoovBox.
 	// We patch in-place because newMoovBox was just freshly allocated by buildBox.
-	// oldMoovEnd is the absolute file position where mdat begins.
 	if delta != 0 {
-		if err := relocateChunkOffsets(newMoovBox, moovEnd, delta); err != nil {
+		if err := relocateChunkOffsets(newMoovBox, oldMoovEnd, delta); err != nil {
 			return nil, fmt.Errorf("cr3: stco/co64 offset relocation: %w", err)
 		}
 	}
-
-	// Reassemble: ftyp (and any pre-moov boxes) + relocated moov + mdat (verbatim).
-	// data[moovEnd:] contains mdat and any subsequent boxes; their bytes are intact,
-	// only their position in the file has shifted by delta — handled by the patched
-	// stco/co64 tables.
-	totalLen := len(data) - oldMoovSize + len(newMoovBox)
-	out := make([]byte, 0, totalLen)
-	out = append(out, data[:moovStart]...)
-	out = append(out, newMoovBox...)
-	out = append(out, data[moovEnd:]...)
-	return out, nil
-}
-
-// writeAll writes b to w, wrapping any error with the cr3 prefix.
-func writeAll(w io.Writer, b []byte) error {
-	if _, err := w.Write(b); err != nil {
-		return fmt.Errorf("cr3: write: %w", err)
-	}
-	return nil
+	return newMoovBox, nil
 }
 
 // buildBox constructs an ISOBMFF box: [4-byte size][4-byte type][content].

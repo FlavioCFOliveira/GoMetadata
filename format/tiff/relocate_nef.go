@@ -81,10 +81,23 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
 )
+
+// nikonMNExtensionFetchMargin is the generous, still-tiny extra range fetched
+// (task #291 follow-up) from the source past the MakerNote blob's own
+// DECLARED end (mnFilePos+len(mnEntry.Value), always within the metadata
+// prefix — it is a standard out-of-line entry #289/#293's scanner walks)
+// before parsing the PreviewIFD/NikonScanIFD structures that live just beyond
+// it (see this file's own top-of-file doc comment, Step A). Those are small,
+// tightly-bounded IFDs — real Nikon PreviewIFDs have on the order of 15-25
+// entries (≈180-300 bytes) plus a handful of small out-of-line RATIONAL
+// arrays — so 8 KiB gives generous (>25x) headroom while remaining
+// negligible next to the tens-of-MB a real NEF file spends on image data.
+const nikonMNExtensionFetchMargin = 8192
 
 // Sentinel errors for the NEF-specific relocation subsystem.
 var (
@@ -206,7 +219,13 @@ func isNikonType3Blob(b []byte) bool {
 // and, if found, returns a nikonPreviewInfo describing the PreviewIFD image block
 // and how to patch the MakerNote after relocation.
 //
-// base is the original TIFF byte stream (offset-arithmetic is done against base).
+// base is the original TIFF byte stream (offset-arithmetic is done against
+// base) — possibly only a metadata PREFIX (#289/#293). r/fileLen let this
+// function fetch the small additional range the PreviewIFD/NikonScanIFD
+// structures need beyond the MakerNote's own declared blob (see
+// nikonMNExtensionFetchMargin's own doc comment); r may be nil when base is
+// already known to be the whole file (fileLen == len(base)), since extendBase
+// never touches r in that case.
 // e is the parsed (and possibly mutated) EXIF struct.
 //
 // Side effect: when a Nikon Type-3 MakerNote with a PreviewIFD is detected,
@@ -215,15 +234,16 @@ func isNikonType3Blob(b []byte) bool {
 // declared byte count in the outer TIFF entry).  exif.Encode then writes the
 // extended blob, preserving those structures in the output.
 //
-// Returns nil (no error) when no relevant Nikon MakerNote is found.
-func extractNikonPreviewInfo(base []byte, e *exif.EXIF) (*nikonPreviewInfo, error) { //nolint:cyclop,gocyclo,funlen // Nikon structure traversal; complexity and length are inherent to the multi-step inspection
+// Returns the (possibly grown) base for the caller to use in place of its own,
+// and a nil info (no error) when no relevant Nikon MakerNote is found.
+func extractNikonPreviewInfo(base []byte, r io.ReadSeeker, fileLen uint64, e *exif.EXIF) (info *nikonPreviewInfo, newBase []byte, err error) { //nolint:cyclop,gocyclo,funlen // Nikon structure traversal; complexity and length are inherent to the multi-step inspection
 	if e == nil || e.ExifIFD == nil {
-		return nil, nil //nolint:nilnil // nil info means "no Nikon preview found"; not an error
+		return nil, base, nil // nil info means "no Nikon preview found"; not an error
 	}
 
 	// MakerNote must be present and recorded by the parser.
 	if !isNikonType3Blob(e.MakerNote) {
-		return nil, nil //nolint:nilnil // not a Nikon Type-3 MakerNote; skip silently
+		return nil, base, nil // not a Nikon Type-3 MakerNote; skip silently
 	}
 
 	// Locate the embedded TIFF header within the blob.
@@ -231,14 +251,14 @@ func extractNikonPreviewInfo(base []byte, e *exif.EXIF) (*nikonPreviewInfo, erro
 	// that place the TIFF header at offset 8 (version 0x0210) or 10 (D70, 0x0200).
 	mnTIFFHdrOff, mnOrder := findNikonMNTIFFHeader(e.MakerNote)
 	if mnOrder == nil {
-		return nil, nil //nolint:nilnil // no valid TIFF header in blob; skip
+		return nil, base, nil // no valid TIFF header in blob; skip
 	}
 
 	// Locate the MakerNote entry (tag 0x927C) in the ExifIFD so we can extend
 	// its Value slice.
 	mnEntry := e.ExifIFD.Get(exif.TagMakerNote)
 	if mnEntry == nil {
-		return nil, nil //nolint:nilnil // no MakerNote entry in ExifIFD
+		return nil, base, nil // no MakerNote entry in ExifIFD
 	}
 
 	// MakerNoteOffset is the outer-TIFF-absolute file position of the blob.
@@ -248,11 +268,20 @@ func extractNikonPreviewInfo(base []byte, e *exif.EXIF) (*nikonPreviewInfo, erro
 		// Fallback: search base for the Nikon magic prefix.
 		mnFilePos = findNikonBlobInBase(base, e.MakerNote)
 		if mnFilePos == 0 {
-			return nil, nil //nolint:nilnil // blob not found in base; skip
+			return nil, base, nil // blob not found in base; skip
 		}
 	}
-	if uint64(mnFilePos)+uint64(len(mnEntry.Value)) > uint64(len(base)) {
-		return nil, nil //nolint:nilnil // blob extends beyond base; skip
+	// declaredBlobEnd is the MakerNote's OWN declared byte range — a standard
+	// out-of-line entry #289/#293's scanner always walks, so this should
+	// already be within base; checked against fileLen (not len(base)) so a
+	// merely-short-so-far prefix does not look "malformed".
+	declaredBlobEnd := uint64(mnFilePos) + uint64(len(mnEntry.Value))
+	if declaredBlobEnd > fileLen {
+		return nil, base, nil // blob extends beyond the true file; skip
+	}
+	base, err = extendBase(base, r, fileLen, declaredBlobEnd)
+	if err != nil {
+		return nil, nil, fmt.Errorf("nef: extend for MakerNote blob: %w", err)
 	}
 
 	// MakerNote TIFF base in the outer file:
@@ -264,11 +293,22 @@ func extractNikonPreviewInfo(base []byte, e *exif.EXIF) (*nikonPreviewInfo, erro
 	ifd0RelOff := mnOrder.Uint32(tiffHdr[4:])
 	mnIFD0FileOff := mnTIFFBase + ifd0RelOff
 
+	// #291 follow-up: the PreviewIFD/NikonScanIFD structures live just beyond
+	// the MakerNote's own declared blob (see this file's top-of-file doc
+	// comment, Step A) — one level deeper than #289/#293's extent.go scanner
+	// walks, so they are never in the metadata prefix. Fetch a generous,
+	// still-tiny margin now (see nikonMNExtensionFetchMargin's own doc
+	// comment); a no-op when base already covers this range.
+	base, err = extendBase(base, r, fileLen, declaredBlobEnd+nikonMNExtensionFetchMargin)
+	if err != nil {
+		return nil, nil, fmt.Errorf("nef: extend for PreviewIFD: %w", err)
+	}
+
 	// Find PreviewIFD (tag 0x0011) in the MakerNote IFD0.
 	previewIFDRelOff, hasPreview := findInlineIFDPointer(base, mnIFD0FileOff, nikonTagPreviewIFD, mnOrder)
 	if !hasPreview {
 		// No PreviewIFD; nothing Nikon-specific to do.
-		return nil, nil //nolint:nilnil // no PreviewIFD in this MakerNote
+		return nil, base, nil // no PreviewIFD in this MakerNote
 	}
 
 	// Optionally find NikonScanIFD (tag 0x0E10) to include its bytes in the extension.
@@ -280,7 +320,7 @@ func extractNikonPreviewInfo(base []byte, e *exif.EXIF) (*nikonPreviewInfo, erro
 		parsePreviewIFDEntries(base, previewIFDFileOff, mnOrder)
 	if !ok || previewImgRelOff == 0 || previewImgSize == 0 {
 		// PreviewIFD present but has no image data; skip.
-		return nil, nil //nolint:nilnil // PreviewIFD with no image block
+		return nil, base, nil // PreviewIFD with no image block
 	}
 
 	// Convert MakerNote-relative preview offset to outer-TIFF-absolute.
@@ -294,6 +334,14 @@ func extractNikonPreviewInfo(base []byte, e *exif.EXIF) (*nikonPreviewInfo, erro
 	// Extend the MakerNote blob if needed so exif.Encode copies the full range.
 	currentBlobEnd := mnFilePos + uint32(len(mnEntry.Value)) //nolint:gosec // G115: < len(base)
 	if fullExtent > currentBlobEnd {
+		// #291 follow-up: precise extend to the exact computed extent — a
+		// defensive no-op in virtually every real case, since
+		// nikonMNExtensionFetchMargin's own generous margin already covers
+		// fullExtent for any real Nikon PreviewIFD/NikonScanIFD structure.
+		base, err = extendBase(base, r, fileLen, uint64(fullExtent))
+		if err != nil {
+			return nil, nil, fmt.Errorf("nef: extend for MakerNote full extent: %w", err)
+		}
 		newEnd := fullExtent
 		if uint64(newEnd) > uint64(len(base)) {
 			newEnd = uint32(len(base)) //nolint:gosec // G115: len(base) < 2^32
@@ -312,7 +360,7 @@ func extractNikonPreviewInfo(base []byte, e *exif.EXIF) (*nikonPreviewInfo, erro
 	previewOff201InBlob := int(off201FilePos) - int(mnFilePos)
 	previewLen202InBlob := int(len202FilePos) - int(mnFilePos)
 	if previewOff201InBlob < 0 || previewLen202InBlob < 0 {
-		return nil, fmt.Errorf("%w: (off201=%d off202=%d blobStart=%d)",
+		return nil, base, fmt.Errorf("%w: (off201=%d off202=%d blobStart=%d)",
 			ErrNikonPreviewPositionMismatch, off201FilePos, len202FilePos, mnFilePos)
 	}
 
@@ -320,10 +368,14 @@ func extractNikonPreviewInfo(base []byte, e *exif.EXIF) (*nikonPreviewInfo, erro
 	// ifdPtr=nil marks it as a "standalone" block (not owned by any outer exif.IFD).
 	// It is tracked separately via nikonPreviewInfo and excluded from
 	// removeImageOffsetEntries (which requires a non-nil IFD pointer to locate entries).
+	// The preview image DATA itself streams via the shared imageBlock/
+	// writeRelocated mechanism (like any StripOffsets block) — it is never
+	// fetched into base; only the small PreviewIFD/NikonScanIFD structure that
+	// POINTS to it was fetched above.
 	previewEnd := uint64(previewImgFileOff) + uint64(previewImgSize)
-	if previewEnd > uint64(len(base)) {
-		return nil, fmt.Errorf("%w (offset=%d size=%d baseLen=%d)",
-			ErrNikonPreviewOutOfBounds, previewImgFileOff, previewImgSize, len(base))
+	if previewEnd > fileLen {
+		return nil, base, fmt.Errorf("%w (offset=%d size=%d fileLen=%d)",
+			ErrNikonPreviewOutOfBounds, previewImgFileOff, previewImgSize, fileLen)
 	}
 
 	blk := &imageBlock{
@@ -342,7 +394,7 @@ func extractNikonPreviewInfo(base []byte, e *exif.EXIF) (*nikonPreviewInfo, erro
 		mnOrder:             mnOrder,
 		previewImageSize:    previewImgSize,
 		mnTIFFHdrOff:        mnTIFFHdrOff,
-	}, nil
+	}, base, nil
 }
 
 // findInlineIFDPointer scans the MakerNote IFD at ifd0FileOff in base for a tag
@@ -672,12 +724,18 @@ func findOOLEntryOffset(buf []byte, ifdStart int, tag uint16, order binary.ByteO
 //
 // When no Nikon Type-3 MakerNote with a PreviewIFD is detected, it falls back
 // to the standard relocateTIFFFromParsed path.
-func relocateTIFFFromParsedNEF(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte) ([]byte, error) {
+//
+// #291 follow-up: base may be only a metadata PREFIX (#289/#293); r/fileLen
+// let extractNikonPreviewInfo fetch the small additional range the
+// PreviewIFD/NikonScanIFD structures need beyond it (see that function's own
+// doc comment). r may be nil only when fileLen == len(base) is already
+// guaranteed (base already the whole file).
+func relocateTIFFFromParsedNEF(base []byte, r io.ReadSeeker, fileLen uint64, e *exif.EXIF, rawIPTC, rawXMP []byte) (header []byte, blocks []*imageBlock, err error) {
 	if e == nil {
 		var parseErr error
 		e, parseErr = exif.Parse(base)
 		if parseErr != nil {
-			return nil, fmt.Errorf("nef: parse for relocation: %w", parseErr)
+			return nil, nil, fmt.Errorf("nef: parse for relocation: %w", parseErr)
 		}
 	}
 
@@ -687,18 +745,18 @@ func relocateTIFFFromParsedNEF(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte
 	}
 
 	// Steps A+B: extend MakerNote blob and register PreviewIFD image block.
-	info, err := extractNikonPreviewInfo(base, e)
+	info, base, err := extractNikonPreviewInfo(base, r, fileLen, e)
 	if err != nil {
-		return nil, fmt.Errorf("nef: extract Nikon preview info: %w", err)
+		return nil, nil, fmt.Errorf("nef: extract Nikon preview info: %w", err)
 	}
 
 	if info == nil {
 		// No Nikon-specific preprocessing needed; use the standard path.
-		return relocateTIFFFromParsed(base, e, rawIPTC, rawXMP)
+		return relocateTIFFFromParsed(base, e, rawIPTC, rawXMP, fileLen)
 	}
 
 	// Step C (and the rest of the main algorithm) is handled here.
-	return nefRelocateWithPreview(base, e, rawIPTC, rawXMP, info, order)
+	return nefRelocateWithPreview(base, e, rawIPTC, rawXMP, info, order, fileLen)
 }
 
 // nefRelocateWithPreview runs the TIFF copy-and-relocate algorithm with the
@@ -715,7 +773,8 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	rawIPTC, rawXMP []byte,
 	info *nikonPreviewInfo,
 	order binary.ByteOrder,
-) ([]byte, error) {
+	fileLen uint64,
+) (header []byte, blocks []*imageBlock, err error) {
 	// Step 2: upsert metadata tags in IFD0.
 	if e.IFD0 == nil {
 		e.IFD0 = &exif.IFD{}
@@ -746,9 +805,9 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	// GM-W1: budget is shared with the SubIFD enumeration below so the
 	// cumulative image-block + SubIFD count for this write is bounded.
 	budget := newImageBlockBudget()
-	mainIFDBlocks, err := enumerateImageBlocks(base, e, order, false, budget)
+	mainIFDBlocks, err := enumerateImageBlocks(e, order, false, budget, fileLen)
 	if err != nil {
-		return nil, fmt.Errorf("nef: enumerate image blocks: %w", err)
+		return nil, nil, fmt.Errorf("nef: enumerate image blocks: %w", err)
 	}
 
 	// Inject the Nikon PreviewIFD image block into the blocks list.
@@ -758,9 +817,9 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	allBlocks := append(mainIFDBlocks, info.previewBlock)
 
 	// Step 4: parse SubIFDs (tag 0x014A).
-	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget)
+	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget, fileLen)
 	if subErr != nil {
-		return nil, fmt.Errorf("nef: enumerate SubIFDs: %w", subErr)
+		return nil, nil, fmt.Errorf("nef: enumerate SubIFDs: %w", subErr)
 	}
 	allBlocks = append(allBlocks, subBlocks...)
 
@@ -782,7 +841,7 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 
 	ifdEndInt, skelErr := exif.EncodedSize(e)
 	if skelErr != nil {
-		return nil, fmt.Errorf("nef: encode placeholder: %w", skelErr)
+		return nil, nil, fmt.Errorf("nef: encode placeholder: %w", skelErr)
 	}
 	ifdEnd := uint64(ifdEndInt) //nolint:gosec // G115: EncodedSize never returns a negative length
 
@@ -793,7 +852,7 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	assignSubIFDOffsets(subIFDs, ifdEnd)
 
 	if info.previewBlock.newOffset == math.MaxUint32 {
-		return nil, fmt.Errorf("%w", ErrNikonPreviewOverflow)
+		return nil, nil, fmt.Errorf("%w", ErrNikonPreviewOverflow)
 	}
 
 	// Step 8a: update placeholder value bytes (main-IFD blocks).
@@ -803,31 +862,32 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	patchSubIFDImageOffsets(subIFDs, false, order)
 
 	// Step 9: re-encode → finalTIFF. The buffer is allocated once with the
-	// exact final length (IFD structure + SubIFD blocks + image blocks,
-	// including the injected PreviewIFD block already folded into allBlocks),
-	// so steps 11 and 12 below never regrow it.
+	// exact HEADER length (IFD structure + SubIFD blocks — task #291 no
+	// longer includes image blocks here), so step 11 below never regrows it.
 	// #285: eliminates the append-driven doubling-growth reallocations that
 	// used to dominate NEF write CPU on large (tens-of-MB) files.
-	finalLen := relocatedLen(ifdEnd, subIFDs, allBlocks)
-	finalTIFF, finalErr := exif.EncodeInto(make([]byte, 0, finalCap(finalLen)), e)
+	// #291: capacity now scales with metadata size only, not file size.
+	headerLen := relocatedLen(ifdEnd, subIFDs)
+	finalTIFF, finalErr := exif.EncodeInto(make([]byte, 0, finalCap(headerLen)), e)
 	if finalErr != nil {
-		return nil, fmt.Errorf("nef: encode final: %w", finalErr)
+		return nil, nil, fmt.Errorf("nef: encode final: %w", finalErr)
 	}
 
 	// Step 9.5 (Nikon-specific): patch PreviewIFD 0x0201/0x0202 in the MakerNote
 	// blob now embedded in finalTIFF.
 	if pErr := patchNikonPreviewInFinalTIFF(finalTIFF, info, order); pErr != nil {
-		return nil, fmt.Errorf("nef: patch Nikon preview offset in finalTIFF: %w", pErr)
+		return nil, nil, fmt.Errorf("nef: patch Nikon preview offset in finalTIFF: %w", pErr)
 	}
 
 	// Step 10: patch 0x014A SubIFDs pointer array.
 	if len(subIFDs) > 0 {
 		if pErr := patchSubIFDPointers(finalTIFF, subIFDs, false, order); pErr != nil {
-			return nil, fmt.Errorf("nef: patch SubIFD pointers: %w", pErr)
+			return nil, nil, fmt.Errorf("nef: patch SubIFD pointers: %w", pErr)
 		}
 	}
 
-	// Step 11: append SubIFD raw bytes.
+	// Step 11: append SubIFD raw bytes. finalTIFF is now the complete HEADER:
+	// everything up to, but excluding, the image-data blocks.
 	// TIFF 6.0 §2: each SubIFD block must start at a word (even) boundary.
 	// assignSubIFDOffsets already reserved space for the 0x00 pad byte;
 	// insert it here to keep finalTIFF and the assigned offsets in sync.
@@ -838,20 +898,13 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 		finalTIFF = append(finalTIFF, si.rawBytes...)
 	}
 
-	// Step 12: append image block bytes from source.
-	for _, blk := range allBlocks {
-		end := blk.srcOffset + blk.size
-		if end > uint64(len(base)) {
-			return nil, fmt.Errorf("nef: image block offset=%d size=%d: %w",
-				blk.srcOffset, blk.size, ErrBlockOutOfBounds)
-		}
-		finalTIFF = append(finalTIFF, base[blk.srcOffset:end]...)
+	// #291: step 12 (append image block bytes) is no longer performed here —
+	// allBlocks (including the injected PreviewIFD block) is returned to the
+	// caller, which streams each block's bytes from the original source.
+	if uint64(len(finalTIFF)) != headerLen {
+		return nil, nil, fmt.Errorf("nef: relocated header length %d, computed %d: %w", len(finalTIFF), headerLen, errRelocateLayout)
 	}
-
-	if uint64(len(finalTIFF)) != finalLen {
-		return nil, fmt.Errorf("nef: relocated length %d, computed %d: %w", len(finalTIFF), finalLen, errRelocateLayout)
-	}
-	return finalTIFF, nil
+	return finalTIFF, allBlocks, nil
 }
 
 // filterNonNilIFDBlocks returns a copy of blocks that excludes entries with a nil

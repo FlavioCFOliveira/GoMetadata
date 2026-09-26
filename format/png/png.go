@@ -234,6 +234,24 @@ func checkChunkTruncation(chunkType [4]byte, pos, length, total int64) error {
 }
 
 // Extract reads the PNG chunk stream from r and returns raw metadata payloads.
+//
+// #294: when a chunk's declared length would overrun the stream — whether
+// the chunk would have been skipped (extractIgnores) or read for its
+// metadata content — Extract stops scanning at that point and returns
+// whatever rawEXIF/rawIPTC/rawXMP had already been collected, with a nil
+// error, rather than rejecting the file outright. This restores parity with
+// ce1dc82 (pre-#288) for testdata/corpus/png/exiv2/issue_790_poc2.png (an
+// overrunning iCCP chunk, which #288's stream-size bounds check correctly
+// detects but which #288 then treated as fatal) and issue_428_poc2.png (an
+// overrunning iTXt chunk — not an ignored chunk type, proving the graceful
+// stop is not limited to the skip path): both files predate whatever
+// metadata chunk their declared length overruns, so ce1dc82 itself read
+// nothing from them either — the correct outcome is "no metadata, no
+// error", not "no metadata, error". Inject's own truncation check
+// (injectOneChunk) is unaffected and continues to reject a truncated input
+// outright: writing a NEW file that silently drops trailing content the
+// caller did not ask to remove is a materially different, unsafe operation
+// from a best-effort Read.
 func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if _, err = r.Seek(0, io.SeekStart); err != nil {
 		return nil, nil, nil, fmt.Errorf("png: seek: %w", err)
@@ -266,7 +284,13 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		})
 		pos = n
 		if err != nil {
-			if errors.Is(err, io.EOF) {
+			// #294: io.EOF is a clean end of stream (unchanged from before
+			// #288). io.ErrUnexpectedEOF is what checkChunkTruncation wraps
+			// when a chunk's declared length would overrun the stream — see
+			// this function's own doc comment for why that is treated the
+			// same way here: stop and return what was collected, not an
+			// error.
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
 			return nil, nil, nil, err

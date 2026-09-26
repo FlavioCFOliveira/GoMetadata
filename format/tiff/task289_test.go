@@ -115,7 +115,7 @@ func TestExtractPrefixParityWithWholeFile(t *testing.T) {
 			// hand exif.Parse the complete file, exactly as this package did
 			// before #289 (the TIFF/CR2/NEF/ARW/DNG stream IS the EXIF
 			// container, so parsing the whole file is always valid input).
-			wholeEXIF, wholeIPTC, wholeXMP, werr := extractWholeFile(bytes.NewReader(data))
+			wholeEXIF, wholeIPTC, wholeXMP, werr := extractWholeFile(bytes.NewReader(data), 0)
 			if werr != nil {
 				t.Fatalf("extractWholeFile: %v (but prefix Extract succeeded — this itself is a parity bug)", werr)
 			}

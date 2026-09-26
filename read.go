@@ -266,6 +266,13 @@ func parseEXIF(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
 	if magic, ok := nonStandardRAWMagic(raw); ok {
 		opts = append(opts, exif.AcceptRAWMagic(magic))
 	}
+	// #293: raw is always m.rawEXIF here (see the call site in Read), a field
+	// retained unmodified for m's entire lifetime — exactly the safety
+	// contract exif.AliasThumbnail requires. Aliasing elides one make+copy
+	// per embedded JPEG thumbnail (EXIF §4.5.5), which can be several hundred
+	// KB for RAW files carrying a PreviewIFD JPEG (e.g. Nikon D810.nef:
+	// 151,236 B). See AliasThumbnail's own doc comment for the full contract.
+	opts = append(opts, exif.AliasThumbnail())
 	e, err := exif.Parse(raw, opts...)
 	if err != nil {
 		return &ParseSegmentError{Segment: "EXIF", Err: err}
@@ -354,7 +361,16 @@ func ReadFile(path string, opts ...ReadOption) (*Metadata, error) {
 // itself, which is always correct, just not maximally fast.
 func tiffFamilyRawEXIFIsWholeFile(r io.ReadSeeker, fmtID format.FormatID, rawEXIF []byte) bool {
 	switch fmtID {
-	case format.FormatTIFF, format.FormatCR2, format.FormatNEF, format.FormatARW, format.FormatDNG:
+	case format.FormatTIFF, format.FormatCR2, format.FormatNEF, format.FormatARW, format.FormatDNG,
+		format.FormatORF, format.FormatRW2:
+		// #293: orf.Extract/rw2.Extract now route through
+		// tiff.ExtractWithMagic (the same #289 metadata-prefix scanner), so
+		// their rawEXIF is subject to the identical "prefix, except when the
+		// scanner happened to read the whole file" contract as TIFF/CR2/NEF/
+		// ARW/DNG — this check must extend to them too, or writeTIFFORF/
+		// writeTIFFRW2 would keep assuming m.rawEXIF is always the whole
+		// file (their pre-#293 invariant) and fail image-block enumeration
+		// for any real ORF/RW2 file, whose prefix excludes the strip data.
 	default:
 		return false
 	}

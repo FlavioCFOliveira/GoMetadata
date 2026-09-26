@@ -245,7 +245,7 @@ func TestConformance_RW2_GUID_preserved_on_write(t *testing.T) {
 
 	rawXMP := []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"/>`)
 	var out bytes.Buffer
-	if err := tiff.InjectWithEXIFRW2(base, nil, nil, rawXMP, &out); err != nil {
+	if err := tiff.InjectWithEXIFRW2(bytes.NewReader(base), base, true, nil, nil, rawXMP, &out); err != nil {
 		t.Fatalf("RW2-GUID-preserved-on-write: InjectWithEXIFRW2: %v", err)
 	}
 
@@ -275,7 +275,7 @@ func TestConformance_RW2_GUID_IFD0_offset_24_after_write(t *testing.T) {
 	base := buildRW2WithGUID(guid)
 
 	var out bytes.Buffer
-	if err := tiff.InjectWithEXIFRW2(base, nil, nil, []byte(`<xmpmeta/>`), &out); err != nil {
+	if err := tiff.InjectWithEXIFRW2(bytes.NewReader(base), base, true, nil, nil, []byte(`<xmpmeta/>`), &out); err != nil {
 		t.Fatalf("RW2-GUID-IFD0-offset-24-after-write: InjectWithEXIFRW2: %v", err)
 	}
 
@@ -320,7 +320,7 @@ func TestConformance_RW2_recursive_IFD_rebase(t *testing.T) {
 	base := buildRW2WithGUID(guid)
 
 	var out bytes.Buffer
-	if err := tiff.InjectWithEXIFRW2(base, nil, wantIPTC, wantXMP, &out); err != nil {
+	if err := tiff.InjectWithEXIFRW2(bytes.NewReader(base), base, true, nil, wantIPTC, wantXMP, &out); err != nil {
 		t.Fatalf("RW2-recursive-IFD-rebase: InjectWithEXIFRW2: %v", err)
 	}
 
@@ -369,7 +369,7 @@ func TestConformance_RW2_OOL_offsets_shift_by_16(t *testing.T) {
 	base := buildRW2WithGUID(guid)
 
 	var outBuf bytes.Buffer
-	if err := tiff.InjectWithEXIFRW2(base, nil, nil, wantXMP, &outBuf); err != nil {
+	if err := tiff.InjectWithEXIFRW2(bytes.NewReader(base), base, true, nil, nil, wantXMP, &outBuf); err != nil {
 		t.Fatalf("RW2-OOL-offsets-shift-by-16: InjectWithEXIFRW2: %v", err)
 	}
 	result := outBuf.Bytes()
@@ -468,7 +468,7 @@ func TestConformance_RW2_JpgFromRaw_preserved_on_write(t *testing.T) {
 
 	wantXMP := []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/" verify="jpgfromraw"/>`)
 	var outBuf bytes.Buffer
-	if err := tiff.InjectWithEXIFRW2(base, nil, nil, wantXMP, &outBuf); err != nil {
+	if err := tiff.InjectWithEXIFRW2(bytes.NewReader(base), base, true, nil, nil, wantXMP, &outBuf); err != nil {
 		t.Fatalf("RW2-JpgFromRaw-preserved-on-write: InjectWithEXIFRW2: %v", err)
 	}
 
@@ -1100,7 +1100,7 @@ func TestConformance_RW2_corpus_write_round_trip(t *testing.T) {
 
 			// Pass-through: nil EXIF/IPTC/XMP → no re-encoding, verbatim output.
 			var out bytes.Buffer
-			if err := tiff.InjectWithEXIFRW2(data, nil, nil, nil, &out); err != nil {
+			if err := tiff.InjectWithEXIFRW2(bytes.NewReader(data), data, true, nil, nil, nil, &out); err != nil {
 				t.Fatalf("RW2-corpus-write-round-trip: InjectWithEXIFRW2: %v", err)
 			}
 			result := out.Bytes()

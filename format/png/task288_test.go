@@ -36,12 +36,14 @@ func buildTruncatedIgnoredChunkPNG(chunkType string, dataLen int, tail []byte) [
 	return buf.Bytes()
 }
 
-// TestExtractSkipsIgnoredChunksBoundsChecked proves the general form of the
-// #288 regression the corpus file issue_790_poc2.png exercises: a chunk type
-// Extract ignores (skips via Seek, never reads) whose declared length
-// overruns the actual remaining stream must still be rejected as truncated,
-// not silently tolerated because Seek succeeds past EOF on most
-// io.ReadSeeker implementations.
+// TestExtractSkipsIgnoredChunksBoundsChecked proves the general, synthetic
+// form of what issue_790_poc2.png exercises: a chunk type Extract ignores
+// (skips via Seek, never reads) whose declared length overruns the actual
+// remaining stream is DETECTED (checkChunkTruncation still fires — #288's
+// bounds check is not weakened) but, per #294, no longer surfaced as an
+// error from Extract: it is treated as a graceful end of scanning, exactly
+// like a clean io.EOF, and Extract returns whatever metadata was already
+// collected (here, nothing precedes the truncated chunk, so (nil,nil,nil)).
 func TestExtractSkipsIgnoredChunksBoundsChecked(t *testing.T) {
 	t.Parallel()
 
@@ -51,35 +53,77 @@ func TestExtractSkipsIgnoredChunksBoundsChecked(t *testing.T) {
 	// 4-byte CRC trailer entirely missing.
 	data := buildTruncatedIgnoredChunkPNG("iCCP", 10, []byte("kevwozere\x00"))
 
-	_, _, _, err := Extract(bytes.NewReader(data))
-	if err == nil {
-		t.Fatal("Extract: expected a truncation error for an ignored chunk whose declared length overruns EOF, got nil")
+	rawEXIF, rawIPTC, rawXMP, err := Extract(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("Extract: expected nil error (graceful stop, #294), got %v", err)
 	}
-	if !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Errorf("Extract: expected an error wrapping io.ErrUnexpectedEOF, got: %v", err)
+	if rawEXIF != nil || rawIPTC != nil || rawXMP != nil {
+		t.Fatalf("Extract: expected (nil,nil,nil), got rawEXIF=%v rawIPTC=%v rawXMP=%v", rawEXIF, rawIPTC, rawXMP)
 	}
 }
 
-// TestExtractIssue790Poc2Rejected pins the exact corpus fixture named in the
-// #288 acceptance criteria: Extract must reject it (any error), not silently
-// return a successful, empty result. Before #288's bounds-checked skip, this
-// exact file was silently ACCEPTED (err == nil) because the truncated
-// "iCCP" chunk's CRC-trailer read returned a bare io.EOF that Extract's loop
-// could not distinguish from a clean end of stream.
-func TestExtractIssue790Poc2Rejected(t *testing.T) {
+// TestExtractOverrunningChunkReturnsCollectedMetadata is #294's regression
+// test, renamed from the #288-era TestExtractIssue790Poc2Rejected now that
+// the contract has changed: Extract no longer rejects a file whose declared
+// chunk length overruns the stream — it stops scanning at that point and
+// returns whatever rawEXIF/rawIPTC/rawXMP had already been collected, with a
+// nil error, matching ce1dc82 (pre-#288) for both known corpus fixtures:
+// issue_790_poc2.png (overrunning iCCP, a chunk Extract ignores/skips) and
+// issue_428_poc2.png (overrunning iTXt, a chunk Extract reads for XMP —
+// proving the graceful stop is not limited to the skip path). Neither file
+// has any metadata-bearing chunk before its overrunning one, so the correct,
+// ce1dc82-matching result for both is (nil, nil, nil, nil).
+func TestExtractOverrunningChunkReturnsCollectedMetadata(t *testing.T) {
 	t.Parallel()
 
-	path := filepath.Join("..", "..", "testdata", "corpus", "png", "exiv2", "issue_790_poc2.png")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Skipf("cannot open %s: %v", path, err)
-	}
+	for _, name := range []string{"issue_790_poc2.png", "issue_428_poc2.png"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-	_, _, _, err = Extract(bytes.NewReader(data))
-	if err == nil {
-		t.Fatal("Extract(issue_790_poc2.png): expected a rejection error, got nil (truncation regression)")
+			path := filepath.Join("..", "..", "testdata", "corpus", "png", "exiv2", name)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Skipf("cannot open %s: %v", path, err)
+			}
+
+			rawEXIF, rawIPTC, rawXMP, err := Extract(bytes.NewReader(data))
+			if err != nil {
+				t.Fatalf("Extract(%s): expected nil error (graceful stop), got %v", name, err)
+			}
+			if rawEXIF != nil || rawIPTC != nil || rawXMP != nil {
+				t.Fatalf("Extract(%s): expected (nil,nil,nil) — no metadata-bearing chunk precedes the "+
+					"overrunning one in this fixture — got rawEXIF=%v rawIPTC=%v rawXMP=%v",
+					name, rawEXIF, rawIPTC, rawXMP)
+			}
+		})
 	}
-	t.Logf("Extract(issue_790_poc2.png) correctly rejected: %v", err)
+}
+
+// TestInjectStillRejectsOverrunningChunk proves #294 did not weaken Inject's
+// own truncation check: writing a NEW file that silently drops trailing
+// content the caller never asked to remove remains unsafe, unlike a
+// best-effort Read, so Inject must keep erroring on the same overrunning
+// chunk Extract now tolerates.
+func TestInjectStillRejectsOverrunningChunk(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"issue_790_poc2.png", "issue_428_poc2.png"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join("..", "..", "testdata", "corpus", "png", "exiv2", name)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Skipf("cannot open %s: %v", path, err)
+			}
+
+			var out bytes.Buffer
+			err = Inject(bytes.NewReader(data), &out, []byte("exif"), nil, nil, false)
+			if err == nil {
+				t.Fatalf("Inject(%s): expected a rejection error for the overrunning chunk, got nil", name)
+			}
+		})
+	}
 }
 
 // TestInjectSkipsTruncatedEXIfBoundsChecked mirrors

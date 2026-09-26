@@ -93,8 +93,9 @@ type EXIF struct {
 type ParseOption func(*parseConfig)
 
 type parseConfig struct {
-	skipMakerNote bool
-	extraMagic    uint16
+	skipMakerNote  bool
+	extraMagic     uint16
+	aliasThumbnail bool
 }
 
 // SkipMakerNote skips parsing the manufacturer-specific MakerNote IFD.
@@ -126,6 +127,30 @@ func SkipMakerNote() ParseOption { return func(c *parseConfig) { c.skipMakerNote
 // stream will simply cause Parse to misinterpret the input.
 func AcceptRAWMagic(magic uint16) ParseOption {
 	return func(c *parseConfig) { c.extraMagic = magic }
+}
+
+// AliasThumbnail configures Parse to alias every IFD's ThumbnailData field
+// (EXIF §4.5.5, tags 0x0201/0x0202) directly into b instead of copying it —
+// eliminating one make+copy of up to several hundred KB for RAW files that
+// carry an embedded PreviewIFD JPEG (e.g. Nikon D810.nef: 151,236 B).
+//
+// Safety contract — the caller MUST guarantee, for as long as any
+// IFD.ThumbnailData field reachable from the returned *EXIF is read:
+//  1. b is retained (not released, pooled, or reused for another Parse call);
+//  2. b is never mutated in place.
+//
+// Without this option (the default), every ThumbnailData is an independent
+// copy and b may be freely discarded, reused, or pooled the instant Parse
+// returns — Parse's long-standing default contract. This option is for
+// gometadata.Read's own internal use, where the buffer passed to Parse is
+// always Metadata.rawEXIF, a field retained unmodified for the *Metadata's
+// entire lifetime (see Metadata.RawEXIF's defensive bytes.Clone for external
+// callers, which exists precisely because the internal field is never
+// copied-on-read). Passing this option with a transient or mutable buffer
+// will corrupt or invalidate the returned ThumbnailData once that buffer is
+// released or modified.
+func AliasThumbnail() ParseOption {
+	return func(c *parseConfig) { c.aliasThumbnail = true }
 }
 
 // parseByteOrder reads the two-byte byte-order marker at b[0:2] and returns
@@ -178,7 +203,7 @@ func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseCon
 	if ptr == nil || len(ptr.Value) < 4 {
 		return nil, nil, 0, 0, nil, nil, nil
 	}
-	sub, subWarnings, err := traverseWithArena(b, order.Uint32(ptr.Value), order, arena, budget)
+	sub, subWarnings, err := traverseWithArena(b, order.Uint32(ptr.Value), order, arena, budget, cfg.aliasThumbnail)
 	warnings = append(warnings, subWarnings...)
 	if err != nil {
 		return nil, nil, 0, 0, nil, nil, warnings
@@ -210,7 +235,7 @@ func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseCon
 
 	// Interoperability IFD pointer (EXIF §4.6.3, tag 0xA005).
 	if iptr := sub.Get(TagInteropIFDPointer); iptr != nil && len(iptr.Value) >= 4 {
-		if isub, isubWarnings, ierr := traverseWithArena(b, order.Uint32(iptr.Value), order, arena, budget); ierr == nil {
+		if isub, isubWarnings, ierr := traverseWithArena(b, order.Uint32(iptr.Value), order, arena, budget, cfg.aliasThumbnail); ierr == nil {
 			interopIFD = isub
 			warnings = append(warnings, isubWarnings...)
 		}
@@ -228,12 +253,12 @@ func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseCon
 //
 // EXIF §4.6.3: GPS IFD pointer is tag 0x8825.
 // task #200: returns []parseWarn for deferred string materialisation at Parse boundary.
-func parseGPSSubIFD(b []byte, ifd0 *IFD, order binary.ByteOrder, arena *parseArena, budget *traverseBudget) (*IFD, []parseWarn) {
+func parseGPSSubIFD(b []byte, ifd0 *IFD, order binary.ByteOrder, arena *parseArena, budget *traverseBudget, aliasThumbnail bool) (*IFD, []parseWarn) {
 	ptr := ifd0.Get(TagGPSIFDPointer)
 	if ptr == nil || len(ptr.Value) < 4 {
 		return nil, nil
 	}
-	sub, warnings, err := traverseWithArena(b, order.Uint32(ptr.Value), order, arena, budget)
+	sub, warnings, err := traverseWithArena(b, order.Uint32(ptr.Value), order, arena, budget, aliasThumbnail)
 	if err != nil {
 		return nil, warnings
 	}
@@ -261,7 +286,7 @@ func parseExifSubIFDsBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *p
 	if !ok || off == 0 {
 		return nil, nil, 0, 0, nil, nil, nil
 	}
-	sub, subWarnings, err := traverseBigTIFF(b, off, order, budget)
+	sub, subWarnings, err := traverseBigTIFF(b, off, order, budget, cfg.aliasThumbnail)
 	warnings = append(warnings, subWarnings...)
 	if err != nil {
 		return nil, nil, 0, 0, nil, nil, warnings
@@ -301,7 +326,7 @@ func parseExifSubIFDsBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *p
 	// Interoperability IFD pointer (EXIF §4.6.3, tag 0xA005).
 	if iptr := sub.Get(TagInteropIFDPointer); iptr != nil {
 		if ioff, iok := readBigTIFFSubIFDOffset(iptr); iok && ioff != 0 {
-			if isub, isubWarnings, ierr := traverseBigTIFF(b, ioff, order, budget); ierr == nil {
+			if isub, isubWarnings, ierr := traverseBigTIFF(b, ioff, order, budget, cfg.aliasThumbnail); ierr == nil {
 				interopIFD = isub
 				warnings = append(warnings, isubWarnings...)
 			}
@@ -321,13 +346,13 @@ func parseExifSubIFDsBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *p
 //
 // EXIF §4.6.3: GPS IFD pointer is tag 0x8825.
 // task #200: returns []parseWarn for deferred string materialisation at Parse boundary.
-func parseGPSSubIFDBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, budget *traverseBudget) (*IFD, []parseWarn) {
+func parseGPSSubIFDBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, budget *traverseBudget, aliasThumbnail bool) (*IFD, []parseWarn) {
 	ptr := ifd0.Get(TagGPSIFDPointer)
 	off, ok := readBigTIFFSubIFDOffset(ptr)
 	if !ok || off == 0 {
 		return nil, nil
 	}
-	sub, warnings, err := traverseBigTIFF(b, off, order, budget)
+	sub, warnings, err := traverseBigTIFF(b, off, order, budget, aliasThumbnail)
 	if err != nil {
 		return nil, warnings
 	}
@@ -415,7 +440,7 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 		// by traverse/traverseWithArena and their callees, none of which
 		// retain the pointer beyond the call.
 		budget := newTraverseBudget(len(b))
-		ifd0, ifd0WarnRecs, ferr := traverse(b, ifd0Off, order, &budget)
+		ifd0, ifd0WarnRecs, ferr := traverse(b, ifd0Off, order, &budget, cfg.aliasThumbnail)
 		if ferr != nil {
 			return nil, ferr
 		}
@@ -445,7 +470,7 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 			e.ExifIFD, e.MakerNote, e.MakerNoteOffset, e.MakerNoteOffset64, e.MakerNoteIFD, e.InteropIFD, exifWarnRecs = parseExifSubIFDs(b, ifd0, order, &cfg, &subArena, &budget)
 			warnRecs = append(warnRecs, exifWarnRecs...)
 
-			e.GPSIFD, gpsWarnRecs = parseGPSSubIFD(b, ifd0, order, &subArena, &budget)
+			e.GPSIFD, gpsWarnRecs = parseGPSSubIFD(b, ifd0, order, &subArena, &budget, cfg.aliasThumbnail)
 			warnRecs = append(warnRecs, gpsWarnRecs...)
 		}
 		// When exifOff == 0 && gpsOff == 0 (single isolated IFD0 with no sub-IFDs),
@@ -486,7 +511,7 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 		// chain and the ExifIFD/GPSIFD/InteropIFD sub-IFD lookups below; see
 		// the classic-TIFF branch above for the full rationale.
 		budget := newTraverseBudget(len(b))
-		ifd0, ifd0WarnRecs, ferr := traverseBigTIFF(b, ifd0Off, order, &budget)
+		ifd0, ifd0WarnRecs, ferr := traverseBigTIFF(b, ifd0Off, order, &budget, cfg.aliasThumbnail)
 		if ferr != nil {
 			return nil, ferr
 		}
@@ -499,7 +524,7 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 		e.ExifIFD, e.MakerNote, e.MakerNoteOffset, e.MakerNoteOffset64, e.MakerNoteIFD, e.InteropIFD, exifWarnRecs = parseExifSubIFDsBigTIFF(b, ifd0, order, &cfg, &budget)
 		warnRecs = append(warnRecs, exifWarnRecs...)
 
-		e.GPSIFD, gpsWarnRecs = parseGPSSubIFDBigTIFF(b, ifd0, order, &budget)
+		e.GPSIFD, gpsWarnRecs = parseGPSSubIFDBigTIFF(b, ifd0, order, &budget, cfg.aliasThumbnail)
 		warnRecs = append(warnRecs, gpsWarnRecs...)
 
 		// task #200: materialise all deferred warn records into []string ONCE here.
@@ -593,7 +618,12 @@ func EncodedSize(e *EXIF) (int, error) {
 //
 // TIFF 6.0 §2: IFD layout — count(2) + entries(count×12) + nextIFD(4).
 func ParseIFDAt(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint32, bool) {
-	ifd, next, ok, _, _ := parseSingleIFD(b, offset, order)
+	// aliasThumbnail is always false here: ParseIFDAt is a general-purpose,
+	// exported single-IFD parse used by format/tiff's write-side relocate
+	// layer on a transient buffer, not gometadata.Read's retained rawEXIF.
+	// See AliasThumbnail's doc comment for the safety contract that opting
+	// in would require.
+	ifd, next, ok, _, _ := parseSingleIFD(b, offset, order, false)
 	return ifd, next, ok
 }
 

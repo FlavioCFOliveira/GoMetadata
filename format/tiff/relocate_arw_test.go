@@ -936,7 +936,7 @@ func buildMinimalARWLikeTIFF(t *testing.T) (base []byte, imageData []byte) {
 func TestARWRelocate_SR2PrivatePointerPatched(t *testing.T) { //nolint:paralleltest // modifies parsed EXIF struct
 	base, imageData := buildMinimalARWLikeTIFF(t)
 
-	out, err := relocateTIFFFromParsedARW(base, nil, nil, nil)
+	out, _, err := relocateTIFFFromParsedARW(base, nil, uint64(len(base)), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("relocateTIFFFromParsedARW: %v", err)
 	}
@@ -994,10 +994,11 @@ func TestARWRelocate_NoSonyStructures(t *testing.T) { //nolint:paralleltest // e
 	writeE(0x0117, 4, 1, uint32(len(stripData))) //nolint:gosec // G115: test
 	copy(buf[dataOff:], stripData)
 
-	out, err := relocateTIFFFromParsedARW(buf, nil, nil, nil)
+	header, blocks, err := relocateTIFFFromParsedARW(buf, nil, uint64(len(buf)), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("relocateTIFFFromParsedARW (no Sony): %v", err)
 	}
+	out := assembleRelocated(t, buf, header, blocks)
 	if !bytes.Contains(out, stripData) {
 		t.Error("strip data bytes not preserved in output")
 	}
@@ -1051,7 +1052,7 @@ func TestPatchSonySR2InFinalTIFF_NilSR2RawBytesNoop(t *testing.T) {
 func TestExtractSonySR2Info_NilEXIF(t *testing.T) {
 	t.Parallel()
 
-	info, err := extractSonySR2Info(make([]byte, 100), nil, binary.LittleEndian)
+	info, _, err := extractSonySR2Info(make([]byte, 100), nil, 100, nil, binary.LittleEndian)
 	if err != nil {
 		t.Errorf("nil EXIF: unexpected error: %v", err)
 	}
@@ -1113,7 +1114,7 @@ func TestExtractSonySR2Info_SR2OutOfBounds(t *testing.T) {
 		t.Skipf("could not parse test fixture: %v", parseErr)
 	}
 
-	_, err := extractSonySR2Info(buf, e, order)
+	_, _, err := extractSonySR2Info(buf, nil, uint64(len(buf)), e, order)
 	if err == nil {
 		// The function may also return nil, nil when the extent is too big —
 		// it skips rather than errors in some paths. Check both outcomes are safe.

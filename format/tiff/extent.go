@@ -35,6 +35,7 @@ import (
 	"io"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/boundscheck"
 )
 
 // extentInitialPrefixSize is the size of the first, unconditional read
@@ -118,11 +119,19 @@ func (s *extentScan) grow(end uint64) {
 // FuzzTIFFExtract during development (a crafted BigTIFF ifd0Off of
 // MaxUint64 made off+countW wrap to a value smaller than len(buf), reaching
 // s.buf[off:] and panicking).
+//
+// Security audit finding (2026-09-26): this same overflow class recurred
+// independently in format/tiff's copy-and-relocate write path
+// (relocate.go, relocate_bigtiff.go, relocate_stream.go — none of which
+// originally called this function) and in exif's own
+// extractJPEGThumbnail (a BigTIFF LONG8 JPEGInterchangeFormat offset). The
+// actual comparison now lives in internal/boundscheck, a dependency-free
+// leaf package both exif and format/tiff import, so every one of those call
+// sites shares this exact implementation instead of re-deriving it; fits
+// here is kept as a thin, package-local alias so every existing call site
+// and doc-comment cross-reference in this file needs no further change.
 func fits(off, width, n uint64) bool {
-	if off > n {
-		return false
-	}
-	return width <= n-off
+	return boundscheck.Fits(off, width, n)
 }
 
 // readUint reads a width-byte (2, 4, or 8) unsigned integer at off. Callers
@@ -457,13 +466,32 @@ func (s *extentScan) walkSubIFDArray(arrayOff, count, elemWidth uint64, depth in
 // scanExtentPass runs one full walk of everything currently reachable within
 // buf and returns the largest byte position the walk determined is needed —
 // which may exceed len(buf) when the walk had to stop early for lack of data.
-func scanExtentPass(buf []byte, ifd0Off uint64, order binary.ByteOrder, bigTIFF bool) uint64 {
-	s := &extentScan{buf: buf, order: order, bigTIFF: bigTIFF, seenIFD: make(map[uint64]bool, 16)}
+//
+// scan is caller-owned and reused across every pass of a single
+// scanMetadataExtent call (task #291 coordinator follow-up): scanExtentPass
+// resets scan's own per-pass fields (need, buf/order/bigTIFF, and — via
+// clear, not reallocation — seenIFD) before walking, so the same
+// *extentScan, and critically the same underlying seenIFD map, serves every
+// pass instead of allocating a fresh extentScan+map per pass. Found via a
+// diff_base pprof comparison (ce1dc82 vs this session's tree,
+// -alloc_objects -focus=GoMetadata): scanExtentPass's own
+// `make(map[uint64]bool, 16)` was the single largest contributor to Read's
+// allocs/op increase after #289 introduced this scanner — scaling with pass
+// count (NEF/ARW typically need 2-3 passes to converge) instead of being a
+// one-time cost per Extract call. Resetting seenIFD between passes (instead
+// of letting a PRIOR pass's "seen" markers persist) is required for
+// correctness, not just cosmetic: a pass that stopped early (walkIFD
+// returned ok=false, buffer too small) must let the NEXT, larger-buffer pass
+// revisit that same IFD from scratch — a stale "seen" entry would
+// incorrectly skip it and under-report need.
+func scanExtentPass(scan *extentScan, buf []byte, ifd0Off uint64, order binary.ByteOrder, bigTIFF bool) uint64 {
+	scan.buf, scan.order, scan.bigTIFF, scan.need = buf, order, bigTIFF, 0
+	clear(scan.seenIFD)
 	// true: IFD0 and every IFD in its own Next chain (IFD1, IFD2, ...) are
 	// exactly what exif.Parse walks and materialises with a ThumbnailData
 	// field (see walkChain's doc comment).
-	s.walkChain(ifd0Off, 0, true)
-	return s.need
+	scan.walkChain(ifd0Off, 0, true)
+	return scan.need
 }
 
 // growBuffer extends buf to at least need bytes by reading ONLY the delta
@@ -518,53 +546,66 @@ func growBuffer(r io.ReadSeeker, buf []byte, need uint64) ([]byte, error) {
 //     measured ~268 MB (~maxFileSize) allocated per Read before this fix; 0
 //     extra bytes after it (its own 325-byte initial prefix already
 //     satisfies every real requirement, so no growBuffer call is even made).
-//  2. Large-fraction snap: once a single pass's need already accounts for at
-//     least 1/largeFractionDenom (10%) of the whole file, there is little
-//     "prefix" benefit left worth protecting with further incremental
-//     growth, so need is raised to fileSize outright. This is the signal
-//     that distinguishes two patterns a pass-count- or fixed-factor-only
-//     policy cannot tell apart, both of which need several small-increment
-//     passes to fully resolve an IFD chain (each IFD's location is only
-//     knowable after growing far enough to read the IFD that points to it):
-//     real camera/RAW files' metadata stays a small, STABLE fraction of a
-//     large file across every pass (e.g. raw/metadata-extractor/
-//     Nikon D810.nef: need stays ~0.62% of the 40.7 MB file for all 3 of its
-//     passes — this check never fires, so NEF keeps the small growth factor
-//     below and converges at ~253 KB, nowhere near the 1 MiB Read AC); some
-//     real, non-adversarial multi-IFD/multi-page TIFFs instead reveal a need
-//     that GROWS toward a large fraction across passes (e.g.
-//     tiff/metadata-extractor/m1-8110934bb3b18d0e87ccc1ddfc5f0107.tif: 15% ->
-//     15% -> 31% on successive passes) — this check fires as soon as that
-//     crossing happens, short-circuiting straight to a single final read
-//     instead of chasing the remainder through several more small steps. A
-//     first draft of this policy escalated on PASS NUMBER instead of this
-//     fraction (any 2nd-or-later pass got a large growth factor); it
-//     mis-fired on NEF precisely because NEF's later passes are real but
-//     still tiny relative to fileSize, ballooning B/op past the 1 MiB Read
-//     AC for a file whose actual need never remotely approached fileSize.
-//  3. Tail-snap: if fewer than one initial-prefix-chunk's worth
+//
+//  2. Tail-snap: if fewer than one initial-prefix-chunk's worth
 //     (extentInitialPrefixSize, 64 KiB) of the file would remain unread
 //     after satisfying the current pass's need, need is raised to fileSize —
-//     catching the case (2) leaves uncovered: a need that is already close
-//     to fileSize in absolute terms but happens to fall under the 10%
-//     relative threshold only because fileSize itself is small. Observed on
+//     finishing a need that is already close to fileSize in absolute terms
+//     right now, instead of leaving a near-certain follow-up pass for step 3
+//     below to eventually reach by a redundant small increment. Observed on
 //     testdata/corpus/tiff/metadata-extractor/Epson PerfectionV800.tiff (a
 //     synthetic fixture where declared metadata is ~100% of an ~800 KB
-//     file): the first pass's need (816,076 B, 99.6% of fileSize) is already
-//     caught by check (2) here too, but this check is what would catch a
-//     need that stalled at, say, 85%-95% instead.
-//  4. Otherwise, plain doubling — max(need, 2×len(buf)), capped at fileSize
-//     — bounds the total copied bytes summed across every pass to
-//     O(final extent) instead of O(final extent × pass count) for a file
-//     whose need happens to grow in many small increments without ever
-//     crossing the (2)/(3) thresholds early. Found via the same corpus-wide
-//     benchmark: testdata/corpus/tiff/exampletiffs/mri.tif (230,578 B, real,
-//     non-adversarial file) needed enough small-increment passes to
-//     allocate ~2.97 MB total (≈13× its own size) under a flat,
-//     exact-need-sized growth policy; doubling converges the same file in a
-//     single pass (its first pass's need, 67,088 B ≈ 29% of fileSize, is
-//     actually caught by check (2) above — doubling alone is the fallback
-//     for files whose fraction never climbs that high).
+//     file): the first pass's need (816,076 B, 99.6% of fileSize) is caught
+//     here, finishing in the same pass instead of one more small step.
+//
+//  3. Otherwise, a bounded additive margin — need + extentInitialPrefixSize
+//     (64 KiB), capped at fileSize — closes the residual gap for a file
+//     whose need happens to grow in several small increments without ever
+//     crossing step (2)'s threshold early, without the multiplicative
+//     overshoot geometric doubling would carry into its LAST grow. Found via
+//     the same corpus-wide benchmark: testdata/corpus/tiff/exampletiffs/
+//     mri.tif (230,578 B) needed several small-increment passes under a
+//     flat, exact-need-sized growth policy (fixed by an earlier version of
+//     this function using max(need, 2×len(buf)) doubling instead — see git
+//     history), but that SAME doubling policy overshot
+//     raw/metadata-extractor/Nikon D810.nef's true final need (253,172 B)
+//     by close to 2× on its own last grow (need only grows 253,054 ->
+//     253,154 -> 253,172, so 2×253,054=506,108 was allocated for a file that
+//     only ever needed 253,172) — a real camera RAW file whose need stays a
+//     tiny, stable 0.62% of a 40.7 MB file across every pass. A small fixed
+//     margin closes both files' "several small increments" gap without
+//     doubling's compounding overshoot.
+//
+//     A prior version of this function additionally snapped to fileSize
+//     whenever a single pass's need already reached >= 10% of fileSize (a
+//     "large-fraction snap"), on the theory that a large RELATIVE fraction
+//     signalled little further prefix benefit. Task #293 follow-up: a
+//     corpus-wide per-file Read benchmark on
+//     raw/metadata-extractor/OM System TG-7.ORF (13.15 MB; Olympus MakerNote
+//     structure puts its stable, single-pass metadata need at 11.5% —
+//     legitimately above the 10% cutoff, but never growing across passes)
+//     found this relative rule forced a full 13.15 MB read for a file whose
+//     true converged need was only ~1.51 MB (12.0% including the additive
+//     margin), blowing past the ≤2 MiB / ≤60 µs Read AC for no correctness
+//     reason: a large but STABLE relative fraction is exactly what steps
+//     (2)/(3) above already resolve correctly in the same number of passes,
+//     without ever inflating the buffer beyond the true need. A dedicated
+//     A/B simulation harness (git history) replayed every one of this
+//     repository's 114 real TIFF-family corpus files above
+//     smallFileWholeReadThreshold (4 MiB) through both policies: removing
+//     the large-fraction snap regressed ZERO files' pass count or final
+//     buffer size, while shrinking the corpus-wide average converged buffer
+//     42% (4,651,608 B -> 2,688,439 B) — the relative rule was firing on
+//     stable-but-large fractions it was never meant to catch, with no
+//     multi-pass "still growing" file in this corpus actually depending on
+//     it. It is not reinstated as an absolute-bytes-remaining rule either:
+//     the same simulation found thresholds up to 4 MiB behaved identically
+//     to removing the rule outright (no file in this corpus has a
+//     converged-need gap in that range), while 8 MiB already regressed a
+//     real file (raw/metadata-extractor/Canon EOS 350D.CR2: 773,969 B ->
+//     7,797,386 B for a 1-pass saving) — evidence that ANY such margin only
+//     ever adds risk, never benefit, for the files this scanner actually
+//     serves.
 //
 // Returns the final buffer. Reaching maxExtentGrowthPasses or maxFileSize
 // without full convergence is not treated as an error: the caller compares
@@ -573,12 +614,16 @@ func growBuffer(r io.ReadSeeker, buf []byte, need uint64) ([]byte, error) {
 // whole-file read — see Extract.
 func scanMetadataExtent(r io.ReadSeeker, initial []byte, ifd0Off uint64, order binary.ByteOrder, bigTIFF bool, fileSize uint64) ([]byte, error) {
 	buf := initial
+	// One extentScan (and its seenIFD map) for every pass this call makes —
+	// see scanExtentPass's own doc comment for why reuse across passes,
+	// rather than one per pass, matters for allocs/op.
+	scan := &extentScan{seenIFD: make(map[uint64]bool, 16)}
 	for range maxExtentGrowthPasses {
-		need := scanExtentPass(buf, ifd0Off, order, bigTIFF)
+		need := scanExtentPass(scan, buf, ifd0Off, order, bigTIFF)
 		if need <= uint64(len(buf)) {
 			return buf, nil
 		}
-		target := nextGrowthTarget(need, uint64(len(buf)), fileSize)
+		target := nextGrowthTarget(need, fileSize)
 		grown, err := growBuffer(r, buf, target)
 		if err != nil {
 			return buf, err
@@ -595,18 +640,30 @@ func scanMetadataExtent(r io.ReadSeeker, initial []byte, ifd0Off uint64, order b
 }
 
 // nextGrowthTarget computes how large scanMetadataExtent's next growBuffer
-// call should target, given this pass's raw need, the current buffer length,
-// and the file's total size. Split out of scanMetadataExtent to keep its
-// cyclomatic complexity within the project's gocyclo threshold; see
-// scanMetadataExtent's own doc comment for the full rationale and
-// corpus-measured evidence behind each of the four steps applied here (via
-// clampNeed) and below.
-func nextGrowthTarget(need, bufLen, fileSize uint64) uint64 {
+// call should target, given this pass's raw need and the file's total size.
+// Split out of scanMetadataExtent to keep its cyclomatic complexity within
+// the project's gocyclo threshold; see scanMetadataExtent's own doc comment
+// for the full rationale and corpus-measured evidence behind each of the
+// three steps applied here (via clampNeed) and below.
+func nextGrowthTarget(need, fileSize uint64) uint64 {
 	need = clampNeed(need, fileSize)
-	target := need
-	if geometric := bufLen * 2; geometric > target {
-		target = geometric
-	}
+	// Bounded additive margin (#293 follow-up), not geometric doubling: grow
+	// to need plus one extra initial-prefix-chunk's worth of headroom. A
+	// prior version of this function doubled bufLen unconditionally
+	// (target = max(need, 2*bufLen)) — correct for bounding total PASS COUNT,
+	// but for a real camera RAW file whose IFD chain needs several
+	// small-increment passes without ever crossing clampNeed's tail-snap
+	// threshold (e.g. raw/metadata-extractor/Nikon D810.nef: need only grows
+	// 253,054 -> 253,154 -> 253,172, converging in 3 tiny steps), doubling the
+	// ALREADY-large current buffer overshoots the true final need by close to
+	// 2x on its very last grow (253,154 doubled to 506,108, when only 253,172
+	// bytes were ever actually needed) — B/op measured ~744 KB for a real
+	// final need of ~500 KB. A small, FIXED additive margin still closes the
+	// same "many tiny increments" gap doubling existed to fix (100-byte
+	// increments comfortably fit within one more 64 KiB chunk, converging in
+	// the same 2 total passes NEF needed under the old policy) without
+	// carrying doubling's multiplicative overshoot forward pass after pass.
+	target := need + extentInitialPrefixSize
 	if fileSize > 0 && target > fileSize {
 		target = fileSize
 	}
@@ -616,10 +673,27 @@ func nextGrowthTarget(need, bufLen, fileSize uint64) uint64 {
 	return target
 }
 
-// clampNeed applies nextGrowthTarget's first three steps — the safety clamp,
-// the large-fraction snap, and the tail-snap — to a single pass's raw need.
-// Split out of nextGrowthTarget to keep its own cyclomatic complexity within
-// the project's gocyclo threshold.
+// clampNeed applies nextGrowthTarget's first two steps — the safety clamp
+// and the tail-snap — to a single pass's raw need. Split out of
+// nextGrowthTarget to keep its own cyclomatic complexity within the
+// project's gocyclo threshold.
+//
+// Task #293 follow-up: this function previously also snapped need to
+// fileSize once it reached >= 10% of fileSize (a "large-fraction snap"),
+// intended to short-circuit a need that keeps GROWING toward a large
+// fraction across passes instead of chasing it in further small increments.
+// Removed: a large but STABLE relative fraction — a file whose need is
+// already at its converged value on the very first pass, simply because
+// that value happens to be a large percentage of a file that itself isn't
+// huge (e.g. raw/metadata-extractor/OM System TG-7.ORF: Olympus MakerNote
+// structure puts its one-pass-stable need at 11.5% of a 13.15 MB file) — is
+// indistinguishable from the "still growing" pattern by this check alone,
+// and the relative threshold fired on the former far more often in this
+// corpus than the latter, forcing full-file reads (blowing past the ≤2 MiB
+// / ≤60 µs Read AC) for files whose true need never approached fileSize. See
+// scanMetadataExtent's doc comment for the corpus-wide A/B evidence (114
+// real TIFF-family files) behind removing it outright rather than
+// replacing the relative threshold with an absolute-bytes-remaining one.
 func clampNeed(need, fileSize uint64) uint64 {
 	if need > fileSize {
 		need = fileSize
@@ -632,18 +706,10 @@ func clampNeed(need, fileSize uint64) uint64 {
 	if need > uint64(maxFileSize) { //nolint:gosec // G115: maxFileSize is a fixed, always-positive package constant (256 MiB)
 		need = uint64(maxFileSize) //nolint:gosec // G115: same rationale
 	}
-	// Large-fraction snap: once a single pass's need already accounts for a
-	// substantial fraction of the whole file (>= 1/largeFractionDenom, e.g.
-	// 10%), read the rest of the file now instead of continuing incremental
-	// growth toward it.
-	const largeFractionDenom = 10 // need*10 >= fileSize <=> need >= 10% of fileSize
-	if fileSize > 0 && need*largeFractionDenom >= fileSize {
-		need = fileSize
-	}
 	// Tail-snap: if fewer than one initial-prefix-chunk's worth of the file
 	// would remain unread after satisfying this pass's need, finish it now
 	// in this same grow rather than leaving a near-certain follow-up pass
-	// for the plain-doubling step below to eventually reach by overshoot.
+	// for the additive-margin step (nextGrowthTarget) to eventually reach.
 	if fileSize > 0 && need < fileSize {
 		if remaining := fileSize - need; remaining <= extentInitialPrefixSize {
 			need = fileSize

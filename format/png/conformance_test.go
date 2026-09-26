@@ -1078,14 +1078,16 @@ func TestPNGRobustLengthPastEOF(t *testing.T) {
 	copy(hdr[4:8], "eXIf")
 	buf.Write(hdr[:])
 
-	_, _, _, err := Extract(bytes.NewReader(buf.Bytes()))
-	if err == nil {
-		t.Fatal("PNG-robust-Length-past-EOF: expected error for declared length > stream, got nil")
+	rawEXIF, rawIPTC, rawXMP, err := Extract(bytes.NewReader(buf.Bytes()))
+	// #294: a declared length exceeding the remaining stream is no longer
+	// surfaced as an error — Extract stops scanning gracefully and returns
+	// whatever metadata was already collected (none precedes the truncated
+	// eXIf chunk here, so (nil,nil,nil)), matching ce1dc82 (pre-#288).
+	if err != nil {
+		t.Fatalf("PNG-robust-Length-past-EOF: expected nil error (graceful stop, #294) for declared length > stream, got %v", err)
 	}
-	// Must NOT be ErrChunkTooLarge — that is for spec violation (Length > 2^31-1).
-	// This is a truncation error.
-	if errors.Is(err, ErrChunkTooLarge) {
-		t.Errorf("PNG-robust-Length-past-EOF: got ErrChunkTooLarge; expected truncation error for valid length in short stream")
+	if rawEXIF != nil || rawIPTC != nil || rawXMP != nil {
+		t.Errorf("PNG-robust-Length-past-EOF: expected (nil,nil,nil), got rawEXIF=%v rawIPTC=%v rawXMP=%v", rawEXIF, rawIPTC, rawXMP)
 	}
 }
 
