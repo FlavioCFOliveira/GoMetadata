@@ -115,7 +115,7 @@ func TestSecurityBigTIFFStripOverflowNoPanic(t *testing.T) {
 				// both paths uniformly); wholeFile==false streams blocks
 				// from it after the same fits() check rejects the PoC pair.
 				r := bytes.NewReader(raw)
-				err = InjectWithEXIF(r, raw, wholeFile, e, nil, []byte("<x/>"), &out)
+				err = InjectWithEXIFStream(r, raw, wholeFile, e, nil, []byte("<x/>"), &out)
 				if err == nil {
 					t.Fatal("InjectWithEXIF succeeded on a malicious StripOffsets/StripByteCounts pair — the overflow guard regressed")
 				}

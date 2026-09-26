@@ -4,6 +4,7 @@
 package tiff
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -292,7 +293,8 @@ func extractBigTIFFPrefix(r io.ReadSeeker, initial []byte, order binary.ByteOrde
 // When rawEXIF was produced by exif.Encode (an IFD skeleton without image
 // blocks), image block enumeration will fail with ErrBlockOutOfBounds. Callers
 // that hold the original TIFF bytes AND a modified *exif.EXIF struct (e.g. the
-// gometadata.Write path) must use InjectWithEXIF instead.
+// gometadata.Write path) must use InjectWithEXIF (or its streaming variant
+// InjectWithEXIFStream) instead.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ bool) error { //nolint:cyclop // inherent nil-dispatch logic
 	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads before
 	// proceeding. The wire-frame encoding (magic 0x00XMPEXT\x00) is specific to
@@ -356,13 +358,50 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ boo
 // bytes for image-data relocation and a pre-built (already-mutated) *exif.EXIF
 // struct for the IFD content.
 //
+// InjectWithEXIF is a whole-file convenience wrapper preserved for backward
+// compatibility (this exact signature shipped in v1.3.0): it is equivalent to
+//
+//	InjectWithEXIFStream(bytes.NewReader(originalBytes), originalBytes, true,
+//		modifiedEXIF, rawIPTC, rawXMP, w)
+//
+// Callers that read from a seekable source (an *os.File, for example) and
+// want to avoid buffering the whole file — including its image data — in
+// memory should call InjectWithEXIFStream directly; see its own doc comment
+// for the streaming contract introduced in task #291.
+//
+// InjectWithEXIF avoids ErrBlockOutOfBounds by separating concerns:
+//   - originalBytes: the ORIGINAL TIFF file bytes (all image blocks at
+//     original absolute offsets). Used only as the source for copying image
+//     data.
+//   - modifiedEXIF: the *exif.EXIF struct produced by exif.Parse(originalBytes)
+//     and subsequently mutated by the caller (SetCopyright, SetGPS, etc.).
+//     Its IFDs carry both the edited metadata AND the original image-block offsets
+//     (StripOffsets/TileOffsets still point at originalBytes positions).
+//   - rawIPTC, rawXMP: freshly encoded IPTC/XMP payloads to upsert into IFD0
+//     (may be nil if unchanged).
+//
+// If modifiedEXIF is nil, InjectWithEXIF falls back to parsing originalBytes
+// (same behaviour as Inject).
+//
+// fix(tiff): task #97 — real-file TIFF/DNG write produced ErrBlockOutOfBounds
+// because encodeEXIF fed an IFD skeleton as the relocate base.
+func InjectWithEXIF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+	return InjectWithEXIFStream(bytes.NewReader(originalBytes), originalBytes, true, modifiedEXIF, rawIPTC, rawXMP, w)
+}
+
+// InjectWithEXIFStream is InjectWithEXIF's streaming variant: it writes a
+// modified TIFF stream to w using the ORIGINAL TIFF bytes (in full, or as a
+// metadata prefix accompanied by the seekable source they were read from) for
+// image-data relocation, and a pre-built (already-mutated) *exif.EXIF struct
+// for the IFD content.
+//
 // This is the correct entry point for the gometadata.Write path on TIFF-based
 // containers. The standard Inject function receives rawEXIF from encodeEXIF,
 // which calls exif.Encode and produces an IFD skeleton that lacks image blocks.
 // Feeding that skeleton to the relocator causes ErrBlockOutOfBounds because the
 // skeleton is shorter than the original strip/tile offsets stored in the IFD.
 //
-// InjectWithEXIF avoids this by separating concerns:
+// InjectWithEXIFStream avoids this by separating concerns:
 //   - prefix: the original file's bytes — either the ENTIRE file (wholeFile
 //     true) or just its METADATA PREFIX (wholeFile false; #289/#293's extent
 //     scanner). Sufficient either way to parse/enumerate every IFD, SubIFD,
@@ -379,16 +418,16 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ boo
 //   - rawIPTC, rawXMP: freshly encoded IPTC/XMP payloads to upsert into IFD0
 //     (may be nil if unchanged).
 //
-// If modifiedEXIF is nil, InjectWithEXIF falls back to parsing prefix (same
-// behaviour as Inject); this requires wholeFile to be true, since a metadata
-// prefix alone cannot be re-parsed as a self-contained TIFF stream by Parse's
-// generic image-block bounds checks.
+// If modifiedEXIF is nil, InjectWithEXIFStream falls back to parsing prefix
+// (same behaviour as Inject); this requires wholeFile to be true, since a
+// metadata prefix alone cannot be re-parsed as a self-contained TIFF stream
+// by Parse's generic image-block bounds checks.
 //
 // fix(tiff): task #97 — real-file TIFF/DNG write produced ErrBlockOutOfBounds
 // because encodeEXIF fed an IFD skeleton as the relocate base.
 // #291: image-data blocks are now streamed from r instead of being buffered
 // in prefix, when prefix is only a metadata prefix.
-func InjectWithEXIF(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+func InjectWithEXIFStream(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
 	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads.
 	if err := rejectWireFrameXMP(rawXMP); err != nil {
 		return err
@@ -444,16 +483,28 @@ func InjectWithEXIF(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedEXIF
 //
 // containers.md §8(e): "CR2: preserve CR 02 00 at offset 8; IFD0 at offset 16."
 //
+// InjectWithEXIFCR2 is a whole-file convenience wrapper preserved for backward
+// compatibility (this exact signature shipped in v1.3.0): it is equivalent to
+// InjectWithEXIFCR2Stream(bytes.NewReader(originalBytes), originalBytes, true,
+// modifiedEXIF, rawIPTC, rawXMP, w). Callers that want to stream image data
+// directly from a seekable source instead of buffering the whole file should
+// call InjectWithEXIFCR2Stream instead.
+func InjectWithEXIFCR2(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+	return InjectWithEXIFCR2Stream(bytes.NewReader(originalBytes), originalBytes, true, modifiedEXIF, rawIPTC, rawXMP, w)
+}
+
+// InjectWithEXIFCR2Stream is InjectWithEXIFCR2's streaming variant.
+//
 // This is the entry point used by gometadata.Write for FormatCR2.
 //
-// #291: see InjectWithEXIF's own doc comment for the prefix/r/wholeFile
+// #291: see InjectWithEXIFStream's own doc comment for the prefix/r/wholeFile
 // contract — identical here. insertCR2MarkerAndShiftOffsets only ever
 // rewrites offset VALUES stored within the header's own IFD entries (it never
 // reads or writes a byte beyond the header it is given), so applying it to
 // just the HEADER portion (before image blocks are streamed) reproduces
 // exactly the same header bytes as applying it to the old combined
 // header+blocks buffer used to.
-func InjectWithEXIFCR2(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+func InjectWithEXIFCR2Stream(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
 	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads.
 	if err := rejectWireFrameXMP(rawXMP); err != nil {
 		return err
@@ -698,11 +749,25 @@ func rebaseAllIFDsAfterCR2Marker(out []byte, ifdStart int, order binary.ByteOrde
 // enumerate PreviewIFD image block) before the standard TIFF copy-and-relocate
 // algorithm, and patches the MakerNote-relative PreviewIFD offsets after encoding.
 //
+// InjectWithEXIFNEF is a whole-file convenience wrapper preserved for
+// backward compatibility (this exact signature shipped in v1.3.0): it is
+// equivalent to InjectWithEXIFNEFStream(bytes.NewReader(originalBytes),
+// originalBytes, true, modifiedEXIF, rawIPTC, rawXMP, w). Callers that want
+// to stream image data directly from a seekable source instead of buffering
+// the whole file should call InjectWithEXIFNEFStream instead.
+//
+// See relocate_nef.go for the full algorithm description.
+func InjectWithEXIFNEF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+	return InjectWithEXIFNEFStream(bytes.NewReader(originalBytes), originalBytes, true, modifiedEXIF, rawIPTC, rawXMP, w)
+}
+
+// InjectWithEXIFNEFStream is InjectWithEXIFNEF's streaming variant.
+//
 // This is the entry point used by gometadata.Write for FormatNEF.
 // See relocate_nef.go for the full algorithm description.
-// #291: see InjectWithEXIF's own doc comment for the prefix/r/wholeFile
+// #291: see InjectWithEXIFStream's own doc comment for the prefix/r/wholeFile
 // contract — identical here.
-func InjectWithEXIFNEF(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+func InjectWithEXIFNEFStream(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
 	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads.
 	if err := rejectWireFrameXMP(rawXMP); err != nil {
 		return err
@@ -737,11 +802,25 @@ func InjectWithEXIFNEF(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedE
 //   - SR2Private (0xC634) inline 4-byte value is updated to point to the new SR2
 //     block position; SR2 internal pointers are rebased.
 //
+// InjectWithEXIFARW is a whole-file convenience wrapper preserved for
+// backward compatibility (this exact signature shipped in v1.3.0): it is
+// equivalent to InjectWithEXIFARWStream(bytes.NewReader(originalBytes),
+// originalBytes, true, modifiedEXIF, rawIPTC, rawXMP, w). Callers that want
+// to stream image data directly from a seekable source instead of buffering
+// the whole file should call InjectWithEXIFARWStream instead.
+//
+// See relocate_arw.go for the full algorithm description.
+func InjectWithEXIFARW(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+	return InjectWithEXIFARWStream(bytes.NewReader(originalBytes), originalBytes, true, modifiedEXIF, rawIPTC, rawXMP, w)
+}
+
+// InjectWithEXIFARWStream is InjectWithEXIFARW's streaming variant.
+//
 // This is the entry point used by gometadata.Write for FormatARW.
 // See relocate_arw.go for the full algorithm description.
-// #291: see InjectWithEXIF's own doc comment for the prefix/r/wholeFile
+// #291: see InjectWithEXIFStream's own doc comment for the prefix/r/wholeFile
 // contract — identical here.
-func InjectWithEXIFARW(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+func InjectWithEXIFARWStream(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
 	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads.
 	if err := rejectWireFrameXMP(rawXMP); err != nil {
 		return err
@@ -777,11 +856,30 @@ func InjectWithEXIFARW(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedE
 // into m.rawEXIF before calling this function, since orf.Extract patches
 // bytes [2:4] to 0x2A 0x00.
 //
+// InjectWithEXIFORF is a whole-file convenience wrapper preserved for
+// backward compatibility (this exact signature shipped in v1.3.0): it is
+// equivalent to InjectWithEXIFORFStream(bytes.NewReader(originalBytes),
+// originalBytes, true, modifiedEXIF, rawIPTC, rawXMP, w). Callers that want
+// to stream image data directly from a seekable source instead of buffering
+// the whole file should call InjectWithEXIFORFStream instead.
+//
+// See relocate_orf.go for the full algorithm description.
+func InjectWithEXIFORF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+	return InjectWithEXIFORFStream(bytes.NewReader(originalBytes), originalBytes, true, modifiedEXIF, rawIPTC, rawXMP, w)
+}
+
+// InjectWithEXIFORFStream is InjectWithEXIFORF's streaming variant.
+//
+// prefix must carry a valid ORF magic at bytes [0:4]; the caller
+// (writeTIFFORF in write.go) is responsible for restoring the real magic
+// into m.rawEXIF before calling this function, since orf.Extract patches
+// bytes [2:4] to 0x2A 0x00.
+//
 // This is the entry point used by gometadata.Write for FormatORF.
 // See relocate_orf.go for the full algorithm description.
-// #291: see InjectWithEXIF's own doc comment for the prefix/r/wholeFile
+// #291: see InjectWithEXIFStream's own doc comment for the prefix/r/wholeFile
 // contract — identical here.
-func InjectWithEXIFORF(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+func InjectWithEXIFORFStream(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
 	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads.
 	if err := rejectWireFrameXMP(rawXMP); err != nil {
 		return err
@@ -817,11 +915,29 @@ func InjectWithEXIFORF(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedE
 // caller (writeTIFFRW2 in write.go) is responsible for restoring the real magic
 // since rw2.Extract patches bytes [2:4] to 0x2A 0x00.
 //
+// InjectWithEXIFRW2 is a whole-file convenience wrapper preserved for
+// backward compatibility (this exact signature shipped in v1.3.0): it is
+// equivalent to InjectWithEXIFRW2Stream(bytes.NewReader(originalBytes),
+// originalBytes, true, modifiedEXIF, rawIPTC, rawXMP, w). Callers that want
+// to stream image data directly from a seekable source instead of buffering
+// the whole file should call InjectWithEXIFRW2Stream instead.
+//
+// See relocate_rw2.go for the full algorithm description.
+func InjectWithEXIFRW2(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+	return InjectWithEXIFRW2Stream(bytes.NewReader(originalBytes), originalBytes, true, modifiedEXIF, rawIPTC, rawXMP, w)
+}
+
+// InjectWithEXIFRW2Stream is InjectWithEXIFRW2's streaming variant.
+//
+// prefix must carry the valid RW2 magic "IIU\x00" at bytes [0:4]; the
+// caller (writeTIFFRW2 in write.go) is responsible for restoring the real magic
+// since rw2.Extract patches bytes [2:4] to 0x2A 0x00.
+//
 // This is the entry point used by gometadata.Write for FormatRW2.
 // See relocate_rw2.go for the full algorithm description.
-// #291: see InjectWithEXIF's own doc comment for the prefix/r/wholeFile
+// #291: see InjectWithEXIFStream's own doc comment for the prefix/r/wholeFile
 // contract — identical here.
-func InjectWithEXIFRW2(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+func InjectWithEXIFRW2Stream(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
 	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads.
 	if err := rejectWireFrameXMP(rawXMP); err != nil {
 		return err
