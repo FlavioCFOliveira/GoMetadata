@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/FlavioCFOliveira/GoMetadata/internal/boundscheck"
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 	"github.com/FlavioCFOliveira/GoMetadata/internal/metaerr"
 )
@@ -757,7 +758,7 @@ func parseIFDEntry(b []byte, e int, order binary.ByteOrder) (IFDEntry, bool) {
 // cap as a backstop: 512 x 65535 entries is a bounded but severe ~4000x
 // amplification (measured: 770KB input -> ~13GB peak heap). See
 // "IFD chain traversal budget" above traverse() for the full budget design.
-func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint32, bool, int, []parseWarn) { //nolint:cyclop // lenient-parse recovery branches (R-05/#126/#132) are inherent in the spec-driven logic
+func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder, aliasThumbnail bool) (*IFD, uint32, bool, int, []parseWarn) { //nolint:cyclop // lenient-parse recovery branches (R-05/#126/#132) are inherent in the spec-driven logic
 	// Use uint64 arithmetic to avoid int truncation on 32-bit platforms
 	// (GOARCH=386/arm): int(uint32 >= 2^31) is negative, which would cause the
 	// guard to pass while the subsequent slice panics. Performing the comparison
@@ -805,7 +806,7 @@ func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint
 	const maxIFDEntryPrealloc = 1024
 	preallocCap := min(count, maxIFDEntryPrealloc)
 	ifd := &IFD{Entries: make([]IFDEntry, 0, preallocCap)}
-	return fillIFD(b, ifd, offset, pos, count, ifdStart, ifdEnd, order, warnings)
+	return fillIFD(b, ifd, offset, pos, count, ifdStart, ifdEnd, order, warnings, aliasThumbnail)
 }
 
 // parseSingleIFDInto is the arena-aware variant of parseSingleIFD.
@@ -827,7 +828,7 @@ func parseSingleIFD(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint
 // EXIF-IFDCHAIN-01 residual (round 2): the 3rd return value is parsedCount —
 // see parseSingleIFD's doc comment for why callers must charge
 // traverseBudget with this value instead of len(ifd.Entries).
-func parseSingleIFDInto(b []byte, ifd *IFD, entrySlice []IFDEntry, offset uint32, order binary.ByteOrder) (uint32, bool, int, []parseWarn) { //nolint:cyclop // same lenient-parse branches as parseSingleIFD
+func parseSingleIFDInto(b []byte, ifd *IFD, entrySlice []IFDEntry, offset uint32, order binary.ByteOrder, aliasThumbnail bool) (uint32, bool, int, []parseWarn) { //nolint:cyclop // same lenient-parse branches as parseSingleIFD
 	if uint64(offset)+2 > uint64(len(b)) {
 		return 0, false, 0, nil
 	}
@@ -865,7 +866,7 @@ func parseSingleIFDInto(b []byte, ifd *IFD, entrySlice []IFDEntry, offset uint32
 	// task #198: arena safety — cap-clamped sub-slice ensures append beyond
 	// cap reallocates outside the arena and cannot overwrite a neighbour's region.
 	ifd.Entries = entrySlice[:0:cap(entrySlice)]
-	_, next, _, parsedCount, w := fillIFD(b, ifd, offset, pos, count, ifdStart, ifdEnd, order, warnings)
+	_, next, _, parsedCount, w := fillIFD(b, ifd, offset, pos, count, ifdStart, ifdEnd, order, warnings, aliasThumbnail)
 	return next, true, parsedCount, w
 }
 
@@ -888,7 +889,7 @@ func parseSingleIFDInto(b []byte, ifd *IFD, entrySlice []IFDEntry, offset uint32
 // logical length without reducing the CPU work already spent in the loop
 // or the backing array already grown to hold every pre-dedup entry. See
 // parseSingleIFD's doc comment for the amplification this closes.
-func fillIFD(b []byte, ifd *IFD, offset uint32, pos, count, ifdStart, ifdEnd int, order binary.ByteOrder, warnings []parseWarn) (*IFD, uint32, bool, int, []parseWarn) { //nolint:cyclop,gocyclo // lenient-parse branches (#126/#132) plus the EXIF-IFDCHAIN-01 round-2 retention right-sizing branch are inherent
+func fillIFD(b []byte, ifd *IFD, offset uint32, pos, count, ifdStart, ifdEnd int, order binary.ByteOrder, warnings []parseWarn, aliasThumbnail bool) (*IFD, uint32, bool, int, []parseWarn) { //nolint:cyclop,gocyclo // lenient-parse branches (#126/#132) plus the EXIF-IFDCHAIN-01 round-2 retention right-sizing branch are inherent
 	for i := 0; i < count; i++ { //nolint:intrange,modernize // binary parser: loop variable is a byte-slice offset multiplier
 		entry, ok := parseIFDEntry(b, pos+i*12, order)
 		if !ok {
@@ -974,7 +975,8 @@ func fillIFD(b []byte, ifd *IFD, offset uint32, pos, count, ifdStart, ifdEnd int
 	// Extract JPEG thumbnail bytes when both JPEGInterchangeFormat (0x0201) and
 	// JPEGInterchangeFormatLength (0x0202) are present (EXIF §4.5.5).
 	// task #199: extractJPEGThumbnail now derives order from the entry's bigEndian flag.
-	ifd.ThumbnailData = extractJPEGThumbnail(b, ifd)
+	// #293: aliasThumbnail (opt-in via AliasThumbnail) elides the copy.
+	ifd.ThumbnailData = extractJPEGThumbnail(b, ifd, aliasThumbnail)
 
 	// Read the next-IFD pointer (4 bytes after the last entry, TIFF §2).
 	// Use the original (unclamped) count stored in the IFD count field for the
@@ -991,8 +993,17 @@ func fillIFD(b []byte, ifd *IFD, offset uint32, pos, count, ifdStart, ifdEnd int
 // parsed ifd contains both TagJPEGInterchangeFormat (0x0201) and
 // TagJPEGInterchangeFormatLength (0x0202) with valid values (EXIF §4.5.5).
 // Returns nil when either tag is absent, malformed, or the indicated byte range
-// falls outside b.  The returned slice is an independent copy so the IFD is not
-// tied to the original parse buffer.
+// falls outside b.
+//
+// alias controls whether the returned slice independently copies the thumbnail
+// bytes (alias == false, the default via Parse) or aliases directly into b
+// (alias == true, opt-in via the AliasThumbnail ParseOption). See
+// AliasThumbnail's doc comment for the exact safety contract a caller must
+// satisfy before requesting the alias — the short version: b must be retained,
+// unmodified, and kept alive for at least as long as the returned *EXIF's
+// ThumbnailData fields are read. When alias is false the IFD is always fully
+// independent of the original parse buffer, matching Parse's long-standing
+// default contract that callers may discard/reuse/pool b once Parse returns.
 //
 // BigTIFF awareness (#141): JPEGInterchangeFormat may carry a TypeLong8 (8-byte)
 // offset in BigTIFF files.  When Value is 8 bytes we read the full uint64 offset
@@ -1006,7 +1017,7 @@ func fillIFD(b []byte, ifd *IFD, offset uint32, pos, count, ifdStart, ifdEnd int
 // rather than a caller-supplied binary.ByteOrder parameter.  Both entries must
 // belong to the same TIFF stream, so they carry the same order flag; the per-entry
 // call is equivalent to the previous stream-level parameter at zero extra cost.
-func extractJPEGThumbnail(b []byte, ifd *IFD) []byte { //nolint:gocyclo,cyclop // BigTIFF-aware type dispatch for TypeLong8/TypeLong offset and length; branches are inherent in the two-type handling
+func extractJPEGThumbnail(b []byte, ifd *IFD, alias bool) []byte { //nolint:gocyclo,cyclop // BigTIFF-aware type dispatch for TypeLong8/TypeLong offset and length; branches are inherent in the two-type handling
 	jifEntry := ifd.Get(TagJPEGInterchangeFormat)
 	if jifEntry == nil {
 		return nil
@@ -1057,10 +1068,33 @@ func extractJPEGThumbnail(b []byte, ifd *IFD) []byte { //nolint:gocyclo,cyclop /
 	}
 	jifLen := uint32(jifLen64) // jifLen64 ≤ 2^32-1 verified by the guard above
 
-	end := jifOff + uint64(jifLen)
-	if end > uint64(len(b)) {
+	// boundscheck.Fits (internal/boundscheck), not a raw `jifOff+jifLen >
+	// len(b)` comparison: jifOff is an attacker-controlled BigTIFF LONG8
+	// offset (up to MaxUint64) when JPEGInterchangeFormat is TypeLong8; a
+	// crafted pair can wrap a raw addition to a small value, passing this
+	// check incorrectly and then panicking on the slice expression below
+	// (security audit finding, 2026-09-26 — same overflow class as
+	// format/tiff's write-path relocate helpers, independently reachable
+	// here on the READ path via any top-level Read of a crafted BigTIFF
+	// file).
+	if !boundscheck.Fits(jifOff, uint64(jifLen), uint64(len(b))) {
 		return nil
 	}
+	end := jifOff + uint64(jifLen) // safe: boundscheck.Fits above proved this cannot overflow
+	// #293: when the caller has opted in via AliasThumbnail (and therefore
+	// guarantees b is retained, unmodified, and outlives the returned IFD
+	// tree — see AliasThumbnail's doc comment), return a direct sub-slice of
+	// b instead of copying. This is gometadata.Read's own top-level call
+	// site (parseEXIF in read.go): b there is always m.rawEXIF, a field
+	// retained on *Metadata for its entire lifetime and never mutated
+	// in-place (see Metadata.RawEXIF's own defensive bytes.Clone for
+	// external callers). Saves one make+copy of up to several hundred KB
+	// for RAW files carrying an embedded PreviewIFD JPEG thumbnail (e.g.
+	// Nikon D810.nef: 151,236 B).
+	if alias {
+		return b[jifOff:end:end]
+	}
+
 	// Copy: the IFD must be independent of the original parse buffer so that
 	// callers can discard the input bytes after Parse returns (TIFF §2).
 	thumb := make([]byte, jifLen)
@@ -1221,7 +1255,7 @@ func (bud *traverseBudget) spend(n int) {
 // (see "IFD chain traversal budget" above). Pass nil to size a fresh budget
 // from len(b) for this call alone; pass a shared *traverseBudget to pool the
 // allowance across sibling calls within the same Parse invocation.
-func traverse(b []byte, offset uint32, order binary.ByteOrder, budget *traverseBudget) (*IFD, []parseWarn, error) { //nolint:gocyclo,cyclop // IFD chain traversal with per-finding warning paths; branches are inherent in the spec-driven logic
+func traverse(b []byte, offset uint32, order binary.ByteOrder, budget *traverseBudget, aliasThumbnail bool) (*IFD, []parseWarn, error) { //nolint:gocyclo,cyclop // IFD chain traversal with per-finding warning paths; branches are inherent in the spec-driven logic
 	if uint64(offset)+2 > uint64(len(b)) {
 		return nil, nil, &metaerr.CorruptMetadataError{
 			Format: "EXIF",
@@ -1278,7 +1312,7 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder, budget *traverseB
 		}
 		visited[cur] = true
 
-		ifd, next, ok, parsedCount, ifdWarnings := parseSingleIFD(b, cur, order)
+		ifd, next, ok, parsedCount, ifdWarnings := parseSingleIFD(b, cur, order, aliasThumbnail)
 		warnings = append(warnings, ifdWarnings...)
 		if !ok {
 			// Audit finding #131 (TIFF 6.0 §2): a non-zero next-IFD pointer that
@@ -1370,7 +1404,7 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder, budget *traverseB
 // same Parse invocation — Parse does this for IFD0 plus the ExifIFD/GPSIFD/
 // InteropIFD sub-IFD lookups so an attacker cannot obtain a fresh full
 // allowance per sub-IFD pointer.
-func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *parseArena, budget *traverseBudget) (*IFD, []parseWarn, error) { //nolint:gocyclo,cyclop,funlen // IFD chain traversal with per-finding warning paths; branches are inherent in the spec-driven logic
+func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *parseArena, budget *traverseBudget, aliasThumbnail bool) (*IFD, []parseWarn, error) { //nolint:gocyclo,cyclop,funlen // IFD chain traversal with per-finding warning paths; branches are inherent in the spec-driven logic
 	// Use uint64 arithmetic to avoid int truncation on 32-bit platforms
 	// (GOARCH=386/arm): int(uint32 >= 2^31) is negative, which would cause the
 	// guard to pass while the subsequent slice panics. Performing the comparison
@@ -1460,7 +1494,7 @@ func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *p
 
 			if entrySlice := arena.allocEntries(slotCount); entrySlice != nil {
 				// Both IFD slot and entry backing are available from the arena.
-				next, ok, parsedCount, ifdWarnings = parseSingleIFDInto(b, ifdPtr, entrySlice, cur, order)
+				next, ok, parsedCount, ifdWarnings = parseSingleIFDInto(b, ifdPtr, entrySlice, cur, order, aliasThumbnail)
 				if !ok {
 					// Arena slot was consumed but not usable; undo the IFD alloc.
 					// Entry alloc cannot be undone, but that region will just be unused.
@@ -1481,7 +1515,7 @@ func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *p
 				// individual alloc so no partial state is left in the arena.
 				arena.ifdN--
 				var parsedIFD *IFD
-				parsedIFD, next, ok, parsedCount, ifdWarnings = parseSingleIFD(b, cur, order)
+				parsedIFD, next, ok, parsedCount, ifdWarnings = parseSingleIFD(b, cur, order, aliasThumbnail)
 				if !ok {
 					// task #200: record compact parseWarn instead of fmt.Sprintf.
 					if root != nil {
@@ -1499,7 +1533,7 @@ func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *p
 			// Arena nil or IFD batch exhausted: allocate individually (MakerNote
 			// parsers, ParseIFDAt, and any chain IFD beyond the pre-scan count).
 			var parsedIFD *IFD
-			parsedIFD, next, ok, parsedCount, ifdWarnings = parseSingleIFD(b, cur, order)
+			parsedIFD, next, ok, parsedCount, ifdWarnings = parseSingleIFD(b, cur, order, aliasThumbnail)
 			if !ok {
 				// task #200: record compact parseWarn instead of fmt.Sprintf.
 				if root != nil && cur != 0 {
@@ -1698,7 +1732,7 @@ func parseIFDEntryBigTIFF(b []byte, e int, order binary.ByteOrder) (IFDEntry, bo
 // EXIF-IFDCHAIN-01 residual (round 2): the 4th return value is parsedCount —
 // see parseSingleIFD's doc comment (classic-TIFF counterpart) for why
 // callers must charge traverseBudget with this value, not len(ifd.Entries).
-func parseSingleIFDBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IFD, uint64, bool, uint64, []parseWarn) {
+func parseSingleIFDBigTIFF(b []byte, offset uint64, order binary.ByteOrder, aliasThumbnail bool) (*IFD, uint64, bool, uint64, []parseWarn) {
 	// Guard: IFD offset + 8-byte count field must fit in b.
 	if offset > uint64(len(b)) || uint64(len(b))-offset < 8 {
 		return nil, 0, false, 0, nil
@@ -1716,9 +1750,9 @@ func parseSingleIFDBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IF
 	pos := offset + 8 // first entry starts after the 8-byte count field
 
 	const maxPrealloc = 1024
-	preallocCap := min(int(count), maxPrealloc) //nolint:gosec // G115: count ≤ bigTIFFMaxEntries (65535) so fits int on all supported platforms
+	preallocCap := min(int(count), maxPrealloc)
 	ifd := &IFD{Entries: make([]IFDEntry, 0, preallocCap)}
-	return fillIFDBigTIFF(b, ifd, offset, pos, count, order, nil)
+	return fillIFDBigTIFF(b, ifd, offset, pos, count, order, nil, aliasThumbnail)
 }
 
 // fillIFDBigTIFF is the body of parseSingleIFDBigTIFF.
@@ -1730,7 +1764,7 @@ func parseSingleIFDBigTIFF(b []byte, offset uint64, order binary.ByteOrder) (*IF
 // equal to the count parameter — see fillIFD's doc comment (classic-TIFF
 // counterpart) for why this must be returned verbatim rather than derived
 // from the post-dedup len(ifd.Entries).
-func fillIFDBigTIFF(b []byte, ifd *IFD, offset, pos, count uint64, order binary.ByteOrder, warnings []parseWarn) (*IFD, uint64, bool, uint64, []parseWarn) { //nolint:cyclop // BigTIFF sort+dedup mirrors fillIFD; inherent complexity
+func fillIFDBigTIFF(b []byte, ifd *IFD, offset, pos, count uint64, order binary.ByteOrder, warnings []parseWarn, aliasThumbnail bool) (*IFD, uint64, bool, uint64, []parseWarn) { //nolint:cyclop // BigTIFF sort+dedup mirrors fillIFD; inherent complexity
 	const bigTIFFEntrySize = uint64(20)
 
 	for i := uint64(0); i < count; i++ { //nolint:intrange,modernize // BigTIFF parser: loop variable is a byte-slice offset multiplier
@@ -1783,7 +1817,8 @@ func fillIFDBigTIFF(b []byte, ifd *IFD, offset, pos, count uint64, order binary.
 	// BigTIFF JPEG thumbnails (if any) — reuse the same extraction logic;
 	// the thumbnail offset stored as TypeLong (4-byte) will be read correctly
 	// by extractJPEGThumbnail using the entry's own bigEndian flag (task #199).
-	ifd.ThumbnailData = extractJPEGThumbnail(b, ifd)
+	// #293: aliasThumbnail (opt-in via AliasThumbnail) elides the copy.
+	ifd.ThumbnailData = extractJPEGThumbnail(b, ifd, aliasThumbnail)
 
 	// Read the next-IFD pointer (8 bytes after the last entry, BigTIFF spec §2).
 	nextPtrPos := pos + count*bigTIFFEntrySize
@@ -1813,7 +1848,7 @@ func fillIFDBigTIFF(b []byte, ifd *IFD, offset, pos, count uint64, order binary.
 // *traverseBudget to pool the allowance across sibling calls within the
 // same Parse invocation (Parse does this for the BigTIFF IFD0 chain plus
 // the ExifIFD/GPSIFD/InteropIFD sub-IFD lookups).
-func traverseBigTIFF(b []byte, offset uint64, order binary.ByteOrder, budget *traverseBudget) (*IFD, []parseWarn, error) { //nolint:gocyclo,cyclop // BigTIFF IFD chain traversal; same inherent branching as classic-TIFF traverse
+func traverseBigTIFF(b []byte, offset uint64, order binary.ByteOrder, budget *traverseBudget, aliasThumbnail bool) (*IFD, []parseWarn, error) { //nolint:gocyclo,cyclop // BigTIFF IFD chain traversal; same inherent branching as classic-TIFF traverse
 	if offset > uint64(len(b)) || uint64(len(b))-offset < 8 {
 		return nil, nil, &metaerr.CorruptMetadataError{
 			Format: "EXIF",
@@ -1860,7 +1895,7 @@ func traverseBigTIFF(b []byte, offset uint64, order binary.ByteOrder, budget *tr
 		}
 		visited[cur] = true
 
-		ifd, next, ok, parsedCount, ifdWarnings := parseSingleIFDBigTIFF(b, cur, order)
+		ifd, next, ok, parsedCount, ifdWarnings := parseSingleIFDBigTIFF(b, cur, order, aliasThumbnail)
 		if !ok {
 			// task #200: record compact parseWarn instead of fmt.Sprintf.
 			// val1=offHi32, val2=offLo32 for BigTIFF 64-bit offset (hi/lo split).
@@ -2393,6 +2428,8 @@ func ifdTotalSize(entries []IFDEntry) uint32 {
 // The type assertion to binary.AppendByteOrder is performed once per writeIFD
 // call; the PutUint16/32 operations that write into the pooled entryBuf scratch
 // buffer are retained as-is (in-place writes, no append, no escape).
+//
+//nolint:gocyclo,cyclop // task #291 follow-up: two per-entry passes (see body comments) intentionally kept in one function so their shared layout arithmetic can never drift apart
 func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, nextIFDOffset uint32) []byte {
 	n := len(entries)
 	// value area begins right after: 2 (count) + n*12 (entries) + 4 (next-IFD).
@@ -2423,9 +2460,15 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 	// bytes; unused bytes must be zero-filled.
 	clear(entryBuf)
 	defer iobuf.Put(scratchPtr)
-	var valueArea []byte
-	curOff := valueOff
 
+	// Pass 1 (task #291 follow-up): fill entryBuf's tag/type/count and
+	// inline-value-or-offset fields, and compute the value area's exact
+	// final byte length, in a single walk over entries. No out-of-line
+	// value BYTES are written here — only entryBuf (fixed 12-byte records)
+	// and the running valueAreaLen/sizeOff bookkeeping that pass 2 replays
+	// to append them directly into out.
+	var valueAreaLen uint64
+	sizeOff := valueOff
 	for i, e := range entries {
 		p := i * 12
 		order.PutUint16(entryBuf[p:], uint16(e.Tag))
@@ -2438,33 +2481,61 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 		if ts == 0 || total <= 4 {
 			// Inline value: copy into the 4-byte field (TIFF §2).
 			copy(entryBuf[p+8:p+12], e.Value)
-		} else {
-			// TIFF 6.0 §2: "Each data item (field value) must begin on a word
-			// boundary."  Insert a single 0x00 alignment pad byte if the running
-			// offset is odd before writing this out-of-line value.
-			if curOff&1 == 1 {
-				valueArea = append(valueArea, 0x00)
-				curOff++
-			}
-			order.PutUint32(entryBuf[p+8:], curOff)
-			valueArea = append(valueArea, e.Value...)
-			// TIFF §2: the value area for this entry must be exactly
-			// Count * typeSize bytes.  When len(Value) < total (e.g. TypeLong
-			// IPTC padded to the next 4-byte boundary), zero-fill the gap so
-			// that subsequent entries receive correct offsets and TIFF readers
-			// see a conformant value area.
-			if uint64(len(e.Value)) < total {
-				pad := total - uint64(len(e.Value))
-				valueArea = append(valueArea, make([]byte, pad)...)
-			}
-			curOff += uint32(total) //nolint:gosec // G115: total bounded by Count*typeSize ≤ MaxUint32 enforced by ifdTotalSize
+			continue
 		}
+		// TIFF 6.0 §2: "Each data item (field value) must begin on a word
+		// boundary."  Insert a single 0x00 alignment pad byte if the running
+		// offset is odd before writing this out-of-line value.
+		if sizeOff&1 == 1 {
+			valueAreaLen++
+			sizeOff++
+		}
+		order.PutUint32(entryBuf[p+8:], sizeOff)
+		valueAreaLen += max(uint64(len(e.Value)), total)
+		sizeOff += uint32(total) //nolint:gosec // G115: total bounded by Count*typeSize ≤ MaxUint32 enforced by ifdTotalSize
 	}
 
 	out = append(out, entryBuf...)
 	// TIFF §2: next-IFD pointer is a 4-byte unsigned integer (0 = no next IFD).
 	out = appendUint32Order(out, order, nextIFDOffset)
-	out = append(out, valueArea...)
+
+	// Pass 2 (task #291 follow-up): append every out-of-line entry's value
+	// bytes DIRECTLY into out, replaying pass 1's identical alignment/sizing
+	// arithmetic byte-for-byte, instead of building a separate valueArea
+	// buffer and then copying it into out via append(out, valueArea...).
+	// That two-buffer design paid for the value area's full byte count
+	// TWICE — once to build valueArea, once to copy it into out — which is
+	// negligible against a whole-file write buffer but became the dominant
+	// remaining Write allocation once #291 shrank TIFF-family Write's total
+	// B/op to metadata-prefix scale (a real camera file's IFD can carry a
+	// multi-hundred-KB-to-multi-MB out-of-line value area, e.g. an embedded
+	// MakerNote blob copied through verbatim). out is grown once, up front,
+	// by the exact valueAreaLen pass 1 computed, so this loop's own appends
+	// never trigger a further reallocation of out.
+	out = slices.Grow(out, int(valueAreaLen)) // valueAreaLen bounded by ifdTotalSize's own MaxUint32-saturating cap, itself far below every caller's 256 MiB aggregate input cap — fits int on every supported platform
+	curOff := valueOff
+	for _, e := range entries {
+		ts := typeSize(e.Type)
+		total := uint64(ts) * uint64(e.Count)
+		if ts == 0 || total <= 4 {
+			continue // inline value: already written into entryBuf by pass 1
+		}
+		if curOff&1 == 1 {
+			out = append(out, 0x00)
+			curOff++
+		}
+		out = append(out, e.Value...)
+		// TIFF §2: the value area for this entry must be exactly
+		// Count * typeSize bytes.  When len(Value) < total (e.g. TypeLong
+		// IPTC padded to the next 4-byte boundary), zero-fill the gap so
+		// that subsequent entries receive correct offsets and TIFF readers
+		// see a conformant value area.
+		if uint64(len(e.Value)) < total {
+			pad := total - uint64(len(e.Value))
+			out = append(out, make([]byte, pad)...)
+		}
+		curOff += uint32(total) //nolint:gosec // G115: total bounded by Count*typeSize ≤ MaxUint32 enforced by ifdTotalSize
+	}
 
 	// Trailing word-alignment pad: ensure the IFD block occupies an even number
 	// of bytes so that the next IFD block placed immediately after starts at an
@@ -2473,6 +2544,53 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 		out = append(out, 0x00)
 	}
 	return out
+}
+
+// ifdWrittenLen returns the exact number of bytes writeIFD (bigTIFF false)
+// or writeIFDBigTIFF (bigTIFF true) appends for entries when the output
+// already holds startOff bytes. It replays their layout rules: a 0x00 pad
+// before each out-of-line value whose running offset is odd, the full
+// len(Value) bytes (zero-filled up to Count × type size), and a trailing pad
+// when the block ends at an odd output length. thumbPatched mirrors
+// patchThumbnailEntries: the JPEGInterchangeFormat and
+// JPEGInterchangeFormatLength values are 4 bytes long.
+func ifdWrittenLen(entries []IFDEntry, startOff uint64, bigTIFF, thumbPatched bool) uint64 { //nolint:gocyclo // mirrors writeIFD/writeIFDBigTIFF layout rules branch for branch
+	fixed, threshold := uint64(2+len(entries)*12+4), uint64(4)
+	if bigTIFF {
+		fixed, threshold = uint64(8+len(entries)*20+8), 8
+	}
+	// curOff is the running value offset writeIFD tracks (advanced by the
+	// declared size); written counts the bytes actually appended.
+	curOff := startOff + fixed
+	written := uint64(0)
+	for i := range entries {
+		e := &entries[i]
+		var ts uint64
+		if bigTIFF {
+			ts = typeSizeBigTIFF(e.Type)
+		} else {
+			ts = uint64(typeSize(e.Type))
+		}
+		total := ts * uint64(e.Count)
+		if ts == 0 || total <= threshold {
+			continue // inline: occupies only the fixed entry field
+		}
+		if curOff&1 == 1 {
+			written++
+			curOff++
+		}
+		vlen := uint64(len(e.Value))
+		if thumbPatched && (e.Tag == TagJPEGInterchangeFormat || e.Tag == TagJPEGInterchangeFormatLength) {
+			vlen = 4
+		}
+		written += max(vlen, total)
+		curOff += total
+	}
+	end := startOff + fixed + written
+	if end&1 == 1 {
+		end++
+	}
+	return end - startOff
 }
 
 // ---------------------------------------------------------------------------
@@ -2564,6 +2682,8 @@ func ifdTotalSizeBigTIFF(entries []IFDEntry) uint64 {
 // mapping and the word-alignment design decision. startOff is the absolute
 // file offset at which the IFD block begins; nextIFDOffset is the absolute
 // file offset of the next IFD in the chain (0 = end of chain).
+//
+//nolint:gocyclo,cyclop // task #291 follow-up: two per-entry passes (see writeIFD's identical rationale) intentionally kept in one function so their shared layout arithmetic can never drift apart
 func writeIFDBigTIFF(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, nextIFDOffset uint64) []byte {
 	n := len(entries)
 	// value area begins right after: 8 (count) + n*20 (entries) + 8 (next-IFD).
@@ -2581,9 +2701,14 @@ func writeIFDBigTIFF(out []byte, entries []IFDEntry, order binary.ByteOrder, sta
 	// stale pool contents from a prior Encode call.
 	clear(entryBuf)
 	defer iobuf.Put(scratchPtr)
-	var valueArea []byte
-	curOff := valueOff
 
+	// Pass 1 (task #291 follow-up): see writeIFD's identical pass 1 comment.
+	// BigTIFF's inline threshold is 8 bytes (the value-or-offset field
+	// itself is 8 bytes wide, vs classic TIFF's 4) and typeSizeBigTIFF
+	// replaces typeSize (LONG8/SLONG8/IFD8 widen to 8 bytes; see the
+	// section comment above ifdTotalSizeBigTIFF).
+	var valueAreaLen uint64
+	sizeOff := valueOff
 	for i, e := range entries {
 		p := i * 20
 		order.PutUint16(entryBuf[p:], uint16(e.Tag))
@@ -2610,30 +2735,48 @@ func writeIFDBigTIFF(out []byte, entries []IFDEntry, order binary.ByteOrder, sta
 			// their full 8-byte raw field as Value, so this copy reproduces
 			// it exactly (V-14).
 			copy(entryBuf[p+12:p+20], e.Value)
-		} else {
-			// Out-of-line: word-align (see design decision above), then
-			// store a uint64 absolute file offset in the 8-byte field.
-			if curOff&1 == 1 {
-				valueArea = append(valueArea, 0x00)
-				curOff++
-			}
-			order.PutUint64(entryBuf[p+12:], curOff)
-			valueArea = append(valueArea, e.Value...)
-			// BigTIFF spec §2: the value area for this entry must be exactly
-			// Count * typeSizeBigTIFF(Type) bytes; zero-fill any shortfall so
-			// subsequent entries receive correct offsets.
-			if uint64(len(e.Value)) < total {
-				pad := total - uint64(len(e.Value))
-				valueArea = append(valueArea, make([]byte, pad)...)
-			}
-			curOff += total
+			continue
 		}
+		// Out-of-line: word-align (see design decision above), then
+		// store a uint64 absolute file offset in the 8-byte field.
+		if sizeOff&1 == 1 {
+			valueAreaLen++
+			sizeOff++
+		}
+		order.PutUint64(entryBuf[p+12:], sizeOff)
+		valueAreaLen += max(uint64(len(e.Value)), total)
+		sizeOff += total
 	}
 
 	out = append(out, entryBuf...)
 	// BigTIFF spec §2: next-IFD pointer is an 8-byte unsigned integer (0 = end).
 	out = appendUint64Order(out, order, nextIFDOffset)
-	out = append(out, valueArea...)
+
+	// Pass 2 (task #291 follow-up): see writeIFD's identical pass 2 comment
+	// — append every out-of-line entry's value bytes directly into out
+	// instead of through an intermediate valueArea buffer.
+	out = slices.Grow(out, int(valueAreaLen)) // valueAreaLen bounded by ifdTotalSizeBigTIFF's own MaxUint32-saturating cap, itself far below every caller's 256 MiB aggregate input cap — fits int on every supported platform
+	curOff := valueOff
+	for _, e := range entries {
+		ts := typeSizeBigTIFF(e.Type)
+		total := ts * uint64(e.Count)
+		if ts == 0 || total <= 8 {
+			continue // inline value: already written into entryBuf by pass 1
+		}
+		if curOff&1 == 1 {
+			out = append(out, 0x00)
+			curOff++
+		}
+		out = append(out, e.Value...)
+		// BigTIFF spec §2: the value area for this entry must be exactly
+		// Count * typeSizeBigTIFF(Type) bytes; zero-fill any shortfall so
+		// subsequent entries receive correct offsets.
+		if uint64(len(e.Value)) < total {
+			pad := total - uint64(len(e.Value))
+			out = append(out, make([]byte, pad)...)
+		}
+		curOff += total
+	}
 
 	// Trailing word-alignment pad — mirrors ifdTotalSizeBigTIFF's parity logic
 	// so the next IFD block placed immediately after also starts even.

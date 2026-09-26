@@ -3,6 +3,8 @@ package rw2
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
+	"os"
 	"testing"
 )
 
@@ -471,5 +473,60 @@ func TestRW2RawEXIFPreservesOriginalMagic(t *testing.T) {
 	if rawEXIF[2] != 0x55 || rawEXIF[3] != 0x00 {
 		t.Errorf("#117 regression: rawEXIF[2:4] = %02X %02X, want 55 00 (original RW2 magic)",
 			rawEXIF[2], rawEXIF[3])
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Benchmarks (task #235: close the cr3/orf/rw2 observability gap)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// BenchmarkRW2Extract measures the cost of extracting metadata from a minimal
+// RW2 (magic-patched TIFF) byte stream.
+//
+// #236: the reader is constructed once outside the loop and rewound via Seek
+// per iteration so the artificial bytes.Reader allocation does not inflate
+// the allocs/op reported for Extract itself.
+func BenchmarkRW2Extract(b *testing.B) {
+	data := buildRW2()
+	r := bytes.NewReader(data)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
+	}
+}
+
+// realRW2ForBenchmark is a real, multi-megabyte RW2 file for
+// BenchmarkRW2ExtractRealFile, where per-byte costs dominate.
+const realRW2ForBenchmark = "../../../testdata/corpus/raw/metadata-extractor/Panasonic DMC-GF7.rw2"
+
+// BenchmarkRW2ExtractRealFile measures Extract on a real RW2 file. Skips when
+// the corpus file is not present (corpus files are downloaded separately).
+func BenchmarkRW2ExtractRealFile(b *testing.B) {
+	data, err := os.ReadFile(realRW2ForBenchmark)
+	if err != nil {
+		b.Skipf("corpus file %s not present: %v", realRW2ForBenchmark, err)
+	}
+	r := bytes.NewReader(data)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
+	}
+}
+
+// BenchmarkRW2Inject measures the pass-through Inject path (RW2 magic
+// save/patch/restore around the TIFF delegate) on a minimal RW2 byte stream.
+func BenchmarkRW2Inject(b *testing.B) {
+	data := buildRW2()
+	r := bytes.NewReader(data)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_, _ = r.Seek(0, io.SeekStart)
+		var out bytes.Buffer
+		_ = Inject(r, &out, nil, nil, nil, true)
 	}
 }

@@ -73,6 +73,42 @@ type XMP struct {
 	// caller rather than via Parse), so the zero/low-alloc parse fast path
 	// is unaffected when a document has no collections to preserve.
 	containerTypes map[string]map[string]string
+
+	// arena is a compact, append-only, result-owned byte buffer holding a
+	// copy of every property value and property/struct/attribute-name key
+	// that Parse actually decided to keep in Properties or containerTypes —
+	// and NOTHING else. Every such string is an unsafe.String view into a
+	// region of arena, produced by the intern method.
+	//
+	// arena receives a copy of a value/key ONLY at the moment it is decided
+	// to be stored (storeProperty, recordContainerType — see intern), never
+	// eagerly for every value computed while scanning. Comments, whitespace,
+	// tag/attribute syntax, namespace declaration URIs that are never
+	// referenced as a stored namespace, and attribute values on attributes
+	// that turn out to be dropped (e.g. rdf:about, x:xmptk) never touch arena
+	// at all — they are read directly from the transient input/normalised
+	// buffer during the synchronous Parse call (see transientAliasString's
+	// doc for the read-only, synchronous-only contract that makes this safe)
+	// and become unreachable garbage the moment that call returns. arena's
+	// worst-case retention is therefore bounded by roughly 2x the total bytes
+	// of content actually kept (see intern's doc for why append-only growth
+	// bounds the multiplier to ~2x, not more), not by document size — except
+	// for struct-in-list keys, tracked in #277.
+	//
+	// Safety invariants — ALL must hold for the lifetime of the returned *XMP:
+	//  1. arena is never handed to a sync.Pool or any other buffer reuse
+	//     mechanism — it is a plain heap slice owned exclusively by this *XMP.
+	//  2. Bytes already appended to arena are never overwritten — growth via
+	//     append() only ever extends a NEW region or (when reallocating)
+	//     copies old content into a NEW backing array, never writes into an
+	//     already-issued string's backing bytes. This is what makes it safe
+	//     for a string produced by an EARLIER intern() call to keep pointing
+	//     at an OLDER backing array after a LATER intern() call triggers
+	//     growth/reallocation — see intern's doc.
+	//  3. arena strictly outlives every string derived from it, via Go's
+	//     normal GC interior-pointer keep-alive rules.
+	//  4. intern is the ONLY function that ever appends to arena.
+	arena []byte
 }
 
 // maxXMPDocumentBytes is the maximum number of UTF-8 bytes that Parse accepts
@@ -97,6 +133,20 @@ type XMP struct {
 // complementary: they bound individual allocations; this cap bounds total input.
 const maxXMPDocumentBytes = 16 << 20 // 16 MiB
 
+// maxInitialArenaCap bounds the initial pre-sizing guess for XMP.arena.
+//
+// Parse pre-sizes arena to min(len(body), maxInitialArenaCap) bytes: a small
+// document gets a right-sized guess (never more than its own body length,
+// which is itself an upper bound on how much content it could possibly have
+// stored), while a large — or adversarially padded, up to
+// maxXMPDocumentBytes — document is capped at this constant regardless of
+// its raw size, so the INITIAL allocation never scales with document size.
+// 256 bytes comfortably covers the representative packet's stored-content
+// total (xmp/bench_test.go) with only one or two amortised regrowths for
+// larger real-world documents; over-hinting further would reintroduce a
+// document-size-proportional initial allocation, defeating the fix.
+const maxInitialArenaCap = 256
+
 // Parse parses a raw XMP packet.
 // b may include the <?xpacket …?> wrapper; if absent, the bytes are
 // treated as the xmpmeta/RDF body directly.
@@ -114,25 +164,35 @@ func Parse(b []byte) (*XMP, error) {
 	// Normalise to UTF-8 so that the BOM-based encoding path is handled once,
 	// here, rather than duplicated across Scan and parseRDF.
 	// normaliseToUTF8 is a zero-copy no-op for UTF-8 input.
-	b = normaliseToUTF8(b)
-	if b == nil {
+	normalised := normaliseToUTF8(b)
+	if normalised == nil {
 		return nil, ErrEmptyInput
 	}
 
 	// Document-level size cap (post-normalisation, pre-RDF-parsing).
 	// See maxXMPDocumentBytes for the design rationale.
-	if len(b) > maxXMPDocumentBytes {
+	if len(normalised) > maxXMPDocumentBytes {
 		return nil, ErrDocumentTooLarge
 	}
 
-	x := &XMP{Properties: make(map[string]map[string]string)}
+	x := &XMP{Properties: make(map[string]map[string]string, 8)}
 
 	// Locate the XMP packet; if no wrapper is found, treat the whole input
 	// as the RDF body (XMP §7.3).
-	body := Scan(b)
+	body := Scan(normalised)
 	if body == nil {
-		body = b
+		body = normalised
 	}
+
+	// x.arena starts small and grows ONLY as parseRDF's intern() calls
+	// actually keep content — body itself is read directly (transient,
+	// read-only, synchronous-only; see transientAliasString's doc) and is
+	// NEVER retained by x. Pre-size arena to a small fraction of body's
+	// length, capped at maxInitialArenaCap, so a legitimately small document
+	// gets a right-sized initial allocation while a large (or adversarially
+	// padded, up to maxXMPDocumentBytes) document never forces a large
+	// upfront allocation regardless of how little of it is actually stored.
+	x.arena = make([]byte, 0, min(len(body), maxInitialArenaCap))
 
 	if err := parseRDF(body, x); err != nil {
 		return nil, err

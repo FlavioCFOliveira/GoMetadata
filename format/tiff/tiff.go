@@ -5,12 +5,15 @@ package tiff
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"slices"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/tiffscan"
 )
 
 // xmpWireFrameMagic is the 8-byte sentinel that identifies a JPEG extended-XMP
@@ -38,30 +41,161 @@ func rejectWireFrameXMP(rawXMP []byte) error {
 	return nil
 }
 
-// Extract reads metadata payloads from a TIFF container.
-// rawEXIF is the entire TIFF byte stream (TIFF itself is the EXIF container).
-// rawIPTC and rawXMP are read from the respective IFD0 tags.
-func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
-	if _, err = r.Seek(0, io.SeekStart); err != nil {
-		return nil, nil, nil, fmt.Errorf("tiff: seek: %w", err)
-	}
-
-	// #140 fix: cap the read to maxFileSize+1 bytes so that an oversized or
-	// infinite streaming reader cannot trigger unbounded heap allocation.
-	// If the reader delivers more than maxFileSize bytes the file is rejected
-	// with ErrFileTooLarge before any further parsing takes place.
-	data, err := io.ReadAll(io.LimitReader(r, maxFileSize+1))
+// readInput reads the whole of r from its current position. The read is
+// capped at maxFileSize bytes (#140) so that an oversized or infinite
+// reader cannot trigger unbounded heap allocation; ErrFileTooLarge is
+// returned before any parsing takes place. A seekable reader is read with a
+// single allocation of its exact size (iobuf.ReadAll).
+func readInput(r io.ReadSeeker) ([]byte, error) {
+	data, err := iobuf.ReadAll(r, maxFileSize)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("tiff: read: %w", err)
+		if errors.Is(err, iobuf.ErrTooLarge) {
+			return nil, fmt.Errorf("tiff: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
+		}
+		return nil, fmt.Errorf("tiff: read: %w", err)
 	}
-	if int64(len(data)) > maxFileSize {
-		return nil, nil, nil, fmt.Errorf("tiff: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
+	return data, nil
+}
+
+// seekFileSize returns r's total length via Seek(0, io.SeekEnd), restoring
+// the current position (assumed 0) before returning, or (-1, nil) if r does
+// not support seeking to its end. -1 tells Extract to fall back to
+// extractWholeFile, so correctness never depends on Seek(SeekEnd) support.
+func seekFileSize(r io.ReadSeeker) (int64, error) {
+	end, err := r.Seek(0, io.SeekEnd)
+	if err != nil {
+		return -1, nil //nolint:nilerr // non-seekable-to-end reader: disable the prefix fast path, not fatal
+	}
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return 0, fmt.Errorf("tiff: seek: %w", err)
+	}
+	return end, nil
+}
+
+// readInitialPrefix reads min(fileSize, extentInitialPrefixSize) bytes from
+// r's current position (assumed 0). fileSize is only used to avoid
+// allocating more than the file actually contains; a short read for any
+// other reason is a genuine I/O error.
+func readInitialPrefix(r io.Reader, fileSize int64) ([]byte, error) {
+	buf := make([]byte, min(fileSize, extentInitialPrefixSize))
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, fmt.Errorf("tiff: read: %w", err)
+	}
+	return buf, nil
+}
+
+// extractWholeFile is Extract's pre-#289 behaviour: read the entire file and
+// scan IFD0 directly. Used only when r cannot report its own size (so the
+// prefix/growth machinery in scanMetadataExtent has no reliable maxFileSize
+// bound to grow toward) — correctness must never depend on Seek(SeekEnd)
+// support, only performance does — or when fileSize is small enough that the
+// prefix scanner's own overhead costs more than it saves (Extract's
+// smallFileWholeReadThreshold check). acceptMagic: see ExtractWithMagic.
+func extractWholeFile(r io.ReadSeeker, acceptMagic uint16) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+	data, err := readInput(r)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 	if len(data) < 8 {
 		return nil, nil, nil, ErrFileTooShort
 	}
-
 	order, err := byteOrder(data)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	magic := order.Uint16(data[2:])
+	switch {
+	case magic == 0x002A || (acceptMagic != 0 && magic == acceptMagic):
+		ifd0Off := order.Uint32(data[4:])
+		rawIPTC, rawXMP = extractTagValues(data, ifd0Off, order)
+		return data, rawIPTC, rawXMP, nil
+	case magic == 0x002B:
+		return extractBigTIFF(data, order)
+	default:
+		return nil, nil, nil, fmt.Errorf("tiff: unsupported magic 0x%04X (expected 0x002A classic TIFF or 0x002B BigTIFF): %w",
+			magic, ErrUnsupportedMagic)
+	}
+}
+
+// Extract reads metadata payloads from a TIFF container.
+//
+// #289: rawEXIF is the metadata PREFIX of the TIFF byte stream — every IFD in
+// IFD0's next-IFD chain, ExifIFD, GPSIFD, InteropIFD, and SubIFDs, and every
+// out-of-line tag value within them (see extent.go) — not the whole file.
+// Strip/tile image data and embedded thumbnails/previews are excluded; a
+// caller that needs the original file bytes verbatim (e.g. to re-embed a
+// thumbnail this package never reads) must keep its own copy of the source.
+// rawIPTC and rawXMP are read from the respective IFD0 tags, which are
+// always within the returned prefix.
+func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+	return extractTIFFWithMagic(r, 0)
+}
+
+// ExtractWithMagic is Extract, but additionally treats magic value
+// acceptMagic (when non-zero) at bytes[2:4] as equivalent to classic TIFF's
+// 0x002A — mirroring exif.AcceptRAWMagic (exif/exif.go).
+//
+// #293: format/raw/orf and format/raw/rw2 are structurally classic TIFF —
+// only bytes[2:4] (the manufacturer's own magic: Olympus ORF "RO"/0x4F52 or
+// "RS"/0x5352; Panasonic RW2 "U\x00"/0x0055) differ from TIFF 6.0 §2's
+// 0x002A — so they call this instead of Extract to get the SAME
+// metadata-prefix scanning (#289) TIFF/CR2/NEF/ARW/DNG already use, instead
+// of reading the whole file.
+func ExtractWithMagic(r io.ReadSeeker, acceptMagic uint16) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+	return extractTIFFWithMagic(r, acceptMagic)
+}
+
+func extractTIFFWithMagic(r io.ReadSeeker, acceptMagic uint16) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+	if _, err = r.Seek(0, io.SeekStart); err != nil {
+		return nil, nil, nil, fmt.Errorf("tiff: seek: %w", err)
+	}
+
+	fileSize, sizeErr := seekFileSize(r)
+	if sizeErr != nil {
+		return nil, nil, nil, sizeErr
+	}
+	if fileSize < 0 {
+		return extractWholeFile(r, acceptMagic)
+	}
+	if fileSize > maxFileSize {
+		return nil, nil, nil, fmt.Errorf("tiff: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
+	}
+	if fileSize <= smallFileWholeReadThreshold {
+		// #289 follow-up: the prefix optimization exists to avoid reading
+		// tens of megabytes of strip/tile image data a real camera RAW file
+		// spends the overwhelming majority of its bytes on. Below this
+		// threshold, reading the WHOLE file is already cheap in absolute
+		// terms, and scanMetadataExtent's own incremental-growth machinery
+		// (see extent.go) costs MORE than it saves for files this size: a
+		// corpus-wide per-file Read benchmark (500 real TIFF/CR2/NEF/ARW/DNG
+		// files) found every file whose extent scan cost more than a plain
+		// whole-file read bounded at ~2.6 MiB; real camera RAW files, tens
+		// of MB, are unaffected either way and keep the >90% Read cost
+		// reduction the scanner exists for. Reusing extractWholeFile here
+		// matches HEAD's exact Read cost for every such file instead of
+		// merely bounding the scanner's worst case. See
+		// smallFileWholeReadThreshold's own doc comment (extent.go) for the
+		// exact threshold and its headroom above that measured bound.
+		return extractWholeFile(r, acceptMagic)
+	}
+	return extractPrefixed(r, fileSize, acceptMagic)
+}
+
+// extractPrefixed implements Extract's prefix-scanning path (files above
+// smallFileWholeReadThreshold): read the initial chunk, determine byte order
+// and container variant, and dispatch to the matching prefix scanner. Split
+// out of Extract to keep its cyclomatic complexity within the project's
+// gocyclo threshold.
+func extractPrefixed(r io.ReadSeeker, fileSize int64, acceptMagic uint16) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+	initial, err := readInitialPrefix(r, fileSize)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(initial) < 8 {
+		return nil, nil, nil, ErrFileTooShort
+	}
+
+	order, err := byteOrder(initial)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -69,27 +203,54 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	// TIFF 6.0 §2: magic number is 42 (0x002A) for classic TIFF.
 	// BigTIFF spec (Aware Systems / libtiff) §2: magic 43 (0x002B) for BigTIFF,
 	// which uses a 16-byte header with 8-byte IFD offsets.
-	magic := order.Uint16(data[2:])
-	switch magic {
-	case 0x002A:
-		// Classic TIFF: 8-byte header, 32-bit IFD offsets, 12-byte entries.
-		// The whole TIFF data IS the EXIF payload (TIFF §2).
-		rawEXIF = data
-		ifd0Off := order.Uint32(data[4:])
-		rawIPTC, rawXMP = extractTagValues(data, ifd0Off, order)
-		return rawEXIF, rawIPTC, rawXMP, nil
-
-	case 0x002B:
-		// BigTIFF: 16-byte header, 64-bit IFD offsets, 20-byte entries.
-		// BigTIFF spec §2: bytes [4:6] = offset bytesize (must be 8),
-		// bytes [6:8] = constant 0, bytes [8:16] = IFD0 offset (uint64).
-		rawEXIF, rawIPTC, rawXMP, err = extractBigTIFF(data, order)
-		return rawEXIF, rawIPTC, rawXMP, err
-
+	magic := order.Uint16(initial[2:])
+	switch {
+	case magic == 0x002A || (acceptMagic != 0 && magic == acceptMagic):
+		return extractClassicPrefix(r, initial, order, uint64(fileSize)) //nolint:gosec // G115: Extract validates 0 <= fileSize <= maxFileSize before calling extractPrefixed
+	case magic == 0x002B:
+		return extractBigTIFFPrefix(r, initial, order, uint64(fileSize)) //nolint:gosec // G115: same rationale
 	default:
 		return nil, nil, nil, fmt.Errorf("tiff: unsupported magic 0x%04X (expected 0x002A classic TIFF or 0x002B BigTIFF): %w",
 			magic, ErrUnsupportedMagic)
 	}
+}
+
+// extractClassicPrefix implements Extract's classic-TIFF (magic 0x002A)
+// branch: 8-byte header, 32-bit IFD offsets, 12-byte entries. fileSize is the
+// total size of the source file (already known from Extract's own
+// seekFileSize call), passed through so scanMetadataExtent can avoid a
+// wasteful trailing growth pass when only a small remainder of the file is
+// left unread (see scanMetadataExtent's doc comment).
+func extractClassicPrefix(r io.ReadSeeker, initial []byte, order binary.ByteOrder, fileSize uint64) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+	ifd0Off := order.Uint32(initial[4:])
+	buf, serr := scanMetadataExtent(r, initial, uint64(ifd0Off), order, false, fileSize)
+	if serr != nil {
+		return nil, nil, nil, serr
+	}
+	rawIPTC, rawXMP = extractTagValues(buf, ifd0Off, order)
+	return buf, rawIPTC, rawXMP, nil
+}
+
+// extractBigTIFFPrefix implements Extract's BigTIFF (magic 0x002B) branch:
+// 16-byte header, 64-bit IFD offsets, 20-byte entries. BigTIFF spec §2:
+// bytes [4:6] = offset bytesize (must be 8), bytes [6:8] = constant 0,
+// bytes [8:16] = IFD0 offset (uint64). fileSize: see extractClassicPrefix.
+func extractBigTIFFPrefix(r io.ReadSeeker, initial []byte, order binary.ByteOrder, fileSize uint64) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+	if len(initial) < bigTIFFMinHeaderLen {
+		return nil, nil, nil, ErrFileTooShort
+	}
+	offsetBytesize := order.Uint16(initial[4:])
+	if offsetBytesize != bigTIFFOffsetBytesize {
+		return nil, nil, nil, fmt.Errorf("tiff: BigTIFF offset bytesize = %d, must be 8: %w",
+			offsetBytesize, ErrUnsupportedMagic)
+	}
+	ifd0Off := order.Uint64(initial[8:])
+	buf, serr := scanMetadataExtent(r, initial, ifd0Off, order, true, fileSize)
+	if serr != nil {
+		return nil, nil, nil, serr
+	}
+	rawIPTC, rawXMP = extractTagValuesBigTIFF(buf, ifd0Off, order)
+	return buf, rawIPTC, rawXMP, nil
 }
 
 // Inject writes a modified TIFF stream to w, replacing the metadata tags.
@@ -132,7 +293,7 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 // blocks), image block enumeration will fail with ErrBlockOutOfBounds. Callers
 // that hold the original TIFF bytes AND a modified *exif.EXIF struct (e.g. the
 // gometadata.Write path) must use InjectWithEXIF instead.
-func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ bool) error { //nolint:gocyclo,cyclop // LimitReader guard added by #140 pushed complexity to 11; inherent nil-dispatch logic
+func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ bool) error { //nolint:cyclop // inherent nil-dispatch logic
 	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads before
 	// proceeding. The wire-frame encoding (magic 0x00XMPEXT\x00) is specific to
 	// JPEG APP1 and cannot be stored in TIFF tag 0x02BC. Writing it verbatim
@@ -151,15 +312,10 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ boo
 	if rawEXIF != nil {
 		base = rawEXIF
 	} else {
-		// #140 fix: cap the read to maxFileSize+1 bytes so that an oversized or
-		// infinite streaming reader cannot trigger unbounded heap allocation.
 		var err error
-		base, err = io.ReadAll(io.LimitReader(r, maxFileSize+1))
+		base, err = readInput(r)
 		if err != nil {
-			return fmt.Errorf("tiff: read: %w", err)
-		}
-		if int64(len(base)) > maxFileSize {
-			return fmt.Errorf("tiff: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
+			return err
 		}
 	}
 
@@ -181,11 +337,16 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ boo
 	// from the rebuilt IFD (upsertIFD0Entry is only called when the value is
 	// non-nil). Callers that only want to update XMP must pass the original
 	// rawIPTC (from tiff.Extract) to avoid silently deleting IPTC.
-	updated, err := relocateTIFF(base, rawIPTC, rawXMP)
+	//
+	// #291: base is always the WHOLE file here (Inject's own contract: base is
+	// either the caller-supplied rawEXIF or a full readInput(r) — see above),
+	// so writeRelocated's wholeFile fast path (slice directly from base, no
+	// r.Seek/Read round trip) always applies.
+	header, blocks, err := relocateTIFF(base, rawIPTC, rawXMP)
 	if err != nil {
 		return err
 	}
-	if _, err = w.Write(updated); err != nil {
+	if err := writeRelocated(r, w, header, blocks, base, true); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -202,22 +363,32 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ boo
 // skeleton is shorter than the original strip/tile offsets stored in the IFD.
 //
 // InjectWithEXIF avoids this by separating concerns:
-//   - originalBytes: the ORIGINAL TIFF file bytes (all image blocks at original
-//     absolute offsets). Used only as the source for copying image data in
-//     relocateTIFFFromParsed step 12.
-//   - modifiedEXIF: the *exif.EXIF struct produced by exif.Parse(originalBytes)
+//   - prefix: the original file's bytes — either the ENTIRE file (wholeFile
+//     true) or just its METADATA PREFIX (wholeFile false; #289/#293's extent
+//     scanner). Sufficient either way to parse/enumerate every IFD, SubIFD,
+//     and out-of-line offset/bytecount ARRAY (see relocateTIFFFromParsed's own
+//     doc comment) — never the image pixel bytes those arrays point to.
+//   - r: the original source, used to stream image-block bytes when prefix is
+//     only a metadata prefix (#291). Ignored when wholeFile is true (may be
+//     nil in that case); must be seekable and remain valid for the call's
+//     duration otherwise.
+//   - modifiedEXIF: the *exif.EXIF struct produced by exif.Parse(prefix, ...)
 //     and subsequently mutated by the caller (SetCopyright, SetGPS, etc.).
 //     Its IFDs carry both the edited metadata AND the original image-block offsets
-//     (StripOffsets/TileOffsets still point at originalBytes positions).
+//     (StripOffsets/TileOffsets still point at ORIGINAL absolute positions).
 //   - rawIPTC, rawXMP: freshly encoded IPTC/XMP payloads to upsert into IFD0
 //     (may be nil if unchanged).
 //
-// If modifiedEXIF is nil, InjectWithEXIF falls back to parsing originalBytes
-// (same behaviour as Inject).
+// If modifiedEXIF is nil, InjectWithEXIF falls back to parsing prefix (same
+// behaviour as Inject); this requires wholeFile to be true, since a metadata
+// prefix alone cannot be re-parsed as a self-contained TIFF stream by Parse's
+// generic image-block bounds checks.
 //
 // fix(tiff): task #97 — real-file TIFF/DNG write produced ErrBlockOutOfBounds
 // because encodeEXIF fed an IFD skeleton as the relocate base.
-func InjectWithEXIF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+// #291: image-data blocks are now streamed from r instead of being buffered
+// in prefix, when prefix is only a metadata prefix.
+func InjectWithEXIF(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
 	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads.
 	if err := rejectWireFrameXMP(rawXMP); err != nil {
 		return err
@@ -225,17 +396,18 @@ func InjectWithEXIF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawX
 
 	// Pass-through: no metadata changes requested and no EXIF edits.
 	if modifiedEXIF == nil && rawIPTC == nil && rawXMP == nil {
-		if _, err := w.Write(originalBytes); err != nil {
-			return fmt.Errorf("tiff: write: %w", err)
-		}
-		return nil
+		return writePassThrough(r, w, prefix, wholeFile)
 	}
 
-	updated, err := relocateTIFFFromParsed(originalBytes, modifiedEXIF, rawIPTC, rawXMP)
+	fileLen, err := resolveFileLen(r, prefix, wholeFile)
 	if err != nil {
 		return err
 	}
-	if _, err = w.Write(updated); err != nil {
+	header, blocks, err := relocateTIFFFromParsed(prefix, modifiedEXIF, rawIPTC, rawXMP, fileLen)
+	if err != nil {
+		return err
+	}
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -273,7 +445,15 @@ func InjectWithEXIF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawX
 // containers.md §8(e): "CR2: preserve CR 02 00 at offset 8; IFD0 at offset 16."
 //
 // This is the entry point used by gometadata.Write for FormatCR2.
-func InjectWithEXIFCR2(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+//
+// #291: see InjectWithEXIF's own doc comment for the prefix/r/wholeFile
+// contract — identical here. insertCR2MarkerAndShiftOffsets only ever
+// rewrites offset VALUES stored within the header's own IFD entries (it never
+// reads or writes a byte beyond the header it is given), so applying it to
+// just the HEADER portion (before image blocks are streamed) reproduces
+// exactly the same header bytes as applying it to the old combined
+// header+blocks buffer used to.
+func InjectWithEXIFCR2(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
 	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads.
 	if err := rejectWireFrameXMP(rawXMP); err != nil {
 		return err
@@ -281,13 +461,14 @@ func InjectWithEXIFCR2(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, r
 
 	// Pass-through: no metadata changes requested and no EXIF edits.
 	if modifiedEXIF == nil && rawIPTC == nil && rawXMP == nil {
-		if _, err := w.Write(originalBytes); err != nil {
-			return fmt.Errorf("tiff: write: %w", err)
-		}
-		return nil
+		return writePassThrough(r, w, prefix, wholeFile)
 	}
 
-	updated, err := relocateTIFFFromParsed(originalBytes, modifiedEXIF, rawIPTC, rawXMP)
+	fileLen, err := resolveFileLen(r, prefix, wholeFile)
+	if err != nil {
+		return err
+	}
+	header, blocks, err := relocateTIFFFromParsed(prefix, modifiedEXIF, rawIPTC, rawXMP, fileLen)
 	if err != nil {
 		return err
 	}
@@ -300,12 +481,12 @@ func InjectWithEXIFCR2(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, r
 	//
 	// Canon CR2 spec §3.1: TIFF header (8 bytes) + CR marker (4 bytes) + zero-pad
 	// (4 bytes) = 16-byte total header; IFD0 immediately follows at offset 16.
-	result, insertErr := insertCR2MarkerAndShiftOffsets(updated, originalBytes)
+	newHeader, insertErr := insertCR2MarkerAndShiftOffsets(header, prefix)
 	if insertErr != nil {
 		return insertErr
 	}
 
-	if _, err = w.Write(result); err != nil {
+	if err := writeRelocated(r, w, newHeader, blocks, prefix, wholeFile); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -369,10 +550,31 @@ func insertCR2MarkerAndShiftOffsets(finalTIFF, originalBytes []byte) ([]byte, er
 	//   [0:8]   original TIFF header slot (II/MM + 0x2A 0x00 + IFD0_off=8 → 16)
 	//   [8:16]  CR2 marker (4-byte CR signature + 4 zero bytes)
 	//   [16:]   finalTIFF[8:] (IFD block + image data)
-	out := make([]byte, len(finalTIFF)+cr2MarkerLen)
-	copy(out[0:8], finalTIFF[0:8])            // preserve BOM + magic
-	copy(out[8:8+cr2MarkerLen], marker[:])    // insert CR2 marker
-	copy(out[8+cr2MarkerLen:], finalTIFF[8:]) // IFD block + image data
+	//
+	// #285: relocateTIFFFromParsed reserves cr2MarkerLen extra bytes of spare
+	// CAPACITY in finalTIFF specifically for this insertion (see that
+	// function's step 9 doc comment). When present, the marker is inserted IN
+	// PLACE: finalTIFF is extended into its own spare capacity and bytes [8:]
+	// are shifted right by cr2MarkerLen with a single overlap-safe copy() —
+	// the Go spec guarantees copy() behaves correctly for overlapping slices
+	// ("The source and destination may overlap"), so this shift-right is safe
+	// regardless of copy order. This eliminates the second whole-file-sized
+	// allocation this function used to require on every CR2 write; bytes
+	// [0:8] are already correct after the reslice (out shares finalTIFF's
+	// backing array and starting offset) and are left untouched by both
+	// copies below. A caller that supplies finalTIFF without the reserved
+	// capacity still gets a correct result via the fallback branch.
+	var out []byte
+	if cap(finalTIFF) >= len(finalTIFF)+cr2MarkerLen {
+		out = finalTIFF[:len(finalTIFF)+cr2MarkerLen]
+		copy(out[8+cr2MarkerLen:], finalTIFF[8:]) // shift IFD block + image data right by cr2MarkerLen
+		copy(out[8:8+cr2MarkerLen], marker[:])    // insert CR2 marker into the vacated gap
+	} else {
+		out = make([]byte, len(finalTIFF)+cr2MarkerLen)
+		copy(out[0:8], finalTIFF[0:8])            // preserve BOM + magic
+		copy(out[8:8+cr2MarkerLen], marker[:])    // insert CR2 marker
+		copy(out[8+cr2MarkerLen:], finalTIFF[8:]) // IFD block + image data
+	}
 
 	// Step 2: update IFD0 offset in TIFF header from 8 to 16.
 	// TIFF 6.0 §2: bytes [4:8] = IFD0 offset. exif.Encode wrote 8; we write 16.
@@ -498,7 +700,9 @@ func rebaseAllIFDsAfterCR2Marker(out []byte, ifdStart int, order binary.ByteOrde
 //
 // This is the entry point used by gometadata.Write for FormatNEF.
 // See relocate_nef.go for the full algorithm description.
-func InjectWithEXIFNEF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+// #291: see InjectWithEXIF's own doc comment for the prefix/r/wholeFile
+// contract — identical here.
+func InjectWithEXIFNEF(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
 	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads.
 	if err := rejectWireFrameXMP(rawXMP); err != nil {
 		return err
@@ -506,17 +710,18 @@ func InjectWithEXIFNEF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, r
 
 	// Pass-through: no metadata changes requested and no EXIF edits.
 	if modifiedEXIF == nil && rawIPTC == nil && rawXMP == nil {
-		if _, err := w.Write(originalBytes); err != nil {
-			return fmt.Errorf("tiff: write: %w", err)
-		}
-		return nil
+		return writePassThrough(r, w, prefix, wholeFile)
 	}
 
-	updated, err := relocateTIFFFromParsedNEF(originalBytes, modifiedEXIF, rawIPTC, rawXMP)
+	fileLen, err := resolveFileLen(r, prefix, wholeFile)
 	if err != nil {
 		return err
 	}
-	if _, err = w.Write(updated); err != nil {
+	header, blocks, err := relocateTIFFFromParsedNEF(prefix, r, fileLen, modifiedEXIF, rawIPTC, rawXMP)
+	if err != nil {
+		return err
+	}
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -534,7 +739,9 @@ func InjectWithEXIFNEF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, r
 //
 // This is the entry point used by gometadata.Write for FormatARW.
 // See relocate_arw.go for the full algorithm description.
-func InjectWithEXIFARW(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+// #291: see InjectWithEXIF's own doc comment for the prefix/r/wholeFile
+// contract — identical here.
+func InjectWithEXIFARW(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
 	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads.
 	if err := rejectWireFrameXMP(rawXMP); err != nil {
 		return err
@@ -542,17 +749,18 @@ func InjectWithEXIFARW(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, r
 
 	// Pass-through: no metadata changes requested and no EXIF edits.
 	if modifiedEXIF == nil && rawIPTC == nil && rawXMP == nil {
-		if _, err := w.Write(originalBytes); err != nil {
-			return fmt.Errorf("tiff: write: %w", err)
-		}
-		return nil
+		return writePassThrough(r, w, prefix, wholeFile)
 	}
 
-	updated, err := relocateTIFFFromParsedARW(originalBytes, modifiedEXIF, rawIPTC, rawXMP)
+	fileLen, err := resolveFileLen(r, prefix, wholeFile)
 	if err != nil {
 		return err
 	}
-	if _, err = w.Write(updated); err != nil {
+	header, blocks, err := relocateTIFFFromParsedARW(prefix, r, fileLen, modifiedEXIF, rawIPTC, rawXMP)
+	if err != nil {
+		return err
+	}
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -571,7 +779,9 @@ func InjectWithEXIFARW(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, r
 //
 // This is the entry point used by gometadata.Write for FormatORF.
 // See relocate_orf.go for the full algorithm description.
-func InjectWithEXIFORF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+// #291: see InjectWithEXIF's own doc comment for the prefix/r/wholeFile
+// contract — identical here.
+func InjectWithEXIFORF(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
 	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads.
 	if err := rejectWireFrameXMP(rawXMP); err != nil {
 		return err
@@ -579,17 +789,18 @@ func InjectWithEXIFORF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, r
 
 	// Pass-through: no metadata changes requested and no EXIF edits.
 	if modifiedEXIF == nil && rawIPTC == nil && rawXMP == nil {
-		if _, err := w.Write(originalBytes); err != nil {
-			return fmt.Errorf("tiff: write: %w", err)
-		}
-		return nil
+		return writePassThrough(r, w, prefix, wholeFile)
 	}
 
-	updated, err := relocateTIFFAsORF(originalBytes, modifiedEXIF, rawIPTC, rawXMP)
+	fileLen, err := resolveFileLen(r, prefix, wholeFile)
 	if err != nil {
 		return err
 	}
-	if _, err = w.Write(updated); err != nil {
+	header, blocks, err := relocateTIFFAsORF(prefix, r, fileLen, modifiedEXIF, rawIPTC, rawXMP)
+	if err != nil {
+		return err
+	}
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -608,7 +819,9 @@ func InjectWithEXIFORF(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, r
 //
 // This is the entry point used by gometadata.Write for FormatRW2.
 // See relocate_rw2.go for the full algorithm description.
-func InjectWithEXIFRW2(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
+// #291: see InjectWithEXIF's own doc comment for the prefix/r/wholeFile
+// contract — identical here.
+func InjectWithEXIFRW2(r io.ReadSeeker, prefix []byte, wholeFile bool, modifiedEXIF *exif.EXIF, rawIPTC, rawXMP []byte, w io.Writer) error {
 	// Task #118 regression: reject JPEG extended-XMP wire-frame payloads.
 	if err := rejectWireFrameXMP(rawXMP); err != nil {
 		return err
@@ -616,17 +829,18 @@ func InjectWithEXIFRW2(originalBytes []byte, modifiedEXIF *exif.EXIF, rawIPTC, r
 
 	// Pass-through: no metadata changes requested and no EXIF edits.
 	if modifiedEXIF == nil && rawIPTC == nil && rawXMP == nil {
-		if _, err := w.Write(originalBytes); err != nil {
-			return fmt.Errorf("tiff: write: %w", err)
-		}
-		return nil
+		return writePassThrough(r, w, prefix, wholeFile)
 	}
 
-	updated, err := relocateTIFFAsRW2(originalBytes, modifiedEXIF, rawIPTC, rawXMP)
+	fileLen, err := resolveFileLen(r, prefix, wholeFile)
 	if err != nil {
 		return err
 	}
-	if _, err = w.Write(updated); err != nil {
+	header, blocks, err := relocateTIFFAsRW2(prefix, fileLen, modifiedEXIF, rawIPTC, rawXMP)
+	if err != nil {
+		return err
+	}
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -704,94 +918,11 @@ func byteOrder(b []byte) (binary.ByteOrder, error) {
 	return nil, fmt.Errorf("tiff: invalid byte order marker %q: %w", b[:2], ErrInvalidByteOrder)
 }
 
-// extractTagValues scans IFD0 for IPTC (0x83BB) and XMP (0x02BC) tags
-// and returns their raw byte values.
-func extractTagValues(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawIPTC, rawXMP []byte) { //nolint:gocyclo // IPTC trimming branch is inherent to TypeLong-vs-TypeUndefined handling; extracting a helper would reduce clarity
-	// Security audit FIX 5 (CWE-681/190): compare in uint64, not int, before
-	// converting ifd0Off to int. On a 32-bit platform (GOARCH=386/arm),
-	// int(ifd0Off) for ifd0Off >= 2^31 is negative, which would let a bad
-	// offset pass an int-typed bound check and then panic on data[ifd0Off:].
-	// Mirrors the #74 fix in format/detect.go's parseClassicTIFFIFD0 and the
-	// #45 fix in format/jpeg's parseIRBEntry.
-	if uint64(ifd0Off)+2 > uint64(len(data)) {
-		return nil, nil
-	}
-	count := int(order.Uint16(data[ifd0Off:]))
-	// ifd0Off ≤ uint64(len(data))-2, and len(data) is a valid int on this
-	// platform, so ifd0Off < len(data) fits int safely here.
-	pos := int(ifd0Off) + 2
-
-	for i := 0; i < count; i++ { //nolint:intrange,modernize // binary parser: loop variable is a byte-slice offset multiplier
-		e := pos + i*12
-		if e+12 > len(data) {
-			break
-		}
-		tag := order.Uint16(data[e:])
-		typ := order.Uint16(data[e+2:])
-		cnt := order.Uint32(data[e+4:])
-
-		var v []byte
-		sz := typeSize(typ)
-		if sz == 0 {
-			continue
-		}
-		total := uint64(sz) * uint64(cnt)
-		if total <= 4 {
-			v = data[e+8 : e+8+int(total)]
-		} else {
-			off := order.Uint32(data[e+8:])
-			// Guard against integer overflow: check before computing end.
-			if uint64(off) > uint64(len(data)) || total > uint64(len(data))-uint64(off) {
-				continue
-			}
-			v = data[uint64(off) : uint64(off)+total]
-		}
-
-		switch tag {
-		case 0x83BB: // IPTC-NAA
-			// ROBUST-16 (iptc.md §5): strip trailing 0x00 bytes ONLY for TypeLong
-			// (typ == 4) because TypeLong IPTC is padded to a 4-byte boundary by
-			// the writer (TIFF 6.0 §2: Count = number of uint32 elements). Those
-			// padding bytes are structural artefacts, not IPTC data.
-			//
-			// For TypeByte (1) and TypeUndefined (7) do NOT strip: a valid IPTC
-			// payload may legitimately end in 0x00 (e.g. a NUL-terminated text
-			// field value). bytes.TrimRight on those types silently corrupted
-			// payloads whose last dataset value ended with 0x00 (task #153).
-			//
-			// The IIM scanner naturally skips non-0x1C bytes (IIM §1.6), so any
-			// residual TypeLong padding bytes are harmless after trimming only
-			// the known structural zeros.
-			if len(v) > 0 {
-				if typ == 4 { // TypeLong: trim structural alignment padding
-					rawIPTC = trimIPTCLongPadding(v)
-				} else {
-					rawIPTC = v // TypeByte / TypeUndefined: no trim (ROBUST-16)
-				}
-				if len(rawIPTC) == 0 {
-					rawIPTC = nil
-				}
-			}
-		case 0x02BC: // XMP
-			rawXMP = v
-		}
-	}
-	return rawIPTC, rawXMP
-}
-
-// trimIPTCLongPadding trims trailing 0x00 alignment-padding bytes from an IPTC
-// payload stored as TypeLong. TypeLong pads the value to the next 4-byte
-// boundary; those trailing zeros are never valid IIM dataset prefixes (0x1C)
-// and are safe to remove. This function is ONLY called for TypeLong (typ == 4);
-// TypeByte and TypeUndefined payloads are not trimmed (ROBUST-16, task #153).
-func trimIPTCLongPadding(v []byte) []byte {
-	// Walk backwards from the end of v, stripping zero bytes until we hit a
-	// non-zero byte or exhaust the slice.
-	end := len(v)
-	for end > 0 && v[end-1] == 0x00 {
-		end--
-	}
-	return v[:end]
+// extractTagValues scans IFD0 for the IPTC (0x83BB) and XMP (0x02BC) tags
+// and returns their raw byte values, using the shared tiffscan scanner with
+// this package's type table (type 13 is the 4-byte TIFF Extensions IFD type).
+func extractTagValues(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawIPTC, rawXMP []byte) {
+	return tiffscan.ExtractTagValues(data, ifd0Off, order, true)
 }
 
 // typeSize returns the byte size of a single value for the given TIFF type.
@@ -1021,7 +1152,7 @@ func extractTagValuesBigTIFF(data []byte, ifd0Off uint64, order binary.ByteOrder
 			// as-is. Same logic as the classic-TIFF path. Task #153.
 			if len(v) > 0 {
 				if typ == 4 { // TypeLong: trim structural alignment padding
-					rawIPTC = trimIPTCLongPadding(v)
+					rawIPTC = tiffscan.TrimIPTCLongPadding(v)
 				} else {
 					rawIPTC = v // TypeByte / TypeUndefined: no trim (ROBUST-16)
 				}

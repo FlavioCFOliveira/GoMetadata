@@ -1,87 +1,99 @@
 # Memory Index
 
-- [Task #274 XMP numeric char-ref forbidden-Char fix](project_task274_xmp_charref_forbidden_chars.md) — isForbiddenXMLCharRef closes U+001E-via-&#x1e; corruption; write.go defense-in-depth assessed+rejected; raw-literal-byte vector left open by design
-- [Task #273 XMP round-trip container preservation (commit 39144d3)](project_task273_xmp_container_preservation.md) — containerTypes field fixes allowlist-scoped corruption class; arrayProperties table consolidation; Lang-Alt leak fixed as side effect
-- [WebFetch unreliable for large HTML reference tables](feedback_webfetch_html_tables_unreliable.md) — use curl+regex parse instead; AI summarization drops/garbles rows in big tag tables
-- [Task #272 Clean-GO final polish (commits 3b72a26, 8890788)](project_task272_clean_go_polish.md) — DC array allowlist +6 props; IPTC doc hygiene; V-15 named test (primitive+fixture)
-- [Width claims need a primitive-level test, not just fixtures](feedback_width_claims_need_primitive_test.md) — bounded real fixtures can't detect uint32-truncation regressions in "uint64 throughout" claims; verified via bug injection
-- [BigTIFF write support in exif.Encode (task #264, commit aa24232)](project_bigtiff_write.md) — serialiseBigTIFF dispatch; typeSizeBigTIFF #1 rule; word-alignment decision; ErrBigTIFFPointerOverflow/ErrBigTIFFEncodeSizeExceeded; #270 tracks container relocation separately
-- [BigTIFF standalone CONTAINER write / relocation (task #270)](project_task270_bigtiff_container_write.md) — full support in format/tiff; type-13 EXIF-3.0/TIFF-Extension collision bug fixed; follow-up gate closed by #271
-- [BigTIFF public-API write gate removed (task #271, commit 0ebf5d4)](project_task271_bigtiff_public_api_gate.md) — isBigTIFFSource + writeTIFF short-circuit removed; gometadata.Write now writes BigTIFF end-to-end; new TestWriteBigTIFFEndToEnd on real LE/BE fixtures
-- [geo: prefix + iptc.Encode overflow guard (2026-07-06)](project_geo_prefix_and_iptc_overflow_fixes.md) — NSgeo→"geo" in prefixMap; ErrDatasetValueTooLarge + test-overridable maxDatasetValueLen var (mirrors maxFileSize idiom)
-- [JPEG #262 maxFileSize cap via pooled countingReader](project_task262_jpeg_maxfilesize.md) — countingReader resets budget per-Seek; io.WriterTo fast-path bug found via benchmarking (376B→1017B/op), fixed with remainingFitsBudget guard
-- [GM-W1 TIFF write-path imageBlockBudget fix (task #261)](project_gmw1_imageblock_budget.md) — per-entry caps (65536 strips, 1024 SubIFDs) + fixed 262144 aggregate budget mirroring traverseBudget; ErrTooManyImageBlocks
-- [FuzzXxxInject write-path coverage (task #258)](project_task258_inject_fuzz_coverage.md) — 9 new targets jpeg/png/7-RAW; rawEXIF semantics diverge (TIFF-base vs container-payload vs ORF/RW2-nil); CR3 seeds reuse extended_size_test.go helpers
-- [EXIF-IFDCHAIN-01 traversal budget fix (task #255, round 2)](project_ifdchain01_traversal_budget.md) — traverseBudget entries/chain caps; round2: charge budget with PRE-dedup parsedCount not len(ifd.Entries), else identical-tag dedup-undercount gives ~4000x amplification
-- [CR3-EXTSIZE-01 extended-size box write fix (task #256)](project_cr3_extsize01_fix.md) — injectIntoMoov/rebuildMoovContent recompute headerLen via parseCR3BoxHeader instead of hardcoded +8/24; flatUUIDBoxRange size>=headerLen+16 guard added
-- [HEIF iloc off-by-one panic (task #243)](project_heif_iloc_offbyone_243.md) — parseIloc AND parseIlocFull guard widened 5→6; 5-byte iloc body panic fixed in both read+write paths
-- [exif sub-IFD lazy arena (task #198)](project_task198_arena.md) — lazy arena for sub-IFDs only; -25% allocs Camera; hint order: ExifIFD→InteropIFD→GPSIFD; cap-clamped safety
-- [format.Detect magic-byte pool (task #203)](project_task203_magic_pool.md) — magicPool *[36]byte; -11% allocs/op BenchmarkRead_JPEG; -8.4% B/op; TestDetect_ZeroAllocs gate
-
+- [Sprint 44 Batch G (2026-09-26, ALL 4 TASKS + 3 coordinator follow-ups CLOSED)](project_sprint44_batchG_291_294.md) — writeIFD double-buffer, extent.go snap removal, scanExtentPass map-reuse, CRITICAL BigTIFF off+size overflow fix (internal/boundscheck); cumulative bench vs ce1dc82
+- [Sprint 44 Batch H / task #297 (2026-09-26, CLOSED, last task of the loop)](project_sprint44_batchH_297.md) — pooled-LimitedReader StreamCopyN fast path (bytes.Buffer sink/bytes.Reader source), go:noinline+fixed-array alloc-free parseEXIF; all AC met, cumulative table refreshed
+- [Corpus-wide bench + CPU contention + pgrep -f rules](feedback_corpuswide_bench_and_cpu_contention.md) — data-dependent changes need a full corpus sweep; check for contention before trusting a surprising number; pgrep -f self-matches its own wait-loop, use pgrep -x or a captured PID
+- [Sprint 44 Batch F (2026-09-25/26)](project_sprint44_batchF_288_289.md) — png skip-ignored/copy-verbatim+CRC-preservation, tiff/raw metadata-prefix extent scanner; overflow panic + JIF-thumbnail bugs, THEN coordinator follow-up found DoS 268MB-alloc bug + real corpus-wide Read regression a 5-fixture harness missed entirely — fixed via fraction-based growth + 4MiB whole-read bypass; readAllCapped now iobuf.ReadAll (exact one-read)
+- [Sprint 44 Batch E (2026-09-25)](project_sprint44_batchE_285_287.md) — tiff/raw write clone removal+presizing, cr3 moov-only Extract + exif.AcceptRAWMagic, xmp name-terminator LUT; found large make(cap=N) can be SLOWER than natural append growth (ARW), + fidelity-improving 1-byte RW2 POC divergence
+- [HEIF-ILOC-DUPBOX-01 iterative security fix (2026-09-25)](feedback_heif_ilocdupbox_iterative_fix.md) — "sum all matching boxes" fix was incomplete; fuzzing found a 2nd trigger; shared traversal (nonIlocBoxesLen) closes the class
+- [Sprint 44 Batch D (2026-09-25)](project_sprint44_batchD_228_234.md) — heif [4]byte types + single-pass iloc/meta; png writeChunk/zlib pooling; webp/riff seek-free Extract
+- [PNG chunkType escape/pool pitfalls (#232)](feedback_png_chunktype_escape.md) — control-flow-insensitive escape via error-path %q; sync.Pool can be slower than a plain tiny escape
+- [govulncheck toolchain mismatch](feedback_govulncheck_toolchain_mismatch.md) — Homebrew binary vs older Go fails math/rand/v2; `go install .../govulncheck@latest` fixes it
+- [Sprint 44 Batch C (2026-09-25)](project_sprint44_batchC_219_227_237.md) — EncodedSize must replay writeIFD; ORF/RW2 InjectWithEXIF input caller-owned; zsh set-- no split
+- [Sprint 44 Batch B (2026-09-25)](project_sprint44_batchB_214_218_238_239.md) — probe-before-clone Inject; writeHeaderedBuf split; WithoutIPTC/XMP skip; extractGUIDFromMain bug found (unfixed)
+- [Sprint 44 Batch A (2026-09-25)](project_sprint44_batchA_210_213_235_236.md) — xmp compact value-arena, intern-at-storage; struct-in-list truncation REVERTED (backlog BUG #277)
+- [Sprint 44 perf #204-#209,#241](project_sprint44_perf_204_209_241.md) — noinline config split, ISO-8859-1 decode, IPTC pre-count, MWG-02 cache, WebP/RIFF alloc-free dispatch
+- [Task #274 XMP numeric char-ref fix](project_task274_xmp_charref_forbidden_chars.md) — isForbiddenXMLCharRef closes U+001E-via-&#x1e; corruption
+- [Task #273 XMP container preservation](project_task273_xmp_container_preservation.md) — containerTypes field fixes allowlist-scoped corruption
+- [WebFetch unreliable for large HTML tables](feedback_webfetch_html_tables_unreliable.md) — use curl+regex instead; AI summarization drops/garbles rows
+- [Task #272 Clean-GO polish](project_task272_clean_go_polish.md) — DC array allowlist +6 props; IPTC doc hygiene; V-15 named test
+- [Width claims need primitive-level test](feedback_width_claims_need_primitive_test.md) — bounded fixtures can't detect uint32-truncation; verify via bug injection
+- [BigTIFF write support (#264)](project_bigtiff_write.md) — serialiseBigTIFF dispatch; typeSizeBigTIFF; word-alignment; new error sentinels
+- [BigTIFF container write/relocation (#270)](project_task270_bigtiff_container_write.md) — full format/tiff support; type-13 EXIF-3.0/TIFF-Extension collision fixed
+- [BigTIFF public-API write gate removed (#271)](project_task271_bigtiff_public_api_gate.md) — gometadata.Write now writes BigTIFF end-to-end
+- [geo: prefix + iptc.Encode overflow guard](project_geo_prefix_and_iptc_overflow_fixes.md) — NSgeo→"geo"; ErrDatasetValueTooLarge + test-overridable maxDatasetValueLen
+- [JPEG #262 maxFileSize via pooled countingReader](project_task262_jpeg_maxfilesize.md) — per-Seek budget reset; io.WriterTo fast-path bug found via benchmarking
+- [GM-W1 TIFF imageBlockBudget fix (#261)](project_gmw1_imageblock_budget.md) — per-entry caps + fixed aggregate budget; ErrTooManyImageBlocks
+- [FuzzXxxInject write-path coverage (#258)](project_task258_inject_fuzz_coverage.md) — 9 targets jpeg/png/7-RAW; rawEXIF semantics diverge by format
+- [EXIF-IFDCHAIN-01 budget fix (#255 round 2)](project_ifdchain01_traversal_budget.md) — charge budget with PRE-dedup count or get ~4000x amplification
+- [CR3-EXTSIZE-01 fix (#256)](project_cr3_extsize01_fix.md) — recompute headerLen via parseCR3BoxHeader instead of hardcoded +8/24
+- [HEIF iloc off-by-one panic (#243)](project_heif_iloc_offbyone_243.md) — parseIloc/parseIlocFull guard widened 5→6
+- [exif sub-IFD lazy arena (#198)](project_task198_arena.md) — lazy arena for sub-IFDs only; -25% allocs Camera
+- [format.Detect magic-byte pool (#203)](project_task203_magic_pool.md) — magicPool *[36]byte; -11% allocs/op; TestDetect_ZeroAllocs gate
 - [Project identity](project_identity.md) — GoMetadata; module github.com/FlavioCFOliveira/GoMetadata; 25 packages; Go 1.26
-- [HEIF reliability fixes commit 1140781](project_heif_reliability_fixes_1140781.md) — #106/#133/#137/#169/#177 fixed: meta<12 panic, infe v0/v1 truncation, iloc method≠0, indexSize bounds, AVIF compat_brands
-- [os.IsNotExist vs errors.Is pattern](feedback_os_error_wrapping.md) — os.IsNotExist/IsPermission do not unwrap %w errors in Go 1.26; tests must use errors.Is with sentinel values
-- [Example output trailing spaces](feedback_example_output.md) — Go 1.26 does NOT strip trailing whitespace in example output; fmt.Println with empty string args fails // Output: comparisons
-- [intrange + modernize nolint for binary parsers](feedback_intrange_nolint.md) — Loops using i*12 offset need //nolint:intrange,modernize; min builtin shadowed in fuzz_test.go affects test builds
-- [sync.Pool buffer subslice race](feedback_pool_buffer_race.md) — Never Put a pool buffer before all reads of subslices derived from it are complete; exposed by t.Parallel() in detect.go and heif.go
-- [gosec G306/G302 + wrapcheck nolint placement](feedback_gosec_test_permissions.md) — nolint directive must be on the offending statement line; on assignment+return pattern only the return line counts
-- [XMP parser leniency — failure triggers](feedback_xmp_parser_lenient.md) — xmp.Parse only fails on ErrEmptyInput or ErrXMLNestingDepth (102 nested tags); generic malformed XML is silently ignored
-- [XMP property key encoding conventions](project_xmp_data_model.md) — "parent.field" for structs, "parent[N].field" for array-of-structs; serialiser must emit rdf:parseType="Resource"
-- [nolint cyclop vs gocyclo](feedback_nolint_cyclop_vs_gocyclo.md) — cyclop and gocyclo are separate linters; must list both when both fire or get "unused directive" error
-- [nolint:intrange on range N loops](feedback_nolint_intrange_range2.md) — `for i := range N` already satisfies intrange; adding nolint:intrange on such loops causes nolintlint to fire
-- [copyloopvar in Go 1.22+ — no tc:=tc needed](feedback_copyloopvar_go122.md) — loop variable copies inside for-range are redundant in Go 1.22+; the copyloopvar linter flags them
-- [gosec G115 inconsistent nolint in test helpers](feedback_gosec_g115_inconsistent.md) — G115 fires on uint32(len(x)) / uint32(intFromLen) but not uint32(const); add nolint only where gosec actually fires
-- [nolint placement: only the exact offending line](feedback_nolint_placement_on_line.md) — Adding nolint on a line that gosec doesn't fire on causes nolintlint "unused directive"; always verify the exact line first
-- [Encode must not mutate receiver — FINDING-002](feedback_encode_no_receiver_mutation.md) — Serialise-only functions must never append/write to the input struct; concurrent callers race on shared slice headers
-- [FuzzJPEGExtract must not assert XMP content](feedback_fuzz_xmp_content_assertion.md) — JPEG layer extracts rawXMP bytes verbatim; XMP structure assertions belong in the xmp package, not format/jpeg fuzz tests
-- [godox linter: avoid BUG/TODO/FIXME in comments AND string literals](feedback_godox_in_strings.md) — godox fires on BUG/TODO/FIXME even inside t.Errorf strings, not just comments; use "task #N regression:" phrasing instead
-- [ExampleWrite output size stale after auto-create policy](feedback_example_output_size.md) — SetCaption auto-creates IPTC+XMP for EXIF-only JPEG; re-measure and update `// Output:` hardcoded byte counts
-- [testing.AllocsPerRun panics in parallel tests](feedback_allocs_per_run_no_parallel.md) — Do not call t.Parallel() in tests using AllocsPerRun; add //nolint:paralleltest on the function line
-- [ISOBMFF recursive walker must use bounded slices](feedback_relocate_isobmff_recursion.md) — Pass data[content:boxEnd] to recursive calls, never the full parent buffer with a start offset; otherwise sibling boxes get processed multiple times
-- [TIFF two-pass encode pattern for copy-and-relocate](feedback_tiff_two_pass_encode.md) — Insert placeholder entries (TypeLong, Count=N, zero bytes), encode to get ifdEnd, update bytes in-place, encode again; Count must be N elements not N×4 bytes
-- [SubIFD relocation at raw-TIFF level](feedback_tiff_subifd_raw_level.md) — 0x014A SubIFD relocation must be raw-byte (not exif.Encode model); OOL array patching needs BOTH element values AND the valOrOff pointer updated
-- [TIFF/DNG write: EXIF must be nil for rawEXIF base to be the full file](feedback_tiff_exif_base_for_write.md) — Read() populates m.EXIF; set m.EXIF=nil before gometadata.Write to pass rawEXIF (full file) as relocateTIFF base when only IPTC/XMP changes
-- [DNG write re-enabled (bug #98 fixed, commit 9ff26ac)](project_dng_write_gated.md) — patchRawIFDOffsets now updates valOrOff for ALL OOL SubIFD entries; DNG write fully enabled
-- [CR2/NEF/ARW/ORF/RW2 write un-gated status (tasks #95,#102,#103,#104)](project_cr2_write_ungated.md) — all TIFF-based RAW formats now writable; isTIFFBased always false
-- [ORF and RW2 write un-gated (task #104, commit 2c6c9a0)](project_orf_rw2_write_ungated.md) — ORF magic-patch-and-restore; RW2 GUID insertion + offset rebasing + standalone RawDataOffset block
-- [ORF/RW2 write corruption fixed (task #104, commit e52dd8f)](project_orf_rw2_write_fixed.md) — OLYMP MakerNote file-absolute rebase + RW2 recursive IFD GUID shift for ALL sub-IFDs
-- [ARW write un-gated (task #103)](project_arw_write_ungated.md) — Sony MakerNote absolute-offset rebase + 3-level SR2SubIFD pointer rebase + PRNG-XOR decrypt/re-encrypt
-- [NEF write un-gated (task #102, commit 7d34aa5)](project_nef_write_ungated.md) — Nikon MakerNote blob extension + PreviewIFD relocation + SubIFD ThumbnailData clear fix; ImageDataHash IN==OUT
-- [IFD0 + SubIFD ThumbnailData must be cleared before block enumeration](feedback_subifd_thumbnail_data_clear.md) — IFD0 and SubIFDs with 0x0201/0x0202 get ThumbnailData set; clear IFD0.ThumbnailData in all relocation entry points or preview JPEG is dropped (ARW task #103 regression)
-- [IPTC/XMP TIFF tag types: TypeLong/TypeByte not TypeUndefined](feedback_iptc_xmp_tiff_types.md) — 0x83BB=TypeLong (padded+trimmed), 0x02BC=TypeByte; writeIFD pads OOL gap; extractTagValues TrimRight for IPTC
-- [TIFF 6.0 §2 word-alignment: writeIFD + ifdTotalSize cooperation](feedback_tiff_word_align.md) — ifdTotalSize always returns even; writeIFD inserts inter-value + trailing 0x00 pads; SubIFD raw blocks also aligned (task #99)
-- [BigTIFF read support (task #54, commits 803070e + 8f5752d + 941c3d1)](project_bigtiff_read.md) — exif.Parse BigTIFF-aware (941c3d1); parameterised IFD traversal; all EXIF tags decoded; 0 lint issues
-- [traverse() offset=0 bug — Canon/Sony/DJI/Samsung/Casio/Leica Type 0](feedback_traverse_offset_zero.md) — `for cur != 0` guard skips offset=0 IFDs; fix uses `first bool` flag; commit 2d3866e
-- [XMP conformance battery (task #154, commit 2d3866e)](project_xmp_conformance_battery.md) — 67 rules all passing; U+001E dual-use as delimiter; ROB-10 C0 filter; ROB-11/NS-03 uniquePrefixFor
-- [MWG-02 IPTC digest reconciliation (task #168)](project_mwg02_iptc_digest.md) — digest-aware precedence in Caption/Copyright/Creator/Keywords; ExtractFull surfaces iptcDigest; iptcTrustElevated() in metadata.go
-- [JPEG conformance battery (task #155)](project_jpeg_conformance_battery.md) — 26 §1 assertions; bug fixed in processAPP1Segment (first-wins for EXIF+XMP)
-- [TIFF+BigTIFF conformance battery (task #156)](project_tiff_conformance_battery.md) — 51 sub-tests; 0 violations; covers S-01..S-17, R-01..R-13, TIFF-01..03, ROBUST-16, corpus+BigTIFF files
-- [PNG conformance battery (task #157)](project_png_conformance_battery.md) — 40 top-level tests, 2 spec violations fixed: handleXMPChunk first-wins (PNG-04) + length boundary test
-- [WebP conformance battery (task #158)](project_webp_conformance_battery.md) — 44 top-level tests; 0 violations; covers §3(b)-(f) RIFF/VP8X/flags/padding/round-trip/robustness/corpus
-- [HEIF/AVIF conformance battery (tasks #159,#160)](project_heif_avif_conformance_battery.md) — 10 BMFF+36 HEIF+24 AVIF tests; CRITICAL infe OOB audit #106 confirmed safe; empty-file fix in heif.go; 0 lint issues; fuzzers clean
-- [CR3 conformance battery (task #163)](project_cr3_conformance_battery.md) — 53 new tests: BMFF-box/ftyp/uuid, CR3 CMT1-4/XMP/IPTC, write/round-trip/robustness; 0 violations; 0 lint issues
-- [DNG conformance battery (task #161)](project_dng_conformance_battery.md) — 37 tests: §7 detect/IFD0/metadata/BigTIFF/write/robust; 0 violations; 0 lint issues
-- [ARW conformance battery (task #165)](project_arw_conformance_battery.md) — ARW-detect/SR2Private/makernote/IFD0/write/robust/corpus; 0 violations; uses arw.Inject not InjectWithEXIFARW
-- [CR2 conformance battery (task #162)](project_cr2_conformance_battery.md) — CR marker insert+rebase fix in InjectWithEXIFCR2; IFD0 at 16 not 8; 0 violations; 0 lint issues
-- [CR2 write: insert-marker-and-shift pattern](feedback_cr2_marker_insertion_pattern.md) — never overwrite IFD0 with proprietary marker; insert at position 8 + rebase all offsets by delta
-- [xml prefix pre-population in rdfParser](feedback_xml_namespace_prepopulation.md) — pre-populate nsTable[0]={xml→XMLNamespaceURI} before parse loop; without it xml:lang resolves to "" and all rdf:Alt breaks
-- [scanAttrs infinite loop on bare '<'](feedback_scanattrs_infinite_loop.md) — scanAttrs exit condition must include '<' in addition to '>' and '/'; omitting it causes infinite loop on malformed tags
-- [canCarryIPTC truth table for TIFF-based RAW](feedback_iptc_cancarry_raw.md) — JPEG+TIFF+DNG+CR2+NEF+ARW+ORF+RW2=true; CR3/PNG/WebP/HEIF/AVIF/Unknown=false; gate: TestCanCarryIPTC_TIFFBasedRAW
-- [Metadata.mu mutex guard on all Set* methods](feedback_metadata_mutex_guard.md) — every Set* holds mu.Lock for full body incl. ensure*; Metadata must not be copied by value
-- [JPEG audit batch #122/#123/#134/#135/#151/#174 (commit eea3957)](project_jpeg_audit_batch_eea3957.md) — ExtXMP: validated reassembly, xmp.Parse merge, truncation surface, GUID uppercase, IRB pad clamp, 8BIM sibling preserve
-- [PNG audit #147/#181/#182 (commit 1f506be)](feedback_png_write_before_validate.md) — validate input sig before writing to w; XMP size guard; always emit IEND on EOF-exit
-- [WriteFile fsync+symlink+chown fixes #124/#125 (commit 278a38b)](project_write_fsync_symlink_124_125.md) — Sync before rename; EvalSymlinks for real target; chownFile uid/gid; _unix.go/_windows.go split pattern
-- [ORF/RW2 rawEXIF carries original magic — patch before exif.Parse](feedback_orf_rw2_rawexif_original_magic.md) — Extract returns IIRO/IIRS/RW2 magic; call patchRawEXIFForParse before exif.Parse; #117 fix commit 929ec97
-- [relocateTIFFFromParsed short-circuit skips post-encode steps](feedback_makernote_short_circuit.md) — Always apply post-encode mutations to BOTH the short-circuit path (no image blocks) AND the main path after step 9
-- [MakerNote OOL offset convention matrix (#127, commit 07c7355)](project_makernote_ool_rebasing.md) — OLYMP-type/Sony=TIFF-absolute (rebaseGenericMakerNote); Nikon Type-3/Panasonic/Canon=blob-relative (safe); all now CORRECT
-- [t.Skip policy — only corpus/OS/constant guards](feedback_tskip_policy.md) — synthetic fixture skips are always bugs; parser assertion skips are always bugs; docs/TESTING.md codifies the rules
-- [testdata/fixtures/ strategy and TestMain generator](project_testing_fixtures.md) — committed fixtures + testmain_test.go idempotent generator; CI passes without corpus
-- [xmp.GPS() W3C Geo namespace fallback (task #195)](project_xmp_geo_namespace.md) — NSgeo fallback for geo:lat/geo:long/geo:lon; was masked by t.Skip; now tested and enforced
-- [filterEntries pool design (task #240)](project_task240_entry_pool.md) — entrySlicePool in write.go; -71% B/op EXIFEncode; -11% TIFF relocate; filterEntriesInto replaces filterEntries; clear before Put pattern
-- [Deferred warning records (task #200)](project_task200_warn_defer.md) — parseWarn 20-byte struct replaces fmt.Sprintf; -55.8% ns/op MakerNoteDispatch; parseIFDEntry must return (IFDEntry,bool) only — any struct return causes STP zero-init regression
-- [parseIFDEntry ABI constraint — no struct returns](feedback_parseifdentry_abi_constraint.md) — returning struct from per-entry hot-loop function causes ARM64 compiler STP zero-init; measured +10-18% ns/op; keep return as (IFDEntry,bool) forever
-- [binary.AppendByteOrder eliminates [N]byte→append heap escapes](feedback_append_byteorder_escape.md) — use comma-ok assertion (task #247), NOT direct assertion (task #201 reverted for panic safety on custom ByteOrder)
-- [Zero-alloc MakerNote dispatch string([]byte) key (task #202)](project_task202_zero_alloc_dispatch.md) — makerNoteDispatch replaces makeEntry.String()+parseMakerNoteIFD; -1 alloc/op Camera; string([]byte) must appear directly as map index; buildCameraEXIF now has Canon MakerNote blob
-- [Security-audit batch #244-247 (2026-07-06)](project_security_audit_batch_244_247.md) — DETECT-SHORTREAD-01 io.ReadFull; EXIF-BO-001 ifd0ByteOrder empty-IFD0; PERF-201-LOW comma-ok; XMPCONC-01 doc-only
-- [Security-audit batch 2 (2026-07-06)](project_security_audit_batch_2_20260706.md) — HEIF iloc zero-field DoS (8200x); ORF/RW2 double-write clone fix; root readAllCapped; EXIF-BO-002 IFD.set bigEndian param; 32-bit offset truncation (5 sites)
-- [Lint after adding parser branches/tests](feedback_lint_iteration_after_new_code.md) — new nolint directives + gocyclo bumps common after hot-path edits; always run golangci-lint before declaring done
+- [HEIF reliability fixes (commit 1140781)](project_heif_reliability_fixes_1140781.md) — #106/#133/#137/#169/#177: meta<12 panic, infe truncation, iloc bounds
+- [os.IsNotExist vs errors.Is](feedback_os_error_wrapping.md) — os.IsNotExist/IsPermission don't unwrap %w; use errors.Is with sentinels
+- [Example output trailing spaces](feedback_example_output.md) — Go 1.26 does NOT strip trailing whitespace in example output
+- [intrange + modernize nolint for binary parsers](feedback_intrange_nolint.md) — i*12 offset loops need //nolint:intrange,modernize
+- [sync.Pool buffer subslice race](feedback_pool_buffer_race.md) — never Put before all subslice reads complete; exposed by t.Parallel()
+- [gosec G306/G302 + wrapcheck nolint placement](feedback_gosec_test_permissions.md) — nolint must be on the offending statement line
+- [XMP parser leniency triggers](feedback_xmp_parser_lenient.md) — xmp.Parse fails only on ErrEmptyInput/ErrXMLNestingDepth
+- [XMP property key encoding](project_xmp_data_model.md) — "parent.field" structs, "parent[N].field" array-of-structs; rdf:parseType="Resource"
+- [nolint cyclop vs gocyclo](feedback_nolint_cyclop_vs_gocyclo.md) — separate linters; list both when both fire
+- [nolint:intrange on range N loops](feedback_nolint_intrange_range2.md) — `for i := range N` already satisfies intrange
+- [copyloopvar in Go 1.22+](feedback_copyloopvar_go122.md) — tc:=tc copies inside for-range are redundant, linter flags them
+- [gosec G115 inconsistent nolint](feedback_gosec_g115_inconsistent.md) — fires on uint32(len(x)) but not uint32(const)
+- [nolint placement: exact offending line only](feedback_nolint_placement_on_line.md) — wrong line causes nolintlint "unused directive"
+- [Encode must not mutate receiver](feedback_encode_no_receiver_mutation.md) — serialise-only functions must never append/write to input struct
+- [FuzzJPEGExtract must not assert XMP content](feedback_fuzz_xmp_content_assertion.md) — XMP structure assertions belong in xmp package
+- [godox: avoid BUG/TODO/FIXME in strings too](feedback_godox_in_strings.md) — fires inside t.Errorf strings, not just comments
+- [ExampleWrite output size stale](feedback_example_output_size.md) — SetCaption auto-creates IPTC+XMP; re-measure hardcoded byte counts
+- [testing.AllocsPerRun panics in parallel](feedback_allocs_per_run_no_parallel.md) — no t.Parallel() with AllocsPerRun
+- [ISOBMFF recursive walker bounded slices](feedback_relocate_isobmff_recursion.md) — pass data[content:boxEnd], never full parent buffer+offset
+- [TIFF two-pass encode for copy-relocate](feedback_tiff_two_pass_encode.md) — placeholder entries, encode, patch, encode again
+- [SubIFD relocation at raw-TIFF level](feedback_tiff_subifd_raw_level.md) — 0x014A must be raw-byte; patch both element values AND valOrOff
+- [TIFF/DNG write: EXIF must be nil](feedback_tiff_exif_base_for_write.md) — set m.EXIF=nil before Write to pass full-file rawEXIF base
+- [DNG write re-enabled (#98 fix)](project_dng_write_gated.md) — patchRawIFDOffsets updates valOrOff for ALL OOL SubIFD entries
+- [CR2/NEF/ARW/ORF/RW2 write un-gated](project_cr2_write_ungated.md) — all TIFF-based RAW formats writable; isTIFFBased always false
+- [ORF/RW2 write un-gated (#104)](project_orf_rw2_write_ungated.md) — magic-patch-restore; GUID insertion + offset rebasing
+- [ORF/RW2 write corruption fixed (#104)](project_orf_rw2_write_fixed.md) — OLYMP file-absolute rebase; RW2 recursive IFD GUID shift
+- [ARW write un-gated (#103)](project_arw_write_ungated.md) — Sony MakerNote rebase + 3-level SR2SubIFD + PRNG-XOR
+- [NEF write un-gated (#102)](project_nef_write_ungated.md) — Nikon MakerNote extension + PreviewIFD relocation + ThumbnailData fix
+- [SubIFD ThumbnailData must be cleared first](feedback_subifd_thumbnail_data_clear.md) — clear before block enumeration or preview JPEG dropped
+- [IPTC/XMP TIFF tag types](feedback_iptc_xmp_tiff_types.md) — 0x83BB=TypeLong, 0x02BC=TypeByte; writeIFD pads OOL gap
+- [TIFF 6.0 word-alignment](feedback_tiff_word_align.md) — ifdTotalSize always even; writeIFD inserts inter-value+trailing pads
+- [BigTIFF read support (#54)](project_bigtiff_read.md) — exif.Parse BigTIFF-aware; parameterised IFD traversal
+- [traverse() offset=0 bug](feedback_traverse_offset_zero.md) — `for cur != 0` skips offset=0 IFDs; fix uses `first bool` flag
+- [XMP conformance battery (#154)](project_xmp_conformance_battery.md) — 67 rules passing; U+001E dual-use delimiter
+- [MWG-02 IPTC digest reconciliation (#168)](project_mwg02_iptc_digest.md) — digest-aware precedence in Caption/Copyright/Creator/Keywords
+- [JPEG conformance battery (#155)](project_jpeg_conformance_battery.md) — 26 assertions; processAPP1Segment first-wins bug fixed
+- [TIFF+BigTIFF conformance battery (#156)](project_tiff_conformance_battery.md) — 51 sub-tests; 0 violations
+- [PNG conformance battery (#157)](project_png_conformance_battery.md) — 40 tests; handleXMPChunk first-wins (PNG-04) fixed
+- [WebP conformance battery (#158)](project_webp_conformance_battery.md) — 44 tests; 0 violations
+- [HEIF/AVIF conformance battery (#159,#160)](project_heif_avif_conformance_battery.md) — 70 tests; infe OOB audit #106 confirmed safe
+- [CR3 conformance battery (#163)](project_cr3_conformance_battery.md) — 53 tests; 0 violations
+- [DNG conformance battery (#161)](project_dng_conformance_battery.md) — 37 tests; 0 violations
+- [ARW conformance battery (#165)](project_arw_conformance_battery.md) — uses arw.Inject not InjectWithEXIFARW
+- [CR2 conformance battery (#162)](project_cr2_conformance_battery.md) — CR marker insert+rebase fix; IFD0 at 16 not 8
+- [CR2 marker-insertion pattern](feedback_cr2_marker_insertion_pattern.md) — never overwrite IFD0; insert at 8 + rebase offsets by delta
+- [xml prefix pre-population in rdfParser](feedback_xml_namespace_prepopulation.md) — pre-populate nsTable[0] or xml:lang breaks rdf:Alt
+- [scanAttrs infinite loop on bare '<'](feedback_scanattrs_infinite_loop.md) — exit condition must include '<' too
+- [canCarryIPTC truth table for TIFF RAW](feedback_iptc_cancarry_raw.md) — JPEG+TIFF+DNG+CR2+NEF+ARW+ORF+RW2=true; CR3/PNG/WebP/HEIF/AVIF=false
+- [Metadata.mu mutex guard on Set*](feedback_metadata_mutex_guard.md) — every Set* holds mu.Lock full body; never copy Metadata by value
+- [JPEG audit batch eea3957](project_jpeg_audit_batch_eea3957.md) — ExtXMP reassembly, xmp.Parse merge, GUID uppercase, IRB pad clamp
+- [PNG audit #147/#181/#182](feedback_png_write_before_validate.md) — validate input sig before writing to w; always emit IEND on EOF
+- [WriteFile fsync+symlink+chown (#124/#125)](project_write_fsync_symlink_124_125.md) — Sync before rename; EvalSymlinks; _unix/_windows split
+- [ORF/RW2 rawEXIF original magic](feedback_orf_rw2_rawexif_original_magic.md) — call patchRawEXIFForParse before exif.Parse
+- [relocateTIFFFromParsed short-circuit gap](feedback_makernote_short_circuit.md) — apply post-encode mutations to BOTH short-circuit and main path
+- [MakerNote OOL offset convention matrix (#127)](project_makernote_ool_rebasing.md) — OLYMP/Sony=TIFF-absolute; Nikon3/Panasonic/Canon=blob-relative
+- [t.Skip policy](feedback_tskip_policy.md) — only corpus/OS/constant guards; synthetic fixture skips are always bugs
+- [testdata/fixtures strategy](project_testing_fixtures.md) — committed fixtures + idempotent generator; CI passes without corpus
+- [xmp.GPS() W3C Geo fallback (#195)](project_xmp_geo_namespace.md) — NSgeo fallback was masked by t.Skip; now tested
+- [filterEntries pool design (#240)](project_task240_entry_pool.md) — entrySlicePool; -71% B/op EXIFEncode; clear-before-Put
+- [Deferred warning records (#200)](project_task200_warn_defer.md) — parseWarn struct replaces fmt.Sprintf; -55.8% ns/op
+- [parseIFDEntry ABI constraint](feedback_parseifdentry_abi_constraint.md) — no struct returns from hot-loop function; ARM64 STP regression
+- [binary.AppendByteOrder escape fix](feedback_append_byteorder_escape.md) — comma-ok assertion (#247), not direct (#201 reverted)
+- [Zero-alloc MakerNote dispatch (#202)](project_task202_zero_alloc_dispatch.md) — string([]byte) must appear directly as map index
+- [Security-audit batch #244-247](project_security_audit_batch_244_247.md) — DETECT-SHORTREAD-01, EXIF-BO-001, PERF-201-LOW, XMPCONC-01
+- [Security-audit batch 2](project_security_audit_batch_2_20260706.md) — HEIF iloc zero-field DoS; ORF/RW2 double-write clone fix
+- [Lint after adding parser branches/tests](feedback_lint_iteration_after_new_code.md) — new nolint + gocyclo bumps common; run golangci-lint before done

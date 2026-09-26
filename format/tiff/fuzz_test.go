@@ -290,6 +290,17 @@ func FuzzTIFFInject(f *testing.F) {
 		f.Add(buf)
 	}
 
+	// Seed 10 (security audit, 2026-09-26): BigTIFF with StripOffsets =
+	// MaxUint64-1 / StripByteCounts = 10 (both LONG8, inline) — the exact PoC
+	// that panicked writeRelocated's wholeFile==true branch before fits
+	// (internal/boundscheck.Fits) replaced the raw `off+size > fileLen`
+	// comparison in extractParallelOffsetBlocks. See
+	// security_bigtiff_overflow_test.go for the dedicated regression test;
+	// this seed additionally gives the fuzzer a starting point to mutate
+	// from for this class of bug.
+	f.Add(buildBigTIFFStripOverflowPoC(binary.LittleEndian))
+	f.Add(buildBigTIFFStripOverflowPoC(binary.BigEndian))
+
 	// Fixed metadata payloads used for all fuzz iterations. The fuzzer varies
 	// the container bytes; the IPTC/XMP payloads are kept short and constant
 	// so that Inject reaches exif.Parse on every iteration.

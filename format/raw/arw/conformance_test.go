@@ -28,6 +28,7 @@ package arw
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"os"
 	"testing"
 
@@ -1757,10 +1758,15 @@ func BenchmarkARWConformanceExtract(b *testing.B) {
 	data := buildARWwithMakerNote([]ifdEntry{
 		{tag: 0x0001, typ: 3, count: 1, valOrOff: 0xFFFF},
 	}, stripData)
+	// #236: reader constructed once outside the loop and rewound via Seek per
+	// iteration so the artificial bytes.Reader allocation does not inflate
+	// the allocs/op reported for Extract itself.
+	r := bytes.NewReader(data)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		_, _, _, _ = Extract(bytes.NewReader(data))
+		_, _ = r.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(r)
 	}
 }
 
@@ -1773,11 +1779,17 @@ func BenchmarkARWConformanceInject(b *testing.B) {
 		{tag: 0x0001, typ: 3, count: 1, valOrOff: 0xFFFF},
 	}, stripData)
 	rawXMP := []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"/>`)
+	// #236: two readers hoisted outside the loop (Extract and Inject are each
+	// called once per iteration) and rewound via Seek per iteration.
+	rExtract := bytes.NewReader(data)
+	rInject := bytes.NewReader(data)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
 		var out bytes.Buffer
-		_, _, _, _ = Extract(bytes.NewReader(data))
-		_ = Inject(bytes.NewReader(data), &out, data, nil, rawXMP, true)
+		_, _ = rExtract.Seek(0, io.SeekStart)
+		_, _, _, _ = Extract(rExtract)
+		_, _ = rInject.Seek(0, io.SeekStart)
+		_ = Inject(rInject, &out, data, nil, rawXMP, true)
 	}
 }

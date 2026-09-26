@@ -283,7 +283,7 @@ func TestBMFFBoxSizeLargesize(t *testing.T) {
 	if sz != uint64(len(data)) {
 		t.Errorf("BMFF-box-size-largesize: sz=%d, want %d", sz, len(data))
 	}
-	if typ != "ftyp" {
+	if typ != fourCC("ftyp") {
 		t.Errorf("BMFF-box-size-largesize: typ=%q, want ftyp", typ)
 	}
 	if hdrLen != 16 {
@@ -309,7 +309,7 @@ func TestBMFFBoxSize0ToEOF(t *testing.T) {
 	if sz != 24 {
 		t.Errorf("BMFF-size0-to-EOF: sz=%d, want 24 (full slice length)", sz)
 	}
-	if typ != "mdat" {
+	if typ != fourCC("mdat") {
 		t.Errorf("BMFF-size0-to-EOF: typ=%q, want mdat", typ)
 	}
 	if hdrLen != 8 {
@@ -601,7 +601,7 @@ func TestHEIFExifItemIlocOffset(t *testing.T) {
 	data := buildConformanceHEIF("heic", exif, nil)
 
 	// Parse meta to find iloc and verify the offset.
-	metaContent, err := findBox(data, "meta", 0)
+	metaContent, err := findBox(data, boxTypeMeta, 0)
 	if err != nil || metaContent == nil {
 		t.Fatalf("HEIF-Exif-item-iloc-offset: meta box not found (err=%v)", err)
 	}
@@ -656,14 +656,14 @@ func TestHEIFMimeXMPContentTypeExact(t *testing.T) {
 	data := buildConformanceHEIF("heic", nil, xmp)
 
 	// Parse the infe box to verify the content_type bytes.
-	metaContent, err := findBox(data, "meta", 0)
+	metaContent, err := findBox(data, boxTypeMeta, 0)
 	if err != nil || metaContent == nil {
 		t.Fatalf("HEIF-mime-xmp-content-type-exact: meta box not found (err=%v)", err)
 	}
 	itemTypes := parseIinf(metaContent)
 	found := false
 	for _, typ := range itemTypes {
-		if typ == "mime" || typ == "rdf+xml" {
+		if typ == itemTypeMime {
 			found = true
 		}
 	}
@@ -727,7 +727,7 @@ func TestHEIFCdscRef(t *testing.T) {
 
 	// Insert iref box into meta box. Parse and re-assemble.
 	// Locate meta box in baseFile and append iref to its content.
-	ms, me, ok := flatBoxRangeInFile(baseFile, "meta")
+	ms, me, ok := flatBoxRangeInFile(baseFile, boxTypeMeta)
 	if !ok {
 		t.Skip("HEIF-cdsc-ref: could not locate meta box in synthetic file")
 	}
@@ -777,7 +777,7 @@ func TestHEIFWriteEXIFPrefixOnInject(t *testing.T) {
 
 	// The EXIF item payload in the output file must begin with 4 zero bytes (the prefix).
 	outData := out.Bytes()
-	metaContent, err := findBox(outData, "meta", 0)
+	metaContent, err := findBox(outData, boxTypeMeta, 0)
 	if err != nil || metaContent == nil {
 		t.Fatalf("HEIF-write-exif-prefix-on-inject: meta box not found in output (err=%v)", err)
 	}
@@ -820,7 +820,7 @@ func TestHEIFWriteIlocOffsetsPatched(t *testing.T) {
 	}
 	outData := out.Bytes()
 
-	metaContent, err := findBox(outData, "meta", 0)
+	metaContent, err := findBox(outData, boxTypeMeta, 0)
 	if err != nil || metaContent == nil {
 		t.Fatalf("HEIF-write-iloc-offsets-patched: meta box not found (err=%v)", err)
 	}
@@ -882,14 +882,14 @@ func TestHEIFWriteXMPContentTypePreserved(t *testing.T) {
 		t.Fatalf("HEIF-write-xmp-content-type-preserved: Inject failed: %v", err)
 	}
 
-	metaContent, err := findBox(out.Bytes(), "meta", 0)
+	metaContent, err := findBox(out.Bytes(), boxTypeMeta, 0)
 	if err != nil || metaContent == nil {
 		t.Fatalf("HEIF-write-xmp-content-type-preserved: meta box not found (err=%v)", err)
 	}
 	itemTypes := parseIinf(metaContent)
 	found := false
 	for _, typ := range itemTypes {
-		if typ == "mime" || typ == "rdf+xml" {
+		if typ == itemTypeMime {
 			found = true
 		}
 	}
@@ -1029,13 +1029,13 @@ func TestHEIFRobustIlocExtentPastEOF(t *testing.T) {
 
 	// Corrupt the iloc to point way past EOF.
 	// Find iloc in meta and corrupt the offset to math.MaxUint32.
-	metaStart, metaEnd, ok := flatBoxRangeInFile(data, "meta")
+	metaStart, metaEnd, ok := flatBoxRangeInFile(data, boxTypeMeta)
 	if !ok {
 		t.Skip("HEIF-robust-iloc-extent-past-EOF: meta box not found")
 	}
 	corrupt := bytes.Clone(data)
 	metaContent := corrupt[metaStart+8+4 : metaEnd]
-	ilocStart, _, ilocOK := flatBoxRangeInFile(metaContent, "iloc")
+	ilocStart, _, ilocOK := flatBoxRangeInFile(metaContent, boxTypeIloc)
 	if !ilocOK {
 		t.Skip("HEIF-robust-iloc-extent-past-EOF: iloc box not found")
 	}
@@ -1112,7 +1112,7 @@ func TestHEIFRobustDeepNesting(t *testing.T) {
 		innerData = bmffBox("moov", innerData)
 	}
 
-	_, err := findBox(innerData, "meta", 0)
+	_, err := findBox(innerData, boxTypeMeta, 0)
 	if err == nil {
 		t.Log("HEIF-robust-deep-nesting: findBox returned nil error on >32 nesting (may have gracefully stopped)")
 	} else if !strings.Contains(err.Error(), "nesting") {

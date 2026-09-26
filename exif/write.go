@@ -14,8 +14,8 @@ import (
 // Performance audit 2026-06-10, finding F41: filterEntries allocated
 // 652 MB (6.68% of alloc_space on the read/write profile) and was the
 // #2 flat allocator on the TIFF relocate profile (2450 MB = 9.35%).
-// It runs twice per Encode (once for IFD0, once for ExifIFD), and twice
-// more per relocate before task #220 eliminates the double-encode.
+// It runs twice per Encode, EncodeInto, or EncodedSize call (once for IFD0,
+// once for ExifIFD).
 //
 // The pool stores *[]IFDEntry (pointer to a slice header) so that the
 // backing array survives GC and is reused across Encode calls.  The
@@ -128,9 +128,15 @@ var maxBigTIFFEncodeSize uint64 = 4 << 30 //nolint:gochecknoglobals // test-over
 //     an inherent constraint: without knowing the type size we cannot locate or
 //     copy the pointed-to data. Callers that embed private data using unknown
 //     type codes must re-inject that data after calling Encode.
-func serialise(e *EXIF) ([]byte, error) {
+//
+// dst and sizeOnly select the mode shared by Encode, EncodeInto, and
+// EncodedSize. When sizeOnly is true nothing is written and only the exact
+// encoded length is returned, after the same validation Encode performs.
+// Otherwise the stream is written into dst's backing array from index 0 when
+// cap(dst) suffices, or into a newly allocated buffer of the exact size.
+func serialise(dst []byte, e *EXIF, sizeOnly bool) ([]byte, uint64, error) {
 	if e == nil {
-		return nil, ErrNilEXIF
+		return nil, 0, ErrNilEXIF
 	}
 
 	order := e.ByteOrder
@@ -152,10 +158,6 @@ func serialise(e *EXIF) ([]byte, error) {
 	// which fire on ALL return paths — including every BigTIFF error return
 	// below.  This single-ownership discipline ensures each pooled pointer is
 	// Put exactly once.
-	//
-	// Performance audit 2026-06-10, finding F41: filterEntries was the #2
-	// flat allocator on the TIFF relocate profile.  Pooling eliminates both
-	// per-Encode make([]IFDEntry) calls.
 	ifd0Ptr := getEntrySlice()
 	defer putEntrySlice(ifd0Ptr)
 	exifPtr := getEntrySlice()
@@ -175,14 +177,28 @@ func serialise(e *EXIF) ([]byte, error) {
 	// arithmetic to 64 bits throughout; see its doc comment for the full
 	// BigTIFF write path.
 	if e.BigTIFF {
-		return serialiseBigTIFF(e, order, ifd0Entries, exifIFDEntries)
+		return serialiseBigTIFF(dst, e, order, ifd0Entries, exifIFDEntries, sizeOnly)
 	}
 
 	exifStart, gpsStart, interopStart, ifd1Start := computeIFDOffsets(e, ifd0Entries, exifIFDEntries)
+	// The exact length (encodedLen, a full pass over every entry) is needed
+	// only to report the size or to decide whether dst can hold the output.
+	// A plain Encode (dst == nil) sizes its buffer from the layout already
+	// computed above: exact for every well-formed IFD, and append grows the
+	// buffer in the rare cases where writeIFD writes more.
+	var total uint64
+	if sizeOnly || dst != nil {
+		total = encodedLen(e, ifd0Entries, exifIFDEntries)
+	} else {
+		total = classicCapacityHint(e, ifd1Start)
+	}
+	if sizeOnly {
+		return nil, total, nil
+	}
 
 	patchPointers(ifd0Entries, exifIFDEntries, order, exifStart, gpsStart, interopStart)
 
-	out := writeTIFFHeader(e, order, ifd0Entries, exifIFDEntries)
+	out := writeTIFFHeader(dst, order, total)
 
 	// IFD0: next-IFD pointer points to IFD1 if present.
 	ifd0NextPtr := uint32(0)
@@ -193,13 +209,14 @@ func serialise(e *EXIF) ([]byte, error) {
 
 	out = writeSubIFDs(out, e, exifIFDEntries, order)
 
-	return out, nil
+	return out, uint64(len(out)), nil
 }
 
 // serialiseBigTIFF is the BigTIFF counterpart of the classic-TIFF tail of
 // serialise (from computeIFDOffsets onward). ifd0Entries and exifIFDEntries
 // have already been built by the shared, container-agnostic
-// buildIFD0Entries/buildExifIFDEntries helpers.
+// buildIFD0Entries/buildExifIFDEntries helpers. dst and sizeOnly have the
+// same meaning as in serialise.
 //
 // Sub-IFD pointer tags (ExifIFDPointer 0x8769, GPSIFDPointer 0x8825,
 // InteropIFDPointer 0xA005) and thumbnail pointer tags (JPEGInterchangeFormat
@@ -209,9 +226,11 @@ func serialise(e *EXIF) ([]byte, error) {
 // against math.MaxUint32 and returns ErrBigTIFFPointerOverflow rather than
 // truncating — see ErrBigTIFFPointerOverflow's doc comment. The thumbnail
 // pointer check happens inside writeSubIFDsBigTIFF, which is where the
-// thumbnail offset becomes known.
-func serialiseBigTIFF(e *EXIF, order binary.ByteOrder, ifd0Entries, exifIFDEntries []IFDEntry) ([]byte, error) { //nolint:gocyclo,cyclop // R-16 overflow guards for exifStart/gpsStart/interopStart are inherent, mirroring classic serialise's IFD dispatch chain
+// thumbnail offset becomes known, or in checkBigTIFFThumbnails when only the
+// size is requested.
+func serialiseBigTIFF(dst []byte, e *EXIF, order binary.ByteOrder, ifd0Entries, exifIFDEntries []IFDEntry, sizeOnly bool) ([]byte, uint64, error) { //nolint:gocyclo,cyclop // R-16 overflow guards for exifStart/gpsStart/interopStart are inherent, mirroring classic serialise's IFD dispatch chain
 	exifStart, gpsStart, interopStart, ifd1Start := computeIFDOffsetsBigTIFF(e, ifd0Entries, exifIFDEntries)
+	total := encodedLen(e, ifd0Entries, exifIFDEntries)
 
 	// R-16: only range-check the offsets that correspond to a pointer tag
 	// actually being written. computeIFDOffsetsBigTIFF always returns a
@@ -222,13 +241,23 @@ func serialiseBigTIFF(e *EXIF, order binary.ByteOrder, ifd0Entries, exifIFDEntri
 	// — an oversized IFD0 alone is instead caught by the aggregate size
 	// ceiling in writeTIFFHeaderBigTIFF (R-15).
 	if e.ExifIFD != nil && exifStart > math.MaxUint32 {
-		return nil, fmt.Errorf("%w: ExifIFDPointer target offset %d", ErrBigTIFFPointerOverflow, exifStart)
+		return nil, 0, fmt.Errorf("%w: ExifIFDPointer target offset %d", ErrBigTIFFPointerOverflow, exifStart)
 	}
 	if e.GPSIFD != nil && gpsStart > math.MaxUint32 {
-		return nil, fmt.Errorf("%w: GPSIFDPointer target offset %d", ErrBigTIFFPointerOverflow, gpsStart)
+		return nil, 0, fmt.Errorf("%w: GPSIFDPointer target offset %d", ErrBigTIFFPointerOverflow, gpsStart)
 	}
 	if e.InteropIFD != nil && interopStart > math.MaxUint32 {
-		return nil, fmt.Errorf("%w: InteropIFDPointer target offset %d", ErrBigTIFFPointerOverflow, interopStart)
+		return nil, 0, fmt.Errorf("%w: InteropIFDPointer target offset %d", ErrBigTIFFPointerOverflow, interopStart)
+	}
+
+	if sizeOnly {
+		if err := checkBigTIFFEncodeSize(total); err != nil {
+			return nil, 0, err
+		}
+		if err := checkBigTIFFThumbnails(e, ifd1Start); err != nil {
+			return nil, 0, err
+		}
+		return nil, total, nil
 	}
 
 	// patchPointers (unchanged, task #264 §NO CHANGE list) still writes a
@@ -237,9 +266,9 @@ func serialiseBigTIFF(e *EXIF, order binary.ByteOrder, ifd0Entries, exifIFDEntri
 	// because the three guards above already proved each offset fits in 32 bits.
 	patchPointers(ifd0Entries, exifIFDEntries, order, uint32(exifStart), uint32(gpsStart), uint32(interopStart)) //nolint:gosec // G115: truncation-free, guarded above
 
-	out, err := writeTIFFHeaderBigTIFF(e, order, ifd0Entries, exifIFDEntries)
+	out, err := writeTIFFHeaderBigTIFF(dst, order, total)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	// IFD0: next-IFD pointer points to IFD1 if present.
@@ -251,10 +280,32 @@ func serialiseBigTIFF(e *EXIF, order binary.ByteOrder, ifd0Entries, exifIFDEntri
 
 	out, err = writeSubIFDsBigTIFF(out, e, exifIFDEntries, order)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
-	return out, nil
+	return out, uint64(len(out)), nil
+}
+
+// checkBigTIFFThumbnails applies writeSubIFDsBigTIFF's R-16 thumbnail-pointer
+// range check without writing: it walks the IFD1 chain from ifd1Start using
+// the same layout arithmetic and returns ErrBigTIFFPointerOverflow when a
+// JPEGInterchangeFormat offset or length would not fit in 32 bits.
+func checkBigTIFFThumbnails(e *EXIF, ifd1Start uint64) error {
+	if e.IFD0 == nil {
+		return nil
+	}
+	pos := ifd1Start
+	for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
+		// patchThumbnailEntries never changes the entry count, types, or
+		// counts, so the unpatched entries have the same encoded size.
+		thumbOff := pos + ifdTotalSizeBigTIFF(ifd.Entries)
+		thumbLen := uint64(len(ifd.ThumbnailData))
+		if ifd.ThumbnailData != nil && (thumbOff > math.MaxUint32 || thumbLen > math.MaxUint32) {
+			return fmt.Errorf("%w: JPEGInterchangeFormat offset %d / length %d", ErrBigTIFFPointerOverflow, thumbOff, thumbLen)
+		}
+		pos = thumbOff + thumbLen
+	}
+	return nil
 }
 
 // appendUint16Order appends the 2-byte encoding of v (per order) to out and
@@ -312,48 +363,18 @@ func appendUint64Order(out []byte, order binary.ByteOrder, v uint64) []byte {
 	return append(out, b[:]...)
 }
 
-// writeTIFFHeader builds the initial output buffer containing the TIFF header
-// (TIFF §2): byte order mark, magic 0x002A, and the IFD0 offset. It also
-// pre-allocates capacity for the IFD0, ExifIFD, GPS IFD, InteropIFD, and IFD1
-// chain blocks (including any JPEG thumbnail data).
+// writeTIFFHeader returns the output buffer holding the 8-byte classic TIFF
+// header (TIFF §2): byte order mark, magic 0x002A, and the IFD0 offset. total
+// is the output capacity: the exact length from encodedLen, or
+// classicCapacityHint for a plain Encode (see outputBuffer).
 //
-// Performance (task #201): the previous implementation allocated a [8]byte
-// stack array and passed hdr[:] to append, which caused the compiler to move
-// hdr to the heap (escape analysis: "hdr escapes to heap in writeTIFFHeader").
-// The replacement builds the 8-byte header directly into the output slice via
-// binary.AppendByteOrder (Go 1.21+), eliminating the heap escape entirely.
-// The type assertion to binary.AppendByteOrder is performed once per call;
-// both binary.LittleEndian and binary.BigEndian implement the interface, and
-// order is always one of these two values (guaranteed by serialise which
-// defaults a nil order to binary.LittleEndian before calling writeTIFFHeader).
-func writeTIFFHeader(e *EXIF, order binary.ByteOrder, ifd0Entries, exifIFDEntries []IFDEntry) []byte {
+// appendUint16Order/appendUint32Order reach binary.AppendByteOrder's
+// allocation-free Append* methods via a comma-ok assertion (task #247), so
+// the header bytes are appended without a heap-escaping scratch array.
+func writeTIFFHeader(dst []byte, order binary.ByteOrder, total uint64) []byte {
 	const headerSize = uint32(8)
 
-	ifd0Size := ifdTotalSize(ifd0Entries)
-	exifSize := uint32(0)
-	if e.ExifIFD != nil {
-		exifSize = ifdTotalSize(exifIFDEntries)
-	}
-	gpsSize := uint32(0)
-	if e.GPSIFD != nil {
-		gpsSize = ifdTotalSize(e.GPSIFD.Entries)
-	}
-	interopSize := uint32(0)
-	if e.InteropIFD != nil {
-		interopSize = ifdTotalSize(e.InteropIFD.Entries)
-	}
-
-	// Include the IFD1 chain (thumbnail IFDs + embedded JPEG data) in the
-	// capacity estimate to avoid reallocation when appending thumbnail bytes.
-	ifd1ChainSize := uint32(0)
-	if e.IFD0 != nil {
-		for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
-			ifd1ChainSize += ifdTotalSize(ifd.Entries)
-			ifd1ChainSize += uint32(len(ifd.ThumbnailData)) //nolint:gosec // G115: thumbnail size bounded by parse-time validation
-		}
-	}
-
-	out := make([]byte, 0, headerSize+ifd0Size+exifSize+gpsSize+interopSize+ifd1ChainSize)
+	out := outputBuffer(dst, total)
 
 	// TIFF §2: byte order mark (II = little-endian, MM = big-endian).
 	if order == binary.LittleEndian {
@@ -362,15 +383,27 @@ func writeTIFFHeader(e *EXIF, order binary.ByteOrder, ifd0Entries, exifIFDEntrie
 		out = append(out, 'M', 'M')
 	}
 	// TIFF §2: magic number 0x002A, then IFD0 offset immediately after the header.
-	// task #201/#247: appendUint16Order/appendUint32Order reach
-	// binary.AppendByteOrder's allocation-free Append* methods via a
-	// comma-ok assertion (see their doc comment above) — zero-alloc and
-	// byte-identical to the former direct-assertion implementation for
-	// binary.LittleEndian/binary.BigEndian, and panic-free for any other
-	// binary.ByteOrder implementation.
 	out = appendUint16Order(out, order, 0x002A)
 	out = appendUint32Order(out, order, headerSize) // IFD0 starts right after the header
 	return out
+}
+
+// outputBuffer returns dst[:0] when cap(dst) >= total, otherwise a new empty
+// buffer with capacity total.
+func outputBuffer(dst []byte, total uint64) []byte {
+	if uint64(cap(dst)) >= total {
+		return dst[:0]
+	}
+	return make([]byte, 0, total)
+}
+
+// checkBigTIFFEncodeSize applies the R-15 sanity ceiling to the aggregate
+// encoded BigTIFF size; see maxBigTIFFEncodeSize's doc comment.
+func checkBigTIFFEncodeSize(total uint64) error {
+	if total > maxBigTIFFEncodeSize {
+		return fmt.Errorf("%w: %d bytes (ceiling %d)", ErrBigTIFFEncodeSizeExceeded, total, maxBigTIFFEncodeSize)
+	}
+	return nil
 }
 
 // writeTIFFHeaderBigTIFF is the BigTIFF counterpart of writeTIFFHeader.
@@ -384,50 +417,24 @@ func writeTIFFHeader(e *EXIF, order binary.ByteOrder, ifd0Entries, exifIFDEntrie
 //	bytes [8:16] first-IFD offset (uint64) — always 16 here (IFD0 immediately
 //	             follows the header, matching the classic layout's offset 8)
 //
-// Before allocating the output buffer, the aggregate encoded size (header +
-// IFD0 + ExifIFD + GPSIFD + InteropIFD + the IFD1 chain, all computed via
-// ifdTotalSizeBigTIFF — the #1 correctness rule, see its doc comment) is
-// checked against maxBigTIFFEncodeSize and rejected with
-// ErrBigTIFFEncodeSizeExceeded (R-15) rather than handed to make([]byte, 0, N)
-// unchecked; see maxBigTIFFEncodeSize's doc comment for the memory-exhaustion
-// rationale this guards against.
-func writeTIFFHeaderBigTIFF(e *EXIF, order binary.ByteOrder, ifd0Entries, exifIFDEntries []IFDEntry) ([]byte, error) {
+// Before allocating the output buffer, the aggregate encoded size total
+// (header + IFD0 + ExifIFD + GPSIFD + InteropIFD + the IFD1 chain, computed by
+// encodedLen with typeSizeBigTIFF — the #1 correctness rule, see
+// ifdTotalSizeBigTIFF's doc comment) is checked against maxBigTIFFEncodeSize and rejected
+// with ErrBigTIFFEncodeSizeExceeded (R-15) rather than handed to
+// make([]byte, 0, N) unchecked; see maxBigTIFFEncodeSize's doc comment for the
+// memory-exhaustion rationale this guards against.
+func writeTIFFHeaderBigTIFF(dst []byte, order binary.ByteOrder, total uint64) ([]byte, error) {
 	const headerSize = uint64(16)
 
-	ifd0Size := ifdTotalSizeBigTIFF(ifd0Entries)
-	exifSize := uint64(0)
-	if e.ExifIFD != nil {
-		exifSize = ifdTotalSizeBigTIFF(exifIFDEntries)
-	}
-	gpsSize := uint64(0)
-	if e.GPSIFD != nil {
-		gpsSize = ifdTotalSizeBigTIFF(e.GPSIFD.Entries)
-	}
-	interopSize := uint64(0)
-	if e.InteropIFD != nil {
-		interopSize = ifdTotalSizeBigTIFF(e.InteropIFD.Entries)
-	}
-
-	// Include the IFD1 chain (thumbnail IFDs + embedded JPEG data) in the
-	// capacity estimate, mirroring writeTIFFHeader's classic-path logic.
-	ifd1ChainSize := uint64(0)
-	if e.IFD0 != nil {
-		for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
-			ifd1ChainSize += ifdTotalSizeBigTIFF(ifd.Entries)
-			ifd1ChainSize += uint64(len(ifd.ThumbnailData))
-		}
-	}
-
-	total := headerSize + ifd0Size + exifSize + gpsSize + interopSize + ifd1ChainSize
-	// R-15: explicit, documented sanity ceiling — see maxBigTIFFEncodeSize's
-	// doc comment. Checked BEFORE the make() below so a pathological Count
+	// R-15: checked BEFORE the allocation below so a pathological Count
 	// value on a caller-constructed IFDEntry cannot trigger an unbounded
 	// allocation attempt.
-	if total > maxBigTIFFEncodeSize {
-		return nil, fmt.Errorf("%w: %d bytes (ceiling %d)", ErrBigTIFFEncodeSizeExceeded, total, maxBigTIFFEncodeSize)
+	if err := checkBigTIFFEncodeSize(total); err != nil {
+		return nil, err
 	}
 
-	out := make([]byte, 0, total)
+	out := outputBuffer(dst, total)
 
 	// BigTIFF spec §2: byte order mark (same encoding as classic TIFF).
 	if order == binary.LittleEndian {
@@ -693,7 +700,8 @@ func buildExifIFDEntries(e *EXIF, order binary.ByteOrder, interopPtrBuf *[4]byte
 }
 
 // computeIFDOffsets derives the byte offset at which each sub-IFD block begins
-// within the final encoded output.
+// within the final encoded output. The exact encoded length is computed by
+// encodedLen.
 //
 // Layout (TIFF §2 / EXIF §4.5.4):
 //
@@ -759,6 +767,56 @@ func computeIFDOffsetsBigTIFF(e *EXIF, ifd0Entries, exifIFDEntries []IFDEntry) (
 	ifd1Start = interopStart + interopSize
 
 	return exifStart, gpsStart, interopStart, ifd1Start
+}
+
+// classicCapacityHint returns the output capacity for a classic-TIFF Encode:
+// ifd1Start (header plus IFD0, ExifIFD, GPS and Interop blocks, from
+// computeIFDOffsets) plus the IFD1 chain and its thumbnail data.
+func classicCapacityHint(e *EXIF, ifd1Start uint32) uint64 {
+	total := uint64(ifd1Start)
+	if e.IFD0 != nil {
+		for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
+			total += uint64(ifdTotalSize(ifd.Entries)) + uint64(len(ifd.ThumbnailData))
+		}
+	}
+	return total
+}
+
+// encodedLen returns the exact number of bytes serialise writes for e: the
+// header followed by every IFD block as writeIFD (or writeIFDBigTIFF) lays it
+// out at its actual position in the output, plus the IFD1-chain thumbnail
+// data. EncodedSize reports it, and EncodeInto and BigTIFF encodes size
+// their buffer with it.
+//
+// The IFD positions are the running output length, not the offsets from
+// computeIFDOffsets: the two differ when a thumbnail of odd length precedes
+// an IFD or when a Value is longer than Count × type size, and serialise
+// writes each IFD at the running output length.
+func encodedLen(e *EXIF, ifd0Entries, exifIFDEntries []IFDEntry) uint64 {
+	pos := uint64(8)
+	if e.BigTIFF {
+		pos = 16
+	}
+	pos += ifdWrittenLen(ifd0Entries, pos, e.BigTIFF, false)
+	if e.ExifIFD != nil {
+		pos += ifdWrittenLen(exifIFDEntries, pos, e.BigTIFF, false)
+	}
+	if e.GPSIFD != nil {
+		pos += ifdWrittenLen(e.GPSIFD.Entries, pos, e.BigTIFF, false)
+	}
+	if e.InteropIFD != nil {
+		pos += ifdWrittenLen(e.InteropIFD.Entries, pos, e.BigTIFF, false)
+	}
+	if e.IFD0 == nil {
+		return pos
+	}
+	for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
+		// writeSubIFDs replaces the JPEGInterchangeFormat/Length values with
+		// 4-byte values (patchThumbnailEntries) when ThumbnailData is set.
+		pos += ifdWrittenLen(ifd.Entries, pos, e.BigTIFF, ifd.ThumbnailData != nil)
+		pos += uint64(len(ifd.ThumbnailData))
+	}
+	return pos
 }
 
 // patchPointers writes the now-known target offsets into the placeholder

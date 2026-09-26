@@ -128,7 +128,7 @@ func TestWordAlignedRelocateTIFF_CrampsTIF(t *testing.T) {
 	e.SetCopyright("(c) 2026 task-99-regression")
 
 	var out bytes.Buffer
-	if err := InjectWithEXIF(original, e, nil, nil, &out); err != nil {
+	if err := InjectWithEXIF(bytes.NewReader(original), original, true, e, nil, nil, &out); err != nil {
 		t.Fatalf("InjectWithEXIF: %v", err)
 	}
 	result := out.Bytes()
@@ -181,7 +181,7 @@ func TestWordAlignedRelocateTIFF_WithXMP(t *testing.T) {
 	iptc[0] = 0x1C
 
 	var out bytes.Buffer
-	if err := InjectWithEXIF(original, e, iptc, xmp, &out); err != nil {
+	if err := InjectWithEXIF(bytes.NewReader(original), original, true, e, iptc, xmp, &out); err != nil {
 		t.Fatalf("InjectWithEXIF: %v", err)
 	}
 	result := out.Bytes()

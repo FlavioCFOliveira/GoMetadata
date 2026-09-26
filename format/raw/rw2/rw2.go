@@ -6,65 +6,120 @@ package rw2
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 
 	"github.com/FlavioCFOliveira/GoMetadata/format/tiff"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/tiffscan"
 )
 
 // rw2Magic is the Panasonic RW2 byte order marker (bytes 0-3).
 var rw2Magic = []byte{0x49, 0x49, 0x55, 0x00} //nolint:gochecknoglobals // package-level constant bytes
 
 // Extract reads metadata from an RW2 file.
-// The TIFF parser operates on a working copy of the data with bytes [2:4]
-// patched to standard TIFF LE magic (0x2A 0x00) so that the shared IFD
-// traversal code can be reused. The returned rawEXIF contains the ORIGINAL
-// unmodified bytes so that RawEXIF() round-trips correctly and writing
-// rawEXIF back to disk produces a valid RW2 file.
 //
-// Note: RW2 uses non-standard IFD encoding; some entries may not decode correctly.
+// #293: rawEXIF is now the METADATA PREFIX of the file (see
+// tiff.ExtractWithMagic / format/tiff/extent.go's #289 scanner), not the
+// whole file — a corpus-wide measurement found RW2's metadata occupies
+// ~3.3% of a real file (including tag 0x002E), so reading only that prefix
+// is a substantial saving over the pre-#293 whole-file read. RawEXIF() docs
+// and CHANGELOG updated accordingly (matching #289's TIFF/CR2/NEF/ARW/DNG
+// contract). RW2 is structurally classic TIFF; only bytes[2:4] (the magic,
+// "U\x00"/0x0055) differ from TIFF 6.0 §2's 0x002A, so tiff.ExtractWithMagic
+// is used instead of tiff.Extract to accept it — mirroring
+// exif.AcceptRAWMagic's existing role on the write path (relocate_rw2.go).
+//
+// Note: RW2 uses non-standard IFD encoding; some entries may not decode
+// correctly.
+//
+// Two behaviours predating #293 are preserved exactly, mirroring orf.Extract
+// (see its own doc comment for the full rationale, shared verbatim here):
+//   - An oversized input is rejected with ErrFileTooLarge before its magic
+//     bytes are ever inspected.
+//   - A file too short to carry an IFD0 offset field (< 8 bytes total) is
+//     tolerated: Extract returns whatever bytes are present, verbatim, as
+//     rawEXIF, with a nil error and nil IPTC/XMP.
 func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if _, err = r.Seek(0, io.SeekStart); err != nil {
 		return nil, nil, nil, fmt.Errorf("rw2: seek: %w", err)
 	}
-	// #140 fix: cap the full-file read to maxFileSize+1 bytes so that an
-	// oversized or infinite streaming reader cannot trigger unbounded heap
-	// allocation. ErrFileTooLarge is returned when the limit is exceeded,
-	// before any parsing takes place.
-	data, err := io.ReadAll(io.LimitReader(r, maxFileSize+1))
+
+	// Handles the size cap and the too-short special case; see Extract's
+	// own doc comment above. handled reports whether Extract should return
+	// immediately with data as rawEXIF (nil IPTC/XMP, nil error).
+	data, handled, err := extractSizeCappedShortCircuit(r)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("rw2: read: %w", err)
+		return nil, nil, nil, err
 	}
-	if int64(len(data)) > maxFileSize {
-		return nil, nil, nil, fmt.Errorf("rw2: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
+	if handled {
+		return data, nil, nil, nil
 	}
-	if !bytes.HasPrefix(data, rw2Magic) {
+
+	var peek [4]byte
+	if _, err = io.ReadFull(r, peek[:]); err != nil {
 		return nil, nil, nil, ErrInvalidMagic
 	}
-
-	// #117 fix: rawEXIF must carry the ORIGINAL bytes so that callers can
-	// round-trip the file correctly (writing rawEXIF to disk produces a valid
-	// RW2, not a standard TIFF). Operate on a separate working copy for TIFF
-	// parsing so the original bytes are never mutated.
-	//
-	// RW2 magic: bytes [0:2]="II", bytes [2:4]=0x55 0x00 ("U\x00").
-	// TIFF parser requires bytes [2:4]=0x2A 0x00 (TIFF 6.0 §2, magic = 42).
-	tiffData := make([]byte, len(data))
-	copy(tiffData, data)
-	tiffData[2] = 0x2A
-	tiffData[3] = 0x00
-
-	rawEXIF = data // original bytes, magic preserved
-
-	if len(tiffData) < 8 {
-		return rawEXIF, nil, nil, nil
+	if !bytes.Equal(peek[:], rw2Magic) {
+		return nil, nil, nil, ErrInvalidMagic
+	}
+	acceptMagic := binary.LittleEndian.Uint16(peek[2:4])
+	if _, err = r.Seek(0, io.SeekStart); err != nil {
+		return nil, nil, nil, fmt.Errorf("rw2: seek: %w", err)
 	}
 
-	order := binary.LittleEndian
-	ifd0Off := order.Uint32(tiffData[4:])
-	// Best-effort extraction; RW2 IFD encoding may differ from standard TIFF.
-	rawIPTC, rawXMP = extractTIFFTags(tiffData, ifd0Off, order)
+	rawEXIF, rawIPTC, rawXMP, err = tiff.ExtractWithMagic(r, acceptMagic)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("rw2: %w", err)
+	}
 	return rawEXIF, rawIPTC, rawXMP, nil
+}
+
+// extractSizeCappedShortCircuit implements the two pre-#293 behaviours
+// Extract preserves verbatim (see Extract's own doc comment for the full
+// rationale): rejecting an oversized input before any magic inspection, and
+// tolerating a file too short to carry an IFD0 offset field. r's position
+// is at 0 on entry and is restored to 0 before returning in every case
+// where the caller (Extract) still needs to read from it (handled == false,
+// err == nil).
+//
+// Split out of Extract to keep its cyclomatic/nesting complexity within the
+// project's linter thresholds.
+//
+// Returns:
+//   - err != nil: Extract must return this error immediately.
+//   - handled: Extract must return data as rawEXIF (nil IPTC/XMP, nil error).
+//   - otherwise: r is positioned at 0; Extract continues its normal path.
+func extractSizeCappedShortCircuit(r io.ReadSeeker) (data []byte, handled bool, err error) {
+	end, szErr := r.Seek(0, io.SeekEnd)
+	if szErr != nil {
+		// r does not support Seek(SeekEnd) — fall through to
+		// tiff.ExtractWithMagic, whose own seekFileSize call will hit the
+		// same condition and take its non-seekable-reader fallback path
+		// (extractWholeFile), enforcing maxFileSize via readInput there
+		// instead. r's position is already wherever szErr's failed Seek left
+		// it; that is unchanged from before this call, per io.Seeker's
+		// contract for a failed Seek.
+		return nil, false, nil //nolint:nilerr // non-seekable-to-end reader: disable the size-cap/short-circuit fast path, not fatal
+	}
+	if end > maxFileSize {
+		return nil, false, fmt.Errorf("rw2: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
+	}
+	if _, serr := r.Seek(0, io.SeekStart); serr != nil {
+		return nil, false, fmt.Errorf("rw2: seek: %w", serr)
+	}
+	if end >= 8 {
+		return nil, false, nil
+	}
+	data, rerr := readInput(r)
+	if rerr != nil {
+		return nil, false, rerr
+	}
+	if !bytes.HasPrefix(data, rw2Magic) {
+		return nil, false, ErrInvalidMagic
+	}
+	return data, true, nil
 }
 
 // Inject writes a modified RW2 stream to w by delegating to the TIFF writer.
@@ -84,130 +139,62 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("rw2: seek: %w", err)
 	}
-	// #140 fix: cap the full-file read to maxFileSize+1 bytes so that an
-	// oversized or infinite streaming reader cannot trigger unbounded heap
-	// allocation. ErrFileTooLarge is returned when the limit is exceeded,
-	// before any parsing takes place.
-	data, err := io.ReadAll(io.LimitReader(r, maxFileSize+1))
+	data, err := readInput(r)
 	if err != nil {
-		return fmt.Errorf("rw2: read: %w", err)
-	}
-	if int64(len(data)) > maxFileSize {
-		return fmt.Errorf("rw2: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
+		return err
 	}
 	if !bytes.HasPrefix(data, rw2Magic) {
 		return ErrInvalidMagic
 	}
 
-	// Patch bytes 2-3 to standard TIFF LE magic so tiff.Inject works.
-	// data is exclusively owned (returned by io.ReadAll), so in-place mutation
-	// is safe and avoids a full-file copy (RAW files can be tens of MB).
+	// Patch bytes 2-3 to standard TIFF LE magic (TIFF 6.0 §2: 0x002A) so
+	// tiff.Inject accepts the stream. data is exclusively owned (returned by
+	// readInput), so in-place mutation is safe.
 	data[2] = 0x2A
 	data[3] = 0x00
 
-	// Buffer the TIFF output so we can restore the RW2 magic bytes.
-	var buf bytes.Buffer
-	if injectErr := tiff.Inject(bytes.NewReader(data), &buf, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments); injectErr != nil {
-		return fmt.Errorf("rw2: inject: %w", injectErr)
+	// mw restores the RW2 magic ("IIU\x00") on the first write; tiff.Inject
+	// writes its output with a single Write call, so no output buffering is
+	// needed.
+	mw := &iobuf.MagicWriter{W: w, Magic: [2]byte{rw2Magic[2], rw2Magic[3]}}
+	injectErr := tiff.Inject(bytes.NewReader(data), mw, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments)
+	if mw.Err != nil {
+		return fmt.Errorf("rw2: write: %w", mw.Err)
 	}
-
-	out := buf.Bytes()
-	if len(out) < 4 {
+	if errors.Is(injectErr, iobuf.ErrShortFirstWrite) {
 		return ErrOutputTooShort
 	}
-	// Restore RW2 magic ("IIU\x00") in the output.
-	out[2] = rw2Magic[2]
-	out[3] = rw2Magic[3]
-
-	_, err = w.Write(out)
-	if err != nil {
-		return fmt.Errorf("rw2: write: %w", err)
+	if injectErr != nil {
+		return fmt.Errorf("rw2: inject: %w", injectErr)
+	}
+	if !mw.Started() {
+		return ErrOutputTooShort
 	}
 	return nil
 }
 
-func extractTIFFTags(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawIPTC, rawXMP []byte) { //nolint:gocyclo // IPTC trimming branch is inherent to TypeLong-vs-TypeUndefined handling; extracting a helper would reduce clarity
-	// Security audit FIX 5 (CWE-681/190): compare in uint64, not int, before
-	// converting ifd0Off to int. On a 32-bit platform (GOARCH=386/arm),
-	// int(ifd0Off) for ifd0Off >= 2^31 is negative, which would let a bad
-	// offset pass an int-typed bound check and then panic on data[ifd0Off:].
-	// Mirrors the #74 fix in format/detect.go's parseClassicTIFFIFD0 and the
-	// #45 fix in format/jpeg's parseIRBEntry.
-	if uint64(ifd0Off)+2 > uint64(len(data)) {
-		return nil, nil
+// readInput reads the whole of r from its current position, capped at
+// maxFileSize bytes (#140): ErrFileTooLarge is returned before any parsing
+// takes place.
+func readInput(r io.ReadSeeker) ([]byte, error) {
+	data, err := iobuf.ReadAll(r, maxFileSize)
+	if err != nil {
+		if errors.Is(err, iobuf.ErrTooLarge) {
+			return nil, fmt.Errorf("rw2: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
+		}
+		return nil, fmt.Errorf("rw2: read: %w", err)
 	}
-	count := int(order.Uint16(data[ifd0Off:]))
-	// ifd0Off ≤ uint64(len(data))-2, and len(data) is a valid int on this
-	// platform, so ifd0Off < len(data) fits int safely here.
-	pos := int(ifd0Off) + 2
-	for i := 0; i < count; i++ { //nolint:intrange,modernize // binary parser: loop variable is a byte-slice offset multiplier
-		e := pos + i*12
-		if e+12 > len(data) {
-			break
-		}
-		tag := order.Uint16(data[e:])
-		typ := order.Uint16(data[e+2:])
-		cnt := order.Uint32(data[e+4:])
-		sz := typeSize(typ)
-		if sz == 0 {
-			continue
-		}
-		total := uint64(sz) * uint64(cnt)
-		var v []byte
-		if total <= 4 {
-			v = data[e+8 : e+8+int(total)]
-		} else {
-			off := order.Uint32(data[e+8:])
-			// Guard against integer overflow: check before computing end.
-			if uint64(off) > uint64(len(data)) || total > uint64(len(data))-uint64(off) {
-				continue
-			}
-			v = data[uint64(off) : uint64(off)+total]
-		}
-		switch tag {
-		case 0x83BB:
-			// ROBUST-16 (iptc.md §5): strip TypeLong structural padding only;
-			// TypeByte/Undefined payloads are returned as-is. See
-			// format/tiff.extractTagValues for the full rationale. Task #153.
-			if len(v) > 0 {
-				if typ == 4 { // TypeLong: trim structural alignment padding
-					rawIPTC = trimIPTCLongPadding(v)
-				} else {
-					rawIPTC = v // TypeByte / TypeUndefined: no trim (ROBUST-16)
-				}
-				if len(rawIPTC) == 0 {
-					rawIPTC = nil
-				}
-			}
-		case 0x02BC:
-			rawXMP = v
-		}
-	}
-	return rawIPTC, rawXMP
+	return data, nil
 }
 
-// trimIPTCLongPadding trims trailing 0x00 alignment bytes from a TypeLong IPTC
-// payload. TIFF 6.0 §2: TypeLong values are padded to the next 4-byte boundary;
-// those padding bytes are not IPTC data. ROBUST-16: only called for TypeLong;
-// TypeByte/Undefined payloads are never trimmed.
-func trimIPTCLongPadding(v []byte) []byte {
-	end := len(v)
-	for end > 0 && v[end-1] == 0x00 {
-		end--
-	}
-	return v[:end]
+// extractTIFFTags scans IFD0 for the IPTC (0x83BB) and XMP (0x02BC) tags and
+// returns their raw byte values, using the shared tiffscan scanner.
+func extractTIFFTags(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawIPTC, rawXMP []byte) {
+	return tiffscan.ExtractTagValues(data, ifd0Off, order, false)
 }
 
+// typeSize returns the byte size of a single value for the given classic TIFF
+// type code, or 0 for an unrecognised type (shared tiffscan table).
 func typeSize(t uint16) uint32 {
-	switch t {
-	case 1, 2, 6, 7:
-		return 1
-	case 3, 8:
-		return 2
-	case 4, 9, 11:
-		return 4
-	case 5, 10, 12:
-		return 8
-	}
-	return 0
+	return tiffscan.TypeSize(t, false)
 }

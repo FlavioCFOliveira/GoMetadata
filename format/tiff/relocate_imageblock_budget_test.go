@@ -497,8 +497,8 @@ func TestExtractParallelOffsetBlocksRejectsHugeCountFast(t *testing.T) {
 	ifd := &exif.IFD{}
 
 	blocks, err := extractParallelOffsetBlocks(
-		make([]byte, 16), ifd, exif.TagStripOffsets, offsetEntry, countEntry,
-		binary.LittleEndian, false, newImageBlockBudget(),
+		ifd, exif.TagStripOffsets, offsetEntry, countEntry,
+		binary.LittleEndian, false, newImageBlockBudget(), 16,
 	)
 	if err == nil {
 		t.Fatalf("extractParallelOffsetBlocks: expected error for Count=%d, got nil (blocks=%d)", hugeCount, len(blocks))
@@ -554,7 +554,7 @@ func TestEnumerateSubIFDsRejectsHugeCountFast(t *testing.T) {
 	buf := buildTinyTIFFWithHugeSubIFDCount(hugeCount)
 	e := &exif.EXIF{IFD0: &exif.IFD{}}
 
-	subIFDs, blocks, err := enumerateSubIFDs(buf, e, binary.LittleEndian, newImageBlockBudget())
+	subIFDs, blocks, err := enumerateSubIFDs(buf, e, binary.LittleEndian, newImageBlockBudget(), uint64(len(buf)))
 	if err == nil {
 		t.Fatalf("enumerateSubIFDs: expected error for Count=%d, got nil (subIFDs=%d blocks=%d)",
 			hugeCount, len(subIFDs), len(blocks))

@@ -66,7 +66,6 @@ package tiff
 //   - #127 audit finding: MakerNote OOL offset rebasing incomplete on write.
 
 import (
-	"bytes"
 	"encoding/binary"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
@@ -114,27 +113,30 @@ func isOlympTypeMakerNote(blob []byte) bool {
 // IFD) or an unknown format — both should be treated the same way for rebasing:
 // attempt to scan as a plain IFD and only rebase entries whose old_voo is within
 // the plausible TIFF range.
+// knownMakerNotePrefixes are the magic prefixes of MakerNote formats that are
+// not Sony plain-IFD MakerNotes. Never mutated.
+var knownMakerNotePrefixes = [...]string{ //nolint:gochecknoglobals // package-level constant table; never mutated
+	"Nikon\x00",
+	"OLYMP\x00",     // OLYMP-type (handled separately)
+	"OLYMPUS\x00",   // newer Olympus (blob-relative, safe)
+	"OM SYSTEM\x00", // OM SYSTEM cameras (blob-relative, safe)
+	"Panasonic\x00",
+	"FUJIFILM",
+	"PENTAX \x00",
+	"AOC\x00",
+	"QVC\x00",
+	"SIGMA\x00",
+	"FOVEON\x00",
+	"LEICA\x00",
+}
+
 func isSonyPlainIFDMakerNote(blob []byte, order binary.ByteOrder) bool {
 	if len(blob) < 2 {
 		return false
 	}
 	// Must NOT start with any of the known magic prefixes.
-	known := [][]byte{
-		[]byte("Nikon\x00"),
-		[]byte("OLYMP\x00"),     // OLYMP-type (handled separately)
-		[]byte("OLYMPUS\x00"),   // newer Olympus (blob-relative, safe)
-		[]byte("OM SYSTEM\x00"), // OM SYSTEM cameras (blob-relative, safe)
-		[]byte("Panasonic\x00"),
-		[]byte("FUJIFILM"),
-		[]byte("PENTAX \x00"),
-		[]byte("AOC\x00"),
-		[]byte("QVC\x00"),
-		[]byte("SIGMA\x00"),
-		[]byte("FOVEON\x00"),
-		[]byte("LEICA\x00"),
-	}
-	for _, prefix := range known {
-		if bytes.HasPrefix(blob, prefix) {
+	for _, prefix := range knownMakerNotePrefixes {
+		if len(blob) >= len(prefix) && string(blob[:len(prefix)]) == prefix {
 			return false
 		}
 	}

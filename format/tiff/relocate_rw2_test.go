@@ -56,7 +56,7 @@ func TestExtractRW2RawDataBlock_ValidEntry(t *testing.T) {
 	base := make([]byte, bufSize)
 	ifd0 := buildIFDWithEntry(rw2TagRawDataOffset, rawDataOff)
 
-	blk := extractRW2RawDataBlock(base, ifd0, order)
+	blk := extractRW2RawDataBlock(ifd0, order, uint64(len(base)))
 	if blk == nil {
 		t.Fatal("extractRW2RawDataBlock: expected non-nil block")
 	}
@@ -82,7 +82,7 @@ func TestExtractRW2RawDataBlock_ZeroOffset(t *testing.T) {
 	base := make([]byte, 100)
 	ifd0 := buildIFDWithEntry(rw2TagRawDataOffset, 0)
 
-	blk := extractRW2RawDataBlock(base, ifd0, order)
+	blk := extractRW2RawDataBlock(ifd0, order, uint64(len(base)))
 	if blk != nil {
 		t.Errorf("extractRW2RawDataBlock with offset=0: expected nil, got %+v", blk)
 	}
@@ -97,7 +97,7 @@ func TestExtractRW2RawDataBlock_OffsetBeyondBuffer(t *testing.T) {
 	base := make([]byte, 100)
 	ifd0 := buildIFDWithEntry(rw2TagRawDataOffset, 100) // offset == bufLen → at EOF
 
-	blk := extractRW2RawDataBlock(base, ifd0, order)
+	blk := extractRW2RawDataBlock(ifd0, order, uint64(len(base)))
 	if blk != nil {
 		t.Errorf("extractRW2RawDataBlock with offset=EOF: expected nil, got %+v", blk)
 	}
@@ -111,7 +111,7 @@ func TestExtractRW2RawDataBlock_NoEntry(t *testing.T) {
 	base := make([]byte, 100)
 	ifd0 := buildIFDWithEntry(exif.TagImageWidth, 1024) // different tag
 
-	blk := extractRW2RawDataBlock(base, ifd0, order)
+	blk := extractRW2RawDataBlock(ifd0, order, uint64(len(base)))
 	if blk != nil {
 		t.Errorf("extractRW2RawDataBlock with no 0x0118: expected nil, got %+v", blk)
 	}
@@ -135,7 +135,7 @@ func TestExtractRW2RawDataBlock_ShortValue(t *testing.T) {
 	}
 	ifd0.Entries = append(ifd0.Entries, entry)
 
-	blk := extractRW2RawDataBlock(base, ifd0, order)
+	blk := extractRW2RawDataBlock(ifd0, order, uint64(len(base)))
 	if blk != nil {
 		t.Errorf("extractRW2RawDataBlock with short value: expected nil, got %+v", blk)
 	}
@@ -412,28 +412,29 @@ func TestRW2Relocate_RoundTrip(t *testing.T) { //nolint:paralleltest // exif.Par
 	origGUID := make([]byte, rw2GUIDLen)
 	copy(origGUID, base[rw2GUIDOffset:rw2GUIDOffset+rw2GUIDLen])
 
-	out, err := relocateTIFFFromParsedRW2(base, nil, nil, nil)
+	header, blocks, err := relocateTIFFFromParsedRW2(base, uint64(len(base)), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("relocateTIFFFromParsedRW2: %v", err)
 	}
-	if len(out) < rw2GUIDOffset+rw2GUIDLen {
-		t.Fatalf("output too short: %d bytes", len(out))
+	if len(header) < rw2GUIDOffset+rw2GUIDLen {
+		t.Fatalf("output too short: %d bytes", len(header))
 	}
 
 	// RW2 magic must be restored.
-	if out[0] != rw2MagicBytes[0] || out[1] != rw2MagicBytes[1] ||
-		out[2] != rw2MagicBytes[2] || out[3] != rw2MagicBytes[3] {
+	if header[0] != rw2MagicBytes[0] || header[1] != rw2MagicBytes[1] ||
+		header[2] != rw2MagicBytes[2] || header[3] != rw2MagicBytes[3] {
 		t.Errorf("RW2 magic not restored: [0:4]=%02X%02X%02X%02X",
-			out[0], out[1], out[2], out[3])
+			header[0], header[1], header[2], header[3])
 	}
 
 	// GUID must be preserved at bytes [8:24].
-	gotGUID := out[rw2GUIDOffset : rw2GUIDOffset+rw2GUIDLen]
+	gotGUID := header[rw2GUIDOffset : rw2GUIDOffset+rw2GUIDLen]
 	if !bytes.Equal(gotGUID, origGUID) {
 		t.Errorf("GUID not preserved:\n  got  %v\n  want %v", gotGUID, origGUID)
 	}
 
-	// Raw sensor data must be present somewhere in the output.
+	// Raw sensor data must be present somewhere in the assembled output.
+	out := assembleRelocated(t, base, header, blocks)
 	if !bytes.Contains(out, rawData) {
 		t.Error("raw sensor data bytes not found in RW2 output")
 	}
@@ -449,7 +450,7 @@ func TestRW2Relocate_InvalidMagic(t *testing.T) {
 	binary.LittleEndian.PutUint16(buf[2:], 0x002A)
 	binary.LittleEndian.PutUint32(buf[4:], 8)
 
-	_, err := relocateTIFFFromParsedRW2(buf, nil, nil, nil)
+	_, _, err := relocateTIFFFromParsedRW2(buf, uint64(len(buf)), nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected ErrRW2InvalidMagic for standard TIFF magic, got nil")
 	}
@@ -467,7 +468,7 @@ func TestRW2Relocate_TooShort(t *testing.T) {
 	buf[2] = rw2MagicBytes[2]
 	buf[3] = rw2MagicBytes[3]
 
-	_, err := relocateTIFFFromParsedRW2(buf, nil, nil, nil)
+	_, _, err := relocateTIFFFromParsedRW2(buf, uint64(len(buf)), nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for too-short RW2 buffer, got nil")
 	}

@@ -20,6 +20,1577 @@ go test -bench=. -benchmem -benchtime=3s ./...
 
 ---
 
+## [feature/44 — sprint 44 perf tasks #204–#209, #241] — 2026-09-25
+
+Sprint 44 "Performance and Efficiency Laboratory": optimisation-only pass over
+the root package, `iptc/`, `internal/riff/`, and `format/webp/`, driven by
+`go build -gcflags=-m` escape analysis and `go test -bench -benchmem`
+evidence. All eight tasks below implemented in one merged pass. #206 was
+initially assessed against its literal wording ("unexported bool") and
+stopped as API-breaking; a follow-up, API-neutral approach (fixed-size
+storage embedded in `*IPTC`, preserving the exact `Records[0]` shape) was
+then specified and implemented — see its entry below. Go version go1.27.1,
+`cpu: Apple M4` (`sysctl -n machdep.cpu.brand_string`).
+
+### Optimisations applied
+
+- **#204 (root: zero-alloc `readConfig`/`writeConfig` for zero-option callers)**:
+  `Read`/`Write` now declare `cfg` as a stack value (`var cfg readConfig` /
+  `cfg := writeConfig{...}`) and only call a new, `//go:noinline`
+  `applyReadOptions`/`applyWriteOptions` helper when `len(opts) > 0`.
+  `ReadOption`/`WriteOption` are `func(*readConfig)`/`func(*writeConfig)`
+  invoked indirectly; passing `&cfg` to an indirect call forces the Go
+  compiler to heap-allocate the pointee unconditionally, even inside an `if`
+  guard that is never taken at runtime — escape analysis is not
+  value-sensitive to runtime branch conditions, only to the static call
+  graph. Confining that indirect call to a dedicated, non-inlined function
+  isolates the forced escape to the (rare) opts-supplied path; the zero-option
+  fast path's `cfg` now stays on the stack, confirmed with
+  `go build -gcflags="-m -m"` (no "moved to heap: cfg" for `Read`/`Write`
+  themselves; only inside `applyReadOptions`/`applyWriteOptions`). Option
+  function signatures are unchanged — no public API impact.
+- **#205 (iptc: `decodeString` hand-rolled ISO-8859-1 decode, no x/text)**:
+  Replaced the `golang.org/x/text/encoding/charmap` pooled decoder with a
+  direct byte-to-UTF-8 transcoder. ISO-8859-1's code point equals its byte
+  value for the full 0x00-0xFF range (verified byte-for-byte against
+  `charmap.ISO8859_1` for all 256 values plus a combined 256-byte buffer —
+  zero mismatches), so no decode table is needed: a single pre-pass counts
+  bytes ≥0x80, then either returns `string(b)` directly (pure ASCII, the
+  common case) or writes into a `strings.Builder` sized with `Grow` up front.
+  Collapses 2-3 allocations (decoder-internal + `dec.Bytes` result +
+  `string()` conversion) into 1 (ASCII) or a single `Builder`-backed
+  allocation (non-ASCII).
+- **#206 (iptc: `Records[0]` UTF-8 flag backed by fixed-size embedded storage,
+  API-neutral revision)**: the original "unexported bool" wording was rejected
+  (see the superseded note that used to live here) because `Records[0]` is
+  observable/mutable through the exported `Records [10][]Dataset` field, not
+  internal-only. The revised, implemented approach keeps `Records[0]`'s
+  observable shape byte-for-byte identical — exactly one
+  `Dataset{Record:0, DataSet:0, Value:[]byte{1}}` — while eliminating both of
+  its allocations: two new unexported fields, `utf8Slot [1]Dataset` and
+  `utf8Val [1]byte`, are embedded directly in `IPTC` (i.e. already part of
+  whatever single allocation produced `*IPTC`, e.g. `new(IPTC)` in `Parse`).
+  A new `(*IPTC).setUTF8Flag` method sets `utf8Val[0] = 1`, points
+  `utf8Slot[0].Value` at `utf8Val[:1:1]`, and assigns
+  `Records[0] = utf8Slot[:1:1]` — a cap-clamped (`[:1:1]`) slice, so an
+  external caller appending to the exported `Records[0]` always reallocates
+  into a fresh backing array instead of writing into `IPTC`'s own struct
+  memory (matching the growth behaviour of the former single-element
+  `append`-produced slice, whose backing array was already at `cap==len==1`).
+  Both former call sites (`Parse`, `setUTF8IfNeeded`) now call
+  `i.setUTF8Flag()`. No `Clone`/copy-by-value path for `*IPTC` exists anywhere
+  in this module (repository-wide grep); documented as an invariant any future
+  `Clone` must uphold (re-point the clone's `Records[0]` at the clone's own
+  arrays rather than copying the slice header verbatim). Verified with
+  `go build -gcflags="-m -m"`: zero "moved to heap" lines anywhere in the
+  `iptc` package after this change — `setUTF8Flag` introduces no new
+  allocation site at all, piggy-backing entirely on `*IPTC`'s existing
+  allocation. Three new regression tests
+  (`iptc/iptc_task206_test.go`) assert the unchanged `Records[0]` shape from
+  both entry points and that an external `append` to `Records[0]` does not
+  corrupt the internal flag (nor leak across two independent `*IPTC`
+  instances).
+- **#207 (iptc: `Encode` skip clone+sort when already sorted; encBufPool cap
+  guard)**: `Encode` now checks `slices.IsSortedFunc(datasets, compareDataSetNum)`
+  before cloning; when true (the common case — `*IPTC` from `Parse` stores
+  datasets in wire order, and `slices.IsSortedFunc` treats equal-key runs as
+  sorted, matching `SortStableFunc`'s own tie-stability) it iterates the
+  receiver's slice read-only, skipping `slices.Clone` + `slices.SortStableFunc`
+  entirely. When not sorted, the clone is still mandatory (Encode must not
+  mutate the receiver, FINDING-002). `putEncBuf` now discards buffers with
+  `Cap() > 65536` instead of returning them to `encBufPool`, mirroring
+  `internal/iobuf.Put`'s discard policy.
+- **#208 (root: cache MWG-02 IPTC-trust-elevation decision)**:
+  `computeIPTCTrustElevated` (renamed from the old per-call `iptcTrustElevated`
+  logic) is now called exactly once, at the end of `Read`, and cached in a new
+  unexported `Metadata.iptcTrustElev bool` field. `iptcTrustElevated()` is now
+  a plain field read. `rawIPTC`/`rawIPTCDigest` are set once at construction
+  and never reassigned afterward (verified by grep across the whole
+  repository), so the cached decision is valid for the object's entire
+  lifetime; a `digestMatchFn` test seam (`var digestMatchFn = iptc.DigestMatch`)
+  lets `TestIPTCTrustElevatedCachedSingleMD5` prove the underlying MD5 runs
+  exactly once regardless of how many times Copyright/Caption/Keywords/Creator
+  are called afterward.
+- **#209 (internal/riff + format/webp: allocation-free chunk dispatch)**:
+  `readWebPChunks`'s `switch chunk.FourCCString()` (an unconditional
+  `string(c.FourCC[:])` allocation per chunk — the compiler's allocation-free
+  `switch string(byteSlice)` special case does not apply because the
+  conversion happens inside the `FourCCString` method, not directly in the
+  switch expression) is replaced with a `switch chunk.FourCC` against two
+  `[4]byte` package-level constants. Added `riff.ReadChunkBuf(r, hdr *[8]byte)`
+  so a caller scanning many chunks (`readWebPChunks`) can hoist a single
+  `[8]byte` header buffer outside its loop instead of paying the
+  interface-call-forced heap allocation (`io.ReadFull(r, hdr[:])` through an
+  `io.Reader` — the Go compiler cannot prove an unknown concrete `Reader`
+  implementation does not retain the slice, so it always heap-allocates the
+  buffer regardless of where it is declared) once per chunk; `ReadChunk`
+  itself is now a thin wrapper over `ReadChunkBuf` with an internal
+  once-per-call buffer, unchanged for existing single-shot callers.
+- **#241 (iptc: `Parse` exact pre-sizing via allocation-free pre-count pass)**:
+  New `preCountDatasets(b []byte) [10]int` mirrors `Parse`'s own scanner and
+  `storeDataset`'s skip/recovery semantics byte-for-byte (standard/extended
+  length decoding, malformed-length recovery, the 1 MiB/`maxIPTCTotalBytes`/
+  `maxIPTCDatasets` DoS guards, the non-storing 1:90/1:00/2:00 skips) without
+  allocating or constructing `Dataset` structs. `Parse` uses its result to
+  `make([]Dataset, 0, counts[rec])` each non-empty record exactly once,
+  replacing the former hard-coded `make([]Dataset, 0, 12)` for record 2 only
+  (and no pre-sizing at all for the other eight records). Verified invariant
+  (fuzzed 14.8M+ execs, zero failures): `len(Records[rec]) <= counts[rec]`
+  always, and `cap(Records[rec]) == counts[rec]` whenever `counts[rec] > 0`
+  (i.e. no regrowth ever occurs).
+
+### Validation gate
+
+| Check | Result |
+|---|---|
+| `go build ./...` | clean |
+| `go vet ./...` | clean |
+| `go test ./...` | all packages pass (includes the `docs/conformance/` battery) |
+| `go test -race ./...` | all packages pass, no races |
+| `golangci-lint run ./...` | 0 issues in every touched package (`.`, `./iptc/...`, `./format/webp/...`, `./internal/riff/...`); 9 pre-existing issues remain in untouched files (`exif/`, `examples/`, `format/tiff/relocate_bigtiff.go`) — out of scope for this sprint |
+| `staticcheck ./...` | clean |
+| `govulncheck ./...` | 0 vulnerabilities reachable from this module's code; 1 informational finding (`GO-2026-5970`, `golang.org/x/text@v0.35.0`, not called by any code path) — pre-existing, unrelated to this sprint, not fixed |
+| `go test -fuzz=FuzzParseIPTC -fuzztime=30s ./iptc/...` | 14.8M execs, 0 failures (initial pass); 10.9M execs, 0 failures (#206 follow-up re-run) |
+| `go test -fuzz=FuzzRIFFRead -fuzztime=30s ./internal/riff/...` | 16.0M execs, 0 failures |
+| `go test -fuzz=FuzzWebPExtract -fuzztime=30s ./format/webp/...` | 8.2M execs, 0 failures |
+| `go test -fuzz=FuzzWebPInject -fuzztime=30s ./format/webp/...` | 2.5M execs, 0 failures |
+
+**#206 follow-up gate** (re-run for the touched package only, after the
+API-neutral revision): `go build ./...` clean · `go vet ./...` clean ·
+`go test ./...` all green · `go test -race ./iptc/... .` clean, no races ·
+`golangci-lint run ./iptc/... .` 0 issues · `staticcheck ./iptc/... .` clean ·
+`FuzzParseIPTC` 30s, 10.9M execs, 0 failures.
+
+### Benchmark results (`-count=10`, `benchstat before → after`)
+
+Before/after captured with `git stash` isolating the production-code and
+internal-API-dependent test changes from the pure benchmark additions, so
+both sides compile and measure the identical benchmark set. Two "after" runs
+were taken; the first overlapped with concurrent `golangci-lint`/`staticcheck`
+CPU load and showed implausibly high variance (±30-40%) on two `ns/op`
+figures (`Write_PNG`, `Write_JPEG`) — those two are reported from the second,
+isolated run (`after2`); every other row is consistent across both runs.
+
+**Root package** (`go test -bench . -benchmem -count 10 .`)
+
+| Benchmark | ns/op before → after | Δ ns/op | B/op before → after | Δ B/op | allocs/op before → after | Δ allocs |
+|---|---|---|---|---|---|---|
+| Read_JPEG | 246.5n → 243.6n | −1.16% (p=0.001) | 521 → 514 | −1.34% | 8 → 7 | **−12.50%** |
+| Read_JPEG_WithXMP | 1.480µ → 1.364µ | −7.84% (p=0.000) | 2.405Ki → 1.785Ki | −25.78% | 23 → 21 | −8.70% |
+| Read_PNG | 172.1n → 178.6n | +3.84% (p=0.000) | 288 → 280 | −2.78% | 10 → 9 | −10.00% |
+| MWGAccessors (new, #208) | 391.4n → 43.5n | **−88.87%** (p=0.000) | 0 → 0 | ~ | 0 → 0 | ~ |
+| ReadProgressiveJPEG | 214.9n → 214.7n | ~ (p=0.515) | 245 → 240 | −2.04% | 3 → 2 | −33.33% |
+| ReadCombinedMetadataJPEG | 12.72µ → 12.00µ | −5.68% (p=0.000) | 21.93Ki → 20.76Ki | −5.31% | 107 → 84 | −21.50% |
+| ReadFile | 2.299µ → 2.308µ | ~ (p=0.361) | 6.181Ki → 6.174Ki | −0.11% | 15 → 14 | −6.67% |
+| Write_JPEG | 401.6n → 380.3n | **−5.30%** (p=0.000) | 240 → 192 | **−20.00%** | 11 → 9 | **−18.18%** |
+| Write_PNG | 249.3n → 248.5n | ~ (p=0.128) | 136 → 136 | ~ | 15 → 14 | −6.67% |
+| ReadFile_Concurrent | 12.73µ → 12.11µ | −4.80% (p=0.003) | 692 → 686 | −0.87% | 10 → 9 | −10.00% |
+| **geomean** | 849.9n → 667.6n | **−21.45%** | — | −6.27% | — | −13.25% |
+
+`Write_JPEG`'s 2-allocation drop is #204 (1 alloc, `writeConfig`) + #207 (1
+alloc, `Encode`'s single-dataset record skips clone+sort). `MWGAccessors`
+(4 accessors × N, digest-mismatch scenario) is the direct #208 evidence:
+0 MD5 computations after the first `Read`, vs. 4 before per accessor round.
+
+**`format/webp`**
+
+| Benchmark | ns/op before → after | Δ ns/op | B/op before → after | Δ B/op | allocs/op before → after | Δ allocs |
+|---|---|---|---|---|---|---|
+| WebPExtract | 93.90n → 81.51n | **−13.20%** (p=0.000) | 104 → 80 | −23.08% | 7 → 4 | **−42.86%** |
+| WebPExtractWithXMP (new) | 125.1n → 113.3n | −9.43% (p=0.000) | 192 → 160 | −16.67% | 9 → 5 | **−44.44%** |
+| WebPInject | 220.3n → 222.7n | +1.11% (p=0.018) | 947 → 947 | ~ | 11 → 11 | ~ |
+
+`WebPInject` is untouched by #209 (it does not call `readWebPChunks`); the
++1.11% is noise (0.4 ns absolute, likely inlining-boundary jitter from the new
+`fourCCEXIF`/`fourCCXMP` package vars being resolved into the same
+compilation unit) and is not a regression in any code path Inject exercises.
+
+**`internal/riff`**
+
+| Benchmark | ns/op before → after | Δ ns/op | B/op | allocs/op |
+|---|---|---|---|---|
+| ReadChunk (single call) | 18.03n → 18.48n | +2.52% (p=0.000) | 56 → 56 (~) | 2 → 2 (~) |
+
+`ReadChunk` (the single-shot wrapper) is expected to be flat: it still
+allocates its own `[8]byte` internally on every call, identical to before —
+the win is only realised by callers that hoist a `ReadChunkBuf` buffer across
+a multi-chunk loop (`WebPExtract`, above). +2.52% here is one extra call
+frame (`ReadChunk` → `ReadChunkBuf`); noise-level in absolute terms (0.45 ns).
+
+**`iptc`**
+
+| Benchmark | ns/op before → after | Δ ns/op | B/op before → after | Δ B/op | allocs/op before → after | Δ allocs |
+|---|---|---|---|---|---|---|
+| DecodeString (non-ASCII) | 95.60n → 38.10n | **−60.15%** (p=0.000) | 96 → 16 | **−83.33%** | 3 → 1 | **−66.67%** |
+| DecodeStringASCII (new) | 85.80n → 22.48n | **−73.79%** (p=0.000) | 96 → 48 | −50.00% | 2 → 1 | −50.00% |
+| IPTCAccessorsNonASCII | 6.707n → 7.070n | +5.40% (p=0.000) | 0 → 0 | ~ | 0 → 0 | ~ |
+| IPTCParse | 240.3n → 101.3n | **−57.85%** (p=0.000) | 1024 → 416 | **−59.38%** | 6 → 4 | **−33.33%** |
+| IPTCEncode | 160.3n → 165.3n | +3.06% (p=0.000) | 304 → 304 | ~ | 2 → 2 | ~ |
+| IPTCAccessors | 17.52n → 17.07n | −2.51% (p=0.001) | 48 → 48 | ~ | 1 → 1 | ~ |
+| IPTCParseFewDatasets (new, 5 ds) | — → 154.1n | n/a | — → 512 | n/a | — → 7 | n/a |
+| IPTCParseManyDatasets (new, 20 ds) | — → 471.4n | n/a | — → 1.320Ki | n/a | — → 22 | n/a |
+| IPTCParseUTF8Declared (new) | — → 108.3n | n/a | — → 464 | n/a | — → 6 | n/a |
+| IPTCEncodeSorted (new) | — → 99.76n | n/a | — → 112 | n/a | — → 1 | n/a |
+| **geomean** (rows present on both sides) | 57.76n → 65.06n | −40.01% | — | −43.12% | — | −30.66% |
+
+`IPTCAccessorsNonASCII` (+5.40%, 0.36 ns absolute) and `IPTCEncode`/`IPTCEncode`
+(+3.06%, +1.78% across runs) are noise-level, sub-nanosecond deltas on
+already-tiny benchmarks; not regressions in any observable sense.
+
+### Task #241 net-win analysis (isolated before/after with #205 already applied)
+
+Because `#241`'s pre-count pass trades one extra O(len(b)) scan for one exact
+allocation, its own AC demanded isolated evidence, not just the combined
+number above (which is dominated by #205). Isolated comparison — `iptc.go`
+with `preCountDatasets` temporarily reverted to the old
+`i.Records[2] = make([]Dataset, 0, 12)` vs. the real #241 code, #205 applied
+identically on both sides:
+
+| Benchmark | ns/op without #241 → with #241 | Δ ns/op | B/op | Δ B/op | allocs/op | Δ allocs |
+|---|---|---|---|---|---|---|
+| IPTCParseFewDatasets (5 ds, < 12) | 144.9n → 152.5n | +5.21% (p=0.000) | 912 → 512 | **−43.86%** | 7 → 7 | ~ |
+| IPTCParseManyDatasets (20 ds, > 12) | 495.9n → 470.6n | **−5.10%** (p=0.000) | 2.195Ki → 1.320Ki | **−39.86%** | 23 → 22 | −4.35% |
+| IPTCParseUTF8Declared (3 ds, < 12) | 127.0n → 106.6n | **−16.06%** (p=0.000) | 1008 → 464 | **−53.97%** | 6 → 6 | ~ |
+| IPTCParse (2 ds, < 12) | 119.1n → 103.9n | ~ (p=0.117) | 960 → 416 | **−56.67%** | 4 → 4 | ~ |
+| **geomean** | 181.6n → 167.9n | **−7.53%** | — | **−49.06%** | — | −1.11% |
+
+Verdict: net win. The only regression is +5.21% ns/op on the 5-dataset case,
+fully compensated by a −43.86% B/op reduction in the same scenario (smaller
+`make` requests are cheaper for the allocator even without changing the
+allocation *count* — this is why 3 of 4 buckets improve in both ns/op and
+B/op despite none but the 20-dataset case avoiding an actual `growslice`
+regrowth). The scenario #241 specifically targets — a record exceeding the
+old fixed guess of 12 — improves on every axis (ns/op, B/op, allocs/op).
+Aggregate geomean across all four buckets is a net win on both time and
+space. Kept as implemented; no revert warranted.
+
+### Task #206 follow-up: isolated before/after (fixed-size embedded storage)
+
+`BenchmarkIPTCParseUTF8Declared` (a genuine 1:90 stream: one Record-1 UTF-8
+declaration + two Record-2 datasets), `-count=10`, `setUTF8Flag` temporarily
+reverted to the original `append(i.Records[0], Dataset{..., Value: []byte{1}})`
+implementation vs. the fixed-size-array implementation actually shipped,
+with #205/#207/#241 already applied identically on both sides:
+
+| Benchmark | ns/op before → after | Δ ns/op | B/op before → after | Δ B/op | allocs/op before → after | Δ allocs |
+|---|---|---|---|---|---|---|
+| IPTCParseUTF8Declared | 111.0n → 104.8n | **−5.58%** (p=0.000) | 464 → 480 | +3.45% | 6 → 4 | **−33.33% (exactly −2, AC met)** |
+
+The small B/op increase (+16 B, 464→480) is the expected trade-off of
+embedding `utf8Slot [1]Dataset` + `utf8Val [1]byte` directly in `IPTC`: the
+single `new(IPTC)` allocation in `Parse` grows by those fields' size, while
+the two allocations it replaces (the `[]byte{1}` literal and the
+`append`-triggered `growslice` for `Records[0]`) are removed entirely — same
+"pay once, unconditionally, to save an unconditional allocation elsewhere"
+trade-off as the exif sub-IFD arena (task #198, see below). AC ("Parse loses
+2 allocs/op") met exactly. `go build -gcflags="-m -m" ./iptc/...` shows zero
+"moved to heap" lines anywhere in the package after this change.
+
+### Batch A (tasks #236, #235, #210, #211, #212, #213) — 2026-09-25
+
+Go version go1.27.1, `cpu: Apple M4`.
+
+#### #236 — hoist `bytes.NewReader` out of benchmark loops
+
+| Benchmark | allocs/op before → after | B/op before → after |
+|---|---|---|
+| HEIFExtract | 15 → 14 | 629 → 580 |
+| PNGExtract | 16 → 15 | 232 → 184 |
+| WebPExtract | 4 → 3 | 80 → 32 |
+
+Same −1 allocs/op pattern in every other hoisted benchmark (WebPExtractWithXMP,
+PNGInject, WebPInject, TIFFExtract, BigTIFFExtract, CR2/NEF/DNG/ARWExtract,
+ARWConformanceExtract/Inject, NEFExtractMakerNote).
+
+#### #235 — new cr3/orf/rw2 Extract/Inject benchmarks (no prior baseline)
+
+| Benchmark | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| CR3Extract | 142.9n | 560 | 8 |
+| CR3Inject | 236.2n | 1028 | 16 |
+| ORFExtract | 84.97n | 552 | 3 |
+| ORFInject | 191.9n | 1344 | 9 |
+| RW2Extract | 80.53n | 552 | 3 |
+| RW2Inject | 189.7n | 1344 | 9 |
+
+#### #210/#211/#212/#213 — `xmp/` RDF-parse allocation reduction
+
+- #210: `Parse` interns each stored value/key into `XMP.arena` (`xmp/xmp.go`,
+  `xmp/rdf.go`); values/keys alias the arena instead of independent copies.
+- #211: `xmpAttr.loc` is `[]byte`, converted to `string` only at the point of storage.
+- #212: `closeProp` stores a single-item collection directly, skipping `strings.Join`.
+- #213: `storeProperty`/`Parse` pre-size the `Properties` maps to 8.
+
+| Benchmark | ns/op orig→final | B/op orig→final | allocs/op orig→final |
+|---|---|---|---|
+| RDFParse | 3.259µ→3.119µ (−4.31%) | 2.164Ki→2.407Ki (+11.24%) | 45→14 (−68.89%) |
+| XMPParse | 1.339µ→1.260µ (−5.94%) | 1.141Ki→1.203Ki (+5.48%) | 20→8 (−60.00%) |
+| Read_JPEG_WithXMP | 1.378µ→1.324µ | 1.801Ki→1.934Ki | 20→13 |
+| ReadCombinedMetadataJPEG | 12.20µ→11.67µ (−4.38%) | 20.78Ki→20.05Ki (−3.49%) | 83→41 (−50.60%) |
+| Read_JPEG (control, no XMP) | 235.2n→236.6n | 466→466 | 6→6 |
+
+Every other `xmp/` benchmark unaffected (≤2% noise, no allocation change).
+
+#### XMPARENA-NS-REINTERN-01 (fixed) — `recordContainerType`
+
+`ns`/`local` interned only the first time a given `(ns, local)` pair is
+recorded (mirrors `storeProperty`'s guard). Auditor repro: 794x → 0.87x.
+`TestXMPArenaNSReintern{ContainerSiblings,SimpleProperties,
+ShorthandAttributes,StructFields}` measure 0.04x–0.37x (bound 8x); guard
+removed → 71.91x (fails as expected).
+
+#### BUG #277 (backlog) — `buildStructInListKey` truncation reverted
+
+A 256-byte truncation cap on `propLocal`/`fieldLocal` closed a
+document-size amplification but corrupted (round-trip) or dropped
+(collision) legal long struct-in-list names — reverted, tracked as #277
+(unbounded again). `TestBug277StructInListLongFieldNameRoundTrip` (300-byte
+name) and `TestBug277StructInListPrefixCollisionNoDataLoss` (256-byte
+shared prefix) both round-trip Parse→Encode→Parse byte-exact; both fail if
+truncation is reintroduced. `FuzzParseXMP`'s arena-ratio invariant now
+computes the struct-in-list contribution in-test (`structInListKeyBytes`,
+via `parseStructKey`) and excludes it before checking the 8x bound.
+
+#### Gate (final)
+
+`go build`/`go vet` clean; `go test ./...` and `go test -race ./...` green;
+`golangci-lint run ./...` 0 new issues; `staticcheck ./...` clean;
+`govulncheck ./...` 0 reachable vulnerabilities; `FuzzParseXMP` 60s,
+~19.3M execs, 0 crashes, 0 invariant violations.
+
+### Batch B (tasks #214, #215, #216, #217, #218, #238, #239) — 2026-09-25
+
+Go version go1.27.1, `cpu: Apple M4`. `format/jpeg/` read/write hot path plus
+the root `extractByFormat` dispatch and a new zero-copy `Metadata` accessor.
+
+#### Benchstat — `format/jpeg` (-count=10)
+
+| Benchmark | ns/op before → after | B/op before → after | allocs/op before → after |
+|---|---|---|---|
+| JPEGExtract | 140.3n → 129.4n (**−7.80%**) | 120 → 104 (**−13.33%**) | 4 → 3 (**−25.00%**) |
+| JPEGInject | 327.6n → 289.9n (**−11.49%**) | 376 → 288 (**−23.40%**) | 10 → 4 (**−60.00%**) |
+| JPEGInject_NoAPP13 | 257.3n → 243.6n (**−5.33%**) | 304 → 288 (**−5.26%**) | 8 → 4 (**−50.00%**) |
+| JPEGExtract_Real | 2.120µ → 1.616µ (**−23.78%**) | 15.38Ki → 9.03Ki (**−41.30%**) | 8 → 6 (**−25.00%**) |
+
+All four `p=0.000, n=10`; geomean −12.40% ns/op, −22.05% B/op, −42.09% allocs/op.
+
+#### Benchstat — root package, `Read_JPEG_ExtendedXMP*` (-count=10)
+
+New synthetic fixture (`buildJPEGWithExtendedXMP`) carrying an attribute-form
+`xmpNote:HasExtendedXMP` GUID and a full, independently parseable extended
+XMP document, so the benchmark actually exercises
+`reassembleExtendedXMPByParse` (parse + merge + re-encode) rather than the
+byte-splice fallback.
+
+| Benchmark | ns/op before → after | B/op before → after | allocs/op before → after |
+|---|---|---|---|
+| Read_JPEG_ExtendedXMP (default) | 5.526µ → 5.605µ (+1.43%, noise) | 9.351Ki → 9.352Ki (~) | 40 → 40 (~) |
+| Read_JPEG_ExtendedXMP_WithoutXMP | 3805n → 682n (**−82.08%**) | 8.144Ki → 2.985Ki (**−63.34%**) | 33 → 16 (**−51.52%**) |
+
+Default read unchanged (p=0.043 but within noise band; B/op and allocs/op
+identical); `WithoutXMP` drops sharply once extraction itself skips the
+reassembly, on top of the pre-existing parse skip.
+
+#### #239 — `Metadata.RawSegments` (new accessor, no prior baseline)
+
+`BenchmarkRawSegments`, -count=10: **0.26 ns/op, 0 B/op, 0 allocs/op** (AC: 0 allocs/op — met).
+
+#### Per-task notes
+
+- **#214** (`readSegment` scratch growth via `iobuf.Get`): every segment over
+  4 KiB (EXIF/XMP/ICC) now grows from the large pool instead of a bare
+  `make`. Evidenced by `JPEGExtract_Real` (real corpus file with large
+  segments): −41.30% B/op, −25.00% allocs/op.
+- **#215** (drop the redundant IPTC clone): the single-payload IRB read path
+  returns the 0x0404 sub-slice of the already-cloned `app13Payloads[0]`
+  directly instead of cloning it again — 1 clone fewer per file, folded into
+  the `JPEGExtract`/`JPEGExtract_Real` deltas above. `RawIPTC()` round-trips
+  byte-identically; #174 sibling tests pass.
+- **#216** (stop fixed-array heap escapes in the write helpers): SOI now reads
+  into `Inject`'s pooled scratch; every segment header (new or pass-through)
+  is stamped directly into a pooled buffer and written in one `w.Write`
+  (`writeHeaderedBuf`/`writeSegmentCopy`); `writeMarker` uses a pooled 2-byte
+  buffer. `writeSegment` itself is untouched and remains covered by its
+  existing direct tests. Reflected in the `JPEGInject`/`JPEGInject_NoAPP13`
+  allocs/op drop above.
+- **#217** (skip the Inject pre-scan clone when nothing needs preserving):
+  `probeIRBHasSiblings` performs one zero-copy pass; the cloning
+  `extractOriginalIRB` pass now only runs when a sibling 8BIM resource is
+  actually present or `rawIPTC` is nil. `JPEGInject_NoAPP13` (no source
+  APP13 at all) shows the full effect; #174 sibling-preservation tests
+  (`jpeg_task77`, `jpeg_irb_task52`, 0x0425 survival) still pass.
+- **#218** (build the spliced IRB directly in the pooled output buffer):
+  `appendSplicedIRB`/`appendIRBBlock` append straight into the segment
+  buffer reserved by `writeIPTCSegment`/`writeIPTCSegmentRaw` instead of
+  allocating a single-use IRB buffer that is then copied again;
+  `spliceIPTCIntoIRB`/`buildIRB` remain as thin, freshly-allocating wrappers
+  for their existing direct unit tests. Folded into the `JPEGInject` allocs/op
+  drop (10 → 4) above; IRB output byte-identical.
+- **#238** (skip extraction of segments excluded by Without{EXIF,IPTC,XMP}):
+  `jpeg.ExtractFullSelective(r, wantIPTC, wantXMP)` (thin-wrapped by the
+  unchanged `ExtractFull`) skips the 0x0425 IPTC digest clone when IPTC is
+  unwanted and the extended-XMP reassembly when XMP is unwanted; `rawEXIF`
+  and `rawIPTC` are always extracted (required for unmodified-Write
+  pass-through). Scope note: only the JPEG path was changed — the other
+  format packages' `Extract` functions have no comparable reassembly cost to
+  skip. See the `Read_JPEG_ExtendedXMP*` table above for the effect.
+- **#239** (zero-copy read-only raw segment accessor, additive/user-authorised):
+  `Metadata.RawSegments()` returns `(rawEXIF, rawIPTC, rawXMP)` aliasing `m`'s
+  own storage with a documented must-not-mutate contract; existing
+  `RawEXIF`/`RawIPTC`/`RawXMP` and the #139 mutation-safety tests unchanged.
+
+#### Gate
+
+`go build`/`go vet` clean; `go test ./...` and `go test -race ./...` green
+(all packages); `golangci-lint run ./...` 0 new issues (6 pre-existing
+issues remain, all in files untouched by this batch); `staticcheck ./...`
+clean; `govulncheck ./...` could not run in this environment (govulncheck
+binary built against an older Go source-processing API than the installed
+go1.27.1 toolchain — pre-existing environment mismatch, unrelated to this
+batch); `FuzzJPEGExtract` and `FuzzJPEGInject` both ran 60s clean (0
+crashes).
+
+### Batch C (tasks #219–#227, #237) — 2026-09-25
+
+Go version go1.27.1, `cpu: Apple M4`, `-count=10` (EXIFEncode after: `-count=20`), all
+changes `p=0.000` unless marked `~` or noted. `format/tiff` relocate and extract, `format/raw/{orf,rw2,cr3}`,
+`exif` encode. Relocate and inject output is byte-identical (SHA-256 of the
+`Read`+`SetCopyright`+`Write` output unchanged for all 578 TIFF/DNG/RAW
+corpus and fixture files).
+
+| Benchmark | ns/op before → after | B/op before → after | allocs/op before → after |
+|---|---|---|---|
+| RelocateSingleStrip | 1.505µ → 1.155µ (**−23.23%**) | 7.271Ki → 6.198Ki (**−14.76%**) | 23 → 14 (**−39.13%**) |
+| RelocateMultiStrip | 1.791µ → 1.202µ (**−32.87%**) | 10.022Ki → 6.237Ki (**−37.77%**) | 29 → 16 (**−44.83%**) |
+| RelocateTiled | 1.854µ → 1.257µ (**−32.18%**) | 10.179Ki → 6.362Ki (**−37.49%**) | 29 → 16 (**−44.83%**) |
+| RelocateDNGLike | 2.358µ → 1.849µ (**−21.61%**) | 13.14Ki → 11.01Ki (**−16.22%**) | 38 → 24 (**−36.84%**) |
+| RelocateMakerNote | 657.9n → 655.5n (~) | 1.473Ki → 1.473Ki (~) | 14 → 14 (~) |
+| TIFFExtract | 87.27n → 42.32n (**−51.51%**) | 536 → 112 (**−79.10%**) | 2 → 1 (**−50.00%**) |
+| TIFFExtractRealFile (36.6 MiB) | 2.794m → 1.286m (**−53.98%**) | 78.24Mi → 36.57Mi (**−53.26%**) | 34 → 1 (**−97.06%**) |
+| ORFExtract | 71.94n → 19.94n (**−72.28%**) | 552 → 16 (**−97.10%**) | 3 → 1 (**−66.67%**) |
+| ORFExtractRealFile (23.1 MiB) | 2651.6µ → 828.4µ (**−68.76%**) | 74.08Mi → 23.14Mi (**−68.76%**) | 34 → 1 (**−97.06%**) |
+| ORFInject | 172.90n → 79.09n (**−54.25%**) | 1344 → 240 (**−82.14%**) | 9 → 6 (**−33.33%**) |
+| RW2Extract | 72.90n → 21.10n (**−71.05%**) | 552 → 16 (**−97.10%**) | 3 → 1 (**−66.67%**) |
+| RW2ExtractRealFile (18.8 MiB) | 2031.6µ → 675.6µ (**−66.75%**) | 65.42Mi → 18.81Mi (**−71.24%**) | 34 → 1 (**−97.06%**) |
+| RW2Inject | 173.00n → 78.58n (**−54.58%**) | 1344 → 240 (**−82.14%**) | 9 → 6 (**−33.33%**) |
+| CR3Extract | 132.05n → 87.83n (**−33.49%**) | 560 → 536 (**−4.29%**) | 8 → 2 (**−75.00%**) |
+| CR3Inject | 223.6n → 177.4n (**−20.67%**) | 1028 → 1000 (**−2.72%**) | 16 → 9 (**−43.75%**) |
+| EXIFEncode | 119.5n → 118.0n (**−1.17%**, p=0.001) | 80 → 80 (~) | 2 → 2 (~) |
+| EXIFEncode_Camera | 1.076µ → 1.016µ (**−5.49%**) | 1.580Ki → 1.580Ki (~) | 14 → 14 (~) |
+| EXIFEncode_BigTIFF | 959.6n → 953.1n (**−0.68%**) | 7.568Ki → 7.568Ki (~) | 6 → 6 (~) |
+
+#### Per-task notes
+
+- **#219**: `relocateTIFFFromParsed` allocates `finalTIFF` once at its exact length (`relocatedLen`) and checks `len(finalTIFF) == finalLen`; no regrowth.
+- **#220**: additive `exif.EncodedSize` and `exif.EncodeInto` share one exact length computation (`encodedLen`/`ifdWrittenLen`); relocate uses `EncodedSize` instead of the skeleton encode. A plain `Encode` sizes its buffer from the layout offsets and skips the exact pass. `EncodedSize(e) == len(Encode(e))` is tested on every corpus file.
+- **#221**: `extractParallelOffsetBlocks` backs all blocks of a source with one `[]imageBlock`; aggregation reuses single-source slices (`appendBlocks`).
+- **#222**: `insertPlaceholders` returns a `[]placeholderGroup` with one value buffer per group, scanned linearly, instead of a map of boxed pairs. SubIFD block lookup (`blockIndex`) is O(1) with no scan fallback, relying on the per-tag contiguity of enumerated blocks.
+- **#223**: linear scans replace the `subIFDSet`, `toRemove`, `visited` (≤16 offsets), `blocksByIFD` and `blkMap` maps; `subIFDInfo` is backed by one slice per level; the MakerNote prefix table is package-level. `RelocateMakerNote` is unchanged: the compiler already kept the prefix literal on the stack.
+- **#224**: `iobuf.ReadAll` reads a seekable input with one exact-size allocation and rejects oversized input before allocating; used by `tiff`, `orf`, and `rw2` `Extract`/`Inject`.
+- **#225**: `orf.Extract`/`rw2.Extract` scan the original bytes; the full-file copy is gone.
+- **#226**: `orf.Inject`/`rw2.Inject` stream through `iobuf.MagicWriter` instead of buffering the output. `relocateTIFFAsORF`/`relocateTIFFAsRW2` keep their copy: their input is caller-owned (exported `InjectWithEXIFORF`/`InjectWithEXIFRW2`).
+- **#227**: `parseCR3BoxHeader` returns a `[4]byte` box type.
+- **#237**: `internal/tiffscan.ExtractTagValues` is the single IFD0 IPTC/XMP scanner for `tiff`, `orf`, and `rw2`.
+
+### Batch D (tasks #228–#234) — 2026-09-25
+
+Go version go1.27.1, `cpu: Apple M4`, `-count=10 -benchtime=2s`, all changes `p=0.000`
+unless noted. `format/heif`, `format/png`, `format/webp`, `internal/riff`. Golden
+SHA-256 identical: `gometadata.Read` + `SetCopyright` + `gometadata.Write` over every
+HEIF/PNG/WebP corpus and fixture file (992 files: 747 successful writes with matching
+hashes, 245 with matching error outcomes) is byte-for-byte unchanged before vs after.
+
+| Benchmark | ns/op before → after | B/op before → after | allocs/op before → after |
+|---|---|---|---|
+| HEIFExtract | 318.5n → 213.7n (**−32.92%**) | 580 → 400 (**−31.03%**) | 14 → 5 (**−64.29%**) |
+| HEIFInject | 559.9n → 316.9n (**−43.39%**) | 1768 → 812 (**−54.07%**) | 34 → 12 (**−64.71%**) |
+| PNGExtract | 285.8n → 259.2n (**−9.29%**) | 184 → 184 (~) | 15 → 14 (**−6.67%**) |
+| PNGExtractCompressedXMP | 487.6n → 466.6n (**−4.32%**) | 651 → 604 (**−7.22%**) | 14 → 12 (**−14.29%**) |
+| PNGInject | 456.8n → 391.6n (**−14.25%**) | 969 → 793 (**−18.16%**) | 25 → 11 (**−56.00%**) |
+| PNGWriteChunk | 59.80n → 52.05n (**−12.94%**) | 136 → 112 (**−17.65%**) | 5 → 2 (**−60.00%**) |
+| WebPExtract | 74.00n → 73.48n (**−0.70%**, p=0.009) | 32 → 32 (~) | 3 → 3 (~) |
+| WebPExtractWithXMP | 103.3n → 100.2n (**−2.96%**) | 112 → 112 (~) | 4 → 4 (~) |
+| WebPInject | 215.8n → 128.1n (**−40.63%**) | 899 → 320 (**−64.40%**) | 10 → 4 (**−60.00%**) |
+| riff.ReadChunk | 18.54n → 18.31n (**−1.21%**) | 56 → 56 (~) | 2 → 2 (~) |
+
+#### Per-task notes
+
+- **#228**: `parseHEIFBoxHeader` returns a `[4]byte` box type; `parseInfe`/`parseInfeV0V1`/`parseInfeV2V3` return a `[4]byte` item type plus an `ok bool` instead of a string; `parseIinf` returns `map[uint16][4]byte`. `selectBestItem`'s dead `"rdf+xml"` candidate (7 bytes; ISO 14496-12 §8.11.6 fixes `item_type` at exactly 4 bytes, so it could never match) is dropped, not carried forward as a `[4]byte`.
+- **#229**: `newMetaBoxLen`/`ilocBoxSize` compute the exact rebuilt-meta-box length from field widths and extent counts alone — no bytes are serialised to learn it — replacing the former placeholder-then-final double build. `updateIlocItemsInPlace` mutates `ilocInfo.items` (never aliased elsewhere) instead of copying the slice, and reuses each matched item's existing one-element extents backing array. `buildIlocBox`/`buildMetaBox` each write into one pre-sized buffer (header placeholder + body + patched size field) instead of separate body/hdr buffers. New regression gate: `TestInjectMultiExtentItemCollapsesToOne` (a 2-extent source item collapses to exactly 1 extent with correct offset/length after Inject). **Post-merge security fix (HEIF-ILOC-DUPBOX-01, 2026-09-25):** the initial `ilocSizeDelta` measured only the FIRST `iloc`-typed child box's size, while `buildMetaBox`'s own copy loop drops EVERY `iloc`-typed child — a meta box with two (or more) `iloc` boxes, or with trailing bytes that fail to parse as a box header at all (both silently dropped by `buildMetaBox`'s real walk), produced a `newMetaLen` estimate that didn't match `buildMetaBox`'s actual output, corrupting the injected item's extent offset. Fixed by extracting the shared traversal into `nonIlocBoxesLen` (used by both `buildMetaBox`'s size pre-computation and the new `newMetaBoxLen`), so the two can no longer drift apart. Regression gates: `TestInjectDuplicateIlocBoxesOffsetInBounds`, `TestInjectMetaWithTrailingUnparseableBytesOffsetInBounds`; `FuzzHEIFInject` strengthened with a within-output-bounds invariant for every Exif/mime-typed item's extent.
+- **#230**: `heif.Inject` and `webp.Inject` read their input via `iobuf.ReadAll` (task #224) instead of `io.ReadAll(io.LimitReader(...))`. New non-seekable-fallback regression tests in both packages' `oom_gate_test.go` (`seekStartOnlyReader`, allowing only the leading `Seek(0, SeekStart)` Inject itself performs).
+- **#231**: `writeChunk` obtains its 8-byte header and 4-byte CRC trailer from `iobuf`, hashes the chunk type directly from `hdr[4:8]` (no `[]byte(chunkType)` conversion), and calls `crc32Pool.Put` explicitly on every return instead of via `defer`. `buildXMPChunk` is pre-sized to its exact final length instead of growing a zero-cap `bytes.Buffer`.
+- **#232**: `readChunk`'s callback type is `[4]byte` (`copy(chunkType[:], hdr[4:8])` replaces `string(hdr[4:8])`), removing a string allocation on every chunk, metadata or not. The 8-byte header and 4-byte CRC trailer stay plain stack arrays: routing them through `iobuf` was measured to cost *more* in ns/op than the single unavoidable heap escape it would replace (a real, if smaller, PNGExtract regression was caught this way before being reverted — see `feedback_png_chunktype_escape.md`). `chunkTypeStr` (a `//go:noinline` `[4]byte`→`string` cold-path helper) is used at every `%q` error-formatting call site instead of slicing `chunkType` inline, because Go's escape analysis is control-flow-insensitive: slicing a `[4]byte` *parameter* inside even a rarely-taken `if err != nil` branch marks that parameter as escaping on **every** call.
+- **#233**: `zlibDecompress` pools its `*bytes.Reader` (`bytesReaderPool`, `Reset` on `Get`) alongside the existing `zlibPool`, with explicit `Put` calls instead of `defer`. **Post-merge security fix (PNG-BYTESREADERPOOL-RETENTION-01, 2026-09-25):** `bytes.Reader.Reset(data)` stores `data` in an unexported field that a plain `Put` never clears, so a pooled reader kept the caller's compressed input (up to `maxPNGChunkSize`, 256 MiB) reachable for as long as it sat in the pool. Fixed via `putBytesReader`, which calls `br.Reset(nil)` before every `Put`. Regression gate: `TestZlibDecompressDoesNotRetainInput` (drains the pool and asserts `Len()==0 && Size()==0` — both public methods, no reflection needed).
+- **#234**: `internal/riff.ReadChunkHeaderAt` takes a caller-supplied data offset instead of discovering it via `Seek(0, SeekCurrent)` (a plain `io.Reader` suffices — no seek at all). `webp.readWebPChunks` tracks its own running offset (start 12, advance `8+size+padding`) and measures the stream's total length at most once per `Extract` call, lazily, only when a metadata chunk is actually seen (`measureStreamEnd`) — `readPaddedChunk` itself no longer seeks; the odd-size padding byte is read and discarded rather than skipped via `Seek(SeekCurrent)`. `collectOriginalChunks`/`webpOriginalChunk`/`writeRIFFChunk`/`isEOFOrKnownFourCC` use `[4]byte` FourCC values throughout instead of converting to `string` per chunk. `buildWebPBody` writes the 12-byte RIFF header into the same pooled buffer as the chunk stream (header placeholder, body, patch size) instead of a separate `riffHdr` allocation plus a second `w.Write` call. New regression gate: `TestExtractNoPerChunkSeekCurrent` asserts the seek trace of a full `Extract` call (VP8X + EXIF + XMP + one non-metadata chunk) contains no `io.SeekCurrent` call at all.
+
+### Batch E (tasks #285, #286, #287) — 2026-09-25
+
+Go version go1.27.1, `cpu: Apple M4`, `-count=8`, all changes `p=0.000` unless noted.
+`format/tiff` (relocate_nef/arw/orf/rw2.go, relocate.go, tiff.go), `format/raw/cr3`,
+`exif` (`AcceptRAWMagic`), `read.go`/`write.go`, `xmp/rdf.go`. Measured with a scratch
+end-to-end harness (`gm.Read`/`gm.Write` over real corpus files, not part of the
+repository — see `internal/testutil` for the equivalent corpus-file convention) against
+real Canon/Nikon/Sony/Panasonic/Olympus/DJI files from `testdata/corpus`: Epson
+PerfectionV800.tiff (819,606 B), Canon EOS 600D.CR2 (22,911,265 B), Canon EOS R3.cr3
+(12,277,000 B), Nikon D810.nef (40,667,772 B), Sony ILCE-7M3.arw (24,795,904 B), DJI
+Phantom 4 (1).dng (24,394,394 B), OM System TG-7.ORF (13,150,700 B), Panasonic
+DMC-GF7.rw2 (19,720,192 B), Canon EOS 7D.jpg (metadata-extractor corpus). Write output
+SHA-256 identical to HEAD (ce1dc82) for `Read`+`SetCaption`+`SetCopyright`+`Write` over
+the full TIFF/DNG/RAW corpus (571 files, 1133 read+write outcomes), **except** 3
+byte-for-byte-identical adversarial fixtures (`raw/exiv2/issue_839_poc*.rw2`) whose
+output differs by exactly 1 byte at the same offset in all three — see the per-task note
+under #286 below; this is a fidelity **improvement**, not a regression.
+
+| Benchmark | ns/op before → after | B/op before → after | allocs/op before → after |
+|---|---|---|---|
+| Write/tiff | 91.39µ → 58.71µ (**−35.76%**) | 1639.9Ki → 828.7Ki (**−49.47%**) | 33 → 28 (**−15.15%**) |
+| Write/cr2 | 2.798m → 1.881m (**−32.78%**) | 65.62Mi → 21.92Mi (**−66.60%**) | 70 → 59 (**−15.71%**) |
+| Write/nef | 4.428m → 2.512m (**−43.27%**) | 131.25Mi → 41.63Mi (**−68.28%**) | 92 → 65 (**−29.35%**) |
+| Write/arw | 2.210m → 1.526m (**−30.96%**) | 48.62Mi → 24.87Mi (**−48.85%**) | 97 → 68.5 (**−29.38%**) |
+| Write/dng | 2.078m → 1.463m (**−29.58%**) | 46.92Mi → 23.63Mi (**−49.64%**) | 69 → 66 (**−4.35%**) |
+| Write/orf | 1633.5µ → 814.5µ (**−50.14%**) | 39.11Mi → 14.01Mi (**−64.18%**) | 43 → 36 (**−16.28%**) |
+| Write/rw2 | 3.057m → 1.607m (**−47.44%**) | 79.31Mi → 20.22Mi (**−74.51%**) | 56 → 27 (**−51.79%**) |
+| Read/jpeg_canon7d | 20.75µ → 17.95µ (**−13.50%**, reproduced −13.5%…−13.9% across 3 independent interleaved runs incl. round-1's isolated A/B) | 57.29Ki → 57.32Ki (~) | 54 → 54 (~) |
+| Read/cr3 | 901.3µ → 1.652µ (**−99.82%**) | 24675.4Ki → 33.53Ki (**−99.86%**) | 41 → 8 (**−80.49%**) |
+| Read/orf | 824.0µ → 417.9µ (**−49.28%**) | 25.10Mi → 12.55Mi (**−49.99%**) | 21 → 19 (**−9.52%**) |
+| Read/rw2 | 1217.0µ → 690.1µ (**−43.29%**) | 37.63Mi → 18.82Mi (**−50.00%**) | 13 → 12 (**−7.69%**) |
+| xmp.BenchmarkRDFParse | 3.155µ → 2.928µ (**−7.18%**) | 2.407Ki → 2.407Ki (~) | 14 → 14 (~) |
+
+Write B/op ÷ source-file size (AC: ≤1.15×): tiff 1.035×, cr2 1.003×, nef 1.073×,
+arw 1.052×, dng 1.016×, orf 1.117×, rw2 1.075×. Read B/op ÷ source-file size:
+cr3 34,335 B absolute (AC: ≤256 KiB), orf 1.0006×, rw2 1.0007× (AC: ≤1.05×).
+
+#### Per-task notes
+
+- **#285** (tiff/raw: drop redundant full-file clones and pre-size RAW write outputs):
+  `write.go`'s six `writeTIFF*` entry points alias `m.rawEXIF` directly instead of
+  `bytes.Clone`-ing it, now that no relocator mutates its `base`/`originalBytes`
+  argument (verified by grepping every `base[i] =` write site in `format/tiff/relocate*.go`
+  before and after: the only two were the ORF/RW2 in-place magic patches removed by #286).
+  `relocate_nef.go`/`relocate_orf.go`/`relocate_rw2.go` replace their `exif.Encode`
+  skeleton-then-final double encode with `exif.EncodedSize` (skeleton) +
+  `exif.EncodeInto(make([]byte, 0, finalCap(finalLen)), e)` (final), mirroring the pattern
+  Batch C (#219/#220) already applied to the shared `relocateTIFFFromParsed`. RW2's
+  post-relocate GUID insertion (`insertRW2GUIDAndShiftOffsets`) and CR2's marker insertion
+  (`insertCR2MarkerAndShiftOffsets`) both used to allocate a *second* whole-file-sized buffer
+  purely to shift bytes right by a small fixed delta (16 and 8 bytes respectively);
+  `relocateTIFFFromParsedRW2`/`relocateTIFFFromParsed` now reserve that many bytes of spare
+  *capacity* (not length) in the buffer `exif.EncodeInto` writes into, so the shift is instead
+  done in place with a single overlap-safe `copy()` (Go's `copy` is memmove-based and
+  explicitly documented to support overlapping source/destination) — with a `make`-based
+  fallback for any caller that supplies a buffer without the reserved capacity. New/updated
+  invariant checks (`len(finalTIFF) != finalLen`) were added to the NEF/ARW/ORF/RW2
+  relocators, mirroring the one `relocateTIFFFromParsed` already had, so a future pre-sizing
+  bug fails loudly instead of silently falling back to `append`'s regrowth.
+
+  **ARW: pre-sizing the FINAL buffer measured slower, not faster — reverted for that one
+  call site.** The initial pass applied the identical `EncodedSize`+`EncodeInto` swap to
+  `arwRelocateWithSR2`'s final encode too, measuring only +21.29% (short of the 25% AC
+  target). A three-way interleaved isolation (`git worktree`s: unmodified HEAD, HEAD +
+  write.go clone-removal only, HEAD + clone-removal + full presizing), `-count=8`,
+  `p=0.000` throughout, on the same Sony ILCE-7M3.arw fixture:
+
+  | Variant | Write/arw ns/op | vs HEAD |
+  |---|---|---|
+  | HEAD | 2.210m | — |
+  | clone-removal only (no relocate_arw.go change) | 1.537m | **−30.46%** |
+  | clone-removal + `EncodedSize`(skeleton) + `EncodeInto`(final, pre-sized) | 1.726m | −21.93% |
+  | clone-removal + `EncodedSize`(skeleton) + plain `Encode`(final, natural growth) | 1.529m | **−30.80%** (~ vs clone-only, p=0.083) |
+
+  `samply` (Go's own CPU profiler is biased on macOS — see round-1 notes) resolved the gap:
+  self-time in `runtime.memclrNoHeapPointers`, focused on the `gometadata.Write` call tree,
+  was **11.45%** with the pre-sized final buffer vs **0.20%** with natural `append` growth for
+  the identical workload. A single `make([]byte, 0, ~25MB)` forces an immediate,
+  unconditional zero-fill of the whole backing array; the same ~25 MB reached via `append`'s
+  incremental doubling growth is zeroed in smaller pieces this workload's allocator/GC state
+  evidently handles more cheaply — the opposite of the outcome on every other format in this
+  batch. `exif.EncodedSize` for the *skeleton* pass remained a clean, unconditional win in all
+  four variants (no bytes written, just layout arithmetic) and was kept; only the *final*
+  pass's pre-sizing was reverted, back to plain `exif.Encode(e)`. `arwRelocatedLen` is
+  retained, but now feeds only the post-hoc `len(finalTIFF) != finalLen` invariant check, not
+  any allocation. Write output is byte-for-byte identical before and after this revert
+  (confirmed via the golden-hash corpus run) — this was purely an allocation-strategy change.
+  **AC now met**: −30.96% (final measurement, exceeds the 25% target). Sony SR2Private
+  decrypt/rebase (`patchSonySR2InFinalTIFF`/`rebaseIFDInBlob`/`sr2CryptBlob`) remains a
+  real, unrelated, untouched cost centre (~14-27% of the focused `Write` call tree depending
+  on variant) explaining why ARW's percentage improvement is smaller than NEF/ORF/RW2's even
+  after this fix — not a remaining #285 defect, just a fixed cost this format alone carries.
+  Whether the same "pre-sized final buffer can be slower than natural growth" effect also
+  leaves headroom on NEF/ORF/RW2/TIFF (which all show strong wins already, comfortably past
+  their own targets) was not investigated — out of scope for this batch; flagged in agent
+  memory as a candidate for a future profiling round.
+- **#286** (cr3/orf/rw2: stop copying and retaining the whole file on read):
+  `exif.AcceptRAWMagic(magic uint16)` is a new internal-use `ParseOption`: it tells `Parse`
+  to dispatch the given magic value through the classic-TIFF path exactly like `0x002A`,
+  guarded by an explicit `cfg.extraMagic != 0` check so a corrupt file with magic `0x0000`
+  is never accidentally accepted by a caller that never opts in. `exif.Parse`'s behaviour
+  with no options is unchanged and still rejects ORF/RW2 magic (see
+  `exif/task286_acceptrawmagic_test.go`). `read.go`'s `parseEXIF` uses it (via the new
+  `nonStandardRAWMagic` detector) instead of `patchRawEXIFForParse`'s whole-file clone;
+  `format/tiff`'s `relocateTIFFFromParsedORF`/`relocateTIFFFromParsedRW2` use it for their
+  `e == nil` fallback parse instead of patching `base[2:4]` in place, so `relocateTIFFAsORF`/
+  `relocateTIFFAsRW2`'s own defensive clone is removed too. `cr3.Extract` no longer reads the
+  whole file: `readTopLevelBox` walks top-level ISOBMFF box headers via `Read`+`Seek` (8 or
+  16 bytes each) and reads only the matched `moov` box's payload into memory, capped at
+  `maxCR3TopLevelBoxScans` (4096) headers as a defence-in-depth bound against a crafted file
+  padded with minimal boxes ahead of `moov`; the returned `rawEXIF`/`rawXMP` are
+  `bytes.Clone`d out of the (still moov-sized, not file-sized) scratch buffer so retention is
+  bounded even if a future file embeds something large inside `moov` itself (see
+  `TestCR3ExtractRetentionBounded`: heap growth for 10 retained `Extract` results against an
+  8 MiB synthetic `mdat` measured **0 bytes** after the fix vs **75,571,424 bytes** — essentially
+  the full 10×8 MiB — before it). `cr3.Inject` (which genuinely needs the whole file, since
+  every byte not touched by the moov rebuild is copied through verbatim) switches from
+  `io.ReadAll(io.LimitReader(...))` to `iobuf.ReadAll`, halving its own transient allocation
+  for a seekable reader and mapping `iobuf.ErrTooLarge` to the package's own
+  `ErrFileTooLarge` (`TestExtractFileTooLarge`/`TestInjectFileTooLarge` both still pass).
+  **Discovered, in-scope fidelity improvement**: three adversarial `exiv2` regression
+  fixtures (`raw/exiv2/issue_839_poc{,_2,_3}.rw2`) declare an IFD entry (tag `0x0148`) whose
+  48-byte OOL value offset points back to file offset 0, aliasing the file's own header —
+  under the old patch-then-parse approach, that entry's `Value` incorrectly contained the
+  *synthetic* patched magic byte (`0x2A`) instead of the file's real on-disk magic byte
+  (`0x55`); the new direct-parse approach preserves the true on-disk bytes. This is the sole
+  source of the 1-byte write-output divergence from HEAD noted above; it affects only these
+  3 deliberately self-referential POC files (confirmed via a full corpus diff and a dedicated
+  before/after entry-value comparison), never a real camera file, and is strictly more
+  faithful to the source bytes, consistent with this project's "preserve existing metadata
+  exactly" mandate.
+- **#287** (xmp: lookup table for name terminator scanning): `isNameTerminator`'s eight-way
+  compare chain is replaced by `nameTerminatorLUT`, a 256-entry `[256]bool` array indexed
+  directly by the input byte (mirrors `iptc/dataset.go`'s existing `datasetMaxLen` table
+  convention). `TestNameTerminatorLUTMatchesPredicate` proves the table matches the old
+  predicate for all 256 byte values, not just the 8 real terminators, so a regression that
+  over-matches is caught as reliably as one that under-matches. **e2e AC** (`BenchmarkRead/
+  jpeg_canon7d` ≥10% faster) verified directly against the scratch harness, not just the
+  package-local `xmp.BenchmarkRDFParse`: −13.50% (this measurement) and −13.74% (an earlier
+  independent run), both `p=0.000, n=8` — consistent with round-1's own isolated A/B
+  (−13.9%), so the end-to-end result matches what the isolated fix predicted with no
+  unexplained gap. `samply`, focused on the `gometadata.Read` call tree for this same
+  benchmark, confirms `isNameTerminator`/`scanName` no longer appear as distinct hot
+  functions at all (the LUT made them cheap enough to fold into their caller's frame or
+  drop below measurement resolution); the largest remaining self-time contributors are
+  `xmp.parseSingleAttr` (14.96%), `runtime.memmove` (8.80%), `internal/bytealg.
+  IndexByteString` (5.24%, via `readQuotedValue` scanning for the closing quote), `xmp.
+  readQuotedValue` (5.10%), `runtime.memequal` (5.02%), and `xmp.scanAttrs` itself (4.49%,
+  now just loop/bounds-check overhead with the terminator check gone) — none of these are
+  name-terminator-scanning cost; they are separate functions, out of #287's stated scope.
+
+### 60-second fuzz clean (Batch E, 2026-09-25)
+
+`FuzzCR3Extract`, `FuzzCR3Inject`, `FuzzTIFFInject`, `FuzzCR2Inject`, `FuzzNEFInject`,
+`FuzzARWInject`, `FuzzORFInject`, `FuzzRW2Inject`, `FuzzDNGInject`, `FuzzParseEXIF`,
+`FuzzParseXMP`, `FuzzRead` — each run standalone for 60 s (`-fuzztime=60s`); zero crashers.
+
+### Batch F (tasks #288, #289) — 2026-09-25
+
+Go version go1.27.1, `cpu: Apple M4`, `-count=10` (`≥8` interleaved runs required by
+the batch's Definition of Done), all changes `p=0.000` unless noted. `format/png/png.go`
+(#288), `format/tiff/extent.go` (new), `format/tiff/tiff.go`, `write.go`, `metadata.go`
+(#289). Measured with the same scratch end-to-end harness as Batch E
+(`gm.Read`/`gm.Write` over real corpus files) against
+`png/metadata-extractor/Issue 280 (dotnet).png`, `tiff/metadata-extractor/Epson
+PerfectionV800.tiff` (819,606 B), `raw/metadata-extractor/Canon EOS 600D.CR2`
+(22,911,265 B), `raw/metadata-extractor/Nikon D810.nef` (40,667,772 B), `raw/
+metadata-extractor/Sony ILCE-7M3 (A7M3).arw` (24,795,904 B), `raw/metadata-extractor/DJI
+Phantom 4 (1).dng` (24,394,394 B).
+
+| Benchmark | ns/op before → after | B/op before → after | allocs/op before → after |
+|---|---|---|---|
+| Read/png | 18.414µ → 2.856µ (**−84.49%**) | 3.752Ki → 2.862Ki (**−23.72%**) | 138 → 28 (**−79.71%**) |
+| Write/png | 109.03µ → 29.23µ (**−73.19%**) | 7.708Ki → 6.827Ki (**−11.43%**) | 131 → 14 (**−89.31%**) |
+| Read/tiff | 49.24µ → 49.89µ (~) | 809.8Ki → 809.8Ki (~) | 10 → 10 (~) |
+| Read/cr2 | 813.6µ → 8.82µ (**−98.92%**) | 22391.8Ki → 80.20Ki (**−99.64%**) | 26 → 27 (+3.85%) |
+| Read/nef | 1387.4µ → 39.24µ (**−97.17%**) | 38.797Mi → 817.6Ki (**−97.94%**) | 19 → 30 (+57.89%) |
+| Read/arw | 885.8µ → 47.50µ (**−94.64%**) | 24552.2Ki → 849.2Ki (**−96.54%**) | 23 → 29 (+26.09%) |
+| Read/dng | 858.0µ → 17.39µ (**−97.97%**) | 23833.8Ki → 202.8Ki (**−99.15%**) | 32 → 38 (+18.75%) |
+| Write/tiff | 61.02µ → 61.02µ (~) | 825.6Ki → 825.6Ki (~) | 27 → 27 (~) |
+| Write/cr2 | 1.938m → 2.569m (+32.55%) | 21.91Mi → 43.77Mi (+99.72%) | 60 → 69 (+15.00%) |
+| Write/nef | 2.574m → 3.990m (+54.97%) | 43.02Mi → 81.81Mi (+90.18%) | 65 → 70 (+7.69%) |
+| Write/arw | 1.532m → 2.431m (+58.63%) | 24.86Mi → 48.51Mi (+95.13%) | 67 → 76.5 (+14.18%) |
+| Write/dng | 1.489m → 2.319m (+55.69%) | 24.50Mi → 47.77Mi (+94.95%) | 67 → 71 (+5.97%) |
+| RoundTrip/tiff (Read+SetCaption+SetCopyright+Write) | 105.6µ → 102.7µ (**−2.73%**) | 1.601Mi → 1.601Mi (~) | 55 → 55 (~) |
+| RoundTrip/cr2 | 2.700m → 2.597m (~/**−3.81%**) | 43.78Mi → 43.85Mi (+0.15%) | 102 → 111 (+8.82%) |
+| RoundTrip/nef | 3.950m → 4.048m (+2.47%) | 81.82Mi → 82.61Mi (+0.97%) | 99 → 114 (+15.15%) |
+| RoundTrip/arw | 2.345m → 2.359m–2.457m (~ to +4.76%, noisy — see Follow-up 2) | 48.84Mi → 49.34Mi (+1.03%) | 110 → 119–120 (+8.18–9.09%) |
+| RoundTrip/dng | 2.347m → 2.337m–2.360m (~) | 47.78Mi → 47.97Mi (+0.40%) | 111 → 121 (+9.01%) |
+
+Read/Write/RoundTrip numbers above are the FINAL, post-follow-up-review measurements after
+BOTH follow-up rounds (see "Follow-up" and "Follow-up 2" subsections below); the original
+per-task note further down predates those and is kept for its record of what was found and
+why, not as the current numbers.
+
+AC scorecard: **PNG both AC met** (Read ≤4µs/≤30 allocs target: 2.856µs/28 allocs; Write
+≤30µs/≤35 allocs target: 29.23µs/14 allocs). **TIFF-family Read both AC met**: B/op ≤1 MiB
+for every one of tiff/cr2/nef/arw/dng (max is nef at 817.6Ki); NEF ns/op ≥80% lower target:
+**−97.17%** actual. **RoundTrip (the realistic Read+edit+Write workflow) is net-neutral or
+better for all 5 formats** after Follow-up 2's `m.rawEXIF`-reuse fix: tiff **−2.73%** (was
++57.17%), cr2 `~`/−3.81%, nef +2.47%, dng `~`, arw ranges `~` to +4.76% across repeated
+clean runs (noise around ~0%, not a stable regression — see Follow-up 2).
+
+#### Per-task notes
+
+- **#288** (png: skip ignored chunks on read, copy unchanged chunks verbatim on write):
+  `Extract` hoists the 8-byte chunk header buffer out of the read loop and, for any chunk
+  type other than `eXIf`/`iTXt`/`tEXt`/`zTXt`/`IHDR`/`IEND`, `Seek`s past its data+CRC
+  instead of reading and CRC-verifying it — bounds-checked against a single upfront
+  `streamSize` probe (mirroring Exiv2's `pngimage.cpp` pattern) so a chunk whose declared
+  length overruns the real stream is still rejected exactly as before, never silently
+  accepted via a `Seek` past EOF. `Inject` copies every unchanged chunk — header, data,
+  **and original CRC trailer, byte-for-byte, uninspected and unrepaired** — via a pooled
+  64 KiB streaming copy (`streamCopyN`/`copyChunkVerbatim`), reserving CRC computation for
+  chunks the library actually constructs (`eXIf`, the XMP `iTXt`). **User decision, matching
+  ExifTool/Exiv2**: a pass-through chunk with an already-invalid CRC keeps that invalid CRC
+  in the output — Inject never repairs a CRC on a chunk it did not itself write.
+  `TestExtractIssue790Poc2Rejected` proves `testdata/corpus/png/exiv2/issue_790_poc2.png`
+  (a truncated-iCCP-chunk file that HEAD's `Extract` silently accepted, returning
+  `(nil,nil,nil,nil)`, because `io.ReadFull`'s bare `io.EOF` on a CRC read starting at
+  exactly 0 remaining bytes was indistinguishable from a clean end-of-stream) is now
+  correctly rejected, because the new bounds check computes `streamSize` up front and
+  checks `pos+length+4 > total` before any `Seek`/read, independent of how the underlying
+  reader happens to signal EOF. `TestInjectPreservesOriginalCRCEvenWhenInvalid` proves the
+  bad-CRC-preservation policy directly. **Golden-hash verification**: SHA-256 of
+  `Read`+`SetCaption`+`SetCopyright`+`Write` output differs from HEAD for exactly 114 PNG
+  corpus files; an automated byte-level diff tool (not manual spot-checking) confirmed all
+  114 differ **only** in a pass-through chunk's 4-byte CRC trailer, and independently
+  confirmed the corresponding input file's original CRC at that same chunk was already
+  invalid in all 114 cases — HEAD was silently repairing bad CRCs on unmodified chunks;
+  this change stops that, which is the intended, spec-compliant behaviour, not a
+  regression.
+- **#289** (tiff/cr2/nef/arw/dng: read only the metadata prefix, not the whole file):
+  `format/tiff/extent.go` (new) computes the exact byte range IFD0's own next-IFD chain,
+  ExifIFD, GPSIFD, InteropIFD, and every `SubIFDs` (0x014A) child IFD occupy — including
+  every out-of-line tag value within them (MakerNote blobs, `RawIPTC`/`RawXMP` payloads) —
+  by an incremental grow-and-rescan loop over the source `io.ReadSeeker` (reads only the
+  delta on each grow, never re-reads bytes already held), bounded by `maxFileSize` and a
+  64-pass ceiling. `Extract` reads and retains only this prefix; `RawEXIF()`'s doc comment
+  and the CHANGELOG now state this precisely for these five formats (unchanged for every
+  other supported format). `write.go`'s `writeTIFF`/`writeTIFFCR2`/`writeTIFFARW`/
+  `writeTIFFNEF` were changed to always re-`Seek(0)`+re-read the full source from `r`
+  rather than reusing `m.rawEXIF` — the copy-and-relocate write path needs every strip/tile
+  image-data block, which the prefix, by design, no longer carries. `writeTIFFORF`/
+  `writeTIFFRW2` are unchanged (out of #289's scope; #286 already made them whole-file
+  reads with a different, unaffected mechanism).
+
+  **Two correctness bugs were found and fixed during this task's own gate work, before
+  either AC was reported met:**
+
+  1. **Integer-overflow panic (fuzz-found, fixed before any benchmark was recorded).**
+     `FuzzTIFFExtract` immediately crashed a first draft of `extent.go` with a crafted
+     BigTIFF `ifd0Off = 0xFFFFFFFFFFFFFFFF`: the naive bounds check `off+countW >
+     len(buf)` overflowed and wrapped to a small value, incorrectly passing, then
+     panicked slicing `buf[off:]`. Fixed with a `fits(off, width, n uint64) bool` helper
+     (`off > n` first, then `width <= n-off`, no addition that can itself overflow) applied
+     at every point in `extent.go` where an offset is read from untrusted file content.
+     60 s of `FuzzTIFFExtract` afterward: clean.
+  2. **Embedded-thumbnail data loss / non-HEAD-identical write output (golden-hash-found,
+     fixed before the AC was reported met).** The initial design deliberately excluded
+     "image data a metadata value merely points to" (`StripOffsets`, `TileOffsets`,
+     `JPEGInterchangeFormat`) from the prefix. This is correct for `StripOffsets`/
+     `TileOffsets` (never materialised into any `exif.EXIF` field; always re-read from the
+     full file at write time by `enumerateImageBlocks`), but **wrong** for
+     `JPEGInterchangeFormat`/`JPEGInterchangeFormatLength`: `exif.Parse`'s own
+     `extractJPEGThumbnail` (exif/ifd.go) actively slices those declared bytes into
+     `IFD.ThumbnailData` **during parsing itself**, for every IFD it materialises, and
+     `exif.Encode` re-embeds that field verbatim on write. Omitting those bytes from the
+     prefix made `extractJPEGThumbnail`'s bounds check fail silently (`ThumbnailData` ends
+     up `nil`, no error, no crash) — caught only by the golden-hash gate, where
+     `raw/metadata-extractor/Canon EOS 70D.cr2` (and 2 other corpus files) produced `Write`
+     output byte-different from HEAD despite parsing to identical tag values: with
+     `ThumbnailData == nil`, `enumerateImageBlocks` treats the declared JPEG range as a
+     generic relocatable image block instead of trusting `exif.Encode` to have already
+     embedded it, placing the same, uncorrupted thumbnail bytes at a different file offset.
+     Fixed by extending the extent scan to include a JIF pair's declared byte range
+     whenever both tags are present on an IFD — but **only** for IFDs `exif.Parse` actually
+     materialises as `*exif.IFD` (IFD0, its own `.Next` chain, and the ExifIFD/GPSIFD/
+     InteropIFD pointer targets), explicitly **excluding** `SubIFDs` (0x014A): `exif.Parse`
+     never materialises a SubIFD as a `*exif.IFD` at all (`enumerateSubIFDs` re-scans the
+     full file directly at write time instead — see `relocate.go`), so a JIF pair declared
+     inside one is never read back into any `ThumbnailData` field this fix exists to
+     protect. The unscoped first version of this fix was itself caught by the AC's own
+     `BenchmarkRead/nef` B/op target: `raw/metadata-extractor/Nikon D810.nef` carries a
+     multi-megabyte medium-resolution preview inside a `SubIFDs` child (not the top-level
+     IFD chain, whose own `ThumbnailData` was `nil` either way), and including it ballooned
+     the prefix from ~253 KB to ~2.7 MB for zero round-trip benefit — scoping the fix to
+     only the materialised IFDs fixed both the AC miss and confirmed the SubIFD bytes were
+     never needed in the first place.
+
+  **Full-corpus verification after both fixes** (temporary local symlink to the real
+  corpus for this run only; the committed test is corpus-gated per docs/TESTING.md §2.1
+  and skips, not fails, when the corpus is absent — see `task289_test.go`):
+  `TestExtractPrefixParityWithWholeFile` — 490 PASS, 19 SKIP (files where either `Extract`
+  or `exif.Parse` legitimately errors identically on both the prefix and the whole file,
+  e.g. deliberately-malformed torture-test fixtures — not a #289 parity issue), 0 FAIL,
+  across every `.tif`/`.tiff`/`.cr2`/`.nef`/`.arw`/`.dng` file in the repo's TIFF/RAW
+  corpus. Golden-hash `Read`+`SetCaption`+`SetCopyright`+`Write` SHA-256 comparison against
+  HEAD across the same 509 files: 0 mismatches in `CameraModel`/`Caption`/`Copyright`/
+  `RawXMP` and 0 mismatches in `Write` output SHA-256 or length — fully byte-identical.
+
+  **Write's ADDITIONAL cost is a deliberate, necessary, and now-minimal trade-off**: since
+  the prefix no longer carries strip/tile/thumbnail image data, the copy-and-relocate write
+  path must always re-read the whole file fresh from `r`, whereas HEAD could reuse the
+  already-resident `m.rawEXIF` (itself the whole file, pre-#289) with no second read. This
+  is outside #289's stated AC (Read-only) and explicitly anticipated by the task's own text
+  ("Write must still see the full source: it re-reads from the reader") — see the Follow-up
+  subsection below for the coordinator-requested verification that this extra cost is
+  EXACTLY "one more exact-size read", no more.
+
+#### Follow-up (coordinator review, 2026-09-26)
+
+  Two evidence gaps were raised before the security audit: (1) verify the Write regression
+  above is no more than one unavoidable extra full read, and measure the realistic
+  Read+edit+Write workflow; (2) measure Read on the FULL TIFF-family corpus (not just the
+  5 harness fixtures) and eliminate any regression on real files. Both were real findings
+  requiring code changes beyond #289's original scope, resolved as follows.
+
+  **(1) `write.go`'s `readAllCapped` was using `io.ReadAll(io.LimitReader(...))`** — the
+  stdlib helper, which grows its buffer geometrically across a variable, unbounded number of
+  internal `Read` calls and reallocations of unknown final size — **not `iobuf.ReadAll`**,
+  the package's own single-exact-allocation-plus-one-`ReadFull` helper (learns the exact
+  remaining size via `Seek(SeekEnd)`, allocates once). This was pre-existing code, but #289
+  made it run on every TIFF-family `Write` instead of only as a rare fallback (removing the
+  "reuse `m.rawEXIF`" fast path), so its own allocation strategy started to matter for
+  exactly the reason #289's own extent scanner does. Fixed by changing `readAllCapped`'s
+  signature to `io.ReadSeeker` (every one of its 6 call sites already had one) and
+  delegating to `iobuf.ReadAll`. Effect: Write's B/op regression roughly HALVED across every
+  format (e.g. dng +208.39% → +94.95%, cr2 +226.56% → +99.72%) and now lands almost exactly
+  at **2.0×** HEAD's original B/op for every format — i.e. HEAD's baseline plus one
+  additional exact-size read of the same file, confirmed by the ratio itself (cr2: 43.77Mi ÷
+  21.91Mi = 1.997×; dng: 47.77Mi ÷ 24.50Mi = 1.950×), not by inspection alone. `BenchmarkRoundTrip`
+  (Read + `SetCaption` + `SetCopyright` + Write on the same file, interleaved n=10) confirms
+  the realistic combined workflow is **net-neutral for cr2/nef/dng** (`~`, p > 0.05) **and a
+  small +6.96% for arw** — the "one extra read" cost is now small enough, relative to the
+  massive Read-side win, that the combined workflow is a wash or a small net loss, not the
+  55-70% combined regression an earlier (CPU-contention-corrupted) measurement briefly
+  suggested before being re-run cleanly. `tiff` still regresses (+57.17% RoundTrip) because
+  its 819,606-byte fixture is legitimately ~100% metadata (see below): Read gains nothing
+  from the prefix optimisation for this one file, so RoundTrip is left carrying Write's
+  "one extra read" cost with no offsetting Read-side saving — a property of this ONE
+  synthetic fixture, not of TIFF files or of #289's design in general (see the corpus-wide
+  results in (2), where only 3 KiB of the 500-file corpus was measurably RoundTrip-costly
+  this way).
+
+  **(2) A corpus-wide per-file `Read` benchmark (all 500 non-malformed TIFF/CR2/NEF/ARW/DNG
+  files in the repo's corpus, `testing.Benchmark` per file, HEAD vs current) found a genuine,
+  previously-unmeasured problem, then a second, more severe one, both now fixed:**
+
+  - **A DoS-class allocation bug** (not merely a perf regression): `testdata/corpus/tiff/
+    exiv2/2018-01-09-exiv2-crash-002.tiff`, a 325-byte deliberately-malformed torture-test
+    fixture, measured **~268 MB allocated per `Read`** (≈`maxFileSize`, the package's own
+    256 MiB safety ceiling) — a **~825,000×** blow-up relative to its own size. Root cause:
+    `scanMetadataExtent`'s growth loop clamped a corrupt/adversarial `need` value to
+    `maxFileSize` (256 MiB) before calling `growBuffer`, which unconditionally
+    `make([]byte, need)`s BEFORE discovering (via a short read) that the real, tiny file had
+    nothing near that many bytes to give — the wasteful allocation happens whether or not
+    the subsequent read is short. Fixed by clamping `need` to the file's OWN real size
+    (`fileSize`, already known exactly via `Seek(SeekEnd)` before scanning ever starts)
+    FIRST, before the much looser `maxFileSize` fallback: no legitimate metadata requirement
+    can ever exceed how many bytes the file actually has, so this clamp is free of any
+    correctness cost and eliminates the class entirely — every file in the corpus with this
+    pattern (several more `exiv2`/`issue_*_poc` crash-test fixtures were found alongside the
+    one above) dropped from up to **60,831×** the correct allocation to ≤ 5 KB.
+  - **A real (non-adversarial), unbounded-pass-count regression on small/medium TIFF files
+    whose IFD chain is only discoverable one link at a time**: `testdata/corpus/tiff/
+    exampletiffs/mri.tif` (230,578 B) needed enough small-increment growth passes — each a
+    full `make`+`copy` — to allocate ~2.97 MB total (≈13× its own size) under the original,
+    exact-need-sized growth policy; `tiff/metadata-extractor/
+    m1-8110934bb3b18d0e87ccc1ddfc5f0107.tif` (1,017,530 B) similarly cost ~9.4× HEAD's B/op
+    and ~8.3× its ns/op. Three growth-policy refinements were needed together (see
+    `extent.go`'s `nextGrowthTarget`/`clampNeed` doc comments for the full, evidence-cited
+    rationale of each) — a first, PASS-COUNT-based escalation heuristic ("any 2nd-or-later
+    growth pass gets a large factor") was tried and REJECTED because it mis-fired on
+    `raw/metadata-extractor/Nikon D810.nef`: NEF genuinely needs 3 small-increment passes to
+    fully resolve its IFD chain, but its `need` stays a stable ~0.62% of the 40.7 MB file the
+    whole time, and the pass-count heuristic ballooned its B/op to 4.18 MiB, breaking the
+    Read AC for a file whose actual metadata never remotely approached the file's size. The
+    signal that actually works is the FRACTION of the file a pass's `need` accounts for, not
+    how many passes have elapsed:
+    1. A "large-fraction snap" — once a single pass's `need` already accounts for ≥10% of
+       `fileSize`, jump straight to reading the rest of the file, since there is no
+       meaningful "prefix" saving left to protect. This correctly distinguishes NEF's
+       stable-small-fraction pattern (never fires) from `m1-8110934...tif`'s pattern (its
+       fraction climbs 15% → 15% → 31% across passes; fires on the 31% pass).
+    2. A "tail-snap" (unchanged from the original design) for the case a `need` is close to
+       `fileSize` in absolute terms but happens to fall under 10% only because `fileSize`
+       itself is small.
+    3. Plain doubling (`max(need, 2×len(buf))`, capped at `fileSize`) as the fallback,
+       bounding total copied bytes to `O(final extent)` instead of `O(final extent ×
+       pass count)` for whatever residual cases the first two checks don't already resolve.
+    4. **A size-based bypass**: files at or below `smallFileWholeReadThreshold` (4 MiB) skip
+       the extent scanner entirely and are read whole via the pre-#289 `extractWholeFile`
+       path — a corpus-wide per-file benchmark found every file whose extent-scan cost
+       exceeded a plain whole-file read was ≤ ~2.6 MiB, and reading a file that size in full
+       is already cheap in absolute terms regardless of how small its own metadata happens
+       to be; real camera RAW files (22–41 MB in this repo's own fixtures) are comfortably
+       clear of this threshold and keep the full scanner benefit.
+
+  **Corpus-wide result after all fixes** (500 files, `testing.Benchmark` per file, HEAD vs
+  current, measured with zero other CPU-intensive processes running — an earlier
+  measurement taken while background fuzz jobs were still running was discarded as
+  CPU-contention-corrupted after re-running cleanly reproduced dramatically different, much
+  worse numbers):
+
+  | Percentile | ns/op ratio (cur/HEAD) | B/op ratio (cur/HEAD) |
+  |---|---|---|
+  | p10 | 0.948 | 0.998 |
+  | p50 (median) | 1.011 | 1.0000 |
+  | p90 | 1.054 | 1.0001 |
+  | p95 | 1.067 | 1.0004 |
+  | p99 | 1.110 | 1.0096 |
+  | max (worst of 500) | **1.173** | **1.014** |
+
+  **Zero of the 500 corpus files exceed a 1.20× ratio in either metric** — the worst case
+  across the entire real-world TIFF/CR2/NEF/ARW/DNG corpus is 1.17× ns/op and 1.01× B/op,
+  both comfortably within normal benchmark noise. This satisfies "no real-file Read
+  regression beyond noise" as a corpus-wide, not just harness-fixture, property.
+
+#### Follow-up 2 (coordinator review, 2026-09-26) — reuse m.rawEXIF for Write when it is already the whole file
+
+  Both #289's own extent-scanning follow-ups above (the ≤4 MiB small-file bypass and the
+  ≥10%-of-`fileSize` large-fraction snap) can make `m.rawEXIF` end up holding the ENTIRE
+  source file, not just a metadata prefix — in which case Write re-reading the whole file
+  from `r` (Follow-up's item 1) is unnecessary work HEAD never had to do either, since HEAD
+  could always reuse `m.rawEXIF` directly.
+
+  **Implemented exactly the reliable signal the coordinator suggested**: a new unexported
+  `Metadata.rawEXIFIsWholeFile bool` field (no public API change), set once by `Read` via a
+  new `tiffFamilyRawEXIFIsWholeFile` check (`read.go`) that compares `len(rawEXIF)` against
+  the source's actual size (`Seek(SeekEnd)`, restoring the reader's position afterward) —
+  computed, never assumed, and only for the five TIFF-family formats (zero extra Seek calls
+  for every other format). `write.go`'s four affected functions
+  (`writeTIFF`/`writeTIFFCR2`/`writeTIFFARW`/`writeTIFFNEF`) now call a new
+  `originalTIFFBytes` helper: when the flag is set, it returns `m.rawEXIF` directly (no
+  second read, no clone); otherwise it falls back to the existing `Seek(0)`+`readAllCapped`
+  re-read. Reuse is exactly as safe as it was pre-#289 — no relocator in
+  `format/tiff/relocate*.go` ever mutates its `base`/`originalBytes` parameter (the same
+  invariant Batch E's own finding #1 already established and re-verified here by re-running
+  every affected gate).
+
+  **Result — the exact two regressions the coordinator named are gone:**
+
+  | Benchmark | Before this fix | After this fix | HEAD |
+  |---|---|---|---|
+  | RoundTrip/tiff ns/op | 165.9µ (+57.17%) | **102.7µ (−2.73%)** | 105.6µ |
+  | RoundTrip/tiff B/op | 2.391Mi (+49.36%) | **1.601Mi (+0.00%)** | 1.601Mi |
+  | Write/tiff ns/op | 103.76µ (+70.05%) | **61.02µ (~, p=0.631)** | 61.02µ |
+  | Write/tiff B/op | 1634.1Ki (+97.92%) | **825.6Ki (~, p=1.000)** | 825.6Ki |
+
+  `tiff`'s fixture (819,606 B) is well under the 4 MiB small-file threshold, so both Read
+  AND Write now take the whole-file path exactly as HEAD always did — Write/tiff and
+  RoundTrip/tiff's B/op and allocs/op are now **bit-for-bit identical** to HEAD (`~`,
+  p=1.000 for allocs), not merely close. cr2/nef/arw/dng are files far above the threshold
+  (22–41 MB) whose extent scan genuinely converges on a small prefix, so they correctly
+  keep re-reading from `r` for Write — there is nothing to reuse for them, and their
+  Write/RoundTrip numbers are unchanged from Follow-up 1's measurements.
+
+  **Why ARW RoundTrip still shows +6.96% in one measurement**: re-measured twice more,
+  cleanly (interleaved n=10, `pgrep` confirmed no other CPU-intensive process running): a
+  second run showed `~` (p=1.000, B/op ratio 1.03%), a third showed +4.76% (p=0.035, B/op
+  ratio still 1.03%). **B/op stays essentially flat (~1.0–1.03%) across all three runs while
+  ns/op fluctuates between 0% and +4.76%** — the signature of ordinary measurement noise
+  around a true value close to 0%, not a reproducible, code-attributable regression. ARW's
+  prefix (849.2Ki) is not unusually large relative to the other formats (NEF's is larger in
+  absolute terms, 817.6Ki, and shows no comparable ns/op instability); nothing in ARW's
+  write path changed in this follow-up (it was already, correctly, on the "re-read from r"
+  branch before and after this fix, identical to cr2/nef/dng). There is no evidence of a
+  real, recoverable regression here, and therefore nothing further to fix within #289's
+  scope — reported as noise, not chased as a phantom bug (see the corpus-wide/CPU-contention
+  lessons recorded in agent memory from Follow-up 1).
+
+  **Full re-verification after this fix**: build/vet/`test`/`test -race` (whole repo)
+  clean; `golangci-lint run ./...` — 0 new issues (same 6 pre-existing); `staticcheck`/
+  `govulncheck` clean; `TestExtractPrefixParityWithWholeFile` — 490 PASS/19 SKIP/0 FAIL
+  (unchanged, since this fix touches `read.go`/`write.go` only, not `format/tiff` itself);
+  golden-hash `Read`+`SetCaption`+`SetCopyright`+`Write` SHA-256 across the same 509 TIFF
+  corpus files — 0 mismatches, fully byte-identical to HEAD (unchanged from Follow-up 1: the
+  reused `m.rawEXIF` is the exact same bytes a fresh re-read would have produced, so Write
+  output cannot differ). `FuzzRead` (60 s — the one existing fuzz target that exercises the
+  new `tiffFamilyRawEXIFIsWholeFile` code path directly, since it lives behind the top-level
+  `gometadata.Read`/`Write` pair no format-package-level fuzzer reaches) plus the five
+  TIFF-family write fuzz targets (`FuzzTIFFInject`, `FuzzCR2Inject`, `FuzzNEFInject`,
+  `FuzzARWInject`, `FuzzDNGInject`, 60 s each): all clean.
+
+### 60-second fuzz clean (Batch F, 2026-09-25)
+
+`FuzzPNGExtract`, `FuzzPNGInject`, `FuzzTIFFExtract`, `FuzzTIFFInject`, `FuzzCR2Extract`,
+`FuzzCR2Inject`, `FuzzNEFExtract`, `FuzzNEFInject`, `FuzzARWExtract`, `FuzzARWInject`,
+`FuzzDNGExtract`, `FuzzDNGInject` — each run standalone for 60 s (`-fuzztime=60s`) against
+the final, post-fix code; zero crashers. `FuzzTIFFExtract` was additionally run against
+the pre-fix code that had the integer-overflow bug (see #289's per-task note above), where
+it found the crash within the first second — confirming the fuzz gate itself is effective,
+not merely clean by chance. All 10 TIFF-family targets (`FuzzTIFFExtract`/`Inject`,
+`FuzzCR2Extract`/`Inject`, `FuzzNEFExtract`/`Inject`, `FuzzARWExtract`/`Inject`,
+`FuzzDNGExtract`/`Inject`) were re-run for a further 60 s each after the follow-up review's
+`readAllCapped`/DoS-allocation/growth-policy fixes above; all clean. The top-level
+`FuzzRead` (the sole existing fuzz target that reaches the `gometadata.Read`/`Write`
+package's own code, where Follow-up 2's `tiffFamilyRawEXIFIsWholeFile`/`originalTIFFBytes`
+logic lives) plus `FuzzTIFFInject`/`FuzzCR2Inject`/`FuzzNEFInject`/`FuzzARWInject`/
+`FuzzDNGInject` were each run a further 60 s after Follow-up 2's `m.rawEXIF`-reuse fix; all
+clean.
+
+### Batch G (tasks #291, #292, #293, #294) — 2026-09-26
+
+Go version go1.26.1, `cpu: Apple M4`, `-count=6` interleaved runs (the batch's own
+Definition of Done). Measured with the same scratch end-to-end harness as Batch E/F
+(`gm.Read`/`gm.Write` over real corpus files): `raw/metadata-extractor/Canon EOS R3.cr3`
+(12,277,000 B), `raw/metadata-extractor/OM System TG-7.ORF` (13,150,700 B),
+`raw/metadata-extractor/Panasonic DMC-GF7.rw2`, plus the same
+tiff/cr2/nef/arw/dng samples as Batch F.
+
+#### #294 (png: graceful stop on an overrunning chunk instead of a fatal error)
+
+**User decision**: `Extract` now treats a truncated/overrunning chunk (the same condition
+`checkChunkTruncation` already detected) as a graceful stop-and-return-collected-metadata,
+matching `io.EOF` handling, instead of a fatal error — `Inject` is unaffected and still
+rejects truncated input. Full-corpus digest diff against HEAD (f9a1c9c): exactly 24 PNG
+files affected (`issue_428_poc2.png`, `issue_790_poc2.png`, `issue_789_poc1.png`, and
+similar truncated-chunk fixtures), zero non-PNG divergence. `TestExtractIssue790Poc2Rejected`
+renamed to `TestExtractOverrunningChunkReturnsCollectedMetadata`.
+
+#### #293 (orf/rw2: route Extract through the #289 metadata-prefix scanner)
+
+`orf.Extract`/`rw2.Extract` now call the new exported `tiff.ExtractWithMagic` (mirrors
+`exif.AcceptRAWMagic`'s non-standard-magic acceptance) instead of the old whole-file +
+IFD0-only `internal/tiffscan` path. `RawEXIF()` is now a metadata PREFIX for ORF/RW2 too.
+`write.go`'s `writeTIFFORF`/`writeTIFFRW2` were fixed to route through the extended
+`m.rawEXIFIsWholeFile` flag (previously assumed whole-file unconditionally, which #293
+broke — caught by the full test suite, not silently shipped).
+
+`extent.go`'s `nextGrowthTarget` fallback step changed from geometric doubling to a fixed
++64 KiB additive margin: doubling overshot NEF's true final need by ~2× on its last grow
+pass (need only grows 253,054 → 253,154 → 253,172; doubling allocated 506,108 B for a
+253,172 B need). NEF Read B/op: 837,445 → 394,324 (**−52.9%**), allocs/op: 30 → 26.
+
+**Follow-up fix (coordinator-requested closure of the ORF gap reported above): the 10%
+large-fraction snap is removed from `clampNeed`, not retuned.** `raw/metadata-extractor/OM
+System TG-7.ORF`'s real metadata need is a STABLE 1,514,496 B (11.516% of its 13,150,700 B
+file — converges on the very first growth pass, confirmed unchanged on a second rescan via
+a dedicated diagnostic), legitimately above the old 10% threshold, so the snap forced a
+full 13.15 MB read instead of the true ~1.5 MB prefix. A large but STABLE relative fraction
+is indistinguishable, by a relative-threshold check alone, from a need that keeps GROWING
+across passes toward a large fraction — the pattern the snap was originally meant to catch —
+so a corpus-wide A/B simulation harness (`clampNeed` vs 4 candidate replacements, replayed
+through the real `scanExtentPass`/`growBuffer` machinery) was built and run against every one
+of the 114 real TIFF-family corpus files above `smallFileWholeReadThreshold` (4 MiB, the
+size below which the scanner is bypassed entirely). Results: removing the snap regressed
+**zero** files' pass count or final buffer size, while shrinking the corpus-wide average
+converged buffer 42% (4,651,608 B → 2,688,439 B); replacing the relative rule with an
+absolute-bytes-remaining threshold gave identical results up to 4 MiB of margin (no file in
+this corpus has a converged-need gap in that range) and a strictly worse result at 8 MiB
+(`raw/metadata-extractor/Canon EOS 350D.CR2`: 773,969 B → 7,797,386 B for a single saved
+pass) — evidence that no replacement margin adds benefit over removing the rule outright.
+TG-7.ORF: 13,150,700 B (100%) → 1,580,032 B (12.0%) prefix, same 2 passes. See `clampNeed`'s
+and `scanMetadataExtent`'s doc comments (`format/tiff/extent.go`) for the full corpus
+citations. Regression tests: `TestClampNeedNoLargeFractionSnap` (unit-level, 5 cases) and
+`TestExtractORFDoesNotOverreadOnStableLargeFraction` (corpus-gated) in
+`format/tiff/task293_test.go`.
+
+**Follow-up fix: `exif.writeIFD`/`writeIFDBigTIFF` no longer double-buffer the out-of-line
+value area.** Both functions previously built a separate `valueArea` slice and then copied
+it into the caller's output buffer via `append(out, valueArea...)` — paying for the value
+area's full byte count TWICE (once to build it, once to copy it in), negligible against a
+whole-file write buffer but the dominant remaining allocation once the fixes above shrank
+every TIFF-family format's Write buffer to metadata-prefix scale. Discovered via
+`go tool pprof -alloc_space` on `BenchmarkWrite/rw2` showing 49.6% of B/op attributed
+directly to the `valueArea = append(valueArea, e.Value...)` line. Fixed by splitting each
+function into two per-entry passes over the SAME entries slice: pass 1 fills the fixed
+12-/20-byte entry records and computes the value area's exact final length (identical
+alignment/sizing arithmetic to before); pass 2 grows `out` once by that exact length
+(`slices.Grow`) and appends every out-of-line value's bytes directly into it — eliminating
+the intermediate buffer entirely. Verified via a full 3,281-file corpus `wcmp` SHA-256
+sweep against f9a1c9c: byte-for-byte identical output (this function is shared by every
+format that embeds EXIF, not only the seven TIFF-family containers).
+
+`exif.AliasThumbnail()` (new `ParseOption`, unconditionally applied by `read.go`'s
+`parseEXIF`, since `raw` there is always `m.rawEXIF`, retained unmodified for
+`*Metadata`'s entire lifetime): `extractJPEGThumbnail` now aliases
+(`b[jifOff:end:end]`, cap-clamped) instead of copying the EXIF §4.5.5 JPEG thumbnail when
+opted in — eliminating a redundant `make`+`copy` of up to several hundred KB. Every
+MakerNote-internal `traverse(...)` call (~18 sites in `makernote_parse.go`) and the
+exported `ParseIFDAt` explicitly pass `false` (deliberately conservative: those parse a
+different, transient, or not-provably-retained buffer). Measured impact: ARW B/op
+935,341 → 602,233 (Sony's PreviewImage lives in the top-level IFD chain, reached by
+aliasing); NEF B/op barely moved (394,346 vs 394,324) because Nikon's own PreviewIFD
+thumbnail is embedded inside the MakerNote sub-structure, not reached by this round's
+scoping decision.
+
+Housekeeping (not a code bug): a stray untracked `format/tiff/testdata/corpus` symlink was
+found and removed — it broke `exif.TestEncodedSizeMatchesEncode`'s directory walk and
+spuriously corrupted 2 unrelated `TestConformance_R18_bigtiff_roundtrip_fidelity_corpus`
+sub-tests (both reproduced identically on `git stash`, i.e. present on f9a1c9c too — not a
+regression from this session's work).
+
+#### #292 (cr3: rebuild only moov, stream everything else)
+
+`cr3.Inject` no longer reads the whole file into one buffer and builds a second,
+equally-large output buffer. It now rebuilds only the `moov` box in memory and streams
+`ftyp`/pre-moov bytes and `mdat`+anything after `moov` from `r` to `w` verbatim through a
+new shared primitive, `iobuf.StreamCopyN` (`internal/iobuf/streamcopy.go` — a fixed 64 KiB
+pooled buffer, reused across the whole call), mirroring ExifTool's `WriteQuickTime.pl`
+"rewrite the moov atom, copy mdat straight through" model. `readTopLevelBox` now also
+returns the matched box's `(start, end)` byte range so `Inject` can compute the 3 stream
+regions from a single scan; the old CR2-EXTSIZE-01-style "re-derive header length" step in
+`injectIntoMoov` is gone entirely, since `readTopLevelBox`'s payload is already
+header-stripped.
+
+| Benchmark (Canon EOS R3.cr3, 12.28 MB) | ns/op f9a1c9c → cur | B/op f9a1c9c → cur |
+|---|---|---|
+| Write | 1.155m → 447µ (**−61.3%**, ratio 0.39×) | 24.75Mi → 217Ki (**−99.14%**, ~114×) |
+| RoundTrip | 1.154m → 476µ (**−58.7%**, ratio 0.41×) | 24.79Mi → 254Ki (**−99.00%**, ~97×) |
+
+AC (B/op ≤2 MiB, ns/op ≤0.6× f9a1c9c): **both exceeded by a wide margin**. `wcmp` SHA-256
+identical across all 12 CR3 corpus files; `pdump` digest identical. `FuzzCR3Inject` 60 s:
+21.8M execs, 0 crashes.
+
+#### #291 (tiff/raw: stream image-data blocks instead of buffering the whole file)
+
+`relocateTIFFFromParsed` (and its NEF/ARW/ORF/RW2-specific siblings) now return
+`(header []byte, blocks []*imageBlock, err error)` instead of a single `[]byte`: `header`
+is the encoded IFD structure + SubIFD raw bytes (bounded by metadata size, never file
+size); `blocks` carries each image block's already-assigned `newOffset` for the caller
+(`writeRelocated`, new file `relocate_stream.go`) to stream from `r` (via
+`iobuf.StreamCopyN`) or slice directly from an already-whole-file buffer, in slice order,
+immediately after `header` — reproducing the exact same byte stream the old single-buffer
+return used to produce.
+
+**Critical bug caught before any benchmark was recorded, via manual code-path tracing (not
+by a failing test — the existing 5-fixture-style test suite would not have caught it):**
+`enumerateIFDBlocks`/`extractParallelOffsetBlocks`/`appendJPEGBlock`'s bounds checks
+(`end > uint64(len(base))`, "does this declared block's range fit in the source buffer")
+were written when `base` was ALWAYS the whole file. Once `base` can be only a metadata
+PREFIX, this check would have REJECTED — with a hard `ErrBlockOutOfBounds` error, not a
+silent skip — every legitimate StripOffsets/TileOffsets/JPEGInterchangeFormat block in
+every real TIFF/DNG/CR2 write, since a real block routinely extends far beyond the prefix
+by design. Fixed by threading a `fileLen uint64` (the TRUE total file length, obtained via
+one `Seek(SeekEnd)` when the source is not already known to be whole) separately from
+`base` through the entire enumeration call graph
+(`enumerateImageBlocks`/`enumerateIFDBlocks`/`extractParallelOffsetBlocks`/
+`appendJPEGBlock`/`enumerateSubIFDs`/`enumerateSubIFDsAt`), used for the bounds check in
+place of `len(base)`.
+
+**Follow-up fix (closes the architectural gap reported above): NEF/ARW/ORF/RW2 now stream
+too, via on-demand fetch of exactly their own manufacturer-specific blob instead of the
+whole file.** Each format's own "special metadata blob" lives outside the standard
+IFD/SubIFD/out-of-line-array structure `extent.go`'s #289/#293 scanner walks: ARW's
+SR2Private (0xC634, an INLINE 4-byte pointer to a ~37 KB blob), NEF's Nikon
+MakerNote-embedded PreviewIFD (nested one level inside the MakerNote's own internal IFD),
+ORF's OLYMP-type MakerNote external ThumbnailImage (same pattern), and RW2's RawDataOffset
+(0x0118, an "extends to EOF" convention). Two design choices close the gap without ever
+buffering the whole file:
+- A new `extendBase(base, r, fileLen, targetLen) ([]byte, error)` (`relocate_extend.go`)
+  grows a metadata-prefix `base` to cover exactly `targetLen` bytes, fetching ONLY the
+  delta `[len(base), targetLen)` from `r` in a single `Seek`+`ReadFull` — never re-reading
+  bytes already held, never touching `r` at all when `base` already covers `targetLen` (the
+  common whole-file-already-resident case). Each manufacturer-specific extractor
+  (`extractSonySR2Info`, `extractNikonPreviewInfo`, `extractOlympMakerNoteInfo`) now calls
+  it with a small, generously-justified fixed margin (4–8 KiB) before parsing that format's
+  own private sub-structure, then a second, precise call once the sub-structure's own
+  declared length is known.
+- RW2's raw sensor DATA was already a standalone `*imageBlock` (streamed via the shared
+  `writeRelocated` mechanism) — its only bug was `extractRW2RawDataBlock` sizing the block
+  from `len(base)` (a prefix) instead of the true `fileLen`; fixed by threading `fileLen`
+  through the same call graph #291's earlier fix already established.
+
+Every bounds check across all four extractors that used to compare against
+`uint64(len(base))` — written when `base` was always the whole file — now compares against
+`fileLen` instead, mirroring the exact same class of fix #291's own critical bug (below)
+already applied to `enumerateIFDBlocks`/`extractParallelOffsetBlocks`/`appendJPEGBlock`.
+`write.go`'s `writeTIFFNEF`/`ARW`/`ORF`/`RW2` now call `tiffPrefixBytes` (the same
+prefix-or-whole-file resolver TIFF/CR2/DNG already used) instead of unconditionally reading
+the whole file; `originalTIFFBytes` — now dead code with zero remaining callers — is
+removed.
+
+**Follow-up fix (coordinator-requested precise attribution of the NEF/ARW/DNG Read
+allocs/op delta vs ce1dc82, the pre-#289 whole-file-read baseline): `scanExtentPass` no
+longer allocates a fresh `*extentScan`/`seenIFD` map on every growth pass.** A
+`-diff_base` pprof comparison (`memprofilerate=1`, `-focus=GoMetadata`) between a ce1dc82
+worktree and this tree isolated `scanExtentPass`'s own `s := &extentScan{...,
+seenIFD: make(map[uint64]bool, 16)}` as the single largest new allocation source —
+invisible before this batch's other fixes, since it scales with GROWTH PASS COUNT
+(NEF/ARW typically need 2–3 passes to converge: 808 objects / 100 iterations = 8.08/op
+for NEF). `scanMetadataExtent` now allocates one `*extentScan` before its growth loop
+instead of one per pass; `scanExtentPass` resets the reused struct's `need`/`buf`/
+`order`/`bigTIFF` and `clear()`s (never reallocates) `seenIFD` before each pass — clearing
+is required for correctness, not just performance: a pass that stopped early (buffer too
+small) must let the next, larger-buffer pass revisit the same IFD offset from scratch, so
+a stale "seen" entry surviving from a prior pass would incorrectly skip it. Result: NEF
+allocs/op 26 → 22, ARW 28 → 24 (exact parity with ce1dc82), DNG 39 → 35, RW2 21 → 17, ORF
+27.2 → 24; TIFF/CR2 unchanged (11, 27 — both already converge in a single pass, so had
+nothing to save). See this task's own AC discussion below for the full per-format
+attribution of what remains.
+
+| Benchmark | ns/op f9a1c9c → cur (ratio) | B/op f9a1c9c → cur (ratio) | allocs f9a1c9c → cur |
+|---|---|---|---|
+| Write/tiff | 66.3µ → 18.6µ (0.281×) | 829.1Ki → 13.8Ki (**0.0166×, ~60×**) | 28.8 → 17.0 |
+| Write/cr2 | 2.636m → 868.6µ (0.330×) | 43.78Mi → 84.1Ki (**0.00188×, ~533×**) | 64.2 → 43.0 |
+| Write/dng | 2.297m → 987.4µ (0.430×) | 46.94Mi → 417.6Ki (**0.00869×, ~115×**) | 72.0 → 45.0 |
+| Write/nef | 3.868m → 1.559m (**0.403×**) | 80.51Mi → 303.6Ki (**0.00368×, ~272×**) | 71.0 → 47.0 |
+| Write/arw | 2.417m → 1.178m (**0.487×**) | 48.51Mi → 745.2Ki (**0.0150×, ~66.7×**) | 74.7 → 44.0 |
+| Write/orf | 801.1µ → 531.5µ (0.663×) | 14.01Mi → 1.457Mi (**0.104×, ~9.6×**) | 35.3 → 20.8 |
+| Write/rw2 | 1.575m → 753.3µ (0.478×) | 20.22Mi → 652.5Ki (**0.0315×, ~31.7×**) | 27.7 → 15.0 |
+| Read/tiff | 43.1µ → 44.8µ (1.041×) | 811.0Ki → 811.0Ki (~1.000×) | 10.0 → 11.0 |
+| Read/cr2 | 7.86µ → 7.33µ (0.932×) | 80.23Ki → 72.24Ki (0.900×) | 27.0 → 27.0 |
+| Read/dng | 16.0µ → 16.7µ (1.042×) | 202.9Ki → 226.9Ki (1.118×) | 38.0 → 35.0 |
+| Read/nef | 32.3µ → 18.6µ (0.576×) | 817.8Ki → 385.1Ki (0.471×) | 30.0 → 22.0 |
+| Read/arw | 37.4µ → 29.0µ (0.776×) | 849.4Ki → 588.1Ki (0.692×) | 29.0 → 24.0 |
+| **Read/orf** | **406.5µ → 59.5µ median, n=10 (0.146×, ~6.8×)** | **12.55Mi → 1.577Mi (0.126×, ~8.0×)** | 19.0 → 24.0 |
+| **Read/rw2** | **708.1µ → 26.2µ (0.037×, ~27×)** | **18.83Mi → 791.1Ki (0.041×, ~24×)** | 12.0 → 17.0 |
+| RoundTrip/tiff | 109.3µ → 76.3µ (0.698×) | 1.608Mi → 833.2Ki (0.506×) | 58.0 → 49.5 |
+| RoundTrip/cr2 | 2.654m → 895.9µ (0.338×) | 43.85Mi → 159.0Ki (**0.00354×, ~282×**) | 105.0 → 82.0 |
+| RoundTrip/dng | 2.327m → 984.7µ (0.423×) | 47.14Mi → 651.1Ki (**0.0135×, ~74.1×**) | 121.8 → 94.0 |
+| RoundTrip/nef | 3.870m → 1.580m (0.408×) | 81.31Mi → 694.4Ki (**0.00834×, ~120×**) | 114.7 → 85.0 |
+| RoundTrip/arw | 2.432m → 1.361m (0.560×) | 49.35Mi → 1.304Mi (**0.0264×, ~37.9×**) | 118.8 → 83.5 |
+| RoundTrip/orf | 1.295m → 614.0µ (0.474×) | 26.56Mi → 3.036Mi (**0.114×, ~8.75×**) | 68.8 → 60.0 |
+| RoundTrip/rw2 | 2.296m → 784.1µ (0.341×) | 39.04Mi → 1.399Mi (**0.0358×, ~27.9×**) | 57.5 → 51.3 |
+
+Methodology: `go test -bench . -benchmem -count=6`, `mod-cur` (this session's tree, replace
+directive to the working copy) vs `mod-head` (a pristine `src-head` snapshot verified
+byte-identical to `f9a1c9c` via `git show f9a1c9c:<file> | diff`), same scratch `e2e`
+harness/corpus samples as prior rounds, Apple M4.
+
+AC scorecard — **all of task #291's Write B/op ≤2 MiB target now met, for all 7
+TIFF-family formats** (max is Write/orf at 1.457 MiB); **NEF/ARW ns/op ≤0.6× f9a1c9c: both
+met** (0.403×, 0.487×). Task #293's Read/{orf,rw2} AC (≤60 µs, ≤2 MiB/op): **RW2 fully met**
+(28.3 µs, 773 KiB). **ORF re-measured, interleaved `count=10`, after the allocs/op fix
+below** (which also reduces ORF's own allocs 27.2 → 24): sorted samples (µs) `57.6, 58.6,
+59.0, 59.0, 59.5, 59.6, 59.9, 61.1, 61.2, 61.2`; **median 59.5 µs (meets the ≤60 µs AC)**,
+mean 59.65 µs, 95% CI (t, df=9) **[58.78, 60.53] µs** — the CI's upper bound sits
+marginally above 60 µs, so this is "meets on the median, right at the boundary on the
+tail" rather than a CI-clean pass; B/op 1.577 MiB (meets ≤2 MiB with margin). A CPU
+profile of `BenchmarkRead/orf` (`-cpuprofile`, 2000 fixed iterations) attributes the real,
+non-runtime-noise time to `runtime.memclrNoHeapPointers` inside `growBuffer`'s
+`make([]byte, targetLen)` and the underlying `read()` syscall — the unavoidable cost of
+allocating and reading the ~1.5 MB Olympus MakerNote blob this camera embeds as a single
+opaque out-of-line value; no further reduction is possible without excluding bytes
+`exif.Parse` itself would parse as real, spec-legal metadata (forbidden by the 100%
+EXIF-compliant mandate).
+
+**NEF/ARW/DNG allocs/op vs the requested ce1dc82-measured targets 20/24/32 — precisely
+attributed via `-diff_base` pprof (`memprofilerate=1`, `-focus=GoMetadata`) between a
+ce1dc82 worktree and this tree, then closed where the delta was this sprint's own
+avoidable cost.** Initial numbers (NEF 26, ARW 28, DNG 39 — over by 6/4/7) were
+attributed to two classes of call site:
+- **Avoidable, fixed:** `scanExtentPass` allocated a fresh `*extentScan` (holding a
+  `seenIFD map[uint64]bool`) on EVERY growth pass, instead of once per `Extract` call —
+  invisible before this batch's other fixes shrank everything else, but the single
+  largest new allocation source once they did (808 objects / 100 iterations = 8.08/op for
+  NEF, which typically needs 2–3 passes to converge). Fixed by hoisting one `*extentScan`
+  out of `scanMetadataExtent`'s growth loop and having `scanExtentPass` reset its state
+  (`need`, `buf`/`order`/`bigTIFF`, and — via `clear`, not reallocation — `seenIFD`)
+  before each pass instead of allocating a new one; `clear`ing `seenIFD` between passes
+  (rather than letting a prior pass's entries persist) is required for correctness, not
+  just an optimisation — a pass that stopped early must let the next, larger-buffer pass
+  revisit the same IFD from scratch. Result: NEF 26 → **22**, ARW 28 → **24** (exact
+  parity with ce1dc82), DNG 39 → **35**.
+- **Inherent, reported not removed:** `format/tiff.growBuffer` (+1.01/op) and
+  `format/tiff.readInitialPrefix` (+1.01/op) are the initial-prefix-read and
+  buffer-grow `make()` calls that ARE the metadata-prefix architecture — the direct price
+  of the ~90–99% B/op reduction #289/#291 exist for, not overhead to eliminate.
+  `scanMetadataExtent`'s own one-time `*extentScan`+map allocation (~4.04/op after the fix
+  above, down from ~8.08/op, no longer scaling with pass count) is likewise inherent to
+  cycle-safe IFD-chain walking; a linear-scan-slice replacement for the map was
+  considered and rejected — `seenIFD` is shared across the IFD0 chain AND every
+  ExifIFD/GPSIFD/InteropIFD/SubIFD branch in one scan, so its worst-case size is bounded
+  by the PRODUCT of several independent per-branch caps (`maxExtentTraverseIFDs` × SubIFD
+  count), not a small constant; a linear scan against that theoretical worst case risks
+  O(n²) CPU for a crafted file, a correctness/safety regression this project's own
+  priority order (correct → safe → fast) forbids trading for a small further allocs/op
+  win. These, plus several DECREASES this sprint's removal of the old whole-file-read
+  path already produces for free (`internal/iobuf.ReadAll`, `exif.traverse`,
+  `format.Detect`, `xmp.Parse`/`parseRDF`, `format.parseTIFFScanHeader`), net out to the
+  remaining **NEF +2 (22 vs 20), DNG +2–3 (35 vs 32–33; the ce1dc82 baseline itself
+  measured 33, not exactly 32, under this round's own methodology), ARW +0 (24 vs 24,
+  exact parity — ARW additionally benefits from `exif.AliasThumbnail`'s own −2.02/op,
+  since Sony's PreviewImage thumbnail lives in the top-level IFD chain this alias reaches,
+  fully offsetting the architecture's own added cost for this format specifically)**.
+  Regression-tested (build/vet/full suite/-race/lint/full corpus `wcmp`+`pdump`
+  byte-identical/7 Extract-side fuzz targets 60 s each) after the fix; see
+  `format/tiff/extent.go`'s `scanExtentPass`/`scanMetadataExtent` doc comments for the
+  full citation.
+
+Full corpus (3,281 files, every supported format) `wcmp` SHA-256 comparison against
+f9a1c9c: **zero unexplained divergence.** The only differences are the 74 already-explained
+PNG `READERR`→`WRITEERR`/graceful-read pairs (#294's own documented behaviour change on
+genuinely truncated fuzz-PoC fixtures) and a newly-discovered, pre-existing (reproduces
+identically on 3 separate runs of the UNMODIFIED f9a1c9c binary, so unrelated to any change
+in this session) non-determinism in 7 corpus JPEGs with very large embedded Google
+Photo-Sphere/Depth-Map XMP payloads (`exiv2-bug922.jpg` and its `_2`/`_3` copies,
+`Android Depth Map.jpg`, `Google Cardboard.jpg` and its `_2` copy) — `Write`'s output SHA-256
+differs run-to-run for these 7 files on both f9a1c9c and this session's tree alike, almost
+certainly a map-iteration-order issue in XMP serialisation; **reported to the coordinator,
+not fixed, per Scope Discipline** (out of scope for #291/#293). `pdump` parsed-digest
+comparison: zero unexplained divergence (the same 74-line PNG explanation, nothing else).
+
+`golangci-lint` surfaced and fixed, as part of this batch's own gate (not pre-existing):
+two now-dead parameters (`relocatedLen`'s `blocks` — always `nil` after the split;
+`extractParallelOffsetBlocks`/`enumerateIFDBlocks`/`enumerateImageBlocks`'s `base` — no
+longer read once bounds checks moved to `fileLen`) were removed rather than left as
+unused-but-harmless, per `unparam`'s finding.
+
+### 60-second fuzz clean (Batch G, 2026-09-26)
+
+`FuzzPNGExtract`, `FuzzORFExtract`, `FuzzRW2Extract`, `FuzzCR3Extract`, `FuzzCR3Inject`,
+`FuzzTIFFExtract`, `FuzzTIFFInject`, `FuzzCR2Inject`, `FuzzNEFInject`, `FuzzARWInject`,
+`FuzzDNGInject`, `FuzzORFInject`, `FuzzRW2Inject`, and `FuzzParseEXIF` (exif package, since
+`exif/exif.go`/`exif/ifd.go`/`exif/makernote_parse.go` were touched for
+`AliasThumbnail`) — each run standalone for 60 s against the final, post-fix code; zero
+crashers across all 13 targets.
+
+### 60-second fuzz clean (Batch G coordinator follow-up, 2026-09-26)
+
+The same 14 targets the coordinator's own follow-up request named (`FuzzParseEXIF`,
+`FuzzTIFFExtract`, `FuzzTIFFInject`, `FuzzCR2Inject`, `FuzzNEFInject`, `FuzzARWInject`,
+`FuzzDNGInject`, `FuzzORFExtract`, `FuzzORFInject`, `FuzzRW2Extract`, `FuzzRW2Inject`,
+`FuzzCR3Extract`, `FuzzCR3Inject`), plus 4 more added on this session's own risk
+assessment (`FuzzJPEGInject`, `FuzzPNGInject`, `FuzzWebPInject`, `FuzzHEIFInject`): the
+`exif.writeIFD`/`writeIFDBigTIFF` double-buffer fix is reached from `encodeEXIF`
+(`write.go`), the single shared entry point every format's `Write` uses whenever `m.EXIF`
+was modified — not only the seven TIFF-family formats `relocate_extend.go`/`extent.go`
+touch — so these four were added for defense-in-depth given that wider blast radius. Each
+run standalone for 60 s (`go test -fuzz=<Name> -fuzztime=60s ./<pkg>/...`) against the
+tree at that point (on-demand manufacturer-blob fetch, `clampNeed`'s large-fraction snap
+removed, `writeIFD`/`writeIFDBigTIFF` double-buffer elimination, all three applied):
+**zero crashers across all 18 targets** (execs/target ranged from ~1.1M to ~22M in the
+60 s budget).
+
+### 60-second fuzz clean (Batch G, `scanExtentPass` allocs/op fix, 2026-09-26)
+
+The 7 Extract-side targets deferred from the round above (`FuzzTIFFExtract`,
+`FuzzCR2Extract`, `FuzzNEFExtract`, `FuzzARWExtract`, `FuzzDNGExtract`, `FuzzORFExtract`,
+`FuzzRW2Extract`) — the direct callers of `scanMetadataExtent`/`scanExtentPass` — each run
+standalone for 60 s against the tree with the `*extentScan` reuse fix applied: **zero
+crashers across all 7 targets** (execs/target ranged from ~958K to ~20M). This closes the
+JPEG/PNG/WebP/HEIF/remaining-RAW-Extract fuzz gap the prior round's note above left open,
+specifically for the function this fix touches.
+
+### Security fix: BigTIFF off+size overflow panic in the copy-and-relocate write path (2026-09-26)
+
+A security audit of Batch G surfaced a **CRITICAL, pre-existing** (bisected to 0ebf5d4,
+long before Sprint 44 — not a Batch G regression) crash: several bounds checks in the
+TIFF-family copy-and-relocate write path computed `end := off + size` as a raw, unchecked
+`uint64` addition, then compared `end > fileLen`. A BigTIFF file declaring
+StripOffsets/StripByteCounts (or a SubIFD entry's value area) as LONG8 (8-byte) fields can
+set `off = MaxUint64-1, size = 10` — the raw addition wraps to `8`, which then incorrectly
+passes as "in bounds" against any `fileLen`. The resulting out-of-range `imageBlock` then
+panics on a Go slice expression (`prefix[blk.srcOffset:end]` — `slice bounds out of range
+[18446744073709551614:8]`), reachable from untrusted input via `Write`/`WriteFile` on any
+BigTIFF source.
+
+Fixed by routing every such comparison through a single shared, overflow-safe helper
+(`internal/boundscheck.Fits`, extracted from `format/tiff/extent.go`'s pre-existing `fits`
+— that function is now a one-line delegate, so every existing call site and doc-comment
+citation in that file needed no further change) instead of re-deriving the check ad hoc at
+each site. Sites fixed, found by grepping the whole `format/tiff` relocate/stream/extend
+code plus `exif`'s own write/read paths for the same `off+size`/`off+len` pattern:
+
+- `format/tiff/relocate.go`: `appendJPEGBlock`, `extractParallelOffsetBlocks` (the
+  coordinator-cited site), and `extractRawIFD` (split into a new `rawEntryValueEnd` helper
+  to keep cyclomatic complexity within budget; defense-in-depth — this site's own
+  `totalLen`/`off` invariants already prevented it from being reachable as a crash, but the
+  raw addition was still wrong on its own terms).
+- `format/tiff/relocate_stream.go`: `writeRelocated` (the coordinator-cited site —
+  `wholeFile==true`'s `prefix[blk.srcOffset:end]` panic).
+- `format/tiff/relocate_bigtiff.go`: `ifdEntryTable`, `readRawEntryAt` (defense-in-depth),
+  `decodeOffsetArray`, and `parseIFDAtBigTIFF` — the latter two also needed an
+  overflow-safe **multiplication** guard (`count > maxU64/elemSz`) before the addition,
+  since `count` is itself an attacker-controlled BigTIFF LONG8 field.
+- `exif/ifd.go`: `extractJPEGThumbnail` — a **newly discovered, independently reachable**
+  instance of the same class, on the **Read** path (not Write): a BigTIFF
+  `JPEGInterchangeFormat` entry stored as `TypeLong8` supplies an offset up to `MaxUint64`,
+  reachable from any top-level `Read`/`ReadFile` of a crafted file — no `Write` call
+  required. `internal/boundscheck` is a new dependency-free leaf package specifically so
+  `exif` (which `format/tiff` imports, precluding the reverse) can share the identical
+  check without a second, hand-derived copy.
+
+Regression test: `format/tiff/security_bigtiff_overflow_test.go`
+(`TestSecurityBigTIFFStripOverflowNoPanic`) exercises the exact PoC (StripOffsets =
+`MaxUint64-1`, StripByteCounts = `10`, both LONG8/inline) through both of
+`writeRelocated`'s branches (`wholeFile` true and false) and both byte orders — confirmed
+to reproduce the identical panic when temporarily reverted (`slice bounds out of range
+[18446744073709551614:8]`), and to return `ErrBlockOutOfBounds` cleanly with the fix
+restored. The same PoC bytes were added as `FuzzTIFFInject` seeds (LE and BE).
+
+Verification: build/vet/full test suite/-race (whole repo, including a `t.Parallel()` data
+race in the new test itself — `exif.EXIF` is not safe for concurrent mutation, #245 — found
+and fixed during this same pass)/staticcheck/golangci-lint (5 pre-existing
+baseline)/govulncheck all clean. Full 3,281-file corpus `wcmp` SHA-256 vs f9a1c9c: zero
+unexplained divergence (same known 136-line baseline). All 7 TIFF-family `*Inject` fuzz
+targets (TIFF/CR2/NEF/ARW/DNG/ORF/RW2), 60 s each: zero crashers.
+
+### Sprint 44 cumulative (ce1dc82 → this session's final tree, updated for task #297, 2026-09-26)
+
+`ce1dc82` is the commit immediately preceding Sprint 44's first performance task — the
+last state before any of tasks #198–#297 landed, and the same baseline task #293's
+original allocs/op targets (20/24/32) were measured against. This table is the full-sprint
+counterpart to every per-batch table above: same scratch `e2e` harness, same corpus
+samples, `count=6` (interleaved via `go test -bench . -count=6`), Apple M4. Full benchstat
+output: `scratchpad/profiling-r2/raw/final_ce1dc82_vs_batchH.txt` (not part of the git
+repository — session-local scratch; supersedes the pre-#297
+`final_ce1dc82_vs_batchG.txt` capture from the same directory).
+
+**Overall geomean across the full suite (`Read`, `ReadAccess`, `AccessOnly`, `ReadFile`,
+`Write`, `RoundTrip` — every sample, every format):** ns/op **-73.54%** (0.265×), B/op
+**-85.68%**¹, allocs/op **-27.07%**¹ — all three improved further over the pre-#297
+capture (-71.25% / -85.63% / -25.12%), entirely from Write's own gains below; Read's own
+ns/op is unchanged by #297 (parseEXIF's fix is allocation-only, not time-only, and
+StreamCopyN is Write-only).
+
+¹ benchstat flags these two geomeans with "summaries must be >0 to compute geomean": a
+few `AccessOnly` samples (pure struct-field reads, no I/O) report exactly 0 B/op, which a
+strict geomean cannot include — the percentage itself is still benchstat's own computed
+delta over the includable rows, not an estimate.
+
+| Format | Read ns/op ce1dc82→final | Read B/op ce1dc82→final | Write ns/op ce1dc82→final | Write B/op ce1dc82→final |
+|---|---|---|---|---|
+| jpeg (canon7d) | 20.96µ→17.33µ (−17.3%) | 57.30Ki→46.44Ki (−19.0%) | 18.81µ→18.34µ (−2.5%) | 31.67Ki→30.82Ki (−2.7%) |
+| jpeg (iphone11) | 3.711µ→3.151µ (−15.1%) | 28.20Ki→17.50Ki (−37.9%) | 127.8µ→126.5µ (~) | 18.86Ki→16.44Ki (−12.8%) |
+| jpeg (exiftool) | 11.211µ→9.867µ (−12.0%) | 13.84Ki→13.85Ki (~) | 7.523µ→7.505µ (~) | 7.712Ki→7.072Ki (−8.3%) |
+| png | 18.770µ→2.863µ (**−84.8%**) | 3.753Ki→2.886Ki (−23.1%) | 109.52µ→29.06µ (**−73.5%**) | 7.722Ki→6.770Ki (−12.3%) |
+| webp | 13.74µ→12.02µ (−12.5%) | 83.00Ki→77.01Ki (−7.2%) | 58.71µ→54.81µ (−6.7%) | 640.7Ki→611.6Ki (−4.5%) |
+| heic | 3.708µ→3.699µ (~) | 1.421Ki→1.437Ki (~) | 127.3µ→131.4µ (+3.2%) | 2.124Mi→2.124Mi (~) |
+| avif | 912.0n→915.4n (~) | 353.0→369.0 (~) | 29.62µ→29.14µ (−1.6%) | 288.2Ki→288.1Ki (~) |
+| tiff | 42.31µ→39.55µ (−6.5%) | 811.1Ki→811.1Ki (~) | 95.56µ→16.85µ (**−82.4%**) | 1640.4Ki→13.79Ki (**−99.2%, ~119×**) |
+| cr2 | 807.8µ→7.510µ (**−99.1%**) | 22393.7Ki→72.23Ki (**−99.7%**) | 2790.6µ→547.1µ (**−80.4%**) | 67194.5Ki→83.98Ki (**−99.9%, ~800×**) |
+| cr3 | 905.6µ→1.661µ (**−99.8%**) | 24675.4Ki→33.55Ki (**−99.9%**) | 1714.2µ→232.7µ (**−86.4%**) | 36853.5Ki→211.3Ki (**−99.4%, ~174×**) |
+| nef | 1395.7µ→19.01µ (**−98.6%**) | 39730.8Ki→384.4Ki (**−99.0%**) | 4.349m→956.6µ (**−78.0%**) | 134389.6Ki→265.3Ki (**−99.8%, ~507×**) |
+| arw | 866.5µ→28.41µ (**−96.7%**) | 24554.8Ki→587.4Ki (**−97.6%**) | 2.180m→819.8µ (**−62.4%**) | 49781.5Ki→744.7Ki (**−98.5%, ~66.8×**) |
+| dng | 843.8µ→16.73µ (**−98.0%**) | 23836.4Ki→226.3Ki (**−99.1%**) | 2073.1µ→590.7µ (**−71.5%**) | 48049.9Ki→402.2Ki (**−99.2%, ~120×**) |
+| orf | 819.0µ→58.89µ (**−92.8%**) | 25.102Mi→1.576Mi (**−93.7%**) | 1617.6µ→322.6µ (**−80.1%**) | 39.106Mi→1.455Mi (**−96.3%, ~26.9×**) |
+| rw2 | 1218.2µ→26.76µ (**−97.8%**) | 38534.5Ki→772.6Ki (**−98.0%**) | 3027.8µ→469.3µ (**−84.5%**) | 81209.8Ki→652.0Ki (**−99.2%, ~125×**) |
+
+All deltas `p<0.05` (Mann-Whitney, `n=6` each side) except where marked `~` (benchstat's
+own "no statistically significant difference" marker). Read columns are essentially
+unchanged from the pre-#297 capture (that task touches only Write's copy mechanism and
+Read's allocation shape, not Read's timing) — Write columns for the seven TIFF-based
+RAW/DNG/CR2 formats and CR3 improved further still (62–86% Write time reduction, up from
+32–75% pre-#297): task #297's single-copy `StreamCopyN` fast path removes the SECOND of
+the two copies these formats' own image-data streaming already reduced to (from
+"buffer the whole file" pre-#291) once the sink is the in-memory `*bytes.Buffer` this
+harness (and any caller writing to an in-memory sink) uses. JPEG/PNG/WebP/HEIF/AVIF's
+smaller (or `~`) Write deltas reflect that neither `StreamCopyN` (they don't stream
+image-data blocks the way the TIFF-family/CR3 do) nor `parseEXIF`'s allocation fix (which
+doesn't change ns/op) meaningfully move their own Write time; HEIF's own `+3.2%` sits
+within this table's normal run-to-run noise band for a benchmark this fast (127µs, `±0-2%`
+typical spread) rather than a real regression — no code this task or Batch G touched is on
+HEIF's own write path.
+
+## Batch H (task #297) — 2026-09-26 (iobuf: single-copy StreamCopyN; alloc-free EXIF parse options)
+
+Profiling round 3 (the prototype at `scratchpad/profiling-r3/srcx`, a generic
+"use `io.CopyN` whenever the sink implements `io.ReaderFrom`") measured −31% to −48% Write
+time with an in-memory sink but 31–38% SLOWER file-to-file on darwin — `(*os.File).ReadFrom`
+falls back to `io.Copy`'s own small internal buffer instead of this package's larger, pooled
+one. Task #297 narrows the optimisation to two specific, safe-to-detect endpoint types
+instead of the generic interface check the prototype used.
+
+#### `internal/iobuf.StreamCopyN` (85–99% of RAW/CR3 Write CPU per the round-3 profile)
+
+`streamCopyNFast` (new, `internal/iobuf/streamcopy.go`) intercepts two cases before
+`StreamCopyN` falls through to its original pooled-buffer loop, unchanged for every other
+`(r, w)` pair:
+
+- **`w` is `*bytes.Buffer`**: `(*bytes.Buffer).ReadFrom` reads directly into the buffer's
+  own backing array (after `Grow`, so `ReadFrom`'s own internal growth never re-allocates)
+  — one copy instead of the pooled loop's two (`ReadFull` into scratch, then `Write` copies
+  scratch into the buffer's array again). Bounded to exactly `n` bytes via a **pooled**
+  `*io.LimitedReader` (`limitedReaderPool`, mirroring `internal/iobuf`'s own `Get`/`Put`
+  pattern for `[]byte`) — constructing one fresh per call and passing it to `ReadFrom` as an
+  `io.Reader` interface value always heap-escapes (confirmed via
+  `go build -gcflags="-m -m"`: `(*bytes.Buffer).ReadFrom`'s own escape summary treats its
+  `io.Reader` parameter as escaping, even though `ReadFrom` never actually retains it beyond
+  the call), so pooling amortises that allocation to a pool miss instead of every call.
+- **`r` is `*bytes.Reader` and `n` equals its own remaining length**:
+  `(*bytes.Reader).WriteTo` writes a zero-copy slice of its own backing array
+  (`r.s[r.i:]`) directly to `w` in one call — the exact "slice obtained without copying"
+  the task named. Deliberately narrower than "any `n` up to `r.Len()`": `bytes.Reader`
+  exposes no public way to bound `WriteTo` to fewer than all of its remaining bytes without
+  copying (its internal `s`/`i` fields are unexported, and wrapping it in `io.LimitedReader`
+  or `io.NewSectionReader` — both considered — loses the fast path entirely, since neither
+  implements `io.WriterTo` and `io.SectionReader` has no `WriteTo` method in this Go
+  version), so the fast path only applies to the (common, in this project's own "stream
+  everything from here to EOF" call sites — CR3's `mdat`+trailer, RW2's
+  `RawDataOffset`-to-EOF, PNG's trailing pass-through) case where the two already coincide.
+  Multi-block call sequences against the same underlying `*bytes.Reader` compose correctly
+  regardless of which individual call takes which path (proven by
+  `TestStreamCopyNBytesReaderSourcePartial`).
+
+Verified allocation-neutral via `testing.AllocsPerRun` in the committed suite
+(`TestStreamCopyNBytesReaderSourceNoAddedAllocation`,
+`TestStreamCopyNBytesBufferSinkNoAddedAllocation`): both report `<= 1` alloc/op, that one
+being the caller's own `bytes.NewReader` construction, not anything inside `StreamCopyN`
+itself.
+
+#### `parseEXIF` (`read.go`) — +1 alloc/op on every EXIF Read
+
+`exif.SkipMakerNote`/`AcceptRAWMagic`/`AliasThumbnail` are each a single closure literal —
+non-capturing except `AcceptRAWMagic`, which captures its `magic` argument by value — that
+Go's compiler normally represents as a static, non-allocating value. Once inlined into
+`parseEXIF` (confirmed via `go build -gcflags="-m -m"`: "inlining call to
+exif.AliasThumbnail" etc.), escape analysis reached a DIFFERENT conclusion for the
+INLINED closure literal appended into `[]exif.ParseOption`, forcing a heap allocation on
+every call — a Go compiler quirk where inlining defeats the "non-capturing closure is
+static" optimisation specifically for the "closure fed into `append`/variadic" pattern.
+Fixed two ways, together:
+
+1. All three exif option constructors (`exif/exif.go`) are now marked `//go:noinline` —
+   preventing inlining restores the static-closure optimisation at its own, un-inlined
+   call site, with zero change to their public signatures or behaviour.
+2. `parseEXIF` assembles its options via a fixed-size `[3]exif.ParseOption` array with
+   direct indexed assignment, not `append(nil, ...)` — a structurally-guaranteed
+   non-escaping construction rather than one relying solely on escape analysis proving a
+   growing nil-slice's backing array doesn't escape.
+
+Both changes together eliminate every "func literal escapes to heap" / "moved to heap:
+opts" diagnostic for `parseEXIF` (confirmed via `go build -gcflags="-m -m"` before and
+after). No public API change: `exif.ParseOption`'s type and every constructor's signature
+are untouched.
+
+#### AC results
+
+| Benchmark | a03b320 → task #297 (ns/op) | ratio | allocs/op a03b320 → #297 |
+|---|---|---|---|
+| Write/cr2 | 908.4µ → 556.6µ | **−38.73%** | 43 → 43 (equal) |
+| Write/cr3 | 472.9µ → 231.9µ | **−50.95%** | 18 → 18 (equal) |
+| Write/nef | 1581.8µ → 953.1µ | **−39.74%** | 47 → 47 (equal) |
+| Write/dng | 981.3µ → 598.3µ | **−39.04%** | 45 → 45 (equal) |
+| Write/orf | 522.4µ → 320.0µ | **−38.75%** | 21 → 21 (equal) |
+| Write/rw2 | 749.1µ → 467.9µ | **−37.54%** | 15 → 15 (equal) |
+| Write/arw (bonus, not AC-named) | 1211.8µ → 823.1µ | −32.08% | 44 → 44 (equal) |
+
+**All six AC-named formats exceed the ≥30% target** (range 37.5–51.0%), **with allocs/op
+identical to a03b320 for every one** (benchstat: "all samples are equal" on every row).
+
+`BenchmarkWriteFileSink` (new, file→file via `*os.File` both ends — added to the scratch
+`e2e` harness specifically to prove the narrowed fast path never regresses this package's
+original, still most common caller): every one of the 15 samples showed `~` (no
+statistically significant difference) or a small improvement; **none regressed**, let alone
+by the ≤+3% tolerance. `allocs/op` likewise unchanged (a handful of samples show a
+sub-1-alloc, non-significant blip attributable to run-to-run noise, not a real difference).
+
+`BenchmarkRead/tiff` and `BenchmarkRead/jpeg_exiftool` allocs/op: **10 and 39** respectively
+— exactly the AC-specified targets, confirmed via the scratch `e2e` harness
+(`E2E_ONLY=tiff`/`E2E_ONLY=jpeg_exiftool`, `count=3`).
+
+Full corpus (3,281 files) `wcmp` SHA-256 comparison against a03b320: 24 diff lines, **zero
+unexplained** (the same pre-existing 7-file JPEG XMP write non-determinism already
+documented under Batch G — reproduces identically on a03b320 itself, not a #297
+regression). `pdump` parsed-digest comparison: **zero diff lines** (task #297 touches only
+the write-side copy mechanism and read-side option construction, never parsed content).
+
+Full gate: build/vet/full test suite/-race (whole repo)/staticcheck/golangci-lint (4
+pre-existing baseline)/govulncheck all clean. Fuzz, 60 s each, zero crashers:
+`FuzzRead` (root — exercises `parseEXIF`), `FuzzTIFFInject`, `FuzzCR2Inject`,
+`FuzzNEFInject`, `FuzzARWInject`, `FuzzDNGInject`, `FuzzORFInject`, `FuzzRW2Inject`,
+`FuzzCR3Inject` (the 8 formats whose write path reaches `iobuf.StreamCopyN`).
+
+**Security note for a quick look**: no new untrusted-input-facing code path — `StreamCopyN`
+still moves the same bytes with the same short-read/error semantics (`io.ErrUnexpectedEOF`
+on a short read from either fast path, matching `io.ReadFull`'s convention the pooled path
+already used); the fast-path type assertions (`w.(*bytes.Buffer)`, `r.(*bytes.Reader)`) are
+concrete-type checks against exported stdlib types, not interface dispatch on
+caller-controlled data. `//go:noinline` and the fixed-size options array are pure
+allocation-shape changes with no behavioural difference. Both changes were run through the
+same full gate (fuzz, race, corpus-wide byte-identical `wcmp`) as every other change in this
+sprint.
+
 ## [main — perf task #198] — 2026-06-10 (exif: parse-level arena for sub-IFDs)
 
 ### Optimisations applied in this version

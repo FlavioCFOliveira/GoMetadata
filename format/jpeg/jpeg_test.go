@@ -1723,6 +1723,24 @@ func BenchmarkJPEGInject(b *testing.B) {
 	}
 }
 
+// BenchmarkJPEGInject_NoAPP13 measures Inject on a source JPEG that carries
+// no Photoshop APP13 segment at all, injecting a brand-new IPTC block. Task
+// #217: the pre-scan that exists to preserve Photoshop sibling resources
+// (#174) must not pay for clones it cannot possibly need on a file with no
+// APP13 to preserve.
+func BenchmarkJPEGInject_NoAPP13(b *testing.B) {
+	tiffData := minimalTIFFBytes()
+	jpeg := buildJPEG(tiffData, nil, nil)
+	newIPTC := []byte{0x1C, 0x02, 0x78, 0x00, 0x03, 'N', 'e', 'w'}
+	b.SetBytes(int64(len(jpeg)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		var out bytes.Buffer
+		_ = Inject(bytes.NewReader(jpeg), &out, tiffData, newIPTC, nil, true)
+	}
+}
+
 func BenchmarkJPEGExtract_Real(b *testing.B) {
 	data, err := os.ReadFile("../../testdata/corpus/jpeg/exiftool/ExifTool.jpg")
 	if err != nil {

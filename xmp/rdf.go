@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+	"unsafe"
 )
 
 // nsEntry maps an XML namespace prefix to its URI.
@@ -18,9 +19,29 @@ type nsEntry struct {
 }
 
 // xmpAttr represents a single parsed XML attribute (excluding xmlns declarations).
+//
+// #211: loc is a zero-copy []byte sub-slice of the transient,
+// synchronous-parse-only input buffer (see transientAliasString's contract)
+// rather than a string, since most attributes (rdf:about, xmlns-adjacent
+// housekeeping, etc.) are only ever compared against string literals and
+// then dropped, never stored. Comparing string(a.loc) == "literal" is a Go
+// compiler zero-allocation optimisation; only the few attributes that are
+// actually stored as a property/struct-field key pay a string(a.loc)
+// conversion, at the point of storage — that conversion produces an
+// independent copy immediately (Go's string([]byte) always copies), which is
+// then passed to storeProperty, which interns it into XMP.arena if and when
+// it is actually kept.
+//
+// Safe because attrBuf (which holds xmpAttr values) is consumed synchronously
+// within parseStartTag, entirely before the next tag's scanAttrs call
+// overwrites the array slots — and because loc's backing bytes are always a
+// sub-slice of the CURRENT Parse call's transient input buffer, which remains
+// valid (unmutated, not yet reused) for the whole synchronous duration of
+// that call — long enough for every string(a.loc) conversion, all of which
+// happen before Parse returns, to read live, correct memory.
 type xmpAttr struct {
 	ns  string // resolved namespace URI
-	loc string // local name
+	loc []byte // local name — zero-copy slice into the parse buffer; see doc above
 	val string // attribute value (entities already unescaped)
 }
 
@@ -143,9 +164,23 @@ func (p *rdfParser) closeStruct() {
 
 // closeProp finalises a property element, flushing any accumulated rdf:li
 // values for collection properties before resetting all property tracking fields.
+//
+// #212: a single-item collection — the common case for
+// dc:description/dc:rights (a one-item rdf:Alt holding only x-default) and
+// dc:creator (frequently a one-item rdf:Seq) — is stored directly without
+// calling strings.Join, which would otherwise allocate a new string even
+// though there is nothing to join. The lone element in *p.liVals is already
+// an independently-owned heap string (built by onCharDataListItem, either via
+// unescapeXML or the lang-prefix builder), so storing it directly round-trips
+// identically to the joined single-element case. strings.Join is still used
+// for two-or-more items.
 func (p *rdfParser) closeProp() {
 	if p.inColl && len(*p.liVals) > 0 {
-		storeProperty(p.x, p.propNS, p.propLocal, strings.Join(*p.liVals, "\x1e"))
+		if len(*p.liVals) == 1 {
+			storeProperty(p.x, p.propNS, p.propLocal, (*p.liVals)[0])
+		} else {
+			storeProperty(p.x, p.propNS, p.propLocal, strings.Join(*p.liVals, "\x1e"))
+		}
 		*p.liVals = (*p.liVals)[:0]
 	}
 	p.inColl = false
@@ -229,12 +264,19 @@ func (p *rdfParser) onStartStructField(ns string, tagLocal []byte) {
 // the property context, so the resource is captured correctly.
 func (p *rdfParser) onStartProperty(ns string, tagLocal []byte, attrs []xmpAttr) {
 	p.propNS = ns
-	p.propLocal = string(tagLocal) // string() here: stored as map key
+	// #210: alias tagLocal transiently (see transientAliasString's contract)
+	// instead of copying independently. propLocal is used as a map key at
+	// various storeProperty call sites
+	// (directly, or concatenated into a struct-field key, which itself
+	// already produces an independent copy) — storeProperty interns it into
+	// XMP.arena at the point it is actually stored, so no eager copy is
+	// needed here.
+	p.propLocal = transientAliasString(tagLocal)
 	p.propDepth = p.depth
 	// XMP Part 1 §C.2.5: rdf:resource on the property element itself is a
 	// simple-value shorthand; store it immediately now that propDepth is set.
 	for _, a := range attrs {
-		if a.ns == NSrdf && a.loc == "resource" {
+		if a.ns == NSrdf && string(a.loc) == "resource" {
 			storeProperty(p.x, p.propNS, p.propLocal, a.val)
 			break
 		}
@@ -322,7 +364,7 @@ func (p *rdfParser) onStartListItem(attrs []xmpAttr) {
 		// tag (finding #180).  The 'xml' prefix is permanently pre-bound to
 		// "http://www.w3.org/XML/1998/namespace" by the XML specification and
 		// does not require an explicit xmlns:xml declaration.
-		if a.loc == "lang" && a.ns == "http://www.w3.org/XML/1998/namespace" {
+		if string(a.loc) == "lang" && a.ns == "http://www.w3.org/XML/1998/namespace" {
 			p.liLang = a.val
 			break
 		}
@@ -341,11 +383,11 @@ func (p *rdfParser) onStartListItem(attrs []xmpAttr) {
 // Compliance: XMP Part 1 §C.2.5 / §C.2.6.
 func (p *rdfParser) applyAttrShorthands(attrs []xmpAttr) {
 	for _, a := range attrs {
-		if a.ns == NSrdf && a.loc == "parseType" && a.val == "Resource" {
+		if a.ns == NSrdf && string(a.loc) == "parseType" && a.val == "Resource" {
 			p.inStruct = true
 			p.structDepth = p.depth
 		}
-		if a.ns == NSrdf && a.loc == "resource" && p.propDepth > 0 && p.depth == p.propDepth {
+		if a.ns == NSrdf && string(a.loc) == "resource" && p.propDepth > 0 && p.depth == p.propDepth {
 			storeProperty(p.x, p.propNS, p.propLocal, a.val)
 		}
 	}
@@ -421,7 +463,9 @@ func (p *rdfParser) onStartStructValueNode(attrs []xmpAttr) {
 		if a.ns == "" || a.ns == NSrdf || a.ns == NSx {
 			continue
 		}
-		storeProperty(p.x, p.propNS, p.propLocal+"."+a.loc, a.val)
+		// #211: a.loc is stored as a map key here — convert to string at this
+		// single point of use (see xmpAttr.loc field doc).
+		storeProperty(p.x, p.propNS, p.propLocal+"."+string(a.loc), a.val)
 	}
 }
 
@@ -451,7 +495,9 @@ func (p *rdfParser) onStartStructInListItem(attrs []xmpAttr) {
 		}
 		// Use the property's namespace (not the attribute's) for the key,
 		// consistent with onStartStructValueNode / onCharDataStructField.
-		key := buildStructInListKey(p.propLocal, p.liItemIndex, a.loc)
+		// #211: a.loc is stored as part of a map key — convert at this single
+		// point of use (see xmpAttr.loc field doc).
+		key := buildStructInListKey(p.propLocal, p.liItemIndex, string(a.loc))
 		storeProperty(p.x, p.propNS, key, a.val)
 	}
 }
@@ -465,7 +511,9 @@ func (p *rdfParser) onStartTopLevelDesc(attrs []xmpAttr) {
 		if a.ns == "" || a.ns == NSrdf || a.ns == NSx {
 			continue
 		}
-		storeProperty(p.x, a.ns, a.loc, a.val)
+		// #211: a.loc is stored as a map key here — convert to string at this
+		// single point of use (see xmpAttr.loc field doc).
+		storeProperty(p.x, a.ns, string(a.loc), a.val)
 	}
 }
 
@@ -515,12 +563,12 @@ func (p *rdfParser) onCharDataStructField(s string) {
 	} else {
 		key = p.propLocal + "." + p.structFieldLocal
 	}
-	if p.x.Properties[p.propNS] == nil {
-		p.x.Properties[p.propNS] = make(map[string]string)
-	}
-	if p.x.Properties[p.propNS][key] == "" {
-		p.x.Properties[p.propNS][key] = s
-	}
+	// storeProperty applies the lazy-map-init + first-wins guard and interns
+	// key/s into XMP.arena at the point they are actually stored — key is
+	// already an independent copy (string concatenation / buildStructInListKey),
+	// s may be a transient alias (see transientAliasString's contract) that
+	// storeProperty is responsible for interning.
+	storeProperty(p.x, p.propNS, key, s)
 }
 
 // onCharDataListItem appends text content inside an rdf:li element to the
@@ -550,13 +598,12 @@ func (p *rdfParser) onCharDataListItem(s string) {
 // onCharDataSimple stores the text content of a simple (scalar) property element.
 // Compliance: XMP Part 1 §C.2.3.
 func (p *rdfParser) onCharDataSimple(s string) {
-	if p.x.Properties[p.propNS] == nil {
-		p.x.Properties[p.propNS] = make(map[string]string)
-	}
-	// Only store if not already set (e.g. by rdf:resource attribute).
-	if p.x.Properties[p.propNS][p.propLocal] == "" {
-		p.x.Properties[p.propNS][p.propLocal] = s
-	}
+	// storeProperty applies the lazy-map-init + first-wins guard ("only store
+	// if not already set, e.g. by an rdf:resource attribute") and interns
+	// propLocal/s into XMP.arena at the point they are actually stored — both
+	// may still be transient aliases at this point (see transientAliasString's
+	// contract).
+	storeProperty(p.x, p.propNS, p.propLocal, s)
 }
 
 // onCharData handles text content between tags.
@@ -963,17 +1010,37 @@ func scanName(b []byte, pos int) (prefix, local []byte, end int) {
 	return prefix, local, pos
 }
 
-// isNameTerminator reports whether c is a byte that terminates an XML name
-// token in the context of attribute/tag parsing.
+// nameTerminatorLUT is a 256-entry lookup table indexed by byte value,
+// true for every byte that terminates an XML name token in the context of
+// attribute/tag parsing: ' ', '\t', '\n', '\r', '>', '/', '=', '<'.
+//
+// #287: scanName/isNameTerminator was measured at 28.8% of Read's self time
+// on a representative Canon 7D JPEG (dominated by attribute/tag name
+// scanning in scanAttrs). Replacing the eight-way branch chain with a single
+// array index turns per-byte dispatch into a predictable, branch-free memory
+// load, which the CPU can pipeline far more effectively than a chain of
+// data-dependent comparisons evaluated in sequence for every byte of every
+// name in the document.
 //
 // XML 1.0 §2.3 (NameStartChar, NameChar): '<' is not a legal XML name character.
 // Including it as a name terminator prevents a crafted document from smuggling
 // '<' into a stored local name, which would allow XML injection when that name
 // is later emitted unescaped in Encode (#171).
-func isNameTerminator(c byte) bool {
-	return c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
-		c == '>' || c == '/' || c == '=' || c == '<'
+var nameTerminatorLUT = [256]bool{ //nolint:gochecknoglobals // read-only table; global avoids per-call allocation
+	' ':  true,
+	'\t': true,
+	'\n': true,
+	'\r': true,
+	'>':  true,
+	'/':  true,
+	'=':  true,
+	'<':  true,
 }
+
+// isNameTerminator reports whether c is a byte that terminates an XML name
+// token in the context of attribute/tag parsing. See nameTerminatorLUT for
+// the exact set of terminators and the rationale for the table form.
+func isNameTerminator(c byte) bool { return nameTerminatorLUT[c] }
 
 // advancePastEquals skips optional whitespace at b[pos], then expects '=' and
 // advances past it. Returns the updated position and true on success; returns
@@ -1093,6 +1160,14 @@ func parseAttributeValue(b []byte, pos int) (val string, newPos int, ok bool) {
 // attribute output buffer accordingly. Returns updated nsCount and nAttrs.
 //
 // #15: nsTable is [64]nsEntry and out is [32]xmpAttr (up from 32 and 16).
+//
+// #211: attrLocal is stored into out[nAttrs].loc as a zero-copy []byte
+// sub-slice rather than a string. Most attributes reaching the default case
+// (rdf:about, x:xmptk, and similar housekeeping attributes on
+// rdf:Description) are only ever compared against string literals by their
+// consumers and are never stored as a property key. Callers that DO need to
+// store a.loc as a map key (onStartTopLevelDesc, onStartStructValueNode,
+// onStartStructInListItem) perform string(a.loc) at that single point of use.
 func classifyAndStoreAttr(attrPrefix, attrLocal []byte, val string, nsTable *[64]nsEntry, nsCount int, out *[32]xmpAttr, nAttrs int) (int, int) {
 	// string(attrPrefix) == "xmlns" is a zero-alloc comparison (Go compiler).
 	switch {
@@ -1106,10 +1181,11 @@ func classifyAndStoreAttr(attrPrefix, attrLocal []byte, val string, nsTable *[64
 	case string(attrLocal) == "xmlns" && len(attrPrefix) == 0:
 		// xmlns="uri" — default namespace declaration; ignore (XMP never uses it).
 	default:
-		// Regular attribute: resolve its namespace and store.
+		// Regular attribute: resolve its namespace and store. attrLocal is
+		// kept as a zero-copy []byte — see the xmpAttr.loc field doc.
 		if nAttrs < len(out) {
 			resolvedNS := resolveNS(nsTable[:nsCount], attrPrefix)
-			out[nAttrs] = xmpAttr{ns: resolvedNS, loc: string(attrLocal), val: val}
+			out[nAttrs] = xmpAttr{ns: resolvedNS, loc: attrLocal, val: val}
 			nAttrs++
 		}
 	}
@@ -1129,37 +1205,83 @@ func resolveNS(table []nsEntry, prefix []byte) string {
 	return ""
 }
 
+// transientAliasString returns a string sharing b's backing array, via
+// unsafe.String, instead of copying.
+//
+// CONTRACT: b MUST be a sub-slice of the transient input/normalised buffer
+// that Parse passes to parseRDF for THIS parse call — i.e. this function
+// must only ever be called from within parseRDF or one of its helpers. The
+// returned string is safe to use ONLY for the remainder of that same
+// synchronous Parse call: it must either be discarded before Parse returns,
+// or copied into XMP.arena via (*XMP).intern before Parse returns, if it
+// needs to survive. Parse itself never retains a reference to the buffer
+// this function aliases — see the XMP.arena field doc (xmp.go) — so by the
+// time Parse returns, any NOT-interned transient alias has already become
+// unreachable garbage; nothing further needs to happen for it to be safe
+// against the caller mutating/recycling its own input buffer (bug #72).
+//
+// Do not call this function with a []byte of unknown provenance (e.g. a
+// slice the caller might still be able to reach/mutate concurrently) — the
+// "transient, synchronous-call-only" contract above is what makes this safe,
+// not any property of b itself.
+func transientAliasString(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	return unsafe.String(unsafe.SliceData(b), len(b)) //nolint:gosec // G103: b is always a sub-slice of the transient, synchronous-parse-only input buffer (see contract doc above); the result is used only within the same Parse call and, if it needs to survive, is copied into XMP.arena via intern() before Parse returns
+}
+
+// intern copies s into x.arena (growing it if necessary) and returns an
+// unsafe.String view into the newly appended region — a permanent,
+// independently-owned, arena-backed string safe to store in Properties or
+// containerTypes for the lifetime of x.
+//
+// This is the ONLY function that permanently retains parse-derived content:
+// storeProperty and recordContainerType call it exactly at the point a
+// value/key is decided to be kept, so arena only ever grows by the bytes
+// actually stored — comments, whitespace, dropped/unstored attribute values,
+// and namespace declarations that are never referenced never touch arena at
+// all, regardless of how large they are in the source document.
+//
+// Append-only growth safety: appending beyond arena's current capacity makes
+// Go allocate a NEW backing array and copy the OLD content into it; the OLD
+// backing array is never written to again. Any string returned by an EARLIER
+// intern() call still points at that OLD array — which remains valid and
+// unchanged forever — so it stays correct regardless of how many later
+// intern() calls grow arena onto a new backing array. Worst-case total
+// memory retained across all of arena's historical backing arrays (kept
+// alive only by whichever intern()-returned strings still reference them) is
+// bounded to approximately 2x the final stored-content size: standard slice
+// growth (geometric, ~2x per regrowth) means the sum of all superseded
+// backing arrays' sizes is itself a geometric series dominated by the final
+// size. Struct-in-list keys are an exception — see #277.
+func (x *XMP) intern(s string) string {
+	if s == "" {
+		return ""
+	}
+	start := len(x.arena)
+	x.arena = append(x.arena, s...)
+	return unsafe.String(unsafe.SliceData(x.arena[start:]), len(s)) //nolint:gosec // G103: x.arena[start:] is the region just appended by this call (bytes [start:start+len(s)]), always in bounds; the resulting string is backed by XMP.arena, which is never pooled and never mutated after being appended to (see XMP.arena's field doc and this function's own append-only-growth-safety doc above)
+}
+
 // unescapeXML converts b to a string, replacing the five predefined XML
 // entities and numeric character references. When b contains no '&', it
-// returns string(b) directly (one allocation, no builder overhead).
-//
-// Fix #72: The fast path previously returned unsafe.String(unsafe.SliceData(b), len(b)),
-// a string whose backing memory IS the caller's parse buffer. Any mutation of that
-// buffer after Parse returned (sync.Pool reuse, mmap, shared-buffer architectures)
-// silently corrupted all entity-free property values with no error signal.
-// The fix is to return string(b) — a standard Go heap copy — which eliminates the
-// aliasing entirely. The allocation cost is one string copy per entity-free text
-// segment, identical to what the slow (entity) path already paid. Benchmark
-// evidence: BenchmarkRDFParse confirms the per-call alloc count and ns/op are
-// within the expected range after this change (see bench_test.go).
+// aliases b directly via transientAliasString (zero allocation) rather than
+// copying: the fast path returns a TRANSIENT alias (see
+// transientAliasString's contract) that is safe only within the current
+// synchronous Parse call; the caller (storeProperty / recordContainerType,
+// via onCharData*/applyAttrShorthands/etc.) is responsible for calling
+// (*XMP).intern on any value it actually decides to keep. Values that are
+// computed here but end up discarded (dropped attributes, stray
+// non-property text) are never copied anywhere and become garbage the
+// instant they go out of scope — costing nothing.
 func unescapeXML(b []byte) string {
 	if bytes.IndexByte(b, '&') < 0 {
-		// Fast path: no XML entities present — copy into a new string so that
-		// the returned value is independent of b's backing array. This is the
-		// standard string(b) conversion: one heap allocation, one copy.
-		//
-		// We deliberately do NOT use unsafe.String here. unsafe.String would
-		// return a string that shares b's backing array; if the caller mutates
-		// or reuses b after Parse returns (sync.Pool, mmap, streaming read),
-		// every stored property value would be silently corrupted. The previous
-		// comment "b is kept alive by the caller via the parent slice" only
-		// addressed GC liveness — it did not address the mutation hazard.
-		//
-		// Task #72 / data-corruption fix: replace unsafe alias with safe copy.
-		if len(b) == 0 {
-			return ""
-		}
-		return string(b)
+		// Fast path: no XML entities present. Alias b directly (see
+		// transientAliasString's contract) instead of copying — safe because
+		// this value is either discarded or interned into XMP.arena before
+		// Parse returns.
+		return transientAliasString(b)
 	}
 
 	bld := builderPool.Get().(*strings.Builder) //nolint:forcetypeassert,revive // builderPool.New always stores *strings.Builder; pool invariant
@@ -1432,14 +1554,41 @@ func isASCIISpace(b byte) bool {
 // allocation of x.Properties below: a document with no collections needing
 // an override at all never allocates this map, so the zero/low-alloc parse
 // fast path for standard, spec-compliant XMP is unaffected.
+//
+// ns and local may still be transient aliases at this point (see
+// transientAliasString's contract) — recordContainerType runs BEFORE the
+// corresponding storeProperty call for the same property (container type is
+// recorded when the collection element OPENS, before its rdf:li children —
+// and therefore the accumulated value — are parsed), so it cannot reuse an
+// already-interned copy from Properties; it interns its own. ctype is always
+// one of three package-level string literals (see startCollection's doc) and
+// is never derived from the parse buffer, so it needs no interning.
+//
+// ns and local are interned ONLY the first time a given (ns, local) pair is
+// recorded, mirroring storeProperty's first-wins guard exactly: XML
+// namespace prefixes let a document declare a long URI ONCE and reference it
+// via a cheap short prefix arbitrarily many times, so an unguarded re-intern
+// on every sibling rdf:Alt/Seq/Bag-typed property sharing that prefix would
+// copy the full namespace URI into arena once per sibling (issue: an
+// unguarded local would similarly re-copy on repeated identical property
+// declarations). Guarding both also makes containerTypes first-wins,
+// consistent with storeProperty's first-wins policy for the value itself.
 func recordContainerType(x *XMP, ns, local, ctype string) {
 	if x.containerTypes == nil {
 		x.containerTypes = make(map[string]map[string]string)
 	}
 	if x.containerTypes[ns] == nil {
+		ns = x.intern(ns)
 		x.containerTypes[ns] = make(map[string]string)
 	}
-	x.containerTypes[ns][local] = ctype
+	// First-wins guard, evaluated BEFORE interning local — mirrors
+	// storeProperty's guard exactly (see its doc). Without this, a repeated
+	// (ns, local) pair (duplicate property declaration) would re-intern
+	// local on every occurrence.
+	if x.containerTypes[ns][local] != "" {
+		return
+	}
+	x.containerTypes[ns][x.intern(local)] = ctype
 }
 
 // storeProperty writes val to x.Properties[ns][local], initialising inner maps
@@ -1455,15 +1604,45 @@ func recordContainerType(x *XMP, ns, local, ctype string) {
 // "First wins" is also the safest choice for round-trip fidelity: the first value
 // is the one the originating tool explicitly set; later duplicates are often
 // artefacts of copy-on-write tool workflows.
+//
+// ns, local, and val may still be transient aliases into the synchronous
+// parse buffer at this point (see transientAliasString's contract) — this is
+// the function that decides they are worth keeping and interns them into
+// XMP.arena accordingly. Interning order matters for correctness, not just
+// efficiency: the first-wins guard
+// below is evaluated BEFORE any interning happens, using Go's ordinary
+// content-based string comparison/map lookup (which works correctly on a
+// transient alias exactly as it would on an independent copy) — so a
+// duplicate property declaration is detected and skipped (and its ns/local/
+// val are never interned) without paying any arena-copy cost at all.
 func storeProperty(x *XMP, ns, local, val string) {
 	if x.Properties[ns] == nil {
-		x.Properties[ns] = make(map[string]string)
+		// #213: pre-size with a small constant hint. Real-world
+		// XMP packets hold a single-digit number of properties per namespace
+		// (the representative packet in xmp/bench_test.go has at most 4); an
+		// unsized map (starting at 0 buckets) forces a bucket-array allocation
+		// on the first write and again on any subsequent load-factor growth.
+		// Over-hinting to 8 is cheap (one small backing array) and changes no
+		// semantics — Go maps grow past a size hint just as they would past a
+		// zero one.
+		//
+		// ns becomes the outer map's key — the FIRST time a given namespace
+		// URI is seen it must be interned into XMP.arena so it survives as a
+		// permanent map key; Go retains whichever key string was used when an
+		// entry was first created, so subsequent storeProperty calls for the
+		// SAME namespace (a fresh transient alias each time, content-equal to
+		// the interned one) never need to re-intern ns — the map lookups
+		// below match by content regardless.
+		ns = x.intern(ns)
+		x.Properties[ns] = make(map[string]string, 8)
 	}
-	// #12: guard against overwrite — first-wins policy.
+	// #12: guard against overwrite — first-wins policy. Evaluated on the
+	// (possibly still-transient) local/val — content-based map lookup finds
+	// an existing entry regardless of whether local is transient or interned.
 	if x.Properties[ns][local] != "" {
 		return
 	}
-	x.Properties[ns][local] = val
+	x.Properties[ns][x.intern(local)] = x.intern(val)
 }
 
 // buildStructInListKey builds the storage key for a struct field within a
@@ -1475,6 +1654,9 @@ func storeProperty(x *XMP, ns, local, val string) {
 //
 // Allocation budget: one strings.Builder call (one alloc for the final string).
 // The builder is stack-allocated; no pool needed for this low-frequency path.
+//
+// propLocal/fieldLocal are not length-bounded: key memory grows with
+// items x name length; tracked in #277.
 func buildStructInListKey(propLocal string, idx int, fieldLocal string) string {
 	// Fast path for small indices: avoid strconv.Itoa overhead.
 	// Maximum realistic xmpMM:History depth is a few hundred entries.

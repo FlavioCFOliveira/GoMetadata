@@ -142,7 +142,7 @@ func TestRW2RoundTripThumbnailOffset(t *testing.T) {
 
 	// Inject an XMP payload to trigger the relocate path (pass-through would skip rebasing).
 	var out bytes.Buffer
-	if err := InjectWithEXIFRW2(rw2, nil, nil, []byte("<x:xmpmeta/>"), &out); err != nil {
+	if err := InjectWithEXIFRW2(bytes.NewReader(rw2), rw2, true, nil, nil, []byte("<x:xmpmeta/>"), &out); err != nil {
 		t.Fatalf("InjectWithEXIFRW2: %v", err)
 	}
 	result := out.Bytes()
@@ -411,7 +411,7 @@ func TestTIFFInjectRejectsWireFrameXMP(t *testing.T) {
 		t.Parallel()
 		tiffData := buildMinimalTIFF(binary.LittleEndian, nil, nil)
 		e := &exif.EXIF{IFD0: &exif.IFD{}}
-		err := InjectWithEXIF(tiffData, e, nil, rawWireXMP, io.Discard)
+		err := InjectWithEXIF(bytes.NewReader(tiffData), tiffData, true, e, nil, rawWireXMP, io.Discard)
 		if err == nil {
 			t.Error("accepted wire-frame XMP without error (task #118 regression)")
 			return
@@ -426,7 +426,7 @@ func TestTIFFInjectRejectsWireFrameXMP(t *testing.T) {
 		// CR2 originalBytes must carry "II*\x00" magic; reuse a standard TIFF.
 		tiffData := buildMinimalTIFF(binary.LittleEndian, nil, nil)
 		e := &exif.EXIF{IFD0: &exif.IFD{}}
-		err := InjectWithEXIFCR2(tiffData, e, nil, rawWireXMP, io.Discard)
+		err := InjectWithEXIFCR2(bytes.NewReader(tiffData), tiffData, true, e, nil, rawWireXMP, io.Discard)
 		if err == nil {
 			t.Error("accepted wire-frame XMP without error (task #118 regression)")
 			return
@@ -440,7 +440,7 @@ func TestTIFFInjectRejectsWireFrameXMP(t *testing.T) {
 		t.Parallel()
 		tiffData := buildMinimalTIFF(binary.LittleEndian, nil, nil)
 		e := &exif.EXIF{IFD0: &exif.IFD{}}
-		err := InjectWithEXIFNEF(tiffData, e, nil, rawWireXMP, io.Discard)
+		err := InjectWithEXIFNEF(bytes.NewReader(tiffData), tiffData, true, e, nil, rawWireXMP, io.Discard)
 		if err == nil {
 			t.Error("accepted wire-frame XMP without error (task #118 regression)")
 			return
@@ -454,7 +454,7 @@ func TestTIFFInjectRejectsWireFrameXMP(t *testing.T) {
 		t.Parallel()
 		tiffData := buildMinimalTIFF(binary.LittleEndian, nil, nil)
 		e := &exif.EXIF{IFD0: &exif.IFD{}}
-		err := InjectWithEXIFARW(tiffData, e, nil, rawWireXMP, io.Discard)
+		err := InjectWithEXIFARW(bytes.NewReader(tiffData), tiffData, true, e, nil, rawWireXMP, io.Discard)
 		if err == nil {
 			t.Error("accepted wire-frame XMP without error (task #118 regression)")
 			return
@@ -472,7 +472,7 @@ func TestTIFFInjectRejectsWireFrameXMP(t *testing.T) {
 		copy(orfBytes, tiffData)
 		orfBytes[2], orfBytes[3] = 'R', 'O' // IIRO ORF magic
 		e := &exif.EXIF{IFD0: &exif.IFD{}}
-		err := InjectWithEXIFORF(orfBytes, e, nil, rawWireXMP, io.Discard)
+		err := InjectWithEXIFORF(bytes.NewReader(orfBytes), orfBytes, true, e, nil, rawWireXMP, io.Discard)
 		if err == nil {
 			t.Error("accepted wire-frame XMP without error (task #118 regression)")
 			return
@@ -486,7 +486,7 @@ func TestTIFFInjectRejectsWireFrameXMP(t *testing.T) {
 		t.Parallel()
 		rw2 := buildRW2WithIFD1()
 		e := &exif.EXIF{IFD0: &exif.IFD{}}
-		err := InjectWithEXIFRW2(rw2, e, nil, rawWireXMP, io.Discard)
+		err := InjectWithEXIFRW2(bytes.NewReader(rw2), rw2, true, e, nil, rawWireXMP, io.Discard)
 		if err == nil {
 			t.Error("accepted wire-frame XMP without error (task #118 regression)")
 			return
@@ -517,7 +517,7 @@ func TestTIFFInjectNilXMPNotRejected(t *testing.T) {
 		t.Parallel()
 		data := buildMinimalTIFF(binary.LittleEndian, nil, nil)
 		e := &exif.EXIF{IFD0: &exif.IFD{}}
-		err := InjectWithEXIF(data, e, nil, nil, io.Discard)
+		err := InjectWithEXIF(bytes.NewReader(data), data, true, e, nil, nil, io.Discard)
 		if err != nil && errors.Is(err, ErrCorruptXMP) {
 			t.Errorf("InjectWithEXIF: nil XMP triggered false-positive ErrCorruptXMP rejection")
 		}
@@ -527,7 +527,7 @@ func TestTIFFInjectNilXMPNotRejected(t *testing.T) {
 		t.Parallel()
 		data := buildMinimalTIFF(binary.LittleEndian, nil, nil)
 		e := &exif.EXIF{IFD0: &exif.IFD{}}
-		err := InjectWithEXIFCR2(data, e, nil, nil, io.Discard)
+		err := InjectWithEXIFCR2(bytes.NewReader(data), data, true, e, nil, nil, io.Discard)
 		if err != nil && errors.Is(err, ErrCorruptXMP) {
 			t.Errorf("InjectWithEXIFCR2: nil XMP triggered false-positive ErrCorruptXMP rejection")
 		}
@@ -537,7 +537,7 @@ func TestTIFFInjectNilXMPNotRejected(t *testing.T) {
 		t.Parallel()
 		data := buildMinimalTIFF(binary.LittleEndian, nil, nil)
 		e := &exif.EXIF{IFD0: &exif.IFD{}}
-		err := InjectWithEXIFNEF(data, e, nil, nil, io.Discard)
+		err := InjectWithEXIFNEF(bytes.NewReader(data), data, true, e, nil, nil, io.Discard)
 		if err != nil && errors.Is(err, ErrCorruptXMP) {
 			t.Errorf("InjectWithEXIFNEF: nil XMP triggered false-positive ErrCorruptXMP rejection")
 		}
@@ -547,7 +547,7 @@ func TestTIFFInjectNilXMPNotRejected(t *testing.T) {
 		t.Parallel()
 		data := buildMinimalTIFF(binary.LittleEndian, nil, nil)
 		e := &exif.EXIF{IFD0: &exif.IFD{}}
-		err := InjectWithEXIFARW(data, e, nil, nil, io.Discard)
+		err := InjectWithEXIFARW(bytes.NewReader(data), data, true, e, nil, nil, io.Discard)
 		if err != nil && errors.Is(err, ErrCorruptXMP) {
 			t.Errorf("InjectWithEXIFARW: nil XMP triggered false-positive ErrCorruptXMP rejection")
 		}
@@ -557,7 +557,7 @@ func TestTIFFInjectNilXMPNotRejected(t *testing.T) {
 		t.Parallel()
 		data := buildMinimalTIFF(binary.LittleEndian, nil, nil)
 		e := &exif.EXIF{IFD0: &exif.IFD{}}
-		err := InjectWithEXIFORF(data, e, nil, nil, io.Discard)
+		err := InjectWithEXIFORF(bytes.NewReader(data), data, true, e, nil, nil, io.Discard)
 		if err != nil && errors.Is(err, ErrCorruptXMP) {
 			t.Errorf("InjectWithEXIFORF: nil XMP triggered false-positive ErrCorruptXMP rejection")
 		}
@@ -567,7 +567,7 @@ func TestTIFFInjectNilXMPNotRejected(t *testing.T) {
 		t.Parallel()
 		rw2 := buildRW2WithIFD1()
 		e := &exif.EXIF{IFD0: &exif.IFD{}}
-		err := InjectWithEXIFRW2(rw2, e, nil, nil, io.Discard)
+		err := InjectWithEXIFRW2(bytes.NewReader(rw2), rw2, true, e, nil, nil, io.Discard)
 		if err != nil && errors.Is(err, ErrCorruptXMP) {
 			t.Errorf("InjectWithEXIFRW2: nil XMP triggered false-positive ErrCorruptXMP rejection")
 		}
@@ -695,7 +695,7 @@ func TestTIFFWritePathPreservesIPTCOnXMPOnlyUpdate(t *testing.T) {
 	// Simulate gometadata.Write: encodeIPTC returns rawIPTC when m.IPTC==nil.
 	// Pass rawIPTC (unchanged) and a new rawXMP.
 	var out bytes.Buffer
-	if err := InjectWithEXIF(tiffData, nil, rawIPTC, []byte("<x:xmpmeta/>"), &out); err != nil {
+	if err := InjectWithEXIF(bytes.NewReader(tiffData), tiffData, true, nil, rawIPTC, []byte("<x:xmpmeta/>"), &out); err != nil {
 		t.Fatalf("InjectWithEXIF: %v", err)
 	}
 
@@ -777,7 +777,7 @@ func TestTIFFInjectEmptyIPTCNoZeroLengthTag(t *testing.T) {
 
 		emptyIPTC := []byte{} // non-nil, zero-length — the #190 trigger
 		var out bytes.Buffer
-		if err := InjectWithEXIF(tiffData, nil, emptyIPTC, nil, &out); err != nil {
+		if err := InjectWithEXIF(bytes.NewReader(tiffData), tiffData, true, nil, emptyIPTC, nil, &out); err != nil {
 			t.Fatalf("InjectWithEXIF with empty IPTC: %v", err)
 		}
 		_, outIPTC, _, err := Extract(bytes.NewReader(out.Bytes()))
