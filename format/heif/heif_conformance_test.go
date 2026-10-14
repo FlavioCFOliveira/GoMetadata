@@ -92,7 +92,7 @@ func bmffInfeV2(itemID uint16, itemType string) []byte {
 
 // bmffInfeV2WithContentType assembles an infe v2 for mime items (XMP).
 // ISO 14496-12 §8.11.6 + ISO 23008-12 §6.2: content_type NUL-terminated after item_type.
-func bmffInfeV2WithContentType(itemID uint16, itemType, contentType string) []byte {
+func bmffInfeV2WithContentType(itemID uint16, itemType, contentType string) []byte { //nolint:unparam // itemType is always "mime" today; kept explicit so the item type of every fixture reads at the call site
 	body := make([]byte, 0, 2+2+4+1+len(contentType)+1)
 	body = binary.BigEndian.AppendUint16(body, itemID)
 	// item_protection_index(2) + item_type(4) + item_name NUL(1)

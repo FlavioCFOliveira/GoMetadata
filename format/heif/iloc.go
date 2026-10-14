@@ -8,7 +8,9 @@ package heif
 // skipped arithmetically; the per-item extent list is capped at
 // maxIlocExtentsPerItem; data_reference_index values other than 0 are resolved
 // against the meta box's dref box instead of being ignored; construction
-// method 2 (item offset) is skipped instead of failing the whole parse.
+// method 2 (item offset) is skipped instead of failing the whole parse; an
+// idat-stored item (construction method 1) is read from the idat box payload
+// by sub-slicing the meta box bytes already in memory, without any I/O.
 
 import (
 	"encoding/binary"
@@ -55,8 +57,8 @@ import (
 // construction_method values (ISO/IEC 14496-12 §8.11.3.3).
 const (
 	constructionFileOffset = 0 // extent offsets are file offsets
-	// construction_method 1 (idat offset) and 2 (item offset) are not
-	// supported by the reader; such items are skipped.
+	constructionIdatOffset = 1 // extent offsets are relative to the idat box payload
+	// construction_method 2 (item offset) is not supported; such items are skipped.
 )
 
 // constructionMethodMask selects the 4-bit construction_method from the 16-bit
@@ -96,8 +98,9 @@ const maxIlocItems = 4096
 const maxItemPayloadSize = 256 << 20 // 256 MB
 
 var (
-	errItemPayloadTooLarge = errors.New("heif: item payload exceeds size limit")
-	errItemOffsetOverflow  = errors.New("heif: item location offset overflows int64")
+	errItemPayloadTooLarge  = errors.New("heif: item payload exceeds size limit")
+	errItemOffsetOverflow   = errors.New("heif: item location offset overflows int64")
+	errIdatExtentOutOfRange = errors.New("heif: item extent lies outside the idat box")
 )
 
 // ilocHeader is the decoded fixed header of an iloc box body (the bytes after
@@ -291,7 +294,15 @@ func decodeIlocExtent(ilocData []byte, pos int, h *ilocHeader) ilocExtent {
 // itemSource gives access to the bytes an iloc item can reference.
 type itemSource struct {
 	r           io.ReadSeeker // the whole file (construction_method 0)
-	metaContent []byte        // meta box content, for dref lookups
+	metaContent []byte        // meta box content, for dref and idat lookups
+}
+
+// idat returns the payload of the meta box's ItemDataBox, or nil when the
+// meta box has none. ISO/IEC 14496-12 §8.11.11: the idat box "contains the
+// data of metadata items that use the construction method indicating that an
+// item's data extents are stored within this box".
+func (src itemSource) idat() []byte {
+	return findInnerBox(src.metaContent, boxTypeIdat)
 }
 
 // readIlocItem returns the payload of item it, the concatenation of all its
@@ -300,14 +311,18 @@ type itemSource struct {
 // The payload is allocated once at its exact size.
 //
 // ISO/IEC 14496-12 §8.11.3.3: construction_method 0 (file offset) resolves
-// base_offset+extent_offset as an absolute file position.
+// base_offset+extent_offset as an absolute file position; construction_method
+// 1 (idat offset) resolves it relative to the first byte of the idat box
+// payload of the same meta box (libavif avifDecoderItemRead: idatBuffer).
 //
 // Items that this reader cannot resolve return (nil, nil): construction
-// methods 1 (idat offset) and 2 (item offset), a data_reference_index that
-// designates another file, an item with no extents or a zero total length,
-// and an extent count above maxIlocExtentsPerItem.
+// method 2 (item offset), a data_reference_index that designates another
+// file, an idat-stored item when the meta box has no idat box, an item with
+// no extents or a zero total length, and an extent count above
+// maxIlocExtentsPerItem.
 func readIlocItem(src itemSource, ilocData []byte, h *ilocHeader, it ilocItemHeader, extPos int) ([]byte, error) {
-	if !itemInThisFile(src, it) || it.extentCount == 0 || it.extentCount > maxIlocExtentsPerItem {
+	idat, ok := itemStorage(src, it)
+	if !ok || it.extentCount == 0 || it.extentCount > maxIlocExtentsPerItem {
 		return nil, nil
 	}
 	total, err := itemLength(ilocData, h, it, extPos)
@@ -322,7 +337,7 @@ func readIlocItem(src itemSource, ilocData []byte, h *ilocHeader, it ilocItemHea
 		if ext.length == 0 {
 			continue
 		}
-		if err := readFileExtent(src.r, it.baseOffset+ext.offset, payload[filled:filled+ext.length]); err != nil {
+		if err := readExtent(src.r, idat, it.baseOffset+ext.offset, payload[filled:filled+ext.length]); err != nil {
 			return nil, err
 		}
 		filled += ext.length
@@ -330,11 +345,23 @@ func readIlocItem(src itemSource, ilocData []byte, h *ilocHeader, it ilocItemHea
 	return payload, nil
 }
 
-// itemInThisFile reports whether the extents of item it are file offsets
-// into this file: construction_method 0 and a data_reference_index that
-// designates this file.
-func itemInThisFile(src itemSource, it ilocItemHeader) bool {
-	return it.method() == constructionFileOffset && itemDataInThisFile(src.metaContent, it.dataRefIdx)
+// itemStorage resolves where the extents of item it are stored: the file
+// (construction_method 0, idat nil) or the meta box's idat payload
+// (construction_method 1). ok is false for an item this reader cannot
+// resolve: construction_method 2, a data_reference_index that designates
+// another file, or an idat-stored item without an idat box.
+func itemStorage(src itemSource, it ilocItemHeader) (idat []byte, ok bool) {
+	switch it.method() {
+	case constructionFileOffset:
+		return nil, itemDataInThisFile(src.metaContent, it.dataRefIdx)
+	case constructionIdatOffset:
+		// The idat box is part of the meta box itself: data_reference_index
+		// does not apply to construction method 1.
+		idat = src.idat()
+		return idat, idat != nil
+	default:
+		return nil, false
+	}
 }
 
 // itemLength validates every extent of item it and returns their total
@@ -353,6 +380,21 @@ func itemLength(ilocData []byte, h *ilocHeader, it ilocItemHeader, extPos int) (
 		}
 	}
 	return total, nil
+}
+
+// readExtent fills dst with the extent at off: from idat when it is non-nil
+// (construction_method 1), otherwise from the file.
+func readExtent(r io.ReadSeeker, idat []byte, off uint64, dst []byte) error {
+	if idat == nil {
+		return readFileExtent(r, off, dst)
+	}
+	// Bounds check in uint64 before any int conversion (32-bit safe).
+	n := uint64(len(dst))
+	if off > uint64(len(idat)) || n > uint64(len(idat))-off {
+		return errIdatExtentOutOfRange
+	}
+	copy(dst, idat[off:off+n])
+	return nil
 }
 
 // readFileExtent fills dst with the bytes at absolute file offset off

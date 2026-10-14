@@ -44,6 +44,7 @@ var (
 	boxTypeInfe = [4]byte{'i', 'n', 'f', 'e'} //nolint:gochecknoglobals // package-level constant box type; never mutated
 	boxTypeDinf = [4]byte{'d', 'i', 'n', 'f'} //nolint:gochecknoglobals // package-level constant box type; never mutated
 	boxTypeDref = [4]byte{'d', 'r', 'e', 'f'} //nolint:gochecknoglobals // package-level constant box type; never mutated
+	boxTypeIdat = [4]byte{'i', 'd', 'a', 't'} //nolint:gochecknoglobals // package-level constant box type; never mutated
 )
 
 // itemTypeExif and itemTypeMime identify a HEIF item by its 4-byte ISOBMFF
