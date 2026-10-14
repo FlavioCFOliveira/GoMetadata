@@ -76,9 +76,6 @@ func assertArenaBounded(t *testing.T, name string, doc []byte) {
 	for _, m := range x.Properties {
 		got += len(m)
 	}
-	for _, m := range x.containerTypes {
-		got += len(m)
-	}
 	if got < longNamespaceDocPropCount {
 		t.Fatalf("%s: parsed %d total property/container-type entries, want >= %d — the test document did not exercise the intended path", name, got, longNamespaceDocPropCount)
 	}

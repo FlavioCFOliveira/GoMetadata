@@ -4,10 +4,10 @@ package xmp
 // a parsed *XMP must retain memory proportional to its actually-stored
 // content, not to the size of the source document. XMP.arena is a compact,
 // append-only buffer that receives a copy of a value/key ONLY at the moment
-// storeProperty or recordContainerType decides to keep it (see (*XMP).intern
-// in rdf.go). Content that is scanned but never stored — comments,
-// whitespace, dropped attribute values on attributes that end up unused
-// (e.g. a huge rdf:about) — is read directly from the transient,
+// Parse decides to keep it (see (*XMP).intern in rdf.go and project.go).
+// Content that is scanned but never stored — comments, whitespace, dropped
+// attribute values on attributes that end up unused (e.g. a huge attribute
+// without a namespace) — is read directly from the transient,
 // synchronous-parse-only input buffer (see transientAliasString's contract)
 // and becomes unreachable garbage the instant Parse returns, never touching
 // arena at all.
@@ -39,18 +39,20 @@ func buildPaddedXMPCommentFiller(paddingBytes int) []byte {
 }
 
 // buildPaddedXMPDroppedAttrFiller constructs an XMP document whose padding is
-// a large VALUE on an attribute that is always dropped (rdf:about on the
-// top-level rdf:Description) rather than a comment: the padded value IS run
-// through unescapeXML (unlike a comment, which the tokenizer skips entirely
-// without unescaping), but is never interned because onStartTopLevelDesc
-// drops any attribute whose namespace is NSrdf before it would ever reach
-// storeProperty.
+// a large VALUE on an attribute that is always dropped (an attribute without
+// a namespace on the top-level rdf:Description) rather than a comment: the
+// padded value IS run through unescapeXML (unlike a comment, which the
+// tokenizer skips entirely without unescaping), but is never interned
+// because the RDF parser ignores an attribute without a namespace ("XML
+// namespace required for all elements and attributes", ParseRDF.cpp).
+// rdf:about is no longer a dropped attribute: since task #303 its value is
+// kept and written back by Encode.
 func buildPaddedXMPDroppedAttrFiller(paddingBytes int) []byte {
 	var b strings.Builder
 	b.WriteString(`<?xpacket begin="" uid="W5M0MpCehiHzreSzNTczkc9d"?>` + "\n")
 	b.WriteString(`<x:xmpmeta xmlns:x="adobe:ns:meta/">` + "\n")
 	b.WriteString(`  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` + "\n")
-	b.WriteString(`    <rdf:Description rdf:about="`)
+	b.WriteString(`    <rdf:Description rdf:about="" pad="`)
 	b.WriteString(strings.Repeat("X", paddingBytes))
 	b.WriteString(`" xmlns:tiff="http://ns.adobe.com/tiff/1.0/" tiff:Model="Canon EOS R5"/>` + "\n")
 	b.WriteString(`  </rdf:RDF>` + "\n")
@@ -149,9 +151,9 @@ func TestXMPBufRetain01CommentFiller(t *testing.T) {
 }
 
 // TestXMPBufRetain01DroppedAttrFiller uses a large VALUE on an attribute
-// that unescapeXML decodes but that is always dropped before ever reaching
-// storeProperty (rdf:about on the top-level rdf:Description) as the padding
-// vector.
+// that unescapeXML decodes but that is always dropped before it is ever
+// stored (an attribute without a namespace on the top-level rdf:Description)
+// as the padding vector.
 //
 //nolint:paralleltest // see TestXMPBufRetain01CommentFiller — global heap-stats measurement, must not race with other parallel tests' allocations
 func TestXMPBufRetain01DroppedAttrFiller(t *testing.T) {

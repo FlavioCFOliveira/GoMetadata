@@ -51,12 +51,11 @@ const (
 //
 // A property NOT listed here is either a Simple (non-array) property, or an
 // array-typed property in a namespace/local this table has not yet been
-// extended to cover; for the latter case, effectiveContainerType (below)
-// still preserves round-trip fidelity for any property that was actually
-// parsed from a source document with a real rdf:Alt/Seq/Bag wrapper — see
-// the XMP.containerTypes field doc in xmp.go. This table is the fallback
-// authority for properties with no parse-time record, i.e. new properties
-// created via Set()/the named setters.
+// extended to cover; for the latter case, a property parsed from a source
+// document with a real rdf:Alt/Seq/Bag wrapper is retained in the parse tree
+// (XMP.nodes) and keeps its container on round trip. This table is the
+// authority for properties without a tree node, i.e. new properties created
+// via Set()/the named setters and parsed properties that agree with it.
 var arrayProperties = map[string]map[string]string{ //nolint:gochecknoglobals // read-only spec-sourced lookup table; never mutated after init
 	// Dublin Core (dc:) — Adobe XMP Specification Part 1, Appendix 8.3;
 	// exiv2.org/tags-xmp-dc.html. dc:format, dc:identifier, dc:source are
@@ -187,58 +186,23 @@ func isCollectionProperty(ns, local string) bool {
 	return ok
 }
 
-// specTableMatches reports whether the spec-sourced arrayProperties table
-// already records (ns, local) with exactly container kind ctype.
-//
-// Used by onStartCollection (rdf.go) to decide whether recording a
-// parse-time container override is actually necessary: if the table already
-// agrees with what the source document used, effectiveContainerType would
-// fall back to the identical answer anyway, so recording it is redundant.
-// Skipping the redundant record keeps the zero/low-alloc parse fast path
-// intact for the overwhelming majority of real-world XMP — standard
-// dc:/tiff:/exif:/xmpMM:/… properties written per spec — while still
-// recording (and thus correctly preserving on round trip) any property
-// whose container the table has never heard of, or gets wrong for this
-// specific document (task #273).
-func specTableMatches(ns, local, ctype string) bool {
-	m, ok := arrayProperties[ns]
-	if !ok {
-		return false
-	}
-	ct, ok := m[local]
-	return ok && ct == ctype
-}
-
 // effectiveContainerType determines whether the top-level property (ns,
 // local) must be serialised using an RDF collection container (rdf:Alt/Seq/
-// Bag) and, if so, which kind. local is the parent/top-level property name —
-// for struct-in-list properties this is the bracket-free parent (e.g.
-// "History"), matching how recordContainerType (rdf.go) and
-// writeStructInListProperty (write.go) key their lookups.
+// Bag) when Encode writes it from its Properties entries alone and, if so,
+// which kind. local is the parent/top-level property name — for
+// struct-in-list properties this is the bracket-free parent (e.g.
+// "History").
 //
-// Priority order (task #273 / ISO 16684-1 §7.5 round-trip fidelity):
-//  1. x.containerTypes — the container kind actually observed for this exact
-//     property when x was produced by Parse. This takes priority over the
-//     spec table so that ANY namespace — including unknown/custom ones the
-//     table below can never enumerate — round-trips with its original
-//     container structure preserved exactly, closing the class of
-//     corruption where a plain Parse → unrelated field write → Encode
-//     silently downgraded an untouched array property to a bare scalar.
-//  2. arrayProperties (via isCollectionProperty/collectionType) — for
-//     properties with no parse-time record, i.e. properties newly created
-//     by Set()/the named setters, which have no source document to
-//     preserve and must fall back to the spec-sourced default.
+// Only properties without a retained tree node reach this function: a
+// property parsed with a container other than the one this table yields is
+// retained in XMP.nodes and written with its own container (task #273,
+// superseded by the tree model of task #303), so the spec-sourced table is
+// the single authority here, used for properties created via Set()/the named
+// setters and for parsed properties whose container agrees with it.
 //
-// Returns ctype == "" and isColl == false when neither source identifies
+// Returns ctype == "" and isColl == false when the table does not identify
 // (ns, local) as a collection.
-func (x *XMP) effectiveContainerType(ns, local string) (ctype string, isColl bool) {
-	if x != nil && x.containerTypes != nil {
-		if m, ok := x.containerTypes[ns]; ok {
-			if ct, ok := m[local]; ok {
-				return ct, true
-			}
-		}
-	}
+func (*XMP) effectiveContainerType(ns, local string) (ctype string, isColl bool) {
 	if isCollectionProperty(ns, local) {
 		return collectionType(ns, local), true
 	}

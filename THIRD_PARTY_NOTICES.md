@@ -70,18 +70,26 @@ for cross-checking only).
 - URL: https://github.com/adobe/XMP-Toolkit-SDK
 - Source commit: `7093513bd3caaad29da01db0f275d88a39d6bcc2`
 - Licence: BSD-3-Clause (see `LICENSES/BSD-3-Clause.txt`), SPDX-License-Identifier: `BSD-3-Clause`
-- Copyright: Copyright (c) 2020, Adobe (repository `LICENSE`); Copyright 2002-2003 Adobe and Copyright 2006 Adobe (source file headers)
+- Copyright: Copyright (c) 2020, Adobe (repository `LICENSE`); Copyright 2002-2009 Adobe (source file headers)
 - Source files: `public/include/XMP_Const.h` (`kXMP_NS_*`), `XMPCore/source/XMPMeta.cpp` (`XMPMeta::Initialize`, `RegisterStandardAliases`);
+  `XMPCore/source/ParseRDF.cpp` (`RDF_Parser`: `GetRDFTermKind`, `AddChildNode`, `AddQualifierNode`, `FixupQualifiedNode`,
+  `NodeElement`, `NodeElementAttrs`, `PropertyElement`, `ResourcePropertyElement`, `LiteralPropertyElement`,
+  `ParseTypeResourcePropertyElement`, `EmptyPropertyElement`), `XMPCore/source/XMPCore_Impl.hpp` (`XMP_Node`),
+  `XMPCore/source/XMPMeta-Serialize.cpp` (`SerializeCanonicalRDFProperty`), `XMPCore/source/ExpatAdapter.cpp` (`SetQualName`);
   `XMPFiles/source/FormatSupport/PSIR_MemoryReader.cpp` (`PSIR_MemoryReader::ParseMemoryResources`),
   `XMPFiles/source/FormatSupport/PSIR_FileWriter.cpp` (`PSIR_FileWriter::ParseMemoryResources`, duplicate-resource
   policy), `XMPFiles/source/FormatSupport/ReconcileIPTC.cpp` (`ComputeIPTCDigest`, `SetIPTCDigest`),
   `XMPFiles/source/FileHandlers/TIFF_Handler.cpp` (`TIFF_MetaHandler::ProcessXMP`)
-- Destination files: `xmp/namespace_toolkit.go`, `xmp/namespace_toolkit_test.go`; `internal/irb/irb.go`,
-  `internal/tiffscan/tiffscan.go`
+- Destination files: `xmp/namespace_toolkit.go`, `xmp/namespace_toolkit_test.go`; `xmp/parserdf.go`, `xmp/tree.go`,
+  `xmp/serialize.go`, `xmp/xmlscan.go`; `internal/irb/irb.go`, `internal/tiffscan/tiffscan.go`
 - Adapted: yes (namespace URIs, prefixes and alias definitions, transcribed to Go tables; the Photoshop image resource
   walk, the MD5 IPTC digest computation and check, and the TIFF IPTC source precedence of tag 0x83BB over tag 0x8649,
   re-implemented in Go; the duplicate-resource policy — first resource of an ID wins, a later non-empty one replaces
-  an empty first one, one resource per ID on write — applied to every reader and to the splice of `internal/irb`)
+  an empty first one, one resource per ID on write — applied to every reader and to the splice of `internal/irb`;
+  the XMP data model tree and its RDF parser and serialiser — the recursive descent over the RDF/XML grammar with every
+  property element form, the duplicate and placement checks, the qualifier ordering, the rdf:value fix-up, and the
+  verbose (rdf:parseType="Resource") form of each node — re-implemented in Go over an index-linked node list; the
+  compatibility mapping of an unqualified about/ID attribute of rdf:Description)
 - Notes: the source files carry the header "Adobe permits you to use, modify, and distribute
   this file in accordance with the terms of the Adobe license agreement accompanying it",
   while the repository root `LICENSE` is the BSD 3-Clause licence. The accompanying licence
@@ -90,7 +98,15 @@ for cross-checking only).
   and IPTC digest logic is re-implemented from the Toolkit's algorithm, with these
   changes: bounds checks in uint64, resources returned as sub-slices instead of copies,
   a digest refreshed only when one already exists, and the stale-digest signal kept when
-  the IPTC is not modified (see the header of `internal/irb/irb.go`).
+  the IPTC is not modified (see the header of `internal/irb/irb.go`). The RDF parser and
+  serialiser differ from the Toolkit in these points: recoverable errors are skipped
+  silently instead of being reported; the element tree is built by an original
+  allocation-free scanner instead of Expat; rdf:parseType="Literal" without markup and
+  non-RDF attributes on a text element are read (as text and as qualifiers) instead of
+  rejected; rdf:nodeID references and their blank-node descriptions are kept verbatim
+  instead of being ignored; and alternative-text arrays are written in document order
+  instead of moving x-default first (see the headers of `xmp/parserdf.go` and
+  `xmp/serialize.go`).
 
 ## libavif
 

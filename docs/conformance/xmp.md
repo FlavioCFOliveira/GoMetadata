@@ -40,22 +40,16 @@ are used verbatim as Go sub-test names. 67 rules total.
 - **RDF-06** `rdf:Alt` MUST contain an `rdf:li xml:lang="x-default"`; return x-default when no lang match.
 - **RDF-07** Qualifiers (other than xml:lang) via `rdf:value` + qualifier elements; MUST preserve on write.
 - **RDF-08** Structures = nested `rdf:Description`; recurse to extract fields.
-  - *Accepted, spec-bounded limitation (task #274):* an array-typed field nested INSIDE a
-    struct value (e.g. a hypothetical `stEvt:foo` whose value is itself an `rdf:Bag`/`Seq`/`Alt`)
-    is not represented — the parser's `atCollection()` requires `!p.inStruct`, and
-    `writeStructInListProperty` emits every struct field as a bare scalar. This is unreachable
-    with the struct types this package models — `ResourceEvent`/`stEvt` (xmpMM:History),
-    `ResourceRef`/`stRef` (xmpMM:Ingredients/Pantry), `Version` (xmpMM:Versions), `Ancestor`
-    (photoshop:DocumentAncestors), `Layer` (photoshop:TextLayers), and
-    `ArtworkOrObjectDetails` (Iptc4xmpExt:ArtworkOrObject) — none of which define an
-    array-typed sub-field per Adobe XMP Specification Part 1/2 or IPTC Photo Metadata
-    Standard 2025.1. Documented here as a deliberate, spec-verified deviation rather than an
-    open gap; revisit if a future schema addition introduces such a field.
+  - Since task #303 the parser builds the XMP data model tree (ISO 16684-1:2019 §6), so
+    structures and arrays nest to any depth (an array inside a struct field, a struct inside an
+    array item, and so on) and keep their qualifiers. `XMP.Properties` exposes the documented
+    keys for the first two levels ("parent.field", "parent[N].field"); every deeper node is kept
+    in the tree and written back unchanged by `Encode`.
 
 ### 2.3 Namespaces — XMP Part 1 §6 / XML Namespaces
 - **NS-01** Namespace URIs are canonical; resolve properties by URI, never by prefix.
 - **NS-02** Prefixes are arbitrary NCNames; never hard-code prefix strings.
-- **NS-03** Writer MUST NOT bind two distinct URIs to the same prefix; generate `ns0`, `ns1`, …
+- **NS-03** Writer MUST NOT bind two distinct URIs to the same prefix; reuse the source document's prefix of a namespace without a well-known prefix when it is free, otherwise generate `ns0`, `ns1`, …
 - **NS-04** Preferred prefix↔URI bindings (conventional): dc, xmp, xmpRights, xmpMM, xmpBJ, xmpTPg, xmpDM, xmpNote, photoshop, crs, tiff, exif, aux, Iptc4xmpCore, Iptc4xmpExt, x=`adobe:ns:meta/`, rdf, xml.
 
 ### 2.4 Value Types — XMP Part 1 §8
