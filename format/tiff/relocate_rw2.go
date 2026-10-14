@@ -239,7 +239,8 @@ func relocateTIFFFromParsedRW2(base []byte, fileLen uint64, e *exif.EXIF, rawIPT
 	}
 
 	// ── Step 4: enumerate SubIFDs ────────────────────────────────────────────
-	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget, fileLen)
+	subTree, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget, fileLen)
+	subIFDs := subTree.all
 	if subErr != nil {
 		return nil, nil, fmt.Errorf("rw2: enumerate SubIFDs: %w", subErr)
 	}
@@ -313,8 +314,8 @@ func relocateTIFFFromParsedRW2(base []byte, fileLen uint64, e *exif.EXIF, rawIPT
 	}
 
 	// ── Step 10: patch the 0x014A SubIFDs pointer array ──────────────────────
-	if len(subIFDs) > 0 {
-		if pErr := patchSubIFDPointers(finalTIFF, subIFDs, false, order); pErr != nil {
+	if subTree.roots != nil {
+		if pErr := patchSubIFDPointers(finalTIFF, subTree, false, order); pErr != nil {
 			return nil, nil, fmt.Errorf("rw2: patch SubIFD pointers: %w", pErr)
 		}
 	}

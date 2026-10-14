@@ -678,7 +678,9 @@ func parseIFDEntry(b []byte, e int, order binary.ByteOrder) (IFDEntry, bool) {
 	typ := DataType(order.Uint16(b[e+2:]))
 	cnt := order.Uint32(b[e+4:])
 
-	sz := typeSize(typ)
+	// entryTypeSize, not typeSize: type 13 on an IFD-pointer tag is the
+	// 4-byte TIFF IFD type, not a 1-byte string (task #311).
+	sz := entryTypeSize(tag, typ)
 	totalSize := uint64(sz) * uint64(cnt)
 
 	var value []byte
@@ -1663,7 +1665,7 @@ func parseIFDEntryBigTIFF(b []byte, e int, order binary.ByteOrder) (IFDEntry, bo
 		return IFDEntry{}, false
 	}
 
-	sz := typeSizeBigTIFF(typ)
+	sz := entryTypeSizeBigTIFF(tag, typ) // type 13 on an IFD-pointer tag is 4 bytes (task #311)
 	if sz == 0 {
 		// Unknown type: store the raw 8-byte value-or-offset field verbatim.
 		// We cannot determine whether this is inline or OOL, so treat it as
@@ -1980,8 +1982,10 @@ func readBigTIFFSubIFDOffset(e *IFDEntry) (uint64, bool) {
 			return 0, false
 		}
 		return uint64(e.order().Uint16(e.Value)), true
-	case TypeLong:
+	case TypeLong, TypeUTF8:
 		// TypeLong (4 bytes): used by tiffcp / libtiff even in BigTIFF containers.
+		// Type 13 is the 4-byte TIFF IFD type on these pointer tags (see
+		// entryTypeSize; task #311).
 		if len(e.Value) < 4 {
 			return 0, false
 		}
@@ -2370,7 +2374,7 @@ func ifdTotalSize(entries []IFDEntry) uint32 {
 	valueParity := uint64(0)
 
 	for _, e := range entries {
-		ts := typeSize(e.Type)
+		ts := entryTypeSize(e.Tag, e.Type)
 		if ts == 0 {
 			continue
 		}
@@ -2475,7 +2479,7 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 		order.PutUint16(entryBuf[p+2:], uint16(e.Type))
 		order.PutUint32(entryBuf[p+4:], e.Count)
 
-		ts := typeSize(e.Type)
+		ts := entryTypeSize(e.Tag, e.Type)
 		total := uint64(ts) * uint64(e.Count)
 
 		if ts == 0 || total <= 4 {
@@ -2515,7 +2519,7 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 	out = slices.Grow(out, int(valueAreaLen)) // valueAreaLen bounded by ifdTotalSize's own MaxUint32-saturating cap, itself far below every caller's 256 MiB aggregate input cap — fits int on every supported platform
 	curOff := valueOff
 	for _, e := range entries {
-		ts := typeSize(e.Type)
+		ts := entryTypeSize(e.Tag, e.Type)
 		total := uint64(ts) * uint64(e.Count)
 		if ts == 0 || total <= 4 {
 			continue // inline value: already written into entryBuf by pass 1
@@ -2567,9 +2571,9 @@ func ifdWrittenLen(entries []IFDEntry, startOff uint64, bigTIFF, thumbPatched bo
 		e := &entries[i]
 		var ts uint64
 		if bigTIFF {
-			ts = typeSizeBigTIFF(e.Type)
+			ts = entryTypeSizeBigTIFF(e.Tag, e.Type)
 		} else {
-			ts = uint64(typeSize(e.Type))
+			ts = uint64(entryTypeSize(e.Tag, e.Type))
 		}
 		total := ts * uint64(e.Count)
 		if ts == 0 || total <= threshold {
@@ -2653,7 +2657,7 @@ func ifdTotalSizeBigTIFF(entries []IFDEntry) uint64 {
 
 	valueParity := uint64(0)
 	for _, e := range entries {
-		ts := typeSizeBigTIFF(e.Type) // #1 correctness rule: never typeSize here.
+		ts := entryTypeSizeBigTIFF(e.Tag, e.Type) // #1 correctness rule: never typeSize here.
 		if ts == 0 {
 			continue
 		}
@@ -2718,7 +2722,7 @@ func writeIFDBigTIFF(out []byte, entries []IFDEntry, order binary.ByteOrder, sta
 		// #1 correctness rule: typeSizeBigTIFF, never typeSize (see the
 		// section comment above ifdTotalSizeBigTIFF). Conflating the two
 		// would silently truncate every LONG8/SLONG8/IFD8 (16/17/18) value.
-		ts := typeSizeBigTIFF(e.Type)
+		ts := entryTypeSizeBigTIFF(e.Tag, e.Type)
 		total := ts * uint64(e.Count)
 
 		if ts == 0 || total <= 8 {
@@ -2758,7 +2762,7 @@ func writeIFDBigTIFF(out []byte, entries []IFDEntry, order binary.ByteOrder, sta
 	out = slices.Grow(out, int(valueAreaLen)) // valueAreaLen bounded by ifdTotalSizeBigTIFF's own MaxUint32-saturating cap, itself far below every caller's 256 MiB aggregate input cap — fits int on every supported platform
 	curOff := valueOff
 	for _, e := range entries {
-		ts := typeSizeBigTIFF(e.Type)
+		ts := entryTypeSizeBigTIFF(e.Tag, e.Type)
 		total := ts * uint64(e.Count)
 		if ts == 0 || total <= 8 {
 			continue // inline value: already written into entryBuf by pass 1

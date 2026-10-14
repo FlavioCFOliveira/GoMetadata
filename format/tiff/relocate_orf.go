@@ -635,7 +635,8 @@ func orfRelocateWithOLYMP(
 	}
 
 	// Step 4: enumerate SubIFDs (tag 0x014A).
-	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget, fileLen)
+	subTree, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget, fileLen)
+	subIFDs := subTree.all
 	if subErr != nil {
 		return nil, nil, fmt.Errorf("enumerate SubIFDs: %w", subErr)
 	}
@@ -702,8 +703,8 @@ func orfRelocateWithOLYMP(
 	rebaseOlympMakerNote(finalTIFF, mnInfo, thumbBlock, order)
 
 	// Step 10: patch the 0x014A SubIFDs pointer array in finalTIFF.
-	if len(subIFDs) > 0 {
-		if pErr := patchSubIFDPointers(finalTIFF, subIFDs, false, order); pErr != nil {
+	if subTree.roots != nil {
+		if pErr := patchSubIFDPointers(finalTIFF, subTree, false, order); pErr != nil {
 			return nil, nil, fmt.Errorf("patch SubIFD pointers: %w", pErr)
 		}
 	}
