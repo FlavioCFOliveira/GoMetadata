@@ -247,7 +247,7 @@ func (x *XMP) effectiveContainerType(ns, local string) (ctype string, isColl boo
 
 // prefixMap maps well-known XMP namespace URIs to their canonical prefix strings.
 // XMP Part 1 §B, Adobe XMP Specification Appendix A.
-var prefixMap = map[string]string{ //nolint:gochecknoglobals // read-only namespace→prefix lookup table per XMP Part 1 §B; never mutated
+var prefixMap = withStandardNamespaces(map[string]string{ //nolint:gochecknoglobals // read-only namespace→prefix lookup table per XMP Part 1 §B; never mutated after package initialisation
 	NSxmp:       "xmp",
 	NSxmpRights: "xmpRights",
 	NSxmpMM:     "xmpMM",
@@ -271,7 +271,7 @@ var prefixMap = map[string]string{ //nolint:gochecknoglobals // read-only namesp
 	// conventional binding that xmp.GPS()'s W3C Geo fallback expects to see
 	// on write, and confusing for tools/readers that key off "geo:lat".
 	NSgeo: "geo",
-}
+})
 
 // uniquePrefixFor returns a prefix for uri that is not already in used.
 // For well-known URIs the canonical prefix is returned (it must already be in
