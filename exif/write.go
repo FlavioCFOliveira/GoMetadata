@@ -674,30 +674,21 @@ func buildIFD0Entries(e *EXIF, order binary.ByteOrder, exifPtrBuf, gpsPtrBuf *[4
 // and returns a sorted slice. Placeholder values are patched later by patchPointers.
 //
 // MakerNote bytes are preserved verbatim by exif.Encode. Offset correctness
-// after relocation depends on the maker's offset convention:
+// after relocation depends on the layout's offset base (EXIF.MakerNoteLayout,
+// from metadata-extractor ExifTiffHandler.processMakernote):
 //
-//   - Blob-relative (safe, no rebasing needed): Canon (plain IFD at offset 0),
-//     Panasonic ("Panasonic\0\0\0" prefix, IFD at offset 12, all val_or_off
-//     relative to blob start), Nikon Type-3 (embedded TIFF header inside the
-//     blob; all internal offsets relative to the embedded TIFF base which moves
-//     with the blob), Olympus "OLYMPUS\0" format (IFD at offset 12, blob-relative
-//     val_or_off), Pentax AOC / PENTAX.
+//   - Relative to a point inside the MakerNote (move-safe, no rebasing
+//     needed): Nikon Type 3 (embedded TIFF header), Olympus "OLYMPUS\0" and
+//     "OM SYSTEM", Fujifilm, Pentax AOC / PENTAX, Apple, Ricoh, Sanyo.
 //
-//   - TIFF-absolute (offsets relative to the outer TIFF base — become stale when
-//     the blob moves): Sony plain-IFD MakerNotes (DSLR-A series, ILCE, SLT —
-//     plain IFD at offset 0, all OOL val_or_off are outer-TIFF-absolute), and
-//     Olympus "OLYMP\0" MakerNotes (older compacts such as C5050Z — "OLYMP\0"
-//     prefix, IFD at offset 8, all OOL val_or_off are outer-TIFF-absolute).
-//     Nikon Type-1 (legacy D1, plain IFD at offset 0, big-endian, OOL offsets
-//     are outer-TIFF-absolute) is a documented limitation: rebasing is not
-//     implemented because Type-1 cameras are extremely rare and empirically
-//     produce no OOL MakerNote entries in practice (ExifTool Nikon.pm confirms
-//     Type-1 has no known OOL sub-structures; see relocate_makernote.go).
+//   - Relative to the TIFF header (stale when the MakerNote moves): Canon,
+//     Sony, Panasonic, Casio, Samsung, DJI, Kyocera, Sigma, Minolta, Nikon
+//     Type 2, Olympus "OLYMP\0", and unrecognised plain-IFD MakerNotes.
 //
-// Rebasing for Sony and Olympus OLYMP-type is performed by the TIFF relocators
-// in format/tiff/relocate_makernote.go after exif.Encode places the blob.
-// EXIF.MakerNoteOffset records the original TIFF offset so relocators can
-// compute the movement delta.
+// The TIFF-family writers rebase the second group after exif.Encode places
+// the blob (format/tiff/relocate_makernote.go, tasks #127, #310).
+// EXIF.MakerNoteOffset records the original TIFF offset so they can compute
+// the movement delta. Other containers (JPEG, PNG, WebP, HEIF) do not rebase.
 //
 // Reference: EXIF §4.6.5 tag 0x927C; ExifTool Sony.pm, Olympus.pm, Panasonic.pm,
 // Nikon.pm; empirical analysis per #127.

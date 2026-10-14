@@ -151,7 +151,7 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 
 	// FormatARW uses the ARW-specific write path that:
 	//   - Rebases all Sony MakerNote OOL offsets (Sony uses TIFF-absolute offsets,
-	//     not blob-relative like Canon, so the 52 MakerNote tags are otherwise lost).
+	//     so the 52 MakerNote tags are otherwise lost).
 	//   - Extracts the SR2Private (0xC634) block (37 kB encrypted blob + IDC_IFD),
 	//     appends it verbatim, rebases its internal TIFF-absolute pointers, and
 	//     patches the IFD0 tag to point to the new SR2 block position.
@@ -371,8 +371,9 @@ func WriteFile(path string, m *Metadata, opts ...WriteOption) error { //nolint:c
 // tiff.InjectWithEXIFStream → relocateTIFFFromParsed step 2.
 //
 // CR2 uses standard LE TIFF magic (II*\0) and parses via exif.Parse.
-// MakerNote blob is copied verbatim — per SPIKE #24, Canon MakerNotes use
-// blob-relative (self-relative) offsets, so verbatim copying is safe.
+// The Canon MakerNote is copied verbatim and its TIFF-relative value offsets
+// and footer are rebased, for the re-encode and for the CR2 marker insertion
+// (task #310; format/tiff/relocate_makernote.go).
 //
 // DNG write is enabled (bug #98 fixed). The SubIFD relocation path now
 // preserves ALL out-of-line value areas in each SubIFD (RATIONAL XResolution,
@@ -533,7 +534,7 @@ func writeTIFFCR2(r io.ReadSeeker, w io.Writer, m *Metadata) error {
 // ARW is TIFF-based (II\0* little-endian magic) but requires Sony-specific
 // handling:
 //   - The Sony MakerNote (tag 0x927C) is a plain TIFF IFD with TIFF-absolute
-//     offsets, unlike Canon (blob-relative) and Nikon (MakerNote-TIFF-relative).
+//     offsets, like Canon and unlike Nikon Type 3 (MakerNote-TIFF-relative).
 //     After relocation, all 34 OOL MakerNote entries would have stale offsets,
 //     causing the 52 MakerNote tags to be lost.  The ARW write path rebases
 //     all MakerNote OOL val_or_off fields by delta = new_blob_abs − old_blob_abs.

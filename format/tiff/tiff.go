@@ -533,7 +533,7 @@ func InjectWithEXIFCR2Stream(r io.ReadSeeker, prefix []byte, wholeFile bool, mod
 	//
 	// Canon CR2 spec §3.1: TIFF header (8 bytes) + CR marker (4 bytes) + RAW IFD
 	// offset (4 bytes) = 16-byte total header; IFD0 immediately follows at offset 16.
-	newHeader, insertErr := insertCR2MarkerAndShiftOffsets(header, prefix)
+	newHeader, insertErr := insertCR2MarkerAndShiftOffsets(header, prefix, cr2MakerNoteOf(modifiedEXIF, prefix))
 	if insertErr != nil {
 		return insertErr
 	}
@@ -570,7 +570,10 @@ const cr2IFD0Offset = 16
 //  1. Build output: hdr[0:8] + marker[0:8] + finalTIFF[8:].
 //  2. Update header bytes [4:8] → 16 (new IFD0 offset).
 //  3. Walk IFD0 (at offset 16) and every IFD reachable from it, shifting all
-//     offsets by +cr2MarkerLen (+8); see rebaseAllIFDsAfterCR2Marker.
+//     offsets by +cr2MarkerLen (+8); see rebaseAllIFDsAfterCR2Marker. The
+//     out-of-line offsets inside a TIFF-relative MakerNote (the Canon
+//     MakerNote of every CR2) are shifted too when mn locates its IFD (task
+//     #310).
 //  4. Write the output offset of the RAW IFD into bytes [12:16]: the IFD at
 //     the same position of the IFD0 chain as the one the original header
 //     pointed to (task #281).
@@ -579,7 +582,7 @@ const cr2IFD0Offset = 16
 // delta=8 for the 8-byte CR2 marker extension.
 //
 // Canon CR2 spec §3.1 / TIFF 6.0 §2 / containers.md §8(e).
-func insertCR2MarkerAndShiftOffsets(finalTIFF, originalBytes []byte) ([]byte, error) {
+func insertCR2MarkerAndShiftOffsets(finalTIFF, originalBytes []byte, mn cr2MakerNote) ([]byte, error) {
 	if len(finalTIFF) < 8 {
 		return nil, fmt.Errorf("%w (%d bytes)", ErrCR2OutputTooShort, len(finalTIFF))
 	}
@@ -644,7 +647,8 @@ func insertCR2MarkerAndShiftOffsets(finalTIFF, originalBytes []byte) ([]byte, er
 	if ifd0Start+2 > len(out) {
 		return nil, fmt.Errorf("%w (offset=%d, len=%d)", ErrCR2IFD0OutOfBounds, ifd0Start, len(out))
 	}
-	rebaseAllIFDsAfterCR2Marker(out, ifd0Start, order)
+	r := cr2Rebaser{out: out, order: order, budget: cr2MaxIFDs, mn: mn}
+	r.chain(ifd0Start, 0)
 
 	// Step 4 (task #281): restore the RAW IFD pointer of the CR2 header. The
 	// original header names the RAW IFD by offset; its position in the IFD0
@@ -737,11 +741,44 @@ const cr2MaxIFDs = 4096
 // cr2Rebaser shifts the TIFF-absolute offsets of every IFD reachable from
 // IFD0 by cr2MarkerLen. seen holds each IFD start (in output coordinates)
 // already shifted, so an offset reachable through two paths is shifted once.
+// mn, when set, locates the IFD of a TIFF-relative MakerNote, whose
+// out-of-line offsets move with everything else.
 type cr2Rebaser struct {
 	out    []byte
 	order  binary.ByteOrder
 	seen   map[int]struct{}
 	budget int
+	mn     cr2MakerNote
+}
+
+// cr2MakerNote locates the IFD of a MakerNote whose value offsets count from
+// the TIFF header (exif.MakerNoteLayout): ifdOffset from the first MakerNote
+// byte, read in order. The zero value (ok false) means no such MakerNote.
+type cr2MakerNote struct {
+	ok        bool
+	ifdOffset int
+	order     binary.ByteOrder
+}
+
+// cr2MakerNoteOf returns the cr2MakerNote of the MakerNote that the CR2
+// writer copies: the one of e, or, when e is nil (the writer then re-parses
+// the original bytes), the one parsed from prefix. Canon MakerNotes are plain
+// IFDs whose value offsets count from the TIFF header (metadata-extractor
+// ExifTiffHandler.processMakernote), so the 8-byte CR2 marker insertion moves
+// the values they address (task #310).
+func cr2MakerNoteOf(e *exif.EXIF, prefix []byte) cr2MakerNote {
+	if e == nil {
+		parsed, err := exif.Parse(prefix)
+		if err != nil {
+			return cr2MakerNote{}
+		}
+		e = parsed
+	}
+	l, ok := e.MakerNoteLayout()
+	if !ok || !l.TIFFRelative || e.BigTIFF {
+		return cr2MakerNote{}
+	}
+	return cr2MakerNote{ok: true, ifdOffset: l.IFDOffset, order: l.ByteOrder}
 }
 
 // shiftOffset returns v + cr2MarkerLen, and false when v lies before the
@@ -855,6 +892,13 @@ func (r *cr2Rebaser) ifd(start, count, depth int) {
 			// Out-of-line value: val_or_off is a TIFF-absolute pointer.
 			if v, ok := shiftOffset(r.order.Uint32(r.out[e+8:])); ok {
 				r.order.PutUint32(r.out[e+8:], v)
+				if tag == exif.TagMakerNote && r.mn.ok {
+					// Task #310: the offsets inside a TIFF-relative MakerNote
+					// moved by the same 8 bytes (shiftOffset semantics:
+					// offsets at or after the insertion point).
+					rebaseMakerNoteIFD(r.out, int(v)+r.mn.ifdOffset, r.mn.order, cr2MarkerLen, 8)
+					fixMakerNoteFooter(r.out, int(v), int(n), r.mn.order, uint64(v)-cr2MarkerLen, uint64(v))
+				}
 			}
 		}
 	}
@@ -944,7 +988,7 @@ func InjectWithEXIFNEFStream(r io.ReadSeeker, prefix []byte, wholeFile bool, mod
 // MakerNote info) before the standard TIFF copy-and-relocate algorithm, and
 // patches the following in the output after encoding:
 //   - Sony MakerNote (0x927C) OOL offsets are rebased (Sony uses TIFF-absolute
-//     offsets, unlike Canon which uses blob-relative).
+//     offsets).
 //   - SR2Private (0xC634) inline 4-byte value is updated to point to the new SR2
 //     block position; SR2 internal pointers are rebased.
 //

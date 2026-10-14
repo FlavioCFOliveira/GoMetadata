@@ -16,8 +16,9 @@
 //   - AVIF (read + write)
 //   - WebP (read + write)
 //   - CR2 — Canon RAW v2, TIFF-based (read + write; uses the same copy-and-relocate
-//     path as TIFF/DNG; Canon MakerNote blobs copied verbatim — blob-relative offsets
-//     are move-safe; validated against real Canon EOS 350D corpus file)
+//     path as TIFF/DNG; the Canon MakerNote is copied verbatim and its
+//     TIFF-relative offsets and footer are rebased; validated against the
+//     corpus CR2 files)
 //   - CR3 — Canon RAW v3, ISOBMFF-based (read + write; cr3.Inject relocates stco/co64 chunk-offset tables after moov rebuild)
 //   - NEF — Nikon RAW, TIFF-based (read + write; Nikon MakerNote blob extended
 //     to cover PreviewIFD and NikonScanIFD; validated against real Nikon D70 NEF)
