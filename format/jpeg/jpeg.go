@@ -46,9 +46,9 @@ var identXMP = []byte("http://ns.adobe.com/xap/1.0/\x00") //nolint:gochecknoglob
 // chunks. Adobe XMP Specification Part 3 §1.1.4.
 //
 // NOTE: this is the APP1 segment identifier ("http://ns.adobe.com/xmp/extension/\x00"),
-// which is distinct from the xmpNote namespace URI
-// ("http://ns.adobe.com/xap/1.0/se/Note/") used for the HasExtendedXMP property
-// inside the main XMP packet.  The two strings must never be confused.
+// which is distinct from the xmpNote namespace URI (xmp.NSxmpNote,
+// "http://ns.adobe.com/xmp/note/") of the HasExtendedXMP property inside the
+// main XMP packet. The two strings must never be confused.
 var identXMPNote = []byte("http://ns.adobe.com/xmp/extension/\x00") //nolint:gochecknoglobals // package-level constant bytes
 
 // identPS is the Photoshop 3.0 signature in APP13 (EXIF §4.5.6).
@@ -1361,8 +1361,8 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 //  4. Write rawXMP verbatim as the extended payload, split into chunks of at
 //     most maxExtChunkSize bytes. Each chunk becomes one extended APP1 segment.
 //
-// The xmpNote namespace URI is http://ns.adobe.com/xap/1.0/se/Note/ per the
-// Adobe XMP Specification Part 3 §1.1.4.
+// The xmpNote namespace is xmp.NSxmpNote, http://ns.adobe.com/xmp/note/
+// (Adobe XMP Specification Part 3 §1.1.3.1; task #315).
 func writeExtendedXMP(w io.Writer, rawXMP []byte) error {
 	// Step 1: generate GUID.
 	var guidRaw [16]byte
@@ -1377,13 +1377,13 @@ func writeExtendedXMP(w io.Writer, rawXMP []byte) error {
 	// top of this stub. The literal template is faster and simpler than
 	// invoking the xmp package from the format layer.
 	//
-	// xmpNote namespace: http://ns.adobe.com/xap/1.0/se/Note/ (XMP Spec Part 3 §1.1.4)
+	// xmpNote namespace: xmp.NSxmpNote (XMP Spec Part 3 §1.1.3.1)
 	mainXMP := []byte(
 		`<?xpacket begin="` + "\xef\xbb\xbf" + `" id="W5M0MpCehiHzreSzNTczkc9d"?>` +
 			`<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="GoMetadata">` +
 			`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
 			`<rdf:Description rdf:about=""` +
-			` xmlns:xmpNote="http://ns.adobe.com/xap/1.0/se/Note/"` +
+			` xmlns:xmpNote="` + xmppkg.NSxmpNote + `"` +
 			` xmpNote:HasExtendedXMP="` + guid + `"/>` +
 			`</rdf:RDF></x:xmpmeta>` +
 			`<?xpacket end="w"?>`,

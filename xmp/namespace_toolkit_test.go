@@ -131,11 +131,6 @@ func TestStandardNamespaces_PrefixesUnique(t *testing.T) {
 	seen := map[string]string{}
 	for uri, p := range prefixMap {
 		if prev, dup := seen[p]; dup {
-			// The XMP Toolkit binds xmpNote to http://ns.adobe.com/xmp/note/;
-			// NSxmpNote is the older URI of this package, kept for round trips.
-			if p == "xmpNote" {
-				continue
-			}
 			t.Errorf("prefix %q bound to both %q and %q", p, prev, uri)
 		}
 		seen[p] = uri

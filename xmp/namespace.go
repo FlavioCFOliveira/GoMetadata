@@ -21,15 +21,28 @@ const (
 	NScc = "http://creativecommons.org/ns#"
 	// NSpdf is the PDF namespace (Adobe PDF 1.3 property set).
 	NSpdf = "http://ns.adobe.com/pdf/1.3/"
-	// NSxmpNote is the XMP namespace for extended XMP notes.
-	// Adobe XMP Specification Part 3 §1.1.4.
-	NSxmpNote = "http://ns.adobe.com/xap/1.0/se/Note/"
+	// NSxmpNote is the xmpNote namespace. Its property
+	// xmpNote:HasExtendedXMP links the standard XMP packet of a JPEG file to
+	// the extended XMP stored after it. Adobe XMP Specification Part 3
+	// (2020) §1.1.3.1: "The URI for the xmpNote: namespace is
+	// http://ns.adobe.com/xmp/note/"; XMP Toolkit kXMP_NS_XMP_Note
+	// (public/include/XMP_Const.h).
+	//
+	// Earlier releases of this package used the URI
+	// "http://ns.adobe.com/xap/1.0/se/Note/". Packets that use it still
+	// parse: namespaces are matched by URI.
+	NSxmpNote = "http://ns.adobe.com/xmp/note/"
 	// NSgeo is the W3C Basic Geo vocabulary namespace for GPS coordinates.
 	// W3C Geo 2003/01: http://www.w3.org/2003/01/geo/wgs84_pos#
 	// Properties: lat (latitude, decimal degrees) and long/lon (longitude, decimal degrees).
 	// The coordinate format is "DDD,MM.mmmR" or "DDD,MM,SS.sssR", same as NSexif.
 	NSgeo = "http://www.w3.org/2003/01/geo/wgs84_pos#"
 )
+
+// nsXMPNoteLegacy is the xmpNote namespace URI that releases of this package
+// before task #315 wrote. It is not a namespace of the specification; it is
+// kept so that files written by those releases read like any other.
+const nsXMPNoteLegacy = "http://ns.adobe.com/xap/1.0/se/Note/"
 
 // arrayProperties is the single, spec-sourced table of every array-typed
 // (rdf:Seq / rdf:Bag / rdf:Alt) top-level property this package recognises,
