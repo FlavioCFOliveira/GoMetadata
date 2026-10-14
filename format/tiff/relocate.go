@@ -392,7 +392,7 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte, f
 	if len(rawIPTC) > 0 {
 		// Adobe XMP Spec / ExifTool convention: IPTC-NAA (0x83BB) as TypeLong.
 		// upsertIFD0Entry pads value to 4-byte boundary; Count = nLongs.
-		upsertIFD0Entry(e.IFD0, exif.TagIPTC, exif.TypeLong, rawIPTC)
+		upsertIPTC(e.IFD0, rawIPTC)
 	}
 	if len(rawXMP) > 0 {
 		// Adobe XMP Spec (TIFF Technical Note 3): XMP (0x02BC) as TypeByte.
@@ -486,7 +486,7 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte, f
 	// Step 7: assign new absolute offsets.
 	// SubIFD blocks are placed first (SubIFD structures after the main EXIF
 	// block), then main image blocks follow after all SubIFD structures.
-	subIFDsSize := computeSubIFDsSize(subIFDs)
+	subIFDsSize := computeSubIFDsSize(ifdEnd, subIFDs)
 	// Guard against overflow: ifdEnd + subIFDsSize > MaxUint32 means the
 	// combined IFD+SubIFD region alone is already beyond the classic TIFF
 	// 4 GiB limit. TIFF 6.0 §2: classic offsets are uint32; a value that
@@ -1529,24 +1529,21 @@ func rawEntryValueEnd(entry rawIFDEntry, bigTIFF bool, threshold uint64, base []
 	return valOff + total, true
 }
 
-// computeSubIFDsSize returns the total byte size of all SubIFD raw blocks
-// including any inter-block word-alignment padding, which is needed to compute
-// where image blocks will land after the SubIFDs.
+// computeSubIFDsSize returns the number of bytes from ifdEnd (the end of the
+// encoded main IFD structure) to the end of the last SubIFD block, including
+// every word-alignment pad byte. imageStart = ifdEnd + computeSubIFDsSize is
+// therefore the exact position where the image blocks begin.
 //
 // TIFF 6.0 §2: "Each data item (field value) must begin on a word boundary."
 // Each SubIFD block (an IFD structure) is a data item and must start at an
-// even file offset. A 1-byte pad is counted before any block that would
-// otherwise start at an odd offset.
-func computeSubIFDsSize(subIFDs []*subIFDInfo) uint64 {
-	var total uint64
-	for _, si := range subIFDs {
-		// Word-align before this SubIFD block.
-		if total&1 == 1 {
-			total++ // alignment pad byte
-		}
-		total += uint64(len(si.rawBytes))
-	}
-	return total
+// even file offset, so a 1-byte pad precedes any block that would otherwise
+// start at an odd offset. Task #280: the pad parity depends on the ABSOLUTE
+// position, so it is derived from ifdEnd (which is odd when the last IFD ends
+// with an odd-length thumbnail), exactly as assignSubIFDOffsets and the
+// append loop of step 11 do — never from a running total that starts at 0.
+// The result equals relocatedLen(ifdEnd, subIFDs) - ifdEnd by construction.
+func computeSubIFDsSize(ifdEnd uint64, subIFDs []*subIFDInfo) uint64 {
+	return relocatedLen(ifdEnd, subIFDs) - ifdEnd
 }
 
 // assignSubIFDOffsets assigns new file offsets to each SubIFD, placing them

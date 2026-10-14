@@ -192,21 +192,29 @@ func TestRebaseWalkerCR2_DepthCapped(t *testing.T) {
 
 	const chainDepth = 20
 
-	buf := buildChainedSubIFDBuffer(chainDepth)
+	// Mirror production: the CR2 marker has physically moved everything after
+	// byte 8 by cr2MarkerLen, while the stored pointers still hold their
+	// pre-shift values. Insert cr2MarkerLen bytes at position 8 so IFD k sits
+	// at 8+cr2MarkerLen+k*18 and its pointer still says 8+(k+1)*18.
+	plain := buildChainedSubIFDBuffer(chainDepth)
+	buf := make([]byte, 0, len(plain)+cr2MarkerLen)
+	buf = append(buf, plain[:8]...)
+	buf = append(buf, make([]byte, cr2MarkerLen)...)
+	buf = append(buf, plain[8:]...)
 	order := binary.LittleEndian
 
 	const (
 		hdrSize = 8
 		ifdSize = 2 + 12 + 4
 	)
-	deepIFDBase := hdrSize + maxSubIFDDepth*ifdSize
+	deepIFDBase := hdrSize + cr2MarkerLen + maxSubIFDDepth*ifdSize
 	if deepIFDBase+14 > len(buf) {
 		t.Fatalf("buffer too short for deep IFD check: need %d, have %d", deepIFDBase+14, len(buf))
 	}
 	deepPtrBefore := order.Uint32(buf[deepIFDBase+10:])
 
-	// Call with depth=0 at IFD0 (offset 8).
-	rebaseAllIFDsAfterCR2Marker(buf, hdrSize, order, 0)
+	// Call with depth=0 at IFD0 (offset 16).
+	rebaseAllIFDsAfterCR2Marker(buf, hdrSize+cr2MarkerLen, order)
 
 	deepPtrAfter := order.Uint32(buf[deepIFDBase+10:])
 	if deepPtrAfter != deepPtrBefore {
@@ -281,7 +289,7 @@ func TestRebaseOOLPointer_OverflowGuard(t *testing.T) {
 	// Choose val_or_off = MaxUint32 - 8 + 1 = 0xFFFFFFF9; adding 8 wraps to 1.
 	cr2VOO := uint32(math.MaxUint32) - uint32(cr2MarkerLen) + 1 // 0xFFFFFFF9
 	cr2Buf := buildBuf(cr2VOO)
-	rebaseAllIFDsAfterCR2Marker(cr2Buf, ifd0Off, order, 0)
+	rebaseAllIFDsAfterCR2Marker(cr2Buf, ifd0Off, order)
 	gotCR2 := order.Uint32(cr2Buf[entryOff+8:])
 	if gotCR2 != cr2VOO {
 		t.Errorf("#176 CR2 OOL overflow guard: val_or_off changed from 0x%08X to 0x%08X; expected unchanged (would wrap)",
@@ -333,7 +341,7 @@ func TestRebaseInlinePointer_OverflowGuard(t *testing.T) {
 	// CR2: MaxUint32 - cr2MarkerLen + 1 = 0xFFFFFFF9 → adding 8 wraps.
 	cr2VOO := uint32(math.MaxUint32) - uint32(cr2MarkerLen) + 1
 	cr2Buf := buildBuf(cr2VOO)
-	rebaseAllIFDsAfterCR2Marker(cr2Buf, ifd0Off, order, 0)
+	rebaseAllIFDsAfterCR2Marker(cr2Buf, ifd0Off, order)
 	gotCR2 := order.Uint32(cr2Buf[entryOff+8:])
 	if gotCR2 != cr2VOO {
 		t.Errorf("#176 CR2 inline ptr overflow guard: val changed from 0x%08X to 0x%08X; expected unchanged (would wrap)",

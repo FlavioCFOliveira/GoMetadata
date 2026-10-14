@@ -782,7 +782,7 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	if rawIPTC != nil {
 		// Adobe XMP Spec / ExifTool convention: IPTC-NAA (0x83BB) as TypeLong.
 		// upsertIFD0Entry pads value to 4-byte boundary; Count = nLongs.
-		upsertIFD0Entry(e.IFD0, exif.TagIPTC, exif.TypeLong, rawIPTC)
+		upsertIPTC(e.IFD0, rawIPTC)
 	}
 	if rawXMP != nil {
 		// Adobe XMP Spec (TIFF Technical Note 3): XMP (0x02BC) as TypeByte.
@@ -846,7 +846,7 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	ifdEnd := uint64(ifdEndInt) //nolint:gosec // G115: EncodedSize never returns a negative length
 
 	// Step 7: assign new absolute offsets.
-	subIFDsSize := computeSubIFDsSize(subIFDs)
+	subIFDsSize := computeSubIFDsSize(ifdEnd, subIFDs)
 	imageStart := ifdEnd + subIFDsSize
 	assignNewOffsets(allBlocks, imageStart)
 	assignSubIFDOffsets(subIFDs, ifdEnd)

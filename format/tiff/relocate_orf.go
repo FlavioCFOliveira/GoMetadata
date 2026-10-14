@@ -584,7 +584,7 @@ func orfRelocateWithOLYMP(
 	}
 	if rawIPTC != nil {
 		// Adobe XMP Spec / ExifTool convention: IPTC-NAA (0x83BB) as TypeLong.
-		upsertIFD0Entry(e.IFD0, exif.TagIPTC, exif.TypeLong, rawIPTC)
+		upsertIPTC(e.IFD0, rawIPTC)
 	}
 	if rawXMP != nil {
 		// Adobe XMP Spec (TIFF Technical Note 3): XMP (0x02BC) as TypeByte.
@@ -661,7 +661,7 @@ func orfRelocateWithOLYMP(
 	ifdEnd := uint64(ifdEndInt) //nolint:gosec // G115: EncodedSize never returns a negative length
 
 	// Step 7: assign new absolute offsets.
-	subIFDsSize := computeSubIFDsSize(subIFDs)
+	subIFDsSize := computeSubIFDsSize(ifdEnd, subIFDs)
 	imageStart := ifdEnd + subIFDsSize
 	// Include the thumbBlock in the allBlocks slice for assignNewOffsets.
 	allBlocks := blocks

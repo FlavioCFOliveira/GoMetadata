@@ -200,7 +200,7 @@ func relocateTIFFFromParsedRW2(base []byte, fileLen uint64, e *exif.EXIF, rawIPT
 
 	// ── Step 2: upsert metadata tags in IFD0 ─────────────────────────────────
 	if rawIPTC != nil {
-		upsertIFD0Entry(e.IFD0, exif.TagIPTC, exif.TypeLong, rawIPTC)
+		upsertIPTC(e.IFD0, rawIPTC)
 	}
 	if rawXMP != nil {
 		upsertIFD0Entry(e.IFD0, exif.TagXMP, exif.TypeByte, rawXMP)
@@ -263,7 +263,7 @@ func relocateTIFFFromParsedRW2(base []byte, fileLen uint64, e *exif.EXIF, rawIPT
 	ifdEnd := uint64(ifdEndInt) //nolint:gosec // G115: EncodedSize never returns a negative length
 
 	// ── Step 7: assign new absolute offsets ──────────────────────────────────
-	subIFDsSize := computeSubIFDsSize(subIFDs)
+	subIFDsSize := computeSubIFDsSize(ifdEnd, subIFDs)
 	imageStart := ifdEnd + subIFDsSize
 	assignNewOffsets(allBlocks, imageStart)
 	assignSubIFDOffsets(subIFDs, ifdEnd)

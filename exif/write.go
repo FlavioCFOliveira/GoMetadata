@@ -298,12 +298,12 @@ func checkBigTIFFThumbnails(e *EXIF, ifd1Start uint64) error {
 	for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
 		// patchThumbnailEntries never changes the entry count, types, or
 		// counts, so the unpatched entries have the same encoded size.
-		thumbOff := pos + ifdTotalSizeBigTIFF(ifd.Entries)
+		thumbOff := pos + ifdWrittenLen(ifd.Entries, pos, true, ifd.ThumbnailData != nil)
 		thumbLen := uint64(len(ifd.ThumbnailData))
 		if ifd.ThumbnailData != nil && (thumbOff > math.MaxUint32 || thumbLen > math.MaxUint32) {
 			return fmt.Errorf("%w: JPEGInterchangeFormat offset %d / length %d", ErrBigTIFFPointerOverflow, thumbOff, thumbLen)
 		}
-		pos = thumbOff + thumbLen
+		pos = thumbOff + thumbnailSpan(ifd)
 	}
 	return nil
 }
@@ -490,28 +490,60 @@ func writeSubIFDs(out []byte, e *EXIF, exifIFDEntries []IFDEntry, order binary.B
 		// JPEGInterchangeFormatLength (0x0202, TypeLong, Count=1) holds its byte
 		// length.  Both are inline (4-byte) values in the IFD entry (TIFF §2:
 		// value stored inline when total size ≤ 4 bytes).
+		//
+		// Task #279: every position is derived from the actual running output
+		// length through ifdWrittenLen, the same replay encodedLen uses, so the
+		// pointers written here and the sizes reported by EncodedSize cannot
+		// drift apart. ifdTotalSize is not used: it assumes an even start offset
+		// and a Value no longer than Count x type size.
+		pos := uint64(len(out))
 		entries := ifd.Entries
 		if ifd.ThumbnailData != nil {
 			entries = patchThumbnailEntries(ifd.Entries, order,
-				uint32(len(out))+ifdTotalSize(ifd.Entries), //nolint:gosec // G115: output offset bounded by buffer size
-				uint32(len(ifd.ThumbnailData)),             //nolint:gosec // G115: thumbnail length bounded by parse-time validation
+				uint32(pos+ifdWrittenLen(ifd.Entries, pos, false, true)), //nolint:gosec // G115: output offset bounded by buffer size
+				uint32(len(ifd.ThumbnailData)),                           //nolint:gosec // G115: thumbnail length bounded by parse-time validation
 			)
 		}
 
 		nextPtr := uint32(0)
 		if ifd.Next != nil {
-			// nextPtr must skip past both the IFD block and any thumbnail data
-			// that follows it before the next IFD begins.
-			nextPtr = uint32(len(out)) + ifdTotalSize(entries) + uint32(len(ifd.ThumbnailData)) //nolint:gosec // G115: output offset bounded by buffer size
+			// nextPtr must skip past the IFD block, the thumbnail data that
+			// follows it and the pad byte that keeps the next IFD word-aligned.
+			nextPtr = uint32(pos + ifdWrittenLen(ifd.Entries, pos, false, ifd.ThumbnailData != nil) + thumbnailSpan(ifd)) //nolint:gosec // G115: output offset bounded by buffer size
 		}
-		out = writeIFD(out, entries, order, uint32(len(out)), nextPtr) //nolint:gosec // G115: output offset bounded by buffer size
+		out = writeIFD(out, entries, order, uint32(pos), nextPtr) //nolint:gosec // G115: output offset bounded by buffer size
 
-		// Append thumbnail bytes after the IFD block.
-		if ifd.ThumbnailData != nil {
-			out = append(out, ifd.ThumbnailData...)
-		}
+		out = appendThumbnail(out, ifd)
 	}
 	return out
+}
+
+// appendThumbnail appends the thumbnail bytes of ifd after its IFD block,
+// followed by one 0x00 pad byte when the data has odd length and another IFD
+// follows; the bytes appended are exactly thumbnailSpan(ifd).
+func appendThumbnail(out []byte, ifd *IFD) []byte {
+	if ifd.ThumbnailData == nil {
+		return out
+	}
+	out = append(out, ifd.ThumbnailData...)
+	if ifd.Next != nil && len(ifd.ThumbnailData)&1 == 1 {
+		out = append(out, 0x00)
+	}
+	return out
+}
+
+// thumbnailSpan returns the number of bytes the IFD's thumbnail occupies
+// after its IFD block: the data itself plus one pad byte when the data has
+// odd length and another IFD follows. TIFF 6.0 §2 (p. 13): an IFD offset must
+// be even ("The Image File Directory ... must begin on a word boundary"), so
+// the IFD that follows an odd-length thumbnail is placed after a pad byte.
+// BigTIFF uses the same rule (libtiff tif_dirwrite.c word-aligns every offset).
+func thumbnailSpan(ifd *IFD) uint64 {
+	n := uint64(len(ifd.ThumbnailData))
+	if ifd.Next != nil && n&1 == 1 {
+		n++
+	}
+	return n
 }
 
 // writeSubIFDsBigTIFF is the BigTIFF counterpart of writeSubIFDs; see its doc
@@ -524,7 +556,7 @@ func writeSubIFDs(out []byte, e *EXIF, exifIFDEntries []IFDEntry, order binary.B
 // the computed uint64 offset/length have been range-checked against
 // math.MaxUint32 — see ErrBigTIFFPointerOverflow's doc comment. Returns a
 // non-nil error instead of truncating when the check fails.
-func writeSubIFDsBigTIFF(out []byte, e *EXIF, exifIFDEntries []IFDEntry, order binary.ByteOrder) ([]byte, error) { //nolint:gocyclo,cyclop // mirrors classic writeSubIFDs' dispatch chain plus the R-16 thumbnail-pointer overflow guard; branches are inherent
+func writeSubIFDsBigTIFF(out []byte, e *EXIF, exifIFDEntries []IFDEntry, order binary.ByteOrder) ([]byte, error) { //nolint:cyclop // mirrors classic writeSubIFDs' dispatch chain plus the R-16 thumbnail-pointer overflow guard; branches are inherent
 	if e.ExifIFD != nil {
 		out = writeIFDBigTIFF(out, exifIFDEntries, order, uint64(len(out)), 0)
 	}
@@ -548,7 +580,7 @@ func writeSubIFDsBigTIFF(out []byte, e *EXIF, exifIFDEntries []IFDEntry, order b
 			// offset to the JPEG thumbnail; JPEGInterchangeFormatLength holds
 			// its byte length. Both stay TypeLong (32-bit) fields (task #264
 			// §4) — range-check before truncating (R-16).
-			thumbOff := uint64(len(out)) + ifdTotalSizeBigTIFF(ifd.Entries)
+			thumbOff := uint64(len(out)) + ifdWrittenLen(ifd.Entries, uint64(len(out)), true, true)
 			thumbLen := uint64(len(ifd.ThumbnailData))
 			if thumbOff > math.MaxUint32 || thumbLen > math.MaxUint32 {
 				return nil, fmt.Errorf("%w: JPEGInterchangeFormat offset %d / length %d", ErrBigTIFFPointerOverflow, thumbOff, thumbLen)
@@ -560,14 +592,13 @@ func writeSubIFDsBigTIFF(out []byte, e *EXIF, exifIFDEntries []IFDEntry, order b
 		if ifd.Next != nil {
 			// nextPtr must skip past both the IFD block and any thumbnail data
 			// that follows it before the next IFD begins.
-			nextPtr = uint64(len(out)) + ifdTotalSizeBigTIFF(entries) + uint64(len(ifd.ThumbnailData))
+			nextPtr = uint64(len(out)) + ifdWrittenLen(ifd.Entries, uint64(len(out)), true, ifd.ThumbnailData != nil) + thumbnailSpan(ifd)
 		}
 		out = writeIFDBigTIFF(out, entries, order, uint64(len(out)), nextPtr)
 
-		// Append thumbnail bytes after the IFD block.
-		if ifd.ThumbnailData != nil {
-			out = append(out, ifd.ThumbnailData...)
-		}
+		// Append thumbnail bytes after the IFD block (plus the word-alignment
+		// pad byte, see thumbnailSpan).
+		out = appendThumbnail(out, ifd)
 	}
 	return out, nil
 }
@@ -776,7 +807,7 @@ func classicCapacityHint(e *EXIF, ifd1Start uint32) uint64 {
 	total := uint64(ifd1Start)
 	if e.IFD0 != nil {
 		for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
-			total += uint64(ifdTotalSize(ifd.Entries)) + uint64(len(ifd.ThumbnailData))
+			total += uint64(ifdTotalSize(ifd.Entries)) + thumbnailSpan(ifd)
 		}
 	}
 	return total
@@ -814,7 +845,7 @@ func encodedLen(e *EXIF, ifd0Entries, exifIFDEntries []IFDEntry) uint64 {
 		// writeSubIFDs replaces the JPEGInterchangeFormat/Length values with
 		// 4-byte values (patchThumbnailEntries) when ThumbnailData is set.
 		pos += ifdWrittenLen(ifd.Entries, pos, e.BigTIFF, ifd.ThumbnailData != nil)
-		pos += uint64(len(ifd.ThumbnailData))
+		pos += thumbnailSpan(ifd)
 	}
 	return pos
 }

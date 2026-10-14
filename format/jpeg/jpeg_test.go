@@ -1056,34 +1056,8 @@ func TestReadSegmentInvalidLength(t *testing.T) {
 	}
 }
 
-// TestSkipPascalStringEdgeCases exercises skipPascalString when the pos is at
-// or beyond the buffer end, and when nameLen requires padding.
-func TestSkipPascalStringEdgeCases(t *testing.T) {
-	t.Parallel()
-
-	t.Run("pos at end returns pos+1, false", func(t *testing.T) {
-		t.Parallel()
-		buf := []byte{0x05}
-		newPos, ok := skipPascalString(buf, 1) // pos == len(buf)
-		if ok {
-			t.Error("expected ok=false")
-		}
-		if newPos != 2 {
-			t.Errorf("newPos = %d, want 2", newPos)
-		}
-	})
-
-	t.Run("even-length name (no padding byte)", func(t *testing.T) {
-		t.Parallel()
-		// nameLen=2 → total = 1(len) + 2(name) = 3 (odd) → padded: total = 4
-		buf := []byte{0x02, 'A', 'B', 0x00} // length + 2 chars + pad
-		newPos, ok := skipPascalString(buf, 0)
-		if !ok {
-			t.Errorf("expected ok=true, got false")
-		}
-		_ = newPos
-	})
-}
+// TestSkipPascalStringEdgeCases moved to internal/irb (TestSkipPascalString_EdgeCases)
+// together with the parser it exercises.
 
 // errorWriter is a test helper that always returns an error on Write.
 type errorWriter struct{}

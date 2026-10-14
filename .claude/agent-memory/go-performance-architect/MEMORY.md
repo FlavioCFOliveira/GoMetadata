@@ -1,5 +1,6 @@
 # Memory Index
 
+- [Sprint 45 E2 (2026-10-14)](project_sprint45_E2_irb_alignment_makernote.md) — TIFF/CR2 alignment+rebase, internal/irb digest policy, PNG raw profiles, MakerNote signatures; exiftool-verified facts + unfixed pre-existing write bugs
 - [Sprint 44 Batch G (2026-09-26, ALL 4 TASKS + 3 coordinator follow-ups CLOSED)](project_sprint44_batchG_291_294.md) — writeIFD double-buffer, extent.go snap removal, scanExtentPass map-reuse, CRITICAL BigTIFF off+size overflow fix (internal/boundscheck); cumulative bench vs ce1dc82
 - [Sprint 44 Batch H / task #297 (2026-09-26, CLOSED, last task of the loop)](project_sprint44_batchH_297.md) — pooled-LimitedReader StreamCopyN fast path (bytes.Buffer sink/bytes.Reader source), go:noinline+fixed-array alloc-free parseEXIF; all AC met, cumulative table refreshed
 - [Corpus-wide bench + CPU contention + pgrep -f rules](feedback_corpuswide_bench_and_cpu_contention.md) — data-dependent changes need a full corpus sweep; check for contention before trusting a surprising number; pgrep -f self-matches its own wait-loop, use pgrep -x or a captured PID

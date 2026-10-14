@@ -20,6 +20,8 @@ import (
 	"github.com/FlavioCFOliveira/GoMetadata/format/raw/rw2"
 	"github.com/FlavioCFOliveira/GoMetadata/format/tiff"
 	"github.com/FlavioCFOliveira/GoMetadata/format/webp"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/irb"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/tiffscan"
 	"github.com/FlavioCFOliveira/GoMetadata/iptc"
 	xmppkg "github.com/FlavioCFOliveira/GoMetadata/xmp"
 )
@@ -40,6 +42,40 @@ var extractors = map[format.FormatID]func(io.ReadSeeker) ([]byte, []byte, []byte
 	format.FormatDNG:  dng.Extract,
 	format.FormatORF:  orf.Extract,
 	format.FormatRW2:  rw2.Extract,
+}
+
+// isTIFFFamily reports whether fmtID is TIFF or a TIFF-based RAW format, whose
+// IFD0 may carry a Photoshop image resource block in tag 0x8649.
+func isTIFFFamily(fmtID format.FormatID) bool {
+	switch fmtID {
+	case format.FormatTIFF, format.FormatDNG, format.FormatCR2, format.FormatNEF,
+		format.FormatARW, format.FormatORF, format.FormatRW2:
+		return true
+	default:
+		return false
+	}
+}
+
+// setIPTCTrust computes the MWG §3.3.1 IPTC-trust-elevation decision for m
+// and caches it in m.iptcTrustElev (#208: exactly once, by Read). For the
+// TIFF family the digest is first read from the 0x0425 resource of the
+// Photoshop IRB in tag 0x8649 of rawEXIF (task #301), the check the Adobe XMP
+// Toolkit makes in TIFF_Handler.cpp:TIFF_MetaHandler::ProcessXMP. Only paid
+// for when the file has IPTC at all.
+func (m *Metadata) setIPTCTrust(fmtID format.FormatID, rawEXIF []byte) {
+	tiffDigest := false
+	if m.rawIPTCDigest == nil && m.rawIPTC != nil && isTIFFFamily(fmtID) {
+		m.rawIPTCDigest = tiffscan.IPTCDigest(rawEXIF)
+		tiffDigest = m.rawIPTCDigest != nil
+	}
+	m.iptcTrustElev = computeIPTCTrustElevated(m.rawIPTC, m.rawIPTCDigest)
+	if m.iptcTrustElev && tiffDigest && irb.DigestCurrent(m.rawIPTC, m.rawIPTCDigest, 4) {
+		// rawIPTC is tag 0x83BB without its LONG zero padding, while Photoshop
+		// and ExifTool hash the padded tag value; the Toolkit accepts both
+		// forms. Rare path: only a TIFF whose digest did not match the
+		// unpadded IIM pays the second MD5.
+		m.iptcTrustElev = false
+	}
 }
 
 // Read reads all metadata from r.
@@ -90,7 +126,8 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 	// For JPEG, rawXMPWire carries the original main+extended segmentation for
 	// lossless passthrough writes when the XMP is not modified.
 	// rawIPTCDigest carries the 16-byte MD5 from Photoshop resource 0x0425 when
-	// present (JPEG only; nil for all other formats). MWG §3.3.1.
+	// the JPEG extractor finds it (nil for all other formats; the TIFF family
+	// is handled below). MWG §3.3.1.
 	// xmpTruncated is set when extended XMP was capped or had invalid layout (#134).
 	// noCMT1Box is set when a CR3 file has no CMT1 sub-box (audit #138).
 	// #238: pass the wanted-segments mask so extraction can skip work that
@@ -111,18 +148,18 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 		rawXMP:             rawXMP,
 		rawXMPWire:         rawXMPWire,
 		rawEXIFIsWholeFile: tiffFamilyRawEXIFIsWholeFile(r, fmtID, rawEXIF),
-		// rawIPTCDigest is populated only for JPEG (the only format whose IRB
-		// carries a Photoshop 0x0425 digest resource). TIFF stores IPTC in tag
-		// 0x83BB without an IRB wrapper, so no digest applies there.
+		// rawIPTCDigest comes from the Photoshop 0x0425 resource: the JPEG
+		// extractor returns it, and for the TIFF family setIPTCTrust reads it
+		// from the IRB in tag 0x8649 (task #301).
 		rawIPTCDigest: rawIPTCDigest,
 	}
-
 	// #208: compute the MWG §3.3.1 IPTC-trust-elevation decision exactly once,
-	// here, and cache it. rawIPTC and rawIPTCDigest are already final at this
-	// point and never change for the rest of m's lifetime, so every later
-	// iptcTrustElevated() call (Copyright, Caption, Keywords, Creator) becomes
-	// a plain field read instead of re-hashing rawIPTC with MD5 each time.
-	m.iptcTrustElev = computeIPTCTrustElevated(m.rawIPTC, m.rawIPTCDigest)
+	// here, and cache it. rawIPTC and rawIPTCDigest are final once
+	// setIPTCTrust has read the TIFF-family digest, and never change for the
+	// rest of m's lifetime, so every later iptcTrustElevated() call
+	// (Copyright, Caption, Keywords, Creator) becomes a plain field read
+	// instead of re-hashing rawIPTC with MD5 each time.
+	m.setIPTCTrust(fmtID, rawEXIF)
 
 	// #134: surface extended XMP truncation as a ParseWarning so the caller
 	// can inspect it without aborting parsing. rawXMP still contains the main

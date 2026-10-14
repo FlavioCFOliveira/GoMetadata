@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
+	irbpkg "github.com/FlavioCFOliveira/GoMetadata/internal/irb"
 	xmppkg "github.com/FlavioCFOliveira/GoMetadata/xmp"
 )
 
@@ -505,39 +506,13 @@ func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte, wantIPTC, wan
 }
 
 // parseIRBForIPTCAndDigest scans a single contiguous Photoshop IRB byte block
-// and returns both the 0x0404 IPTC-NAA data and the 0x0425 IPTC-Digest data.
-// Either return value may be nil when the corresponding resource is absent.
+// and returns the 0x0404 IPTC-NAA data and the 0x0425 IPTC-Digest data; the
+// shared parser lives in internal/irb. Either result may be nil.
 //
 // MWG §3.3.1: the 0x0425 resource carries the 16-byte MD5 of the raw 0x0404
 // IIM stream at the time XMP was last written.
 func parseIRBForIPTCAndDigest(b []byte) (iptcData, digestData []byte) {
-	pos := 0
-	for pos < len(b) {
-		resourceID, data, newPos, ok := parseIRBEntry(b, pos)
-		if !ok {
-			if newPos == pos {
-				pos++
-				continue
-			}
-			break
-		}
-		switch resourceID {
-		case 0x0404:
-			iptcData = data
-		case 0x0425:
-			// MWG §3.3.1: 0x0425 payload is exactly 16 bytes (MD5 digest).
-			// Tolerate malformed blocks: copy only if exactly 16 bytes.
-			if len(data) == 16 {
-				digestData = data
-			}
-		}
-		pos = newPos
-		// Apply even-padding to data block (Adobe IRB spec §"Image Resources").
-		if len(data)%2 != 0 {
-			pos++
-		}
-	}
-	return iptcData, digestData
+	return irbpkg.IPTCAndDigest(b)
 }
 
 // extractIPTCAndDigestFromIRBPayloads searches the concatenated Photoshop IRB
@@ -908,19 +883,7 @@ func writeIPTCSegment(w io.Writer, rawIPTC, origIRB []byte) error {
 // slice. Produces the same bytes as buildIRB without a single-use allocation
 // when dst already has spare capacity (#218).
 func appendIRBBlock(dst, iptcData []byte) []byte {
-	size := len(iptcData)
-	//nolint:gosec // G115: byte extraction from int size value; shifts are safe bit extractions
-	dst = append(dst,
-		'8', 'B', 'I', 'M', // 8BIM marker
-		0x04, 0x04, // resource ID 0x0404
-		0x00, 0x00, // empty pascal name (length 0 + padding byte)
-		byte(size>>24), byte(size>>16), byte(size>>8), byte(size), // data length
-	)
-	dst = append(dst, iptcData...)
-	if size%2 != 0 {
-		dst = append(dst, 0x00) // pad data to even boundary
-	}
-	return dst
+	return irbpkg.AppendBlock(dst, irbpkg.ResourceIPTC, iptcData)
 }
 
 // buildIRB wraps a raw IPTC IIM stream in a minimal Photoshop IRB block
@@ -934,74 +897,15 @@ func buildIRB(iptcData []byte) []byte {
 // appendSplicedIRB appends to dst an IRB byte sequence identical to origIRB
 // except the 0x0404 (IPTC-NAA) resource block is replaced with a freshly
 // built block wrapping newIPTCData; every other 8BIM block is copied
-// verbatim in its original order and with its original padding. Returns the
-// extended slice.
-//
-// When newIPTCData is nil the 0x0404 block is removed rather than replaced.
-// All sibling resources are preserved in both cases. This behaviour is
-// required by #174: a nil rawIPTC to Inject must strip only the IPTC data
-// while keeping Photoshop siblings such as the 0x0425 digest resource.
-//
-// If origIRB contains no 0x0404 block and newIPTCData is non-nil, the new
-// block is appended at the end.
-//
-// EXIF §4.5.6: each 8BIM block is 4 ('8BIM') + 2 (ID) + pascal-name + 4 (size)
-// + data [+ 1 padding if data size is odd].
+// verbatim. When newIPTCData is nil the 0x0404 block is removed and all
+// siblings survive (#174). A 16-byte 0x0425 digest already present is
+// refreshed to the MD5 of newIPTCData when newIPTCData is non-nil (#284); see
+// irbpkg.AppendSpliced for the full semantics.
 //
 // #218: appends directly onto the caller's buffer (typically a pooled
-// segment buffer) instead of allocating a new one, eliminating the
-// single-use intermediate that spliceIPTCIntoIRB otherwise requires.
+// segment buffer) instead of allocating a new one.
 func appendSplicedIRB(dst, origIRB, newIPTCData []byte) []byte {
-	replaced := false
-	pos := 0
-	for pos < len(origIRB) {
-		entryStart := pos
-		resourceID, data, newPos, ok := parseIRBEntry(origIRB, pos)
-		if !ok {
-			if newPos == pos {
-				// Signature mismatch: advance one byte (scan-forward miss).
-				pos++
-				continue
-			}
-			// Structural failure: stop processing; emit what we have so far.
-			break
-		}
-
-		// Compute the end of the full encoded block including even-padding.
-		// We use the raw bytes from origIRB directly rather than re-encoding,
-		// preserving non-standard pascal names, reserved fields, etc.
-		blockEnd := newPos
-		if len(data)%2 != 0 {
-			blockEnd++ // skip the even-padding byte
-		}
-
-		if resourceID == 0x0404 {
-			// Replace the IPTC block with a freshly built one, or drop it
-			// entirely when newIPTCData is nil (strip-only mode).
-			if newIPTCData != nil {
-				dst = appendIRBBlock(dst, newIPTCData)
-			}
-			replaced = true
-		} else {
-			// Copy the block verbatim — 8BIM header + data + any padding byte.
-			// blockEnd is bounded by origIRB length (validated inside parseIRBEntry).
-			if blockEnd > len(origIRB) {
-				blockEnd = len(origIRB)
-			}
-			dst = append(dst, origIRB[entryStart:blockEnd]...)
-		}
-
-		pos = blockEnd
-	}
-
-	if !replaced && newIPTCData != nil {
-		// No 0x0404 block was found in the original IRB and we have a
-		// replacement: append the new one at the end. When newIPTCData is
-		// nil (remove-only mode) there is nothing to append; dst already
-		// holds the siblings-only result.
-		dst = appendIRBBlock(dst, newIPTCData)
-	}
-	return dst
+	return irbpkg.AppendSpliced(dst, origIRB, newIPTCData)
 }
 
 // spliceIPTCIntoIRB returns a new IRB byte slice built by appendSplicedIRB;
@@ -1504,140 +1408,16 @@ func writeExtendedXMP(w io.Writer, rawXMP []byte) error {
 	return writeExtendedChunks(w, []byte(guid), rawXMP)
 }
 
-// skipPascalString advances pos past a Pascal-string name field in a
-// Photoshop IRB entry. The field is 1-byte length + length bytes of name,
-// padded to an even total. Returns (newPos, true) on success or (pos+1, false)
-// when the buffer is too short. EXIF §4.5.6.
-func skipPascalString(b []byte, pos int) (int, bool) {
-	if pos >= len(b) {
-		return pos + 1, false
-	}
-	nameLen := int(b[pos])
-	pos++ // consume length byte
-	pos += nameLen
-	// Bounds check after advancing by nameLen: a crafted/corrupt Pascal-name
-	// length byte can push pos past the end of the buffer. Without this check
-	// the function would return (pos, true) for an overrun, letting the caller
-	// interpret a garbage position as valid and eventually triggering a terminal
-	// break in parseIRB that silently drops all subsequent 8BIM blocks
-	// (including a valid 0x0404 IPTC block). Returning false here allows
-	// parseIRBEntry to signal a recoverable miss. EXIF §4.5.6.
-	if pos > len(b) {
-		return pos, false
-	}
-	if (nameLen+1)%2 != 0 {
-		pos++ // even-padding byte
-	}
-	return pos, true
-}
-
-// parseIRBEntry validates the "8BIM" signature at b[pos], reads the resource
-// ID, Pascal-string name, and data block, and returns the resource ID, data
-// slice, new position, and a success flag.
-//
-// Two distinct failure modes:
-//   - signature mismatch / recoverable miss: returns (0, nil, entryPos, false) —
-//     newPos == entryPos (the pos at call time) signals this; the caller may
-//     advance by 1 to scan forward. This includes an overflowing Pascal-name,
-//     which is treated as a recoverable miss so that later 8BIM blocks are not
-//     silently dropped.
-//   - structural failure (truncated data, bad size): returns with newPos > pos;
-//     the caller treats this as terminal.
-//
-// IRB format: "8BIM" + 2-byte resource ID + Pascal string name + 4-byte size + data.
-// EXIF §4.5.6.
+// parseIRBEntry delegates to irbpkg.ParseEntry; see there for the recoverable-miss
+// (newPos == pos) versus terminal-failure (newPos > pos) contract. EXIF §4.5.6.
 func parseIRBEntry(b []byte, pos int) (resourceID uint16, data []byte, newPos int, ok bool) {
-	entryPos := pos // saved so we can signal a recoverable miss (newPos == entryPos)
-
-	if pos+4 > len(b) {
-		return 0, nil, pos + 1, false // terminal: not enough bytes even for signature
-	}
-
-	// Check "8BIM" signature; return pos unchanged on mismatch so the caller
-	// can distinguish a scan-forward miss from a structural error.
-	if b[pos] != '8' || b[pos+1] != 'B' || b[pos+2] != 'I' || b[pos+3] != 'M' {
-		return 0, nil, pos, false // signature mismatch — caller advances by 1
-	}
-	pos += 4
-
-	if pos+2 > len(b) {
-		return 0, nil, pos + 1, false
-	}
-	resourceID = binary.BigEndian.Uint16(b[pos:])
-	pos += 2
-
-	// Skip the Pascal-string name field (1-byte length + name + even padding).
-	// If the declared name length overflows the buffer, skipPascalString returns
-	// ok=false. We treat this as a recoverable miss (return entryPos) rather than
-	// a terminal failure so that parseIRB continues scanning for subsequent valid
-	// 8BIM blocks (including the 0x0404 IPTC resource). EXIF §4.5.6.
-	pos, ok = skipPascalString(b, pos)
-	if !ok {
-		return 0, nil, entryPos, false
-	}
-
-	if pos+4 > len(b) {
-		return 0, nil, pos + 1, false
-	}
-	// #45 (32-bit safety): read as uint64 before any arithmetic to prevent the
-	// negative-int wrap-around on 32-bit platforms where int is 32 bits.
-	// binary.BigEndian.Uint32 returns uint32 (max ~4 GiB); on a 32-bit platform
-	// casting directly to int would produce a negative value for sizes ≥ 2 GiB,
-	// bypassing the bounds check below and panicking on the slice expression.
-	// We validate using uint64 arithmetic throughout, then convert to int only
-	// after confirming the value fits within the buffer (which is at most
-	// MaxInt32 bytes on 32-bit, so the conversion is always safe at that point).
-	dataSizeU64 := uint64(binary.BigEndian.Uint32(b[pos:]))
-	pos += 4
-
-	// Bounds check entirely in uint64 to be safe on 32-bit platforms.
-	// pos is a non-negative int (it has been advanced past the fixed-size header
-	// fields without exceeding len(b)); the cast is safe.
-	posU64 := uint64(pos) //nolint:gosec // G115: pos is always non-negative (bounded by len(b))
-	if posU64+dataSizeU64 > uint64(len(b)) {
-		return 0, nil, pos + 1, false
-	}
-	// Safe to convert: dataSizeU64 ≤ len(b)−pos ≤ len(b) ≤ MaxInt (both 32 and 64-bit).
-	dataSize := int(dataSizeU64) //nolint:gosec // G115: safe; bounded by uint64 check above
-	return resourceID, b[pos : pos+dataSize], pos + dataSize, true
+	return irbpkg.ParseEntry(b, pos)
 }
 
-// parseIRB extracts the IPTC IIM stream from a Photoshop IRB block.
-// IRB format: "8BIM" + 2-byte resource ID + Pascal string name + 4-byte size + data.
-// Resource ID 0x0404 is the IPTC-NAA resource (EXIF §4.5.6.2).
+// parseIRB extracts the IPTC IIM stream (resource 0x0404) from a Photoshop IRB
+// block, or nil when absent (EXIF §4.5.6.2).
 func parseIRB(b []byte) []byte {
-	pos := 0
-	for pos < len(b) {
-		resourceID, data, newPos, ok := parseIRBEntry(b, pos)
-		if !ok {
-			if newPos == pos {
-				// Signature mismatch: advance one byte to scan forward.
-				pos++
-				continue
-			}
-			// Structural failure (truncated data, bad bounds): terminal.
-			break
-		}
-
-		if resourceID == 0x0404 {
-			return data
-		}
-
-		pos = newPos
-		// Apply even-padding to data block (EXIF §4.5.6).
-		if len(data)%2 != 0 {
-			pos++
-			// #151: clamp pos so a single non-IPTC block with odd-length data and no
-			// trailing pad byte does not advance pos past len(b). The for-guard
-			// (pos < len(b)) already prevents an out-of-bounds read, but leaving pos
-			// one beyond len(b) is semantically incorrect and mirrors the identical
-			// clamp in spliceIPTCIntoIRB. Adobe Photoshop IRB spec §"Image Resources".
-			if pos > len(b) {
-				pos = len(b)
-			}
-		}
-	}
-	return nil
+	return irbpkg.FindIPTC(b)
 }
 
 // skipFillBytes reads consecutive 0xFF fill bytes from r into hdr[1], advancing
