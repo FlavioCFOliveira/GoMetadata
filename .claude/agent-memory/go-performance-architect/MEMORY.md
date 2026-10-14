@@ -1,5 +1,6 @@
 # Memory Index
 
+- [Sprint 45 E2b (2026-10-14)](project_sprint45_e2b_subifd_makernote_irb.md) — SubIFD tree+chains, MakerNote base/footer, IRB first-wins; TypeUTF8=13 vs 129 finding
 - [Sprint 45 E2 (2026-10-14)](project_sprint45_E2_irb_alignment_makernote.md) — TIFF/CR2 alignment+rebase, internal/irb digest policy, PNG raw profiles, MakerNote signatures; exiftool-verified facts + unfixed pre-existing write bugs
 - [Sprint 44 Batch G (2026-09-26, ALL 4 TASKS + 3 coordinator follow-ups CLOSED)](project_sprint44_batchG_291_294.md) — writeIFD double-buffer, extent.go snap removal, scanExtentPass map-reuse, CRITICAL BigTIFF off+size overflow fix (internal/boundscheck); cumulative bench vs ce1dc82
 - [Sprint 44 Batch H / task #297 (2026-09-26, CLOSED, last task of the loop)](project_sprint44_batchH_297.md) — pooled-LimitedReader StreamCopyN fast path (bytes.Buffer sink/bytes.Reader source), go:noinline+fixed-array alloc-free parseEXIF; all AC met, cumulative table refreshed
@@ -86,7 +87,7 @@
 - [WriteFile fsync+symlink+chown (#124/#125)](project_write_fsync_symlink_124_125.md) — Sync before rename; EvalSymlinks; _unix/_windows split
 - [ORF/RW2 rawEXIF original magic](feedback_orf_rw2_rawexif_original_magic.md) — call patchRawEXIFForParse before exif.Parse
 - [relocateTIFFFromParsed short-circuit gap](feedback_makernote_short_circuit.md) — apply post-encode mutations to BOTH short-circuit and main path
-- [MakerNote OOL offset convention matrix (#127)](project_makernote_ool_rebasing.md) — OLYMP/Sony=TIFF-absolute; Nikon3/Panasonic/Canon=blob-relative
+- [MakerNote offset-base model (corrected #310/#312)](project_makernote_ool_rebasing.md) — Canon/Panasonic/Sony/OLYMP TIFF-relative; layout table is truth
 - [t.Skip policy](feedback_tskip_policy.md) — only corpus/OS/constant guards; synthetic fixture skips are always bugs
 - [testdata/fixtures strategy](project_testing_fixtures.md) — committed fixtures + idempotent generator; CI passes without corpus
 - [xmp.GPS() W3C Geo fallback (#195)](project_xmp_geo_namespace.md) — NSgeo fallback was masked by t.Skip; now tested
