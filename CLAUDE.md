@@ -173,8 +173,9 @@ Motto: **"Maximise the return on effort: deliver the most with the least work."*
 
 This is the default way of working on this project. The user MUST NOT need to ask for it, and it MUST NOT be modelled as an `rmp` task.
 
-- **Merge related tasks.** Whenever tasks — in `rmp` or requested ad hoc by the user — show verifiable functional or technical proximity, merge them into a single development effort.
-- **Batch work within and across tasks.** Write all the code for the merged tasks in one pass, then test all the changes in one pass. Do not write small fragments and test each one in isolation.
+- **Group related tasks into one effort.** Whenever tasks — in `rmp` or requested ad hoc by the user — show verifiable functional or technical proximity, execute them as a single development effort that benefits all of them together.
+- **Tasks stay separate.** When tasks are identified and recorded, each task remains a separate, individually defined task. Only the work effort — development and testing — is joined.
+- **Batch work within and across tasks.** Write all the code for the grouped tasks in one pass, then test all the changes in one pass. Do not write small fragments and test each one in isolation.
 - **Batch documentation.** Write all the documentation in one pass. When the scope is too large, split it into a few coherent blocks and handle each block in one pass.
 - **Apply the principle to all work**, not only to code and documentation.
 - **Minimise tasks and iterations.** Reach each objective with the smallest possible number of tasks and iterations.
@@ -183,7 +184,7 @@ This is the default way of working on this project. The user MUST NOT need to as
 
 ## Work Convergence Policy
 
-- **Always look for convergence** between the individual objectives of each task, and turn that convergence into synergy. Tasks with complementary objectives, functional proximity, or technical proximity MUST always be grouped so that the effort is optimised and the synergies are maximised.
+- **Always look for convergence** between the individual objectives of each task, and turn that convergence into synergy. Tasks with complementary objectives, functional proximity, or technical proximity MUST always have their work effort grouped (the tasks themselves stay separate) so that the effort is optimised and the synergies are maximised.
 - **Group work of the same type**: write all the code at once, write all the documentation at once, and run the tests for all changed code at once.
 - **Quality is not negotiable.** Grouping MUST deliver work that is faster and cheaper than task-by-task development and at least equal in quality. If grouping would reduce quality, do not group.
 - **Maximise internal resources** (skills, subagents, the Knowledge Graph, existing tooling) so that deliveries are faster and cost the user less.
@@ -210,7 +211,7 @@ All writing and all interpretation of instructions on this project MUST be:
 
 ### Documentation Language
 
-**All documentation** — from the main README to the specifications, including code documentation (comments and doc comments) — MUST be written in flawless English, in a professional tone, with no spelling, grammatical, or syntax errors. It MUST be accurate and faithful to the code, aimed at human readers, and follow the four rules above (explicit, objective, closed, concise).
+**All documentation** — from the main README and this `CLAUDE.md` to the specifications, including code documentation (comments and doc comments) — MUST be written in flawless English, in a professional tone, with no spelling, grammatical, or syntax errors. It MUST be accurate and faithful to the code, aimed at human readers, and follow the four rules above (explicit, objective, closed, concise).
 
 ---
 
@@ -223,6 +224,18 @@ Act strictly towards the objective of the current work. You are FORBIDDEN from v
 ## Completeness
 
 You are FORBIDDEN from executing any task or piece of work only partially. Every piece of work that is started MUST be executed in full. **DO NOT LEAVE TASKS HALF-DONE OR PARTIALLY DONE.**
+
+---
+
+## Open Source Policy
+
+At every stage of analysis, exploration, and development, determine whether a reference open-source project already implements or solves what is required. Use such projects to copy from, in full or in part, where possible, or otherwise to study as examples. Use **only reference projects** that are useful and trustworthy for the intended contribution.
+
+---
+
+## Do Not Reinvent
+
+When analysing existing problems, new features, or refactorings of existing features, do not invent a solution entirely from scratch. Base the solution primarily on existing knowledge of the subject and, wherever possible, on the knowledge, engineering, architecture, and approach of an open-source project that already solves the problem in whole or in part. Copying and studying projects that already implement what is needed is authorised. These projects are only the starting point: never stay bound to the source code — the current project must benefit from the code of other projects, in full or in part, and adapt it to its own requirements.
 
 ---
 
@@ -242,7 +255,7 @@ Every development cycle must follow these steps in order:
 
 **Specify → Implement → Test → Document**
 
-Apply the Work Synergy and Work Convergence policies to each step: when a cycle covers several merged tasks, specify them together, implement them together, test them together, and document them together.
+Apply the Work Synergy and Work Convergence policies to each step: when a cycle covers several grouped tasks, specify them together, implement them together, test them together, and document them together.
 
 ---
 
@@ -270,7 +283,7 @@ Use the **Knowledge Graph**, queried through the `knowledge-authority` skill, to
 
 ### Planning
 
-Assess the proposed work and determine whether multiple development phases (sprints) are needed, each delivering a solid, well-defined deliverable. Apply the Work Synergy and Work Convergence policies: plan the smallest possible number of sprints and tasks, and merge tasks with functional or technical proximity.
+Assess the proposed work and determine whether multiple development phases (sprints) are needed, each delivering a solid, well-defined deliverable. Apply the Work Synergy and Work Convergence policies: plan the smallest possible number of sprints and tasks, and group tasks with functional or technical proximity into shared development efforts, keeping each task as a separate record.
 
 Every task must have a clear, objective definition of: goals, functional requirements, technical requirements, and acceptance criteria that confirm the task is complete. When a task is closed, include a brief summary of what was done.
 
@@ -285,7 +298,7 @@ Subdivide a task only when its scope is too large for a single development cycle
 Task execution is the natural continuation of planning. Always, through the `roadmap-manager` skill, use `rmp` to:
 
 1. Check whether any open task is already in progress and resume it if so.
-2. Identify the next task, together with every other open task that can be merged with it under the Work Synergy and Work Convergence policies.
+2. Identify the next task, together with every other open task whose work can be grouped with it under the Work Synergy and Work Convergence policies.
 3. Understand the objective of each selected task from its description, functional requirements, and technical requirements.
 4. Determine the most appropriate specialist subagent and delegate the execution to it, per the Subagent Policy (one subagent at a time, in series). Go code is always delegated to `go-performance-architect`, per the mandatory Code Authorship Rule above.
 5. Validate the acceptance criteria before closing each task.
@@ -295,7 +308,7 @@ Task execution is the natural continuation of planning. Always, through the `roa
 
 Whenever possible, adapt the model and its reasoning-effort level to the requirements of each task's individual operations.
 
-Sprints must always be executed sequentially. Tasks within a sprint may be merged into a single effort under the Work Synergy and Work Convergence policies; subagents always run in series, per the Subagent Policy.
+Sprints must always be executed sequentially. The work of tasks within a sprint may be grouped into a single effort, with the tasks kept separate, under the Work Synergy and Work Convergence policies; subagents always run in series, per the Subagent Policy.
 
 ---
 
