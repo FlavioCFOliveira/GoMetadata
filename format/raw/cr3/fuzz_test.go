@@ -23,6 +23,13 @@ func FuzzCR3Extract(f *testing.F) {
 	// Seed: truncated ftyp box.
 	f.Add([]byte{0x00, 0x00, 0x00, 0x14, 'f', 't', 'y', 'p'})
 
+	// Seed (task #300): CMT3, CMT4, a legacy "XMP " sub-box, a top-level XMP
+	// uuid box and stco/co64 chunk offsets into mdat.
+	f.Add(buildTask300CR3(cr3Fixture{
+		cmt1: buildMinimalCR3Seed(), cmt3: buildMinimalCR3Seed(), cmt4: buildMinimalCR3Seed(),
+		legacyXMP: []byte("<x/>"), topXMP: []byte("<x:xmpmeta/>"), mdat: []byte("RAWDATA"),
+	}))
+
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic regardless of input.
 		_, _, _, _ = Extract(bytes.NewReader(data))
@@ -117,10 +124,23 @@ func FuzzCR3Inject(f *testing.F) {
 	rawEXIF := minimalTIFF()
 	rawXMP := []byte(`<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?><x:xmpmeta xmlns:x='adobe:ns:meta/'></x:xmpmeta><?xpacket end='r'?>`)
 
+	// Seed (task #300): CMT3, CMT4, a legacy "XMP " sub-box, a top-level XMP
+	// uuid box and stco/co64 chunk offsets into mdat.
+	f.Add(buildTask300CR3(cr3Fixture{
+		cmt1: buildMinimalCR3Seed(), cmt3: buildMinimalCR3Seed(), cmt4: buildMinimalCR3Seed(),
+		legacyXMP: []byte("<x/>"), topXMP: []byte("<x:xmpmeta/>"), mdat: []byte("RAWDATA"),
+	}))
+
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic regardless of input. Inject must return an error or
 		// write valid output — a panic is always a bug in the write path.
 		err := Inject(bytes.NewReader(data), io.Discard, rawEXIF, nil, rawXMP, true)
 		_ = err
 	})
+}
+
+// buildMinimalCR3Seed returns a minimal little-endian TIFF stream (an empty
+// first IFD) for the CMT sub-boxes of the fuzz seeds.
+func buildMinimalCR3Seed() []byte {
+	return []byte{'I', 'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
 }

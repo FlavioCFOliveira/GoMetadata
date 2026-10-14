@@ -143,7 +143,8 @@ Proprietary deviations to tolerate: Nikon Type-3 TIFF-in-TIFF (`Nikon\0`+header)
 encrypted/obfuscated tags, ORF/RW2 non-standard magic (patch to `2A 00` for the walk, restore on write).
 **(d)** EXIF via 0x8769; GPS via 0x8825; MakerNote 0x927C. XMP via tag `0x02BC` (700). IPTC via
 tag `0x83BB` and/or XMP. CR3 (BMFF): Canon `CMT1`=IFD0, `CMT2`=EXIF IFD, `CMT3`=MakerNote,
-`CMT4`=GPS; not the TIFF item model.
+`CMT4`=GPS, each a complete TIFF stream; XMP in the top-level `uuid` box
+`be7acfcb-97a9-42e8-9c71-999491e3afac`; not the TIFF item model.
 **(e)** Byte order fixed by header (no mixing); patch all dependent offsets when moving
 (StripOffsets 0x0111, TileOffsets 0x0144, SubIFDs, ExifIFD, MakerNote internal). Absolute-offset
 MakerNotes break if relocated — preserve in place or fix up. ORF/RW2: restore original magic on

@@ -1,7 +1,17 @@
-// Package cr3 implements metadata extraction for Canon CR3 files.
-// CR3 is an ISOBMFF-based format (ftyp brand "crx ") with Canon-specific
-// boxes CMT1, CMT2, CMT3, CMT4 that contain EXIF IFDs.
+// Package cr3 implements metadata extraction and injection for Canon CR3
+// files. CR3 is an ISOBMFF-based format (ftyp brand "crx ") whose moov box
+// holds a Canon uuid box with the sub-boxes CMT1 (IFD0), CMT2 (Exif IFD),
+// CMT3 (Canon MakerNote IFD) and CMT4 (GPS IFD), each a complete TIFF stream,
+// and whose XMP packet is a top-level uuid box.
 package cr3
+
+// Adapted from evanoberholster/imagemeta meta/isobmff/crx.go:readUUIDBox,readCrxMoovBox, Copyright (c) 2019-2023 Evan Oberholster, SPDX-License-Identifier: MIT
+//
+// Changes from imagemeta: the UUIDs of the Canon metadata box and of the XMP
+// packet box, and the mapping of CMT1-CMT4 to IFD0, Exif IFD, MakerNote IFD
+// and GPS IFD, are applied to byte slices instead of a streaming reader;
+// CMT3 and CMT4 are returned as raw TIFF streams (Segments) for the caller
+// to parse; and the same layout is written back by Inject.
 
 import (
 	"bytes"
@@ -9,7 +19,9 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 
+	"github.com/FlavioCFOliveira/GoMetadata/exif"
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 )
 
@@ -17,6 +29,15 @@ import (
 var canonUUID = []byte{ //nolint:gochecknoglobals // package-level constant bytes
 	0x85, 0xC0, 0xB6, 0x87, 0x82, 0x0F, 0x11, 0xE0,
 	0x81, 0x11, 0xF4, 0xCE, 0x46, 0x2B, 0x6A, 0x48,
+}
+
+// xmpUUID identifies the top-level uuid box that carries the XMP packet of a
+// CR3 file: {BE7ACFCB-97A9-42E8-9C71-999491E3AFAC} (imagemeta
+// cr3XPacketUUID; ExifTool QuickTime "UUID-XMP"). The packet follows the
+// 16-byte UUID directly (ISO 14496-12 §4.2 extended type).
+var xmpUUID = []byte{ //nolint:gochecknoglobals // package-level constant bytes
+	0xBE, 0x7A, 0xCF, 0xCB, 0x97, 0xA9, 0x42, 0xE8,
+	0x9C, 0x71, 0x99, 0x94, 0x91, 0xE3, 0xAF, 0xAC,
 }
 
 // ISOBMFF box types compared against parseCR3BoxHeader's [4]byte result
@@ -33,7 +54,12 @@ var (
 	boxUUID = [4]byte{'u', 'u', 'i', 'd'} //nolint:gochecknoglobals // package-level constant box type; never mutated
 	boxCMT1 = [4]byte{'C', 'M', 'T', '1'} //nolint:gochecknoglobals // package-level constant box type; never mutated
 	boxCMT2 = [4]byte{'C', 'M', 'T', '2'} //nolint:gochecknoglobals // package-level constant box type; never mutated
-	boxXMP  = [4]byte{'X', 'M', 'P', ' '} //nolint:gochecknoglobals // package-level constant box type; never mutated
+	boxCMT3 = [4]byte{'C', 'M', 'T', '3'} //nolint:gochecknoglobals // package-level constant box type; never mutated
+	boxCMT4 = [4]byte{'C', 'M', 'T', '4'} //nolint:gochecknoglobals // package-level constant box type; never mutated
+	// boxXMP is a non-standard "XMP " sub-box of the Canon uuid box that
+	// GoMetadata versions before task #300 wrote; it is still read as a
+	// fallback and kept in step on write, but never created.
+	boxXMP = [4]byte{'X', 'M', 'P', ' '} //nolint:gochecknoglobals // package-level constant box type; never mutated
 )
 
 // parseCR3BoxHeader reads an ISOBMFF box header at data[pos:] and returns the
@@ -156,117 +182,258 @@ func cr3BoxHeaderAt(r io.ReadSeeker, hdr *[16]byte, pos, fileLen int64) (size ui
 	return size, typ, headerLen, true
 }
 
-// readTopLevelBox scans top-level ISOBMFF boxes starting at r's current
-// position (assumed 0) for the first box of type want, and returns its
-// payload (header excluded) as a freshly allocated, exactly-sized slice.
-// r's position after the call is unspecified.
-//
-// Every box before the match has only its header (8 bytes, or 16 for the
-// ISO 14496-12 §4.2 extended-size encoding) read; its payload is skipped via
-// Seek without ever being read into memory. This keeps the read volume
-// proportional to the metadata actually present — ftyp's header plus moov's
-// full payload — rather than the whole file, which in a CR3 is almost
-// entirely raw sensor data in the mdat box (#286).
-//
-// Returns (nil, 0, 0, nil) if no matching box is found before EOF or the scan
-// cap is reached; a non-nil error is returned only for a genuine I/O failure
-// on the matched box's payload read or on the seek past a skipped box.
-//
-// boxStart/boxEnd are the matched box's absolute byte range in the stream,
-// header included (boxEnd-boxStart == the box's own resolved size). #292:
-// Inject uses these to stream-copy the bytes surrounding the box (everything
-// NOT part of the matched box) verbatim, without ever buffering them.
-func readTopLevelBox(r io.ReadSeeker, want [4]byte, fileLen int64) (payload []byte, boxStart, boxEnd int64, err error) {
+// topLevelLayout records the top-level boxes of a CR3 file that metadata
+// lives in. Ranges are absolute byte offsets, header included; an absent box
+// has start == end == 0.
+type topLevelLayout struct {
+	moov               []byte // moov payload (header excluded); nil when absent
+	moovStart, moovEnd int64
+	xmpStart, xmpEnd   int64  // the first top-level XMP uuid box
+	xmp                []byte // its payload after the 16-byte UUID; read only on request
+}
+
+// hasXMPBox reports whether a top-level XMP uuid box was found.
+func (l *topLevelLayout) hasXMPBox() bool { return l.xmpEnd > l.xmpStart }
+
+// scanTopLevel scans the top-level ISOBMFF boxes of r (positioned at 0) for
+// the first moov box, whose payload it reads, and the first uuid box with the
+// XMP UUID, whose payload it reads when wantXMP is set. Every other box has
+// only its header read; its payload is skipped via Seek (#286: the read
+// volume stays proportional to the metadata, not to the raw image data in
+// mdat). The scan stops once both boxes are found, at the first malformed
+// header, or after maxCR3TopLevelBoxScans boxes. A non-nil error is returned
+// only for an I/O failure.
+func scanTopLevel(r io.ReadSeeker, fileLen int64, wantXMP bool) (topLevelLayout, error) {
+	var lay topLevelLayout
 	var hdr [16]byte
 	pos := int64(0)
 	for scans := 0; scans < maxCR3TopLevelBoxScans && pos+8 <= fileLen; scans++ {
 		size, typ, headerLen, ok := cr3BoxHeaderAt(r, &hdr, pos, fileLen)
 		if !ok {
-			return nil, 0, 0, nil
+			return lay, nil
 		}
-
-		if typ == want {
-			payloadLen := int64(size) - headerLen //nolint:gosec // G115: size <= fileLen-pos <= maxFileSize, fits int64
-			payload := make([]byte, payloadLen)
-			if _, err := io.ReadFull(r, payload); err != nil {
-				return nil, 0, 0, fmt.Errorf("cr3: read %s box payload: %w", typ, err)
-			}
-			return payload, pos, pos + int64(size), nil //nolint:gosec // G115: size <= fileLen-pos, fits int64
+		end := pos + int64(size) //nolint:gosec // G115: size <= fileLen-pos, fits int64
+		if err := lay.visit(r, typ, pos, end, end-pos-headerLen, wantXMP); err != nil {
+			return lay, err
 		}
-
-		// Skip the rest of this box (its payload) without reading it.
-		next := pos + int64(size) //nolint:gosec // G115: size <= fileLen-pos, fits int64
-		if _, err := r.Seek(next, io.SeekStart); err != nil {
-			return nil, 0, 0, fmt.Errorf("cr3: seek past %s box: %w", typ, err)
+		if (lay.moov != nil && lay.hasXMPBox()) || end+8 > fileLen {
+			return lay, nil // done, or no room for another box header
 		}
-		pos = next
+		if _, err := r.Seek(end, io.SeekStart); err != nil {
+			return lay, fmt.Errorf("cr3: seek past %s box: %w", typ, err)
+		}
+		pos = end
 	}
-	return nil, 0, 0, nil
+	return lay, nil
+}
+
+// visit records the top-level box [start, end) of type typ, whose payload of
+// payloadLen bytes starts at r's position, when it is the first moov box or
+// the first XMP uuid box.
+func (l *topLevelLayout) visit(r io.ReadSeeker, typ [4]byte, start, end, payloadLen int64, wantXMP bool) error {
+	switch {
+	case typ == boxMoov && l.moov == nil:
+		return l.readMoov(r, start, end, payloadLen)
+	case typ == boxUUID && !l.hasXMPBox() && payloadLen >= 16:
+		return l.readXMPBox(r, start, end, payloadLen, wantXMP)
+	default:
+		return nil
+	}
+}
+
+// readMoov reads the payload of the moov box [start, end) at r's position.
+func (l *topLevelLayout) readMoov(r io.ReadSeeker, start, end, payloadLen int64) error {
+	l.moov = make([]byte, payloadLen)
+	if _, err := io.ReadFull(r, l.moov); err != nil {
+		l.moov = nil
+		return fmt.Errorf("cr3: read moov box payload: %w", err)
+	}
+	l.moovStart, l.moovEnd = start, end
+	return nil
+}
+
+// readXMPBox reads the 16-byte UUID of the uuid box [start, end) at r's
+// position and, when it is the XMP UUID, records the box and (when wantXMP is
+// set) reads its payload.
+func (l *topLevelLayout) readXMPBox(r io.ReadSeeker, start, end, payloadLen int64, wantXMP bool) error {
+	var id [16]byte
+	if _, err := io.ReadFull(r, id[:]); err != nil {
+		return fmt.Errorf("cr3: read uuid box: %w", err)
+	}
+	if !bytes.Equal(id[:], xmpUUID) {
+		return nil
+	}
+	l.xmpStart, l.xmpEnd = start, end
+	if !wantXMP {
+		return nil
+	}
+	l.xmp = make([]byte, payloadLen-16)
+	if _, err := io.ReadFull(r, l.xmp); err != nil {
+		return fmt.Errorf("cr3: read XMP uuid box payload: %w", err)
+	}
+	return nil
+}
+
+// Segments holds the metadata payloads of a CR3 file.
+type Segments struct {
+	// EXIF is the CMT1 TIFF stream (IFD0), with CMT2 appended when the
+	// ExifIFD pointer of IFD0 points beyond CMT1 (see mergeCMT).
+	EXIF []byte
+	// MakerNote is the CMT3 TIFF stream: its first IFD is the Canon
+	// MakerNote IFD. nil when absent.
+	MakerNote []byte
+	// GPS is the CMT4 TIFF stream: its first IFD is the GPS IFD. nil when
+	// absent.
+	GPS []byte
+	// XMP is the packet of the top-level XMP uuid box, or, when the file has
+	// none, of a legacy "XMP " sub-box of the Canon uuid box. nil when absent.
+	XMP []byte
 }
 
 // Extract reads metadata from a CR3 file by navigating the ISOBMFF box tree.
-// CMT1 contains IFD0 (TIFF header + entries); CMT2 contains the Exif IFD that
-// IFD0's ExifIFD pointer (tag 0x8769) addresses. Both are merged into rawEXIF
-// so that exif.Parse receives a contiguous buffer covering both IFDs.
+// rawEXIF is Segments.EXIF and rawXMP is Segments.XMP (see ExtractSegments);
+// rawIPTC is always nil (CR3 carries no IPTC).
 //
 // If the moov/UUID structure is present but no CMT1 sub-box is found, Extract
-// returns (nil, nil, rawXMP, ErrNoCMT1Box). rawXMP is still populated when a
-// "XMP " sub-box exists, so callers can use XMP even when EXIF is absent.
+// returns (nil, nil, rawXMP, ErrNoCMT1Box), with rawXMP still populated.
 //
 // # audit finding #138
 //
 // ErrNoCMT1Box lets callers distinguish "no EXIF" from a broken container parse.
 // lclevy canon_cr3: CMT1 carries IFD0; its absence means no EXIF is present.
-//
-// #286: Extract reads only the ftyp and moov boxes from r — typically tens of
-// KB combined — instead of the whole file, which for a real Canon CR3 is
-// mostly raw sensor data (the mdat box) that Extract never touches; a 12-37 MB
-// source file used to be read and retained in full for a few hundred bytes of
-// actual EXIF. The returned rawEXIF/rawXMP are freshly cloned so that neither
-// retains moov's (or the Canon UUID box's) full backing array — bounding
-// per-Metadata retention to the size of the EXIF/XMP payloads themselves,
-// regardless of what else (e.g. an embedded preview) moov may also carry.
 func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+	seg, err := ExtractSegments(r)
+	return seg.EXIF, nil, seg.XMP, err
+}
+
+// ExtractSegments reads every metadata payload of a CR3 file: the CMT1-CMT4
+// TIFF streams of the Canon uuid box in moov (imagemeta readCrxMoovBox:
+// CMT1 = IFD0, CMT2 = Exif IFD, CMT3 = MakerNote IFD, CMT4 = GPS IFD) and the
+// XMP packet of the top-level XMP uuid box (task #300).
+//
+// When the moov box has no Canon uuid box, the CMT sub-boxes are searched in
+// the moov box itself. When the file has no top-level XMP uuid box, a legacy
+// "XMP " sub-box is read instead. If no CMT1 sub-box exists, the returned
+// Segments carry everything else and the error is ErrNoCMT1Box.
+//
+// #286: only ftyp, moov and the XMP uuid box are read — typically tens of KB
+// — instead of the whole file, which is mostly raw sensor data in mdat. Every
+// returned slice is freshly allocated at its exact size, so none retains the
+// moov buffer.
+func ExtractSegments(r io.ReadSeeker) (Segments, error) {
+	var seg Segments
 	fileLen, err := seekFileLen(r)
 	if err != nil {
-		return nil, nil, nil, err
+		return seg, err
 	}
-	// #140: reject an oversized input before any content is read, exactly as
-	// the previous whole-file-read implementation did.
+	// #140: reject an oversized input before any content is read.
 	if fileLen > maxFileSize {
-		return nil, nil, nil, fmt.Errorf("cr3: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
+		return seg, fmt.Errorf("cr3: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
 	}
 
-	moovData, _, _, err := readTopLevelBox(r, boxMoov, fileLen)
+	lay, err := scanTopLevel(r, fileLen, true)
 	if err != nil {
-		return nil, nil, nil, err
+		return seg, err
 	}
-	if moovData == nil {
-		return nil, nil, nil, ErrNoMoovBox
+	if lay.moov == nil {
+		return seg, ErrNoMoovBox
 	}
 
-	uuidData := findUUIDBox(moovData, canonUUID)
-	if uuidData == nil {
-		// Fall back: search for CMT1/CMT2 anywhere in the moov box.
-		cmt1 := findBox(moovData, boxCMT1, 0)
-		cmt2 := findBox(moovData, boxCMT2, 0)
-		rawXMP = bytes.Clone(findBox(moovData, boxXMP, 0))
+	var cb canonBoxes
+	if canon := findUUIDBox(lay.moov, canonUUID); canon != nil {
+		cb = scanCanonBoxes(canon)
+	} else {
+		// Fall back: search for the sub-boxes anywhere in the moov box.
+		cb = canonBoxes{
+			cmt: [4][]byte{findBox(lay.moov, boxCMT1, 0), findBox(lay.moov, boxCMT2, 0), findBox(lay.moov, boxCMT3, 0), findBox(lay.moov, boxCMT4, 0)},
+			xmp: findBox(lay.moov, boxXMP, 0),
+		}
+	}
+	// lay.xmp is already an exact-size allocation of its own.
+	seg.XMP = lay.xmp
+	if seg.XMP == nil {
+		seg.XMP = bytes.Clone(cb.xmp)
+	}
+	seg.MakerNote = bytes.Clone(cb.cmt[2])
+	seg.GPS = bytes.Clone(cb.cmt[3])
+	if cb.cmt[0] == nil {
 		// audit #138: surface missing CMT1 as a sentinel error so callers can
 		// distinguish no-EXIF from a broken container.
-		if cmt1 == nil {
-			return nil, nil, rawXMP, ErrNoCMT1Box
-		}
-		return bytes.Clone(mergeCMT(cmt1, cmt2)), nil, rawXMP, nil
+		return seg, ErrNoCMT1Box
 	}
+	seg.EXIF = bytes.Clone(mergeCMT(cb.cmt[0], cb.cmt[1]))
+	return seg, nil
+}
 
-	cmt1 := findBox(uuidData, boxCMT1, 0)
-	cmt2 := findBox(uuidData, boxCMT2, 0)
-	rawXMP = bytes.Clone(findBox(uuidData, boxXMP, 0))
-	// audit #138: surface missing CMT1 as a sentinel error.
-	if cmt1 == nil {
-		return nil, nil, rawXMP, ErrNoCMT1Box
+// canonBoxes holds the payloads of the first CMT1-CMT4 and "XMP " sub-boxes
+// of the Canon uuid box (nil when absent).
+type canonBoxes struct {
+	cmt [4][]byte // CMT1, CMT2, CMT3, CMT4
+	xmp []byte
+}
+
+// scanCanonBoxes collects the canonBoxes of the Canon uuid payload canon in
+// one flat walk over its children.
+func scanCanonBoxes(canon []byte) canonBoxes {
+	var cb canonBoxes
+	pos := 0
+	for pos+8 <= len(canon) {
+		size, typ, headerLen, ok := parseCR3BoxHeader(canon, pos)
+		if !ok {
+			break
+		}
+		payload := canon[pos+int(headerLen) : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by slice length
+		pos += int(size)                                     //nolint:gosec // G115: ISOBMFF box size bounded by slice length
+		if typ == boxXMP && cb.xmp == nil {
+			cb.xmp = payload
+		} else if i := cmtIndex(typ); i >= 0 && cb.cmt[i] == nil {
+			cb.cmt[i] = payload
+		}
 	}
-	return bytes.Clone(mergeCMT(cmt1, cmt2)), nil, rawXMP, nil
+	return cb
+}
+
+// cmtIndex returns 0-3 for the box types CMT1-CMT4 and -1 for any other.
+func cmtIndex(typ [4]byte) int {
+	if typ[0] != 'C' || typ[1] != 'M' || typ[2] != 'T' || typ[3] < '1' || typ[3] > '4' {
+		return -1
+	}
+	return int(typ[3] - '1')
+}
+
+// ParseSubIFD parses the first IFD of a CMT TIFF stream (Segments.MakerNote
+// or Segments.GPS). Each CMT box is a complete TIFF stream (TIFF 6.0 §2:
+// byte order, magic 42, IFD offset), so its value offsets are relative to the
+// start of the box. The entries' out-of-line values alias b.
+func ParseSubIFD(b []byte) (*exif.IFD, binary.ByteOrder, error) {
+	order, ifdOff, ok := tiffHeader(b)
+	if !ok {
+		return nil, nil, ErrBadCMTStream
+	}
+	ifd, _, ok := exif.ParseIFDAt(b, ifdOff, order)
+	if !ok {
+		return nil, nil, ErrBadCMTStream
+	}
+	return ifd, order, nil
+}
+
+// tiffHeader decodes the 8-byte TIFF header of b (TIFF 6.0 §2).
+func tiffHeader(b []byte) (order binary.ByteOrder, ifdOff uint32, ok bool) {
+	if len(b) < 8 {
+		return nil, 0, false
+	}
+	switch {
+	case b[0] == 'I' && b[1] == 'I':
+		order = binary.LittleEndian
+	case b[0] == 'M' && b[1] == 'M':
+		order = binary.BigEndian
+	default:
+		return nil, 0, false
+	}
+	if order.Uint16(b[2:]) != 0x002A {
+		return nil, 0, false
+	}
+	return order, order.Uint32(b[4:]), true
 }
 
 // getExifIFDOffset detects byte order from cmt1's TIFF header and returns the
@@ -324,10 +491,24 @@ func mergeCMT(cmt1, cmt2 []byte) []byte {
 	return merged
 }
 
+// hasIFD0Tag reports whether the IFD at ifd0Off in buf has an entry for tag.
+func hasIFD0Tag(buf []byte, ifd0Off uint32, order binary.ByteOrder, tag uint16) bool {
+	_, found := findIFD0Tag(buf, ifd0Off, order, tag)
+	return found
+}
+
 // findExifIFDOffset walks IFD0 in buf (starting at ifd0Off) looking for tag
 // 0x8769 (ExifIFD) and returns its LONG value (the offset). Returns 0 if not
 // found or if buf is too short to parse.
 func findExifIFDOffset(buf []byte, ifd0Off uint32, order binary.ByteOrder) uint32 {
+	v, _ := findIFD0Tag(buf, ifd0Off, order, 0x8769)
+	return v
+}
+
+// findIFD0Tag walks the IFD at ifd0Off in buf looking for tag and returns the
+// 4-byte value/offset field of its entry. found is false when the tag is
+// absent or buf is too short to parse.
+func findIFD0Tag(buf []byte, ifd0Off uint32, order binary.ByteOrder, want uint16) (value uint32, found bool) {
 	// Security audit FIX 5 (CWE-681/190): compare in uint64, not int, before
 	// converting ifd0Off to int. On a 32-bit platform (GOARCH=386/arm),
 	// int(ifd0Off) for ifd0Off >= 2^31 is negative, which would let a bad
@@ -335,7 +516,7 @@ func findExifIFDOffset(buf []byte, ifd0Off uint32, order binary.ByteOrder) uint3
 	// Mirrors the #74 fix in format/detect.go's parseClassicTIFFIFD0 and the
 	// #45 fix in format/jpeg's parseIRBEntry.
 	if uint64(ifd0Off)+2 > uint64(len(buf)) {
-		return 0
+		return 0, false
 	}
 	count := order.Uint16(buf[ifd0Off:])
 	// ifd0Off ≤ uint64(len(buf))-2, and len(buf) is a valid int on this
@@ -345,63 +526,159 @@ func findExifIFDOffset(buf []byte, ifd0Off uint32, order binary.ByteOrder) uint3
 		if pos+12 > len(buf) {
 			break
 		}
-		tag := order.Uint16(buf[pos:])
-		if tag == 0x8769 { // ExifIFD pointer
-			// type must be LONG (4), count must be 1; value is the 4-byte offset.
-			return order.Uint32(buf[pos+8:])
+		if order.Uint16(buf[pos:]) == want {
+			// TIFF 6.0 §2: the last 4 bytes of an entry hold the value or
+			// its offset; IFD pointers are LONG, count 1, so this is the
+			// pointer itself.
+			return order.Uint32(buf[pos+8:]), true
 		}
 		pos += 12
 	}
-	return 0
+	return 0, false
+}
+
+// tagGPSIFDPointer is the IFD0 tag that points to the GPS IFD
+// (CIPA DC-008 §4.6.3, Table 13).
+const tagGPSIFDPointer = 0x8825
+
+// splitEXIF separates the GPS IFD from rawEXIF, the single TIFF stream the
+// caller encodes, into the two TIFF streams a CR3 file stores them in: cmt1
+// (IFD0 and any Exif IFD, for CMT1) and cmt4 (the GPS IFD as the first IFD
+// of its own stream, for CMT4). imagemeta readCrxMoovBox: CMT1 = IFD0,
+// CMT4 = GPS IFD. Without this split, a GPS IFD read from CMT4 would be
+// written a second time inside CMT1, behind a GPS pointer the source never
+// had.
+//
+// When rawEXIF has no GPS IFD, cmt1 is rawEXIF itself and cmt4 is nil.
+func splitEXIF(rawEXIF []byte) (cmt1, cmt4 []byte, err error) {
+	order, ifdOff, ok := tiffHeader(rawEXIF)
+	if !ok || !hasIFD0Tag(rawEXIF, ifdOff, order, tagGPSIFDPointer) {
+		return rawEXIF, nil, nil
+	}
+	e, err := exif.Parse(rawEXIF, exif.SkipMakerNote())
+	if err != nil {
+		return nil, nil, fmt.Errorf("cr3: split the GPS IFD from the EXIF stream: %w", err)
+	}
+	if e.GPSIFD == nil {
+		return rawEXIF, nil, nil
+	}
+	gps := e.GPSIFD
+	e.GPSIFD = nil // exif.Encode emits no GPS pointer without a GPS IFD
+	if cmt1, err = exif.Encode(e); err != nil {
+		return nil, nil, fmt.Errorf("cr3: encode CMT1: %w", err)
+	}
+	if cmt4, err = exif.Encode(&exif.EXIF{ByteOrder: e.ByteOrder, IFD0: gps}); err != nil {
+		return nil, nil, fmt.Errorf("cr3: encode CMT4: %w", err)
+	}
+	return cmt1, cmt4, nil
+}
+
+// sameFirstIFD reports whether the first IFDs of the TIFF streams a and b
+// hold the same entries: both are re-encoded with b's byte order by
+// exif.Encode, which sorts entries and lays out values canonically, and the
+// encodings are compared. It lets Inject keep an unchanged CMT4 box byte for
+// byte instead of replacing it with an equivalent re-encoding.
+func sameFirstIFD(a, b []byte) bool {
+	ia, _, errA := ParseSubIFD(a)
+	ib, order, errB := ParseSubIFD(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	ea, errA := exif.Encode(&exif.EXIF{ByteOrder: order, IFD0: ia})
+	eb, errB := exif.Encode(&exif.EXIF{ByteOrder: order, IFD0: ib})
+	return errA == nil && errB == nil && bytes.Equal(ea, eb)
 }
 
 // rebuildUUIDContent iterates the sub-boxes of the Canon UUID box payload and
-// reconstructs the content with CMT1 replaced by rawEXIF (if non-nil) and
-// "XMP " replaced by rawXMP (if non-nil). Other sub-boxes are copied unchanged.
-// hadXMP reports whether an "XMP " sub-box was present in the original content.
+// reconstructs it with CMT1 replaced by cmt1 (if non-nil), CMT4 replaced by
+// cmt4 (if non-nil and its GPS IFD differs from the existing one), and the
+// legacy "XMP " sub-box replaced by rawXMP (if both exist). Other sub-boxes,
+// including CMT2 and CMT3, are copied unchanged. hadXMP reports whether an
+// "XMP " sub-box was present.
 //
-// audit #175: if rawEXIF is non-nil and no CMT1 sub-box exists in the original
-// content, a new CMT1 box is appended after the loop. This mirrors the XMP
-// add-if-absent pattern in rebuildMoovContent and ensures that writing EXIF to a
-// UUID box that only carries CMT2/CMT3/CMT4 does not silently discard rawEXIF.
+// A missing CMT1 is appended when cmt1 is non-nil (audit #175: writing EXIF
+// to a UUID box that only carries CMT2/CMT3/CMT4 must not discard it). A
+// missing CMT4 is inserted right after the last CMT box when cmt4 is non-nil.
+// A missing "XMP " sub-box is never created: CR3 stores XMP in the top-level
+// XMP uuid box (task #300), which Inject writes.
 //
 // lclevy canon_cr3: CMT1 is the mandatory IFD0 TIFF stream inside the Canon UUID.
-func rebuildUUIDContent(uuidContent, rawEXIF, rawXMP []byte) (newContent []byte, hadXMP bool) {
-	var buf bytes.Buffer
-	var hadCMT1 bool
+func rebuildUUIDContent(uuidContent, cmt1, cmt4, rawXMP []byte) (newContent []byte, hadXMP bool) {
+	b := uuidRebuild{cmt1: cmt1, cmt4: cmt4, rawXMP: rawXMP, afterCMT: -1}
 	pos := 0
 	for pos+8 <= len(uuidContent) {
-		size, typ, _, ok := parseCR3BoxHeader(uuidContent, pos)
+		size, typ, headerLen, ok := parseCR3BoxHeader(uuidContent, pos)
 		if !ok {
 			break
 		}
-		switch typ {
-		case boxCMT1:
-			hadCMT1 = true
-			if rawEXIF != nil {
-				buf.Write(buildBox("CMT1", rawEXIF))
-			} else {
-				buf.Write(uuidContent[pos : pos+int(size)]) //nolint:gosec // G115: ISOBMFF box size bounded by file size
-			}
-		case boxXMP:
-			hadXMP = true
-			if rawXMP != nil {
-				buf.Write(buildBox("XMP ", rawXMP))
-			} else {
-				buf.Write(uuidContent[pos : pos+int(size)]) //nolint:gosec // G115: ISOBMFF box size bounded by file size
-			}
-		default:
-			buf.Write(uuidContent[pos : pos+int(size)]) //nolint:gosec // G115: ISOBMFF box size bounded by file size
+		b.add(typ, uuidContent[pos:pos+int(size)], int(headerLen)) //nolint:gosec // G115: ISOBMFF box size bounded by file size; headerLen is 8 or 16
+		pos += int(size)                                           //nolint:gosec // G115: ISOBMFF box size bounded by file size
+	}
+	return b.finish(), b.hadXMP
+}
+
+// uuidRebuild accumulates the output of rebuildUUIDContent.
+type uuidRebuild struct {
+	buf                bytes.Buffer
+	cmt1, cmt4, rawXMP []byte
+	hadCMT1, hadCMT4   bool
+	hadXMP             bool
+	afterCMT           int // buf length right after the last CMT box written
+}
+
+// add writes the output for one source sub-box of type typ whose header is
+// headerLen bytes long.
+func (b *uuidRebuild) add(typ [4]byte, box []byte, headerLen int) {
+	switch typ {
+	case boxCMT1:
+		b.hadCMT1 = true
+		b.buf.Write(replacedBox("CMT1", b.cmt1, box))
+		b.afterCMT = b.buf.Len()
+	case boxCMT4:
+		b.hadCMT4 = true
+		if b.cmt4 != nil && sameFirstIFD(box[headerLen:], b.cmt4) {
+			b.buf.Write(box) // unchanged GPS IFD: keep the source bytes
+		} else {
+			b.buf.Write(replacedBox("CMT4", b.cmt4, box))
 		}
-		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
+		b.afterCMT = b.buf.Len()
+	case boxCMT2, boxCMT3:
+		b.buf.Write(box)
+		b.afterCMT = b.buf.Len()
+	case boxXMP:
+		b.hadXMP = true
+		b.buf.Write(replacedBox("XMP ", b.rawXMP, box))
+	default:
+		b.buf.Write(box)
 	}
-	// audit #175: insert a new CMT1 sub-box when rawEXIF is provided but the
-	// original UUID content had no CMT1. Without this, Inject silently discards
-	// rawEXIF for CR3 files whose UUID box carries only CMT2/CMT3/CMT4.
-	if rawEXIF != nil && !hadCMT1 {
-		buf.Write(buildBox("CMT1", rawEXIF))
+}
+
+// finish inserts a missing CMT4 after the last CMT box and appends a
+// missing CMT1, and returns the rebuilt content.
+func (b *uuidRebuild) finish() []byte {
+	out := b.buf.Bytes()
+	if b.cmt4 != nil && !b.hadCMT4 {
+		at := b.afterCMT
+		if at < 0 {
+			at = len(out)
+		}
+		out = slices.Insert(out, at, buildBox("CMT4", b.cmt4)...)
 	}
-	return buf.Bytes(), hadXMP
+	// audit #175: insert a new CMT1 sub-box when cmt1 is provided but the
+	// original UUID content had no CMT1.
+	if b.cmt1 != nil && !b.hadCMT1 {
+		out = append(out, buildBox("CMT1", b.cmt1)...)
+	}
+	return out
+}
+
+// replacedBox returns a new box of type typ holding payload when payload is
+// non-nil, and the source box orig otherwise.
+func replacedBox(typ string, payload, orig []byte) []byte {
+	if payload == nil {
+		return orig
+	}
+	return buildBox(typ, payload)
 }
 
 // findMoovRange returns the start and end byte positions of the first moov box
@@ -422,55 +699,76 @@ func findMoovRange(data []byte) (start, end int, found bool) {
 	return 0, 0, false
 }
 
-// relocateChunkOffsets walks moovBytes in-place and adjusts every stco/co64
-// entry whose absolute file offset is >= oldMoovEnd by adding delta.
+// chunkShift maps an absolute offset of the source file to the output file
+// after up to two box replacements: an offset at or beyond the old end of a
+// replaced box moves by that box's size change. ISO 14496-12 §8.7.5: chunk
+// offsets are absolute file offsets, so every chunk stored after a resized
+// box moves with it.
+type chunkShift struct {
+	regions [2]shiftRegion
+	n       int
+}
+
+// shiftRegion is one replaced region of a chunkShift.
+type shiftRegion struct {
+	end   int64 // old end of the replaced region
+	delta int64 // its size change
+}
+
+// add records a replaced region; at most two are supported (Inject edits
+// the moov box and the XMP uuid box). A zero delta is not recorded.
+func (s *chunkShift) add(end, delta int64) {
+	if delta != 0 && s.n < len(s.regions) {
+		s.regions[s.n] = shiftRegion{end: end, delta: delta}
+		s.n++
+	}
+}
+
+// apply returns the output-file position of source offset o. Every
+// threshold is compared with the SOURCE offset: comparing a partially shifted
+// value would skip a later region when an earlier one shrank.
+func (s *chunkShift) apply(o int64) int64 {
+	shifted := o
+	for _, r := range s.regions[:s.n] {
+		if o >= r.end {
+			shifted += r.delta
+		}
+	}
+	return shifted
+}
+
+// relocateChunkOffsets walks moovBytes in-place and moves every stco/co64
+// entry by shift.
 //
-// ISO 14496-12 §8.7.3 (ChunkOffsetBox / stco):
-//   - FullBox header: 4-byte size + "stco" + 1-byte version + 3-byte flags = 12 bytes total
-//   - entry_count: uint32 at offset 12
-//   - entries: entry_count × uint32 starting at offset 16
+// ISO 14496-12 §8.7.5 (ChunkOffsetBox 'stco' / ChunkLargeOffsetBox 'co64'):
+// FullBox version+flags(4), entry_count(4), then entry_count chunk offsets of
+// 4 bytes (stco) or 8 bytes (co64).
 //
-// ISO 14496-12 §8.7.5 (ChunkLargeOffsetBox / co64):
-//   - FullBox header: 4-byte size + "co64" + 1-byte version + 3-byte flags = 12 bytes total
-//   - entry_count: uint32 at offset 12
-//   - entries: entry_count × uint64 starting at offset 16
-//
-// moovBytes is the complete rebuilt moov box (including its 8-byte header).
-// All stco/co64 boxes are patched in-place because moovBytes is freshly
-// allocated by buildBox — no aliasing with the original data.
-//
-// oldMoovEnd is the absolute end offset of the original moov box in the file
-// (= moovStart + original moov size). Any chunk offset >= oldMoovEnd points at
-// or beyond the region that was shifted by delta; those entries are incremented.
-// Offsets before moovStart (e.g., into ftyp) are unchanged.
-//
-// For stco: if the relocated value would exceed math.MaxUint32, the function
-// returns ErrStcoOverflow rather than silently truncating the offset.
-func relocateChunkOffsets(moovBytes []byte, oldMoovEnd int64, delta int64) error {
-	if len(moovBytes) < 8 {
+// moovBytes is the complete rebuilt moov box (including its 8-byte header),
+// freshly allocated by buildBox — no aliasing with the original data. For
+// stco, an offset that would exceed math.MaxUint32 returns ErrStcoOverflow
+// rather than being truncated.
+func relocateChunkOffsets(moovBytes []byte, shift *chunkShift) error {
+	if len(moovBytes) < 8 || shift.n == 0 {
 		return nil
 	}
 	// moovBytes includes the 8-byte moov box header; pass the content slice.
 	// audit #191: start at depth=0; cap recursion at 32 levels (mirrors findBox).
-	return relocateInContainer(moovBytes[8:], oldMoovEnd, delta, 0)
+	return relocateInContainer(moovBytes[8:], shift, 0)
 }
 
 // relocateInContainer recursively walks ISOBMFF boxes in the container content
 // slice (data). Only container box types that lead to stco/co64 are recursed
 // into: trak, mdia, minf, stbl. stco and co64 boxes are patched in-place.
 //
-// data must be exactly the content payload of the enclosing container box
-// (the header bytes must already have been stripped by the caller). This
-// ensures each recursion level only scans within its own box boundary.
+// data must be exactly the content payload of the enclosing container box,
+// so each recursion level only scans within its own box boundary.
 //
-// depth is the current recursion depth. audit #191: the guard `depth > 32`
-// mirrors the cap used by findBox — providing defence-in-depth against crafted
-// ISOBMFF structures with pathological nesting. Valid CR3 files never reach
-// this limit; the guard is purely protective.
-// ISO 14496-12 §4.2: box hierarchy is structurally bounded by box sizes.
-func relocateInContainer(data []byte, oldMoovEnd int64, delta int64, depth int) error {
-	// audit #191: cap recursion at 32 levels to mirror findBox and prevent
-	// stack exhaustion on adversarially crafted ISOBMFF containers.
+// audit #191: the guard `depth > 32` mirrors the cap used by findBox —
+// defence-in-depth against crafted ISOBMFF structures with pathological
+// nesting. ISO 14496-12 §4.2: box hierarchy is structurally bounded by box
+// sizes.
+func relocateInContainer(data []byte, shift *chunkShift, depth int) error {
 	if depth > 32 {
 		return nil
 	}
@@ -485,20 +783,15 @@ func relocateInContainer(data []byte, oldMoovEnd int64, delta int64, depth int) 
 
 		switch typ {
 		case boxTrak, boxMdia, boxMinf, boxStbl:
-			// Recurse into container boxes using the box payload slice only.
-			// This ensures the recursive scan is strictly bounded within this box.
-			if err := relocateInContainer(content, oldMoovEnd, delta, depth+1); err != nil {
+			if err := relocateInContainer(content, shift, depth+1); err != nil {
 				return err
 			}
 		case boxStco:
-			// ISO 14496-12 §8.7.3: FullBox (version 1B + flags 3B) + entry_count (4B) + entries (N×4B).
-			// Pass content (the stco payload after the box header) for in-place patching.
-			if err := relocateStco(content, oldMoovEnd, delta); err != nil {
+			if err := relocateStco(content, shift); err != nil {
 				return err
 			}
 		case boxCo64:
-			// ISO 14496-12 §8.7.5: FullBox (version 1B + flags 3B) + entry_count (4B) + entries (N×8B).
-			if err := relocateCo64(content, oldMoovEnd, delta); err != nil {
+			if err := relocateCo64(content, shift); err != nil {
 				return err
 			}
 		}
@@ -510,58 +803,50 @@ func relocateInContainer(data []byte, oldMoovEnd int64, delta int64, depth int) 
 
 // relocateStco patches stco entries (uint32) in-place.
 // content is the stco box payload: version (1B) + flags (3B) + entry_count (4B) + entries (N×4B).
-// Entries >= oldMoovEnd are incremented by delta; overflow returns ErrStcoOverflow.
-func relocateStco(content []byte, oldMoovEnd int64, delta int64) error {
-	// FullBox: version (1B) + flags (3B) = 4 bytes; entry_count follows at offset 4.
+func relocateStco(content []byte, shift *chunkShift) error {
 	if len(content) < 8 {
-		// Box too small to contain version/flags + entry_count — skip gracefully.
-		return nil
+		return nil // too small to hold version/flags + entry_count
 	}
 	entryCount := binary.BigEndian.Uint32(content[4:])
-	entryStart := 8
-	// Guard: entry array must fit within content.
-	if int(entryCount) > (len(content)-entryStart)/4 {
+	const entryStart = 8
+	if uint64(entryCount) > uint64(len(content)-entryStart)/4 { //nolint:gosec // G115: len(content) >= 8
 		return nil
 	}
 	for i := range int(entryCount) {
 		off := entryStart + i*4
 		orig := int64(binary.BigEndian.Uint32(content[off:]))
-		if orig >= oldMoovEnd {
-			relocated := orig + delta
-			if relocated < 0 || relocated > math.MaxUint32 {
-				return fmt.Errorf("cr3: stco offset %d + delta %d = %d: %w", orig, delta, relocated, ErrStcoOverflow)
-			}
-			binary.BigEndian.PutUint32(content[off:], uint32(relocated))
+		relocated := shift.apply(orig)
+		if relocated < 0 || relocated > math.MaxUint32 {
+			return fmt.Errorf("cr3: stco offset %d relocated to %d: %w", orig, relocated, ErrStcoOverflow)
 		}
+		binary.BigEndian.PutUint32(content[off:], uint32(relocated))
 	}
 	return nil
 }
 
 // relocateCo64 patches co64 entries (uint64) in-place.
 // content is the co64 box payload: version (1B) + flags (3B) + entry_count (4B) + entries (N×8B).
-// Entries >= oldMoovEnd are incremented by delta; since uint64 is large enough for
-// any file size, no overflow check is needed beyond sign safety.
-func relocateCo64(content []byte, oldMoovEnd int64, delta int64) error {
-	// FullBox: version (1B) + flags (3B) = 4 bytes; entry_count follows at offset 4.
+func relocateCo64(content []byte, shift *chunkShift) error {
 	if len(content) < 8 {
 		return nil
 	}
 	entryCount := binary.BigEndian.Uint32(content[4:])
-	entryStart := 8
-	// Guard: entry array must fit within content.
-	if int(entryCount) > (len(content)-entryStart)/8 {
+	const entryStart = 8
+	if uint64(entryCount) > uint64(len(content)-entryStart)/8 { //nolint:gosec // G115: len(content) >= 8
 		return nil
 	}
 	for i := range int(entryCount) {
 		off := entryStart + i*8
-		orig := int64(binary.BigEndian.Uint64(content[off:])) //nolint:gosec // G115: uint64→int64 safe for file offsets < 2^63
-		if orig >= oldMoovEnd {
-			relocated := orig + delta
-			if relocated < 0 {
-				return fmt.Errorf("cr3: co64 offset %d + delta %d = %d underflows: %w", orig, delta, relocated, ErrStcoOverflow)
-			}
-			binary.BigEndian.PutUint64(content[off:], uint64(relocated))
+		raw := binary.BigEndian.Uint64(content[off:])
+		if raw > math.MaxInt64 {
+			continue // beyond any file this package accepts; left unchanged
 		}
+		orig := int64(raw)
+		relocated := shift.apply(orig)
+		if relocated < 0 {
+			return fmt.Errorf("cr3: co64 offset %d relocated to %d: %w", orig, relocated, ErrStcoOverflow)
+		}
+		binary.BigEndian.PutUint64(content[off:], uint64(relocated))
 	}
 	return nil
 }
@@ -569,7 +854,7 @@ func relocateCo64(content []byte, oldMoovEnd int64, delta int64) error {
 // rebuildMoovContent replaces the Canon UUID box inside moovContent with a new
 // UUID box containing the rebuilt CMTx payloads. Returns the new moov content
 // slice. If no Canon UUID box is found, moovContent is returned unchanged.
-func rebuildMoovContent(moovContent, rawEXIF, rawXMP []byte) []byte {
+func rebuildMoovContent(moovContent, cmt1, cmt4, rawXMP []byte) []byte {
 	uuidStart, uuidEnd, hasUUID := flatUUIDBoxRange(moovContent, canonUUID)
 	if !hasUUID {
 		return moovContent
@@ -577,17 +862,9 @@ func rebuildMoovContent(moovContent, rawEXIF, rawXMP []byte) []byte {
 	// CR3-EXTSIZE-01 fix: re-derive the Canon uuid box's ACTUAL header length
 	// instead of assuming the normal 8-byte header. ISO 14496-12 §4.2: when a
 	// box's 32-bit size field is 1, the real size lives in an 8-byte largesize
-	// field immediately after the type, making the header 16 bytes, not 8. The
-	// previous code hardcoded `const uuidHeaderLen = 8 + 16`, which — on a
-	// source file whose Canon uuid box used the extended encoding — sliced 8
-	// bytes too early, embedding half of the largesize field as bogus leading
-	// "content" and silently dropping every sibling sub-box (CMT2, XMP , ...)
-	// while returning no error.
-	//
-	// flatUUIDBoxRange already parsed a well-formed box header at uuidStart
-	// (that is how it located this box), so re-parsing it here is a cheap,
-	// pure, side-effect-free re-derivation — not a hardcoded assumption — and
-	// is guaranteed to succeed.
+	// field immediately after the type, making the header 16 bytes, not 8.
+	// flatUUIDBoxRange already parsed a well-formed box header at uuidStart,
+	// so re-parsing it here is guaranteed to succeed.
 	_, _, uuidHeaderLen, ok := parseCR3BoxHeader(moovContent, uuidStart)
 	if !ok {
 		// Unreachable in practice; degrade gracefully rather than panic.
@@ -595,14 +872,9 @@ func rebuildMoovContent(moovContent, rawEXIF, rawXMP []byte) []byte {
 	}
 	// uuidData is the UUID payload: everything after the box header (8 or 16
 	// bytes) plus the mandatory 16-byte UUID field. flatUUIDBoxRange guarantees
-	// size >= headerLen+16, so uuidEnd >= uuidStart+uuidHeaderLen+16 and this
-	// slice cannot underflow.
+	// size >= headerLen+16, so this slice cannot underflow.
 	uuidData := moovContent[uuidStart+int(uuidHeaderLen)+16 : uuidEnd] //nolint:gosec // G115: uuidHeaderLen is 8 or 16; bounds guaranteed by flatUUIDBoxRange's size>=headerLen+16 check
-	newUUIDContent, hadXMP := rebuildUUIDContent(uuidData, rawEXIF, rawXMP)
-	// Append a new "XMP " sub-box if XMP was not already present but is now provided.
-	if !hadXMP && rawXMP != nil {
-		newUUIDContent = append(newUUIDContent, buildBox("XMP ", rawXMP)...)
-	}
+	newUUIDContent, _ := rebuildUUIDContent(uuidData, cmt1, cmt4, rawXMP)
 	newUUIDBox := buildUUIDBox(canonUUID, newUUIDContent)
 	// Rebuild moovContent: prefix + newUUIDBox + suffix.
 	capacity := len(moovContent) - (uuidEnd - uuidStart) + len(newUUIDBox)
@@ -613,55 +885,54 @@ func rebuildMoovContent(moovContent, rawEXIF, rawXMP []byte) []byte {
 	return newContent
 }
 
-// Inject reads the CR3 from r, replaces the Canon UUID sub-boxes with the
-// provided metadata payloads, relocates all trak/stbl stco/co64 chunk-offset
-// table entries to account for the change in moov size, and writes the result
-// to w.
+// boxEdit replaces the bytes [start, end) of the source file with data
+// (start == end inserts data at start).
+type boxEdit struct {
+	start, end int64
+	data       []byte
+}
+
+// Inject reads the CR3 from r, writes the metadata payloads into the boxes a
+// CR3 file keeps them in, relocates all trak/stbl stco/co64 chunk-offset
+// table entries to account for the boxes that changed size, and writes the
+// result to w.
 //
-// #292: only the moov box is rebuilt in memory; every other byte of the file
-// (ftyp and any other pre-moov boxes, plus mdat and anything after moov) is
-// streamed from r to w verbatim through a fixed-size pooled buffer
-// (iobuf.StreamCopyN), never buffered in full — mirroring ExifTool's
-// WriteQuickTime.pl model ("rewrite the moov atom, copy mdat straight
-// through"). A real Canon CR3 is routinely tens of megabytes, almost
-// entirely raw sensor data in mdat; the previous implementation read the
-// whole file into one buffer and built a second, equally large buffer for
-// the reassembled output. Peak retained memory is now bounded by the moov
-// box's own size (typically tens of KB) plus the fixed copy buffer,
-// regardless of file size.
+//   - rawEXIF: IFD0 (and any Exif IFD) go to the CMT1 sub-box of the Canon
+//     uuid box; a GPS IFD goes to the CMT4 sub-box, which is kept byte for
+//     byte when its GPS IFD is unchanged (splitEXIF, sameFirstIFD). CMT2 and
+//     CMT3 are never rewritten. A source CMT4 is kept when rawEXIF has no
+//     GPS IFD.
+//   - rawXMP: the packet goes to the top-level XMP uuid box (task #300),
+//     replacing the existing one or, when there is none, inserted right
+//     after moov; a legacy "XMP " sub-box of the Canon uuid box written by
+//     earlier GoMetadata versions is kept in step.
+//   - rawIPTC is ignored: CR3 does not carry IPTC.
 //
-// Offset relocation algorithm (ISO 14496-12 §8.7.3 / §8.7.5) is unchanged:
+// #292: only the moov box (and the XMP uuid box) is rebuilt in memory; every
+// other byte of the file — ftyp, mdat and anything else — is streamed from r
+// to w verbatim through a fixed-size pooled buffer (iobuf.StreamCopyN),
+// mirroring ExifTool's WriteQuickTime.pl model ("rewrite the moov atom, copy
+// mdat straight through").
 //
-//  1. Locate moov's payload and its exact [moovStart, moovEnd) byte range by
-//     scanning top-level box headers (readTopLevelBox); every other
-//     top-level box's payload is skipped via Seek, never read.
-//  2. Rebuild the Canon UUID box and the enclosing moov box with the new CMTx
-//     payloads; compute delta = len(newMoovBox) - (moovEnd - moovStart).
-//  3. Walk every trak → mdia → minf → stbl → {stco, co64} box inside the
-//     rebuilt moov. For each chunk offset O:
-//     - If O >= oldMoovEnd: set O = O + delta  (the byte it references shifted).
-//     - If O < oldMoovEnd: leave unchanged    (points before the shifted region).
-//  4. stco entries are uint32; if O + delta > MaxUint32, return ErrStcoOverflow
-//     rather than truncate silently.
-//  5. Stream: r[0:moovStart) + newMoovBox + r[moovEnd:fileLen).
+// Offset relocation (ISO 14496-12 §8.7.3 / §8.7.5): every chunk offset O of
+// every trak → mdia → minf → stbl → {stco, co64} box inside the rebuilt moov
+// is moved by the size change of each edited box whose old end is at or
+// before O (chunkShift). stco entries are uint32; an entry that would exceed
+// MaxUint32 returns ErrStcoOverflow rather than being truncated.
 //
 // preserveUnknownSegments must be true; passing false returns
 // ErrPreserveUnknownSegmentsNotSupported because CR3 ISOBMFF boxes are
 // structurally mandatory and cannot be selectively stripped.
 //
 // If all payloads are nil, or no moov box is found, the source is streamed
-// through unchanged (no moov rebuild, no stco/co64 relocation needed).
-func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error { //nolint:gocyclo // #292: sequential error-checked streaming steps (size cap, pass-through, moov locate/rebuild, 3-part stream reassembly) are inherent in the streaming design; each branch is a distinct, independently-tested failure mode
-	// Reject PreserveUnknownSegments(false) for CR3: ISOBMFF boxes are
-	// structurally mandatory. There is no concept of "unknown optional segment"
-	// in ISOBMFF analogous to JPEG's APPn segments.
+// through unchanged.
+func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error { //nolint:gocyclo,cyclop // #292: sequential error-checked streaming steps (size cap, pass-through, box locate/rebuild, edit-list reassembly) are inherent in the streaming design; each branch is a distinct, independently-tested failure mode
 	if !preserveUnknownSegments {
 		return ErrPreserveUnknownSegmentsNotSupported
 	}
 
 	// #140/#286/#292: reject an oversized input before any content is read
-	// or streamed, exactly as the previous whole-file-read implementation
-	// did — seekFileLen never reads the file's content.
+	// or streamed — seekFileLen never reads the file's content.
 	fileLen, err := seekFileLen(r)
 	if err != nil {
 		return err
@@ -670,52 +941,79 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 		return fmt.Errorf("cr3: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
 	}
 
-	// All payloads nil: pass through unchanged. moov size does not change, so
-	// stco/co64 tables remain valid — no ISOBMFF parsing is needed at all.
-	// #292: streamed via a pooled buffer instead of buffering the whole file.
+	// All payloads nil: no box changes size, so the file is streamed through.
 	if rawEXIF == nil && rawIPTC == nil && rawXMP == nil {
 		return streamWholeFile(r, w, fileLen)
 	}
 
-	// #292: locate moov's payload and its exact byte range by scanning
-	// top-level box headers only. r's position after a successful match is
-	// immediately past moov's payload (moovEnd); readTopLevelBox's payload
-	// is moov's CONTENT only (header already consumed by its internal
-	// cr3BoxHeaderAt scan), so no re-derivation of moov's own header length
-	// is needed here — unlike the previous full-buffer implementation, which
-	// had to re-slice a flat byte array and therefore had to re-derive it
-	// (the CR3-EXTSIZE-01 fix this comment used to describe).
-	moovContent, moovStart, moovEnd, err := readTopLevelBox(r, boxMoov, fileLen)
+	lay, err := scanTopLevel(r, fileLen, false)
 	if err != nil {
 		return err
 	}
-	if moovContent == nil {
+	if lay.moov == nil {
 		// No moov box — file is corrupt/incomplete. Pass through unchanged.
 		return streamWholeFile(r, w, fileLen)
 	}
 
-	newMoovBox, err := injectIntoMoov(moovContent, rawEXIF, rawXMP, moovEnd, moovEnd-moovStart)
+	cmt1, cmt4, err := splitEXIF(rawEXIF)
 	if err != nil {
 		return err
 	}
+	var editBuf [2]boxEdit
+	edits, moovIdx := planEdits(editBuf[:0], &lay, buildBox("moov", rebuildMoovContent(lay.moov, cmt1, cmt4, rawXMP)), rawXMP)
 
-	// #292: stream the reassembly — r[0:moovStart) verbatim, the rebuilt moov
-	// box (already fully in memory), then r[moovEnd:fileLen) (mdat and any
-	// trailing boxes) verbatim — instead of concatenating the whole file into
-	// one in-memory buffer.
-	if _, err := r.Seek(0, io.SeekStart); err != nil {
+	var shift chunkShift
+	for _, e := range edits {
+		shift.add(e.end, int64(len(e.data))-(e.end-e.start))
+	}
+	// The moov edit's data is the freshly built moov box: patch it in place.
+	if err := relocateChunkOffsets(edits[moovIdx].data, &shift); err != nil {
+		return fmt.Errorf("cr3: stco/co64 offset relocation: %w", err)
+	}
+	return streamEdits(r, w, fileLen, edits)
+}
+
+// planEdits appends to dst the box edits of Inject in file order — the moov
+// box replaced by newMoov and, when rawXMP is non-nil, the top-level XMP uuid
+// box replaced (or inserted right after moov when the file has none) — and
+// returns them with the index of the moov edit.
+func planEdits(dst []boxEdit, lay *topLevelLayout, newMoov, rawXMP []byte) (edits []boxEdit, moovIdx int) {
+	moov := boxEdit{start: lay.moovStart, end: lay.moovEnd, data: newMoov}
+	if rawXMP == nil {
+		return append(dst, moov), 0
+	}
+	xmp := boxEdit{start: lay.moovEnd, end: lay.moovEnd, data: buildUUIDBox(xmpUUID, rawXMP)}
+	if lay.hasXMPBox() {
+		xmp.start, xmp.end = lay.xmpStart, lay.xmpEnd
+	}
+	if xmp.start < moov.start {
+		return append(dst, xmp, moov), 1
+	}
+	return append(dst, moov, xmp), 0
+}
+
+// streamEdits writes r to w with each edit applied: the bytes between edits
+// are streamed verbatim through a pooled buffer (iobuf.StreamCopyN); the
+// edited boxes are written from memory. edits must be sorted by start and
+// non-overlapping.
+func streamEdits(r io.ReadSeeker, w io.Writer, fileLen int64, edits []boxEdit) error {
+	pos := int64(0)
+	for _, e := range edits {
+		if _, err := r.Seek(pos, io.SeekStart); err != nil {
+			return fmt.Errorf("cr3: seek: %w", err)
+		}
+		if err := iobuf.StreamCopyN(r, w, e.start-pos); err != nil {
+			return fmt.Errorf("cr3: copy unchanged bytes: %w", err)
+		}
+		if _, err := w.Write(e.data); err != nil {
+			return fmt.Errorf("cr3: write box: %w", err)
+		}
+		pos = e.end
+	}
+	if _, err := r.Seek(pos, io.SeekStart); err != nil {
 		return fmt.Errorf("cr3: seek: %w", err)
 	}
-	if err := iobuf.StreamCopyN(r, w, moovStart); err != nil {
-		return fmt.Errorf("cr3: copy pre-moov bytes: %w", err)
-	}
-	if _, err := w.Write(newMoovBox); err != nil {
-		return fmt.Errorf("cr3: write moov box: %w", err)
-	}
-	if _, err := r.Seek(moovEnd, io.SeekStart); err != nil {
-		return fmt.Errorf("cr3: seek past moov: %w", err)
-	}
-	if err := iobuf.StreamCopyN(r, w, fileLen-moovEnd); err != nil {
+	if err := iobuf.StreamCopyN(r, w, fileLen-pos); err != nil {
 		return fmt.Errorf("cr3: copy mdat and trailing bytes: %w", err)
 	}
 	return nil
@@ -733,36 +1031,6 @@ func streamWholeFile(r io.ReadSeeker, w io.Writer, fileLen int64) error {
 		return fmt.Errorf("cr3: copy: %w", err)
 	}
 	return nil
-}
-
-// injectIntoMoov rebuilds the moov box whose payload is moovContent (the
-// box's header is NOT included — see readTopLevelBox) with the new metadata
-// payloads, relocates stco/co64 offsets, and returns the new, fully-encoded
-// moov box (header + rebuilt content). rawIPTC is intentionally ignored: CR3
-// does not carry IPTC.
-//
-// oldMoovEnd is the absolute file position where mdat begins (the original
-// moov box's end offset); oldMoovSize is the original moov box's total size
-// (header included). Both describe the SOURCE box being replaced, used only
-// to compute the relocation delta and the stco/co64 threshold — see
-// relocateChunkOffsets.
-func injectIntoMoov(moovContent, rawEXIF, rawXMP []byte, oldMoovEnd, oldMoovSize int64) ([]byte, error) {
-	newMoovContent := rebuildMoovContent(moovContent, rawEXIF, rawXMP)
-	newMoovBox := buildBox("moov", newMoovContent)
-
-	// Compute the size delta between the new and old moov boxes.
-	// delta > 0: moov grew; mdat shifted forward.
-	// delta < 0: moov shrank; mdat shifted backward.
-	delta := int64(len(newMoovBox)) - oldMoovSize
-
-	// Relocate stco/co64 offsets inside newMoovBox.
-	// We patch in-place because newMoovBox was just freshly allocated by buildBox.
-	if delta != 0 {
-		if err := relocateChunkOffsets(newMoovBox, oldMoovEnd, delta); err != nil {
-			return nil, fmt.Errorf("cr3: stco/co64 offset relocation: %w", err)
-		}
-	}
-	return newMoovBox, nil
 }
 
 // buildBox constructs an ISOBMFF box: [4-byte size][4-byte type][content].

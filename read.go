@@ -36,12 +36,13 @@ var extractors = map[format.FormatID]func(io.ReadSeeker) ([]byte, []byte, []byte
 	// AVIF uses the same ISOBMFF container as HEIF; delegate to the HEIF handler.
 	format.FormatAVIF: heif.Extract,
 	format.FormatCR2:  cr2.Extract,
-	format.FormatCR3:  cr3.Extract,
-	format.FormatNEF:  nef.Extract,
-	format.FormatARW:  arw.Extract,
-	format.FormatDNG:  dng.Extract,
-	format.FormatORF:  orf.Extract,
-	format.FormatRW2:  rw2.Extract,
+	// CR3 is dispatched by extractByFormat to cr3.ExtractSegments, which also
+	// returns the CMT3 (MakerNote) and CMT4 (GPS) streams.
+	format.FormatNEF: nef.Extract,
+	format.FormatARW: arw.Extract,
+	format.FormatDNG: dng.Extract,
+	format.FormatORF: orf.Extract,
+	format.FormatRW2: rw2.Extract,
 }
 
 // isTIFFFamily reports whether fmtID is TIFF or a TIFF-based RAW format, whose
@@ -136,7 +137,10 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 	// extended-XMP reassembly). rawEXIF and rawIPTC are always extracted
 	// regardless — they must remain available for an unmodified Write to
 	// pass through byte-for-byte.
-	rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, noCMT1Box, err := extractByFormat(r, fmtID, !cfg.lazyIPTC, !cfg.lazyXMP)
+	// cr3Sub receives the CMT3 (MakerNote) and CMT4 (GPS) streams of a CR3
+	// file (task #300); it stays nil for every other format.
+	var cr3Sub cr3SubStreams
+	rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, noCMT1Box, err := extractByFormat(r, fmtID, !cfg.lazyIPTC, !cfg.lazyXMP, &cr3Sub)
 	if err != nil {
 		return nil, err
 	}
@@ -186,9 +190,80 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 	if err := parseParsedMetadata(m, rawEXIF, rawIPTC, rawXMP, &cfg); err != nil {
 		return nil, err
 	}
+	if err := parseCR3SubIFDs(m, cr3Sub, &cfg); err != nil {
+		return nil, err
+	}
 
 	return m, nil
 }
+
+// parseCR3SubIFDs attaches the IFDs that a CR3 file stores outside CMT1
+// (task #300): the CMT3 stream's first IFD as EXIF.MakerNoteIFD (the Canon
+// MakerNote) and the CMT4 stream's first IFD as EXIF.GPSIFD, the mapping of
+// imagemeta's readCrxMoovBox and ExifTool's Canon CR3 tables. An IFD that the
+// CMT1 stream itself already provides is kept. Nothing is attached when EXIF
+// is not parsed (no CMT1, WithoutEXIF) or, for the MakerNote, when
+// SkipMakerNote is set.
+//
+// The GPS IFD is attached only when its byte order matches the EXIF byte
+// order: exif.Encode writes entry values as stored, so an IFD in the other
+// order could not be written back intact.
+//
+// A CMT box that cannot be parsed is reported like any other segment
+// failure: a ParseWarning in best-effort mode, an error in strict mode.
+//
+// The nil check is kept in this small function so that it inlines into Read:
+// every other format pays no call.
+func parseCR3SubIFDs(m *Metadata, sub cr3SubStreams, cfg *readConfig) error {
+	if sub.makerNote == nil && sub.gps == nil {
+		return nil
+	}
+	return attachCR3SubIFDs(m, sub.makerNote, sub.gps, cfg)
+}
+
+// attachCR3SubIFDs implements parseCR3SubIFDs for a CR3 file.
+func attachCR3SubIFDs(m *Metadata, makerNote, gps []byte, cfg *readConfig) error {
+	if m.EXIF == nil || cfg.lazyEXIF {
+		return nil
+	}
+	if makerNote != nil && !cfg.skipMakerNote && m.EXIF.MakerNoteIFD == nil {
+		if err := applyOrWarn(m, attachCR3MakerNote(m.EXIF, makerNote), cfg.strict); err != nil {
+			return err
+		}
+	}
+	if gps != nil && m.EXIF.GPSIFD == nil {
+		return applyOrWarn(m, attachCR3GPS(m.EXIF, gps), cfg.strict)
+	}
+	return nil
+}
+
+// attachCR3MakerNote sets e.MakerNoteIFD from the CMT3 stream.
+func attachCR3MakerNote(e *exif.EXIF, cmt3 []byte) *ParseSegmentError {
+	ifd, _, err := cr3.ParseSubIFD(cmt3)
+	if err != nil {
+		return &ParseSegmentError{Segment: "EXIF", Err: fmt.Errorf("camera maker note: %w", err)}
+	}
+	e.MakerNoteIFD = ifd
+	return nil
+}
+
+// attachCR3GPS sets e.GPSIFD from the CMT4 stream when its byte order is the
+// EXIF byte order.
+func attachCR3GPS(e *exif.EXIF, cmt4 []byte) *ParseSegmentError {
+	ifd, order, err := cr3.ParseSubIFD(cmt4)
+	if err != nil {
+		return &ParseSegmentError{Segment: "EXIF", Err: fmt.Errorf("GPS data: %w", err)}
+	}
+	if order != e.ByteOrder {
+		return &ParseSegmentError{Segment: "EXIF", Err: errCR3GPSByteOrder}
+	}
+	e.GPSIFD = ifd
+	return nil
+}
+
+// errCR3GPSByteOrder reports a CR3 GPS IFD (CMT4) whose byte order differs
+// from the EXIF IFD0 (CMT1) byte order; the GPS IFD is not attached.
+var errCR3GPSByteOrder = errors.New("CR3 GPS data uses a different byte order than the main EXIF data and was not read")
 
 // applyReadOptions builds a readConfig by applying opts and returns it by
 // value.
@@ -443,18 +518,30 @@ func tiffFamilyRawEXIFIsWholeFile(r io.ReadSeeker, fmtID format.FormatID, rawEXI
 	return int64(len(rawEXIF)) == end
 }
 
+// cr3SubStreams holds the CMT3 (MakerNote) and CMT4 (GPS) TIFF streams of
+// a CR3 file (task #300), which extractByFormat returns besides rawEXIF.
+type cr3SubStreams struct {
+	makerNote, gps []byte
+}
+
 // wantIPTC and wantXMP (#238) are forwarded to jpeg.ExtractFullSelective so
 // the JPEG extractor can skip the 0x0425 IPTC digest and/or the extended-XMP
 // reassembly when the caller has opted out of that segment. Other formats do
 // not yet have an equivalent selective-extraction path (their raw-segment
 // extraction has no comparable reassembly cost) and are unaffected.
-func extractByFormat(r io.ReadSeeker, fmtID format.FormatID, wantIPTC, wantXMP bool) (rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire []byte, xmpTruncated, noCMT1Box bool, err error) {
-	if fmtID == format.FormatJPEG {
+func extractByFormat(r io.ReadSeeker, fmtID format.FormatID, wantIPTC, wantXMP bool, cr3Sub *cr3SubStreams) (rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire []byte, xmpTruncated, noCMT1Box bool, err error) {
+	switch fmtID {
+	case format.FormatJPEG:
 		rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, err = jpeg.ExtractFullSelective(r, wantIPTC, wantXMP)
 		if err != nil {
 			return nil, nil, nil, nil, nil, false, false, fmt.Errorf("gometadata: %w", err)
 		}
 		return rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, false, nil
+	case format.FormatCR3:
+		rawEXIF, rawXMP, noCMT1Box, err = extractCR3(r, cr3Sub)
+		return rawEXIF, nil, nil, rawXMP, nil, false, noCMT1Box, err
+	default:
+		// Every other format uses the uniform extractors table below.
 	}
 	fn, ok := extractors[fmtID]
 	if !ok {
@@ -462,14 +549,25 @@ func extractByFormat(r io.ReadSeeker, fmtID format.FormatID, wantIPTC, wantXMP b
 	}
 	rawEXIF, rawIPTC, rawXMP, err = fn(r)
 	if err != nil {
-		// audit #138: cr3.ErrNoCMT1Box is a non-fatal partial-success: the
-		// moov/UUID structure is valid but CMT1 is absent. rawXMP is still
-		// populated when an "XMP " sub-box exists. Surface as ParseWarning
-		// rather than aborting; return noCMT1Box=true so Read records the warning.
-		if errors.Is(err, cr3.ErrNoCMT1Box) {
-			return nil, rawIPTC, nil, rawXMP, nil, false, true, nil
-		}
 		return nil, nil, nil, nil, nil, false, false, fmt.Errorf("gometadata: %w", err)
 	}
 	return rawEXIF, rawIPTC, nil, rawXMP, nil, false, false, nil
+}
+
+// extractCR3 returns the EXIF and XMP payloads of a CR3 file and stores its
+// CMT3 and CMT4 streams in cr3Sub. noCMT1Box reports cr3.ErrNoCMT1Box (audit
+// #138), a non-fatal partial success: the moov/UUID structure is valid but
+// CMT1 is absent; rawXMP is still populated and Read surfaces the condition
+// as a ParseWarning rather than aborting.
+func extractCR3(r io.ReadSeeker, cr3Sub *cr3SubStreams) (rawEXIF, rawXMP []byte, noCMT1Box bool, err error) {
+	seg, err := cr3.ExtractSegments(r)
+	if errors.Is(err, cr3.ErrNoCMT1Box) {
+		cr3Sub.makerNote, cr3Sub.gps = seg.MakerNote, seg.GPS
+		return nil, seg.XMP, true, nil
+	}
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("gometadata: %w", err)
+	}
+	cr3Sub.makerNote, cr3Sub.gps = seg.MakerNote, seg.GPS
+	return seg.EXIF, seg.XMP, false, nil
 }
