@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"strings"
 	"testing"
+
+	"github.com/FlavioCFOliveira/GoMetadata/xmp"
 )
 
 // BenchmarkRead_JPEG measures the full top-level Read path for a JPEG:
@@ -203,5 +206,30 @@ func BenchmarkMWGAccessors(b *testing.B) {
 		_ = m.Caption()
 		_ = m.Keywords()
 		_ = m.Creator()
+	}
+}
+
+// BenchmarkWrite_JPEG_ExtendedXMP measures Write for a JPEG whose XMP is too
+// large for one APP1 segment, so it is written as a standard packet plus
+// extended XMP chunks (Adobe XMP Specification Part 3 §1.1.3.1). Task #295
+// derives the GUID from the MD5 digest of the extended serialisation.
+func BenchmarkWrite_JPEG_ExtendedXMP(b *testing.B) {
+	data := buildMinimalJPEG(minimalTIFFPayload())
+	m, err := Read(bytes.NewReader(data))
+	if err != nil {
+		b.Fatalf("Read: %v", err)
+	}
+	m.XMP = new(xmp.XMP)
+	m.XMP.SetCaption(strings.Repeat("Extended XMP benchmark caption. ", 4096)) // 128 KiB
+	r := bytes.NewReader(data)
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		_, _ = r.Seek(0, io.SeekStart)
+		if err := Write(r, io.Discard, m); err != nil {
+			b.Fatalf("Write: %v", err)
+		}
 	}
 }

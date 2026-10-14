@@ -1,7 +1,7 @@
 package jpeg
 
 // extxmp_test.go — regression battery for extended XMP in JPEG (tasks #278,
-// #315; Adobe XMP Specification Part 3 §1.1.3.1).
+// #295, #315; Adobe XMP Specification Part 3 §1.1.3.1).
 
 import (
 	"bytes"
@@ -83,6 +83,26 @@ func TestTask278_SpliceFallbackExtendedWins(t *testing.T) {
 	}
 }
 
+// TestExtendedSerialization proves that the packet wrapper, its padding and
+// the white space around the document are removed (Part 3 §1.1.3.1: the
+// extended portion is serialised without a packet wrapper).
+func TestExtendedSerialization(t *testing.T) {
+	t.Parallel()
+	const doc = `<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF/></x:xmpmeta>`
+	tests := []struct{ name, in, want string }{
+		{"wrapped and padded", `<?xpacket begin="` + "\xef\xbb\xbf" + `" id="W5M0MpCehiHzreSzNTczkc9d"?>` + "\n" + doc + "\n" + strings.Repeat(" ", 2048) + "\n" + `<?xpacket end="w"?>`, doc},
+		{"leading white space", "\n " + `<?xpacket begin='' id='x'?>` + doc + `<?xpacket end='r'?>`, doc},
+		{"no wrapper", "  " + doc + "\n", doc},
+		{"wrapper not first", doc + `<?xpacket begin="" id=""?>`, doc + `<?xpacket begin="" id=""?>`},
+		{"unterminated wrapper", `<?xpacket begin=` + doc, `<?xpacket begin=` + doc},
+	}
+	for _, tc := range tests {
+		if got := string(extendedSerialization([]byte(tc.in))); got != tc.want {
+			t.Errorf("%s: extendedSerialization = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 // extSegments returns the standard XMP packet and the extended XMP chunks,
 // keyed by GUID and reassembled in offset order, of the JPEG data.
 func extSegments(t *testing.T, data []byte) (main []byte, ext map[string][]byte) {
@@ -122,6 +142,75 @@ func extSegments(t *testing.T, data []byte) (main []byte, ext map[string][]byte)
 		ext[g] = b
 	}
 	return main, ext
+}
+
+// largeXMPPacket returns an XMP packet larger than one APP1 segment, with a
+// nested structure.
+func largeXMPPacket(t *testing.T) []byte {
+	t.Helper()
+	x, err := xmppkg.Parse([]byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<rdf:Description rdf:about="" xmlns:GDepth="http://ns.google.com/photos/1.0/depthmap/"` +
+		` xmlns:Container="http://ns.google.com/photos/1.0/container/" xmlns:Item="http://ns.google.com/photos/1.0/container/item/">` +
+		`<GDepth:Data>` + strings.Repeat("QUJD", 40000) + `</GDepth:Data>` +
+		`<Container:Directory><rdf:Seq><rdf:li rdf:parseType="Resource"><Container:Item Item:Semantic="Primary"/></rdf:li></rdf:Seq></Container:Directory>` +
+		`</rdf:Description></rdf:RDF></x:xmpmeta>`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	x.SetCaption("caption")
+	raw, err := xmppkg.Encode(x)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if len(raw) <= maxXMPPayload {
+		t.Fatalf("precondition: packet of %d bytes fits one segment", len(raw))
+	}
+	return raw
+}
+
+// TestTask295_ExtendedXMPWriteDeterministic proves that writing the same
+// oversized XMP twice gives identical bytes, that the extended serialisation
+// is the written packet without its wrapper, and that the written file reads
+// back with the nested structure and without HasExtendedXMP. The GUID, the
+// wrapper and the namespace rules are checked by
+// TestConformanceExtendedXMPWrite.
+func TestTask295_ExtendedXMPWriteDeterministic(t *testing.T) {
+	t.Parallel()
+	raw := largeXMPPacket(t)
+	src := buildJPEG(nil, nil, nil)
+	var out1, out2 bytes.Buffer
+	if err := Inject(bytes.NewReader(src), &out1, nil, nil, raw, true); err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	if err := Inject(bytes.NewReader(src), &out2, nil, nil, raw, true); err != nil {
+		t.Fatalf("second Inject: %v", err)
+	}
+	if !bytes.Equal(out1.Bytes(), out2.Bytes()) {
+		t.Fatal("two writes of the same XMP differ")
+	}
+
+	_, ext := extSegments(t, out1.Bytes())
+	if len(ext) != 1 {
+		t.Fatalf("extended XMP carries %d GUIDs, want 1", len(ext))
+	}
+	for _, body := range ext {
+		if !bytes.Equal(body, extendedSerialization(raw)) {
+			t.Error("extended serialisation is not the written packet without its wrapper")
+		}
+	}
+
+	_, _, got, err := Extract(bytes.NewReader(out1.Bytes()))
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	for _, want := range []string{"Item:Semantic", "Primary", "QUJDQUJD", "caption"} {
+		if !bytes.Contains(got, []byte(want)) {
+			t.Errorf("reassembled XMP lacks %q", want)
+		}
+	}
+	if bytes.Contains(got, []byte("HasExtendedXMP")) {
+		t.Error("reassembled XMP still carries HasExtendedXMP")
+	}
 }
 
 // TestTask278_BothFormsAndNestedMerge reads JPEG files whose standard packet
@@ -193,4 +282,65 @@ func checkExtendedMerge(t *testing.T, form, uri, prop, guid string, ext []byte) 
 	if _, gotExt := extSegments(t, out.Bytes()); !bytes.Equal(gotExt[guid], ext) {
 		t.Errorf("%s: pass-through write changed or dropped the extended XMP", ns)
 	}
+}
+
+// TestConformanceExtendedXMPWrite checks the extended XMP rules of
+// docs/conformance/xmp.md §3.1 on a written file (Adobe XMP Specification
+// Part 3 §1.1.3.1).
+func TestConformanceExtendedXMPWrite(t *testing.T) {
+	t.Parallel()
+	raw := largeXMPPacket(t)
+	var out bytes.Buffer
+	if err := Inject(bytes.NewReader(buildJPEG(nil, nil, nil)), &out, nil, nil, raw, true); err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	main, ext := extSegments(t, out.Bytes())
+	if len(ext) != 1 {
+		t.Fatalf("extended XMP carries %d GUIDs, want 1", len(ext))
+	}
+	var guid string
+	var body []byte
+	for g, b := range ext {
+		guid, body = g, b
+	}
+
+	t.Run("JPEG-06", func(t *testing.T) {
+		t.Parallel()
+		sum := md5.Sum(body) //nolint:gosec // G401: spec-mandated digest
+		if want := strings.ToUpper(hex.EncodeToString(sum[:])); guid != want {
+			t.Errorf("GUID = %s, want the MD5 digest of the extended XMP %s", guid, want)
+		}
+		if g, ok := extractGUIDFromMain(main); !ok || g != guid {
+			t.Errorf("xmpNote:HasExtendedXMP = %q, %v; want %s", g, ok, guid)
+		}
+	})
+	t.Run("JPEG-09", func(t *testing.T) {
+		t.Parallel()
+		if bytes.Contains(body, []byte("<?xpacket")) || !bytes.HasPrefix(body, []byte("<x:xmpmeta")) {
+			t.Errorf("extended XMP is not serialized without a packet wrapper: %.80q", body)
+		}
+		if strings.ToUpper(guid) != guid {
+			t.Errorf("GUID %s is not written with capital A-F", guid)
+		}
+	})
+	t.Run("JPEG-10", func(t *testing.T) {
+		t.Parallel()
+		if !bytes.Contains(main, []byte(`xmlns:xmpNote="http://ns.adobe.com/xmp/note/"`)) {
+			t.Errorf("standard packet does not bind xmpNote to http://ns.adobe.com/xmp/note/:\n%s", main)
+		}
+		_, _, got, err := Extract(bytes.NewReader(out.Bytes()))
+		if err != nil {
+			t.Fatalf("Extract: %v", err)
+		}
+		x, err := xmppkg.Parse(got)
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if v := x.Get(xmppkg.NSxmpNote, "HasExtendedXMP"); v != "" {
+			t.Errorf("recomposed XMP keeps xmpNote:HasExtendedXMP = %q", v)
+		}
+		if x.Caption() != "caption" {
+			t.Errorf("recomposed XMP lost the extended properties")
+		}
+	})
 }

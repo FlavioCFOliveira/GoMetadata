@@ -129,17 +129,17 @@ type Metadata struct {
 	//                   mismatch → IPTC trust is elevated.
 	rawIPTCDigest []byte
 
-	// rawXMPWire is non-nil when the image carried extended XMP (Adobe XMP
-	// Specification Part 3 §1.1.4) and the XMP was not modified by the caller.
-	// It holds the internal wire-frame encoding produced by jpeg.ExtractWithWire:
-	// the original main APP1 content and the assembled extended payload packed
-	// together. Inject uses this to reproduce the original segmentation without
-	// regenerating the GUID, guaranteeing that rawXMP is byte-stable across an
-	// unmodified round-trip.
+	// rawXMPWire is non-nil when a JPEG carried extended XMP (Adobe XMP
+	// Specification Part 3 §1.1.3.1). It holds the internal wire-frame
+	// encoding produced by jpeg.ExtractFullSelective: the original standard
+	// APP1 content and the assembled extended payload packed together.
 	//
-	// rawXMPWire is always nil when m.XMP is non-nil (user modified the XMP);
-	// in that case encodeMetadata re-encodes from the struct and the extended
-	// split path uses a freshly generated GUID.
+	// Write uses it only when m.XMP is nil (XMP not parsed, for example with
+	// WithoutXMP): Inject then reproduces the original segmentation with the
+	// original GUID. When m.XMP is non-nil, Write encodes m.XMP instead, and
+	// a packet too large for one APP1 segment is split with a GUID derived
+	// from the MD5 digest of the extended serialisation (task #295), so the
+	// same XMP always produces the same bytes.
 	rawXMPWire []byte
 
 	// iptcTrustElev caches the result of computeIPTCTrustElevated(rawIPTC,

@@ -2,7 +2,7 @@
 
 Normative-requirements checklist for the GoMetadata conformance test battery. Rule IDs
 (`PW-*`, `RDF-*`, `NS-*`, `VT-*`, `JPEG-*`, `TIFF-*`, `PNG-*`, `HEIF-*`, `MWG-*`, `ROB-*`)
-are used verbatim as Go sub-test names. 67 rules total.
+are used verbatim as Go sub-test names. 69 rules total.
 
 > Note for implementers: a few byte-length constants below (e.g. the JPEG XMP namespace
 > identifier length) must be reconciled against the actual codebase during implementation —
@@ -73,6 +73,8 @@ are used verbatim as Go sub-test names. 67 rules total.
 - **JPEG-06** GUID = MD5 of full extended XMP = value of `xmpNote:HasExtendedXMP` in standard packet; validate before reassembly.
 - **JPEG-07** Reassembly validates: same GUID, same fullLength, Σ chunk lengths = fullLength, no dup/overlap offsets; incomplete → error.
 - **JPEG-08** Merge extended `rdf:Description` into primary model without duplicating props; a top-level property present in both portions takes the extended value as a whole (Adobe XMP Toolkit `XMPUtils::MergeFromJPEG`).
+- **JPEG-09** ExtendedXMP serialized without a packet wrapper; GUID written as 32 hex digits with capital A–F (S3 §1.1.3.1).
+- **JPEG-10** Reader recomposes StandardXMP and ExtendedXMP into one data model tree and removes `xmpNote:HasExtendedXMP`; the xmpNote namespace URI is `http://ns.adobe.com/xmp/note/` (S3 §1.1.3.1).
 
 ### 3.2 TIFF — XMP Part 3 §1.3
 - **TIFF-01** XMP in tag 700 (`0x02BC`); type BYTE(1) or UNDEFINED(7); accept both, write BYTE.

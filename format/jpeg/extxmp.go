@@ -1,6 +1,26 @@
 package jpeg
 
-import "bytes"
+// Adapted from Adobe XMP-Toolkit-SDK XMPCore/source/XMPUtils.cpp:XMPUtils::PackageForJPEG, Copyright 2003 Adobe, SPDX-License-Identifier: BSD-3-Clause
+//
+// See THIRD_PARTY_NOTICES.md for the licence note on this file.
+//
+// writeExtendedXMP follows the Toolkit in naming the extended XMP by the
+// uppercase hexadecimal MD5 digest of its serialisation, which it writes
+// without a packet wrapper. It keeps this package's partitioning, which
+// differs from the Toolkit's: the standard packet carries only
+// xmpNote:HasExtendedXMP and the extended serialisation carries the whole
+// document, instead of moving the largest top-level properties out of the
+// standard packet until it fits.
+
+import (
+	"bytes"
+	"crypto/md5" //nolint:gosec // G501: MD5 is the digest that Adobe XMP Specification Part 3 §1.1.3.1 mandates for the extended XMP GUID; it is an identifier, not a security control
+	"fmt"
+	"io"
+
+	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
+	xmppkg "github.com/FlavioCFOliveira/GoMetadata/xmp"
+)
 
 // guidLen is the length of the extended XMP GUID: 128 bits written as 32
 // ASCII hexadecimal digits (Adobe XMP Specification Part 3 §1.1.3.1).
@@ -9,6 +29,13 @@ const guidLen = 32
 // hasExtendedXMPName is the local name of the property that carries the GUID
 // in the standard XMP packet (Adobe XMP Specification Part 3 §1.1.3.1).
 var hasExtendedXMPName = []byte("HasExtendedXMP") //nolint:gochecknoglobals // package-level constant bytes
+
+// xpacketBegin and xpacketEnd open the two processing instructions of an XMP
+// packet wrapper (XMP Part 1 §7.3).
+var (
+	xpacketBegin = []byte("<?xpacket begin=") //nolint:gochecknoglobals // package-level constant bytes
+	xpacketEnd   = []byte("<?xpacket end=")   //nolint:gochecknoglobals // package-level constant bytes
+)
 
 // extractGUIDFromMain returns the GUID stored in the xmpNote:HasExtendedXMP
 // property of the standard XMP packet main, and whether one was found.
@@ -125,4 +152,90 @@ func skipXMLSpace(b []byte, i int) int {
 		i++
 	}
 	return i
+}
+
+// extendedSerialization returns the extended XMP serialisation of the XMP
+// packet: packet without its <?xpacket?> wrapper, its padding, and the white
+// space around the document. Adobe XMP Specification Part 3 §1.1.3.1: "The
+// extended portion must be serialized without a packet wrapper". A packet
+// that does not begin with a wrapper is returned with only the surrounding
+// white space removed. The result is a sub-slice of packet.
+func extendedSerialization(packet []byte) []byte {
+	b := packet[skipXMLSpace(packet, 0):]
+	if bytes.HasPrefix(b, xpacketBegin) {
+		if end := bytes.Index(b, xmlPIEnd); end >= 0 {
+			b = b[end+len(xmlPIEnd):]
+			if tail := bytes.LastIndex(b, xpacketEnd); tail >= 0 {
+				b = b[:tail]
+			}
+		}
+	}
+	end := len(b)
+	for end > 0 && isXMLSpace(b[end-1]) {
+		end--
+	}
+	return b[skipXMLSpace(b[:end], 0):end]
+}
+
+// xmlPIEnd closes an XML processing instruction (XML 1.0 §2.6).
+var xmlPIEnd = []byte("?>") //nolint:gochecknoglobals // package-level constant bytes
+
+// extendedXMPGUID returns the GUID of the extended XMP serialisation ext:
+// the MD5 digest of ext in uppercase hexadecimal. Adobe XMP Specification
+// Part 3 §1.1.3.1: "The GUID is a 128-bit MD5 digest of the full ExtendedXMP
+// serialization", stored "as a 32-byte ASCII hex string, capital A-F".
+// Deriving it from the content makes a write deterministic (task #295).
+func extendedXMPGUID(ext []byte) [guidLen]byte {
+	const hexDigits = "0123456789ABCDEF"
+	sum := md5.Sum(ext) //nolint:gosec // G401: see the import comment; the spec mandates MD5
+	var g [guidLen]byte
+	for i, c := range sum {
+		g[2*i] = hexDigits[c>>4]
+		g[2*i+1] = hexDigits[c&0x0F]
+	}
+	return g
+}
+
+// writeExtendedXMP writes rawXMP, which is too large for one APP1 segment,
+// as a standard XMP packet followed by extended XMP APP1 segments (Adobe XMP
+// Specification Part 3 §1.1.3.1):
+//
+//  1. The extended serialisation is rawXMP without its packet wrapper.
+//  2. Its GUID is the uppercase hexadecimal MD5 digest of that
+//     serialisation, so the same XMP always produces the same bytes.
+//  3. The standard packet is a minimal XMP packet whose only property is
+//     xmpNote:HasExtendedXMP, in the NSxmpNote namespace, set to the GUID.
+//  4. The serialisation is written in chunks of at most maxExtChunkSize
+//     bytes, one extended APP1 segment each.
+func writeExtendedXMP(w io.Writer, rawXMP []byte) error {
+	ext := extendedSerialization(rawXMP)
+	guid := extendedXMPGUID(ext)
+
+	// The literal template is faster and simpler than invoking the xmp
+	// package's encoder from the format layer.
+	mainXMP := []byte(
+		`<?xpacket begin="` + "\xef\xbb\xbf" + `" id="W5M0MpCehiHzreSzNTczkc9d"?>` +
+			`<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="GoMetadata">` +
+			`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+			`<rdf:Description rdf:about=""` +
+			` xmlns:xmpNote="` + xmppkg.NSxmpNote + `"` +
+			` xmpNote:HasExtendedXMP="` + string(guid[:]) + `"/>` +
+			`</rdf:RDF></x:xmpmeta>` +
+			`<?xpacket end="w"?>`,
+	)
+	if len(mainXMP) > maxXMPPayload {
+		// This cannot happen in practice — the template is ~300 bytes — but
+		// guard defensively so the error is actionable rather than silent.
+		return fmt.Errorf("jpeg: extended XMP: main XMP stub (%d bytes) exceeds APP1 limit: %w", len(mainXMP), ErrXMPStubTooLarge)
+	}
+
+	// #216: header + prefix + stub built in one pooled buffer, one w.Write.
+	bufPtr := iobuf.Get(segHeaderSize + len(identXMP) + len(mainXMP))
+	b := *bufPtr
+	copy(b[segHeaderSize:], identXMP)
+	copy(b[segHeaderSize+len(identXMP):], mainXMP)
+	if err := writeHeaderedBuf(w, markerAPP1, bufPtr); err != nil {
+		return err
+	}
+	return writeExtendedChunks(w, guid[:], ext)
 }

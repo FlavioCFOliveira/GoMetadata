@@ -12,9 +12,7 @@ package jpeg
 
 import (
 	"bytes"
-	"crypto/rand"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -703,10 +701,11 @@ func writeEXIFSegment(w io.Writer, rawEXIF []byte) error {
 // When rawXMP begins with xmpWireMagic (a wire-frame encoding), the function
 // decodes the original main XMP and the assembled extended payload and writes
 // them using the passthrough path — main as a standard APP1, extended as
-// re-chunked extended APP1 segments — preserving semantic content without
-// repackaging into a new random-GUID stub. This ensures that round-trip
-// writes of unmodified extended XMP are byte-stable (same reassembled content
-// before and after).
+// re-chunked extended APP1 segments under the original GUID. This ensures
+// that round-trip writes of unmodified extended XMP are byte-stable (same
+// reassembled content before and after). Any other packet larger than one
+// segment is split by writeExtendedXMP, whose GUID is the MD5 digest of the
+// extended serialisation (task #295).
 func writeXMPSegments(w io.Writer, rawXMP []byte) error {
 	// Wire-frame passthrough: preserve original main+extended without regenerating GUID.
 	if main, ext, ok := decodeXMPWire(rawXMP); ok {
@@ -1345,65 +1344,6 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 
 	// Copy remaining segments, skipping old metadata APP segments.
 	return copyNonMetadataSegments(cr, w, scratch, preserveUnknownSegments)
-}
-
-// writeExtendedXMP splits rawXMP across a main APP1 and one or more extended
-// APP1 segments, per Adobe XMP Specification Part 3 §1.1.4.
-//
-// Strategy:
-//  1. Generate a random 32-hex-character GUID via crypto/rand.
-//  2. Build a minimal "main" XMP document that contains only the
-//     xmpNote:HasExtendedXMP property set to the GUID. This document is
-//     guaranteed to be far smaller than the 65504-byte limit.
-//  3. Write the main XMP as a standard APP1 segment.
-//  4. Write rawXMP verbatim as the extended payload, split into chunks of at
-//     most maxExtChunkSize bytes. Each chunk becomes one extended APP1 segment.
-//
-// The xmpNote namespace is xmp.NSxmpNote, http://ns.adobe.com/xmp/note/
-// (Adobe XMP Specification Part 3 §1.1.3.1; task #315).
-func writeExtendedXMP(w io.Writer, rawXMP []byte) error {
-	// Step 1: generate GUID.
-	var guidRaw [16]byte
-	if _, err := rand.Read(guidRaw[:]); err != nil {
-		return fmt.Errorf("jpeg: extended XMP: generate GUID: %w", err)
-	}
-	guid := hex.EncodeToString(guidRaw[:]) // 32 hex characters
-
-	// Step 2: build the minimal main XMP document.
-	// The document is a self-contained, valid XMP packet that carries only the
-	// xmpNote:HasExtendedXMP attribute. Readers merge the extended payload on
-	// top of this stub. The literal template is faster and simpler than
-	// invoking the xmp package from the format layer.
-	//
-	// xmpNote namespace: xmp.NSxmpNote (XMP Spec Part 3 §1.1.3.1)
-	mainXMP := []byte(
-		`<?xpacket begin="` + "\xef\xbb\xbf" + `" id="W5M0MpCehiHzreSzNTczkc9d"?>` +
-			`<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="GoMetadata">` +
-			`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
-			`<rdf:Description rdf:about=""` +
-			` xmlns:xmpNote="` + xmppkg.NSxmpNote + `"` +
-			` xmpNote:HasExtendedXMP="` + guid + `"/>` +
-			`</rdf:RDF></x:xmpmeta>` +
-			`<?xpacket end="w"?>`,
-	)
-	if len(mainXMP) > maxXMPPayload {
-		// This cannot happen in practice — the template is ~200 bytes — but
-		// guard defensively so the error is actionable rather than silent.
-		return fmt.Errorf("jpeg: extended XMP: main XMP stub (%d bytes) exceeds APP1 limit: %w", len(mainXMP), ErrXMPStubTooLarge)
-	}
-
-	// Step 3: write main APP1. #216: header + prefix + stub built in one
-	// pooled buffer, one w.Write.
-	bufPtr := iobuf.Get(segHeaderSize + len(identXMP) + len(mainXMP))
-	b := *bufPtr
-	copy(b[segHeaderSize:], identXMP)
-	copy(b[segHeaderSize+len(identXMP):], mainXMP)
-	if err := writeHeaderedBuf(w, markerAPP1, bufPtr); err != nil {
-		return err
-	}
-
-	// Step 4: split rawXMP into extended APP1 chunks.
-	return writeExtendedChunks(w, []byte(guid), rawXMP)
 }
 
 // parseIRBEntry delegates to irbpkg.ParseEntry; see there for the recoverable-miss
