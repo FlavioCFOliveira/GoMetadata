@@ -1,5 +1,6 @@
 # Memory Index
 
+- [Sprint 45 E4a (2026-10-14)](project_sprint45_e4a_xmp_tree.md) — XMP tree model (#303/#283/#277): Toolkit port, retained-subset design, perf traps, fuzz finds, unfixed defects
 - [Sprint 45 E3 (2026-10-14)](project_sprint45_e3_heif_cr3_webp.md) — iloc data_reference_index, HEIF item creation, CR3 XMP uuid/CMT4 split, WebP VP8X; fuzz finds + Read perf trap
 - [Sprint 45 E2b (2026-10-14)](project_sprint45_e2b_subifd_makernote_irb.md) — SubIFD tree+chains, MakerNote base/footer, IRB first-wins; TypeUTF8=13 vs 129 finding
 - [Sprint 45 E2 (2026-10-14)](project_sprint45_E2_irb_alignment_makernote.md) — TIFF/CR2 alignment+rebase, internal/irb digest policy, PNG raw profiles, MakerNote signatures; exiftool-verified facts + unfixed pre-existing write bugs
@@ -17,7 +18,7 @@
 - [Sprint 44 Batch A (2026-09-25)](project_sprint44_batchA_210_213_235_236.md) — xmp compact value-arena, intern-at-storage; struct-in-list truncation REVERTED (backlog BUG #277)
 - [Sprint 44 perf #204-#209,#241](project_sprint44_perf_204_209_241.md) — noinline config split, ISO-8859-1 decode, IPTC pre-count, MWG-02 cache, WebP/RIFF alloc-free dispatch
 - [Task #274 XMP numeric char-ref fix](project_task274_xmp_charref_forbidden_chars.md) — isForbiddenXMLCharRef closes U+001E-via-&#x1e; corruption
-- [Task #273 XMP container preservation](project_task273_xmp_container_preservation.md) — containerTypes field fixes allowlist-scoped corruption
+- [Task #273 XMP container preservation](project_task273_xmp_container_preservation.md) — SUPERSEDED by E4a tree: containerTypes removed; history only
 - [WebFetch unreliable for large HTML tables](feedback_webfetch_html_tables_unreliable.md) — use curl+regex instead; AI summarization drops/garbles rows
 - [Task #272 Clean-GO polish](project_task272_clean_go_polish.md) — DC array allowlist +6 props; IPTC doc hygiene; V-15 named test
 - [Width claims need primitive-level test](feedback_width_claims_need_primitive_test.md) — bounded fixtures can't detect uint32-truncation; verify via bug injection
@@ -41,7 +42,7 @@
 - [sync.Pool buffer subslice race](feedback_pool_buffer_race.md) — never Put before all subslice reads complete; exposed by t.Parallel()
 - [gosec G306/G302 + wrapcheck nolint placement](feedback_gosec_test_permissions.md) — nolint must be on the offending statement line
 - [XMP parser leniency triggers](feedback_xmp_parser_lenient.md) — xmp.Parse fails only on ErrEmptyInput/ErrXMLNestingDepth
-- [XMP property key encoding](project_xmp_data_model.md) — "parent.field" structs, "parent[N].field" array-of-structs; rdf:parseType="Resource"
+- [XMP property key encoding](project_xmp_data_model.md) — "parent.field"/"parent[N].field" keys; deeper data lives in XMP.nodes (E4a)
 - [nolint cyclop vs gocyclo](feedback_nolint_cyclop_vs_gocyclo.md) — separate linters; list both when both fire
 - [nolint:intrange on range N loops](feedback_nolint_intrange_range2.md) — `for i := range N` already satisfies intrange
 - [copyloopvar in Go 1.22+](feedback_copyloopvar_go122.md) — tc:=tc copies inside for-range are redundant, linter flags them
