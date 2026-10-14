@@ -72,7 +72,9 @@ type Metadata struct {
 	// Must not be copied after first use — always use *Metadata.
 	mu sync.Mutex
 
-	// EXIF, IPTC and XMP are the parsed metadata, each nil when absent.
+	// EXIF, IPTC and XMP are the parsed metadata, each nil when absent. They
+	// are not safe for concurrent mutation (see the concurrency contract
+	// above).
 	//
 	// The entry values of EXIF (exif.IFDEntry.Value, EXIF.MakerNote) are
 	// zero-copy views of the raw EXIF bytes that Read retains and that Write

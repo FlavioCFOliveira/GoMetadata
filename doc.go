@@ -62,6 +62,15 @@
 //	fmt.Println(m.CameraModel())
 //	lat, lon, ok := m.GPS()
 //
+// # Concurrency
+//
+// The Set* methods of [Metadata] are serialised by an internal mutex, and
+// its getters may run concurrently with each other. The parsed components
+// Metadata.EXIF, Metadata.IPTC and Metadata.XMP are not safe for concurrent
+// use: mutating them directly from several goroutines, bypassing the Set*
+// methods of Metadata, needs the caller's own synchronisation (see the
+// concurrency contract of [Metadata]).
+//
 // # Parsed EXIF values
 //
 // Read does not copy EXIF values: every exif.IFDEntry.Value is a read-only
