@@ -23,3 +23,8 @@ coverage.out
 /gallery-sidecar
 /multi-format-roundtrip
 /stream-transcode
+
+# Authoritative specifications — local offline copies only; not redistributable.
+# Only the index README.md is tracked.
+docs/specs/*
+!docs/specs/README.md
