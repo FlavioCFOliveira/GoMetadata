@@ -1218,24 +1218,30 @@ func upsertIFD0Entry(ifd *exif.IFD, tag exif.TagID, typ exif.DataType, value []b
 const tagPhotoshopIRB = exif.TagID(tiffscan.PSIRTag)
 
 // upsertIPTC stores rawIPTC in tag 0x83BB of ifd (TypeLong, see
-// upsertIFD0Entry) and keeps the IPTC digest of the Photoshop image resource
-// block (tag 0x8649, resource 0x0425) consistent with it (task #284).
+// upsertIFD0Entry) and keeps the Photoshop image resource block (tag 0x8649)
+// consistent with it: its copy of the IIM (resource 0x0404) and its IPTC
+// digest (resource 0x0425).
 //
-// MWG Guidelines v2.0 §3.3.1: the digest is the MD5 of the IPTC-IIM block, so
-// a writer that changes the IIM must update it. The new digest covers the
-// stored value of tag 0x83BB including its LONG zero padding, the bytes
-// Photoshop and ExifTool hash (irb.Digest with align 4). Policy, shared with
-// the JPEG writer (irb.AppendSpliced):
+// IIM copy (task #314): when the resource block already holds a 0x0404
+// resource, it is replaced by rawIPTC (irb.AppendSplicedDigest; duplicates are
+// resolved as irb documents), so no reader sees a stale second copy of the
+// IPTC (ExifTool lists it as group IPTC2 and updates both copies when it
+// writes). A 0x0404 resource is never added to a block that has none. The
+// Adobe XMP Toolkit (ReconcileLegacy.cpp:ExportPhotoData) updates only tag
+// 0x83BB and the digest for TIFF; it is not followed here because a stale
+// copy would contradict the IPTC just written.
+//
+// Digest (task #284). MWG Guidelines v2.0 §3.3.1: the digest is the MD5 of
+// the IPTC-IIM block, so a writer that changes the IIM must update it. The new
+// digest covers the stored value of tag 0x83BB including its LONG zero
+// padding, the bytes Photoshop and ExifTool hash (irb.Digest with align 4).
+// Policy, shared with the JPEG writer (irb.AppendSpliced):
 //   - no digest resource: none is created;
 //   - the IIM changed: the digest is refreshed;
 //   - the IIM is unchanged: a current digest is rewritten in the padded form
 //     (same meaning, now also current for ExifTool), and a stale digest is
 //     left stale, because a stale digest is the MWG signal that the IIM was
 //     edited without updating XMP, and rewriting identical IIM is no edit.
-//
-// The 0x0404 copy of the IIM inside the resource block is not rewritten
-// (writing IPTC into tag 0x8649 is out of scope, task #301); readers take
-// tag 0x83BB first (TIFF_Handler.cpp:TIFF_MetaHandler::ProcessXMP).
 func upsertIPTC(ifd *exif.IFD, rawIPTC []byte) {
 	oldIPTC := currentIPTC(ifd)
 	upsertIFD0Entry(ifd, exif.TagIPTC, exif.TypeLong, rawIPTC)
@@ -1244,21 +1250,43 @@ func upsertIPTC(ifd *exif.IFD, rawIPTC []byte) {
 	if psir == nil {
 		return
 	}
-	stored := irb.FindDigest(psir.Value)
+	digest, refresh := iptcDigestUpdate(psir.Value, oldIPTC, rawIPTC)
+	// The resource block is a byte stream (Adobe Photoshop File Formats
+	// Specification, TIFF tag 34377: BYTE or UNDEFINED); any other declared
+	// type is left alone, as its Count would not be a byte count.
+	byteTyped := psir.Type == exif.TypeByte || psir.Type == exif.TypeUndefined
+	copy0404 := irb.FindIPTC(psir.Value)
+	copyIIM := byteTyped && copy0404 != nil && !bytes.Equal(copy0404, rawIPTC)
+	switch {
+	case copyIIM:
+		var d *[irb.DigestSize]byte
+		if refresh {
+			d = &digest
+		}
+		// A fresh slice: psir.Value may alias the caller's input.
+		psir.Value = irb.AppendSplicedDigest(make([]byte, 0, len(psir.Value)+len(rawIPTC)+16), psir.Value, rawIPTC, d)
+		psir.Count = uint32(len(psir.Value)) //nolint:gosec // G115: bounded by the TIFF value size
+	case refresh:
+		// RefreshDigest copies: psir.Value may alias the caller's input.
+		if v := irb.RefreshDigest(psir.Value, digest); v != nil {
+			psir.Value = v
+		}
+	}
+}
+
+// iptcDigestUpdate applies the digest policy of upsertIPTC to the resource
+// block psir when the IIM goes from oldIPTC to rawIPTC: it returns the digest
+// to store and true when the 0x0425 resource must be rewritten.
+func iptcDigestUpdate(psir, oldIPTC, rawIPTC []byte) (digest [irb.DigestSize]byte, refresh bool) {
+	stored := irb.FindDigest(psir)
 	if stored == nil {
-		return
+		return digest, false
 	}
 	if bytes.Equal(oldIPTC, tiffscan.TrimIPTCLongPadding(rawIPTC)) && !irb.DigestCurrent(oldIPTC, stored, 4) {
-		return // unchanged IIM, stale digest: keep the MWG signal
+		return digest, false // unchanged IIM, stale digest: keep the MWG signal
 	}
-	digest := irb.Digest(rawIPTC, 4)
-	if bytes.Equal(stored, digest[:]) {
-		return
-	}
-	// RefreshDigest copies: psir.Value may alias the caller's input.
-	if v := irb.RefreshDigest(psir.Value, digest); v != nil {
-		psir.Value = v
-	}
+	digest = irb.Digest(rawIPTC, 4)
+	return digest, !bytes.Equal(stored, digest[:])
 }
 
 // currentIPTC returns the IIM stream ifd holds before an IPTC write: the

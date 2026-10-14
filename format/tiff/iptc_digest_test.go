@@ -86,7 +86,14 @@ func TestUpsertIPTC_DigestPolicy(t *testing.T) {
 			if !bytes.Equal(aliased, before) {
 				t.Error("the original 0x8649 value was modified in place")
 			}
-			if len(psir) != len(before) {
+			// Task #314: a 0x0404 copy of the IIM in 0x8649 is rewritten with
+			// the new IIM; a block without one keeps its length (only the
+			// digest changes in place).
+			if irb.FindIPTC(before) != nil {
+				if got := irb.FindIPTC(psir); !bytes.Equal(got, tc.newIPTC) {
+					t.Errorf("0x8649 IIM copy = %x, want %x", got, tc.newIPTC)
+				}
+			} else if len(psir) != len(before) {
 				t.Errorf("0x8649 length changed: %d -> %d", len(before), len(psir))
 			}
 		})

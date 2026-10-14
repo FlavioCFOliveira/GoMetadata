@@ -4,6 +4,9 @@ package png
 
 import (
 	"bytes"
+	"compress/zlib"
+	"fmt"
+	"strconv"
 
 	"github.com/FlavioCFOliveira/GoMetadata/internal/irb"
 )
@@ -92,17 +95,9 @@ func rawProfileText(chunkType [4]byte, data []byte, keywordLen int) (text []byte
 // data[pos] (PNG §11.3.4.5: compression flag, compression method, language
 // tag NUL, translated keyword NUL, text).
 func iTXtText(data []byte, pos int) (text []byte, ok bool) {
-	if pos+2 > len(data) {
+	compFlag, compMethod, pos, ok := iTXtTextStart(data, pos)
+	if !ok {
 		return nil, false
-	}
-	compFlag, compMethod := data[pos], data[pos+1]
-	pos += 2
-	for range 2 { // skip language tag and translated keyword
-		nul := bytes.IndexByte(data[pos:], 0x00)
-		if nul < 0 {
-			return nil, false
-		}
-		pos += nul + 1
 	}
 	if compFlag == 0 {
 		return data[pos:], true
@@ -112,6 +107,25 @@ func iTXtText(data []byte, pos int) (text []byte, ok bool) {
 	}
 	dec, err := zlibDecompress(data[pos:])
 	return dec, err == nil
+}
+
+// iTXtTextStart returns the compression flag and method of an iTXt chunk
+// whose compression flag is at data[pos], and the offset of its text (after
+// the language tag and translated keyword, PNG §11.3.4.5).
+func iTXtTextStart(data []byte, pos int) (compFlag, compMethod byte, textStart int, ok bool) {
+	if pos+2 > len(data) {
+		return 0, 0, 0, false
+	}
+	compFlag, compMethod = data[pos], data[pos+1]
+	pos += 2
+	for range 2 { // skip language tag and translated keyword
+		nul := bytes.IndexByte(data[pos:], 0x00)
+		if nul < 0 {
+			return 0, 0, 0, false
+		}
+		pos += nul + 1
+	}
+	return compFlag, compMethod, pos, true
 }
 
 // decodeRawProfile decodes the text of a raw profile chunk into the profile
@@ -302,4 +316,118 @@ func (st *extractState) result() (rawEXIF, rawIPTC, rawXMP []byte) {
 		rawXMP = st.profXMP
 	}
 	return rawEXIF, st.iptc, rawXMP
+}
+
+// Writing raw profiles (task #314). After an IPTC write, an existing
+// "Raw profile type iptc" chunk would otherwise keep the old IIM and
+// contradict the IPTC just written (ExifTool, which reads and writes this
+// chunk, rewrites it in place). rewriteRawProfileIPTC re-encodes such a chunk
+// with the new IIM: same chunk type, keyword, compression and iTXt language
+// fields, same profile name line, and the payload form of the original (a
+// Photoshop IRB, with or without the "Photoshop 3.0" identifier, spliced by
+// irb.AppendSpliced so every other resource is kept; or a bare IIM stream).
+// The text layout is the one ImageMagick defines and ExifTool writes:
+//
+//	"\n" name "\n" length (decimal, right-aligned in 8 columns) "\n"
+//	hex digits, 72 per line, each line ended by "\n"
+
+// rawProfileHexLine is the number of profile bytes per hex line (72 digits).
+const rawProfileHexLine = 36
+
+// rewriteRawProfileIPTC returns the payload that replaces data, the payload of
+// a text chunk of type chunkType, so that its IPTC raw profile holds newIIM;
+// ok is false when data must be kept as is: it is not an IPTC raw profile, it
+// cannot be decoded (a malformed chunk is preserved, never repaired), its
+// payload form is not one profileIPTC reads, or it already holds newIIM.
+func rewriteRawProfileIPTC(chunkType [4]byte, data, newIIM []byte) (payload []byte, ok bool, err error) {
+	kind, kwLen := isRawProfileKeyword(data)
+	if kind != rawProfileIPTC {
+		return nil, false, nil
+	}
+	text, tok := rawProfileText(chunkType, data, kwLen)
+	if !tok {
+		return nil, false, nil
+	}
+	p := decodeRawProfile(text)
+	cur := profileIPTC(p)
+	if cur == nil || bytes.Equal(cur, newIIM) {
+		return nil, false, nil
+	}
+	newText := appendRawProfileText(nil, text, splicedProfile(p, newIIM))
+	return rawProfileChunk(chunkType, data, kwLen, newText)
+}
+
+// splicedProfile returns profile p (a form profileIPTC reads) with its IIM
+// replaced by newIIM.
+func splicedProfile(p, newIIM []byte) []byte {
+	body := bytes.TrimPrefix(p, identPhotoshop)
+	if !bytes.HasPrefix(body, []byte("8BIM")) {
+		return newIIM // bare IIM stream
+	}
+	ident := p[:len(p)-len(body)]
+	out := make([]byte, 0, len(p)+len(newIIM))
+	out = append(out, ident...)
+	return irb.AppendSpliced(out, body, newIIM)
+}
+
+// appendRawProfileText appends to dst the raw profile text of profile, keeping
+// the leading whitespace and the profile name line of the original text old
+// (validated by rawProfileHeader).
+func appendRawProfileText(dst, old, profile []byte) []byte {
+	i := skipSpace(old, 0)
+	nameEnd := i + bytes.IndexByte(old[i:], '\n') + 1
+	dst = append(dst, old[:nameEnd]...)
+	n := strconv.Itoa(len(profile))
+	for range 8 - min(8, len(n)) {
+		dst = append(dst, ' ')
+	}
+	dst = append(dst, n...)
+	dst = append(dst, '\n')
+	const digits = "0123456789abcdef"
+	for j, c := range profile {
+		if j > 0 && j%rawProfileHexLine == 0 {
+			dst = append(dst, '\n')
+		}
+		dst = append(dst, digits[c>>4], digits[c&0x0F])
+	}
+	return append(dst, '\n')
+}
+
+// rawProfileChunk rebuilds the payload of the text chunk data (keyword of
+// kwLen bytes) around newText, keeping its compression settings: tEXt text
+// as is; zTXt compression method 0 and a zlib stream; iTXt flag, method,
+// language tag and translated keyword as in data, the text compressed when
+// the flag is set (PNG §11.3.4.3–5).
+func rawProfileChunk(chunkType [4]byte, data []byte, kwLen int, newText []byte) ([]byte, bool, error) {
+	var head []byte
+	compress := false
+	switch chunkType {
+	case chunkTEXt:
+		head = data[:kwLen+1]
+	case chunkZTXt:
+		head, compress = data[:kwLen+2], true
+	case chunkITXt:
+		flag, _, textStart, ok := iTXtTextStart(data, kwLen+1)
+		if !ok {
+			return nil, false, nil
+		}
+		head, compress = data[:textStart], flag != 0
+	default:
+		return nil, false, nil
+	}
+	out := make([]byte, 0, len(head)+len(newText))
+	out = append(out, head...)
+	if !compress {
+		return append(out, newText...), true, nil
+	}
+	var buf bytes.Buffer
+	buf.Write(out)
+	zw := zlib.NewWriter(&buf)
+	if _, err := zw.Write(newText); err != nil {
+		return nil, false, fmt.Errorf("png: compress raw profile: %w", err)
+	}
+	if err := zw.Close(); err != nil {
+		return nil, false, fmt.Errorf("png: compress raw profile: %w", err)
+	}
+	return buf.Bytes(), true, nil
 }
