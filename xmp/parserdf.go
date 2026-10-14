@@ -204,6 +204,10 @@ type rdfParser struct {
 	topLen        int
 	seenNS        [8]string
 	nseen         int
+
+	// topSeen counts the top-level property nodes the documents offered,
+	// duplicates included (see parseRDFExtended).
+	topSeen int
 }
 
 // parseRDF parses the XMP document body b into x: it builds the element
@@ -782,6 +786,7 @@ func (p *rdfParser) addChildNode(parent int32, ns string, local, prefix []byte, 
 	}
 	if top {
 		parent = p.schemaFor(ns, prefix)
+		p.topSeen++
 	}
 	isArrayParent := p.t[parent].isArray()
 	isItem := ns == NSrdf && string(local) == "li"

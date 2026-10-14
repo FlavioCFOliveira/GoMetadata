@@ -40,6 +40,23 @@ func FuzzJPEGExtract(f *testing.F) {
 		f.Add(seed)
 	}
 
+	// Seeds: extended XMP whose standard packet writes HasExtendedXMP as a
+	// property element and as a property attribute (task #278).
+	{
+		ext := []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+			`<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:format>image/jpeg</dc:format>` +
+			`</rdf:Description></rdf:RDF></x:xmpmeta>`)
+		const guid = "04B9E48040A30A6308713BD1E4223B41"
+		for _, prop := range []string{
+			`><xmpNote:HasExtendedXMP>` + guid + `</xmpNote:HasExtendedXMP></rdf:Description>`,
+			` xmpNote:HasExtendedXMP="` + guid + `"/>`,
+		} {
+			main := []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+				`<rdf:Description rdf:about="" xmlns:xmpNote="http://ns.adobe.com/xmp/note/"` + prop + `</rdf:RDF></x:xmpmeta>`)
+			f.Add(buildExtendedXMPJPEG(main, guid, ext))
+		}
+	}
+
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic regardless of input.
 		// Extract signature: (rawEXIF, rawIPTC, rawXMP []byte, err error).

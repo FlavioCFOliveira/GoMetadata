@@ -370,18 +370,16 @@ func buildXMPResult(rawXMP []byte, extended map[string][]extChunk, extFullLens m
 		return xmpResult{rawXMP: rawXMP, rawXMPWire: wire, truncated: extTruncated}
 	}
 
-	// #123: Use xmp.Parse to merge the extended document into the main packet
-	// in a prefix-agnostic way. The extended XMP document is a full XMP packet
-	// that may bind the RDF namespace to any prefix (e.g. R:, RDF:); a literal
-	// string search for "<rdf:Description" would silently drop all properties
-	// when a non-canonical prefix is used. Parsing both packets and merging
-	// Properties maps handles all namespace prefix assignments correctly.
-	// Adobe XMP Specification Part 3 §1.1.4: the assembler must merge the
-	// extended properties into the main XMP packet.
+	// #123, #278: xmp.ParseExtended recomposes both documents into one XMP
+	// data model tree (Adobe XMP Specification Part 3 §1.1.3.1), resolving
+	// namespace prefixes by URI — the extended document may bind the RDF
+	// namespace to any prefix (e.g. R:, RDF:) — and keeping nested
+	// structures of the extended document intact.
 	//
-	// Fall back to the byte-splice reassembler when xmp.Parse fails on either
-	// packet (e.g. deeply malformed XML), so that the common "rdf:" prefix case
-	// is always served.
+	// Fall back to the byte-splice reassembler when either document cannot be
+	// parsed or the extended document holds no property (e.g. a bare
+	// rdf:Description fragment), so that the common "rdf:" prefix case is
+	// always served.
 	reassembled := reassembleExtendedXMPByParse(rawXMP, extBytes)
 	if reassembled == nil {
 		// xmp.Parse fallback: use the old byte-splice method.
@@ -1578,31 +1576,6 @@ func writeSegmentCopy(w io.Writer, marker byte, data []byte) error {
 	return writeHeaderedBuf(w, marker, bufPtr)
 }
 
-// extractGUIDFromMain locates the HasExtendedXMP attribute in the main XMP
-// packet and returns the 32-hex-character GUID value.
-// Returns ("", false) if the attribute is absent or malformed.
-func extractGUIDFromMain(main []byte) (guid string, ok bool) {
-	const marker = "HasExtendedXMP"
-	// The GUID value follows the property name as either an attribute
-	// (HasExtendedXMP="<GUID>") or element content (HasExtendedXMP><GUID></...).
-	// In both cases we scan past up to 5 bytes for the opening quote character.
-	_, rest, found := bytes.Cut(main, []byte(marker))
-	if !found {
-		return "", false
-	}
-	qi := bytes.IndexAny(rest, `"'`)
-	if qi < 0 || qi > 5 {
-		return "", false
-	}
-	quote := rest[qi]
-	rest = rest[qi+1:]
-	end := bytes.IndexByte(rest, quote)
-	if end != 32 { // GUID must be exactly 32 hex characters
-		return "", false
-	}
-	return string(rest[:32]), true
-}
-
 // isAllHex reports whether b consists entirely of ASCII hex digits (0-9, a-f, A-F).
 // Used to validate the 32-character GUID in extended XMP APP1 segments.
 // Adobe XMP Specification Part 3 §1.1.4: GUID is a 32-character uppercase hex string.
@@ -1688,53 +1661,30 @@ func mergeExtendedChunksValidated(chunks []extChunk, declaredTotal uint64, hasDe
 	return extBytes, true
 }
 
-// reassembleExtendedXMPByParse merges the extended XMP document into the main
-// XMP packet using xmp.Parse for prefix-agnostic property extraction.
+// reassembleExtendedXMPByParse recomposes the standard XMP packet mainBytes
+// and the extended XMP serialisation extBytes into one XMP packet.
 //
-// Adobe XMP Specification Part 3 §1.1.4: after assembling the extended payload
-// the reader must merge its properties into the main packet. The extended packet
-// is a full XMP document that may use any namespace prefix binding (not
-// necessarily "rdf:"); a literal string search for "<rdf:Description" fails
-// silently when a non-canonical prefix is used. This function parses both
-// documents with xmp.Parse and merges the Properties maps, which is correct
-// regardless of prefix assignment. (#123)
+// Adobe XMP Specification Part 3 §1.1.3.1: "A JPEG reader must recompose the
+// StandardXMP and ExtendedXMP into a single data model tree containing all of
+// the XMP for the JPEG file, and remove the xmpNote:HasExtendedXMP property."
+// xmp.ParseExtended builds that tree — nested structures, qualifiers and
+// array forms of the extended portion included (task #278) — and resolves
+// namespace prefixes by URI, so any prefix binding of the rdf namespace works
+// (#123). A top-level property present in both portions takes the extended
+// value, as a whole property, as the Adobe XMP Toolkit does
+// (XMPUtils::MergeFromJPEG).
 //
-// Merge policy: properties already present in main are not overwritten (main
-// wins on conflict), consistent with Adobe XMP Specification Part 3 §1.1.4
-// which states that the extended packet extends rather than replaces the main.
-//
-// Returns nil when either packet fails to parse OR when the extended packet
-// yields no properties after parsing. The latter case means extBytes is not a
-// proper full-XMP packet (e.g. it is a raw RDF fragment); the caller must fall
-// back to the byte-splice reassembler, which handles such fragments correctly.
+// Returns nil when either document cannot be parsed or when the extended
+// document holds no property — for example a bare rdf:Description fragment
+// that relies on the namespace declarations of the main packet. The caller
+// then falls back to the byte-splice reassembler, which handles such
+// fragments.
 func reassembleExtendedXMPByParse(mainBytes, extBytes []byte) []byte {
-	mainXMP, err := xmppkg.Parse(mainBytes)
+	x, err := xmppkg.ParseExtended(mainBytes, extBytes)
 	if err != nil {
 		return nil
 	}
-	extXMP, err := xmppkg.Parse(extBytes)
-	if err != nil {
-		return nil
-	}
-	// If the extended packet parsed but carries no properties, it is most likely
-	// not a proper full XMP document (e.g. a raw rdf:Description fragment that
-	// xmp.Parse accepted without error due to its lenient parser). Signal the
-	// caller to use the byte-splice fallback, which handles RDF fragments.
-	if len(extXMP.Properties) == 0 {
-		return nil
-	}
-
-	// Merge: add extended properties that are absent from the main packet.
-	// main wins on conflict (Adobe XMP Spec Part 3 §1.1.4).
-	for ns, props := range extXMP.Properties {
-		for local, val := range props {
-			if mainXMP.Get(ns, local) == "" {
-				mainXMP.Set(ns, local, val)
-			}
-		}
-	}
-
-	encoded, err := xmppkg.Encode(mainXMP)
+	encoded, err := xmppkg.Encode(x)
 	if err != nil {
 		return nil
 	}
@@ -1749,7 +1699,11 @@ func reassembleExtendedXMPByParse(mainBytes, extBytes []byte) []byte {
 // function locates that GUID, sorts the matching chunks by their byte offset,
 // concatenates their data into a complete extended XMP document, and splices
 // the inner rdf:Description elements from that document into the main packet
-// immediately before its closing </rdf:RDF> tag.
+// before its first rdf:Description element (or, without one, before its
+// closing </rdf:RDF> tag). The parser keeps the first occurrence of a
+// property, so the extended value of a property that both portions carry
+// wins, as in xmp.ParseExtended and XMPUtils::MergeFromJPEG of the Adobe XMP
+// Toolkit (task #278).
 //
 // If any step fails (missing marker, GUID not found, malformed packet) the
 // function returns main unchanged — graceful degradation is required because
@@ -1777,16 +1731,21 @@ func reassembleExtendedXMP(main []byte, extended map[string][]extChunk) []byte {
 	}
 	extraDescs := extBytes[descStart:closeRDFExt]
 
-	// Splice extraDescs into main immediately before its </rdf:RDF> close tag.
+	// Splice extraDescs into main before its first rdf:Description, so that
+	// the extended properties come first, or before its </rdf:RDF> close tag.
 	mainCloseRDF := bytes.LastIndex(main, []byte("</rdf:RDF>"))
 	if mainCloseRDF < 0 {
 		return main
 	}
+	at := mainCloseRDF
+	if first := bytes.Index(main, []byte("<rdf:Description")); first >= 0 && first < mainCloseRDF {
+		at = first
+	}
 
 	result := make([]byte, 0, len(main)+len(extraDescs))
-	result = append(result, main[:mainCloseRDF]...)
+	result = append(result, main[:at]...)
 	result = append(result, extraDescs...)
-	result = append(result, main[mainCloseRDF:]...)
+	result = append(result, main[at:]...)
 	return result
 }
 

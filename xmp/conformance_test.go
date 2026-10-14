@@ -1083,6 +1083,20 @@ func TestConformanceJPEG04to08(t *testing.T) {
 		}
 	})
 
+	t.Run("JPEG-08/extended-value-wins", func(t *testing.T) {
+		t.Parallel()
+		// Adobe XMP Toolkit XMPUtils::MergeFromJPEG: a top-level property
+		// present in both portions takes the extended value.
+		std := xmpDoc(`<rdf:Description rdf:about="" xmlns:tiff="http://ns.adobe.com/tiff/1.0/" tiff:Model="JPEG08standard"/>`)
+		ext := xmpDoc(`<rdf:Description rdf:about="" xmlns:tiff="http://ns.adobe.com/tiff/1.0/" tiff:Model="JPEG08extended"/>`)
+		x, err := ParseExtended(std, ext)
+		if err != nil {
+			t.Fatalf("JPEG-08: ParseExtended: %v", err)
+		}
+		if x.CameraModel() != "JPEG08extended" {
+			t.Errorf("JPEG-08: CameraModel=%q, want the extended value", x.CameraModel())
+		}
+	})
 }
 
 // TestConformance_TIFF-01 verifies XMP stored in TIFF tag 700 (0x02BC).

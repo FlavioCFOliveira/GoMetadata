@@ -79,9 +79,11 @@ for cross-checking only).
   `XMPFiles/source/FormatSupport/PSIR_MemoryReader.cpp` (`PSIR_MemoryReader::ParseMemoryResources`),
   `XMPFiles/source/FormatSupport/PSIR_FileWriter.cpp` (`PSIR_FileWriter::ParseMemoryResources`, duplicate-resource
   policy), `XMPFiles/source/FormatSupport/ReconcileIPTC.cpp` (`ComputeIPTCDigest`, `SetIPTCDigest`),
-  `XMPFiles/source/FileHandlers/TIFF_Handler.cpp` (`TIFF_MetaHandler::ProcessXMP`)
+  `XMPFiles/source/FileHandlers/TIFF_Handler.cpp` (`TIFF_MetaHandler::ProcessXMP`);
+  `XMPFiles/source/FileHandlers/JPEG_Handler.cpp` (`JPEG_MetaHandler::ProcessXMP`), `XMPCore/source/XMPUtils.cpp`
+  (`XMPUtils::MergeFromJPEG`)
 - Destination files: `xmp/namespace_toolkit.go`, `xmp/namespace_toolkit_test.go`; `xmp/parserdf.go`, `xmp/tree.go`,
-  `xmp/serialize.go`, `xmp/xmlscan.go`; `internal/irb/irb.go`, `internal/tiffscan/tiffscan.go`
+  `xmp/serialize.go`, `xmp/xmlscan.go`; `internal/irb/irb.go`, `internal/tiffscan/tiffscan.go`; `xmp/extended.go`
 - Adapted: yes (namespace URIs, prefixes and alias definitions, transcribed to Go tables; the Photoshop image resource
   walk, the MD5 IPTC digest computation and check, and the TIFF IPTC source precedence of tag 0x83BB over tag 0x8649,
   re-implemented in Go; the duplicate-resource policy — first resource of an ID wins, a later non-empty one replaces
@@ -89,7 +91,8 @@ for cross-checking only).
   the XMP data model tree and its RDF parser and serialiser — the recursive descent over the RDF/XML grammar with every
   property element form, the duplicate and placement checks, the qualifier ordering, the rdf:value fix-up, and the
   verbose (rdf:parseType="Resource") form of each node — re-implemented in Go over an index-linked node list; the
-  compatibility mapping of an unqualified about/ID attribute of rdf:Description)
+  compatibility mapping of an unqualified about/ID attribute of rdf:Description; the recomposition of the standard and
+  extended XMP of a JPEG file into one tree without xmpNote:HasExtendedXMP)
 - Notes: the source files carry the header "Adobe permits you to use, modify, and distribute
   this file in accordance with the terms of the Adobe license agreement accompanying it",
   while the repository root `LICENSE` is the BSD 3-Clause licence. The accompanying licence
@@ -106,7 +109,10 @@ for cross-checking only).
   rejected; rdf:nodeID references and their blank-node descriptions are kept verbatim
   instead of being ignored; and alternative-text arrays are written in document order
   instead of moving x-default first (see the headers of `xmp/parserdf.go` and
-  `xmp/serialize.go`).
+  `xmp/serialize.go`). The extended XMP of a JPEG file differs from the Toolkit in this point: the two
+  portions are parsed into one tree, the extended serialisation first, so that a property present in both takes the
+  extended value as `XMPUtils::MergeFromJPEG` gives it, but the extended properties precede the standard ones in their
+  schema (see the header of `xmp/extended.go`).
 
 ## libavif
 

@@ -30,7 +30,8 @@ const (
 	//
 	// Earlier releases of this package used the URI
 	// "http://ns.adobe.com/xap/1.0/se/Note/". Packets that use it still
-	// parse: namespaces are matched by URI.
+	// parse: namespaces are matched by URI, and ParseExtended removes
+	// HasExtendedXMP in both namespaces.
 	NSxmpNote = "http://ns.adobe.com/xmp/note/"
 	// NSgeo is the W3C Basic Geo vocabulary namespace for GPS coordinates.
 	// W3C Geo 2003/01: http://www.w3.org/2003/01/geo/wgs84_pos#

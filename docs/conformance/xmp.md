@@ -72,7 +72,7 @@ are used verbatim as Go sub-test names. 67 rules total.
 - **JPEG-05** ExtendedXMP header after id = 32 ASCII hex GUID + uint32 BE fullLength + uint32 BE offset.
 - **JPEG-06** GUID = MD5 of full extended XMP = value of `xmpNote:HasExtendedXMP` in standard packet; validate before reassembly.
 - **JPEG-07** Reassembly validates: same GUID, same fullLength, Σ chunk lengths = fullLength, no dup/overlap offsets; incomplete → error.
-- **JPEG-08** Merge extended `rdf:Description` into primary model without duplicating standard props.
+- **JPEG-08** Merge extended `rdf:Description` into primary model without duplicating props; a top-level property present in both portions takes the extended value as a whole (Adobe XMP Toolkit `XMPUtils::MergeFromJPEG`).
 
 ### 3.2 TIFF — XMP Part 3 §1.3
 - **TIFF-01** XMP in tag 700 (`0x02BC`); type BYTE(1) or UNDEFINED(7); accept both, write BYTE.

@@ -157,6 +157,30 @@ const maxXMPDocumentBytes = 16 << 20 // 16 MiB
 // Parse rejects inputs larger than maxXMPDocumentBytes (16 MiB) after
 // UTF-8 normalisation to prevent O(n) parsing of pathological documents.
 func Parse(b []byte) (*XMP, error) {
+	body, err := documentBody(b)
+	if err != nil {
+		return nil, err
+	}
+
+	x := &XMP{Properties: make(map[string]map[string]string, 8)}
+
+	// body is read directly (transient, read-only, synchronous-only; see
+	// transientAliasString's doc) and is NEVER retained by x. parseRDF sizes
+	// x.arena once, from the content it decides to keep (see finish in
+	// project.go), so the arena does not scale with comments, padding or
+	// other content that is scanned but not stored.
+	if err := parseRDF(body, x); err != nil {
+		return nil, err
+	}
+
+	return x, nil
+}
+
+// documentBody returns the part of b that Parse reads: b normalised to
+// UTF-8 (XMP Part 1 §7.2), limited to maxXMPDocumentBytes, and reduced to
+// the XMP packet when b carries a <?xpacket?> wrapper (XMP Part 1 §7.3);
+// without a wrapper the whole input is the document body.
+func documentBody(b []byte) ([]byte, error) {
 	if len(b) == 0 {
 		return nil, ErrEmptyInput
 	}
@@ -175,25 +199,10 @@ func Parse(b []byte) (*XMP, error) {
 		return nil, ErrDocumentTooLarge
 	}
 
-	x := &XMP{Properties: make(map[string]map[string]string, 8)}
-
-	// Locate the XMP packet; if no wrapper is found, treat the whole input
-	// as the RDF body (XMP §7.3).
-	body := Scan(normalised)
-	if body == nil {
-		body = normalised
+	if body := Scan(normalised); body != nil {
+		return body, nil
 	}
-
-	// body is read directly (transient, read-only, synchronous-only; see
-	// transientAliasString's doc) and is NEVER retained by x. parseRDF sizes
-	// x.arena once, from the content it decides to keep (see finish in
-	// project.go), so the arena does not scale with comments, padding or
-	// other content that is scanned but not stored.
-	if err := parseRDF(body, x); err != nil {
-		return nil, err
-	}
-
-	return x, nil
+	return normalised, nil
 }
 
 // Encode serialises x to a padded XMP packet ready for embedding in a
