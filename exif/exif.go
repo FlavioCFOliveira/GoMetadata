@@ -228,14 +228,17 @@ func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseCon
 		makerNoteOffset64 = mn.rawOffset
 		makerNoteOffset = uint32(mn.rawOffset) //nolint:gosec // G115: classic TIFF offsets always fit uint32
 		if !cfg.skipMakerNote {
+			// task #202: zero-alloc dispatch — pass raw IFDEntry.Value bytes to
+			// makerNoteDispatch so the NUL+whitespace trim and detection operate
+			// on []byte with no heap string allocation.
+			// Task #304: detection is by MakerNote signature first, so a missing
+			// Make no longer skips dispatch (Apple, Epson, ... write signed notes).
+			// EXIF §4.6.4 tag 0x010F (Make); EXIF §4.6.5 tag 0x927C (MakerNote).
+			var makeValue []byte
 			if makeEntry := ifd0.Get(TagMake); makeEntry != nil {
-				// task #202: zero-alloc dispatch — pass raw IFDEntry.Value bytes to
-				// makerNoteDispatch so the NUL+whitespace trim and map lookup operate
-				// on []byte with no heap string allocation. The Go compiler elides the
-				// string([]byte) heap copy when it appears directly as a map key.
-				// EXIF §4.6.4 tag 0x010F (Make); EXIF §4.6.5 tag 0x927C (MakerNote).
-				makerNoteIFD = makerNoteDispatch(makeEntry.Value, order, mn.Value)
+				makeValue = makeEntry.Value
 			}
+			makerNoteIFD = makerNoteDispatch(makeValue, order, mn.Value)
 		}
 	}
 
@@ -314,18 +317,19 @@ func parseExifSubIFDsBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *p
 		makerNoteOffset64 = mn.rawOffset
 		makerNoteOffset = uint32(mn.rawOffset & 0xFFFF_FFFF) // backward compat: lower 32 bits only; callers needing full offset use MakerNoteOffset64
 		if !cfg.skipMakerNote {
+			// task #202: zero-alloc dispatch — same pattern as the classic TIFF path.
+			// makerNoteDispatch trims NULs+whitespace from the raw Make bytes and
+			// detects the layout (signature first, task #304) without allocating.
+			// parseMakerNoteIFD uses the classic-TIFF traversal internally; for
+			// BigTIFF containers the MakerNote blob is still a classic-TIFF
+			// fragment so this is correct IF the MakerNote itself is a plain IFD.
+			// On failure (e.g. Nikon encrypted notes) the result is nil — safe.
+			// EXIF §4.6.4 tag 0x010F (Make); BigTIFF spec §2; task #202.
+			var makeValue []byte
 			if makeEntry := ifd0.Get(TagMake); makeEntry != nil {
-				// task #202: zero-alloc dispatch — same pattern as the classic TIFF path.
-				// makerNoteDispatch trims NULs+whitespace from the raw Make bytes and
-				// performs a string([]byte)-keyed map lookup that the Go compiler
-				// special-cases to avoid heap allocation (cmd/compile mapaccess2_faststr).
-				// parseMakerNoteIFD uses the classic-TIFF traversal internally; for
-				// BigTIFF containers the MakerNote blob is still a classic-TIFF
-				// fragment so this is correct IF the MakerNote itself is a plain IFD.
-				// On failure (e.g. Nikon encrypted notes) the result is nil — safe.
-				// EXIF §4.6.4 tag 0x010F (Make); BigTIFF spec §2; task #202.
-				makerNoteIFD = makerNoteDispatch(makeEntry.Value, order, mn.Value)
+				makeValue = makeEntry.Value
 			}
+			makerNoteIFD = makerNoteDispatch(makeValue, order, mn.Value)
 		}
 	}
 

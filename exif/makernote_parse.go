@@ -6,41 +6,12 @@ import (
 	"strings"
 )
 
-// makerNoteParsers maps EXIF Make strings to their MakerNote IFD parser.
-// Each value is a function that takes the raw MakerNote bytes and the parent
-// byte order and returns the parsed IFD, or nil on failure.
-//
-//nolint:gochecknoglobals // dispatch table: package-level read-only map populated at init and never mutated
-var makerNoteParsers = map[string]func([]byte, binary.ByteOrder) *IFD{
-	"Canon":                   parseCanonMakerNote,
-	"NIKON CORPORATION":       func(b []byte, _ binary.ByteOrder) *IFD { return parseNikonMakerNote(b) },
-	"Nikon":                   func(b []byte, _ binary.ByteOrder) *IFD { return parseNikonMakerNote(b) },
-	"SONY":                    parseSonyMakerNote,
-	"FUJIFILM":                func(b []byte, _ binary.ByteOrder) *IFD { return parseFujifilmMakerNote(b) },
-	"OLYMPUS IMAGING CORP.":   func(b []byte, _ binary.ByteOrder) *IFD { return parseOlympusMakerNote(b) },
-	"OLYMPUS CORPORATION":     func(b []byte, _ binary.ByteOrder) *IFD { return parseOlympusMakerNote(b) },
-	"Olympus":                 func(b []byte, _ binary.ByteOrder) *IFD { return parseOlympusMakerNote(b) },
-	"PENTAX Corporation":      func(b []byte, _ binary.ByteOrder) *IFD { return parsePentaxMakerNote(b) },
-	"Ricoh":                   func(b []byte, _ binary.ByteOrder) *IFD { return parsePentaxMakerNote(b) },
-	"RICOH":                   func(b []byte, _ binary.ByteOrder) *IFD { return parsePentaxMakerNote(b) },
-	"Panasonic":               func(b []byte, _ binary.ByteOrder) *IFD { return parsePanasonicMakerNote(b) },
-	"LEICA CAMERA AG":         parseLeicaMakerNote,
-	"Leica Camera AG":         parseLeicaMakerNote,
-	"LEICA":                   parseLeicaMakerNote,
-	"Leica":                   parseLeicaMakerNote,
-	"DJI":                     parseDJIMakerNote,
-	"SAMSUNG":                 parseSamsungMakerNote,
-	"SIGMA":                   func(b []byte, _ binary.ByteOrder) *IFD { return parseSigmaMakerNote(b) },
-	"CASIO COMPUTER CO.,LTD.": parseCasioMakerNote,
-	"Casio Computer Co.,Ltd.": parseCasioMakerNote,
-	"CASIO":                   parseCasioMakerNote,
-}
-
 // parseMakerNoteIFD attempts to parse the raw MakerNote bytes into an IFD.
 // Returns nil when the format is unrecognised or parsing fails.
 //
-// cameraMake is trimmed of leading/trailing whitespace before the dispatch
-// table lookup. Real-world camera files (e.g. Canon EOS bodies) sometimes
+// The layout is detected from the MakerNote signature first and from cameraMake
+// second (detectMakerNote, task #304). cameraMake is trimmed of
+// leading/trailing whitespace before detection. Real-world camera files (e.g. Canon EOS bodies) sometimes
 // store the Make field with a trailing space ("Canon "); trimming aligns
 // our behaviour with ExifTool's MakerNote dispatch logic.
 //
@@ -60,6 +31,12 @@ var makerNoteParsers = map[string]func([]byte, binary.ByteOrder) *IFD{
 //   - Samsung: plain IFD at offset 0, parent byte order
 //   - Sigma: "SIGMA\0\0\0" or "FOVEON\0\0" prefix, LE IFD at offset 10
 //   - Casio: plain IFD at offset 0, parent byte order
+//
+// Detected by signature or Make family since task #304 (see
+// makernote_detect.go): Olympus "OLYMP\0"/Epson/Agfa (IFD at 8), "OM SYSTEM",
+// Nikon Type 1 header, "SONY CAM"/"SONY DSC", "SEMC MS", Kyocera, Sanyo,
+// Ricoh, "Apple iOS" and Minolta; Kodak and Reconyx are recognised but are
+// binary layouts without an IFD.
 //
 // Arena exclusion (task #198, performance audit 2026-06-10):
 // The per-Parse lazy sub-IFD arena (parseArena in Parse) does NOT extend to
@@ -91,8 +68,8 @@ func parseMakerNoteIFD(b []byte, cameraMake string, parentOrder binary.ByteOrder
 	// Make values with trailing spaces. ExifTool normalises the value before its
 	// own MakerNote dispatch; we do the same to avoid silent dispatch failures.
 	trimmed := strings.TrimSpace(cameraMake)
-	if fn, ok := makerNoteParsers[trimmed]; ok {
-		return fn(b, parentOrder)
+	if parse := mnLayouts[detectLayout(b, trimmed)].parse; parse != nil {
+		return parse(b, parentOrder)
 	}
 	return nil
 }
@@ -105,11 +82,10 @@ func parseMakerNoteIFD(b []byte, cameraMake string, parentOrder binary.ByteOrder
 //   - bytes.TrimRight(makeValue, "\x00")  ≡ (*IFDEntry).String()'s NUL stripping
 //   - bytes.TrimSpace(…)                  ≡ strings.TrimSpace applied inside parseMakerNoteIFD
 //
-// The map[string]V lookup with string([]byte) is a compiler-recognised pattern
-// (cmd/compile mapaccess2_faststr): the Go compiler elides the heap allocation
-// when string([]byte) appears directly as a map key expression.  This is why
-// makeValue must reach the lookup as a []byte sub-slice, not a pre-built string.
-// Confirmed no-alloc with go test -gcflags='-m' (see task #202 evidence).
+// Detection (detectMakerNote) works on the []byte directly through generic
+// ASCII-fold helpers, so no string is built and nothing is allocated; this
+// replaces the string([]byte) map-key idiom of task #202 and is covered by
+// TestMakerNoteDispatchZeroAllocLookup.
 //
 // The trimmed slice is transient and never retained beyond this call, so there
 // is no aliasing risk with the task-#198 parse arena or the task-#240 entry pool.
@@ -127,17 +103,13 @@ func makerNoteDispatch(makeValue []byte, parentOrder binary.ByteOrder, makerNote
 	// space before NUL) in real-world files; this ensures those files dispatch
 	// correctly. bytes.TrimSpace returns a sub-slice (zero allocation).
 	raw = bytes.TrimSpace(raw)
-	if len(raw) == 0 {
-		return nil
-	}
-	// Zero-alloc map lookup: the Go compiler (cmd/compile mapaccess2_faststr)
-	// special-cases map[string]V lookups where the key expression is string([]byte)
-	// — it reads the map bucket using the slice's backing array as a temporary string
-	// without heap-allocating. This is only guaranteed when string(raw) appears
-	// directly as the index expression, not when stored in a string variable first.
-	// EXIF §4.6.4 tag 0x010F; task #202.
-	if fn, ok := makerNoteParsers[string(raw)]; ok {
-		return fn(makerNote, parentOrder)
+	// Task #304: detection is by MakerNote signature first, Make family second
+	// (see detectMakerNote), so an empty or unknown Make no longer disables a
+	// signed MakerNote. Detection works on the []byte directly and allocates
+	// nothing (the former string([]byte) map-key idiom of task #202 is not
+	// needed any more).
+	if parse := mnLayouts[detectLayout(makerNote, raw)].parse; parse != nil {
+		return parse(makerNote, parentOrder)
 	}
 	return nil
 }
@@ -376,8 +348,11 @@ func parsePentaxAOC(b []byte) *IFD {
 
 // parsePentaxPENTAX parses a Pentax PENTAX-format MakerNote.
 //
-// PENTAX format ("PENTAX \x00" prefix): byte order at [8..9], IFD at offset 12.
-// Used by older Samsung GX-series and early Pentax DSLRs (ExifTool Pentax.pm).
+// PENTAX format ("PENTAX \x00" prefix): byte order at [8..9], IFD at offset
+// 10, immediately after the byte-order mark. Used by Pentax K-1 Mark II, Q-S1
+// and Ricoh WG-series bodies (corpus files "Pentax K-1 Mark II.jpg",
+// "Pentax QS1.jpg", "Ricoh WG20.jpg": the entry count at offset 10 equals the
+// entry count ExifTool reports; task #304 corrected the former offset 12).
 func parsePentaxPENTAX(b []byte) *IFD {
 	// Audit finding #188: defence-in-depth guard; b[8] and b[9] would index
 	// out of range if len(b) < 10. The public caller (parsePentaxMakerNote)
@@ -395,7 +370,7 @@ func parsePentaxPENTAX(b []byte) *IFD {
 	default:
 		return nil
 	}
-	ifd, _, err := traverse(b, 12, order, nil, false)
+	ifd, _, err := traverse(b, 10, order, nil, false)
 	if err != nil {
 		return nil
 	}
@@ -409,7 +384,7 @@ func parsePentaxPENTAX(b []byte) *IFD {
 //   - AOC format ("AOC\x00" prefix): big-endian IFD at offset 6.
 //     Used by all modern K-series and 645-series DSLRs.
 //
-//   - PENTAX format ("PENTAX \x00" prefix): byte order at [8..9], IFD at 12.
+//   - PENTAX format ("PENTAX \x00" prefix): byte order at [8..9], IFD at 10.
 //     Used by older Samsung GX-series and early Pentax DSLRs.
 func parsePentaxMakerNote(b []byte) *IFD {
 	switch {

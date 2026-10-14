@@ -2054,10 +2054,10 @@ func TestParseMakerNoteIFD_PentaxPENTAX(t *testing.T) {
 	ifdEntries := buildPlainIFD(binary.LittleEndian, [][4]uint32{
 		{0x0001, uint32(TypeShort), 1, 1},
 	})
-	b := make([]byte, 12+len(ifdEntries))
+	b := make([]byte, 10+len(ifdEntries))
 	copy(b[0:], "PENTAX \x00")
 	b[8], b[9] = 'I', 'I' // LE
-	copy(b[12:], ifdEntries)
+	copy(b[10:], ifdEntries)
 
 	result := parseMakerNoteIFD(b, "Ricoh", binary.LittleEndian)
 	if result == nil {
