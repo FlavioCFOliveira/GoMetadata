@@ -239,6 +239,41 @@ When analysing existing problems, new features, or refactorings of existing feat
 
 ---
 
+## Reference Open-Source Projects
+
+This table maps each area of GoMetadata to the open-source projects to use as references, per the Open Source and Do Not Reinvent policies.
+
+GoMetadata is MIT-licensed, so only permissively licensed code (MIT, BSD, Apache-2.0, libpng, libtiff) may be copied or adapted, and every copyright and NOTICE requirement must be retained; GPL, LGPL, and Artistic-licensed projects may be used only for study and as differential-test oracles, never as a source of copied code.
+
+The projects listed below may be cloned locally so that their code can be used directly for whatever the work requires: reading, studying, copying, adapting, building, and running them as test oracles. Copying code from them remains subject to the licensing rule above, so only code from permissively licensed projects may be copied into GoMetadata. Local clones are working references only and must never be committed to this repository.
+
+| Area | Copy / adapt | Study / oracle |
+|---|---|---|
+| EXIF tag registry | [metadata-extractor], [libtiff] | [ExifTool], [Exiv2] |
+| MakerNote decoding | [evanoberholster/imagemeta], [metadata-extractor] | [ExifTool] |
+| MakerNote writing | — | [Exiv2], [ExifTool] |
+| IPTC in PNG / RAW | [Adobe XMP Toolkit SDK] | [Exiv2], [ExifTool] |
+| XMP and MWG reconciliation | [Adobe XMP Toolkit SDK] | [ExifTool] |
+| HEIF / AVIF writing | [libavif] | [libheif], [ExifTool] |
+| CR3 | [evanoberholster/imagemeta] | [lclevy canon_cr3], [ExifTool] |
+| WebP | [libwebp] | [Exiv2] |
+| PNG | [libpng] | [Exiv2] |
+| TIFF | [libtiff] | [Exiv2] |
+
+[metadata-extractor]: https://github.com/drewnoakes/metadata-extractor
+[libtiff]: https://gitlab.com/libtiff/libtiff
+[ExifTool]: https://github.com/exiftool/exiftool
+[Exiv2]: https://github.com/Exiv2/exiv2
+[evanoberholster/imagemeta]: https://github.com/evanoberholster/imagemeta
+[Adobe XMP Toolkit SDK]: https://github.com/adobe/XMP-Toolkit-SDK
+[libavif]: https://github.com/AOMediaCodec/libavif
+[libheif]: https://github.com/strukturag/libheif
+[lclevy canon_cr3]: https://github.com/lclevy/canon_cr3
+[libwebp]: https://chromium.googlesource.com/webm/libwebp
+[libpng]: https://github.com/pnggroup/libpng
+
+---
+
 ## Skills
 
 Use the following Claude Code skills for the corresponding operations:
