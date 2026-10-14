@@ -1082,6 +1082,21 @@ func TestConformanceJPEG04to08(t *testing.T) {
 			t.Errorf("JPEG-08: extended props lost; Copyright=%q", x.Copyright())
 		}
 	})
+
+	t.Run("JPEG-08/extended-value-wins", func(t *testing.T) {
+		t.Parallel()
+		// Adobe XMP Toolkit XMPUtils::MergeFromJPEG: a top-level property
+		// present in both portions takes the extended value.
+		std := xmpDoc(`<rdf:Description rdf:about="" xmlns:tiff="http://ns.adobe.com/tiff/1.0/" tiff:Model="JPEG08standard"/>`)
+		ext := xmpDoc(`<rdf:Description rdf:about="" xmlns:tiff="http://ns.adobe.com/tiff/1.0/" tiff:Model="JPEG08extended"/>`)
+		x, err := ParseExtended(std, ext)
+		if err != nil {
+			t.Fatalf("JPEG-08: ParseExtended: %v", err)
+		}
+		if x.CameraModel() != "JPEG08extended" {
+			t.Errorf("JPEG-08: CameraModel=%q, want the extended value", x.CameraModel())
+		}
+	})
 }
 
 // TestConformance_TIFF-01 verifies XMP stored in TIFF tag 700 (0x02BC).
@@ -1705,18 +1720,22 @@ func TestConformanceROB07(t *testing.T) {
 	t.Parallel()
 	t.Run("ROB-07", func(t *testing.T) {
 		t.Parallel()
-		x := mustParse(t, xmpDoc(
-			`<rdf:Description rdf:about=""`+
-				` xmlns:xmpNote="http://ns.adobe.com/xap/1.0/se/Note/"`+
-				` xmlns:tiff="http://ns.adobe.com/tiff/1.0/"`+
-				` tiff:Model="ROB07standard"`+
-				` xmpNote:HasExtendedXMP="deadbeefdeadbeefdeadbeefdeadbeef"/>`,
-		))
-		if x.CameraModel() != "ROB07standard" {
-			t.Errorf("ROB-07: standard content not returned; CameraModel=%q", x.CameraModel())
-		}
-		if x.Get(NSxmpNote, "HasExtendedXMP") == "" {
-			t.Error("ROB-07: HasExtendedXMP property missing")
+		// Task #315: NSxmpNote is the Toolkit URI; the URI that earlier
+		// releases wrote must still parse, under its own namespace.
+		for _, ns := range []string{NSxmpNote, nsXMPNoteLegacy} {
+			x := mustParse(t, xmpDoc(
+				`<rdf:Description rdf:about=""`+
+					` xmlns:xmpNote="`+ns+`"`+
+					` xmlns:tiff="http://ns.adobe.com/tiff/1.0/"`+
+					` tiff:Model="ROB07standard"`+
+					` xmpNote:HasExtendedXMP="deadbeefdeadbeefdeadbeefdeadbeef"/>`,
+			))
+			if x.CameraModel() != "ROB07standard" {
+				t.Errorf("ROB-07 %s: standard content not returned; CameraModel=%q", ns, x.CameraModel())
+			}
+			if x.Get(ns, "HasExtendedXMP") == "" {
+				t.Errorf("ROB-07 %s: HasExtendedXMP property missing", ns)
+			}
 		}
 	})
 }

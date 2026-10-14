@@ -7,7 +7,7 @@ metadata:
 
 CR2 write is un-gated as of task #95 (commit 561f5d8). CR2 uses standard LE TIFF magic and routes through `writeTIFF` + `relocateTIFFFromParsed`.
 
-**Why:** Canon MakerNotes use blob-relative (self-relative) offsets — verbatim blob copy is safe. Validated against real Canon EOS 350D (7.4 MB CR2): ImageDataHash IN==OUT, all MakerNote tags preserved.
+**Why (corrected 2026-10-14):** Canon MakerNote offsets are TIFF-relative, NOT blob-relative; since task #310 the CR2 path rebases them twice (re-encode delta, then +8 marker) and fixes the Canon footer. See [[project-makernote-ool-rebasing]].
 
 NEF write is un-gated as of task #102 (commit 7d34aa5). See [[project-nef-write-ungated]].
 

@@ -554,16 +554,16 @@ func TestEnumerateSubIFDsRejectsHugeCountFast(t *testing.T) {
 	buf := buildTinyTIFFWithHugeSubIFDCount(hugeCount)
 	e := &exif.EXIF{IFD0: &exif.IFD{}}
 
-	subIFDs, blocks, err := enumerateSubIFDs(buf, e, binary.LittleEndian, newImageBlockBudget(), uint64(len(buf)))
+	tree, blocks, err := enumerateSubIFDs(buf, e, binary.LittleEndian, newImageBlockBudget(), uint64(len(buf)))
 	if err == nil {
 		t.Fatalf("enumerateSubIFDs: expected error for Count=%d, got nil (subIFDs=%d blocks=%d)",
-			hugeCount, len(subIFDs), len(blocks))
+			hugeCount, len(tree.all), len(blocks))
 	}
 	if !errors.Is(err, ErrTooManyImageBlocks) {
 		t.Errorf("enumerateSubIFDs: error does not wrap ErrTooManyImageBlocks: %v", err)
 	}
-	if subIFDs != nil || blocks != nil {
-		t.Errorf("enumerateSubIFDs: expected nil results on error, got subIFDs=%d blocks=%d", len(subIFDs), len(blocks))
+	if tree.all != nil || tree.roots != nil || blocks != nil {
+		t.Errorf("enumerateSubIFDs: expected nil results on error, got subIFDs=%d blocks=%d", len(tree.all), len(blocks))
 	}
 }
 

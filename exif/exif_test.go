@@ -1976,14 +1976,14 @@ func TestParseMakerNoteIFD_SonyTooShort(t *testing.T) {
 // TestParseMakerNoteIFD_Fujifilm tests Fujifilm MakerNote parsing.
 func TestParseMakerNoteIFD_Fujifilm(t *testing.T) {
 	t.Parallel()
-	// Layout: "FUJIFILM"(8) + version(4) + ifdOffset(4=16) + IFD
+	// Layout: "FUJIFILM"(8) + ifdOffset(4=16) + filler(4) + IFD
 	ifdEntries := buildPlainIFD(binary.LittleEndian, [][4]uint32{
 		{0x1000, uint32(TypeShort), 1, 1},
 	})
 	b := make([]byte, 16+len(ifdEntries))
 	copy(b[0:], "FUJIFILM")
-	copy(b[8:], "0100")
-	binary.LittleEndian.PutUint32(b[12:], 16) // IFD starts at byte 16
+	binary.LittleEndian.PutUint32(b[8:], 16) // IFD starts at byte 16
+	copy(b[12:], "0100")
 	copy(b[16:], ifdEntries)
 
 	result := parseMakerNoteIFD(b, "FUJIFILM", binary.LittleEndian)
@@ -2054,10 +2054,10 @@ func TestParseMakerNoteIFD_PentaxPENTAX(t *testing.T) {
 	ifdEntries := buildPlainIFD(binary.LittleEndian, [][4]uint32{
 		{0x0001, uint32(TypeShort), 1, 1},
 	})
-	b := make([]byte, 12+len(ifdEntries))
+	b := make([]byte, 10+len(ifdEntries))
 	copy(b[0:], "PENTAX \x00")
 	b[8], b[9] = 'I', 'I' // LE
-	copy(b[12:], ifdEntries)
+	copy(b[10:], ifdEntries)
 
 	result := parseMakerNoteIFD(b, "Ricoh", binary.LittleEndian)
 	if result == nil {

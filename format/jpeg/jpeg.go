@@ -12,9 +12,7 @@ package jpeg
 
 import (
 	"bytes"
-	"crypto/rand"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
+	irbpkg "github.com/FlavioCFOliveira/GoMetadata/internal/irb"
 	xmppkg "github.com/FlavioCFOliveira/GoMetadata/xmp"
 )
 
@@ -45,9 +44,9 @@ var identXMP = []byte("http://ns.adobe.com/xap/1.0/\x00") //nolint:gochecknoglob
 // chunks. Adobe XMP Specification Part 3 §1.1.4.
 //
 // NOTE: this is the APP1 segment identifier ("http://ns.adobe.com/xmp/extension/\x00"),
-// which is distinct from the xmpNote namespace URI
-// ("http://ns.adobe.com/xap/1.0/se/Note/") used for the HasExtendedXMP property
-// inside the main XMP packet.  The two strings must never be confused.
+// which is distinct from the xmpNote namespace URI (xmp.NSxmpNote,
+// "http://ns.adobe.com/xmp/note/") of the HasExtendedXMP property inside the
+// main XMP packet. The two strings must never be confused.
 var identXMPNote = []byte("http://ns.adobe.com/xmp/extension/\x00") //nolint:gochecknoglobals // package-level constant bytes
 
 // identPS is the Photoshop 3.0 signature in APP13 (EXIF §4.5.6).
@@ -369,18 +368,16 @@ func buildXMPResult(rawXMP []byte, extended map[string][]extChunk, extFullLens m
 		return xmpResult{rawXMP: rawXMP, rawXMPWire: wire, truncated: extTruncated}
 	}
 
-	// #123: Use xmp.Parse to merge the extended document into the main packet
-	// in a prefix-agnostic way. The extended XMP document is a full XMP packet
-	// that may bind the RDF namespace to any prefix (e.g. R:, RDF:); a literal
-	// string search for "<rdf:Description" would silently drop all properties
-	// when a non-canonical prefix is used. Parsing both packets and merging
-	// Properties maps handles all namespace prefix assignments correctly.
-	// Adobe XMP Specification Part 3 §1.1.4: the assembler must merge the
-	// extended properties into the main XMP packet.
+	// #123, #278: xmp.ParseExtended recomposes both documents into one XMP
+	// data model tree (Adobe XMP Specification Part 3 §1.1.3.1), resolving
+	// namespace prefixes by URI — the extended document may bind the RDF
+	// namespace to any prefix (e.g. R:, RDF:) — and keeping nested
+	// structures of the extended document intact.
 	//
-	// Fall back to the byte-splice reassembler when xmp.Parse fails on either
-	// packet (e.g. deeply malformed XML), so that the common "rdf:" prefix case
-	// is always served.
+	// Fall back to the byte-splice reassembler when either document cannot be
+	// parsed or the extended document holds no property (e.g. a bare
+	// rdf:Description fragment), so that the common "rdf:" prefix case is
+	// always served.
 	reassembled := reassembleExtendedXMPByParse(rawXMP, extBytes)
 	if reassembled == nil {
 		// xmp.Parse fallback: use the old byte-splice method.
@@ -505,39 +502,13 @@ func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte, wantIPTC, wan
 }
 
 // parseIRBForIPTCAndDigest scans a single contiguous Photoshop IRB byte block
-// and returns both the 0x0404 IPTC-NAA data and the 0x0425 IPTC-Digest data.
-// Either return value may be nil when the corresponding resource is absent.
+// and returns the 0x0404 IPTC-NAA data and the 0x0425 IPTC-Digest data; the
+// shared parser lives in internal/irb. Either result may be nil.
 //
 // MWG §3.3.1: the 0x0425 resource carries the 16-byte MD5 of the raw 0x0404
 // IIM stream at the time XMP was last written.
 func parseIRBForIPTCAndDigest(b []byte) (iptcData, digestData []byte) {
-	pos := 0
-	for pos < len(b) {
-		resourceID, data, newPos, ok := parseIRBEntry(b, pos)
-		if !ok {
-			if newPos == pos {
-				pos++
-				continue
-			}
-			break
-		}
-		switch resourceID {
-		case 0x0404:
-			iptcData = data
-		case 0x0425:
-			// MWG §3.3.1: 0x0425 payload is exactly 16 bytes (MD5 digest).
-			// Tolerate malformed blocks: copy only if exactly 16 bytes.
-			if len(data) == 16 {
-				digestData = data
-			}
-		}
-		pos = newPos
-		// Apply even-padding to data block (Adobe IRB spec §"Image Resources").
-		if len(data)%2 != 0 {
-			pos++
-		}
-	}
-	return iptcData, digestData
+	return irbpkg.IPTCAndDigest(b)
 }
 
 // extractIPTCAndDigestFromIRBPayloads searches the concatenated Photoshop IRB
@@ -730,10 +701,11 @@ func writeEXIFSegment(w io.Writer, rawEXIF []byte) error {
 // When rawXMP begins with xmpWireMagic (a wire-frame encoding), the function
 // decodes the original main XMP and the assembled extended payload and writes
 // them using the passthrough path — main as a standard APP1, extended as
-// re-chunked extended APP1 segments — preserving semantic content without
-// repackaging into a new random-GUID stub. This ensures that round-trip
-// writes of unmodified extended XMP are byte-stable (same reassembled content
-// before and after).
+// re-chunked extended APP1 segments under the original GUID. This ensures
+// that round-trip writes of unmodified extended XMP are byte-stable (same
+// reassembled content before and after). Any other packet larger than one
+// segment is split by writeExtendedXMP, whose GUID is the MD5 digest of the
+// extended serialisation (task #295).
 func writeXMPSegments(w io.Writer, rawXMP []byte) error {
 	// Wire-frame passthrough: preserve original main+extended without regenerating GUID.
 	if main, ext, ok := decodeXMPWire(rawXMP); ok {
@@ -908,19 +880,7 @@ func writeIPTCSegment(w io.Writer, rawIPTC, origIRB []byte) error {
 // slice. Produces the same bytes as buildIRB without a single-use allocation
 // when dst already has spare capacity (#218).
 func appendIRBBlock(dst, iptcData []byte) []byte {
-	size := len(iptcData)
-	//nolint:gosec // G115: byte extraction from int size value; shifts are safe bit extractions
-	dst = append(dst,
-		'8', 'B', 'I', 'M', // 8BIM marker
-		0x04, 0x04, // resource ID 0x0404
-		0x00, 0x00, // empty pascal name (length 0 + padding byte)
-		byte(size>>24), byte(size>>16), byte(size>>8), byte(size), // data length
-	)
-	dst = append(dst, iptcData...)
-	if size%2 != 0 {
-		dst = append(dst, 0x00) // pad data to even boundary
-	}
-	return dst
+	return irbpkg.AppendBlock(dst, irbpkg.ResourceIPTC, iptcData)
 }
 
 // buildIRB wraps a raw IPTC IIM stream in a minimal Photoshop IRB block
@@ -934,74 +894,15 @@ func buildIRB(iptcData []byte) []byte {
 // appendSplicedIRB appends to dst an IRB byte sequence identical to origIRB
 // except the 0x0404 (IPTC-NAA) resource block is replaced with a freshly
 // built block wrapping newIPTCData; every other 8BIM block is copied
-// verbatim in its original order and with its original padding. Returns the
-// extended slice.
-//
-// When newIPTCData is nil the 0x0404 block is removed rather than replaced.
-// All sibling resources are preserved in both cases. This behaviour is
-// required by #174: a nil rawIPTC to Inject must strip only the IPTC data
-// while keeping Photoshop siblings such as the 0x0425 digest resource.
-//
-// If origIRB contains no 0x0404 block and newIPTCData is non-nil, the new
-// block is appended at the end.
-//
-// EXIF §4.5.6: each 8BIM block is 4 ('8BIM') + 2 (ID) + pascal-name + 4 (size)
-// + data [+ 1 padding if data size is odd].
+// verbatim. When newIPTCData is nil the 0x0404 block is removed and all
+// siblings survive (#174). A 16-byte 0x0425 digest already present is
+// refreshed to the MD5 of newIPTCData when newIPTCData is non-nil (#284); see
+// irbpkg.AppendSpliced for the full semantics.
 //
 // #218: appends directly onto the caller's buffer (typically a pooled
-// segment buffer) instead of allocating a new one, eliminating the
-// single-use intermediate that spliceIPTCIntoIRB otherwise requires.
+// segment buffer) instead of allocating a new one.
 func appendSplicedIRB(dst, origIRB, newIPTCData []byte) []byte {
-	replaced := false
-	pos := 0
-	for pos < len(origIRB) {
-		entryStart := pos
-		resourceID, data, newPos, ok := parseIRBEntry(origIRB, pos)
-		if !ok {
-			if newPos == pos {
-				// Signature mismatch: advance one byte (scan-forward miss).
-				pos++
-				continue
-			}
-			// Structural failure: stop processing; emit what we have so far.
-			break
-		}
-
-		// Compute the end of the full encoded block including even-padding.
-		// We use the raw bytes from origIRB directly rather than re-encoding,
-		// preserving non-standard pascal names, reserved fields, etc.
-		blockEnd := newPos
-		if len(data)%2 != 0 {
-			blockEnd++ // skip the even-padding byte
-		}
-
-		if resourceID == 0x0404 {
-			// Replace the IPTC block with a freshly built one, or drop it
-			// entirely when newIPTCData is nil (strip-only mode).
-			if newIPTCData != nil {
-				dst = appendIRBBlock(dst, newIPTCData)
-			}
-			replaced = true
-		} else {
-			// Copy the block verbatim — 8BIM header + data + any padding byte.
-			// blockEnd is bounded by origIRB length (validated inside parseIRBEntry).
-			if blockEnd > len(origIRB) {
-				blockEnd = len(origIRB)
-			}
-			dst = append(dst, origIRB[entryStart:blockEnd]...)
-		}
-
-		pos = blockEnd
-	}
-
-	if !replaced && newIPTCData != nil {
-		// No 0x0404 block was found in the original IRB and we have a
-		// replacement: append the new one at the end. When newIPTCData is
-		// nil (remove-only mode) there is nothing to append; dst already
-		// holds the siblings-only result.
-		dst = appendIRBBlock(dst, newIPTCData)
-	}
-	return dst
+	return irbpkg.AppendSpliced(dst, origIRB, newIPTCData)
 }
 
 // spliceIPTCIntoIRB returns a new IRB byte slice built by appendSplicedIRB;
@@ -1445,199 +1346,16 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	return copyNonMetadataSegments(cr, w, scratch, preserveUnknownSegments)
 }
 
-// writeExtendedXMP splits rawXMP across a main APP1 and one or more extended
-// APP1 segments, per Adobe XMP Specification Part 3 §1.1.4.
-//
-// Strategy:
-//  1. Generate a random 32-hex-character GUID via crypto/rand.
-//  2. Build a minimal "main" XMP document that contains only the
-//     xmpNote:HasExtendedXMP property set to the GUID. This document is
-//     guaranteed to be far smaller than the 65504-byte limit.
-//  3. Write the main XMP as a standard APP1 segment.
-//  4. Write rawXMP verbatim as the extended payload, split into chunks of at
-//     most maxExtChunkSize bytes. Each chunk becomes one extended APP1 segment.
-//
-// The xmpNote namespace URI is http://ns.adobe.com/xap/1.0/se/Note/ per the
-// Adobe XMP Specification Part 3 §1.1.4.
-func writeExtendedXMP(w io.Writer, rawXMP []byte) error {
-	// Step 1: generate GUID.
-	var guidRaw [16]byte
-	if _, err := rand.Read(guidRaw[:]); err != nil {
-		return fmt.Errorf("jpeg: extended XMP: generate GUID: %w", err)
-	}
-	guid := hex.EncodeToString(guidRaw[:]) // 32 hex characters
-
-	// Step 2: build the minimal main XMP document.
-	// The document is a self-contained, valid XMP packet that carries only the
-	// xmpNote:HasExtendedXMP attribute. Readers merge the extended payload on
-	// top of this stub. The literal template is faster and simpler than
-	// invoking the xmp package from the format layer.
-	//
-	// xmpNote namespace: http://ns.adobe.com/xap/1.0/se/Note/ (XMP Spec Part 3 §1.1.4)
-	mainXMP := []byte(
-		`<?xpacket begin="` + "\xef\xbb\xbf" + `" id="W5M0MpCehiHzreSzNTczkc9d"?>` +
-			`<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="GoMetadata">` +
-			`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
-			`<rdf:Description rdf:about=""` +
-			` xmlns:xmpNote="http://ns.adobe.com/xap/1.0/se/Note/"` +
-			` xmpNote:HasExtendedXMP="` + guid + `"/>` +
-			`</rdf:RDF></x:xmpmeta>` +
-			`<?xpacket end="w"?>`,
-	)
-	if len(mainXMP) > maxXMPPayload {
-		// This cannot happen in practice — the template is ~200 bytes — but
-		// guard defensively so the error is actionable rather than silent.
-		return fmt.Errorf("jpeg: extended XMP: main XMP stub (%d bytes) exceeds APP1 limit: %w", len(mainXMP), ErrXMPStubTooLarge)
-	}
-
-	// Step 3: write main APP1. #216: header + prefix + stub built in one
-	// pooled buffer, one w.Write.
-	bufPtr := iobuf.Get(segHeaderSize + len(identXMP) + len(mainXMP))
-	b := *bufPtr
-	copy(b[segHeaderSize:], identXMP)
-	copy(b[segHeaderSize+len(identXMP):], mainXMP)
-	if err := writeHeaderedBuf(w, markerAPP1, bufPtr); err != nil {
-		return err
-	}
-
-	// Step 4: split rawXMP into extended APP1 chunks.
-	return writeExtendedChunks(w, []byte(guid), rawXMP)
-}
-
-// skipPascalString advances pos past a Pascal-string name field in a
-// Photoshop IRB entry. The field is 1-byte length + length bytes of name,
-// padded to an even total. Returns (newPos, true) on success or (pos+1, false)
-// when the buffer is too short. EXIF §4.5.6.
-func skipPascalString(b []byte, pos int) (int, bool) {
-	if pos >= len(b) {
-		return pos + 1, false
-	}
-	nameLen := int(b[pos])
-	pos++ // consume length byte
-	pos += nameLen
-	// Bounds check after advancing by nameLen: a crafted/corrupt Pascal-name
-	// length byte can push pos past the end of the buffer. Without this check
-	// the function would return (pos, true) for an overrun, letting the caller
-	// interpret a garbage position as valid and eventually triggering a terminal
-	// break in parseIRB that silently drops all subsequent 8BIM blocks
-	// (including a valid 0x0404 IPTC block). Returning false here allows
-	// parseIRBEntry to signal a recoverable miss. EXIF §4.5.6.
-	if pos > len(b) {
-		return pos, false
-	}
-	if (nameLen+1)%2 != 0 {
-		pos++ // even-padding byte
-	}
-	return pos, true
-}
-
-// parseIRBEntry validates the "8BIM" signature at b[pos], reads the resource
-// ID, Pascal-string name, and data block, and returns the resource ID, data
-// slice, new position, and a success flag.
-//
-// Two distinct failure modes:
-//   - signature mismatch / recoverable miss: returns (0, nil, entryPos, false) —
-//     newPos == entryPos (the pos at call time) signals this; the caller may
-//     advance by 1 to scan forward. This includes an overflowing Pascal-name,
-//     which is treated as a recoverable miss so that later 8BIM blocks are not
-//     silently dropped.
-//   - structural failure (truncated data, bad size): returns with newPos > pos;
-//     the caller treats this as terminal.
-//
-// IRB format: "8BIM" + 2-byte resource ID + Pascal string name + 4-byte size + data.
-// EXIF §4.5.6.
+// parseIRBEntry delegates to irbpkg.ParseEntry; see there for the recoverable-miss
+// (newPos == pos) versus terminal-failure (newPos > pos) contract. EXIF §4.5.6.
 func parseIRBEntry(b []byte, pos int) (resourceID uint16, data []byte, newPos int, ok bool) {
-	entryPos := pos // saved so we can signal a recoverable miss (newPos == entryPos)
-
-	if pos+4 > len(b) {
-		return 0, nil, pos + 1, false // terminal: not enough bytes even for signature
-	}
-
-	// Check "8BIM" signature; return pos unchanged on mismatch so the caller
-	// can distinguish a scan-forward miss from a structural error.
-	if b[pos] != '8' || b[pos+1] != 'B' || b[pos+2] != 'I' || b[pos+3] != 'M' {
-		return 0, nil, pos, false // signature mismatch — caller advances by 1
-	}
-	pos += 4
-
-	if pos+2 > len(b) {
-		return 0, nil, pos + 1, false
-	}
-	resourceID = binary.BigEndian.Uint16(b[pos:])
-	pos += 2
-
-	// Skip the Pascal-string name field (1-byte length + name + even padding).
-	// If the declared name length overflows the buffer, skipPascalString returns
-	// ok=false. We treat this as a recoverable miss (return entryPos) rather than
-	// a terminal failure so that parseIRB continues scanning for subsequent valid
-	// 8BIM blocks (including the 0x0404 IPTC resource). EXIF §4.5.6.
-	pos, ok = skipPascalString(b, pos)
-	if !ok {
-		return 0, nil, entryPos, false
-	}
-
-	if pos+4 > len(b) {
-		return 0, nil, pos + 1, false
-	}
-	// #45 (32-bit safety): read as uint64 before any arithmetic to prevent the
-	// negative-int wrap-around on 32-bit platforms where int is 32 bits.
-	// binary.BigEndian.Uint32 returns uint32 (max ~4 GiB); on a 32-bit platform
-	// casting directly to int would produce a negative value for sizes ≥ 2 GiB,
-	// bypassing the bounds check below and panicking on the slice expression.
-	// We validate using uint64 arithmetic throughout, then convert to int only
-	// after confirming the value fits within the buffer (which is at most
-	// MaxInt32 bytes on 32-bit, so the conversion is always safe at that point).
-	dataSizeU64 := uint64(binary.BigEndian.Uint32(b[pos:]))
-	pos += 4
-
-	// Bounds check entirely in uint64 to be safe on 32-bit platforms.
-	// pos is a non-negative int (it has been advanced past the fixed-size header
-	// fields without exceeding len(b)); the cast is safe.
-	posU64 := uint64(pos) //nolint:gosec // G115: pos is always non-negative (bounded by len(b))
-	if posU64+dataSizeU64 > uint64(len(b)) {
-		return 0, nil, pos + 1, false
-	}
-	// Safe to convert: dataSizeU64 ≤ len(b)−pos ≤ len(b) ≤ MaxInt (both 32 and 64-bit).
-	dataSize := int(dataSizeU64) //nolint:gosec // G115: safe; bounded by uint64 check above
-	return resourceID, b[pos : pos+dataSize], pos + dataSize, true
+	return irbpkg.ParseEntry(b, pos)
 }
 
-// parseIRB extracts the IPTC IIM stream from a Photoshop IRB block.
-// IRB format: "8BIM" + 2-byte resource ID + Pascal string name + 4-byte size + data.
-// Resource ID 0x0404 is the IPTC-NAA resource (EXIF §4.5.6.2).
+// parseIRB extracts the IPTC IIM stream (resource 0x0404) from a Photoshop IRB
+// block, or nil when absent (EXIF §4.5.6.2).
 func parseIRB(b []byte) []byte {
-	pos := 0
-	for pos < len(b) {
-		resourceID, data, newPos, ok := parseIRBEntry(b, pos)
-		if !ok {
-			if newPos == pos {
-				// Signature mismatch: advance one byte to scan forward.
-				pos++
-				continue
-			}
-			// Structural failure (truncated data, bad bounds): terminal.
-			break
-		}
-
-		if resourceID == 0x0404 {
-			return data
-		}
-
-		pos = newPos
-		// Apply even-padding to data block (EXIF §4.5.6).
-		if len(data)%2 != 0 {
-			pos++
-			// #151: clamp pos so a single non-IPTC block with odd-length data and no
-			// trailing pad byte does not advance pos past len(b). The for-guard
-			// (pos < len(b)) already prevents an out-of-bounds read, but leaving pos
-			// one beyond len(b) is semantically incorrect and mirrors the identical
-			// clamp in spliceIPTCIntoIRB. Adobe Photoshop IRB spec §"Image Resources".
-			if pos > len(b) {
-				pos = len(b)
-			}
-		}
-	}
-	return nil
+	return irbpkg.FindIPTC(b)
 }
 
 // skipFillBytes reads consecutive 0xFF fill bytes from r into hdr[1], advancing
@@ -1798,31 +1516,6 @@ func writeSegmentCopy(w io.Writer, marker byte, data []byte) error {
 	return writeHeaderedBuf(w, marker, bufPtr)
 }
 
-// extractGUIDFromMain locates the HasExtendedXMP attribute in the main XMP
-// packet and returns the 32-hex-character GUID value.
-// Returns ("", false) if the attribute is absent or malformed.
-func extractGUIDFromMain(main []byte) (guid string, ok bool) {
-	const marker = "HasExtendedXMP"
-	// The GUID value follows the property name as either an attribute
-	// (HasExtendedXMP="<GUID>") or element content (HasExtendedXMP><GUID></...).
-	// In both cases we scan past up to 5 bytes for the opening quote character.
-	_, rest, found := bytes.Cut(main, []byte(marker))
-	if !found {
-		return "", false
-	}
-	qi := bytes.IndexAny(rest, `"'`)
-	if qi < 0 || qi > 5 {
-		return "", false
-	}
-	quote := rest[qi]
-	rest = rest[qi+1:]
-	end := bytes.IndexByte(rest, quote)
-	if end != 32 { // GUID must be exactly 32 hex characters
-		return "", false
-	}
-	return string(rest[:32]), true
-}
-
 // isAllHex reports whether b consists entirely of ASCII hex digits (0-9, a-f, A-F).
 // Used to validate the 32-character GUID in extended XMP APP1 segments.
 // Adobe XMP Specification Part 3 §1.1.4: GUID is a 32-character uppercase hex string.
@@ -1908,53 +1601,30 @@ func mergeExtendedChunksValidated(chunks []extChunk, declaredTotal uint64, hasDe
 	return extBytes, true
 }
 
-// reassembleExtendedXMPByParse merges the extended XMP document into the main
-// XMP packet using xmp.Parse for prefix-agnostic property extraction.
+// reassembleExtendedXMPByParse recomposes the standard XMP packet mainBytes
+// and the extended XMP serialisation extBytes into one XMP packet.
 //
-// Adobe XMP Specification Part 3 §1.1.4: after assembling the extended payload
-// the reader must merge its properties into the main packet. The extended packet
-// is a full XMP document that may use any namespace prefix binding (not
-// necessarily "rdf:"); a literal string search for "<rdf:Description" fails
-// silently when a non-canonical prefix is used. This function parses both
-// documents with xmp.Parse and merges the Properties maps, which is correct
-// regardless of prefix assignment. (#123)
+// Adobe XMP Specification Part 3 §1.1.3.1: "A JPEG reader must recompose the
+// StandardXMP and ExtendedXMP into a single data model tree containing all of
+// the XMP for the JPEG file, and remove the xmpNote:HasExtendedXMP property."
+// xmp.ParseExtended builds that tree — nested structures, qualifiers and
+// array forms of the extended portion included (task #278) — and resolves
+// namespace prefixes by URI, so any prefix binding of the rdf namespace works
+// (#123). A top-level property present in both portions takes the extended
+// value, as a whole property, as the Adobe XMP Toolkit does
+// (XMPUtils::MergeFromJPEG).
 //
-// Merge policy: properties already present in main are not overwritten (main
-// wins on conflict), consistent with Adobe XMP Specification Part 3 §1.1.4
-// which states that the extended packet extends rather than replaces the main.
-//
-// Returns nil when either packet fails to parse OR when the extended packet
-// yields no properties after parsing. The latter case means extBytes is not a
-// proper full-XMP packet (e.g. it is a raw RDF fragment); the caller must fall
-// back to the byte-splice reassembler, which handles such fragments correctly.
+// Returns nil when either document cannot be parsed or when the extended
+// document holds no property — for example a bare rdf:Description fragment
+// that relies on the namespace declarations of the main packet. The caller
+// then falls back to the byte-splice reassembler, which handles such
+// fragments.
 func reassembleExtendedXMPByParse(mainBytes, extBytes []byte) []byte {
-	mainXMP, err := xmppkg.Parse(mainBytes)
+	x, err := xmppkg.ParseExtended(mainBytes, extBytes)
 	if err != nil {
 		return nil
 	}
-	extXMP, err := xmppkg.Parse(extBytes)
-	if err != nil {
-		return nil
-	}
-	// If the extended packet parsed but carries no properties, it is most likely
-	// not a proper full XMP document (e.g. a raw rdf:Description fragment that
-	// xmp.Parse accepted without error due to its lenient parser). Signal the
-	// caller to use the byte-splice fallback, which handles RDF fragments.
-	if len(extXMP.Properties) == 0 {
-		return nil
-	}
-
-	// Merge: add extended properties that are absent from the main packet.
-	// main wins on conflict (Adobe XMP Spec Part 3 §1.1.4).
-	for ns, props := range extXMP.Properties {
-		for local, val := range props {
-			if mainXMP.Get(ns, local) == "" {
-				mainXMP.Set(ns, local, val)
-			}
-		}
-	}
-
-	encoded, err := xmppkg.Encode(mainXMP)
+	encoded, err := xmppkg.Encode(x)
 	if err != nil {
 		return nil
 	}
@@ -1969,7 +1639,11 @@ func reassembleExtendedXMPByParse(mainBytes, extBytes []byte) []byte {
 // function locates that GUID, sorts the matching chunks by their byte offset,
 // concatenates their data into a complete extended XMP document, and splices
 // the inner rdf:Description elements from that document into the main packet
-// immediately before its closing </rdf:RDF> tag.
+// before its first rdf:Description element (or, without one, before its
+// closing </rdf:RDF> tag). The parser keeps the first occurrence of a
+// property, so the extended value of a property that both portions carry
+// wins, as in xmp.ParseExtended and XMPUtils::MergeFromJPEG of the Adobe XMP
+// Toolkit (task #278).
 //
 // If any step fails (missing marker, GUID not found, malformed packet) the
 // function returns main unchanged — graceful degradation is required because
@@ -1997,16 +1671,21 @@ func reassembleExtendedXMP(main []byte, extended map[string][]extChunk) []byte {
 	}
 	extraDescs := extBytes[descStart:closeRDFExt]
 
-	// Splice extraDescs into main immediately before its </rdf:RDF> close tag.
+	// Splice extraDescs into main before its first rdf:Description, so that
+	// the extended properties come first, or before its </rdf:RDF> close tag.
 	mainCloseRDF := bytes.LastIndex(main, []byte("</rdf:RDF>"))
 	if mainCloseRDF < 0 {
 		return main
 	}
+	at := mainCloseRDF
+	if first := bytes.Index(main, []byte("<rdf:Description")); first >= 0 && first < mainCloseRDF {
+		at = first
+	}
 
 	result := make([]byte, 0, len(main)+len(extraDescs))
-	result = append(result, main[:mainCloseRDF]...)
+	result = append(result, main[:at]...)
 	result = append(result, extraDescs...)
-	result = append(result, main[mainCloseRDF:]...)
+	result = append(result, main[at:]...)
 	return result
 }
 

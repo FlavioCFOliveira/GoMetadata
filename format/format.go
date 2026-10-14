@@ -80,10 +80,10 @@ func (f FormatID) String() string {
 //
 // FormatCR2 returns true as of task #95. CR2 uses standard LE TIFF magic
 // (II*\0) and routes through the same writeTIFF copy-and-relocate path as
-// FormatTIFF/FormatDNG. MakerNote blobs are copied verbatim; per SPIKE #24
-// Canon MakerNotes use blob-relative (self-relative) offsets, so verbatim
-// copying is safe. Validated against a real Canon EOS 350D CR2 corpus file:
-// ImageDataHash IN==OUT, all MakerNote/SubIFD tags preserved.
+// FormatTIFF/FormatDNG. The Canon MakerNote is copied verbatim and its
+// value offsets, which count from the TIFF header, and its footer are
+// rebased (task #310). Validated against the corpus CR2 files: ImageDataHash
+// IN==OUT, all MakerNote/SubIFD tags preserved.
 //
 // FormatNEF returns true as of task #102. The NEF-specific write path extends the
 // Nikon Type-3 MakerNote blob to cover PreviewIFD and NikonScanIFD (which live
@@ -93,8 +93,7 @@ func (f FormatID) String() string {
 // a real Nikon D70 NEF corpus file: ImageDataHash IN==OUT, all metadata preserved.
 //
 // FormatARW returns true as of task #103. The ARW-specific write path rebases all
-// Sony MakerNote OOL offsets (Sony uses TIFF-absolute offsets, not blob-relative
-// like Canon), extracts the SR2Private (0xC634) block verbatim, appends it to the
+// Sony MakerNote OOL offsets (Sony uses TIFF-absolute offsets), extracts the SR2Private (0xC634) block verbatim, appends it to the
 // output, and patches both the SR2 internal pointers and the IFD0 tag to the new
 // position. Validated against a real Sony DSLR-A500 ARW corpus file:
 // ImageDataHash IN==OUT, all 52 MakerNote tags + SR2Private preserved.

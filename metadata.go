@@ -3,12 +3,12 @@ package gometadata
 import (
 	"bytes"
 	"encoding/binary"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
 	"github.com/FlavioCFOliveira/GoMetadata/format"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/reconcile"
 	"github.com/FlavioCFOliveira/GoMetadata/iptc"
 	"github.com/FlavioCFOliveira/GoMetadata/xmp"
 )
@@ -35,11 +35,26 @@ func NewMetadata(fmtID format.FormatID) *Metadata {
 // Any of the three embedded pointers may be nil if that metadata
 // type was not present in the image.
 //
-// When the same field exists in more than one metadata type, the
-// convenience methods below apply a documented resolution policy:
-//   - Camera data (model, make, lens, settings): EXIF wins.
-//   - Descriptive and rights data (caption, copyright, keywords): XMP wins,
-//     falling back to IPTC, then EXIF.
+// The convenience methods below read and write the fields that EXIF, IPTC
+// and XMP share through one mapping table (package internal/reconcile,
+// transcribed from the Adobe XMP Toolkit and the Metadata Working Group
+// Guidelines v2.0, "MWG"). When the same field exists in more than one
+// metadata type, the getters apply this policy:
+//   - Camera data (model, make, lens, settings): EXIF wins, then XMP.
+//   - Caption, copyright, creator and the capture date (MWG §4.2.3.3): EXIF
+//     wins, falling back to XMP, then IPTC. Keywords, which EXIF does not
+//     carry (MWG §5.1): XMP wins, falling back to IPTC.
+//   - When the Photoshop IPTC digest shows that the IPTC was edited after the
+//     XMP was written, an IPTC value wins over EXIF and XMP unless it is only
+//     the XMP value truncated to the IPTC length limit (MWG §4.2.3.2 and
+//     §4.2.3.3).
+//   - A value made only of spaces or NUL characters counts as absent
+//     (MWG §4.2.3.3).
+//
+// Each setter writes every form of its field that the format can carry, so
+// that one call leaves EXIF, IPTC and XMP consistent. An XMP copy of an EXIF
+// camera setting (for example tiff:Orientation) is updated when the XMP
+// already has it, and never created (MWG §4.2.3.1).
 //
 // Concurrency contract:
 //
@@ -72,6 +87,16 @@ type Metadata struct {
 	// Must not be copied after first use — always use *Metadata.
 	mu sync.Mutex
 
+	// EXIF, IPTC and XMP are the parsed metadata, each nil when absent. They
+	// are not safe for concurrent mutation (see the concurrency contract
+	// above).
+	//
+	// The entry values of EXIF (exif.IFDEntry.Value, EXIF.MakerNote) are
+	// zero-copy views of the raw EXIF bytes that Read retains and that Write
+	// uses as the source of everything it copies from the original file
+	// (task #296). Treat them as read-only: change a value with the Set*
+	// methods, or by assigning a new slice to IFDEntry.Value (and updating
+	// IFDEntry.Count); never write into the bytes of an existing Value.
 	EXIF *exif.EXIF
 	IPTC *iptc.IPTC
 	XMP  *xmp.XMP
@@ -120,26 +145,27 @@ type Metadata struct {
 
 	// rawIPTCDigest is the 16-byte MD5 value stored in Photoshop resource
 	// 0x0425 ("IPTC Digest") inside the APP13 IRB, or nil when absent.
-	// MWG Guidelines v2.0 §3.3.1: the digest is used at read time to determine
-	// whether IPTC or XMP takes precedence for conflicting descriptive fields.
+	// MWG Guidelines v2.0 §4.2.3.2: the digest is used at read time to determine
+	// whether an IPTC value takes precedence over EXIF and XMP for conflicting
+	// descriptive fields.
 	//
-	// nil  → digest resource absent; default XMP-over-IPTC priority applies.
+	// nil  → digest resource absent; default EXIF > XMP > IPTC priority applies.
 	// 16 B = all-zero → "unknown" sentinel; IPTC trust is elevated.
-	// 16 B, non-zero  → compare to MD5(rawIPTC); match → XMP priority;
+	// 16 B, non-zero  → compare to MD5(rawIPTC); match → default priority;
 	//                   mismatch → IPTC trust is elevated.
 	rawIPTCDigest []byte
 
-	// rawXMPWire is non-nil when the image carried extended XMP (Adobe XMP
-	// Specification Part 3 §1.1.4) and the XMP was not modified by the caller.
-	// It holds the internal wire-frame encoding produced by jpeg.ExtractWithWire:
-	// the original main APP1 content and the assembled extended payload packed
-	// together. Inject uses this to reproduce the original segmentation without
-	// regenerating the GUID, guaranteeing that rawXMP is byte-stable across an
-	// unmodified round-trip.
+	// rawXMPWire is non-nil when a JPEG carried extended XMP (Adobe XMP
+	// Specification Part 3 §1.1.3.1). It holds the internal wire-frame
+	// encoding produced by jpeg.ExtractFullSelective: the original standard
+	// APP1 content and the assembled extended payload packed together.
 	//
-	// rawXMPWire is always nil when m.XMP is non-nil (user modified the XMP);
-	// in that case encodeMetadata re-encodes from the struct and the extended
-	// split path uses a freshly generated GUID.
+	// Write uses it only when m.XMP is nil (XMP not parsed, for example with
+	// WithoutXMP): Inject then reproduces the original segmentation with the
+	// original GUID. When m.XMP is non-nil, Write encodes m.XMP instead, and
+	// a packet too large for one APP1 segment is split with a GUID derived
+	// from the MD5 digest of the extended serialisation (task #295), so the
+	// same XMP always produces the same bytes.
 	rawXMPWire []byte
 
 	// iptcTrustElev caches the result of computeIPTCTrustElevated(rawIPTC,
@@ -226,14 +252,15 @@ func (m *Metadata) RawSegments() (rawEXIF, rawIPTC, rawXMP []byte) {
 	return m.rawEXIF, m.rawIPTC, m.rawXMP
 }
 
-// iptcTrustElevated reports whether IPTC should take read priority over XMP
-// for fields where both are present and carry different values.
+// iptcTrustElevated reports whether an edited IPTC value should take read
+// priority over EXIF and XMP (MWG §4.2.3.2 and §4.2.3.3).
 //
 // The decision is computed once, by Read, and cached in m.iptcTrustElev
-// (task #208); this method is a plain field read so that the four MWG-02
-// accessors (Copyright, Caption, Keywords, Creator) never each pay their own
-// MD5 hash of the raw IPTC stream. See computeIPTCTrustElevated for the full
-// MWG §3.3.1 policy this value encodes.
+// (task #208); this method is a plain field read so that the MWG-02
+// accessors (Copyright, Caption, Creator, Keywords, and the IPTC date fallback
+// of DateTimeOriginal) never each pay their own MD5 hash of the raw IPTC
+// stream. See computeIPTCTrustElevated for the full
+// MWG §4.2.3.2 policy this value encodes.
 func (m *Metadata) iptcTrustElevated() bool {
 	return m.iptcTrustElev
 }
@@ -245,19 +272,19 @@ func (m *Metadata) iptcTrustElevated() bool {
 // and is never reassigned outside test code.
 var digestMatchFn = iptc.DigestMatch //nolint:gochecknoglobals // test seam; identical to calling iptc.DigestMatch directly in production
 
-// computeIPTCTrustElevated reports whether IPTC should take read priority
-// over XMP for fields where both are present and carry different values.
+// computeIPTCTrustElevated reports whether an edited IPTC value should take
+// read priority over EXIF and XMP (MWG §4.2.3.2 and §4.2.3.3).
 //
-// MWG Guidelines v2.0 §3.3.1: the Photoshop resource 0x0425 stores an MD5
+// MWG Guidelines v2.0 §4.2.3.2: the Photoshop resource 0x0425 stores an MD5
 // digest of the raw 0x0404 IIM block at the time XMP was last written. If the
 // digest matches the current IIM block, XMP was written after the last IPTC
-// edit, so XMP remains authoritative (the default MWG-01 priority). If the
+// edit, so the default MWG-01 priority (EXIF > XMP > IPTC) applies. If the
 // digest mismatches, or if the stored digest is the all-zero "unknown"
 // sentinel, IPTC may have been edited independently of XMP, so IPTC trust is
 // elevated for conflicting fields.
 //
-// When rawIPTCDigest is nil (the resource was absent), the default XMP-over-
-// IPTC priority (MWG-01) is preserved unchanged.
+// When rawIPTCDigest is nil (the resource was absent), the default MWG-01
+// priority is preserved unchanged.
 //
 // Called exactly once, by Read, immediately after rawIPTC and rawIPTCDigest
 // are final; the result is cached in m.iptcTrustElev (task #208). This
@@ -266,7 +293,7 @@ var digestMatchFn = iptc.DigestMatch //nolint:gochecknoglobals // test seam; ide
 // IPTC stream again on every single Copyright/Caption/Keywords/Creator call.
 func computeIPTCTrustElevated(rawIPTC, rawIPTCDigest []byte) bool {
 	if len(rawIPTCDigest) != 16 {
-		// No digest resource in the IRB — use default MWG-01 (XMP priority).
+		// No digest resource in the IRB — use the default MWG-01 priority.
 		return false
 	}
 	var stored [16]byte
@@ -324,82 +351,20 @@ func (m *Metadata) GPS() (float64, float64, bool) {
 }
 
 // Copyright returns the copyright notice.
-// Source priority: XMP > IPTC > EXIF (MWG-01).
-// Exception — MWG §3.3.1 (MWG-02): when the Photoshop 0x0425 IPTC digest
-// mismatches (or is the all-zero sentinel), IPTC trust is elevated and the
-// priority for conflicting values becomes IPTC > XMP > EXIF.
-//
-//nolint:cyclop,gocyclo,nestif // MWG-02 digest-conditional branching is inherent; splitting would obscure the priority logic
+// Source priority (MWG §4.2.3.3, §5.6): EXIF > XMP > IPTC. When the Photoshop
+// IPTC digest does not match, an edited IPTC value wins over both (see
+// resolveText); a blank value counts as absent.
 func (m *Metadata) Copyright() string {
-	if m.iptcTrustElevated() {
-		if m.IPTC != nil {
-			if v := m.IPTC.Copyright(); v != "" {
-				return v
-			}
-		}
-		if m.XMP != nil {
-			if v := m.XMP.Copyright(); v != "" {
-				return v
-			}
-		}
-		if m.EXIF != nil {
-			return m.EXIF.Copyright()
-		}
-		return ""
-	}
-	if m.XMP != nil {
-		if v := m.XMP.Copyright(); v != "" {
-			return v
-		}
-	}
-	if m.IPTC != nil {
-		if v := m.IPTC.Copyright(); v != "" {
-			return v
-		}
-	}
-	if m.EXIF != nil {
-		return m.EXIF.Copyright()
-	}
-	return ""
+	return m.resolveText(reconcile.Copyright)
 }
 
 // Caption returns the image description / caption.
-// Source priority: XMP > IPTC > EXIF (MWG-01).
-// Exception — MWG §3.3.1 (MWG-02): IPTC digest mismatch elevates IPTC trust
-// so the priority becomes IPTC > XMP > EXIF for conflicting values.
-//
-//nolint:cyclop,gocyclo,nestif // MWG-02 digest-conditional branching is inherent; splitting would obscure the priority logic
+// Source priority (MWG §4.2.3.3, §5.2): EXIF ImageDescription > XMP
+// dc:description > IPTC Caption/Abstract. When the Photoshop IPTC digest does
+// not match, an edited IPTC value wins over both (see resolveText); a blank
+// value counts as absent.
 func (m *Metadata) Caption() string {
-	if m.iptcTrustElevated() {
-		if m.IPTC != nil {
-			if v := m.IPTC.Caption(); v != "" {
-				return v
-			}
-		}
-		if m.XMP != nil {
-			if v := m.XMP.Caption(); v != "" {
-				return v
-			}
-		}
-		if m.EXIF != nil {
-			return m.EXIF.Caption()
-		}
-		return ""
-	}
-	if m.XMP != nil {
-		if v := m.XMP.Caption(); v != "" {
-			return v
-		}
-	}
-	if m.IPTC != nil {
-		if v := m.IPTC.Caption(); v != "" {
-			return v
-		}
-	}
-	if m.EXIF != nil {
-		return m.EXIF.Caption()
-	}
-	return ""
+	return m.resolveText(reconcile.Description)
 }
 
 // xmpDateLayouts lists the ISO 8601 time formats used by XMP DateTimeOriginal,
@@ -411,37 +376,41 @@ var xmpDateLayouts = [3]string{ //nolint:gochecknoglobals // constant time layou
 }
 
 // DateTimeOriginal returns the original capture date/time.
-// Source priority: EXIF > XMP.
+// Source priority (MWG §4.2.3.3, §5.3): EXIF DateTimeOriginal, then XMP
+// exif:DateTimeOriginal, then XMP photoshop:DateCreated, then IPTC 2:55 Date
+// Created with 2:60 Time Created. When the Photoshop IPTC digest does not
+// match and the IPTC date differs from the one predicted from
+// photoshop:DateCreated, the IPTC date wins over all of them (the digest rule
+// of Caption).
 //
-// MWG timezone synthesis: when EXIF carries DateTimeOriginal without
-// OffsetTimeOriginal (EXIF 2.31+, tag 0x9011), the method checks whether XMP
-// exif:DateTimeOriginal carries a timezone offset (e.g. "+02:00") and, if so,
-// applies it to the EXIF wall-clock date/time. This follows the Metadata
-// Working Group (MWG) Guidelines §2.2.1 recommendation for reconstructing a
-// fully-qualified timestamp from split EXIF+XMP metadata.
+// The EXIF value includes the fraction of a second of SubSecTimeOriginal
+// (tag 0x9291) and the offset of OffsetTimeOriginal (tag 0x9011). MWG timezone
+// synthesis: when EXIF carries DateTimeOriginal without OffsetTimeOriginal,
+// the method checks whether XMP exif:DateTimeOriginal carries a timezone
+// offset (e.g. "+02:00") and, if so, applies it to the EXIF wall-clock
+// date/time, so that a fully-qualified timestamp is reconstructed from split
+// EXIF+XMP metadata (MWG §4.2.3.4, "Time-zone handling": the zone is taken
+// from the same field, never added arbitrarily).
 //
-// When neither EXIF OffsetTimeOriginal nor an XMP timezone is available, the
-// returned time.Time uses UTC (as before).
+// When no timezone is available, the returned time.Time uses UTC.
 func (m *Metadata) DateTimeOriginal() (time.Time, bool) {
+	if t, ok := m.editedIIMDate(); ok {
+		return t, true
+	}
 	if m.EXIF != nil {
 		if t, ok := m.EXIF.DateTimeOriginal(); ok {
-			return m.applyXMPTimezone(t), true
+			return m.exifSubSecOriginal(m.applyXMPTimezone(t)), true
 		}
 	}
 	if m.XMP != nil {
-		if v := m.XMP.DateTimeOriginal(); v != "" {
-			// XMP stores dates as ISO 8601: "YYYY-MM-DDTHH:MM:SS" with optional TZ.
-			for _, layout := range xmpDateLayouts {
-				if t, err := time.Parse(layout, v); err == nil {
-					return t, true
-				}
-			}
+		if t, ok := parseXMPDateTimeOriginal(m.XMP.DateTimeOriginal()); ok {
+			return t, true
 		}
 	}
-	return time.Time{}, false
+	return m.resolveDateCreated()
 }
 
-// applyXMPTimezone applies MWG §2.2.1 timezone synthesis to t: when EXIF
+// applyXMPTimezone applies MWG §4.2.3.4 timezone synthesis to t: when EXIF
 // ExifIFD lacks OffsetTimeOriginal and XMP carries an explicit UTC offset, the
 // wall-clock time from EXIF is re-expressed in the XMP timezone. t is returned
 // unchanged when the EXIF offset is present, when XMP is absent, or when the
@@ -462,7 +431,7 @@ func (m *Metadata) applyXMPTimezone(t time.Time) time.Time {
 		return t
 	}
 	// Reconstruct the same wall-clock time in the synthesised timezone.
-	// MWG §2.2.1: the EXIF wall-clock digits are authoritative; only the
+	// MWG §4.2.3.4: the EXIF wall-clock digits are authoritative; only the
 	// timezone is taken from XMP.
 	return time.Date(t.Year(), t.Month(), t.Day(),
 		t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), loc)
@@ -532,19 +501,22 @@ func (m *Metadata) FocalLength() (float64, bool) {
 }
 
 // LensModel returns the lens model string.
-// Source priority: EXIF > XMP.
+// Source priority: EXIF (tag 0xA434) > XMP aux:Lens > XMP exifEX:LensModel
+// (the XMP Toolkit mapping of tag 0xA434).
 func (m *Metadata) LensModel() string {
 	if m.EXIF != nil {
 		if v := m.EXIF.LensModel(); v != "" {
 			return v
 		}
 	}
-	if m.XMP != nil {
-		if v := m.XMP.LensModel(); v != "" {
-			return v
-		}
+	if m.XMP == nil {
+		return ""
 	}
-	return ""
+	if v := m.XMP.LensModel(); v != "" {
+		return v
+	}
+	p := &reconcile.Lookup(reconcile.LensModel).XMP[1]
+	return m.XMP.Get(p.NS, p.Name)
 }
 
 // Orientation returns the image orientation (1–8 per EXIF §4.6.4).
@@ -566,30 +538,12 @@ func (m *Metadata) ImageSize() (width, height uint32, ok bool) {
 }
 
 // Keywords returns the subject keywords.
-// Source priority: XMP > IPTC (MWG-01 / MWG-07).
-// Exception — MWG §3.3.1 (MWG-02): IPTC digest mismatch elevates IPTC trust
-// so the priority becomes IPTC > XMP for conflicting values.
+// Source priority: XMP > IPTC (MWG §5.1). When the Photoshop IPTC digest
+// shows that the IPTC was edited after the XMP was written, the IPTC keywords
+// win unless each of them is only the XMP keyword truncated to the IPTC
+// length limit (MWG §4.2.3.2).
 func (m *Metadata) Keywords() []string {
-	if m.iptcTrustElevated() {
-		if m.IPTC != nil {
-			if kw := m.IPTC.Keywords(); len(kw) > 0 {
-				return kw
-			}
-		}
-		if m.XMP != nil {
-			return m.XMP.Keywords()
-		}
-		return nil
-	}
-	if m.XMP != nil {
-		if kw := m.XMP.Keywords(); len(kw) > 0 {
-			return kw
-		}
-	}
-	if m.IPTC != nil {
-		return m.IPTC.Keywords()
-	}
-	return nil
+	return m.resolveKeywords()
 }
 
 // Make returns the camera manufacturer string.
@@ -762,43 +716,14 @@ func (m *Metadata) MeteringMode() (uint16, bool) {
 	return 0, false
 }
 
-// Creator returns the author / creator name.
-// Source priority: XMP > IPTC > EXIF (MWG-01 / MWG-04).
-// Exception — MWG §3.3.1 (MWG-02): IPTC digest mismatch elevates IPTC trust
-// so the priority becomes IPTC > XMP > EXIF for conflicting values.
-//
-//nolint:cyclop,gocyclo,nestif // MWG-02 digest-conditional branching is inherent; splitting would obscure the priority logic
+// Creator returns the author / creator name: the first creator of the list.
+// Source priority (MWG §4.2.3.3, §5.7): EXIF Artist > XMP dc:creator > IPTC
+// By-line. When the Photoshop IPTC digest does not match, an edited IPTC value
+// wins over both (see resolveText); a blank value counts as absent. The EXIF
+// Artist tag holds the list as one string; its first item is returned
+// (MWG §5.7).
 func (m *Metadata) Creator() string {
-	if m.iptcTrustElevated() {
-		if m.IPTC != nil {
-			if v := m.IPTC.Creator(); v != "" {
-				return v
-			}
-		}
-		if m.XMP != nil {
-			if v := m.XMP.Creator(); v != "" {
-				return v
-			}
-		}
-		if m.EXIF != nil {
-			return m.EXIF.Creator()
-		}
-		return ""
-	}
-	if m.XMP != nil {
-		if v := m.XMP.Creator(); v != "" {
-			return v
-		}
-	}
-	if m.IPTC != nil {
-		if v := m.IPTC.Creator(); v != "" {
-			return v
-		}
-	}
-	if m.EXIF != nil {
-		return m.EXIF.Creator()
-	}
-	return ""
+	return m.resolveText(reconcile.Creator)
 }
 
 // ---------------------------------------------------------------------------
@@ -817,7 +742,7 @@ func (m *Metadata) Creator() string {
 //	TIFF                        → EXIF ✓  IPTC ✓  XMP ✓
 //	DNG / CR2 / NEF / ARW /     → EXIF ✓  IPTC ✓  XMP ✓
 //	  ORF / RW2 (TIFF-based RAW)
-//	PNG                         → EXIF ✓  IPTC ✗  XMP ✓
+//	PNG                         → EXIF ✓  IPTC ✗¹ XMP ✓
 //	WebP                        → EXIF ✓  IPTC ✗  XMP ✓
 //	HEIF / AVIF                 → EXIF ✓  IPTC ✗  XMP ✓
 //	CR3                         → EXIF ✓  IPTC ✗  XMP ✓
@@ -826,6 +751,11 @@ func (m *Metadata) Creator() string {
 // IPTC pathway for TIFF-based formats: the write path embeds IPTC as IFD0
 // tag 0x83BB (IPTC-NAA, TypeLong). All TIFF-derived formats route through
 // relocate.go / relocate_*.go which upsert this tag on write.
+//
+// ¹ PNG has no native IPTC chunk, so no IPTC component is created for a PNG
+// that has none. A PNG that already carries IPTC in a "Raw profile type iptc"
+// text chunk has it read into m.IPTC, and the write path rewrites that chunk
+// in place (format/png).
 //
 // CR3 does NOT carry IPTC: CR3 uses an ISO BMFF container whose CMT1–CMT4
 // UUID boxes carry only EXIF and XMP; there is no IPTC pathway.
@@ -849,8 +779,10 @@ func (m *Metadata) canCarryEXIF() bool {
 // TIFF-based write path embeds IPTC as IFD0 tag 0x83BB (IPTC-NAA).
 //
 // Formats without an IPTC pathway: PNG, WebP, HEIF, AVIF, and CR3 (ISO BMFF
-// — the CMT UUID boxes carry only EXIF and XMP).
-// FormatUnknown also returns false.
+// — the CMT UUID boxes carry only EXIF and XMP). For PNG this means only that
+// no new IPTC component is created: IPTC already present in a "Raw profile
+// type iptc" text chunk is read into m.IPTC, and the write path rewrites that
+// chunk in place (format/png). FormatUnknown also returns false.
 //
 // Finding #110: prior to this fix, only JPEG and TIFF returned true, causing
 // DNG/CR2/NEF/ARW/ORF/RW2 to silently drop IPTC on Set* calls.
@@ -921,8 +853,11 @@ func (m *Metadata) ensureXMP() {
 // ensure* helpers are called while the lock is held; they are unexported and
 // non-recursive — they must never acquire m.mu themselves.
 //
-// Components that the format cannot carry (e.g. IPTC for PNG, CR3) are never
-// constructed, and the setter silently skips writing to that component.
+// Components that the format cannot carry (e.g. IPTC for CR3, or for a PNG
+// without a "Raw profile type iptc" chunk) are never constructed, and the
+// setter silently skips writing to that component. A component that already
+// exists is always written, even when the format could not create it: IPTC
+// read from a PNG raw profile chunk is updated by the setters.
 // For FormatUnknown, no component is ever created — see NewMetadata for the
 // documented contract.
 //
@@ -972,51 +907,59 @@ func (m *Metadata) SetCopyright(s string) {
 	}
 }
 
-// SetCreator writes s to all metadata components that can carry a creator
-// (EXIF, IPTC, XMP). Components are auto-created when nil and the format
+// SetCreator sets the creator list to the single creator s, in every
+// metadata component that can carry it: EXIF Artist (0x013B), IPTC 2:80
+// By-line and XMP dc:creator. Like SetCreators with a one-item list, it
+// replaces every existing creator in all three components, so that they stay
+// consistent (MWG §5.7). Components are auto-created when nil and the format
 // supports them. Concurrent calls are safe.
+//
+// The EXIF Artist value follows the MWG list convention: s is enclosed in
+// quotes when it contains "; " or begins with a quote, so that a reader
+// splitting the Artist list at "; " gets s back as one creator.
 func (m *Metadata) SetCreator(s string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ensureEXIF()
 	m.ensureIPTC()
 	m.ensureXMP()
+	one := [1]string{s}
 	if m.EXIF != nil {
-		m.EXIF.SetCreator(s)
+		m.EXIF.SetCreator(reconcile.JoinArtist(one[:]))
 	}
 	if m.IPTC != nil {
 		m.IPTC.SetCreator(s)
+		keepFirstRecord2(m.IPTC, iptc.DS2Byline)
 	}
 	if m.XMP != nil {
-		m.XMP.SetCreator(s)
+		m.XMP.SetCreator(s) // replaces dc:creator with the one-item list
 	}
 }
 
 // SetCreators writes an ordered list of creators to IPTC (2:80 By-line,
 // repeatable, order preserved), XMP (dc:creator, ordered rdf:Seq, order
-// preserved — RECONCILE-04), and EXIF (0x013B Artist, flattened to a single
-// "; "-joined string per the MWG list-handling convention for EXIF tags
-// that mirror a multi-valued XMP/IIM property). Components are auto-created
-// when nil and the format supports them. Concurrent calls are safe.
+// preserved — RECONCILE-04), and EXIF (0x013B Artist, the list joined with
+// "; " as MWG §5.7 prescribes: an item that contains "; " or begins with a
+// quote is enclosed in quotes, and its quotes are doubled). Components are
+// auto-created when nil and the format supports them. Concurrent calls are
+// safe.
 //
-// SetCreators is a FULL REPLACE across all three backends. This differs
-// from SetCreator(s string), which updates only the first IIM By-line
-// occurrence (preserving any additional pre-existing entries) while fully
-// replacing the XMP dc:creator property outright. Prefer SetCreators
-// exclusively once a document's creator list has more than one entry — the
-// two setters are not designed to be mixed on the same *Metadata.
-//
-// Empty (or nil) creators clears dc:creator and all 2:80 By-line entries;
-// EXIF Artist is left UNTOUCHED (not zeroed), because the current Set*
-// surface has no "delete tag" primitive.
+// SetCreators is a FULL REPLACE across all three backends. Empty (or nil)
+// creators removes dc:creator, every 2:80 By-line entry and the EXIF Artist
+// tag (MWG §4.2.3.1: a value removed from one form MUST be removed from the
+// others).
 func (m *Metadata) SetCreators(creators []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ensureEXIF()
 	m.ensureIPTC()
 	m.ensureXMP()
-	if m.EXIF != nil && len(creators) > 0 {
-		m.EXIF.SetCreator(strings.Join(creators, "; "))
+	if m.EXIF != nil {
+		if len(creators) > 0 {
+			m.EXIF.SetCreator(reconcile.JoinArtist(creators))
+		} else {
+			removeEXIFTag(m.EXIF.IFD0, exif.TagArtist)
+		}
 	}
 	if m.IPTC != nil {
 		m.IPTC.SetCreators(creators)
@@ -1060,7 +1003,9 @@ func (m *Metadata) SetGPS(lat, lon float64) {
 // SetKeywords writes kws to IPTC and XMP. Components are auto-created when nil
 // and the format supports them. For formats that cannot carry IPTC (PNG, WebP,
 // HEIF, AVIF, CR3), only XMP is populated so the keywords are not silently
-// dropped. Concurrent calls are safe.
+// dropped, unless m.IPTC already exists: a PNG whose "Raw profile type iptc"
+// chunk was read has a non-nil m.IPTC, which is updated as well. Concurrent
+// calls are safe.
 func (m *Metadata) SetKeywords(kws []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1074,8 +1019,10 @@ func (m *Metadata) SetKeywords(kws []string) {
 	}
 }
 
-// SetLensModel writes s to EXIF and XMP. Components are auto-created when nil
-// and the format supports them. Concurrent calls are safe.
+// SetLensModel writes s to EXIF (0xA434 LensModel) and XMP aux:Lens, and to
+// XMP exifEX:LensModel when the XMP already has that property. Components are
+// auto-created when nil and the format supports them. Concurrent calls are
+// safe.
 func (m *Metadata) SetLensModel(s string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1087,9 +1034,11 @@ func (m *Metadata) SetLensModel(s string) {
 	if m.XMP != nil {
 		m.XMP.SetLensModel(s)
 	}
+	m.mirrorToXMP(reconcile.LensModel)
 }
 
-// SetMake writes s to EXIF. EXIF is auto-created when nil and the format
+// SetMake writes s to EXIF (0x010F Make), and to XMP tiff:Make when the XMP
+// already has that property. EXIF is auto-created when nil and the format
 // supports it. Concurrent calls are safe.
 func (m *Metadata) SetMake(s string) {
 	m.mu.Lock()
@@ -1097,6 +1046,7 @@ func (m *Metadata) SetMake(s string) {
 	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetMake(s)
+		m.mirrorToXMP(reconcile.Make)
 	}
 }
 
@@ -1105,8 +1055,11 @@ func (m *Metadata) SetMake(s string) {
 // safe.
 //
 // This is the single write-side bridge for "when was this taken" across all
-// three backends (RECONCILE-03):
-//   - EXIF ExifIFD 0x9003 DateTimeOriginal (EXIF §4.6.5).
+// three backends (RECONCILE-03, MWG §5.3):
+//   - EXIF ExifIFD 0x9003 DateTimeOriginal (EXIF §4.6.5), with 0x9011
+//     OffsetTimeOriginal set to the offset of t and 0x9291
+//     SubSecTimeOriginal removed (see exif.EXIF.SetDateTimeOriginal), so
+//     that the EXIF form names the same instant as the IPTC and XMP forms.
 //   - IPTC dataset 2:55 Date Created + 2:60 Time Created (IIM §2.2.23), via
 //     IPTC.SetDateCreated. Sub-second precision is dropped (IIM has no
 //     sub-second field). If t.Year() is outside [0, 9999], the IPTC write is
@@ -1124,8 +1077,9 @@ func (m *Metadata) SetMake(s string) {
 // written here — see the IPTC/XMP reconciliation spec §0.1.
 //
 // For formats that cannot carry IPTC (PNG, WebP, HEIF, AVIF, CR3), m.IPTC
-// stays nil and only EXIF+XMP are written — the same fallback pattern used
-// by SetKeywords.
+// is not created and only EXIF+XMP are written — the same fallback pattern
+// used by SetKeywords. A PNG whose "Raw profile type iptc" chunk was read has
+// a non-nil m.IPTC, which is updated as well.
 func (m *Metadata) SetDateTimeOriginal(t time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1144,7 +1098,8 @@ func (m *Metadata) SetDateTimeOriginal(t time.Time) {
 	}
 }
 
-// SetExposureTime writes the rational exposure time to EXIF. EXIF is
+// SetExposureTime writes the rational exposure time to EXIF (0x829A), and to
+// XMP exif:ExposureTime when the XMP already has that property. EXIF is
 // auto-created when nil and the format supports it. Concurrent calls are safe.
 func (m *Metadata) SetExposureTime(num, den uint32) {
 	m.mu.Lock()
@@ -1152,10 +1107,12 @@ func (m *Metadata) SetExposureTime(num, den uint32) {
 	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetExposureTime(num, den)
+		m.mirrorToXMP(reconcile.ExposureTime)
 	}
 }
 
-// SetFNumber writes the F-number to EXIF. EXIF is auto-created when nil and
+// SetFNumber writes the F-number to EXIF (0x829D), and to XMP exif:FNumber
+// when the XMP already has that property. EXIF is auto-created when nil and
 // the format supports it. Concurrent calls are safe.
 func (m *Metadata) SetFNumber(f float64) {
 	m.mu.Lock()
@@ -1163,21 +1120,26 @@ func (m *Metadata) SetFNumber(f float64) {
 	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetFNumber(f)
+		m.mirrorToXMP(reconcile.FNumber)
 	}
 }
 
-// SetISO writes the ISO speed rating to EXIF. EXIF is auto-created when nil
-// and the format supports it. Concurrent calls are safe.
+// SetISO writes the ISO speed rating to EXIF (0x8827), and to XMP
+// exif:ISOSpeedRatings and exifEX:PhotographicSensitivity when the XMP
+// already has them. EXIF is auto-created when nil and the format supports it.
+// Concurrent calls are safe.
 func (m *Metadata) SetISO(iso uint) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetISO(iso)
+		m.mirrorToXMP(reconcile.ISO)
 	}
 }
 
-// SetFocalLength writes the focal length in millimetres to EXIF. EXIF is
+// SetFocalLength writes the focal length in millimetres to EXIF (0x920A),
+// and to XMP exif:FocalLength when the XMP already has that property. EXIF is
 // auto-created when nil and the format supports it. Concurrent calls are safe.
 func (m *Metadata) SetFocalLength(mm float64) {
 	m.mu.Lock()
@@ -1185,27 +1147,35 @@ func (m *Metadata) SetFocalLength(mm float64) {
 	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetFocalLength(mm)
+		m.mirrorToXMP(reconcile.FocalLength)
 	}
 }
 
-// SetOrientation writes the orientation tag to EXIF. EXIF is auto-created
-// when nil and the format supports it. Concurrent calls are safe.
+// SetOrientation writes the orientation tag to EXIF (0x0112, the only form
+// of the orientation, MWG §5.4), and to XMP tiff:Orientation when the XMP
+// already has that property. EXIF is auto-created when nil and the format
+// supports it. Concurrent calls are safe.
 func (m *Metadata) SetOrientation(v uint16) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetOrientation(v)
+		m.mirrorToXMP(reconcile.Orientation)
 	}
 }
 
-// SetImageSize writes the pixel dimensions to EXIF. EXIF is auto-created when
-// nil and the format supports it. Concurrent calls are safe.
+// SetImageSize writes the pixel dimensions to EXIF (0xA002 and 0xA003), and
+// to XMP exif:PixelXDimension and exif:PixelYDimension when the XMP already
+// has them. EXIF is auto-created when nil and the format supports it.
+// Concurrent calls are safe.
 func (m *Metadata) SetImageSize(width, height uint32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ensureEXIF()
 	if m.EXIF != nil {
 		m.EXIF.SetImageSize(width, height)
+		m.mirrorToXMP(reconcile.PixelXDimension)
+		m.mirrorToXMP(reconcile.PixelYDimension)
 	}
 }

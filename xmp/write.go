@@ -32,12 +32,19 @@ var localListPool = sync.Pool{New: func() any { s := make([]string, 0, 16); retu
 // serialise encodes x to a padded XMP packet.
 // The packet uses UTF-8 encoding and a read/write <?xpacket?> wrapper
 // with 2 KB of whitespace padding per XMP §7.3 (in-place editing support).
-func serialise(x *XMP) ([]byte, error) { //nolint:gocyclo,cyclop // complexity is inherent: XMP serialiser must handle structs, arrays, bags, sequences, and all scalar types with distinct XML representations
+//
+// Each namespace is written in its own rdf:Description, in URI order. A
+// namespace's retained tree properties (XMP.nodes) come first, in document
+// order, each written unchanged, merged with its edited Properties entries,
+// or omitted when all its entries were deleted. The remaining Properties
+// entries follow, written from their keys alone (classifyProps). serialise
+// never modifies x: merges are applied to a pooled scratch copy.
+func serialise(x *XMP) ([]byte, error) {
 	buf := encBufPool.Get().(*bytes.Buffer) //nolint:forcetypeassert,revive // encBufPool.New always stores *bytes.Buffer; pool invariant
 	buf.Reset()
 
 	// Estimate output size: fixed wrapper (~250 B) + 2 KB padding + ~100 B per property.
-	nProps := 0
+	nProps := len(x.nodes)
 	for _, props := range x.Properties {
 		nProps += len(props)
 	}
@@ -45,18 +52,20 @@ func serialise(x *XMP) ([]byte, error) { //nolint:gocyclo,cyclop // complexity i
 
 	// Opening packet wrapper with UTF-8 BOM marker (XMP §7.1).
 	buf.WriteString("<?xpacket begin=\"\xef\xbb\xbf\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n")
-	buf.WriteString("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n")
+	buf.WriteString("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"")
+	if x.toolkit != "" {
+		// XMP Part 1 §7.3.3: x:xmptk names the toolkit that wrote the packet;
+		// a parsed value is kept so that a round trip does not lose it.
+		buf.WriteString(" x:xmptk=\"")
+		writeXMLEscaped(buf, x.toolkit)
+		buf.WriteByte('"')
+	}
+	buf.WriteString(">\n")
 	buf.WriteString(" <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n")
 
 	// Sort namespace URIs for deterministic output (ISO 16684-1 §7.4).
 	nsListPtr := nsListPool.Get().(*[]string) //nolint:forcetypeassert,revive // nsListPool.New always stores *[]string; pool invariant
-	nsList := (*nsListPtr)[:0]
-	for ns, props := range x.Properties {
-		if len(props) > 0 {
-			nsList = append(nsList, ns)
-		}
-	}
-	slices.Sort(nsList)
+	nsList := x.namespaces((*nsListPtr)[:0])
 	// Write-back: if append grew the slice, update the pointer so the pool
 	// gets the larger backing array next time.
 	*nsListPtr = nsList
@@ -64,10 +73,11 @@ func serialise(x *XMP) ([]byte, error) { //nolint:gocyclo,cyclop // complexity i
 
 	// NS-03 / XMP Part 1 §6 / XML Namespaces: the writer MUST NOT bind two
 	// distinct URIs to the same prefix.  Well-known URIs have fixed canonical
-	// prefixes (prefixMap).  Unknown URIs fall back to generated prefixes
+	// prefixes (prefixMap).  Unknown URIs reuse the prefix of the source
+	// document when it is free, and otherwise fall back to generated prefixes
 	// ns0, ns1, … using a per-call counter so sibling unknown namespaces always
 	// get distinct prefixes regardless of insertion order.
-	usedPrefixes := make(map[string]struct{}, len(nsList))
+	usedPrefixes := make(map[string]struct{}, len(nsList)+3)
 	// Pre-populate with all well-known prefixes that will be used in this packet,
 	// so generated ns0/ns1/… never accidentally collide with a canonical prefix.
 	for _, ns := range nsList {
@@ -75,22 +85,30 @@ func serialise(x *XMP) ([]byte, error) { //nolint:gocyclo,cyclop // complexity i
 			usedPrefixes[p] = struct{}{}
 		}
 	}
-	unknownNSCounter := 0
+	// The same holds for well-known namespaces used only below the top level
+	// of retained properties (fields, qualifiers, blank nodes): their
+	// canonical prefix must be reserved before an unknown namespace may
+	// reuse a source prefix.
+	x.reserveNestedPrefixes(usedPrefixes)
+	enc := encoder{x: x, buf: buf, pf: prefixer{used: usedPrefixes, src: x.prefixes}}
+	for _, ns := range nsList {
+		enc.pf.prefix(ns)
+	}
+
+	if len(x.nodes) > 0 {
+		sc := encScratchPool.Get().(*encScratch) //nolint:forcetypeassert,revive // encScratchPool.New always stores *encScratch; pool invariant
+		enc.sc = sc
+		defer releaseEncScratch(sc)
+	}
 
 	for _, ns := range nsList {
+		if s := x.schemaIndex(ns); s != noNode {
+			enc.writeSchema(ns, s)
+			continue
+		}
 		props := x.Properties[ns]
-		prefix := uniquePrefixFor(ns, usedPrefixes, &unknownNSCounter)
-		buf.WriteString("  <rdf:Description rdf:about=\"\" xmlns:")
-		buf.WriteString(prefix)
-		buf.WriteString("=\"")
-		// #170 / XML 1.0 §3.1 / ISO 16684-1 §7: the namespace URI is written as
-		// an XML attribute value and MUST be XML-escaped.  An unescaped URI can
-		// contain '"', '<', or '&' (e.g., a URI decoded from &quot; while parsing
-		// untrusted XMP), which would break the attribute boundary and inject
-		// arbitrary XML.  writeXMLEscaped handles all five XML entities plus C0
-		// control chars, making the value safe for attribute context.
-		writeXMLEscaped(buf, ns)
-		buf.WriteString("\">\n")
+		prefix := enc.pf.prefix(ns)
+		enc.startDescription(ns, prefix, nil)
 
 		// Sort property names for deterministic output.
 		localListPtr := localListPool.Get().(*[]string) //nolint:forcetypeassert,revive // localListPool.New always stores *[]string; pool invariant
@@ -101,78 +119,17 @@ func serialise(x *XMP) ([]byte, error) { //nolint:gocyclo,cyclop // complexity i
 		slices.Sort(localList)
 		*localListPtr = localList
 
-		// #14: Classify properties into three groups before serialising:
-		//   1. Top-level properties (no dot, or dot not preceded by "[N]") → simple / multi-valued.
-		//   2. Struct properties (key "parent.field") → must be emitted under one
-		//      <prefix:parent rdf:parseType="Resource"> wrapper per parent key.
-		//   3. Struct-in-list-item properties (key "parent[N].field") → must be emitted
-		//      as a sequence/bag of rdf:Description elements.
-		//
-		// Strategy: scan localList and collect the set of "top" (parent) names for
-		// struct groups. Emit top-level props first, then each struct group, then
-		// each struct-in-list group. All groups are sorted for deterministic output.
-		topProps, structParents, listStructParents := classifyProps(localList)
+		writeKeyedProperties(buf, x, prefix, ns, props, localList, "")
 
-		for _, local := range topProps {
-			val := props[local]
-			// #RECONCILE-05 / task #273 fix: an array-typed property MUST always
-			// use its rdf:Alt/Seq/Bag collection container per ISO 16684-1 §7.5,
-			// even when it holds exactly one item — the presence of the internal
-			// U+001E multi-item separator is not, by itself, a reliable signal of
-			// array-ness. effectiveContainerType carries that knowledge (from the
-			// source document's own container, when x was parsed, or else the
-			// spec-sourced table) independently of value count.
-			//
-			// Task #274 defense-in-depth assessment: could this dispatch defer to
-			// effectiveContainerType ENTIRELY — i.e. treat isColl==false as proof
-			// the property is scalar and ignore \x1e presence — so a stray sentinel
-			// byte can never misclassify a Simple property as an array? Assessed
-			// and rejected as unclean: effectiveContainerType has no "confirmed
-			// scalar" signal, only "confirmed collection" (from parse-time
-			// containerTypes) or "unknown" (isColl==false covers BOTH a
-			// spec-known Simple property AND a brand-new custom property with no
-			// spec-table entry at all). The ctype=="" branch immediately below
-			// exists precisely for that second case — a caller joining values
-			// manually via Set() on an unrecognised property — and deferring
-			// blindly to isColl==false would silently downgrade that legitimate
-			// multi-value property to a Simple element, replacing its \x1e
-			// separators with U+FFFD on output (writeXMLEscaped) and losing the
-			// list structure entirely: a new corruption, not a fix. Closing this
-			// narrower residual (a raw, un-encoded U+001E byte copied verbatim
-			// from ill-formed XML text — decodeCharRef's numeric-character-reference
-			// vector is closed by isForbiddenXMLCharRef in rdf.go) would require a
-			// new "confirmed Simple at parse time" record, which is disproportionate
-			// given the primary vector is already closed at the input boundary.
-			ctype, isColl := x.effectiveContainerType(ns, local)
-			if strings.IndexByte(val, '\x1e') < 0 && !isColl {
-				writeSimpleProperty(buf, prefix, local, val)
-			} else {
-				if ctype == "" {
-					// The value carries the \x1e separator but (ns, local) has no
-					// parse-time record and no spec-table entry — e.g. a caller
-					// joined values manually via Set() for an unrecognised
-					// property. Fall back to the historical default container.
-					ctype = collectionType(ns, local)
-				}
-				writeMultiValuedProperty(buf, prefix, local, val, ctype)
-			}
-		}
-		for _, parent := range structParents {
-			writeStructProperty(buf, prefix, parent, props, localList)
-		}
-		for _, parent := range listStructParents {
-			writeStructInListProperty(buf, x, prefix, ns, parent, props, localList)
-		}
-
-		// #151: localListPool.Put MUST follow the last use of localList (i.e.
-		// after all three classify loops above). Putting the pointer back to the
-		// pool before the loops complete would allow another goroutine to receive
-		// and overwrite the backing slice while this call is still iterating it.
-		// The current placement (after writeStructInListProperty) is correct.
+		// #151: localListPool.Put MUST follow the last use of localList.
+		// Putting the pointer back to the pool earlier would allow another
+		// goroutine to receive and overwrite the backing slice while this
+		// call is still iterating it.
 		localListPool.Put(localListPtr)
 		buf.WriteString("  </rdf:Description>\n")
 	}
 
+	enc.writeBlankBlocks()
 	buf.WriteString(" </rdf:RDF>\n</x:xmpmeta>\n")
 
 	// 2 KB padding of spaces / newlines for in-place editing (XMP §7.3).
@@ -185,6 +142,258 @@ func serialise(x *XMP) ([]byte, error) { //nolint:gocyclo,cyclop // complexity i
 	result := bytes.Clone(buf.Bytes())
 	encBufPool.Put(buf)
 	return result, nil
+}
+
+// reserveNestedPrefixes adds to used the canonical prefix of every
+// well-known namespace that occurs in the retained tree.
+func (x *XMP) reserveNestedPrefixes(used map[string]struct{}) {
+	for i := range x.nodes {
+		if p, ok := prefixMap[x.nodes[i].ns]; ok {
+			used[p] = struct{}{}
+		}
+	}
+}
+
+// namespaces appends to dst, sorted, every namespace that has Properties
+// entries or retained tree properties.
+func (x *XMP) namespaces(dst []string) []string {
+	for ns, props := range x.Properties {
+		if len(props) > 0 {
+			dst = append(dst, ns)
+		}
+	}
+	if len(x.nodes) > 0 {
+		for s := x.nodes[0].firstChild; s != noNode; s = x.nodes[s].next {
+			if x.nodes[s].flags&nodeBlank != 0 {
+				continue
+			}
+			if ns := x.nodes[s].ns; len(x.Properties[ns]) == 0 && x.nodes[s].firstChild != noNode {
+				dst = append(dst, ns)
+			}
+		}
+	}
+	slices.Sort(dst)
+	return dst
+}
+
+// owned returns, in key order, the keys of sc.keys that belong to the
+// retained property with ordinal o. The first call groups every bucketed key
+// by ordinal in one pass (a counting sort over sc.counts), so a schema with
+// many modified properties is handled in linear time.
+func (sc *encScratch) owned(o int) []string {
+	if len(sc.byOrd) == 0 {
+		sc.start = slices.Grow(sc.start[:0], len(sc.counts)+1)[:len(sc.counts)+1]
+		sc.start[0] = 0
+		for i, n := range sc.counts {
+			sc.start[i+1] = sc.start[i] + n
+		}
+		total := sc.start[len(sc.counts)]
+		sc.byOrd = slices.Grow(sc.byOrd[:0], total)[:total]
+		next := slices.Clone(sc.start[:len(sc.counts)])
+		for i, k := range sc.keys {
+			if ord := sc.ords[i]; ord >= 0 {
+				sc.byOrd[next[ord]] = k
+				next[ord]++
+			}
+		}
+	}
+	return sc.byOrd[sc.start[o]:sc.start[o+1]]
+}
+
+// releaseEncScratch returns sc to its pool, clearing every reference to
+// caller-owned strings first. It is a function rather than an encoder method
+// so that the encoder, and the prefix map it holds, stay on the stack.
+func releaseEncScratch(sc *encScratch) {
+	clear(sc.nodes)
+	sc.nodes = sc.nodes[:0]
+	sc.keyBuf = sc.keyBuf[:0]
+	sc.items = sc.items[:0]
+	clear(sc.keys)
+	sc.keys = sc.keys[:0]
+	clear(sc.keyed)
+	sc.keyed = sc.keyed[:0]
+	clear(sc.extra)
+	sc.extra = sc.extra[:0]
+	clear(sc.byOrd)
+	sc.byOrd = sc.byOrd[:0]
+	clearMap(sc.seen)
+	sc.props = sc.props[:0]
+	encScratchPool.Put(sc)
+}
+
+// startDescription writes the rdf:Description start tag of namespace ns,
+// bound to prefix, declaring also every namespace in extra.
+func (e *encoder) startDescription(ns, prefix string, extra []string) {
+	buf := e.buf
+	buf.WriteString("  <rdf:Description rdf:about=\"")
+	writeXMLEscaped(buf, e.x.about)
+	buf.WriteString("\" xmlns:")
+	buf.WriteString(prefix)
+	buf.WriteString("=\"")
+	// #170 / XML 1.0 §3.1 / ISO 16684-1 §7: the namespace URI is written as
+	// an XML attribute value and MUST be XML-escaped.  An unescaped URI can
+	// contain '"', '<', or '&' (e.g., a URI decoded from &quot; while parsing
+	// untrusted XMP), which would break the attribute boundary and inject
+	// arbitrary XML.  writeXMLEscaped handles all five XML entities plus C0
+	// control chars, making the value safe for attribute context.
+	writeXMLEscaped(buf, ns)
+	buf.WriteByte('"')
+	for _, u := range extra {
+		if u == ns {
+			continue
+		}
+		buf.WriteString(" xmlns:")
+		buf.WriteString(e.pf.prefix(u))
+		buf.WriteString("=\"")
+		writeXMLEscaped(buf, u)
+		buf.WriteByte('"')
+	}
+	buf.WriteString(">\n")
+}
+
+// writeSchema writes the rdf:Description of namespace ns, whose retained
+// schema node is s: first the retained properties, then the Properties
+// entries that belong to no retained property.
+func (e *encoder) writeSchema(ns string, s int32) { //nolint:cyclop,gocyclo // classification, status, and emission of the two property sources of one namespace
+	x := e.x
+	t := x.nodes
+	props := x.Properties[ns]
+	sc := e.sc
+
+	// The retained properties of the schema, in document order.
+	sc.props = sc.props[:0]
+	for c := t[s].firstChild; c != noNode; c = t[c].next {
+		sc.props = append(sc.props, c)
+	}
+	names := propNames{t: t, props: sc.props}
+	if len(sc.props) > dupLinearLimit {
+		names.index = make(map[string]int, len(sc.props))
+		for o, c := range sc.props {
+			if _, dup := names.index[t[c].name]; !dup {
+				names.index[t[c].name] = o
+			}
+		}
+	}
+
+	// Sort the keys and bucket them by retained property.
+	sc.keys = sc.keys[:0]
+	for k := range props {
+		sc.keys = append(sc.keys, k)
+	}
+	slices.Sort(sc.keys)
+	sc.counts = slices.Grow(sc.counts[:0], len(sc.props))[:len(sc.props)]
+	clear(sc.counts)
+	sc.keyed = sc.keyed[:0]
+	sc.ords = sc.ords[:0]
+	clear(sc.byOrd)
+	sc.byOrd = sc.byOrd[:0]
+	for _, k := range sc.keys {
+		o := names.bucketOf(k)
+		sc.ords = append(sc.ords, o)
+		if o >= 0 {
+			sc.counts[o]++
+		} else {
+			sc.keyed = append(sc.keyed, k)
+		}
+	}
+
+	sc.status = slices.Grow(sc.status[:0], len(sc.props))[:len(sc.props)]
+	write := len(sc.keyed) > 0
+	sc.extra = sc.extra[:0]
+	clearMap(sc.seen)
+	for o, c := range sc.props {
+		sc.status[o] = e.status(c, props, sc.counts[o])
+		if sc.status[o] != propDeleted {
+			write = true
+			sc.extra = collectNS(t, c, sc.extra, sc.seen)
+		}
+	}
+	if !write {
+		return
+	}
+	for _, u := range sc.extra {
+		e.pf.prefix(u)
+	}
+	prefix := e.pf.prefix(ns)
+	e.startDescription(ns, prefix, sc.extra)
+
+	for o, c := range sc.props {
+		switch sc.status[o] {
+		case propDeleted:
+		case propUnchanged:
+			e.emitNode(t, c, 3, false)
+		default:
+			own := sc.owned(o)
+			if r, ok := e.merge(c, props, own); ok {
+				e.emitNode(sc.nodes, r, 3, false)
+			} else {
+				ctype := ""
+				if t[c].isArray() {
+					ctype = t[c].containerName()
+				}
+				writeKeyedProperties(e.buf, x, prefix, ns, props, own, ctype)
+			}
+		}
+	}
+	writeKeyedProperties(e.buf, x, prefix, ns, props, sc.keyed, "")
+	e.buf.WriteString("  </rdf:Description>\n")
+}
+
+// writeKeyedProperties writes the Properties entries localList (sorted) of
+// namespace ns from their keys alone: plain keys as simple or array
+// properties, "parent.field" keys as structs and "parent[N].field" keys as
+// arrays of structs. ctype, when not empty, is the container to use for
+// arrays instead of the spec-sourced default.
+func writeKeyedProperties(buf *bytes.Buffer, x *XMP, prefix, ns string, props map[string]string, localList []string, ctype string) {
+	// #14: Classify properties into three groups before serialising:
+	//   1. Top-level properties (no dot, or dot not preceded by "[N]") → simple / multi-valued.
+	//   2. Struct properties (key "parent.field") → must be emitted under one
+	//      <prefix:parent rdf:parseType="Resource"> wrapper per parent key.
+	//   3. Struct-in-list-item properties (key "parent[N].field") → must be emitted
+	//      as a sequence/bag of rdf:Description elements.
+	topProps, structParents, listStructParents := classifyProps(localList)
+
+	for _, local := range topProps {
+		val := props[local]
+		// #RECONCILE-05 / task #273: an array-typed property MUST always use
+		// its rdf:Alt/Seq/Bag collection container per ISO 16684-1 §7.5,
+		// even when it holds exactly one item — the presence of the internal
+		// U+001E multi-item separator is not, by itself, a reliable signal of
+		// array-ness. effectiveContainerType carries that knowledge from the
+		// spec-sourced table; a parsed property whose container differs from
+		// the table is retained in the tree and never reaches this function
+		// unmodified (task #303).
+		//
+		// Task #274 defense-in-depth assessment: deferring to
+		// effectiveContainerType ENTIRELY (ignoring \x1e) was rejected —
+		// isColl==false covers BOTH a spec-known Simple property AND a new
+		// custom property, and a caller joining values via Set() on a custom
+		// property relies on the \x1e branch below to get a collection.
+		// Numeric character references cannot smuggle U+001E into a parsed
+		// value (isForbiddenXMLCharRef in rdf.go).
+		ct, isColl := x.effectiveContainerType(ns, local)
+		if ctype != "" {
+			ct, isColl = ctype, true
+		}
+		if strings.IndexByte(val, '\x1e') < 0 && !isColl {
+			writeSimpleProperty(buf, prefix, local, val)
+		} else {
+			if ct == "" {
+				// The value carries the \x1e separator but (ns, local) has no
+				// spec-table entry — e.g. a caller joined values manually via
+				// Set() for an unrecognised property. Fall back to the
+				// historical default container.
+				ct = collectionType(ns, local)
+			}
+			writeMultiValuedProperty(buf, prefix, local, val, ct)
+		}
+	}
+	for _, parent := range structParents {
+		writeStructProperty(buf, prefix, parent, props, localList)
+	}
+	for _, parent := range listStructParents {
+		writeStructInListProperty(buf, x, prefix, ns, parent, props, localList, ctype)
+	}
 }
 
 // writeSimpleProperty writes a single-valued XMP property element to buf.
@@ -308,7 +517,7 @@ func classifyProps(localList []string) (topProps, structParents, listStructParen
 //   - "plain"           → parent="", field="plain", isListStruct=false, isStruct=false
 //
 // #14 / #13: The bracket index format "parent[N].field" is produced by
-// buildStructInListKey in rdf.go; "parent.field" is produced by onCharDataStructField.
+// the projection of the parse tree (project.go), which also produces "parent.field".
 func parseStructKey(local string) (parent, field string, isListStruct, isStruct bool) {
 	bracketIdx := strings.IndexByte(local, '[')
 	dotIdx := strings.IndexByte(local, '.')
@@ -386,7 +595,7 @@ func writeStructProperty(buf *bytes.Buffer, prefix, parent string, props map[str
 // properties with no parse-time record.
 //
 // Items are sorted by index to ensure deterministic, correct ordering.
-func writeStructInListProperty(buf *bytes.Buffer, x *XMP, prefix, ns, parent string, props map[string]string, localList []string) {
+func writeStructInListProperty(buf *bytes.Buffer, x *XMP, prefix, ns, parent string, props map[string]string, localList []string, ctypeHint string) {
 	// Collect all unique indices present for this parent.
 	indices := collectStructInListIndices(parent, localList)
 	if len(indices) == 0 {
@@ -395,6 +604,9 @@ func writeStructInListProperty(buf *bytes.Buffer, x *XMP, prefix, ns, parent str
 	slices.Sort(indices)
 
 	ctype, isColl := x.effectiveContainerType(ns, parent)
+	if ctypeHint != "" {
+		ctype, isColl = ctypeHint, true
+	}
 	if !isColl {
 		// A struct-in-list property is always wrapped in a collection — there
 		// is no "simple" rendering for an array of structs — so fall back to

@@ -292,7 +292,8 @@ func TestPatchSubIFDPointersMismatch(t *testing.T) {
 	subIFDs := []*subIFDInfo{sub0, sub1, sub2}
 
 	// Must not panic under -race.
-	err := patchSubIFDPointers(finalTIFF, subIFDs, false, order)
+	// The array of IFD0 (chain position 0) is the one under test.
+	err := patchSubIFDPointers(finalTIFF, subIFDTree{roots: [][]*subIFDInfo{subIFDs}}, false, order)
 
 	// (c) Error must be ErrSubIFDCountMismatch.
 	if !errors.Is(err, ErrSubIFDCountMismatch) {
@@ -345,7 +346,7 @@ func TestPatchSubIFDPointersMismatchReverse(t *testing.T) {
 	sub1 := &subIFDInfo{newOffset: 0xBBBB}
 	subIFDs := []*subIFDInfo{sub0, sub1} // only 2, declared = 3
 
-	err := patchSubIFDPointers(buf, subIFDs, false, order)
+	err := patchSubIFDPointers(buf, subIFDTree{roots: [][]*subIFDInfo{subIFDs}}, false, order)
 	if !errors.Is(err, ErrSubIFDCountMismatch) {
 		t.Errorf("want ErrSubIFDCountMismatch, got %v", err)
 	}

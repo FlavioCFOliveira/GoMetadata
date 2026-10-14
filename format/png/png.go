@@ -146,25 +146,27 @@ func zlibDecompress(data []byte) ([]byte, error) {
 }
 
 // processExtractChunk dispatches a single PNG chunk during Extract, updating
-// rawEXIF and rawXMP as appropriate. It returns (rawEXIF, rawXMP, done, err)
-// where done is true when IEND signals the end of the chunk stream.
-// data is backed by a pooled buffer; any slice that must outlive this call is
-// cloned here or in its callees before being returned as rawEXIF/rawXMP.
-func processExtractChunk(chunkType [4]byte, data, rawEXIF, rawXMP []byte) ([]byte, []byte, bool, error) {
+// st as appropriate. It returns done = true when IEND signals the end of the
+// chunk stream. data is backed by a pooled buffer; any slice that must outlive
+// this call is cloned here or in its callees before being stored in st.
+func processExtractChunk(chunkType [4]byte, data []byte, st *extractState) (done bool, err error) {
 	switch chunkType {
 	case chunkEXIf:
 		// Clone: data is pooled and will be returned to the pool after this call.
-		return bytes.Clone(data), rawXMP, false, nil
+		st.exif = bytes.Clone(data)
 	case chunkITXt, chunkTEXt, chunkZTXt:
-		xmp, err := handleXMPChunk(chunkType, data, rawXMP)
+		xmp, err := handleXMPChunk(chunkType, data, st.xmp)
 		if err != nil {
-			return rawEXIF, rawXMP, false, err
+			return false, err
 		}
-		return rawEXIF, xmp, false, nil
+		st.xmp = xmp
+		// "Raw profile type ..." chunks: decodeRawProfile always returns a fresh
+		// buffer, so nothing aliases the pooled data.
+		st.addRawProfile(chunkType, data)
 	case chunkIEND:
-		return rawEXIF, rawXMP, true, nil
+		return true, nil
 	}
-	return rawEXIF, rawXMP, false, nil
+	return false, nil
 }
 
 // extractIgnores reports whether Extract's chunk-scanning loop can skip a
@@ -273,13 +275,14 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	// #288: hdr is hoisted out of the loop and reused for every chunk header
 	// instead of being declared fresh per call.
 	var hdr [8]byte
+	var st extractState
 	pos := int64(len(pngSig))
 	var done bool
 	for !done {
 		var n int64
 		n, err = readOrSkipChunk(r, &hdr, pos, total, func(chunkType [4]byte, data []byte) error {
 			var perr error
-			rawEXIF, rawXMP, done, perr = processExtractChunk(chunkType, data, rawEXIF, rawXMP)
+			done, perr = processExtractChunk(chunkType, data, &st)
 			return perr
 		})
 		pos = n
@@ -296,7 +299,8 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 			return nil, nil, nil, err
 		}
 	}
-	return rawEXIF, nil, rawXMP, nil
+	rawEXIF, rawIPTC, rawXMP = st.result()
+	return rawEXIF, rawIPTC, rawXMP, nil
 }
 
 // readOrSkipChunk reads one PNG chunk header at the reader's current
@@ -554,7 +558,7 @@ func writeVerbatimChunk(w io.Writer, hdr *[8]byte, data []byte, crcB [4]byte) er
 // rejected here rather than silently accepted.
 //
 //nolint:cyclop,gocyclo // straight-line chunk-type dispatch; splitting would obscure the shared bounds check every branch needs
-func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64, rawEXIF, rawXMP []byte) (int64, error) {
+func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64, rawEXIF, rawIPTC, rawXMP []byte) (int64, error) {
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return pos, fmt.Errorf("png: read chunk header: %w", err)
 	}
@@ -585,15 +589,15 @@ func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64
 		return pos + length + 4, nil
 	}
 
-	if chunkType == chunkITXt {
+	// iTXt is always inspected (it may be the XMP chunk being replaced);
+	// tEXt and zTXt only when an IPTC write may have to rewrite a "Raw profile
+	// type iptc" chunk (task #314), so a write without IPTC still streams them.
+	if chunkType == chunkITXt || (rawIPTC != nil && (chunkType == chunkTEXt || chunkType == chunkZTXt)) {
 		data, crcB, release, err := readChunkBody(r, length)
 		if err != nil {
 			return pos, fmt.Errorf("png: chunk %q: %w", chunkTypeStr(chunkType), err)
 		}
-		var werr error
-		if !shouldDropChunk(chunkType, data) {
-			werr = writeVerbatimChunk(w, hdr, data, crcB)
-		}
+		werr := writeTextChunk(w, hdr, chunkType, data, crcB, rawIPTC)
 		release()
 		if werr != nil {
 			return pos, werr
@@ -615,9 +619,37 @@ func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64
 	return pos + length + 4, nil
 }
 
+// writeTextChunk writes the text chunk data (type chunkType, original CRC
+// crcB) read by injectOneChunk: an XMP iTXt chunk is dropped (Inject writes
+// its own), an IPTC raw profile chunk is rewritten with rawIPTC when it holds
+// another IIM (rewriteRawProfileIPTC; a fresh CRC is computed), and any other
+// chunk is copied through byte-identical, original CRC included.
+func writeTextChunk(w io.Writer, hdr *[8]byte, chunkType [4]byte, data []byte, crcB [4]byte, rawIPTC []byte) error {
+	if shouldDropChunk(chunkType, data) {
+		return nil
+	}
+	if rawIPTC != nil {
+		payload, ok, err := rewriteRawProfileIPTC(chunkType, data, rawIPTC)
+		if err != nil {
+			return err
+		}
+		if ok {
+			if len(payload) > maxPNGChunkSize {
+				return fmt.Errorf("png: raw profile chunk length %d exceeds limit: %w", len(payload), ErrChunkTooLarge)
+			}
+			return writeChunk(w, chunkType, payload)
+		}
+	}
+	return writeVerbatimChunk(w, hdr, data, crcB)
+}
+
 // Inject reads the PNG chunk stream from r, replaces or inserts the eXIf and
-// iTXt(XMP) chunks, and writes the result to w. IPTC is not natively
-// supported in PNG; rawIPTC is ignored.
+// iTXt(XMP) chunks, and writes the result to w. PNG has no native IPTC
+// chunk, so rawIPTC is not added to a file that has none; when the file
+// already carries IPTC in a "Raw profile type iptc" text chunk (the ImageMagick
+// convention ExifTool also writes), that chunk is rewritten to hold rawIPTC,
+// so it never contradicts the IPTC just written (task #314). A nil rawIPTC
+// leaves such a chunk unchanged.
 //
 // preserveUnknownSegments must be true. PNG chunk semantics differ
 // fundamentally from JPEG APPn segments: chunks such as tEXt, gAMA, cHRM, and
@@ -675,7 +707,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	pos := int64(len(pngSig))
 	for {
 		var err error
-		pos, err = injectOneChunk(r, w, &hdr, pos, total, rawEXIF, rawXMP)
+		pos, err = injectOneChunk(r, w, &hdr, pos, total, rawEXIF, rawIPTC, rawXMP)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break

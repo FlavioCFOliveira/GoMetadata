@@ -1,0 +1,351 @@
+package xmp
+
+// Adapted from Adobe XMP-Toolkit-SDK XMPCore/source/ExpatAdapter.cpp:SetQualName, Copyright 2005 Adobe, SPDX-License-Identifier: BSD-3-Clause
+//
+// See THIRD_PARTY_NOTICES.md for the licence note on this file. Only the
+// compatibility mapping of an unqualified about/ID attribute of
+// rdf:Description is adapted; the scanner itself is original.
+
+import (
+	"bytes"
+	"slices"
+)
+
+// maxXMLDepth is the maximum element nesting depth accepted by the scanner.
+// A deeper document is rejected with ErrXMLNestingDepth. The limit bounds
+// the recursion of the RDF parser (parserdf.go) and of the serialiser.
+const maxXMLDepth = 100
+
+// xelem is one element of the transient element tree built by scanXML.
+//
+// Every []byte and string field is a TRANSIENT view of the input buffer (or
+// a heap string produced by entity decoding) and is valid only during the
+// synchronous Parse call that built it; see transientAliasString's contract.
+// Nothing in an xelem is ever stored in an *XMP without being interned first.
+type xelem struct {
+	prefix, local []byte  // qualified name split at the first ':'
+	ns            string  // namespace URI resolved for prefix ("" when unbound)
+	term          rdfTerm // RDF syntax term of the name (termOther outside rdf:)
+
+	// The character data of the element is decoded on demand by
+	// xmlDoc.text: most elements (rdf:RDF, rdf:Description, containers)
+	// carry only whitespace that the RDF parser never reads. textPos is the
+	// offset of the first run (after the start tag; -1 for an empty-element
+	// tag), extra any CDATA found after later markup, and text the cache.
+	textPos  int32
+	textDone bool
+	extra    string
+	text     string
+
+	attrLo, attrHi int32 // attributes are xmlDoc.attrs[attrLo:attrHi]
+
+	firstChild, lastChild, next int32 // child element links; noNode terminates
+}
+
+// xattr is one non-namespace-declaration attribute of an xelem.
+type xattr struct {
+	prefix, local []byte
+	ns            string // namespace URI resolved for prefix ("" for an unprefixed attribute)
+	val           string
+	term          rdfTerm // RDF syntax term of the name (termOther outside rdf:)
+}
+
+// nsBinding is one in-scope namespace declaration (xmlns:prefix="uri").
+type nsBinding struct {
+	prefix []byte
+	uri    string
+}
+
+// openElem records an element that is open on the scanner stack together
+// with the length of the namespace scope before its own declarations, so the
+// scope can be restored when the element closes (XML Namespaces §6.1).
+type openElem struct {
+	elem     int32
+	scopeLen int32
+}
+
+// xmlDoc is the transient element tree of one XMP document. It plays the
+// role of the XML_Node tree that the Adobe XMP Toolkit builds with Expat
+// before its RDF parser runs, which gives the RDF parser the look-ahead it
+// needs to tell the property element forms apart (RDF/XML Syntax §7.2.14).
+//
+// All slices grow on demand, so neither the number of attributes on one
+// element nor the number of namespace declarations in scope is capped
+// (task #283). elems[0] is a virtual document node whose children are the
+// top-level elements.
+type xmlDoc struct {
+	src   []byte // the document being scanned (transient, see transientAliasString)
+	elems []xelem
+	attrs []xattr
+	scope []nsBinding
+	open  []openElem
+
+	// hasNodeID records that some attribute is named nodeID, so the RDF
+	// parser looks for rdf:nodeID references only in documents that can
+	// have them.
+	hasNodeID bool
+
+	// inFirstRun is true between a start tag and the next markup other than
+	// a CDATA section: a CDATA section met in that span belongs to the
+	// element's first character-data run, which xmlDoc.text decodes.
+	inFirstRun bool
+}
+
+// text returns the character data of element e: its first run, entity-decoded
+// and trimmed, followed by any CDATA section found after later markup. It
+// is computed once, on first use.
+func (d *xmlDoc) text(e int32) string {
+	el := &d.elems[e]
+	if el.textDone {
+		return el.text
+	}
+	el.textDone = true
+	if el.textPos >= 0 {
+		_, el.text = collectTextContent(d.src, int(el.textPos))
+	}
+	if el.extra != "" {
+		if el.text == "" {
+			el.text = el.extra
+		} else {
+			el.text += el.extra
+		}
+	}
+	return el.text
+}
+
+// reset prepares d for a new document. It clears the previous content first
+// so that no transient view of an earlier input buffer stays reachable from a
+// pooled xmlDoc (finding XMPBUF-RETAIN-01).
+func (d *xmlDoc) reset() {
+	clear(d.elems)
+	clear(d.attrs)
+	clear(d.scope)
+	d.src = nil
+	d.inFirstRun = false
+	d.elems = d.elems[:0]
+	d.attrs = d.attrs[:0]
+	d.scope = d.scope[:0]
+	d.open = d.open[:0]
+	d.hasNodeID = false
+	d.elems = append(d.elems, xelem{firstChild: noNode, lastChild: noNode, next: noNode, textPos: -1})
+	// XML Namespaces §3: the 'xml' prefix is bound to XMLNamespaceURI by
+	// definition and needs no declaration, so xml:lang always resolves.
+	d.scope = append(d.scope, nsBinding{prefix: xmlPrefixBytes, uri: XMLNamespaceURI})
+}
+
+// canonicalNS returns the package constant for the namespaces that the RDF
+// parser compares against, so that those comparisons find identical string
+// data and finish without comparing bytes; any other URI is returned as is.
+func canonicalNS(uri string) string {
+	switch uri {
+	case NSrdf:
+		return NSrdf
+	case XMLNamespaceURI:
+		return XMLNamespaceURI
+	case NSx:
+		return NSx
+	}
+	return uri
+}
+
+// resolve returns the URI bound to prefix by the innermost in-scope
+// declaration, or "" when prefix is empty or unbound. XMP does not use
+// default namespaces, so an unprefixed name has no namespace (as before).
+func (d *xmlDoc) resolve(prefix []byte) string {
+	if len(prefix) == 0 {
+		return ""
+	}
+	for _, b := range slices.Backward(d.scope) {
+		// Length and first byte reject most bindings before bytes.Equal.
+		if q := b.prefix; len(q) == len(prefix) && q[0] == prefix[0] && bytes.Equal(q, prefix) {
+			return b.uri
+		}
+	}
+	return ""
+}
+
+// scanXML builds the element tree of b into d. It never fails on malformed
+// input except for a nesting depth above maxXMLDepth: unmatched end tags are
+// ignored, unterminated constructs end the scan, and an unclosed element is
+// closed implicitly at the end of the input. Comments, processing
+// instructions and DOCTYPE declarations are skipped without interpretation,
+// so no entity is ever expanded from a DTD (anti-XXE).
+func scanXML(b []byte, d *xmlDoc) error { //nolint:cyclop,gocyclo // one branch per XML markup kind (XML 1.0 §2.4–§2.8)
+	d.src = b
+	pos := 0
+	for pos < len(b) {
+		i := bytes.IndexByte(b[pos:], '<')
+		if i < 0 {
+			break
+		}
+		pos += i + 1 // b[pos] is the byte after '<'
+		if pos >= len(b) {
+			break
+		}
+
+		// XML 1.0 §2.7: a CDATA section found outside the text run that
+		// follows a start tag (for example after a comment) still belongs to
+		// the character data of the innermost open element.
+		if isCDATA(b, pos) {
+			content, after := parseCDATA(b, pos)
+			pos = after
+			if !d.inFirstRun && len(content) > 0 && len(d.open) > 0 {
+				e := &d.elems[d.open[len(d.open)-1].elem]
+				if e.extra == "" {
+					e.extra = transientAliasString(content)
+				} else {
+					e.extra += string(content)
+				}
+			}
+			continue
+		}
+
+		d.inFirstRun = false
+		if newPos, skipped := skipSpecialTag(b, pos); skipped {
+			pos = newPos
+			continue
+		}
+
+		if b[pos] == '/' {
+			end := bytes.IndexByte(b[pos:], '>')
+			if end < 0 {
+				break
+			}
+			pos += end + 1
+			d.closeElem()
+			continue
+		}
+
+		var err error
+		if pos, err = d.startElem(b, pos); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// closeElem pops the innermost open element and restores the namespace
+// scope that was in effect before it. A spurious end tag with no open
+// element is ignored.
+func (d *xmlDoc) closeElem() {
+	n := len(d.open)
+	if n == 0 {
+		return
+	}
+	top := d.open[n-1]
+	clear(d.scope[top.scopeLen:])
+	d.scope = d.scope[:top.scopeLen]
+	d.open = d.open[:n-1]
+}
+
+// startElem parses the start tag (or empty-element tag) that begins at
+// b[pos], the byte after '<'. It records the element, its attributes and its
+// namespace declarations, and the first run of character data that follows
+// the tag. It returns the position of the next markup.
+func (d *xmlDoc) startElem(b []byte, pos int) (int, error) { //nolint:cyclop,gocyclo // start tag, attributes, namespace resolution, and the empty-element form
+	if len(d.open)+1 > maxXMLDepth {
+		return 0, ErrXMLNestingDepth
+	}
+	scopeLen := int32(len(d.scope)) //nolint:gosec // G115: bounded by the 16 MiB document cap
+	attrLo := int32(len(d.attrs))   //nolint:gosec // G115: bounded by the 16 MiB document cap
+
+	prefix, local, pos := scanName(b, pos)
+	pos = d.scanAttrs(b, pos)
+
+	// XML Namespaces §6.1: the scope of a declaration includes the element
+	// that carries it, so names are resolved only after every attribute of
+	// the start tag has been read — a declaration may follow its first use.
+	attrHi := int32(len(d.attrs)) //nolint:gosec // G115: bounded by the 16 MiB document cap
+	for i := attrLo; i < attrHi; i++ {
+		a := &d.attrs[i]
+		a.ns = d.resolve(a.prefix)
+		a.term = rdfTermKind(a.ns, a.local)
+	}
+
+	selfClose := false
+	if pos < len(b) && b[pos] == '/' {
+		selfClose = true
+		pos++
+	}
+	if pos < len(b) && b[pos] == '>' {
+		pos++
+	}
+
+	ns := d.resolve(prefix)
+	if ns == NSrdf && string(local) == "Description" {
+		// Compatibility with pre-standard XMP (ExpatAdapter.cpp:SetQualName):
+		// an unqualified "about" or "ID" attribute of rdf:Description means
+		// rdf:about or rdf:ID. Early Adobe writers emitted that form.
+		for i := attrLo; i < attrHi; i++ {
+			if a := &d.attrs[i]; a.ns == "" && (string(a.local) == "about" || string(a.local) == "ID") {
+				a.ns = NSrdf
+				a.term = rdfTermKind(a.ns, a.local)
+			}
+		}
+	}
+
+	idx := int32(len(d.elems)) //nolint:gosec // G115: bounded by the 16 MiB document cap
+	parent := int32(0)
+	if n := len(d.open); n > 0 {
+		parent = d.open[n-1].elem
+	}
+	d.elems = append(d.elems, xelem{
+		prefix: prefix, local: local, ns: ns, term: rdfTermKind(ns, local),
+		attrLo: attrLo, attrHi: attrHi,
+		firstChild: noNode, lastChild: noNode, next: noNode,
+		textPos: -1,
+	})
+	p := &d.elems[parent]
+	if p.lastChild == noNode {
+		p.firstChild = idx
+	} else {
+		d.elems[p.lastChild].next = idx
+	}
+	p.lastChild = idx
+
+	if selfClose {
+		clear(d.scope[scopeLen:])
+		d.scope = d.scope[:scopeLen]
+		return pos, nil
+	}
+	d.open = append(d.open, openElem{elem: idx, scopeLen: scopeLen})
+	d.elems[idx].textPos = int32(pos) //nolint:gosec // G115: bounded by the 16 MiB document cap
+	d.inFirstRun = true
+	return pos, nil
+}
+
+// scanAttrs parses the attributes of a start tag beginning at b[pos] up to
+// the closing '>' or '/'. Namespace declarations are pushed onto the scope;
+// every other attribute is appended to d.attrs with its namespace still
+// unresolved. Neither list is capped (task #283).
+func (d *xmlDoc) scanAttrs(b []byte, pos int) int { //nolint:cyclop,gocyclo // attribute list grammar (XML 1.0 §3.1) and the three attribute kinds
+	// XML 1.0 §3.1: the attribute list ends at '>' or '/'. A '<' inside a tag
+	// is illegal (XML 1.0 §2.4) and also ends the list, which guarantees
+	// progress on malformed input.
+	for pos < len(b) && b[pos] != '>' && b[pos] != '/' && b[pos] != '<' {
+		for pos < len(b) && isASCIISpace(b[pos]) {
+			pos++
+		}
+		if pos >= len(b) || b[pos] == '>' || b[pos] == '/' || b[pos] == '<' {
+			break
+		}
+		attrPrefix, attrLocal, val, newPos, ok := parseSingleAttr(b, pos)
+		pos = newPos
+		if !ok {
+			continue
+		}
+		switch {
+		case string(attrPrefix) == "xmlns":
+			// xmlns:prefix="uri" — XML Namespaces §3.
+			d.scope = append(d.scope, nsBinding{prefix: attrLocal, uri: canonicalNS(val)})
+		case len(attrPrefix) == 0 && string(attrLocal) == "xmlns":
+			// xmlns="uri" — a default namespace; XMP never relies on it.
+		default:
+			if string(attrLocal) == "nodeID" {
+				d.hasNodeID = true
+			}
+			d.attrs = append(d.attrs, xattr{prefix: attrPrefix, local: attrLocal, val: val})
+		}
+	}
+	return pos
+}

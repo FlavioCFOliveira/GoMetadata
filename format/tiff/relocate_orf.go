@@ -584,7 +584,7 @@ func orfRelocateWithOLYMP(
 	}
 	if rawIPTC != nil {
 		// Adobe XMP Spec / ExifTool convention: IPTC-NAA (0x83BB) as TypeLong.
-		upsertIFD0Entry(e.IFD0, exif.TagIPTC, exif.TypeLong, rawIPTC)
+		upsertIPTC(e.IFD0, rawIPTC)
 	}
 	if rawXMP != nil {
 		// Adobe XMP Spec (TIFF Technical Note 3): XMP (0x02BC) as TypeByte.
@@ -635,7 +635,8 @@ func orfRelocateWithOLYMP(
 	}
 
 	// Step 4: enumerate SubIFDs (tag 0x014A).
-	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget, fileLen)
+	subTree, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget, fileLen)
+	subIFDs := subTree.all
 	if subErr != nil {
 		return nil, nil, fmt.Errorf("enumerate SubIFDs: %w", subErr)
 	}
@@ -661,7 +662,7 @@ func orfRelocateWithOLYMP(
 	ifdEnd := uint64(ifdEndInt) //nolint:gosec // G115: EncodedSize never returns a negative length
 
 	// Step 7: assign new absolute offsets.
-	subIFDsSize := computeSubIFDsSize(subIFDs)
+	subIFDsSize := computeSubIFDsSize(ifdEnd, subIFDs)
 	imageStart := ifdEnd + subIFDsSize
 	// Include the thumbBlock in the allBlocks slice for assignNewOffsets.
 	allBlocks := blocks
@@ -702,8 +703,8 @@ func orfRelocateWithOLYMP(
 	rebaseOlympMakerNote(finalTIFF, mnInfo, thumbBlock, order)
 
 	// Step 10: patch the 0x014A SubIFDs pointer array in finalTIFF.
-	if len(subIFDs) > 0 {
-		if pErr := patchSubIFDPointers(finalTIFF, subIFDs, false, order); pErr != nil {
+	if subTree.roots != nil {
+		if pErr := patchSubIFDPointers(finalTIFF, subTree, false, order); pErr != nil {
 			return nil, nil, fmt.Errorf("patch SubIFD pointers: %w", pErr)
 		}
 	}

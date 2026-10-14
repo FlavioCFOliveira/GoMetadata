@@ -33,10 +33,10 @@ import (
 // 32-bit file offsets) may safely continue using MakerNoteOffset.
 //
 // These fields are informational: callers can use them to detect whether Encode
-// has moved the MakerNote to a different position.  Manufacturers that store
-// MakerNote-internal offsets relative to the parent TIFF start (e.g. certain
-// Nikon bodies) will produce stale internal offsets if the MakerNote moves;
-// full offset rebasing is not yet implemented.  EXIF §4.6.5, tag 0x927C.
+// has moved the MakerNote to a different position.  Encode copies the
+// MakerNote verbatim; when its layout counts value offsets from the TIFF
+// header (EXIF.MakerNoteLayout), a writer that moves it must rebase them, as
+// the TIFF-family writers of format/tiff do.  EXIF §4.6.5, tag 0x927C.
 // BigTIFF spec §2 (Aware Systems / libtiff); fix for audit finding #142.
 //
 // BigTIFF is true when the EXIF was parsed from a BigTIFF source (magic 0x002B,
@@ -144,13 +144,13 @@ func AcceptRAWMagic(magic uint16) ParseOption {
 //  2. b is never mutated in place.
 //
 // Without this option (the default), every ThumbnailData is an independent
-// copy and b may be freely discarded, reused, or pooled the instant Parse
-// returns — Parse's long-standing default contract. This option is for
-// gometadata.Read's own internal use, where the buffer passed to Parse is
-// always Metadata.rawEXIF, a field retained unmodified for the *Metadata's
-// entire lifetime (see Metadata.RawEXIF's defensive bytes.Clone for external
-// callers, which exists precisely because the internal field is never
-// copied-on-read). Passing this option with a transient or mutable buffer
+// copy. Entry values and MakerNote alias b in either case (see Parse), so b
+// must not be modified, reused, or pooled while the result is in use. This
+// option is for gometadata.Read's own internal use, where the buffer passed
+// to Parse is always Metadata.rawEXIF, a field retained unmodified for the
+// *Metadata's entire lifetime (see Metadata.RawEXIF's defensive bytes.Clone
+// for external callers, which exists precisely because the internal field is
+// never copied-on-read). Passing this option with a transient or mutable buffer
 // will corrupt or invalidate the returned ThumbnailData once that buffer is
 // released or modified.
 //
@@ -228,14 +228,19 @@ func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseCon
 		makerNoteOffset64 = mn.rawOffset
 		makerNoteOffset = uint32(mn.rawOffset) //nolint:gosec // G115: classic TIFF offsets always fit uint32
 		if !cfg.skipMakerNote {
+			// task #202: zero-alloc dispatch — pass raw IFDEntry.Value bytes to
+			// makerNoteDispatch so the NUL+whitespace trim and detection operate
+			// on []byte with no heap string allocation.
+			// Task #304: detection is by MakerNote signature first, so a missing
+			// Make no longer skips dispatch (Apple, Epson, ... write signed notes).
+			// EXIF §4.6.4 tag 0x010F (Make); EXIF §4.6.5 tag 0x927C (MakerNote).
+			var makeValue []byte
 			if makeEntry := ifd0.Get(TagMake); makeEntry != nil {
-				// task #202: zero-alloc dispatch — pass raw IFDEntry.Value bytes to
-				// makerNoteDispatch so the NUL+whitespace trim and map lookup operate
-				// on []byte with no heap string allocation. The Go compiler elides the
-				// string([]byte) heap copy when it appears directly as a map key.
-				// EXIF §4.6.4 tag 0x010F (Make); EXIF §4.6.5 tag 0x927C (MakerNote).
-				makerNoteIFD = makerNoteDispatch(makeEntry.Value, order, mn.Value)
+				makeValue = makeEntry.Value
 			}
+			// Task #312: b is passed so that a layout whose value offsets
+			// count from the TIFF header resolves them against b.
+			makerNoteIFD = makerNoteDispatchAt(makeValue, order, mn.Value, b, mn.rawOffset)
 		}
 	}
 
@@ -314,18 +319,19 @@ func parseExifSubIFDsBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *p
 		makerNoteOffset64 = mn.rawOffset
 		makerNoteOffset = uint32(mn.rawOffset & 0xFFFF_FFFF) // backward compat: lower 32 bits only; callers needing full offset use MakerNoteOffset64
 		if !cfg.skipMakerNote {
+			// task #202: zero-alloc dispatch — same pattern as the classic TIFF path.
+			// makerNoteDispatch trims NULs+whitespace from the raw Make bytes and
+			// detects the layout (signature first, task #304) without allocating.
+			// parseMakerNoteIFD uses the classic-TIFF traversal internally; for
+			// BigTIFF containers the MakerNote blob is still a classic-TIFF
+			// fragment so this is correct IF the MakerNote itself is a plain IFD.
+			// On failure (e.g. Nikon encrypted notes) the result is nil — safe.
+			// EXIF §4.6.4 tag 0x010F (Make); BigTIFF spec §2; task #202.
+			var makeValue []byte
 			if makeEntry := ifd0.Get(TagMake); makeEntry != nil {
-				// task #202: zero-alloc dispatch — same pattern as the classic TIFF path.
-				// makerNoteDispatch trims NULs+whitespace from the raw Make bytes and
-				// performs a string([]byte)-keyed map lookup that the Go compiler
-				// special-cases to avoid heap allocation (cmd/compile mapaccess2_faststr).
-				// parseMakerNoteIFD uses the classic-TIFF traversal internally; for
-				// BigTIFF containers the MakerNote blob is still a classic-TIFF
-				// fragment so this is correct IF the MakerNote itself is a plain IFD.
-				// On failure (e.g. Nikon encrypted notes) the result is nil — safe.
-				// EXIF §4.6.4 tag 0x010F (Make); BigTIFF spec §2; task #202.
-				makerNoteIFD = makerNoteDispatch(makeEntry.Value, order, mn.Value)
+				makeValue = makeEntry.Value
 			}
+			makerNoteIFD = makerNoteDispatch(makeValue, order, mn.Value)
 		}
 	}
 
@@ -381,6 +387,10 @@ const bigTIFFMinHeader = 16
 // profile.  The BigTIFF path uses separate traversal functions
 // (traverseBigTIFF, parseSingleIFDBigTIFF, parseIFDEntryBigTIFF) that share
 // the same IFD/IFDEntry types with the classic path.
+//
+// Parse does not copy value bytes: every IFDEntry.Value and EXIF.MakerNote
+// of the result is a view of b (task #296). b must stay unmodified while the
+// result is in use, and the views are read-only — see IFDEntry.Value.
 func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cyclop,funlen // multi-format TIFF/BigTIFF dispatch; branches are inherent in format detection
 	var cfg parseConfig
 	for _, o := range opts {
@@ -1034,16 +1044,31 @@ func (e *EXIF) SetMake(s string) {
 }
 
 // SetDateTimeOriginal sets ExifIFD tag 0x9003 (DateTimeOriginal, EXIF §4.6.5)
-// from t, using the EXIF datetime format "YYYY:MM:DD HH:MM:SS\x00" (20 bytes).
+// from t, using the EXIF datetime format "YYYY:MM:DD HH:MM:SS\x00" (20 bytes),
+// and keeps the two tags that qualify it consistent with t:
+//
+//   - 0x9011 OffsetTimeOriginal is set to the UTC offset of t, "±HH:MM" (EXIF
+//     2.31+, CIPA DC-008-2023 §4.6.5: ASCII, count 7, the offset of
+//     DateTimeOriginal from UTC). A UTC time is written "+00:00".
+//   - 0x9291 SubSecTimeOriginal is removed: it records the fraction of the
+//     second of DateTimeOriginal, which the datetime format above does not
+//     carry, so a fraction left from an earlier value would be wrong.
+//
+// DateTimeOriginal then reads back the same instant as t, to the second.
 func (e *EXIF) SetDateTimeOriginal(t time.Time) {
 	if e == nil || e.IFD0 == nil {
 		return
 	}
 	e.ensureExifIFD()
+	big := e.ifd0BigEndian()
 	// EXIF §4.6.5: DateTimeOriginal is a 20-byte ASCII field including the NUL.
 	formatted := t.Format("2006:01:02 15:04:05") + "\x00"
 	v := []byte(formatted)
-	e.ExifIFD.set(TagDateTimeOriginal, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
+	e.ExifIFD.set(TagDateTimeOriginal, TypeASCII, uint32(len(v)), v, big) //nolint:gosec // G115: string length bounded by input
+	// "-07:00" renders "+00:00" for UTC; the NUL makes the count 7.
+	off := append(t.AppendFormat(make([]byte, 0, 7), "-07:00"), 0)
+	e.ExifIFD.set(TagOffsetTimeOriginal, TypeASCII, uint32(len(off)), off, big) //nolint:gosec // G115: 7 bytes
+	e.ExifIFD.remove(TagSubSecTimeOriginal)
 }
 
 // SetExposureTime sets ExifIFD tag 0x829A (ExposureTime, EXIF §4.6.5).

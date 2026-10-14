@@ -257,35 +257,34 @@ type groupKey struct {
 	tag exif.TagID
 }
 
-// subIFDInfo describes a single SubIFD entry encountered while parsing the
-// 0x014A SubIFDs array from a raw TIFF buffer.
+// subIFDInfo describes one SubIFD carried by a relocation (see the SubIFD
+// model comment above enumerateSubIFDs).
 //
 // srcOffset is the absolute byte position of the SubIFD's IFD block in the
-// original buffer (as stored in the 0x014A value array). The SubIFD's image
-// blocks (strips/tiles) are accumulated in the same imageBlock pool as the
-// main-IFD blocks; the subIFD-local *exif.IFD parsed below is only used to
-// enumerate those blocks and collect their newOffset values.
+// original buffer (as stored in a 0x014A value array). The SubIFD's image
+// blocks (strips/tiles/JPEG) are accumulated in the same imageBlock pool as
+// the main-IFD blocks; ifd, the SubIFD parsed from the source, is only used to
+// enumerate those blocks.
 //
-// rawBytes holds a verbatim copy of the source SubIFD block (count word +
-// entries + next-IFD pointer + value area) taken directly from base[]. It is
-// appended to the output after the main exif.Encode skeleton and before the
-// image blocks. The strip/tile offset entries within rawBytes are patched
-// in-place after assignNewOffsets() to reflect the relocated block positions.
-//
-// parentOffsetArrayPos is the absolute position within the *finalTIFF* output
-// buffer of the uint32 in the 0x014A value array that points at this SubIFD.
-// It is patched after the SubIFD block is appended to finalTIFF so that the
-// 0x014A pointer correctly names the new position.
+// rawBytes is the SubIFD re-serialised by rawSubIFD: directory, zero next-IFD
+// pointer, then every out-of-line value, with value-or-offset fields relative
+// to the block start. It is appended to the output after the main
+// exif.Encode skeleton and before the image blocks, at newOffset, and is
+// completed in place by patchSubIFDImageOffsets once newOffset and the image
+// block offsets are known.
 type subIFDInfo struct {
 	srcOffset uint64    // original SubIFD offset in base
 	ifd       *exif.IFD // parsed SubIFD (for block enumeration)
-	rawBytes  []byte    // verbatim copy of source SubIFD bytes
+	rawBytes  []byte    // re-serialised SubIFD block
 	newOffset uint64    // filled in when SubIFD is appended to output
 	// blocks holds this SubIFD's own image blocks in enumeration order; each
 	// offset tag's blocks are contiguous and ordered by index.
 	blocks []*imageBlock
-	// Note: the 0x014A pointer array is patched via patchSubIFDPointers which
-	// scans the re-encoded finalTIFF — no per-SubIFD pointer slot is tracked here.
+	// children is this SubIFD's own 0x014A array, element by element (nil
+	// for an element whose SubIFD is not carried).
+	children []*subIFDInfo
+	// next is the SubIFD the next-IFD pointer of this SubIFD links to, or nil.
+	next *subIFDInfo
 }
 
 // relocateTIFF is the core TIFF copy-and-relocate serializer.
@@ -392,7 +391,7 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte, f
 	if len(rawIPTC) > 0 {
 		// Adobe XMP Spec / ExifTool convention: IPTC-NAA (0x83BB) as TypeLong.
 		// upsertIFD0Entry pads value to 4-byte boundary; Count = nLongs.
-		upsertIFD0Entry(e.IFD0, exif.TagIPTC, exif.TypeLong, rawIPTC)
+		upsertIPTC(e.IFD0, rawIPTC)
 	}
 	if len(rawXMP) > 0 {
 		// Adobe XMP Spec (TIFF Technical Note 3): XMP (0x02BC) as TypeByte.
@@ -444,14 +443,15 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte, f
 	//
 	// #270: enumerateSubIFDs re-scans base directly rather than trusting the
 	// already-parsed *exif.IFDEntry for 0x014A — see its doc comment.
-	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget, fileLen)
+	subTree, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget, fileLen)
 	if subErr != nil {
 		return nil, nil, fmt.Errorf("tiff: enumerate SubIFDs: %w", subErr)
 	}
+	subIFDs := subTree.all
 	blocks = append(blocks, subBlocks...)
 
 	// Short-circuit when there are no image blocks to relocate and no SubIFDs.
-	if len(blocks) == 0 && len(subIFDs) == 0 {
+	if len(blocks) == 0 && len(subIFDs) == 0 && subTree.roots == nil {
 		out, encErr := exif.Encode(e)
 		if encErr != nil {
 			return nil, nil, fmt.Errorf("tiff: encode (no image blocks): %w", encErr)
@@ -486,7 +486,7 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte, f
 	// Step 7: assign new absolute offsets.
 	// SubIFD blocks are placed first (SubIFD structures after the main EXIF
 	// block), then main image blocks follow after all SubIFD structures.
-	subIFDsSize := computeSubIFDsSize(subIFDs)
+	subIFDsSize := computeSubIFDsSize(ifdEnd, subIFDs)
 	// Guard against overflow: ifdEnd + subIFDsSize > MaxUint32 means the
 	// combined IFD+SubIFD region alone is already beyond the classic TIFF
 	// 4 GiB limit. TIFF 6.0 §2: classic offsets are uint32; a value that
@@ -565,8 +565,8 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte, f
 	// verbatim (it is generic pass-through for tags it does not specially
 	// interpret). We must overwrite the value bytes with the new SubIFD
 	// positions before appending anything.
-	if len(subIFDs) > 0 {
-		if err := patchSubIFDPointers(finalTIFF, subIFDs, bigTIFF, order); err != nil {
+	if subTree.roots != nil {
+		if err := patchSubIFDPointers(finalTIFF, subTree, bigTIFF, order); err != nil {
 			return nil, nil, fmt.Errorf("tiff: patch SubIFD pointers: %w", err)
 		}
 	}
@@ -1183,370 +1183,469 @@ func upsertIFDEntryWithCount(ifd *exif.IFD, tag exif.TagID, typ exif.DataType, c
 }
 
 // ---------------------------------------------------------------------------
-// SubIFD support (task #94)
+// SubIFD support (tasks #94, #311)
 // ---------------------------------------------------------------------------
+//
+// Model (task #311). A SubIFDs entry (tag 0x014A) may sit in ANY IFD of the
+// main chain (IFD0, IFD1, ... — e.g. one reduced-resolution SubIFD per page),
+// may list several SubIFDs, and a SubIFD may carry its own 0x014A (TIFF
+// Technical Note 1; Adobe DNG Specification 1.7.1.0 §"SubIFD Trees"). The
+// relocator therefore carries the whole tree:
+//
+//   - subIFDTree.roots[k] lists, element by element, the SubIFDs of the 0x014A
+//     array of the k-th IFD of the main chain; subIFDInfo.children does the
+//     same for a SubIFD's own array. Every array is re-written with exactly
+//     its declared number of elements: an element whose SubIFD could not be
+//     read is written as 0, never as a stale offset.
+//   - A SubIFD may also link further SubIFDs through its next-IFD pointer (a
+//     SubIFD chain: libtiff reads the directories that follow a SubIFD this
+//     way, and ExifTool lists them as SubIFD1, SubIFD2, ...; corpus
+//     f15fca5b: one 0x014A element, five chained SubIFDs). The chain is
+//     carried and subIFDInfo.next is written as the next-IFD pointer.
+//   - subIFDTree.all lists every carried SubIFD once (depth first, in array
+//     and chain order); a SubIFD referenced twice is carried once and both
+//     pointers address it.
+//   - Each SubIFD is re-serialised compactly (rawSubIFD): its directory, then
+//     every out-of-line value copied behind it, wherever the value was in the
+//     source (libtiff writes values before the directory). Pointers into that
+//     value area are stored relative to the SubIFD and rebased once the
+//     SubIFD's output offset is known (patchSubIFDImageOffsets).
+//
+// The 0x014A arrays of the main chain are written by exif.Encode with the
+// values of the parsed EXIF and patched in the encoded stream
+// (patchSubIFDPointers). Reference: libtiff tif_dirwrite.c
+// (TIFFWriteDirectoryTagSubifd writes the array with one slot per SubIFD and
+// fills each slot when that SubIFD is written).
 
-// enumerateSubIFDs parses the SubIFDs (0x014A) pointer array from IFD0 in the
-// raw base buffer, builds a subIFDInfo for each referenced SubIFD, and
-// enumerates their image blocks (strips/tiles).
+// subIFDTree is the result of enumerateSubIFDs: every SubIFD reachable from
+// the main IFD chain.
+type subIFDTree struct {
+	// all lists each carried SubIFD once, in output placement order.
+	all []*subIFDInfo
+	// roots[k] is the element-aligned 0x014A array of the k-th IFD of the
+	// main chain (IFD0 is 0); nil when that IFD has no SubIFDs entry. A nil
+	// element is a SubIFD that could not be read.
+	roots [][]*subIFDInfo
+}
+
+// enumerateSubIFDs parses the SubIFDs (0x014A) arrays of every IFD of the
+// main chain in the raw base buffer, builds a subIFDInfo for each referenced
+// SubIFD (recursively, up to maxSubIFDDepth levels), and enumerates their
+// image blocks (strips/tiles/JPEG).
 //
 // TIFF Extension §F / Adobe DNG Spec §4: SubIFDs (tag 0x014A) is typically a
 // LONG array; each element is an absolute file offset pointing to an IFD that
-// is a child of the current IFD. DNG's IFD0 typically points to one or more
-// SubIFDs that carry the full-resolution image data. Real-world files also
-// legitimately declare 0x014A as type IFD (13) or, in BigTIFF, LONG8 (16) /
-// IFD8 (18) — see testdata/corpus/tiff/metadata-extractor/BigTIFFSubIFD4.tif
-// and BigTIFFSubIFD8.tif.
+// is a child of the current IFD. Real-world files also legitimately declare
+// 0x014A as type IFD (13) or, in BigTIFF, LONG8 (16) / IFD8 (18) — see
+// testdata/corpus/tiff/metadata-extractor/BigTIFFSubIFD4.tif and
+// BigTIFFSubIFD8.tif.
 //
-// #270: this function re-scans base directly via findEntryInIFD/
-// decodeOffsetArray rather than trusting ifd0.Get(exif.TagSubIFDs) (the
-// already-parsed *exif.IFDEntry). exif.Parse follows CIPA DC-008-2023 and
-// treats type code 13 as TypeUTF8 (1 byte/element) — correct for EXIF-registry
-// tags, but wrong for 0x014A, where TIFF Extensions assign the SAME code 13
-// to IFD (4 bytes/element). Relying on the exif-parsed Value for a type=13
-// 0x014A entry would silently read a truncated 1-byte pointer instead of the
-// true 4-byte offset. Re-reading raw bytes with format/tiff's own corrected
-// type table (typeSize/typeSizeBigTIFF in tiff.go) sidesteps the collision
-// entirely and, as a side effect, also handles LONG8/IFD8 correctly for
-// BigTIFF sources.
+// #270: the arrays are re-read from base with format/tiff's own type table
+// (typeSize/typeSizeBigTIFF in tiff.go, which reads type 13 as the 4-byte IFD
+// type) rather than taken from the parsed *exif.EXIF, so a damaged or
+// implausible entry is judged on the bytes of the file. The k-th IFD of the
+// raw chain is matched with the k-th IFD of e's chain, which exif.Encode
+// writes in the same order; the raw walk stops at the length of e's chain.
 //
-// This function handles nested SubIFD-of-SubIFD chains up to maxSubIFDDepth
-// levels deep (DNG spec only mandates one level; deeper nesting is a defensive
-// extension). It silently skips SubIFD entries whose offsets are out of bounds
-// or whose IFD cannot be parsed — a lenient-parse policy consistent with
-// enumerateIFDBlocks.
-//
-// Returns:
-//   - subIFDs: slice of *subIFDInfo in encounter order (outermost first);
-//     each entry holds the source offset, parsed IFD, raw bytes, and new offset.
-//   - blocks: image-data blocks from all SubIFDs; ifdPtr fields point to the
-//     corresponding subIFDInfo.ifd.
+// A SubIFD entry whose offset is zero, out of bounds, or unparsable is not
+// carried (lenient-parse policy, consistent with enumerateIFDBlocks); its
+// array element is written as 0.
 //
 // GM-W1: budget bounds the cumulative number of SubIFD entries and image
-// blocks accepted across this call and every nested recursion level; see
-// maxAggregateImageBlocks.
-func enumerateSubIFDs(base []byte, e *exif.EXIF, order binary.ByteOrder, budget *imageBlockBudget, fileLen uint64) ([]*subIFDInfo, []*imageBlock, error) {
+// blocks accepted across every array and recursion level; see
+// maxAggregateImageBlocks. An array whose Count exceeds maxSubIFDsPerEntry is
+// rejected with ErrTooManyImageBlocks before anything proportional to the
+// Count is allocated.
+func enumerateSubIFDs(base []byte, e *exif.EXIF, order binary.ByteOrder, budget *imageBlockBudget, fileLen uint64) (subIFDTree, []*imageBlock, error) {
 	if e == nil || e.IFD0 == nil {
-		return nil, nil, nil
+		return subIFDTree{}, nil, nil
 	}
-	bigTIFF := e.BigTIFF
-	ifd0Off, ok := readIFD0Offset(base, bigTIFF, order)
+	// The walker holds a copy of the budget, written back below: storing the
+	// caller's pointer in the walker made it escape to the heap (one
+	// allocation per relocation), because the content of the walker leaks
+	// through its recursive methods.
+	w := subIFDWalker{base: base, order: order, bigTIFF: e.BigTIFF, budget: budgetValue(budget), fileLen: fileLen}
+	off, ok := readIFD0Offset(base, w.bigTIFF, order)
 	if !ok {
-		return nil, nil, nil
+		return subIFDTree{}, nil, nil
 	}
-	entry, found := findEntryInIFD(base, ifd0Off, uint16(exif.TagSubIFDs), bigTIFF, order)
-	if !found || entry.count == 0 {
-		return nil, nil, nil
+	chainLen := 0
+	for ifd := e.IFD0; ifd != nil && chainLen < maxSubIFDChain; ifd = ifd.Next {
+		chainLen++
 	}
+	roots, err := w.mainChain(off, chainLen)
+	if budget != nil {
+		*budget = w.budget
+	}
+	if err != nil {
+		return subIFDTree{}, nil, err
+	}
+	if len(w.all) == 0 && roots == nil {
+		return subIFDTree{}, nil, nil
+	}
+	return subIFDTree{all: w.all, roots: roots}, w.blocks, nil
+}
 
+// mainChain walks the first chainLen IFDs of the main chain of w.base, from
+// the IFD at off, and returns the SubIFD array of each (subIFDTree.roots), or
+// nil when none has one. A cyclic chain ends the walk.
+func (w *subIFDWalker) mainChain(off uint64, chainLen int) ([][]*subIFDInfo, error) {
+	var roots [][]*subIFDInfo
+	var seenBuf [8]uint64
+	seen := seenBuf[:0]
+	ok := true
+	for k := 0; ok && k < chainLen && off != 0 && !slices.Contains(seen, off); k++ {
+		seen = append(seen, off)
+		kids, err := w.array(off, 0)
+		if err != nil {
+			return nil, err
+		}
+		if kids != nil {
+			if roots == nil {
+				roots = make([][]*subIFDInfo, chainLen)
+			}
+			roots[k] = kids
+		}
+		off, ok = rawNextIFD(w.base, off, w.bigTIFF, w.order)
+	}
+	return roots, nil
+}
+
+// budgetValue returns *b, or an unbounded budget when b is nil (spend treats
+// a nil budget as unbounded).
+func budgetValue(b *imageBlockBudget) imageBlockBudget {
+	if b == nil {
+		return imageBlockBudget{remaining: math.MaxInt}
+	}
+	return *b
+}
+
+// maxSubIFDChain bounds the main-chain IFDs whose SubIFDs enumerateSubIFDs
+// visits. exif.Parse follows at most 512 chained IFDs (maxTraverseChainIFDs);
+// real files chain a handful (a CR2 chains four).
+const maxSubIFDChain = 512
+
+// subIFDWalker carries the state of one enumerateSubIFDs call.
+type subIFDWalker struct {
+	base    []byte
+	order   binary.ByteOrder
+	bigTIFF bool
+	budget  imageBlockBudget // copy of the caller's budget; see enumerateSubIFDs
+	fileLen uint64
+	all     []*subIFDInfo
+	byOff   map[uint64]*subIFDInfo // index of all once it outgrows smallSetMax
+	blocks  []*imageBlock
+}
+
+// array decodes the 0x014A entry of the IFD at ifdOff in w.base and returns
+// its SubIFDs, element-aligned (nil elements for SubIFDs that cannot be
+// read), or nil when the IFD has no usable SubIFDs entry.
+func (w *subIFDWalker) array(ifdOff uint64, depth int) ([]*subIFDInfo, error) {
+	entry, found := findEntryInIFD(w.base, ifdOff, uint16(exif.TagSubIFDs), w.bigTIFF, w.order)
+	if !found || entry.count == 0 {
+		return nil, nil
+	}
 	// GM-W1 (CWE-770/CWE-405): reject an implausibly large Count BEFORE
-	// decodeOffsetArray allocates a []uint64 proportional to it. This mirrors
-	// enumerateSubIFDsAt's own per-entry cap and MUST be checked here too, now
-	// that decoding happens in this function rather than after entering
-	// enumerateSubIFDsAt (task #270 refactor) — see
-	// TestEnumerateSubIFDsRejectsHugeCountFast for the regression proof.
+	// decodeOffsetArray allocates a []uint64 proportional to it (see
+	// TestEnumerateSubIFDsRejectsHugeCountFast).
 	if entry.count > maxSubIFDsPerEntry {
-		return nil, nil, fmt.Errorf("tiff: 0x014A SubIFDs: count=%d exceeds %d: %w",
+		return nil, fmt.Errorf("tiff: 0x014A SubIFDs: count=%d exceeds %d: %w",
 			entry.count, maxSubIFDsPerEntry, ErrTooManyImageBlocks)
 	}
-
-	elemSz := elemSizeFor(entry.typ, bigTIFF)
+	elemSz := elemSizeFor(entry.typ, w.bigTIFF)
 	if elemSz == 0 {
-		// Unknown type for 0x014A — skip gracefully.
-		return nil, nil, nil
+		return nil, nil // unknown type for 0x014A: skip gracefully
 	}
-	offsets, ok := decodeOffsetArray(base, entry.valField, entry.count, elemSz, bigTIFF, order)
+	// The elements are read in place (offsetArrayBytes): decoding them into a
+	// []uint64 first would cost one allocation per array.
+	src, ok := offsetArrayBytes(w.base, entry.valField, entry.count, elemSz, w.bigTIFF, w.order)
 	if !ok {
-		return nil, nil, nil
+		return nil, nil
 	}
-
-	return enumerateSubIFDsAt(base, offsets, order, bigTIFF, 0, maxSubIFDDepth, budget, fileLen)
-}
-
-// enumerateSubIFDsAt recursively enumerates SubIFDs given their already-decoded
-// absolute offsets. depth is the current nesting depth; maxDepth prevents
-// unbounded recursion on crafted inputs.
-//
-// GM-W1 (CWE-770/CWE-405): len(offsets) is rejected outright once it exceeds
-// maxSubIFDsPerEntry, and the accepted count is additionally charged against
-// budget (maxAggregateImageBlocks), both BEFORE the visited-set map below is
-// sized — a crafted file with an implausibly large 0x014A Count must not be
-// able to drive proportional heap allocation, at any recursion depth.
-func enumerateSubIFDsAt( //nolint:cyclop,gocyclo,funlen // SubIFD recursion, cycle detection, and BigTIFF-vs-classic child-IFD parsing dispatch require several branches; complexity is inherent to the algorithm
-	base []byte,
-	offsets []uint64,
-	order binary.ByteOrder,
-	bigTIFF bool,
-	depth, maxDepth int,
-	budget *imageBlockBudget,
-	fileLen uint64,
-) ([]*subIFDInfo, []*imageBlock, error) {
-	if depth > maxDepth {
-		return nil, nil, nil
+	n := int(entry.count)
+	if !w.budget.spend(n) {
+		return nil, fmt.Errorf("tiff: 0x014A SubIFDs: count=%d: %w", n, ErrTooManyImageBlocks)
 	}
-	n := len(offsets)
-	if n > maxSubIFDsPerEntry {
-		return nil, nil, fmt.Errorf("tiff: 0x014A SubIFDs: count=%d exceeds %d: %w",
-			n, maxSubIFDsPerEntry, ErrTooManyImageBlocks)
-	}
-	if !budget.spend(n) {
-		return nil, nil, fmt.Errorf("tiff: 0x014A SubIFDs: count=%d: %w", n, ErrTooManyImageBlocks)
-	}
-
-	var subIFDs []*subIFDInfo
-	var allBlocks []*imageBlock
-
-	// One backing array for this level's subIFDInfo values: at most one per
-	// offset, so appends never exceed the capacity and &infos[i] stays valid.
-	// The capacity is clamped independently of the per-entry cap above (task
-	// convention: see extractRawIFD).
-	infos := make([]subIFDInfo, 0, min(n, maxSubIFDsPerEntry))
-
-	// Cycle guard: an offset already seen in this array is skipped. Small
-	// arrays use a linear scan of the preceding offsets; larger ones a map.
-	var visited map[uint64]bool
-	if n > smallSetMax {
-		visited = make(map[uint64]bool, min(n, maxSubIFDsPerEntry))
-	}
-
-	for i, off := range offsets {
-		if off == 0 {
-			continue
-		}
-		if visited != nil {
-			if visited[off] {
-				continue // cycle guard
-			}
-			visited[off] = true
-		} else if slices.Contains(offsets[:i], off) {
-			continue // cycle guard
-		}
-
-		// Parse the SubIFD at this offset.
-		rawIFD := extractRawIFD(base, off, bigTIFF, order)
-		if rawIFD == nil {
-			// Out-of-bounds or unreadable; skip gracefully.
-			continue
-		}
-
-		var parsedIFD *exif.IFD
-		if bigTIFF {
-			// #270: a SubIFD nested in a BigTIFF file inherits the file-wide
-			// 20-byte-entry/8-byte-field format (BigTIFF spec §2). exif.ParseIFDAt
-			// is classic-TIFF-only, so it cannot be used here.
-			var pok bool
-			parsedIFD, pok = parseIFDAtBigTIFF(base, off, order)
-			if !pok {
-				continue
-			}
-		} else {
-			var pok bool
-			parsedIFD, _, pok = exif.ParseIFDAt(base, uint32(off), order) //nolint:gosec // G115: classic path; off < 2^32 (bounded by maxFileSize, verified by extractRawIFD above)
-			if !pok || parsedIFD == nil {
-				continue
-			}
-		}
-
-		// Clear ThumbnailData on the SubIFD before block enumeration.
-		//
-		// parseSingleIFD (via ParseIFDAt) sets IFD.ThumbnailData when it finds
-		// both tag 0x0201 (JPEGInterchangeFormat) and 0x0202 in the same IFD,
-		// because those tags normally indicate a JPEG thumbnail in IFD1.
-		// For SubIFDs (tag 0x014A), 0x0201/0x0202 hold the JpgFromRaw offset
-		// (Nikon NEF SubIFD[0]) or another JPEG image, NOT a thumbnail managed
-		// by exif.Encode. parseIFDAtBigTIFF never sets ThumbnailData at all, so
-		// this assignment is a defensive no-op on that path.
-		//
-		// enumerateIFDBlocks → appendJPEGBlock skips the block when ThumbnailData
-		// is non-nil (assuming exif.Encode handles it).  That assumption is wrong
-		// for SubIFDs: exif.Encode never sees SubIFD IFDs — they are raw bytes.
-		// Clearing ThumbnailData forces appendJPEGBlock to enumerate the JPEG
-		// as a relocatable imageBlock.  The ThumbnailData bytes themselves are
-		// NOT needed for SubIFDs because the data lives in base[off:off+size]
-		// and is copied verbatim in step 12.
-		parsedIFD.ThumbnailData = nil
-
-		infos = append(infos, subIFDInfo{
-			srcOffset: off,
-			ifd:       parsedIFD,
-			rawBytes:  rawIFD,
-		})
-		si := &infos[len(infos)-1]
-		subIFDs = append(subIFDs, si)
-
-		// Enumerate image blocks from this SubIFD.
-		iblocks, err := enumerateIFDBlocks(parsedIFD, order, bigTIFF, budget, fileLen)
+	kids := make([]*subIFDInfo, n)
+	for i := range kids {
+		si, _, err := w.chain(elemAt(src, uint64(i), elemSz, w.order), depth)
 		if err != nil {
-			return nil, nil, fmt.Errorf("tiff: SubIFD at offset %d: %w", off, err)
+			return nil, err
 		}
-		// Re-point the ifdPtr to the parsedIFD so filterMainBlocks can identify them.
-		for _, blk := range iblocks {
-			blk.ifdPtr = parsedIFD
-		}
-		si.blocks = iblocks
-		allBlocks = appendBlocks(allBlocks, iblocks)
-
-		// Recurse into any nested SubIFDs (0x014A) within this SubIFD, using the
-		// SAME raw-rescan approach (re-reading from base at this SubIFD's own
-		// offset) rather than parsedIFD.Get(exif.TagSubIFDs), for identical
-		// reasons to the outer-level lookup above.
-		nestedEntry, nestedFound := findEntryInIFD(base, off, uint16(exif.TagSubIFDs), bigTIFF, order)
-		// GM-W1 (CWE-770/CWE-405): reject an implausibly large nested Count
-		// BEFORE decodeOffsetArray allocates a []uint64 proportional to it —
-		// same rationale as the top-level check in enumerateSubIFDs.
-		if nestedFound && nestedEntry.count > maxSubIFDsPerEntry {
-			return nil, nil, fmt.Errorf("tiff: 0x014A SubIFDs: count=%d exceeds %d: %w",
-				nestedEntry.count, maxSubIFDsPerEntry, ErrTooManyImageBlocks)
-		}
-		if !nestedFound || nestedEntry.count == 0 {
-			continue
-		}
-		nestedElemSz := elemSizeFor(nestedEntry.typ, bigTIFF)
-		if nestedElemSz == 0 {
-			continue
-		}
-		nestedOffsets, nok := decodeOffsetArray(base, nestedEntry.valField, nestedEntry.count, nestedElemSz, bigTIFF, order)
-		if !nok {
-			continue
-		}
-		nestSubs, nestBlocks, nestErr := enumerateSubIFDsAt(
-			base, nestedOffsets, order, bigTIFF, depth+1, maxDepth, budget, fileLen,
-		)
-		if nestErr != nil {
-			return nil, nil, nestErr
-		}
-		subIFDs = append(subIFDs, nestSubs...)
-		allBlocks = appendBlocks(allBlocks, nestBlocks)
+		kids[i] = si
 	}
-
-	return subIFDs, allBlocks, nil
+	return kids, nil
 }
 
-// extractRawIFD returns a byte slice containing the complete raw IFD block
-// starting at offset off within base: count field + entries + next-IFD
-// pointer + out-of-line value area, using classic (12-byte entry, uint32
-// fields) or BigTIFF (20-byte entry, uint64 fields) widths per bigTIFF. The
-// returned slice is a copy (independent of base), safe to mutate for offset
-// patching.
-//
-// Returns nil if off is out of bounds or the IFD is malformed.
-//
-// Important: the value area includes the TileOffsets/StripOffsets array data
-// (these are index arrays, NOT image pixel data). Image pixel data is excluded
-// because it is referenced by the offset values stored in those arrays and is
-// handled by the imageBlock relocation mechanism. Only the arrays themselves
-// (the lists of offsets and byte counts) are included here, so that
-// patchRawIFDOffsets can overwrite the array elements in-place.
-func extractRawIFD(base []byte, off uint64, bigTIFF bool, order binary.ByteOrder) []byte { //nolint:cyclop // IFD scanning requires bounds-checking branches; complexity is inherent to raw binary parsing
-	_, entryWidth, valFieldWidth := ifdWidths(bigTIFF)
-	nextIFDWidth := valFieldWidth // next-IFD pointer is the same width as a value-or-offset field
+// chain carries the SubIFD at off and the SubIFDs its next-IFD pointers link
+// (see the SubIFD model above), and returns the first one; ok is false when it
+// cannot be read. The walk is iterative; it stops at a zero or unreadable
+// pointer, at a SubIFD already carried (the link then addresses it, so a cycle
+// ends there), or after maxSubIFDChain links.
+func (w *subIFDWalker) chain(off uint64, depth int) (head *subIFDInfo, ok bool, err error) {
+	if seen := w.lookup(off); seen != nil {
+		return seen, true, nil
+	}
+	if head, ok, err = w.visit(off, depth); !ok || err != nil {
+		return nil, false, err
+	}
+	prev := head
+	for range maxSubIFDChain {
+		next, rok := rawNextIFD(w.base, prev.srcOffset, w.bigTIFF, w.order)
+		if !rok || next == 0 {
+			break
+		}
+		if seen := w.lookup(next); seen != nil {
+			prev.next = seen
+			break
+		}
+		cur, vok, verr := w.visit(next, depth)
+		if verr != nil {
+			return nil, false, verr
+		}
+		if !vok {
+			break
+		}
+		prev.next, prev = cur, cur
+	}
+	return head, true, nil
+}
 
+// lookup returns the subIFDInfo already built for the SubIFD at off, or nil.
+func (w *subIFDWalker) lookup(off uint64) *subIFDInfo {
+	if w.byOff != nil {
+		return w.byOff[off]
+	}
+	for _, si := range w.all {
+		if si.srcOffset == off {
+			return si
+		}
+	}
+	return nil
+}
+
+// record adds si to w.all and to the offset index.
+func (w *subIFDWalker) record(si *subIFDInfo) {
+	w.all = append(w.all, si)
+	switch {
+	case w.byOff != nil:
+		w.byOff[si.srcOffset] = si
+	case len(w.all) > smallSetMax:
+		w.byOff = make(map[uint64]*subIFDInfo, 2*len(w.all))
+		for _, s := range w.all {
+			w.byOff[s.srcOffset] = s
+		}
+	}
+}
+
+// visit returns the subIFDInfo of the SubIFD at off, building it (and its
+// own SubIFDs, but not the SubIFDs its next-IFD pointer links: see chain) on
+// first sight; ok is false when off is zero, too deep, or unreadable.
+// A SubIFD is recorded before its children are visited, so a cyclic
+// reference resolves to the existing record instead of recursing.
+func (w *subIFDWalker) visit(off uint64, depth int) (si *subIFDInfo, ok bool, err error) {
+	if off == 0 || depth > maxSubIFDDepth {
+		return nil, false, nil
+	}
+	if found := w.lookup(off); found != nil {
+		return found, true, nil
+	}
+	raw := rawSubIFD(w.base, off, w.bigTIFF, w.order)
+	if raw == nil {
+		return nil, false, nil // out of bounds or unreadable: skip gracefully
+	}
+	parsedIFD, ok := w.parseIFD(off)
+	if !ok {
+		return nil, false, nil
+	}
+	si = &subIFDInfo{srcOffset: off, ifd: parsedIFD, rawBytes: raw}
+	w.record(si)
+
+	iblocks, err := enumerateIFDBlocks(parsedIFD, w.order, w.bigTIFF, &w.budget, w.fileLen)
+	if err != nil {
+		return nil, false, fmt.Errorf("tiff: SubIFD at offset %d: %w", off, err)
+	}
+	for _, blk := range iblocks {
+		blk.ifdPtr = parsedIFD // filterMainBlocks identifies SubIFD blocks by this
+	}
+	si.blocks = iblocks
+	w.blocks = appendBlocks(w.blocks, iblocks)
+
+	if si.children, err = w.array(off, depth+1); err != nil {
+		return nil, false, err
+	}
+	return si, true, nil
+}
+
+// parseIFD parses the SubIFD at off in w.base for image-block enumeration.
+//
+// #270: a SubIFD nested in a BigTIFF file inherits the file-wide
+// 20-byte-entry/8-byte-field format (BigTIFF spec §2); exif.ParseIFDAt is
+// classic-TIFF-only, so parseIFDAtBigTIFF is used there.
+//
+// ParseIFDAt sets ThumbnailData when a SubIFD holds 0x0201/0x0202 (Nikon NEF
+// SubIFD[0] JpgFromRaw). exif.Encode never sees SubIFDs, so the JPEG must be
+// enumerated as an image block like any other: ThumbnailData is cleared so
+// that appendJPEGBlock enumerates it.
+func (w *subIFDWalker) parseIFD(off uint64) (*exif.IFD, bool) {
+	var ifd *exif.IFD
+	var ok bool
+	if w.bigTIFF {
+		ifd, ok = parseIFDAtBigTIFF(w.base, off, w.order)
+	} else {
+		ifd, _, ok = exif.ParseIFDAt(w.base, uint32(off), w.order) //nolint:gosec // G115: classic path; off < 2^32 (bounded by maxFileSize, verified by rawSubIFD)
+	}
+	if !ok || ifd == nil {
+		return nil, false
+	}
+	ifd.ThumbnailData = nil
+	return ifd, true
+}
+
+// rawNextIFD returns the next-IFD pointer of the IFD at off in buf (TIFF 6.0
+// §2; BigTIFF spec §2), and false when the IFD does not fit in buf.
+func rawNextIFD(buf []byte, off uint64, bigTIFF bool, order binary.ByteOrder) (uint64, bool) {
+	count, entriesStart, ok := ifdEntryTable(buf, off, bigTIFF, order)
+	if !ok || count > bigTIFFMaxIFDEntries {
+		return 0, false
+	}
+	_, entryWidth, fieldWidth := ifdWidths(bigTIFF)
+	at := entriesStart + count*uint64(entryWidth)        //nolint:gosec // G115: entryWidth is the constant 12 or 20
+	if !fits(at, uint64(fieldWidth), uint64(len(buf))) { //nolint:gosec // G115: fieldWidth is the constant 4 or 8
+		return 0, false
+	}
+	return fieldAsU64(buf[at:at+uint64(fieldWidth)], bigTIFF, order), true //nolint:gosec // G115: same constant
+}
+
+// rawSubIFD re-serialises the SubIFD at off in base into a self-contained
+// block: the entry count, every entry, a zero next-IFD pointer, then the
+// out-of-line value of each entry, word-aligned (TIFF 6.0 §2: "Each data item
+// (field value) must begin on a word boundary"), in entry order. The
+// value-or-offset field of each out-of-line entry holds the offset of its
+// value RELATIVE to the start of the block; patchSubIFDImageOffsets adds the
+// block's output offset once it is known. Classic (12-byte entries, 4-byte
+// fields) or BigTIFF (20-byte entries, 8-byte fields) widths follow bigTIFF.
+//
+// Task #311: the former verbatim copy of [off, end of the furthest value)
+// lost every value stored BEFORE the directory (libtiff writes values first)
+// and copied whatever lay between the directory and its values. Entries are
+// kept in source order; an entry of unknown type keeps its field verbatim
+// (as exif.Encode does), and an out-of-line entry whose value lies outside
+// base is dropped (as exif.Parse does). The next-IFD pointer is written as 0;
+// patchRawIFDOffsets sets it when the SubIFD chain continues (subIFDInfo.next).
+//
+// Returns nil when the directory does not fit in base, or when the values
+// would exceed len(base) in total (only overlapping, adversarial entries can
+// need more space than the file holds).
+func rawSubIFD(base []byte, off uint64, bigTIFF bool, order binary.ByteOrder) []byte { //nolint:cyclop,gocyclo // two passes over the entries with inline/out-of-line and keep/drop branches
+	countWidth, entryWidth, fieldWidth := ifdWidths(bigTIFF)
 	count, entriesStart, ok := ifdEntryTable(base, off, bigTIFF, order)
 	if !ok {
 		return nil
 	}
-	if count > bigTIFFMaxIFDEntries {
-		count = bigTIFFMaxIFDEntries
-	}
-	entriesEnd := entriesStart + count*uint64(entryWidth) + uint64(nextIFDWidth) //nolint:gosec // G115: entryWidth/nextIFDWidth are compile-time constants (12/20, 4/8) from ifdWidths, never negative
-	if entriesEnd > uint64(len(base)) {
+	count = min(count, bigTIFFMaxIFDEntries)
+	ew := uint64(entryWidth)                                                 //nolint:gosec // G115: entryWidth is the constant 12 or 20
+	if !fits(entriesStart, count*ew+uint64(fieldWidth), uint64(len(base))) { //nolint:gosec // G115: fieldWidth is the constant 4 or 8
 		return nil
 	}
-
-	// First pass: compute the extent of all out-of-line value areas that need
-	// to be included in rawBytes.
-	//
-	// We include the value arrays for ALL entries — including the
-	// TileOffsets/StripOffsets/TileByteCounts/StripByteCounts arrays.
-	// These arrays are metadata (index tables), not pixel data. We will
-	// patch the element values in-place after assignNewOffsets.
-	//
-	// We DO NOT include the data that those arrays POINT TO — the actual
-	// image pixels — because those are handled by the imageBlock mechanism.
-	// In other words: include the "index" (the array of offsets), but not
-	// the "image" (the bytes at those offsets).
-	//
-	// For JPEGInterchangeFormat the out-of-line value is the JPEG thumbnail
-	// data itself, which we also exclude (imageBlock handles it). Only if a
-	// JPEG offset tag's value array is OOL (which is impossible for scalar
-	// entries: count=1, inline) would we need to think about this.
-	valueAreaEnd := entriesEnd
 	threshold := inlineThreshold(bigTIFF)
+
+	// Pass 1: count the kept entries and size the value area.
+	kept, valLen := uint64(0), uint64(0)
 	for i := range count {
-		entry, ok := readRawEntryAt(base, entriesStart+i*uint64(entryWidth), bigTIFF, order) //nolint:gosec // G115: entryWidth is a compile-time constant (12/20) from ifdWidths, never negative
-		if !ok {
+		entry, rok := readRawEntryAt(base, entriesStart+i*ew, bigTIFF, order)
+		if !rok {
 			break
 		}
-		valEnd, ok := rawEntryValueEnd(entry, bigTIFF, threshold, base, order)
-		if !ok {
+		total, keep := rawEntrySize(entry, bigTIFF, threshold, base, order)
+		if !keep {
 			continue
 		}
-		if valEnd > valueAreaEnd {
-			valueAreaEnd = valEnd
+		kept++
+		if total > threshold {
+			valLen += valLen&1 + total
+			if valLen > uint64(len(base)) {
+				return nil
+			}
 		}
 	}
 
-	// Compute total rawBytes size: valueAreaEnd already floors at entriesEnd
-	// (the fixed count+entries+next-IFD block), capped at len(base).
-	totalLen := min(valueAreaEnd, uint64(len(base)))
+	fixed := uint64(countWidth) + kept*ew + uint64(fieldWidth) //nolint:gosec // G115: widths are small constants
+	out := make([]byte, fixed, fixed+valLen)
+	if bigTIFF {
+		order.PutUint64(out, kept)
+	} else {
+		order.PutUint16(out, uint16(kept))
+	}
 
-	raw := make([]byte, totalLen-off)
-	copy(raw, base[off:totalLen])
-	return raw
+	// Pass 2: copy the entries and append their out-of-line values.
+	pos := uint64(countWidth) //nolint:gosec // G115: countWidth is the constant 2 or 8
+	for i := range count {
+		entry, rok := readRawEntryAt(base, entriesStart+i*ew, bigTIFF, order)
+		if !rok {
+			break
+		}
+		total, keep := rawEntrySize(entry, bigTIFF, threshold, base, order)
+		if !keep {
+			continue
+		}
+		copy(out[pos:pos+ew], base[entry.pos:entry.pos+ew])
+		field := pos + ew - uint64(fieldWidth) //nolint:gosec // G115: fieldWidth is the constant 4 or 8
+		pos += ew
+		if total <= threshold {
+			continue
+		}
+		if len(out)&1 == 1 {
+			out = append(out, 0x00) // word alignment
+		}
+		src := fieldAsU64(entry.valField, bigTIFF, order)
+		rel := uint64(len(out))
+		out = append(out, base[src:src+total]...)
+		putFieldU64(out[field:], bigTIFF, order, rel)
+	}
+	// The next-IFD pointer (out[pos:pos+fieldWidth]) is already zero.
+	return out
 }
 
-// rawEntryValueEnd computes the end-of-value-area position (within base) for
-// a single out-of-line rawIFDEntry, or reports ok=false when the entry is
-// inline, of unknown type, or its declared range would overflow or fall
-// outside base. Split out of extractRawIFD purely to keep its cyclomatic
-// complexity within the project's gocyclo budget.
+// rawEntrySize returns the byte size of the value of entry and whether
+// rawSubIFD keeps the entry: entries of unknown type are kept (their field
+// is copied verbatim, total 0); an entry whose value size overflows, or whose
+// out-of-line value lies outside base, is dropped.
 //
 // Security audit finding (2026-09-26): entry.count is an 8-byte BigTIFF
-// LONG8 field, attacker-controlled up to MaxUint64, so sz*entry.count can
-// overflow uint64 before the addition below ever runs — guarded the same
-// way as extent.go's resolveEntryValue. fits (internal/boundscheck.Fits),
-// not a raw `valOff+total > len(base)` comparison, guards the addition
-// itself (defense-in-depth: extractRawIFD's own valueAreaEnd/totalLen
-// invariants already prevent this specific site from being reachable as a
-// crash, but the raw addition was still wrong on its own terms).
-func rawEntryValueEnd(entry rawIFDEntry, bigTIFF bool, threshold uint64, base []byte, order binary.ByteOrder) (uint64, bool) {
+// LONG8 field, attacker-controlled up to MaxUint64, so sz*entry.count is
+// checked for overflow first, and fits (internal/boundscheck.Fits) guards
+// the offset addition.
+func rawEntrySize(entry rawIFDEntry, bigTIFF bool, threshold uint64, base []byte, order binary.ByteOrder) (total uint64, keep bool) {
 	sz := elemSizeFor(entry.typ, bigTIFF)
 	if sz == 0 {
+		return 0, true
+	}
+	if entry.count > ^uint64(0)/sz {
 		return 0, false
 	}
-	const maxU64 = ^uint64(0)
-	if entry.count > maxU64/sz {
-		return 0, false // corrupt/adversarial: sz*count would overflow uint64
-	}
-	total := sz * entry.count
+	total = sz * entry.count
 	if total <= threshold {
-		return 0, false // inline, no value area
+		return total, true
 	}
-	valOff := fieldAsU64(entry.valField, bigTIFF, order)
-	if !fits(valOff, total, uint64(len(base))) {
-		return 0, false
-	}
-	return valOff + total, true
+	return total, fits(fieldAsU64(entry.valField, bigTIFF, order), total, uint64(len(base)))
 }
 
-// computeSubIFDsSize returns the total byte size of all SubIFD raw blocks
-// including any inter-block word-alignment padding, which is needed to compute
-// where image blocks will land after the SubIFDs.
+// computeSubIFDsSize returns the number of bytes from ifdEnd (the end of the
+// encoded main IFD structure) to the end of the last SubIFD block, including
+// every word-alignment pad byte. imageStart = ifdEnd + computeSubIFDsSize is
+// therefore the exact position where the image blocks begin.
 //
 // TIFF 6.0 §2: "Each data item (field value) must begin on a word boundary."
 // Each SubIFD block (an IFD structure) is a data item and must start at an
-// even file offset. A 1-byte pad is counted before any block that would
-// otherwise start at an odd offset.
-func computeSubIFDsSize(subIFDs []*subIFDInfo) uint64 {
-	var total uint64
-	for _, si := range subIFDs {
-		// Word-align before this SubIFD block.
-		if total&1 == 1 {
-			total++ // alignment pad byte
-		}
-		total += uint64(len(si.rawBytes))
-	}
-	return total
+// even file offset, so a 1-byte pad precedes any block that would otherwise
+// start at an odd offset. Task #280: the pad parity depends on the ABSOLUTE
+// position, so it is derived from ifdEnd (which is odd when the last IFD ends
+// with an odd-length thumbnail), exactly as assignSubIFDOffsets and the
+// append loop of step 11 do — never from a running total that starts at 0.
+// The result equals relocatedLen(ifdEnd, subIFDs) - ifdEnd by construction.
+func computeSubIFDsSize(ifdEnd uint64, subIFDs []*subIFDInfo) uint64 {
+	return relocatedLen(ifdEnd, subIFDs) - ifdEnd
 }
 
 // assignSubIFDOffsets assigns new file offsets to each SubIFD, placing them
@@ -1556,7 +1655,9 @@ func computeSubIFDsSize(subIFDs []*subIFDInfo) uint64 {
 // Each SubIFD block is a data item and must begin at an even file offset.
 // A single 0x00 alignment pad byte is counted (and later inserted by the
 // append loop in step 11) before any SubIFD that would otherwise start at an
-// odd offset.
+// odd offset. rawSubIFD's value area relies on this: its values are aligned
+// relative to the block start, so they are aligned in the file only when the
+// block starts at an even offset.
 //
 // The math.MaxUint32 saturation ceiling is kept identical for BigTIFF sources
 // too — see assignNewOffsets' doc comment for the rationale (maxFileSize
@@ -1578,202 +1679,211 @@ func assignSubIFDOffsets(subIFDs []*subIFDInfo, ifdEnd uint64) {
 	}
 }
 
-// patchSubIFDImageOffsets patches the strip/tile offset entries within each
-// SubIFD's rawBytes to point at the final image-block positions.
-//
-// Algorithm: for each subIFDInfo, scan the fixed IFD block in rawBytes.
-// For each offset entry (0x0111/0x0144), find the corresponding imageBlocks
-// and overwrite:
-//
-//	(1) For COUNT=1 inline entries: the 4-byte value-or-offset field.
-//	(2) For COUNT>1 out-of-line entries: the array elements within rawBytes,
-//	    AND the 4-byte value-or-offset field (the pointer to the array) is
-//	    updated to reflect the new absolute position of the array in the output
-//	    (= si.newOffset + relOff).
-//
-// Each SubIFD's own blocks are taken from subIFDInfo.blocks, recorded during
-// enumeration.
-//
-// This function must be called after assignNewOffsets and assignSubIFDOffsets
-// have filled blk.newOffset and si.newOffset respectively.
+// patchSubIFDImageOffsets completes each SubIFD block once assignNewOffsets
+// and assignSubIFDOffsets have filled blk.newOffset and si.newOffset: see
+// patchRawIFDOffsets.
 func patchSubIFDImageOffsets(subIFDs []*subIFDInfo, bigTIFF bool, order binary.ByteOrder) {
 	for _, si := range subIFDs {
-		if len(si.blocks) == 0 {
-			continue
-		}
-		patchRawIFDOffsets(si.rawBytes, si.blocks, si.srcOffset, si.newOffset, bigTIFF, order)
+		patchRawIFDOffsets(si.rawBytes, si.blocks, si.children, si.next, si.newOffset, bigTIFF, order)
 	}
 }
 
-// patchRawIFDOffsets patches all IFD entries in the raw SubIFD bytes that hold
-// out-of-line value areas, updating their value-or-offset pointer fields to
-// reflect the new absolute position of those value areas in the output.
+// patchRawIFDOffsets completes a SubIFD block built by rawSubIFD that will be
+// written at the absolute offset newSubIFDOff:
 //
-// The raw SubIFD block (rawBytes) is a verbatim copy of the original file's IFD
-// block starting at srcOff. Entry offset fields reference original file positions.
-//
-// newSubIFDOff is the absolute position at which rawBytes will be written in the
-// output buffer. It is used to compute the new absolute file position of any
-// out-of-line value areas that live within rawBytes.
-//
-// Two classes of OOL entries are handled:
-//
-// (1) Strip/tile image-data offset and bytecount tags (0x0111/0x0117/0x0144/0x0145):
-//   - Total size > 4 (out-of-line array): update each array element with the
-//     new image-block offset/size, AND update the entry's valOrOff field to
-//     newSubIFDOff + relOff.
-//   - Total size ≤ 4 (inline scalar): overwrite the valOrOff field directly.
-//
-// (2) ALL other OOL entries (RATIONAL, SRATIONAL, DOUBLE, long ASCII, etc.):
-//   - Task #98 fix: value bytes ARE captured verbatim in rawBytes by extractRawIFD,
-//     but the entry's valOrOff pointer still holds the OLD absolute file offset.
-//     After rawBytes is appended at newSubIFDOff the pointer is stale, causing
-//     readers to follow it into garbage (XResolution/YResolution → "undef").
-//   - Fix: rewrite the valOrOff field to newSubIFDOff + relOff, where relOff is
-//     (origFileOff − srcOff), the position of the value area within rawBytes.
-//     The value bytes themselves are already correct — only the pointer changes.
+//  1. every out-of-line value-or-offset field, which rawSubIFD left relative
+//     to the block, becomes newSubIFDOff + relative offset (task #98: an OOL
+//     RATIONAL/ASCII/... pointer left at its source value made readers read
+//     garbage);
+//  2. the strip/tile offset and byte-count arrays (0x0111/0x0117,
+//     0x0144/0x0145) and the JPEGInterchangeFormat/Length pair (0x0201/0x0202,
+//     a SubIFD JPEG such as Nikon JpgFromRaw) receive the relocated position
+//     and size of each image block (blocks, from enumerateIFDBlocks);
+//  3. the SubIFDs array (0x014A) receives the output offset of each child,
+//     element by element, 0 for a child that is not carried (task #311);
+//  4. the next-IFD pointer receives the output offset of next, the SubIFD
+//     the source chain links (0 when nil).
 //
 // Spec references:
 //   - TIFF 6.0 §2: classic IFD entry layout — tag(2)+type(2)+count(4)+valOrOff(4);
 //     valOrOff holds the value inline when total byte size ≤ 4, otherwise it is
 //     a file-absolute offset to the value area.
 //   - BigTIFF spec §2: BigTIFF IFD entry layout — tag(2)+type(2)+count(8)+
-//     valOrOff(8); inline threshold is 8 bytes. bigTIFF selects which layout
-//     rawBytes uses (task #270) — a SubIFD nested inside a BigTIFF file
-//     inherits the file-wide BigTIFF entry shape.
-func patchRawIFDOffsets(rawBytes []byte, blocks []*imageBlock, srcOff, newSubIFDOff uint64, bigTIFF bool, order binary.ByteOrder) { //nolint:cyclop,gocyclo,funlen // patch loop requires multiple tag-specific branches; inline/OOL branching is inherent to the spec
-	_, entryWidth, _ := ifdWidths(bigTIFF)
+//     valOrOff(8); inline threshold is 8 bytes.
+func patchRawIFDOffsets(rawBytes []byte, blocks []*imageBlock, children []*subIFDInfo, next *subIFDInfo, newSubIFDOff uint64, bigTIFF bool, order binary.ByteOrder) { //nolint:cyclop,gocyclo // next pointer plus inline/out-of-line dispatch per entry; splitting would separate the two passes over one layout
+	_, entryWidth, fieldWidth := ifdWidths(bigTIFF)
 	count, pos, ok := ifdEntryTable(rawBytes, 0, bigTIFF, order)
 	if !ok {
 		return
 	}
-
+	if next != nil {
+		at := pos + count*uint64(entryWidth)                     //nolint:gosec // G115: entryWidth is the constant 12 or 20
+		if fits(at, uint64(fieldWidth), uint64(len(rawBytes))) { //nolint:gosec // G115: fieldWidth is the constant 4 or 8
+			putFieldU64(rawBytes[at:], bigTIFF, order, next.newOffset)
+		}
+	}
 	// Blocks are looked up by (OFFSET tag, index), so both the offset and the
 	// bytecount entry resolve to the same block record.
 	idx := newBlockIndex(blocks)
-
 	threshold := inlineThreshold(bigTIFF)
 	for i := range count {
 		entry, ok := readRawEntryAt(rawBytes, pos+i*uint64(entryWidth), bigTIFF, order) //nolint:gosec // G115: entryWidth is a compile-time constant (12/20) from ifdWidths, never negative
 		if !ok {
 			break
 		}
-		entryTag := exif.TagID(entry.tag)
 		elemSz := elemSizeFor(entry.typ, bigTIFF)
-		if elemSz == 0 || entry.count == 0 {
+		if elemSz == 0 || entry.count == 0 || entry.count > ^uint64(0)/elemSz {
 			continue
 		}
-
 		total := elemSz * entry.count
-		if total <= threshold { //nolint:nestif // inline path for strip/tile scalar entries; branching is inherent to TIFF §2 inline/OOL duality
-			// Inline value: no valOrOff pointer to update for non-image-data entries.
-			// Strip/tile offset tags and JPEGInterchangeFormat with a single inline
-			// value are handled below.
-			//
-			// Tag 0x0201 (JPEGInterchangeFormat) in a SubIFD (not IFD1) represents a
-			// full-resolution JPEG image (e.g. Nikon NEF JpgFromRaw), not a thumbnail.
-			isImageOffsetTag := entryTag == exif.TagStripOffsets || entryTag == exif.TagTileOffsets ||
-				entryTag == exif.TagStripByteCounts || entryTag == exif.TagTileByteCounts ||
-				entryTag == exif.TagJPEGInterchangeFormat || entryTag == exif.TagJPEGInterchangeFormatLength
-			if !isImageOffsetTag {
+		elems := entry.valField
+		if total > threshold {
+			rel := fieldAsU64(entry.valField, bigTIFF, order)
+			putFieldU64(entry.valField, bigTIFF, order, newSubIFDOff+rel)
+			if !fits(rel, total, uint64(len(rawBytes))) {
 				continue
 			}
+			elems = rawBytes[rel : rel+total]
+		}
+		patchRawEntryElements(exif.TagID(entry.tag), elems, entry.count, elemSz, idx, children, order)
+	}
+}
 
-			// Single inline strip/tile/JPEG offset or bytecount — patch in-place.
-			isByteCount := entryTag == exif.TagStripByteCounts || entryTag == exif.TagTileByteCounts ||
-				entryTag == exif.TagJPEGInterchangeFormatLength
-			offsetTag := entryTag
-			if isByteCount {
-				switch entryTag {
-				case exif.TagStripByteCounts:
-					offsetTag = exif.TagStripOffsets
-				case exif.TagTileByteCounts:
-					offsetTag = exif.TagTileOffsets
-				case exif.TagJPEGInterchangeFormatLength:
-					offsetTag = exif.TagJPEGInterchangeFormat
-				}
+// patchRawEntryElements writes the relocated values of one SubIFD entry into
+// elems, its count elements of elemSz bytes: image-block offsets or sizes for
+// the strip, tile and JPEG tags, child SubIFD offsets for 0x014A. Other tags
+// are left unchanged.
+func patchRawEntryElements(tag exif.TagID, elems []byte, count, elemSz uint64, idx blockIndex, children []*subIFDInfo, order binary.ByteOrder) { //nolint:gocyclo // one case per offset-bearing tag of TIFF 6.0 §7/§15 and TIFF Tech Note 1
+	var offsetTag exif.TagID
+	size := false
+	switch tag {
+	case exif.TagStripOffsets, exif.TagTileOffsets, exif.TagJPEGInterchangeFormat:
+		offsetTag = tag
+	case exif.TagStripByteCounts:
+		offsetTag, size = exif.TagStripOffsets, true
+	case exif.TagTileByteCounts:
+		offsetTag, size = exif.TagTileOffsets, true
+	case exif.TagJPEGInterchangeFormatLength:
+		offsetTag, size = exif.TagJPEGInterchangeFormat, true
+	case exif.TagSubIFDs:
+		for j := uint64(0); j < count && j < uint64(len(children)); j++ {
+			var v uint64
+			if c := children[j]; c != nil {
+				v = c.newOffset
 			}
-			blk := idx.find(offsetTag, 0)
-			if blk == nil {
-				continue
-			}
-			if isByteCount {
-				putFieldU64(entry.valField, bigTIFF, order, blk.size)
-			} else {
-				putFieldU64(entry.valField, bigTIFF, order, blk.newOffset)
-			}
+			putElem(elems, j, elemSz, order, v)
+		}
+		return
+	default:
+		return
+	}
+	for j := range count {
+		blk := idx.find(offsetTag, int(j))
+		if blk == nil {
 			continue
 		}
-
-		// Out-of-line value: entry.valField is a file-absolute pointer to the
-		// value area. The value bytes are already captured verbatim in rawBytes
-		// by extractRawIFD. We must update the pointer to the new absolute position.
-		origFileOff := fieldAsU64(entry.valField, bigTIFF, order)
-		if origFileOff < srcOff {
-			// Value area precedes the SubIFD start — not captured in rawBytes. Skip.
-			continue
+		v := blk.newOffset
+		if size {
+			v = blk.size
 		}
-		relOff := origFileOff - srcOff // relative offset of value area within rawBytes
-		if relOff+total > uint64(len(rawBytes)) {
-			continue // out of rawBytes bounds — skip
-		}
+		putElem(elems, j, elemSz, order, v)
+	}
+}
 
-		// Update the valOrOff pointer to the new absolute position of the value area.
-		// Task #98 regression: RATIONAL/SRATIONAL/DOUBLE/long-ASCII/etc. entries
-		// had their value bytes preserved verbatim in rawBytes but their valOrOff
-		// pointers left pointing at the old file position → "undef" on read.
-		putFieldU64(entry.valField, bigTIFF, order, newSubIFDOff+relOff)
-
-		// For strip/tile image-data offset and bytecount tags, additionally update
-		// each array element with the new image-block offset/size assigned by
-		// assignNewOffsets.
-		isImageOffsetTag := entryTag == exif.TagStripOffsets || entryTag == exif.TagTileOffsets ||
-			entryTag == exif.TagStripByteCounts || entryTag == exif.TagTileByteCounts
-		if !isImageOffsetTag {
-			// Non-image-data OOL entry: valOrOff pointer already updated above.
-			// The value bytes are verbatim-correct; no element-level patching needed.
-			continue
-		}
-
-		isByteCount := entryTag == exif.TagStripByteCounts || entryTag == exif.TagTileByteCounts
-		offsetTag := entryTag
-		if isByteCount {
-			switch entryTag {
-			case exif.TagStripByteCounts:
-				offsetTag = exif.TagStripOffsets
-			case exif.TagTileByteCounts:
-				offsetTag = exif.TagTileOffsets
-			}
-		}
-
-		for j := range entry.count {
-			blk := idx.find(offsetTag, int(j))
-			if blk == nil {
-				continue
-			}
-			valPos := relOff + j*elemSz
-			if valPos+elemSz > uint64(len(rawBytes)) {
-				continue
-			}
-			v := blk.newOffset
-			if isByteCount {
-				v = blk.size
-			}
-			switch elemSz {
-			case 8:
-				order.PutUint64(rawBytes[valPos:], v)
-			case 4:
-				order.PutUint32(rawBytes[valPos:], uint32(v)) //nolint:gosec // G115: source entry declared 4-byte elements; value bounded by maxFileSize
-			case 2:
-				// TypeShort: new value must fit in uint16. The guard ensures the
-				// value fits; a value that doesn't (implausible given maxFileSize)
-				// is left unpatched rather than silently wrapping.
-				if v <= 0xFFFF {
-					order.PutUint16(rawBytes[valPos:], uint16(v))
-				}
-			}
+// putElem writes v as element j (elemSz bytes: 2, 4 or 8) of elems, in the
+// TIFF byte order. A value that does not fit a SHORT element is left
+// unwritten rather than truncated; a write past elems is ignored.
+func putElem(elems []byte, j, elemSz uint64, order binary.ByteOrder, v uint64) {
+	at := j * elemSz
+	if at+elemSz > uint64(len(elems)) {
+		return
+	}
+	switch elemSz {
+	case 8:
+		order.PutUint64(elems[at:], v)
+	case 4:
+		order.PutUint32(elems[at:], uint32(v)) //nolint:gosec // G115: source declared 4-byte elements; value bounded by maxFileSize
+	case 2:
+		if v <= 0xFFFF {
+			order.PutUint16(elems[at:], uint16(v))
 		}
 	}
+}
+
+// patchSubIFDPointers writes the output offsets of the SubIFDs into the 0x014A
+// arrays of the main IFD chain of finalTIFF (the stream exif.Encode wrote):
+// the array of the k-th chained IFD receives tree.roots[k], element by
+// element, 0 for a SubIFD that is not carried (task #311: the arrays of IFD1
+// and later IFDs used to keep their source offsets, and the array of IFD0 was
+// filled from the flat list of all SubIFDs, nested ones included, so a
+// multi-element array pointed at the wrong IFDs).
+//
+// exif.Encode writes 0x014A with the Type and Count of the parsed entry
+// (generic pass-through), so the element width is read from the entry: 4 bytes
+// for LONG/IFD, 8 for LONG8/IFD8 (task #270; do not assume LONG). bigTIFF
+// selects the header/entry/field widths used to scan finalTIFF (TIFF 6.0 §2
+// for classic; BigTIFF spec §2 for BigTIFF).
+//
+// Task #116: when the declared Count differs from the number of SubIFDs known
+// for that IFD only min(declared, known) elements are written, so no write
+// leaves the array, and ErrSubIFDCountMismatch is returned after patching.
+// ErrSubIFDEntryNotFound is returned when an IFD with SubIFDs has no 0x014A
+// entry in finalTIFF.
+func patchSubIFDPointers(finalTIFF []byte, tree subIFDTree, bigTIFF bool, order binary.ByteOrder) error {
+	off, ok := readIFD0Offset(finalTIFF, bigTIFF, order)
+	var mismatch error
+	for k := 0; ok && off != 0 && k < len(tree.roots); k++ {
+		if kids := tree.roots[k]; kids != nil {
+			if err := patchSubIFDArray(finalTIFF, off, kids, bigTIFF, order); err != nil {
+				if !errors.Is(err, ErrSubIFDCountMismatch) {
+					return err
+				}
+				mismatch = err
+			}
+		}
+		off, ok = rawNextIFD(finalTIFF, off, bigTIFF, order)
+	}
+	return mismatch
+}
+
+// patchSubIFDArray patches the 0x014A array of the IFD at ifdOff in finalTIFF
+// with the output offsets of kids; see patchSubIFDPointers.
+func patchSubIFDArray(finalTIFF []byte, ifdOff uint64, kids []*subIFDInfo, bigTIFF bool, order binary.ByteOrder) error {
+	entry, found := findEntryInIFD(finalTIFF, ifdOff, uint16(exif.TagSubIFDs), bigTIFF, order)
+	if !found {
+		return fmt.Errorf("%w (IFD at offset %d)", ErrSubIFDEntryNotFound, ifdOff)
+	}
+	declared := entry.count
+	actual := uint64(len(kids))
+	patchCount := min(declared, actual)
+	var mismatchErr error
+	if declared != actual {
+		mismatchErr = fmt.Errorf("%w (declared=%d actual=%d)", ErrSubIFDCountMismatch, declared, actual)
+	}
+	elemSz := elemSizeFor(entry.typ, bigTIFF)
+	if elemSz == 0 || patchCount == 0 {
+		return mismatchErr
+	}
+	if declared > ^uint64(0)/elemSz {
+		return fmt.Errorf("%w (count=%d)", ErrSubIFDPointerArrayOOB, declared)
+	}
+	elems := entry.valField
+	if elemSz*declared > inlineThreshold(bigTIFF) {
+		total := elemSz * patchCount
+		arrOff := fieldAsU64(entry.valField, bigTIFF, order)
+		if !fits(arrOff, total, uint64(len(finalTIFF))) {
+			return fmt.Errorf("%w (offset=%d, len=%d)", ErrSubIFDPointerArrayOOB, arrOff, len(finalTIFF))
+		}
+		elems = finalTIFF[arrOff : arrOff+total]
+	}
+	for j := range patchCount {
+		var v uint64
+		if c := kids[j]; c != nil {
+			v = c.newOffset
+		}
+		putElem(elems, j, elemSz, order, v)
+	}
+	return mismatchErr
 }
 
 // blockIndex finds the image block of one IFD by (offset tag, index) in
@@ -1833,85 +1943,4 @@ func (x blockIndex) find(tag exif.TagID, index int) *imageBlock {
 	// with a large Count and no matching blocks would make patchRawIFDOffsets
 	// quadratic.
 	return nil
-}
-
-// patchSubIFDPointers locates the 0x014A SubIFDs entry in the final TIFF
-// output and overwrites the pointer array values with the new SubIFD offsets.
-//
-// exif.Encode preserves 0x014A's original declared Type/Count/Value verbatim
-// (it is generic pass-through for tags it does not specially interpret).
-// After re-encoding we must scan IFD0 in finalTIFF to find the 0x014A entry
-// and patch its value bytes to reflect the new SubIFD positions, using
-// whatever element width (4 bytes for LONG/IFD, 8 bytes for LONG8/IFD8) the
-// entry actually declares — task #270; do not assume LONG.
-//
-// bigTIFF selects the header/entry/field widths used to scan finalTIFF
-// (TIFF 6.0 §2 for classic; BigTIFF spec §2 for BigTIFF).
-func patchSubIFDPointers(finalTIFF []byte, subIFDs []*subIFDInfo, bigTIFF bool, order binary.ByteOrder) error { //nolint:cyclop,gocyclo // linear IFD scan with inline/OOL branching; splitting further would reduce clarity
-	ifd0Off, ok := readIFD0Offset(finalTIFF, bigTIFF, order)
-	if !ok {
-		return nil
-	}
-	entry, found := findEntryInIFD(finalTIFF, ifd0Off, uint16(exif.TagSubIFDs), bigTIFF, order)
-	if !found {
-		// 0x014A entry not found in IFD0 of the re-encoded output. This can
-		// happen when exif.Encode drops entries it doesn't understand
-		// (unknown types). In practice 0x014A is always a recognised numeric
-		// type so it should be preserved. If it is absent, we cannot fix the
-		// SubIFD pointers — return an error so the caller can detect the problem.
-		return fmt.Errorf("%w", ErrSubIFDEntryNotFound)
-	}
-
-	declaredCount := int(entry.count) //nolint:gosec // G115: entry.count bounded by bigTIFFMaxIFDEntries/uint32 IFD-entry semantics in practice
-	actualCount := len(subIFDs)
-
-	// Task #116 regression: bound the write loop by min(declaredCount, actualCount) to
-	// prevent either:
-	//   (a) writing beyond the allocated pointer array in finalTIFF
-	//       (declaredCount > actualCount would index subIFDs[j] OOB), or
-	//   (b) writing beyond the allocated pointer array in finalTIFF
-	//       when actualCount > declaredCount (the slot at j=declaredCount is
-	//       not allocated in the re-encoded IFD and writing it corrupts the
-	//       subsequent IFD or value area).
-	//
-	// Return ErrSubIFDCountMismatch when the counts differ so callers can
-	// log or propagate the discrepancy rather than relying on silent patching.
-	//
-	// TIFF Extension §F: 0x014A holds exactly as many elements as there are
-	// SubIFDs; exif.Encode preserves the original Count faithfully.
-	patchCount := min(declaredCount, actualCount)
-	var mismatchErr error
-	if declaredCount != actualCount {
-		mismatchErr = fmt.Errorf("%w (declared=%d actual=%d)", ErrSubIFDCountMismatch, declaredCount, actualCount)
-	}
-
-	elemSz := elemSizeFor(entry.typ, bigTIFF)
-	if elemSz == 0 || patchCount == 0 {
-		return mismatchErr
-	}
-
-	total := elemSz * uint64(patchCount) //nolint:gosec // G115: patchCount bounded by IFD entry count ceiling
-	if total <= inlineThreshold(bigTIFF) && patchCount == 1 {
-		// Single SubIFD: inline value in the value-or-offset field.
-		putFieldU64(entry.valField, bigTIFF, order, subIFDs[0].newOffset)
-	} else if patchCount > 0 {
-		// Multiple SubIFDs: the value-or-offset field is an offset to the value array.
-		arrOff := fieldAsU64(entry.valField, bigTIFF, order)
-		if arrOff+uint64(patchCount)*elemSz > uint64(len(finalTIFF)) {
-			return fmt.Errorf("%w (offset=%d, len=%d)", ErrSubIFDPointerArrayOOB,
-				arrOff, len(finalTIFF))
-		}
-		for j := range patchCount {
-			elemPos := arrOff + uint64(j)*elemSz
-			switch elemSz {
-			case 8:
-				order.PutUint64(finalTIFF[elemPos:], subIFDs[j].newOffset) //nolint:gosec // G602: elemPos+8 <= len(finalTIFF) is guaranteed by the arrOff+patchCount*elemSz bounds check above (elemSz==8 in this case), for every j < patchCount
-			default: // 4 (LONG/IFD); 0x014A never legitimately uses SHORT
-				order.PutUint32(finalTIFF[elemPos:], uint32(subIFDs[j].newOffset)) //nolint:gosec // G115: newOffset bounded by maxFileSize, always < 2^32
-			}
-		}
-	}
-	// Return mismatch error after patching so that the partial write is visible
-	// but the caller knows the SubIFD array was not fully consistent.
-	return mismatchErr
 }

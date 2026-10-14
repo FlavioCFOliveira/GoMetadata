@@ -58,6 +58,9 @@ chunk (`58 4D 50 20`, 4th byte is space `0x20`), raw packet. IPTC → via XMP. M
 VP8X (extended) format.
 **(e)** Adding EXIF/XMP requires VP8X + set flag; Chunk-Size = exact payload; pad byte iff odd;
 update RIFF File-Size; reserved bits 0; ICCP before image data; do not reorder reconstruction chunks.
+A VP8X added to a simple-format file takes its canvas (u24 LE width−1, height−1) from the VP8/VP8L
+bitstream header and sets Alpha when the image has alpha (VP8L `alpha_is_used`, or an `ALPH` chunk);
+libwebp rejects a canvas that differs from the image size (`VP8_STATUS_BITSTREAM_ERROR`).
 **(f)** File-Size mismatch; Chunk-Size past EOF; odd size missing/non-zero pad; chunk present but
 flag unset (read lenient, write correct); truncated VP8X; `XMP` without trailing space; duplicate
 metadata chunks; metadata before image data.
@@ -81,7 +84,8 @@ than parent; box-vs-FullBox confusion; duplicate ftyp.
 **(b)** ftyp major_brand ∈ {heic, heix, heim, heis, hevc, mif1, msf1} (or in compatible_brands).
 **(c)** Inside `meta`: `hdlr` handler `pict`; `pitm` primary item ID; `iinf` entry_count + `infe`
 per item (item_ID, type e.g. hvc1/Exif/mime/grid, name; FullBox v≥2); `iloc` item byte locations
-(construction_method, base_offset, extents: extent_offset/extent_length); `iref` typed refs
+(construction_method, data_reference_index — present in every iloc version, ISO/IEC 14496-12
+§8.11.3.2 — base_offset, extents: extent_offset/extent_length); `iref` typed refs
 (dimg/thmb/cdsc); `iprp`/`ipco`/`ipma` item properties (ispe/colr/hvcC/pixi/irot).
 **(d)** EXIF item: `infe` item_type `Exif`; payload via iloc is an ExifDataBlock = **4-byte u32 BE
 `exif_tiff_header_offset`** then EXIF (`Exif\0\0`+TIFF or directly TIFF). XMP item: `infe`
@@ -139,7 +143,8 @@ Proprietary deviations to tolerate: Nikon Type-3 TIFF-in-TIFF (`Nikon\0`+header)
 encrypted/obfuscated tags, ORF/RW2 non-standard magic (patch to `2A 00` for the walk, restore on write).
 **(d)** EXIF via 0x8769; GPS via 0x8825; MakerNote 0x927C. XMP via tag `0x02BC` (700). IPTC via
 tag `0x83BB` and/or XMP. CR3 (BMFF): Canon `CMT1`=IFD0, `CMT2`=EXIF IFD, `CMT3`=MakerNote,
-`CMT4`=GPS; not the TIFF item model.
+`CMT4`=GPS, each a complete TIFF stream; XMP in the top-level `uuid` box
+`be7acfcb-97a9-42e8-9c71-999491e3afac`; not the TIFF item model.
 **(e)** Byte order fixed by header (no mixing); patch all dependent offsets when moving
 (StripOffsets 0x0111, TileOffsets 0x0144, SubIFDs, ExifIFD, MakerNote internal). Absolute-offset
 MakerNotes break if relocated — preserve in place or fix up. ORF/RW2: restore original magic on

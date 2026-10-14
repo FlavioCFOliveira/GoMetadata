@@ -57,7 +57,7 @@ Write operations have a narrower, explicitly documented trust boundary that is d
 
 ## Fuzz test coverage
 
-All 29 fuzz targets run continuously in CI using Go's built-in fuzzer. Crash-inducing inputs found during a run are committed to `testdata/fuzz/<Target>/` and are replayed automatically on every subsequent `go test` invocation. MakerNote parsing (Canon, Nikon, Sony, Olympus, Panasonic, Pentax, DJI, FujiFilm, Leica, Samsung, Sigma, Minolta, Casio) is consolidated into a single file, `exif/makernote_parse.go`, dispatched from and covered by `FuzzParseEXIF` — there are no separate per-vendor MakerNote fuzz targets or packages.
+All 37 fuzz targets run continuously in CI using Go's built-in fuzzer. Crash-inducing inputs found during a run are committed to `testdata/fuzz/<Target>/` and are replayed automatically on every subsequent `go test` invocation. MakerNote handling (Canon, Nikon, Sony, Olympus, Panasonic, Pentax, DJI, FujiFilm, Leica, Samsung, Sigma, Minolta, Casio) is consolidated in two files of package `exif`: `exif/makernote_detect.go` (vendor detection and the per-vendor dispatch table) and `exif/makernote_parse.go` (layout resolution and the vendor parsers), reached from and covered by `FuzzParseEXIF` — there are no separate per-vendor MakerNote fuzz targets or packages.
 
 This inventory is verified directly against the source tree (`grep -rn '^func Fuzz' --include='*.go' .`); if you add or rename a fuzz target, update this table in the same change.
 
@@ -74,6 +74,7 @@ This inventory is verified directly against the source tree (`grep -rn '^func Fu
 | `FuzzParseEXIF` | `exif/` | EXIF/TIFF IFD traversal: byte order detection, tag decoding, inline vs. offset values, IFD chaining (bounded by the IFD-chain traversal budget, EXIF-IFDCHAIN-01), and MakerNote dispatch/decoding for all supported manufacturers |
 | `FuzzParseIPTC` | `iptc/` | IPTC IIM dataset decoding: record/dataset markers, extended-length headers, and character-encoding fields |
 | `FuzzParseXMP` | `xmp/` | XMP/RDF-XML parsing: namespace resolution, property type dispatch, and packet boundary detection |
+| `FuzzParseExtended` | `xmp/` | Standard and extended XMP recomposition into one tree: never panics, never keeps `xmpNote:HasExtendedXMP`, and the result encodes and reaches a fixpoint |
 
 ### Container extractors and injectors
 
@@ -85,6 +86,9 @@ Every container format with a write path has both an `Extract` (read) and an `In
 | `FuzzJPEGInject` | `format/jpeg/` | JPEG write path: APP1(EXIF)/APP1(XMP)/APP13(IPTC) segment rebuild, extended-XMP GUID generation and chunk splitting, and Photoshop IRB sibling-resource preservation on a malformed or truncated original APP13 |
 | `FuzzPNGExtract` | `format/png/` | PNG chunk extraction: chunk length and CRC validation, iTXt/tEXt/zTXt identification |
 | `FuzzPNGInject` | `format/png/` | PNG write path: chunk rebuild and metadata upsert on structurally varied container bytes |
+| `FuzzDecodeRawProfile` | `format/png/` | Decoder of the "Raw profile type" text chunk payload: never panics, and a non-nil result has the length it declares |
+| `FuzzPNGExtractRawProfile` | `format/png/` | PNG extraction from whole files seeded with "Raw profile type" chunks (IPTC and EXIF) |
+| `FuzzRewriteRawProfileIPTC` | `format/png/` | In-place rewrite of a "Raw profile type iptc" chunk: never panics, and the rewritten chunk reads back as exactly the new IIM |
 | `FuzzTIFFExtract` | `format/tiff/` | Standalone TIFF container parsing: IFH magic, IFD0 offset, and sub-IFD discovery |
 | `FuzzTIFFInject` | `format/tiff/` | TIFF copy-and-relocate write path: image-block enumeration/relocation, SubIFD relocation, and the image-block budget caps (GM-W1) |
 | `FuzzWebPExtract` | `format/webp/` | WebP RIFF chunk parsing: four-byte chunk type identification, chunk size bounds, and EXIF/XMP chunk location |
@@ -116,6 +120,10 @@ Every container format with a write path has both an `Extract` (read) and an `In
 | Target | Package | What it covers |
 |---|---|---|
 | `FuzzRIFFRead` | `internal/riff/` | RIFF chunk-header parsing (used by WebP): chunk `Size` and `Offset` arithmetic, exercised independently of the WebP-specific dispatch layer |
+| `FuzzIRB` | `internal/irb/` | Photoshop image resource block parsers: never panic, every returned slice aliases the input, and refreshing the digest never changes the stream length |
+| `FuzzIPTCDigest` | `internal/tiffscan/` | IPTC digest lookup in TIFF-like input (classic and BigTIFF): never panics, and a non-nil digest is exactly 16 bytes inside the input |
+| `FuzzArtist` | `internal/reconcile/` | EXIF Artist list functions: never panic, and the list survives a join/split round trip |
+| `FuzzParseDates` | `internal/reconcile/` | XMP and IIM date parsing for reconciliation: never panics, and parsed values are consistent with their own export |
 
 ---
 

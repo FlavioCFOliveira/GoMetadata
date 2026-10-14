@@ -2,7 +2,7 @@
 
 Normative-requirements checklist for the GoMetadata conformance test battery. Rule IDs
 (`PW-*`, `RDF-*`, `NS-*`, `VT-*`, `JPEG-*`, `TIFF-*`, `PNG-*`, `HEIF-*`, `MWG-*`, `ROB-*`)
-are used verbatim as Go sub-test names. 67 rules total.
+are used verbatim as Go sub-test names. 69 rules total.
 
 > Note for implementers: a few byte-length constants below (e.g. the JPEG XMP namespace
 > identifier length) must be reconciled against the actual codebase during implementation —
@@ -40,22 +40,16 @@ are used verbatim as Go sub-test names. 67 rules total.
 - **RDF-06** `rdf:Alt` MUST contain an `rdf:li xml:lang="x-default"`; return x-default when no lang match.
 - **RDF-07** Qualifiers (other than xml:lang) via `rdf:value` + qualifier elements; MUST preserve on write.
 - **RDF-08** Structures = nested `rdf:Description`; recurse to extract fields.
-  - *Accepted, spec-bounded limitation (task #274):* an array-typed field nested INSIDE a
-    struct value (e.g. a hypothetical `stEvt:foo` whose value is itself an `rdf:Bag`/`Seq`/`Alt`)
-    is not represented — the parser's `atCollection()` requires `!p.inStruct`, and
-    `writeStructInListProperty` emits every struct field as a bare scalar. This is unreachable
-    with the struct types this package models — `ResourceEvent`/`stEvt` (xmpMM:History),
-    `ResourceRef`/`stRef` (xmpMM:Ingredients/Pantry), `Version` (xmpMM:Versions), `Ancestor`
-    (photoshop:DocumentAncestors), `Layer` (photoshop:TextLayers), and
-    `ArtworkOrObjectDetails` (Iptc4xmpExt:ArtworkOrObject) — none of which define an
-    array-typed sub-field per Adobe XMP Specification Part 1/2 or IPTC Photo Metadata
-    Standard 2025.1. Documented here as a deliberate, spec-verified deviation rather than an
-    open gap; revisit if a future schema addition introduces such a field.
+  - Since task #303 the parser builds the XMP data model tree (ISO 16684-1:2019 §6), so
+    structures and arrays nest to any depth (an array inside a struct field, a struct inside an
+    array item, and so on) and keep their qualifiers. `XMP.Properties` exposes the documented
+    keys for the first two levels ("parent.field", "parent[N].field"); every deeper node is kept
+    in the tree and written back unchanged by `Encode`.
 
 ### 2.3 Namespaces — XMP Part 1 §6 / XML Namespaces
 - **NS-01** Namespace URIs are canonical; resolve properties by URI, never by prefix.
 - **NS-02** Prefixes are arbitrary NCNames; never hard-code prefix strings.
-- **NS-03** Writer MUST NOT bind two distinct URIs to the same prefix; generate `ns0`, `ns1`, …
+- **NS-03** Writer MUST NOT bind two distinct URIs to the same prefix; reuse the source document's prefix of a namespace without a well-known prefix when it is free, otherwise generate `ns0`, `ns1`, …
 - **NS-04** Preferred prefix↔URI bindings (conventional): dc, xmp, xmpRights, xmpMM, xmpBJ, xmpTPg, xmpDM, xmpNote, photoshop, crs, tiff, exif, aux, Iptc4xmpCore, Iptc4xmpExt, x=`adobe:ns:meta/`, rdf, xml.
 
 ### 2.4 Value Types — XMP Part 1 §8
@@ -78,7 +72,9 @@ are used verbatim as Go sub-test names. 67 rules total.
 - **JPEG-05** ExtendedXMP header after id = 32 ASCII hex GUID + uint32 BE fullLength + uint32 BE offset.
 - **JPEG-06** GUID = MD5 of full extended XMP = value of `xmpNote:HasExtendedXMP` in standard packet; validate before reassembly.
 - **JPEG-07** Reassembly validates: same GUID, same fullLength, Σ chunk lengths = fullLength, no dup/overlap offsets; incomplete → error.
-- **JPEG-08** Merge extended `rdf:Description` into primary model without duplicating standard props.
+- **JPEG-08** Merge extended `rdf:Description` into primary model without duplicating props; a top-level property present in both portions takes the extended value as a whole (Adobe XMP Toolkit `XMPUtils::MergeFromJPEG`).
+- **JPEG-09** ExtendedXMP serialized without a packet wrapper; GUID written as 32 hex digits with capital A–F (S3 §1.1.3.1).
+- **JPEG-10** Reader recomposes StandardXMP and ExtendedXMP into one data model tree and removes `xmpNote:HasExtendedXMP`; the xmpNote namespace URI is `http://ns.adobe.com/xmp/note/` (S3 §1.1.3.1).
 
 ### 3.2 TIFF — XMP Part 3 §1.3
 - **TIFF-01** XMP in tag 700 (`0x02BC`); type BYTE(1) or UNDEFINED(7); accept both, write BYTE.
@@ -98,12 +94,12 @@ are used verbatim as Go sub-test names. 67 rules total.
 - **HEIF-03** Wrapper not required; handle both.
 
 ## Section 4: Reconciliation / MWG (v2.0)
-- **MWG-01** Read priority XMP > EXIF > IPTC-IIM on conflict.
-- **MWG-02** IPTC digest (Photoshop resource `0x0425`): match → XMP priority; mismatch → elevate IIM trust.
-- **MWG-03** dc:description[x-default] ↔ EXIF UserComment `0x9286` ↔ IIM 2:120; sync all on write.
+- **MWG-01** Read priority EXIF > XMP > IPTC-IIM on conflict (MWG §4.2.3.1, §4.2.3.3) for the fields mapped in all three formats (description, copyright, creator, date/time original); XMP > IPTC-IIM for keywords (§5.1). A value of only spaces or NULs is absent (§4.2.3.3).
+- **MWG-02** IPTC digest (Photoshop resource `0x0425`): match or absent → MWG-01 priority; mismatch → an IIM value that differs from the value predicted from XMP wins over EXIF and XMP (§4.2.3.2 scenario 4, §4.2.3.3).
+- **MWG-03** dc:description[x-default] ↔ EXIF ImageDescription `0x010E` ↔ IIM 2:120 (MWG §5.2); sync all on write.
 - **MWG-04** dc:creator[1] ↔ EXIF Artist `0x013B` ↔ IIM 2:80; sync all on write.
 - **MWG-05** dc:rights[x-default] ↔ EXIF Copyright `0x8298` ↔ IIM 2:116; sync all on write.
-- **MWG-06** photoshop:DateCreated ↔ EXIF DateTimeOriginal `0x9003`+SubSec `0x9291` ↔ IIM 2:55+2:60; combine/split.
+- **MWG-06** photoshop:DateCreated ↔ EXIF DateTimeOriginal `0x9003`+SubSec `0x9291` (+OffsetTime `0x9011`) ↔ IIM 2:55+2:60; combine/split (MWG §5.3).
 - **MWG-07** dc:subject ↔ IIM 2:25 keywords (no EXIF equivalent); sync both.
 - **MWG-08** exif:GPS* (XMP) ↔ EXIF GPS IFD `0x0002/0x0004/0x0006/0x0005`; decimal degrees in XMP.
 - **MWG-09** Write sync scope: update all formats present unless API requests a format-specific mode.

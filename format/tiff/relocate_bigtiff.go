@@ -243,8 +243,23 @@ func putFieldU64(valField []byte, bigTIFF bool, order binary.ByteOrder, v uint64
 // field width are left-justified within it (starting at the lowest-address
 // byte), independent of file byte order — the same convention exif.Encode
 // already uses for BigTIFF writes (see exif/write.go serialiseBigTIFF).
-func decodeOffsetArray(buf, valField []byte, count, elemSz uint64, bigTIFF bool, order binary.ByteOrder) ([]uint64, bool) { //nolint:gocyclo // inline/OOL branching plus a 4-way element-width switch; splitting further would obscure the single decode algorithm
-	if count == 0 || elemSz == 0 {
+func decodeOffsetArray(buf, valField []byte, count, elemSz uint64, bigTIFF bool, order binary.ByteOrder) ([]uint64, bool) {
+	src, ok := offsetArrayBytes(buf, valField, count, elemSz, bigTIFF, order)
+	if !ok {
+		return nil, false
+	}
+	out := make([]uint64, count)
+	for i := range count {
+		out[i] = elemAt(src, i, elemSz, order)
+	}
+	return out, true
+}
+
+// offsetArrayBytes returns the count*elemSz bytes of the array described by
+// valField (see decodeOffsetArray), and false when it does not fit in buf or
+// elemSz is not 1, 2, 4 or 8.
+func offsetArrayBytes(buf, valField []byte, count, elemSz uint64, bigTIFF bool, order binary.ByteOrder) ([]byte, bool) {
+	if count == 0 || (elemSz != 1 && elemSz != 2 && elemSz != 4 && elemSz != 8) {
 		return nil, false
 	}
 	// Overflow-safe multiplication (mirrors extent.go's resolveEntryValue):
@@ -256,40 +271,36 @@ func decodeOffsetArray(buf, valField []byte, count, elemSz uint64, bigTIFF bool,
 		return nil, false // corrupt/adversarial: count*elemSz would overflow uint64
 	}
 	total := count * elemSz
-	var src []byte
 	if total <= inlineThreshold(bigTIFF) {
-		src = valField
-	} else {
-		off := fieldAsU64(valField, bigTIFF, order)
-		// fits (extent.go), not a raw `off+total > len(buf)` comparison —
-		// off can independently be near MaxUint64 from the same LONG8
-		// field, wrapping the addition to a small value that would
-		// incorrectly pass and then panic on buf[off:off+total] below.
-		if !fits(off, total, uint64(len(buf))) {
+		if uint64(len(valField)) < total {
 			return nil, false
 		}
-		src = buf[off : off+total]
+		return valField[:total], true
 	}
-	out := make([]uint64, count)
-	for i := range count {
-		p := i * elemSz
-		if p+elemSz > uint64(len(src)) {
-			return nil, false
-		}
-		switch elemSz {
-		case 1:
-			out[i] = uint64(src[p])
-		case 2:
-			out[i] = uint64(order.Uint16(src[p:]))
-		case 4:
-			out[i] = uint64(order.Uint32(src[p:]))
-		case 8:
-			out[i] = order.Uint64(src[p:])
-		default:
-			return nil, false
-		}
+	off := fieldAsU64(valField, bigTIFF, order)
+	// fits (extent.go), not a raw `off+total > len(buf)` comparison —
+	// off can independently be near MaxUint64 from the same LONG8
+	// field, wrapping the addition to a small value that would
+	// incorrectly pass and then panic on buf[off:off+total] below.
+	if !fits(off, total, uint64(len(buf))) {
+		return nil, false
 	}
-	return out, true
+	return buf[off : off+total], true
+}
+
+// elemAt returns element i (elemSz bytes: 1, 2, 4 or 8, validated by
+// offsetArrayBytes) of src in order, widened to uint64.
+func elemAt(src []byte, i, elemSz uint64, order binary.ByteOrder) uint64 {
+	p := src[i*elemSz:]
+	switch elemSz {
+	case 1:
+		return uint64(p[0])
+	case 2:
+		return uint64(order.Uint16(p))
+	case 4:
+		return uint64(order.Uint32(p))
+	}
+	return order.Uint64(p)
 }
 
 // parseIFDAtBigTIFF parses a single BigTIFF-shaped IFD at absolute offset off

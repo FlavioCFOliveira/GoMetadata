@@ -68,7 +68,7 @@ func buildNikonType3(order binary.ByteOrder, entries [][4]uint32) []byte {
 // buildFujifilmMakerNote builds a Fujifilm MakerNote payload.
 // Uses a non-zero IFD offset so traverse works.
 func buildFujifilmMakerNote(entries [][4]uint32) []byte {
-	// [0..7] "FUJIFILM", [8..11] version "0100", [12..15] LE uint32 IFD offset.
+	// [0..7] "FUJIFILM", [8..11] LE uint32 IFD offset, [12..15] filler.
 	// IFD is placed immediately after the 16-byte header.
 	const ifdStart = 16
 	n := len(entries)
@@ -76,8 +76,8 @@ func buildFujifilmMakerNote(entries [][4]uint32) []byte {
 	buf := make([]byte, ifdStart+ifdSize)
 
 	copy(buf[0:8], "FUJIFILM")
-	copy(buf[8:12], "0100")
-	binary.LittleEndian.PutUint32(buf[12:16], uint32(ifdStart))
+	binary.LittleEndian.PutUint32(buf[8:12], uint32(ifdStart))
+	copy(buf[12:16], "0100")
 
 	order := binary.LittleEndian
 	ifd := buf[ifdStart:]
@@ -147,10 +147,10 @@ func buildPentaxAOCMakerNote(entries [][4]uint32) []byte {
 }
 
 // buildPentaxPENTAXMakerNote builds a Pentax PENTAX-format MakerNote payload.
-// Uses IFD at offset 12 (non-zero) so traverse works.
+// The IFD starts at offset 10, right after the byte-order mark.
 func buildPentaxPENTAXMakerNote(order binary.ByteOrder, entries [][4]uint32) []byte {
-	// "PENTAX \0" (8) + byte order (2) + version (2) + IFD at 12.
-	const ifdStart = 12
+	// "PENTAX \0" (8) + byte order (2) + IFD at 10.
+	const ifdStart = 10
 	n := len(entries)
 	ifdSize := 2 + n*12 + 4
 	buf := make([]byte, ifdStart+ifdSize)
@@ -161,8 +161,6 @@ func buildPentaxPENTAXMakerNote(order binary.ByteOrder, entries [][4]uint32) []b
 	} else {
 		buf[8], buf[9] = 'M', 'M'
 	}
-	buf[10] = 0x01
-	buf[11] = 0x00
 
 	ifd := buf[ifdStart:]
 	order.PutUint16(ifd[0:], uint16(n)) //nolint:gosec // G115: test helper
@@ -1016,12 +1014,16 @@ func TestParseMakerNoteIFDMakeWithTrailingSpace(t *testing.T) {
 func TestParseMakerNoteIFDCanonWithTrailingSpace(t *testing.T) {
 	t.Parallel()
 	b := buildNikonType3(binary.LittleEndian, testOneEntry())
+	// Task #304: a Nikon Type-3 blob is recognised by its "Nikon\0" signature
+	// whatever the Make says, so the unknown-Make check below uses a blob with
+	// no signature at all.
+	noSig := []byte{0x01, 0x00, 0x01, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
 	// "Canon " (with trailing space) must dispatch to the Canon parser, not fall
 	// through to "unknown make".  The Canon parser calls traverse(b, 0, order)
 	// which returns nil for a Nikon Type-3 payload — the important thing is that
 	// the dispatch happened (no panic, no wrong parser).
 	ifdCanonSpace := parseMakerNoteIFD(b, "Canon ", binary.LittleEndian)
-	ifdUnknown := parseMakerNoteIFD(b, "TOTALLY_UNKNOWN_MAKE", binary.LittleEndian)
+	ifdUnknown := parseMakerNoteIFD(noSig, "TOTALLY_UNKNOWN_MAKE", binary.LittleEndian)
 	// Both return nil for this payload, but they must have reached different code
 	// paths.  We cannot distinguish them at the return-value level when both are
 	// nil, so we verify the unknown make explicitly returns nil (no dispatch).
@@ -1037,8 +1039,11 @@ func TestParseMakerNoteIFDCanonWithTrailingSpace(t *testing.T) {
 // entirely of whitespace does not dispatch to any parser (no false positives).
 func TestParseMakerNoteIFDMakeWhitespaceOnly(t *testing.T) {
 	t.Parallel()
-	b := buildNikonType3(binary.LittleEndian, testOneEntry())
-	ifd := parseMakerNoteIFD(b, "   ", binary.LittleEndian)
+	// Task #304: the Nikon signature makes the Nikon blob detectable without a
+	// Make; use a signature-less plain IFD to prove that a blank Make alone
+	// selects nothing.
+	plain := []byte{0x01, 0x00, 0x01, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	ifd := parseMakerNoteIFD(plain, "   ", binary.LittleEndian)
 	if ifd != nil {
 		t.Error("whitespace-only Make should return nil (no match after TrimSpace)")
 	}
@@ -1399,11 +1404,11 @@ func TestMakerNoteDispatchZeroAllocLookup(t *testing.T) {
 }
 
 // TestMakerNoteDispatchAllRegisteredKeys verifies that makerNoteDispatch finds
-// every key registered in makerNoteParsers when the makeValue bytes are the key
+// every Make of the former exact-Make table (legacyMakerNoteMakes) when the makeValue bytes are the key
 // string followed by a NUL terminator (the standard EXIF ASCII encoding).
 //
-// This test catches any regression where a key is registered in makerNoteParsers
-// but the trim logic in makerNoteDispatch fails to match it.
+// This test catches any regression where a Make that used to dispatch no longer
+// does, or where the trim logic in makerNoteDispatch fails to match it.
 //
 // task #202, performance audit 2026-06-10.
 func TestMakerNoteDispatchAllRegisteredKeys(t *testing.T) {
@@ -1412,7 +1417,7 @@ func TestMakerNoteDispatchAllRegisteredKeys(t *testing.T) {
 	// Build a registry of all keys: key → a builder for a valid payload.
 	// We only need to verify dispatch (fn != nil returned from the map), not
 	// that the parser succeeds; use the key itself as a marker.
-	for key := range makerNoteParsers {
+	for _, key := range legacyMakerNoteMakes {
 		t.Run(key, func(t *testing.T) {
 			t.Parallel()
 

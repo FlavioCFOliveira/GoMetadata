@@ -3,6 +3,7 @@ package heif
 import (
 	"bytes"
 	"encoding/binary"
+	"os"
 	"testing"
 )
 
@@ -271,6 +272,15 @@ func FuzzHEIFInject(f *testing.F) {
 	// buildHEIFDuplicateIloc / TestInjectDuplicateIlocBoxesOffsetInBounds in
 	// heif_test.go for the full writeup.
 	f.Add(buildHEIFDuplicateIloc())
+
+	// Seeds (task #309): real metadata-free AVIF and HEIC files, which make
+	// Inject create the Exif and XMP items, shift the image item's offset and
+	// insert an iref box.
+	for _, name := range []string{"testdata/no_metadata.avif", "testdata/no_metadata.heic"} {
+		if seed, err := os.ReadFile(name); err == nil {
+			f.Add(seed)
+		}
+	}
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic regardless of input. Inject must return an error or

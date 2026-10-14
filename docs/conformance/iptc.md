@@ -129,16 +129,22 @@ Namespaces: `Iptc4xmpCore` = `http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/`,
   lossy constraints (sub-second truncation, single-string flattening of a
   repeatable field, 8859-1 vs UTF-8 transcoding). — IPTC Photo Metadata 2025.1
   Mapping Guidelines; MWG §2 ("Synchronization").
-- **RECONCILE-02** Read priority: default is XMP > IIM (MWG §2, "MWG-01").
-  Exception (MWG §3.3.1, "MWG-02"): when Photoshop IRB resource `0x0425`
+- **RECONCILE-02** Read priority (MWG §4.2.3.3, "MWG-01"): EXIF > XMP > IIM
+  for {Caption/Abstract, CopyrightNotice, By-line, DateCreated+TimeCreated};
+  XMP > IIM for Keywords, which EXIF does not carry (MWG §5.1). Exception
+  (MWG §4.2.3.2, scenario 4, "MWG-02"): when Photoshop IRB resource `0x0425`
   ("IPTC Digest") is present, compare `MD5(raw 0x0404 IIM stream)` to the
   stored 16-byte value. All-zero stored digest ("unknown" sentinel) OR a
-  computed/stored mismatch ⇒ elevate IIM priority (IIM > XMP > EXIF) for the
-  conflict-prone field set {Caption/Abstract, CopyrightNotice, By-line,
-  Keywords}. Digest match, or resource absent, ⇒ default MWG-01 applies
-  unchanged. Digest is not consulted for any field outside the set above
-  (in particular, not for DateCreated/DateTimeOriginal in this codebase).
-  Proven by `TestConformance_MWG02` (metadata_conformance_test.go).
+  computed/stored mismatch ⇒ the IIM value wins over EXIF and XMP unless it
+  equals the IIM value predicted from the XMP value (the XMP value truncated
+  to the DataSet length limit; for dates, the IIM export of the XMP date).
+  Digest match, or resource absent, ⇒ MWG-01 applies unchanged. A value of
+  only spaces or NULs is absent (MWG §4.2.3.3). Proven by
+  `TestConformance_MWG02` (metadata_conformance_test.go),
+  `TestPrecedence_ExplicitPolicyComment` (root_task50_test.go) and
+  `TestTask308_ReadPolicy_Text`, `TestTask308_ReadPolicy_Keywords`,
+  `TestTask308_DateTimeOriginalSources`,
+  `TestTask308_DateTimeOriginalEditedIIMWinsOverEXIF` (reconcile_task308_test.go).
 - **RECONCILE-03** Date bridging (write path): a single capture timestamp is
   split into IIM 2:55 `CCYYMMDD` + 2:60 `HHMMSS±HHMM` (IIM §2.2.23), EXIF
   ExifIFD 0x9003 DateTimeOriginal (EXIF §4.6.5), and XMP `photoshop:DateCreated`
@@ -152,7 +158,9 @@ Namespaces: `Iptc4xmpCore` = `http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/`,
   The convenience setter also flattens the ordered list into EXIF IFD0 0x013B
   Artist (EXIF §4.6.4 Table 3) as a single string joined with `"; "`
   (semicolon-space), the MWG list-handling convention for single-string EXIF
-  fields that mirror a multi-valued XMP/IIM property.
+  fields that mirror a multi-valued XMP/IIM property (MWG §5.7): an item that
+  contains `"; "` or begins with a quote is enclosed in quotes and its quotes
+  are doubled, and on read the Artist string is split back into items.
 - **RECONCILE-05** Lang Alt ↔ IIM plain-string reconciliation: an IIM Record 2
   text dataset (2:05 ObjectName, 2:116 CopyrightNotice, 2:120 Caption/Abstract)
   round-trips through XMP as an `rdf:Alt` collection whose `x-default`

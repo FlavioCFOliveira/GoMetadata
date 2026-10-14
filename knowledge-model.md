@@ -17,7 +17,7 @@ both in the same step.
 
 ---
 
-## Node labels (14)
+## Node labels (15)
 
 | Label | Key | Count* | Properties |
 |---|---|---|---|
@@ -35,6 +35,7 @@ both in the same step.
 | `Audit` | `key` | 4 | `key, date, type, scope, method, baseline, prior_audit, critical, high, medium, low, findings_new, new_tasks, sprints, status, remediation_commits, remediation_date, confirmed_live, closed_verified_fixed, open_tasks, headlines, gitCommit, gitDate` |
 | `ConformanceBattery` | `name` | 1 | `name, id, package, file, ruleCount, ruleSections, defectsFixed, status, commitHash, completedDate` |
 | `Milestone` | `name` | 1 | `name, kind, verdict, date, head, sprint, dimensions, note, release_*, released, pushed_remotes` — a project-level checkpoint (e.g. production-readiness verdict) |
+| `ReferenceProject` | `name` (string) | — | `name, url, license, sourceCommit, copyright, copyAreas, studyAreas, gitCommit, gitDate` — an external open-source project used as a reference (CLAUDE.md *Reference Open-Source Projects*) or as a source of adapted content (`THIRD_PARTY_NOTICES.md`) |
 
 \* approximate at bootstrap (`402a067`, 2026-06-01).
 
@@ -44,6 +45,9 @@ both in the same step.
 - `Feature.type = known_bug` — an open defect tracked as an rmp backlog task (`task` = its id); `Feature.status` = `open` | `fixed`. Tests guarding it link via `TESTS`.
 - `Commit.tasks_verified_closed` / `Commit.tasks_still_open` — comma-separated rmp task ids confirmed closed / still open after post-hoc verification of the commit's claimed fixes; `Commit.verified_date` — ISO date of that verification. `Audit.open_tasks` — remediation task ids of the audit still open.
 - `Function.kind`: `api` (public entry point), `exported` (exported non-root symbol), `internal` (unexported symbol, modelled only when it implements a tracked `Feature`), `method` (method; `name` = `Receiver.Method`). `Function.line` = declaration line.
+- `ReferenceProject` (added 2026-10-14, sprint 45): `name` = project name as written in CLAUDE.md / `THIRD_PARTY_NOTICES.md` (e.g. `libtiff`, `Adobe XMP Toolkit SDK`). `copyAreas` / `studyAreas` — comma-separated CLAUDE.md areas for which the project is listed in the *Copy / adapt* / *Study / oracle* column (null when not listed). `license` (SPDX id), `sourceCommit` (pinned upstream commit) and `copyright` are set only for projects with a `THIRD_PARTY_NOTICES.md` entry; null otherwise (never inferred). Which projects have adapted content: `MATCH (f:File)-[:ADAPTED_FROM]->(r:ReferenceProject) RETURN DISTINCT r.name`.
+- `ADAPTED_FROM` edge properties: `source` (upstream `file:symbol` list from the `// Adapted from` header), `adapted` (boolean; `true` = content transcribed into this file, `false` = upstream used for cross-checking only), `testFile` (repo-relative test file that carries an `Adapted from` header for the same project, or null).
+- `Feature.domain = legal` — licensing / third-party attribution infrastructure.
 - `Test` identity: `MERGE` on `{name, package}` — Go test names are only unique per package (e.g. `TestExtractKeepsOriginalMagic` exists in both `format/raw/orf` and `format/raw/rw2`).
 
 ### `layer` values for `Package`
@@ -52,7 +56,7 @@ both in the same step.
 `example`.
 
 ### `domain` values for `Feature` / `Spec`
-`exif` · `iptc` · `xmp` · `container` · `api` · `hardening`.
+`exif` · `iptc` · `xmp` · `container` · `api` · `hardening` · `legal` (Feature only).
 
 ### `entryReachable` on `Package` (boolean)
 Computed from the graph's own `DEPENDS_ON` edges: `true` if the package is the entry
@@ -95,7 +99,7 @@ NOT modelled as `FormatCapability` nodes: the module returns `UnsupportedFormatE
 
 ---
 
-## Edge types (18)
+## Edge types (19)
 
 **Structural**
 
@@ -114,7 +118,8 @@ NOT modelled as `FormatCapability` nodes: the module returns `UnsupportedFormatE
 | `FUZZES` | `FuzzTarget → {Package, Feature}` | robustness surface under test |
 | `TESTS` | `Test → {Feature, Package}` | test verifies the target |
 | `HAS_TEST` | `Package → Test` | package owns the (feature-linked) test |
-| `INTRODUCED` | `Commit → {Feature, Test, Benchmark, FuzzTarget}` | commit that introduced the element |
+| `INTRODUCED` | `Commit → {Feature, Test, Benchmark, FuzzTarget, ReferenceProject}` | commit that introduced the element (for `ReferenceProject`: the commit that first recorded the project in CLAUDE.md or `THIRD_PARTY_NOTICES.md`) |
+| `ADAPTED_FROM` | `File → ReferenceProject` | the source file carries an `// Adapted from` header naming the project (`docs/THIRD_PARTY.md`); content was transcribed or cross-checked per `adapted` |
 | `FIXED` | `Commit → Feature` | commit that fixed/hardened the feature |
 | `RESOLVES` | `Commit → Audit` | commit that remediates an audit finding/sprint (×19) |
 | `FOLLOWS` | `Audit → Audit` | an audit pass that succeeds a prior one (×2) |

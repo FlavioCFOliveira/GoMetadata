@@ -239,6 +239,41 @@ When analysing existing problems, new features, or refactorings of existing feat
 
 ---
 
+## Reference Open-Source Projects
+
+This table maps each area of GoMetadata to the open-source projects to use as references, per the Open Source and Do Not Reinvent policies.
+
+GoMetadata is MIT-licensed, so only permissively licensed code (MIT, BSD, Apache-2.0, libpng, libtiff) may be copied or adapted, and every copyright and NOTICE requirement must be retained; GPL, LGPL, and Artistic-licensed projects may be used only for study and as differential-test oracles, never as a source of copied code.
+
+The projects listed below may be cloned locally so that their code can be used directly for whatever the work requires: reading, studying, copying, adapting, building, and running them as test oracles. Copying code from them remains subject to the licensing rule above, so only code from permissively licensed projects may be copied into GoMetadata. Local clones are working references only and must never be committed to this repository.
+
+| Area | Copy / adapt | Study / oracle |
+|---|---|---|
+| EXIF tag registry | [metadata-extractor], [libtiff] | [ExifTool], [Exiv2] |
+| MakerNote decoding | [evanoberholster/imagemeta], [metadata-extractor] | [ExifTool] |
+| MakerNote writing | — | [Exiv2], [ExifTool] |
+| IPTC in PNG / RAW | [Adobe XMP Toolkit SDK] | [Exiv2], [ExifTool] |
+| XMP and MWG reconciliation | [Adobe XMP Toolkit SDK] | [ExifTool] |
+| HEIF / AVIF writing | [libavif] | [libheif], [ExifTool] |
+| CR3 | [evanoberholster/imagemeta] | [lclevy canon_cr3], [ExifTool] |
+| WebP | [libwebp] | [Exiv2] |
+| PNG | [libpng] | [Exiv2] |
+| TIFF | [libtiff] | [Exiv2] |
+
+[metadata-extractor]: https://github.com/drewnoakes/metadata-extractor
+[libtiff]: https://gitlab.com/libtiff/libtiff
+[ExifTool]: https://github.com/exiftool/exiftool
+[Exiv2]: https://github.com/Exiv2/exiv2
+[evanoberholster/imagemeta]: https://github.com/evanoberholster/imagemeta
+[Adobe XMP Toolkit SDK]: https://github.com/adobe/XMP-Toolkit-SDK
+[libavif]: https://github.com/AOMediaCodec/libavif
+[libheif]: https://github.com/strukturag/libheif
+[lclevy canon_cr3]: https://github.com/lclevy/canon_cr3
+[libwebp]: https://chromium.googlesource.com/webm/libwebp
+[libpng]: https://github.com/pnggroup/libpng
+
+---
+
 ## Skills
 
 Use the following Claude Code skills for the corresponding operations:
@@ -300,7 +335,7 @@ Task execution is the natural continuation of planning. Always, through the `roa
 1. Check whether any open task is already in progress and resume it if so.
 2. Identify the next task, together with every other open task whose work can be grouped with it under the Work Synergy and Work Convergence policies.
 3. Understand the objective of each selected task from its description, functional requirements, and technical requirements.
-4. Determine the most appropriate specialist subagent and delegate the execution to it, per the Subagent Policy (one subagent at a time, in series). Go code is always delegated to `go-performance-architect`, per the mandatory Code Authorship Rule above.
+4. Determine the most appropriate specialist subagent and delegate the execution to it, per the Subagent Policy (one subagent at a time, in series). Go code is always delegated to `go-performance-architect`, per the mandatory Code Authorship Rule above. Record the work in the `rmp` comment log as it happens, per the [Work Log](#work-log-rmp-comments) section.
 5. Validate the acceptance criteria before closing each task.
 6. Close each task with a brief summary of what was done.
 7. Create the git commit(s) describing what was done, through the `gitflow` skill.
@@ -309,6 +344,45 @@ Task execution is the natural continuation of planning. Always, through the `roa
 Whenever possible, adapt the model and its reasoning-effort level to the requirements of each task's individual operations.
 
 Sprints must always be executed sequentially. The work of tasks within a sprint may be grouped into a single effort, with the tasks kept separate, under the Work Synergy and Work Convergence policies; subagents always run in series, per the Subagent Policy.
+
+---
+
+## Work Log (rmp Comments)
+
+Use the `rmp` comment log, through the `roadmap-manager` skill, on every task and every sprint to track the progression of the work. Write each entry when the event happens; never reconstruct the log at closing time.
+
+### Sprint comments
+
+Sprint comments record high-level sprint management only.
+
+| Type | Use it for |
+|---|---|
+| `DECISION` | Scope, grouping of tasks into efforts, execution order, and exclusions, with the rejected options. |
+| `PROGRESS` | An effort or milestone delivered, and what remains. |
+| `FINDING` | An impediment, risk, or discovery that affects the sprint as a whole. |
+| `UPDATE` | A change to the sprint definition, and why. |
+
+`HYPOTHESIS`, `TEST`, and `NOTE` are not valid on sprints.
+
+### Task comments
+
+Task comments record the work of that task only.
+
+| Type | Must state |
+|---|---|
+| `HYPOTHESIS` | The proposition to verify, written before testing, and what would confirm or refute it. |
+| `TEST` | The exact command or procedure, and its result. |
+| `FINDING` | What was discovered: root cause, measurement, refuted hypothesis, or pre-existing defect. |
+| `DECISION` | The choice, its reasoning, the rejected options, and the open-source reference used. |
+| `PROGRESS` | A part delivered, and what remains. |
+| `UPDATE` | Why the task definition changed. Always paired with an edit of the task. |
+| `NOTE` | Useful context that fits no other type. |
+
+### Rules
+
+- Choose the type whose meaning matches the entry. Never default to `NOTE` when a typed entry applies.
+- For investigative work, follow the chain `HYPOTHESIS` → `TEST` → `FINDING` → `DECISION`.
+- Close a task only when its log holds a `DECISION` for each non-obvious choice, a `TEST` proving the acceptance criteria, a `FINDING` for each discovery, and an `UPDATE` for each definition change.
 
 ---
 

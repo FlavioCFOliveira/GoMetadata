@@ -566,6 +566,7 @@ func TestAVIFRobustMalformedIloc(t *testing.T) {
 		0x00,       // baseOffsetSize=0
 		0x00, 0x01, // item_count=1
 		0x00, 0x01, // item_ID=1
+		0x00, 0x00, // data_reference_index=0
 		0x00, 0x01, // extent_count=1
 		0xDE, 0xAD, 0xBE, // 3-byte offset (non-standard)
 	}

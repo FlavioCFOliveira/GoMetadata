@@ -73,3 +73,8 @@ var ErrStcoOverflow = errors.New("cr3: stco chunk offset would overflow uint32 a
 //
 // Use PreserveUnknownSegments(true) (the default) when writing to CR3.
 var ErrPreserveUnknownSegmentsNotSupported = errors.New("cr3: PreserveUnknownSegments(false) is not supported for CR3; ISOBMFF boxes are structurally mandatory")
+
+// ErrBadCMTStream is returned by ParseSubIFD when a CMT sub-box does not hold
+// a TIFF stream with a readable first IFD (TIFF 6.0 §2: byte order, magic
+// 42, IFD offset, then the IFD).
+var ErrBadCMTStream = errors.New("cr3: a camera metadata block is not readable EXIF data")

@@ -4,6 +4,11 @@ description: task #273 XMP round-trip container-type corruption fix (commit 3914
 type: project
 ---
 
+**SUPERSEDED (Sprint 45 E4a, 2026-10-14):** `containerTypes`, `recordContainerType`
+and `specTableMatches` were removed; a parsed array whose container differs from
+the spec table is now retained in the parse tree (`XMP.nodes`) and written with
+its own container. Kept for history. See [[project_sprint45_e4a_xmp_tree]].
+
 Task #273 (Clean-GO sprint) fixed a real round-trip CORRUPTION defect in
 xmp/, not just a coverage gap: `xmp.Properties` (`map[string]map[string]string`)
 carried no per-property RDF container-type tag, so `collectionType`/

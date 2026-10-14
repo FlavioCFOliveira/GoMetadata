@@ -17,3 +17,10 @@ The serialiser (`write.go` `classifyProps`) partitions keys by these patterns be
 **Why:** XMP Part 1 §C.2.5 / §C.2.6 require struct values to use `rdf:parseType="Resource"` wrapper. Dots in element names are illegal XML 1.0.
 
 **How to apply:** When adding new accessor methods for structured XMP properties, use `x.Get(ns, "parent.field")` for simple structs and `x.Get(ns, "parent[N].field")` for array-of-struct items.
+
+**Since Sprint 45 E4a (2026-10-14):** these keys are a projection of a parsed
+data-model tree. Anything deeper (struct in struct field, arrays in structs,
+qualifiers, URI values, empty arrays, rdf:nodeID) has no key and is kept in the
+unexported `XMP.nodes`; Encode writes unmodified retained properties verbatim and
+merges edits of their keys. Composed keys are subject to a size budget (#277).
+See [[project_sprint45_e4a_xmp_tree]].

@@ -610,9 +610,17 @@ type IFDEntry struct {
 	Tag   TagID
 	Type  DataType
 	Count uint32
-	// Value holds the decoded value. For types whose total size fits in 4 bytes
-	// the raw bytes are stored inline; otherwise this is a []byte slice into
-	// the original buffer (zero-copy).
+	// Value holds the raw value bytes, in the byte order of the stream.
+	//
+	// For an entry returned by Parse, Value is a zero-copy view of the
+	// buffer passed to Parse — of the 4-byte (BigTIFF: 8-byte) value field
+	// of the entry when the value fits there, otherwise of the out-of-line
+	// value it points to. Treat its bytes as read-only: writing into them
+	// writes into that buffer, which gometadata.Metadata retains as the base
+	// that Write relocates from, and into any other entry that shares the
+	// same bytes. To change a value, assign a new slice (and update Count),
+	// or use the Set* methods of EXIF. Value is capped at its own length, so
+	// append on it always copies (task #296).
 	Value     []byte
 	bigEndian bool
 	// rawOffset is the TIFF-stream offset stored in the value-or-offset field
@@ -678,14 +686,20 @@ func parseIFDEntry(b []byte, e int, order binary.ByteOrder) (IFDEntry, bool) {
 	typ := DataType(order.Uint16(b[e+2:]))
 	cnt := order.Uint32(b[e+4:])
 
-	sz := typeSize(typ)
+	// entryTypeSize, not typeSize: type 13 on an IFD-pointer tag is the
+	// 4-byte TIFF IFD type, not a 1-byte string (task #311).
+	sz := entryTypeSize(tag, typ)
 	totalSize := uint64(sz) * uint64(cnt)
 
+	// Every Value aliases b (zero-copy) and is capped at its own length with
+	// a full slice expression, so that append on a Value copies instead of
+	// overwriting the bytes of b that follow it — the next IFD entry or
+	// another value, which a later Write may read (task #296).
 	var value []byte
 	switch {
 	case sz == 0:
 		// Unknown type: store the raw 4-byte offset/value field verbatim.
-		value = b[e+8 : e+12]
+		value = b[e+8 : e+12 : e+12]
 	case totalSize > 4:
 		// Value is out-of-line; bytes 8-11 are the file offset (TIFF §2).
 		valOff := order.Uint32(b[e+8:])
@@ -694,7 +708,7 @@ func parseIFDEntry(b []byte, e int, order binary.ByteOrder) (IFDEntry, bool) {
 			// Out-of-bounds offset: skip this entry gracefully.
 			return IFDEntry{}, false
 		}
-		value = b[valOff:end]
+		value = b[valOff:end:end]
 		return IFDEntry{
 			Tag:       tag,
 			Type:      typ,
@@ -705,7 +719,7 @@ func parseIFDEntry(b []byte, e int, order binary.ByteOrder) (IFDEntry, bool) {
 		}, true
 	default:
 		// Value is inline, left-justified in the 4-byte field (TIFF §2).
-		value = b[e+8 : e+8+int(totalSize)]
+		value = b[e+8 : e+8+int(totalSize) : e+8+int(totalSize)]
 	}
 
 	return IFDEntry{
@@ -1663,7 +1677,9 @@ func parseIFDEntryBigTIFF(b []byte, e int, order binary.ByteOrder) (IFDEntry, bo
 		return IFDEntry{}, false
 	}
 
-	sz := typeSizeBigTIFF(typ)
+	sz := entryTypeSizeBigTIFF(tag, typ) // type 13 on an IFD-pointer tag is 4 bytes (task #311)
+	// Every Value is capped at its own length (full slice expression), as in
+	// parseIFDEntry (task #296).
 	if sz == 0 {
 		// Unknown type: store the raw 8-byte value-or-offset field verbatim.
 		// We cannot determine whether this is inline or OOL, so treat it as
@@ -1673,7 +1689,7 @@ func parseIFDEntryBigTIFF(b []byte, e int, order binary.ByteOrder) (IFDEntry, bo
 			Tag:       tag,
 			Type:      typ,
 			Count:     uint32(cnt), // safe: cnt ≤ maxBigTIFFCount (2^30) < MaxUint32
-			Value:     b[e+12 : e+20],
+			Value:     b[e+12 : e+20 : e+20],
 			bigEndian: isBig,
 		}, true
 	}
@@ -1696,7 +1712,7 @@ func parseIFDEntryBigTIFF(b []byte, e int, order binary.ByteOrder) (IFDEntry, bo
 			Tag:       tag,
 			Type:      typ,
 			Count:     uint32(cnt), // safe: cnt ≤ maxBigTIFFCount (2^30) < MaxUint32
-			Value:     b[e+12 : end],
+			Value:     b[e+12 : end : end],
 			bigEndian: isBig,
 		}, true
 	}
@@ -1711,7 +1727,7 @@ func parseIFDEntryBigTIFF(b []byte, e int, order binary.ByteOrder) (IFDEntry, bo
 		Tag:       tag,
 		Type:      typ,
 		Count:     uint32(cnt), // safe: cnt ≤ maxBigTIFFCount (2^30) < MaxUint32
-		Value:     b[valOff : valOff+totalSize],
+		Value:     b[valOff : valOff+totalSize : valOff+totalSize],
 		bigEndian: isBig,
 		rawOffset: valOff, // BigTIFF spec §2: full 64-bit offset preserved; used by MakerNoteOffset64 (#142)
 	}, true
@@ -1980,8 +1996,10 @@ func readBigTIFFSubIFDOffset(e *IFDEntry) (uint64, bool) {
 			return 0, false
 		}
 		return uint64(e.order().Uint16(e.Value)), true
-	case TypeLong:
+	case TypeLong, TypeUTF8:
 		// TypeLong (4 bytes): used by tiffcp / libtiff even in BigTIFF containers.
+		// Type 13 is the 4-byte TIFF IFD type on these pointer tags (see
+		// entryTypeSize; task #311).
 		if len(e.Value) < 4 {
 			return 0, false
 		}
@@ -2216,6 +2234,17 @@ func (ifd *IFD) set(tag TagID, typ DataType, count uint32, value []byte, bigEndi
 	ifd.Entries = slices.Insert(ifd.Entries, i, entry)
 }
 
+// remove deletes the entry of tag from the IFD, if present, keeping the
+// entries sorted. It shifts the following entries within the slice and never
+// grows it, so it is safe on entries that share a backing array with other
+// IFDs (the parse arena gives each IFD its own region).
+func (ifd *IFD) remove(tag TagID) {
+	i := sort.Search(len(ifd.Entries), func(i int) bool { return ifd.Entries[i].Tag >= tag })
+	if i < len(ifd.Entries) && ifd.Entries[i].Tag == tag {
+		ifd.Entries = slices.Delete(ifd.Entries, i, i+1)
+	}
+}
+
 // asciiValue encodes s as a NUL-terminated ASCII byte slice suitable for
 // IFDEntry.Value (TypeASCII, TIFF §2).
 func asciiValue(s string) []byte {
@@ -2370,7 +2399,7 @@ func ifdTotalSize(entries []IFDEntry) uint32 {
 	valueParity := uint64(0)
 
 	for _, e := range entries {
-		ts := typeSize(e.Type)
+		ts := entryTypeSize(e.Tag, e.Type)
 		if ts == 0 {
 			continue
 		}
@@ -2475,7 +2504,7 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 		order.PutUint16(entryBuf[p+2:], uint16(e.Type))
 		order.PutUint32(entryBuf[p+4:], e.Count)
 
-		ts := typeSize(e.Type)
+		ts := entryTypeSize(e.Tag, e.Type)
 		total := uint64(ts) * uint64(e.Count)
 
 		if ts == 0 || total <= 4 {
@@ -2515,7 +2544,7 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 	out = slices.Grow(out, int(valueAreaLen)) // valueAreaLen bounded by ifdTotalSize's own MaxUint32-saturating cap, itself far below every caller's 256 MiB aggregate input cap — fits int on every supported platform
 	curOff := valueOff
 	for _, e := range entries {
-		ts := typeSize(e.Type)
+		ts := entryTypeSize(e.Tag, e.Type)
 		total := uint64(ts) * uint64(e.Count)
 		if ts == 0 || total <= 4 {
 			continue // inline value: already written into entryBuf by pass 1
@@ -2567,9 +2596,9 @@ func ifdWrittenLen(entries []IFDEntry, startOff uint64, bigTIFF, thumbPatched bo
 		e := &entries[i]
 		var ts uint64
 		if bigTIFF {
-			ts = typeSizeBigTIFF(e.Type)
+			ts = entryTypeSizeBigTIFF(e.Tag, e.Type)
 		} else {
-			ts = uint64(typeSize(e.Type))
+			ts = uint64(entryTypeSize(e.Tag, e.Type))
 		}
 		total := ts * uint64(e.Count)
 		if ts == 0 || total <= threshold {
@@ -2653,7 +2682,7 @@ func ifdTotalSizeBigTIFF(entries []IFDEntry) uint64 {
 
 	valueParity := uint64(0)
 	for _, e := range entries {
-		ts := typeSizeBigTIFF(e.Type) // #1 correctness rule: never typeSize here.
+		ts := entryTypeSizeBigTIFF(e.Tag, e.Type) // #1 correctness rule: never typeSize here.
 		if ts == 0 {
 			continue
 		}
@@ -2718,7 +2747,7 @@ func writeIFDBigTIFF(out []byte, entries []IFDEntry, order binary.ByteOrder, sta
 		// #1 correctness rule: typeSizeBigTIFF, never typeSize (see the
 		// section comment above ifdTotalSizeBigTIFF). Conflating the two
 		// would silently truncate every LONG8/SLONG8/IFD8 (16/17/18) value.
-		ts := typeSizeBigTIFF(e.Type)
+		ts := entryTypeSizeBigTIFF(e.Tag, e.Type)
 		total := ts * uint64(e.Count)
 
 		if ts == 0 || total <= 8 {
@@ -2758,7 +2787,7 @@ func writeIFDBigTIFF(out []byte, entries []IFDEntry, order binary.ByteOrder, sta
 	out = slices.Grow(out, int(valueAreaLen)) // valueAreaLen bounded by ifdTotalSizeBigTIFF's own MaxUint32-saturating cap, itself far below every caller's 256 MiB aggregate input cap — fits int on every supported platform
 	curOff := valueOff
 	for _, e := range entries {
-		ts := typeSizeBigTIFF(e.Type)
+		ts := entryTypeSizeBigTIFF(e.Tag, e.Type)
 		total := ts * uint64(e.Count)
 		if ts == 0 || total <= 8 {
 			continue // inline value: already written into entryBuf by pass 1

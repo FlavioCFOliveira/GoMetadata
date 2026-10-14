@@ -265,17 +265,17 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 | Feature | Details |
 |---|---|
 | Metadata standards | EXIF 3.0 (CIPA DC-008 / TIFF 6.0), IPTC IIM 4.2, XMP (ISO 16684-1) |
-| Read | Whichever of EXIF / IPTC / XMP the container carries, across all 13 formats (IPTC is only carried by JPEG and TIFF) |
+| Read | Whichever of EXIF / IPTC / XMP the container carries, across all 13 formats (IPTC is carried by JPEG, the TIFF-based formats, and PNG "Raw profile type iptc" text chunks) |
 | Write | All three standards across all 13 container formats, including BigTIFF (magic `0x002B`); preserves unmodified metadata byte-for-byte. All TIFF-based formats (TIFF, DNG, CR2, NEF, ARW, ORF, RW2) use a copy-and-relocate serializer that preserves image-data blocks (strips/tiles/MakerNote blobs) at corrected offsets; BigTIFF uses a native 64-bit encoder and a container-width-aware relocator. |
 | Atomic writes | `WriteFile` uses temp file + rename — no partial writes |
 | Format detection | Magic bytes only; file extension is never consulted |
-| MakerNote (read) | Canon, Nikon, Sony, Olympus, Panasonic, Pentax, DJI, FujiFilm, Leica, Samsung, Sigma, Minolta, Casio |
+| MakerNote (read) | Canon, Nikon, Sony, Sony Ericsson, Olympus, OM System, Epson, Agfa, Panasonic, Pentax, Ricoh, DJI, FujiFilm, Leica, Samsung, Sigma, Minolta, Casio, Kyocera, Sanyo, Apple; the layout is detected from the MakerNote signature, then from the Make |
 | Convenience getters | 30+ typed getters with explicit source-priority resolution |
 | Convenience setters | 15+ setters that write to all applicable non-nil components simultaneously |
 | Priority resolution | Each getter documents its source order (e.g., EXIF > XMP); the caller always gets one answer |
 | Lazy parsing | `WithoutEXIF()`, `WithoutIPTC()`, `WithoutXMP()`, `WithoutMakerNote()` skip unwanted work |
 | Allocation budget | Zero/near-zero heap allocation in parsing fast paths; `sync.Pool` for reusable buffers |
-| Fuzz testing | 29 fuzz targets covering all parsers and format extractors/injectors (see `SECURITY.md`) |
+| Fuzz testing | 37 fuzz targets covering all parsers and format extractors/injectors (see `SECURITY.md`) |
 | Race safety | Clean under `go test -race ./...` |
 | Corpus coverage | 3,000+ real-world images tested, 0 failures |
 
@@ -285,7 +285,7 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 |---|---|:---:|:---:|:---:|:---:|:---:|
 | JPEG | .jpg, .jpeg | Yes | Yes | Yes | Yes | Yes |
 | TIFF | .tif, .tiff | Yes | Yes² | Yes | Yes | Yes |
-| PNG | .png | Yes | Yes | Yes | No | Yes |
+| PNG | .png | Yes | Yes | Yes | Yes⁵ | Yes |
 | WebP | .webp | Yes | Yes | Yes | No | Yes |
 | HEIF | .heif, .heic | Yes | Yes | Yes | No | Yes |
 | AVIF | .avif | Yes | Yes | Yes | No | Yes |
@@ -297,11 +297,13 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 | Olympus ORF | .orf | Yes | Yes³ | Yes | No | Yes |
 | Panasonic RW2 | .rw2 | Yes | Yes⁴ | Yes | No | Yes |
 
-> ² **Copy-and-relocate write** (`format/tiff/relocate.go`). Image strips, tiles, and non-thumbnail JPEG blocks are enumerated, copied verbatim to fresh absolute offsets in the output stream, and all offset entries are patched. DNG additionally relocates SubIFD structures and their out-of-line values (RATIONAL, SRATIONAL, etc.). CR2 and NEF route through the same path; Canon MakerNote blobs are copied verbatim (blob-relative offsets; move-safe). NEF extends the Nikon Type-3 MakerNote blob to cover PreviewIFD and NikonScanIFD. ARW rebases Sony MakerNote TIFF-absolute offsets and relocates the SR2Private block verbatim. Use `format.SupportsWrite(id)` to check programmatically. BigTIFF sources (magic `0x002B`) are written through the same TIFF row: `exif.Encode` emits a native 16-byte-header, 64-bit-offset BigTIFF IFD skeleton, and the relocator's raw-offset scans, image-block enumeration, and SubIFD handling are all container-width-aware, so image data and metadata round-trip byte-for-byte just as they do for classic TIFF.
+> ² **Copy-and-relocate write** (`format/tiff/relocate.go`). Image strips, tiles, and non-thumbnail JPEG blocks are enumerated, copied verbatim to fresh absolute offsets in the output stream, and all offset entries are patched. DNG additionally relocates SubIFD structures and their out-of-line values (RATIONAL, SRATIONAL, etc.). CR2 and NEF route through the same path; MakerNotes are copied verbatim, and those whose value offsets count from the TIFF header (Canon, Sony, Panasonic, Olympus "OLYMP", ...) are rebased when they move. SubIFDs of every chained IFD, SubIFD arrays and SubIFD chains are carried. NEF extends the Nikon Type-3 MakerNote blob to cover PreviewIFD and NikonScanIFD. ARW rebases Sony MakerNote TIFF-absolute offsets and relocates the SR2Private block verbatim. Use `format.SupportsWrite(id)` to check programmatically. BigTIFF sources (magic `0x002B`) are written through the same TIFF row: `exif.Encode` emits a native 16-byte-header, 64-bit-offset BigTIFF IFD skeleton, and the relocator's raw-offset scans, image-block enumeration, and SubIFD handling are all container-width-aware, so image data and metadata round-trip byte-for-byte just as they do for classic TIFF.
 >
 > ³ **ORF copy-and-relocate write**: the non-standard IIRO/IIRS magic bytes are patched to standard LE TIFF before relocation and restored in the output. Both IIRO (Olympus DSLRs) and IIRS (older compacts) are supported.
 >
 > ⁴ **RW2 copy-and-relocate write**: the Panasonic 16-byte device GUID header is preserved and all absolute IFD0 offsets are rebased after GUID insertion.
+>
+> ⁵ **PNG IPTC**: PNG has no native IPTC chunk. IPTC stored in a `tEXt`, `zTXt` or `iTXt` chunk keyed "Raw profile type iptc" is read, and `Write` rewrites that chunk in place; `Write` never adds one.
 
 ## Performance
 
