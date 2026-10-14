@@ -1,5 +1,6 @@
 # Memory Index
 
+- [Sprint 46 E2 (2026-10-14)](project_sprint46_e2_xmp_bugs.md) — XMP #326-#331: alias fold, strict scanner, unparsed-packet carry, verbatim text; Go slice-header eval-order trap
 - [Sprint 45 E5 (2026-10-14)](project_sprint45_e5_reconcile_tables.md) — internal/reconcile Toolkit tables + MWG EXIF>XMP>IIM read order (user-chosen); real MWG § numbers, perf cost accepted, corpus defects
 - [Sprint 45 E4b (2026-10-14)](project_sprint45_e4b_extxmp_aliasing.md) — xmp.ParseExtended one-tree merge, MD5 GUID, xmpNote URI, IFDEntry.Value caps; spec facts + measured costs
 - [Sprint 45 E4a (2026-10-14)](project_sprint45_e4a_xmp_tree.md) — XMP tree model (#303/#283/#277): Toolkit port, retained-subset design, perf traps, fuzz finds, unfixed defects
