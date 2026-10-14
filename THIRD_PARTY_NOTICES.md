@@ -98,8 +98,11 @@ for cross-checking only).
 - Source commit: `ab37e2946dfb6d2cc52886f39cb0fbf701db98e1`
 - Licence: BSD-2-Clause (see `LICENSES/BSD-2-Clause.txt`), SPDX-License-Identifier: `BSD-2-Clause`
 - Copyright: Copyright 2019 Joe Drago. All rights reserved.
-- Source files: `src/read.c` (`avifParseItemLocationBox`, `avifDecoderItemRead`)
-- Destination files: `format/heif/iloc.go`
+- Source files: `src/read.c` (`avifParseItemLocationBox`, `avifDecoderItemRead`); `src/write.c`
+  (`avifEncoderDataCreateExifItem`, `avifEncoderDataCreateXMPItem`, `avifEncoderFinish`)
+- Destination files: `format/heif/iloc.go`, `format/heif/inject.go`
 - Adapted: yes (the item location box field order, including the 16-bit `data_reference_index` of every version, the
-  field-width validation, and the concatenation of an item's extents, re-implemented as allocation-free Go)
+  field-width validation, the concatenation of an item's extents and the idat construction method, re-implemented as
+  allocation-free Go; the layout of a new Exif or XMP item — infe version 2, item name, XMP content type, iref `cdsc`
+  reference to the primary item, iloc entry with construction method 0 — re-implemented to edit an existing file)
 - Notes: the changes made are stated in the header of each destination file.

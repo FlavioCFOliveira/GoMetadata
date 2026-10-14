@@ -37,13 +37,19 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 	// --- Build infe boxes ---
 	// infe v2: version(1)+flags(3)+item_id(2)+item_protection_index(2)+item_type(4)+item_name(1, "")
 	makeInfe := func(id uint16, itemType string) []byte {
-		body := make([]byte, 4+2+2+4+1)
+		// ISO 23008-12 Annex A.3: the XMP item is the 'mime' item whose
+		// content_type is "application/rdf+xml" (NUL-terminated).
+		contentType := ""
+		if itemType == "mime" {
+			contentType = "application/rdf+xml\x00"
+		}
+		body := make([]byte, 4+2+2+4+1+len(contentType))
 		body[0] = 2 // version 2
 		binary.BigEndian.PutUint16(body[4:], id)
 		// item_protection_index = 0
 		copy(body[8:], itemType)
-		// item_name = "" (single NUL)
-		body[12] = 0
+		// item_name = "" (single NUL) at body[12], then the content type.
+		copy(body[13:], contentType)
 		size := uint32(8 + len(body)) //nolint:gosec // G115: test helper, intentional type cast
 		hdr := make([]byte, 0, 8+len(body))
 		hdr = append(hdr, 0, 0, 0, 0, 'i', 'n', 'f', 'e')
@@ -717,10 +723,12 @@ func TestParseInfeV2V3(t *testing.T) {
 
 	t.Run("version 3 valid", func(t *testing.T) {
 		t.Parallel()
-		data := make([]byte, 10)
+		const ct = "\x00application/rdf+xml\x00" // item_name "", content_type
+		data := make([]byte, 10+len(ct))
 		binary.BigEndian.PutUint32(data[0:], 5) // uint32 ID = 5
 		// protection index = 0 at [4:6]
 		copy(data[6:], "mime")
+		copy(data[10:], ct)
 		id, typ, ok := parseInfeV2V3(data, 0, 3)
 		if id != 5 {
 			t.Errorf("id = %d, want 5", id)
@@ -1184,11 +1192,13 @@ func buildHEIFV1Iloc(xmpPayload []byte) []byte {
 
 	// --- infe v2 for XMP item ---
 	// infe v2: version(1)+flags(3)+item_id(2)+item_protection_index(2)+item_type(4)+item_name(NUL)
-	infeBody := make([]byte, 4+2+2+4+1)
+	const contentType = "application/rdf+xml\x00" // content_type of the XMP item
+	infeBody := make([]byte, 4+2+2+4+1+len(contentType))
 	infeBody[0] = 2 // version 2
 	binary.BigEndian.PutUint16(infeBody[4:], xmpItemID)
 	copy(infeBody[8:], "mime")
-	infeBody[12] = 0 // NUL-terminated item name
+	// infeBody[12] = 0: NUL-terminated (empty) item name.
+	copy(infeBody[13:], contentType)
 	infeHdr := make([]byte, 0, 8+len(infeBody))
 	infeHdr = append(infeHdr, 0, 0, 0, 0, 'i', 'n', 'f', 'e')
 	binary.BigEndian.PutUint32(infeHdr, uint32(8+len(infeBody))) //nolint:gosec // G115: test helper, bounded size
@@ -1953,10 +1963,12 @@ func buildIlocWithLargeExtentCount(xmpPayload []byte, extentCount uint16) []byte
 	const xmpItemID uint16 = 1
 
 	// infe v2 for the XMP item.
-	infeBody := make([]byte, 4+2+2+4+1)
+	const contentType = "application/rdf+xml\x00" // content_type of the XMP item
+	infeBody := make([]byte, 4+2+2+4+1+len(contentType))
 	infeBody[0] = 2
 	binary.BigEndian.PutUint16(infeBody[4:], xmpItemID)
 	copy(infeBody[8:], "mime")
+	copy(infeBody[13:], contentType)
 	infeHdr := make([]byte, 0, 8+len(infeBody))
 	infeHdr = append(infeHdr, 0, 0, 0, 0, 'i', 'n', 'f', 'e')
 	binary.BigEndian.PutUint32(infeHdr, uint32(8+len(infeBody))) //nolint:gosec // G115: test helper

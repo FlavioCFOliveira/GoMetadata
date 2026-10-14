@@ -58,6 +58,12 @@ var (
 	itemTypeMime = [4]byte{'m', 'i', 'm', 'e'} //nolint:gochecknoglobals // package-level constant item type; never mutated
 )
 
+// xmpContentType is the content_type of an XMP item (ISO 23008-12 Annex A.3;
+// libavif AVIF_CONTENT_TYPE_XMP). A 'mime' item is the XMP item only when its
+// content_type equals this string: 'mime' items also carry other MIME
+// payloads, which must never be read or overwritten as XMP.
+const xmpContentType = "application/rdf+xml"
+
 // Extract navigates the ISOBMFF box hierarchy of r and extracts raw payloads.
 // rawEXIF has the 4-byte TIFF-header offset prefix stripped before return.
 //
@@ -484,8 +490,14 @@ func parseInfeV0V1(data []byte, pos int) (id uint16, typ [4]byte, ok bool) {
 
 // parseInfeV2V3 handles infe version 2 and 3 parsing.
 // v2: item_ID is uint16; v3: item_ID is uint32 (must fit uint16).
-// Both versions include: item_protection_index(2) + item_type(4).
-// ISO 14496-12 §8.11.6.
+// Both versions include: item_protection_index(2) + item_type(4), then
+// item_name (NUL-terminated) and, for item_type 'mime', content_type
+// (NUL-terminated). ISO 14496-12 §8.11.6.2.
+//
+// A 'mime' item is reported as itemTypeMime (the XMP item) only when its
+// content_type is "application/rdf+xml", the test libavif applies
+// (avifDecoderFindMetadata). Any other 'mime' item is reported with the zero
+// type: a valid item that carries no metadata this package handles.
 func parseInfeV2V3(data []byte, pos int, version byte) (id uint16, typ [4]byte, ok bool) {
 	if version == 2 {
 		if pos+2 > len(data) {
@@ -512,7 +524,24 @@ func parseInfeV2V3(data []byte, pos int, version byte) (id uint16, typ [4]byte, 
 	// Direct array conversion from the slice: zero allocation, unlike the
 	// former string(data[pos:pos+4]) conversion (task #228).
 	typ = [4]byte(data[pos : pos+4])
+	if typ == itemTypeMime && !isXMPContentType(data[pos+4:]) {
+		return id, [4]byte{}, true
+	}
 	return id, typ, true
+}
+
+// isXMPContentType reports whether rest — the bytes of a 'mime' infe body
+// after item_type — holds the item_name string followed by the
+// content_type "application/rdf+xml". Both strings are NUL-terminated
+// (ISO 14496-12 §8.11.6.2); an unterminated content_type running to the end
+// of the box is accepted. The comparison does not allocate.
+func isXMPContentType(rest []byte) bool {
+	_, ct, found := bytes.Cut(rest, []byte{0x00}) // skip item_name
+	if !found {
+		return false
+	}
+	ct, _, _ = bytes.Cut(ct, []byte{0x00})
+	return string(ct) == xmpContentType
 }
 
 // metaFullBoxMinSize is the minimum valid size for a meta FullBox:
