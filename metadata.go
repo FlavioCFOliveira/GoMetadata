@@ -168,6 +168,15 @@ type Metadata struct {
 	// same XMP always produces the same bytes.
 	rawXMPWire []byte
 
+	// xmpUnparsed is set by Read when the container carried an XMP packet
+	// that is not well-formed XML and so could not be parsed (the reason is
+	// in ParseWarnings). Write then carries rawXMP to the output byte for
+	// byte, and the setters create no XMP of their own, because encoding a
+	// fresh XMP from the setters' values would replace the unreadable packet
+	// and lose everything it held (task #327). A caller that wants to
+	// replace the packet assigns m.XMP explicitly.
+	xmpUnparsed bool
+
 	// iptcTrustElev caches the result of computeIPTCTrustElevated(rawIPTC,
 	// rawIPTCDigest), computed once by Read (see read.go) immediately after
 	// rawIPTC and rawIPTCDigest are known. iptcTrustElevated() below reads
@@ -837,8 +846,15 @@ func (m *Metadata) ensureIPTC() {
 // ensureXMP constructs a minimal valid *xmp.XMP when m.XMP is nil and the
 // detected format can carry XMP. The Properties map must be non-nil to satisfy
 // the Validate invariant (m.XMP != nil ⟹ m.XMP.Properties != nil).
+//
+// It constructs nothing when the image carried an XMP packet that could not
+// be parsed (xmpUnparsed): the packet is written back unchanged, and the XMP
+// part of a setter is skipped, so that no metadata is lost silently
+// (task #327; XMP Part 1 §7.1 requires a well-formed packet, and an
+// ill-formed one cannot be edited faithfully). Read reports the packet in
+// ParseWarnings.
 func (m *Metadata) ensureXMP() {
-	if m.XMP != nil || !m.canCarryXMP() {
+	if m.XMP != nil || m.xmpUnparsed || !m.canCarryXMP() {
 		return
 	}
 	m.XMP = &xmp.XMP{Properties: make(map[string]map[string]string)}

@@ -651,10 +651,10 @@ func TestConformanceVT01(t *testing.T) {
 		}
 		for _, text := range texts {
 
-			x := &XMP{Properties: map[string]map[string]string{NStiff: {"ImageDescription": text}}}
+			x := &XMP{Properties: map[string]map[string]string{NSxmp: {"Label": text}}}
 			enc := mustEncode(t, x)
 			x2 := mustParse(t, enc)
-			if got := x2.Get(NStiff, "ImageDescription"); got != text {
+			if got := x2.Get(NSxmp, "Label"); got != text {
 				t.Errorf("VT-01: text=%q round-trip got %q", text, got)
 			}
 		}

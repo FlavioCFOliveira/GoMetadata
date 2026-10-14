@@ -2,7 +2,7 @@
 
 Normative-requirements checklist for the GoMetadata conformance test battery. Rule IDs
 (`PW-*`, `RDF-*`, `NS-*`, `VT-*`, `JPEG-*`, `TIFF-*`, `PNG-*`, `HEIF-*`, `MWG-*`, `ROB-*`)
-are used verbatim as Go sub-test names. 69 rules total.
+are used verbatim as Go sub-test names. 74 rules total.
 
 > Note for implementers: a few byte-length constants below (e.g. the JPEG XMP namespace
 > identifier length) must be reconciled against the actual codebase during implementation —
@@ -27,8 +27,9 @@ are used verbatim as Go sub-test names. 69 rules total.
 - **PW-02** `id` MUST be exactly `W5M0MpCehiHzreSzNTczkc9d`.
 - **PW-03** Packet ends with `<?xpacket end="r"?>` or `end="w"`; missing end → error/partial+diagnostic.
 - **PW-04** For in-place writeable packets, whitespace padding fills space before the end PI.
-- **PW-05** BOM encodes byte order (UTF-8 / UTF-16 LE / UTF-16 BE); empty/absent ⇒ assume UTF-8.
+- **PW-05** BOM encodes byte order (UTF-8 / UTF-16 LE / UTF-16 BE); empty/absent ⇒ assume UTF-8 unless the NUL-byte pattern of the first character says otherwise (PW-08).
 - **PW-06** Scanning locates begin PI by searching `3C 3F 78` (`<?x`) then matching `xpacket`+`begin`; no fixed offset.
+- **PW-08** A UTF-16 or UTF-32 packet without a BOM is recognised from the first bytes (`00 nn` UTF-16BE, `nn 00` UTF-16LE, `00 00 00 nn` UTF-32BE, `nn 00 00 00` UTF-32LE; XMP Part 1 §7.1 p. 9, §7.3.2; XML 1.0 App. F.1; Toolkit `DetermineInputEncoding`) and decoded to the same properties as the UTF-8 form. A first byte of 0x80 or more that is not a BOM is UTF-8 (divergence from the Toolkit).
 - **PW-07** Wrapper optional when the container delimits XMP (APP1, TIFF tag 700, PNG iTXt, HEIF item) — handle both.
 
 ### 2.2 RDF/XML Serialization — XMP Part 1 §7.2–§7.4
@@ -39,6 +40,10 @@ are used verbatim as Go sub-test names. 69 rules total.
 - **RDF-05** Arrays: `rdf:Seq` (ordered), `rdf:Bag` (unordered), `rdf:Alt` (lang alt); preserve semantics on round-trip.
 - **RDF-06** `rdf:Alt` MUST contain an `rdf:li xml:lang="x-default"`; return x-default when no lang match.
 - **RDF-07** Qualifiers (other than xml:lang) via `rdf:value` + qualifier elements; MUST preserve on write.
+- **RDF-09** Element text of a literal property is verbatim: leading, trailing and inner white space is kept, as in the attribute form (XML 1.0 §2.10; XMP Part 1 §7.5; Toolkit `LiteralPropertyElement`); CRLF and CR read as LF (XML 1.0 §2.11). White space between child elements is not content.
+- **RDF-10** Registered aliases (35, Adobe XMP Part 2 §1.1.1; Toolkit `RegisterStandardAliases`) are folded into the base property on parse by the rules of `MoveExplicitAliases`: base absent ⇒ the alias is transplanted (a text or array-item alias becomes the x-default or first item of a new array); base present ⇒ the alias is deleted (base wins); readers find the value at the base property and writers write the base form only.
+- **RDF-11** Setting the default text of a language alternative (`SetCaption`, `SetCopyright`) updates the x-default item and the items that repeated its old text, keeps the other languages, and inserts x-default first when absent (XMP Part 1 §8.2.2.4; Toolkit `SetLocalizedText`).
+- **RDF-12** `CameraModel` is `tiff:Model` only; `xmp:CreatorTool` names the software and is never a fallback (XMP Part 1 §8.4 p. 27).
 - **RDF-08** Structures = nested `rdf:Description`; recurse to extract fields.
   - Since task #303 the parser builds the XMP data model tree (ISO 16684-1:2019 §6), so
     structures and arrays nest to any depth (an array inside a struct field, a struct inside an
@@ -106,7 +111,7 @@ are used verbatim as Go sub-test names. 69 rules total.
 
 ## Section 5: Robustness Cases (MUST NOT crash)
 - **ROB-01** Missing end PI → partial content + diagnostic, no crash.
-- **ROB-02** Malformed RDF (not well-formed) → descriptive error, no silent partial.
+- **ROB-02** Malformed RDF (not well-formed) → descriptive error, no silent partial. The scanner checks Element Type Match (every end tag names the innermost open start tag), stray end tags, malformed start tags and unclosed elements (XML 1.0 §3; error wraps `ErrXMLNotWellFormed` and names the element). `Write` carries an unparseable packet unchanged and the setters create no XMP over it.
 - **ROB-03** XXE / billion-laughs: disable external entities, cap entity expansion; reject/cap `<!DOCTYPE>` internal entities.
 - **ROB-04** Unknown-namespace properties preserved on read, re-serialized on write losslessly.
 - **ROB-05** Duplicate property → last-value + diagnostic; continue parsing.

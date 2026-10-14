@@ -439,6 +439,7 @@ func parseXMP(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
 	}
 	x, err := xmppkg.Parse(raw)
 	if err != nil {
+		m.xmpUnparsed = true // Write keeps the packet unchanged (task #327)
 		return &ParseSegmentError{Segment: "XMP", Err: err}
 	}
 	m.XMP = x

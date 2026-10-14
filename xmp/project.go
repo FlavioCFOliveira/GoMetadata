@@ -35,6 +35,10 @@ const (
 // parse tree itself holds transient views of the input (see
 // transientAliasString).
 func (p *rdfParser) finish(docLen int) {
+	// Fold the aliases into their base properties before anything is
+	// projected, so that Properties and the retained tree hold one value per
+	// aliased property (Adobe XMP Specification Part 2 §1.1.1; task #329).
+	p.moveExplicitAliases()
 	budget := composedKeyFactor*docLen + composedKeySlack
 	if need := p.arenaNeed(budget); need > 0 {
 		p.x.arena = make([]byte, 0, need)

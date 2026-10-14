@@ -138,6 +138,9 @@ func skipSpecialTag(b []byte, pos int) (newPos int, skipped bool) {
 //   - Raw text segments (entity-unescaped via unescapeXML)
 //   - CDATA section content (delivered as-is — no entity expansion inside CDATA)
 //
+// The text is verbatim: white space is not trimmed (XML 1.0 §2.10), and line
+// ends are normalised (XML 1.0 §2.11, see normaliseEOL).
+//
 // Returns the updated position (pointing at the '<' of the next tag, or len(b))
 // and the combined text string.  Returns an empty string when there is no text.
 //
@@ -149,7 +152,7 @@ func collectTextContent(b []byte, pos int) (newPos int, text string) { //nolint:
 	textEnd := bytes.IndexByte(b[pos:], '<')
 	if textEnd < 0 {
 		// No '<' at all — all remaining bytes are text.
-		s := unescapeXML(trimSpace(b[pos:]))
+		s := unescapeXML(normaliseEOL(b[pos:]))
 		return len(b), s
 	}
 
@@ -157,7 +160,7 @@ func collectTextContent(b []byte, pos int) (newPos int, text string) { //nolint:
 	ahead := pos + textEnd + 1 // position after '<'
 	if ahead >= len(b) || !isCDATA(b, ahead) {
 		// No CDATA involved — fast path: return text before '<', leave pos at '<'.
-		s := unescapeXML(trimSpace(b[pos : pos+textEnd]))
+		s := unescapeXML(normaliseEOL(b[pos : pos+textEnd]))
 		return pos + textEnd, s // do NOT advance past '<'; outer loop handles it
 	}
 
@@ -175,15 +178,15 @@ func collectTextContent(b []byte, pos int) (newPos int, text string) { //nolint:
 		nextTag := bytes.IndexByte(b[pos:], '<')
 		if nextTag < 0 {
 			// No more tags — append remaining text.
-			bld.WriteString(unescapeXML(trimSpace(b[pos:])))
+			bld.WriteString(unescapeXML(normaliseEOL(b[pos:])))
 			pos = len(b)
 			break
 		}
 
 		// Append text segment before '<'.
-		seg := trimSpace(b[pos : pos+nextTag])
+		seg := b[pos : pos+nextTag]
 		if len(seg) > 0 {
-			bld.WriteString(unescapeXML(seg))
+			bld.WriteString(unescapeXML(normaliseEOL(seg)))
 		}
 		pos = pos + nextTag + 1 // advance past '<'
 
@@ -196,7 +199,7 @@ func collectTextContent(b []byte, pos int) (newPos int, text string) { //nolint:
 			// The content is appended as-is (raw bytes converted to string).
 			content, afterCDATA := parseCDATA(b, pos)
 			if len(content) > 0 {
-				bld.Write(content)
+				bld.Write(normaliseEOL(content))
 			}
 			pos = afterCDATA
 			// Continue scanning for more text or CDATA after this section.
@@ -687,18 +690,30 @@ func parseDec(b []byte) (rune, bool) {
 	return v, true
 }
 
-// trimSpace returns a sub-slice of b with leading and trailing ASCII whitespace
-// removed. It operates on []byte to avoid an intermediate string allocation.
-func trimSpace(b []byte) []byte {
-	start := 0
-	for start < len(b) && isASCIISpace(b[start]) {
-		start++
+// normaliseEOL returns b with every line end normalised to a single U+000A,
+// as XML 1.0 §2.11 requires of the processor before it hands character data
+// to the application: "\r\n" and a lone "\r" both become "\n". It returns b
+// itself, without copying, when b holds no '\r', which is the common case. A
+// character reference such as &#13; is decoded later and stays a carriage
+// return (XML 1.0 §2.11).
+func normaliseEOL(b []byte) []byte {
+	i := bytes.IndexByte(b, '\r')
+	if i < 0 {
+		return b
 	}
-	end := len(b)
-	for end > start && isASCIISpace(b[end-1]) {
-		end--
+	out := make([]byte, 0, len(b))
+	out = append(out, b[:i]...)
+	for ; i < len(b); i++ {
+		if b[i] != '\r' {
+			out = append(out, b[i])
+			continue
+		}
+		out = append(out, '\n')
+		if i+1 < len(b) && b[i+1] == '\n' {
+			i++
+		}
 	}
-	return b[start:end]
+	return out
 }
 
 // isASCIISpace reports whether b is an ASCII whitespace character.

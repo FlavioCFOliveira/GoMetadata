@@ -1522,8 +1522,8 @@ func TestNamespaceURIInjectionBlockedRoundTrip(t *testing.T) {
 // TestLocalNameInjectionBlockedFromParseEncodeChain is the GATE test for finding #171.
 //
 // Two injection vectors are tested:
-//  1. Parse-then-encode: a '<' in an element local name is stripped by
-//     isNameTerminator so the parser never stores it; the name is truncated at '<'.
+//  1. Parse-then-encode: a '<' in an element name makes the start tag
+//     ill-formed (XML 1.0 §3.1), so Parse rejects the packet (task #327).
 //  2. Direct-Set-then-encode: Set() with a key containing '<' is sanitised by
 //     writeXMLName before emission, so the encoded XML contains no injected element.
 //
@@ -1542,20 +1542,11 @@ func TestLocalNameInjectionBlockedFromParseEncodeChain(t *testing.T) {
 			`<dc:title` + `<inject/>` + `>value</dc:title>` +
 			`</rdf:Description>` +
 			`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`
+		// Task #327 (XML 1.0 §3.1, §3.3): the start tag is not well-formed,
+		// so the packet is rejected at parse time; nothing reaches Encode.
 		x, err := Parse([]byte(raw))
-		if err != nil {
-			t.Fatalf("Parse: %v", err)
-		}
-		enc, err := Encode(x)
-		if err != nil {
-			t.Fatalf("Encode: %v", err)
-		}
-		if strings.Contains(string(enc), "<inject/>") {
-			t.Error("#171/via-parse REGRESSION: encoded output contains injected <inject/> element")
-		}
-		var v any
-		if xmlErr := xml.Unmarshal(enc, &v); xmlErr != nil {
-			t.Errorf("#171/via-parse REGRESSION: Encode produced malformed XML: %v", xmlErr)
+		if !errors.Is(err, ErrXMLNotWellFormed) || x != nil {
+			t.Fatalf("Parse = %v, %v; want nil, ErrXMLNotWellFormed", x, err)
 		}
 	})
 

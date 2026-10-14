@@ -75,7 +75,10 @@ for cross-checking only).
   `XMPCore/source/ParseRDF.cpp` (`RDF_Parser`: `GetRDFTermKind`, `AddChildNode`, `AddQualifierNode`, `FixupQualifiedNode`,
   `NodeElement`, `NodeElementAttrs`, `PropertyElement`, `ResourcePropertyElement`, `LiteralPropertyElement`,
   `ParseTypeResourcePropertyElement`, `EmptyPropertyElement`), `XMPCore/source/XMPCore_Impl.hpp` (`XMP_Node`),
-  `XMPCore/source/XMPMeta-Serialize.cpp` (`SerializeCanonicalRDFProperty`), `XMPCore/source/ExpatAdapter.cpp` (`SetQualName`);
+  `XMPCore/source/XMPMeta-Serialize.cpp` (`SerializeCanonicalRDFProperty`), `XMPCore/source/ExpatAdapter.cpp` (`SetQualName`),
+  `XMPCore/source/XMPMeta-Parse.cpp` (`DetermineInputEncoding`, `MoveExplicitAliases`, `TransplantNamedAlias`,
+  `TransplantArrayItemAlias`), `XMPCore/source/XMPMeta-GetSet.cpp` (`XMPMeta::SetLocalizedText`, `ChooseLocalizedText`,
+  `AppendLangItem`), `source/XML_Node.cpp` (`XML_Node::IsWhitespaceNode`);
   `XMPFiles/source/FormatSupport/PSIR_MemoryReader.cpp` (`PSIR_MemoryReader::ParseMemoryResources`),
   `XMPFiles/source/FormatSupport/PSIR_FileWriter.cpp` (`PSIR_FileWriter::ParseMemoryResources`, duplicate-resource
   policy), `XMPFiles/source/FormatSupport/ReconcileIPTC.cpp` (`ComputeIPTCDigest`, `SetIPTCDigest`),
@@ -89,7 +92,7 @@ for cross-checking only).
   `XMPFiles/source/FormatSupport/ReconcileIPTC.cpp` (`PhotoDataUtils::Import2WayIPTC`,
   `PhotoDataUtils::ImportIPTC_Date`, `ExportIPTC_Date`)
 - Destination files: `xmp/namespace_toolkit.go`, `xmp/namespace_toolkit_test.go`; `xmp/parserdf.go`, `xmp/tree.go`,
-  `xmp/serialize.go`, `xmp/xmlscan.go`; `internal/irb/irb.go`, `internal/tiffscan/tiffscan.go`; `xmp/extended.go`,
+  `xmp/serialize.go`, `xmp/xmlscan.go`, `xmp/alias.go`, `xmp/encoding.go`, `xmp/xmp.go`; `internal/irb/irb.go`, `internal/tiffscan/tiffscan.go`; `xmp/extended.go`,
   `format/jpeg/extxmp.go`; `internal/reconcile/tables.go`, `internal/reconcile/reconcile.go`,
   `internal/reconcile/policy.go`, `reconcile.go`
 - Adapted: yes (namespace URIs, prefixes and alias definitions, transcribed to Go tables; the Photoshop image resource
@@ -106,7 +109,10 @@ for cross-checking only).
   mapping forms and length limits, transcribed row by row into Go tables; the XMP text of a SHORT, LONG, RATIONAL,
   SRATIONAL and ASCII tag; the read order of the three-way fields (EXIF, then XMP, then IIM, per MWG v2.0 §4.2.3) and of
   the two-way IIM fields (XMP, then IIM), with the IIM value preferred over all others when the IPTC digest does not
-  match and the IIM differs from the value predicted from the XMP; and the tolerant parse and the export form of the IIM date and time)
+  match and the IIM differs from the value predicted from the XMP; the tolerant parse and the export form of the IIM date and time; the
+  detection of the encoding of a packet without a byte-order mark, the folding of the registered aliases into their base
+  properties after parsing, and the update of the x-default item of a language alternative that keeps the other
+  languages — each re-implemented in Go over the flat Properties view or the node list)
 - Notes: the source files carry the header "Adobe permits you to use, modify, and distribute
   this file in accordance with the terms of the Adobe license agreement accompanying it",
   while the repository root `LICENSE` is the BSD 3-Clause licence. The accompanying licence
@@ -132,7 +138,16 @@ for cross-checking only).
   of being merged into the XMP; an XMP copy of an EXIF camera setting is refreshed only when it already exists, instead
   of the tiff: and exif: namespaces being rewritten from the native tags; the predicted IIM value is the value the iptc
   package writes (no CR/LF conversion); and out-of-range IIM date fields are rejected instead of clamped (see the
-  headers of `internal/reconcile/policy.go` and `reconcile.go`).
+  headers of `internal/reconcile/policy.go` and `reconcile.go`). The encoding detection differs from
+  `DetermineInputEncoding` in that a first byte of 0x80 or more other than a byte-order mark is UTF-8, not UTF-16LE or
+  UTF-32LE (XML 1.0 Appendix F.1). The alias folding differs from `MoveExplicitAliases` in that an alias that the Toolkit
+  would report as a fatal error or would transplant into an invalid tree is left as written (an alias to an array item
+  that is not a simple value, an alias with an xml:lang other than x-default, an alias whose base is a struct), and in that
+  a language alternative that is an alias of dc:description (tiff:ImageDescription as written by Exiv2) is merged into the
+  base alternative language by language instead of being rejected (see the header of `xmp/alias.go`). The XML scanner
+  differs from Expat in that it reports the first well-formedness violation that it detects (a mismatched or stray end
+  tag, a malformed start tag, an unclosed element) but does not validate names, attribute values or character data
+  (see the header of `xmp/xmlscan.go`).
 
 ## libavif
 
