@@ -742,7 +742,7 @@ func (m *Metadata) Creator() string {
 //	TIFF                        → EXIF ✓  IPTC ✓  XMP ✓
 //	DNG / CR2 / NEF / ARW /     → EXIF ✓  IPTC ✓  XMP ✓
 //	  ORF / RW2 (TIFF-based RAW)
-//	PNG                         → EXIF ✓  IPTC ✗  XMP ✓
+//	PNG                         → EXIF ✓  IPTC ✗¹ XMP ✓
 //	WebP                        → EXIF ✓  IPTC ✗  XMP ✓
 //	HEIF / AVIF                 → EXIF ✓  IPTC ✗  XMP ✓
 //	CR3                         → EXIF ✓  IPTC ✗  XMP ✓
@@ -751,6 +751,11 @@ func (m *Metadata) Creator() string {
 // IPTC pathway for TIFF-based formats: the write path embeds IPTC as IFD0
 // tag 0x83BB (IPTC-NAA, TypeLong). All TIFF-derived formats route through
 // relocate.go / relocate_*.go which upsert this tag on write.
+//
+// ¹ PNG has no native IPTC chunk, so no IPTC component is created for a PNG
+// that has none. A PNG that already carries IPTC in a "Raw profile type iptc"
+// text chunk has it read into m.IPTC, and the write path rewrites that chunk
+// in place (format/png).
 //
 // CR3 does NOT carry IPTC: CR3 uses an ISO BMFF container whose CMT1–CMT4
 // UUID boxes carry only EXIF and XMP; there is no IPTC pathway.
@@ -774,8 +779,10 @@ func (m *Metadata) canCarryEXIF() bool {
 // TIFF-based write path embeds IPTC as IFD0 tag 0x83BB (IPTC-NAA).
 //
 // Formats without an IPTC pathway: PNG, WebP, HEIF, AVIF, and CR3 (ISO BMFF
-// — the CMT UUID boxes carry only EXIF and XMP).
-// FormatUnknown also returns false.
+// — the CMT UUID boxes carry only EXIF and XMP). For PNG this means only that
+// no new IPTC component is created: IPTC already present in a "Raw profile
+// type iptc" text chunk is read into m.IPTC, and the write path rewrites that
+// chunk in place (format/png). FormatUnknown also returns false.
 //
 // Finding #110: prior to this fix, only JPEG and TIFF returned true, causing
 // DNG/CR2/NEF/ARW/ORF/RW2 to silently drop IPTC on Set* calls.
@@ -846,8 +853,11 @@ func (m *Metadata) ensureXMP() {
 // ensure* helpers are called while the lock is held; they are unexported and
 // non-recursive — they must never acquire m.mu themselves.
 //
-// Components that the format cannot carry (e.g. IPTC for PNG, CR3) are never
-// constructed, and the setter silently skips writing to that component.
+// Components that the format cannot carry (e.g. IPTC for CR3, or for a PNG
+// without a "Raw profile type iptc" chunk) are never constructed, and the
+// setter silently skips writing to that component. A component that already
+// exists is always written, even when the format could not create it: IPTC
+// read from a PNG raw profile chunk is updated by the setters.
 // For FormatUnknown, no component is ever created — see NewMetadata for the
 // documented contract.
 //
@@ -993,7 +1003,9 @@ func (m *Metadata) SetGPS(lat, lon float64) {
 // SetKeywords writes kws to IPTC and XMP. Components are auto-created when nil
 // and the format supports them. For formats that cannot carry IPTC (PNG, WebP,
 // HEIF, AVIF, CR3), only XMP is populated so the keywords are not silently
-// dropped. Concurrent calls are safe.
+// dropped, unless m.IPTC already exists: a PNG whose "Raw profile type iptc"
+// chunk was read has a non-nil m.IPTC, which is updated as well. Concurrent
+// calls are safe.
 func (m *Metadata) SetKeywords(kws []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1065,8 +1077,9 @@ func (m *Metadata) SetMake(s string) {
 // written here — see the IPTC/XMP reconciliation spec §0.1.
 //
 // For formats that cannot carry IPTC (PNG, WebP, HEIF, AVIF, CR3), m.IPTC
-// stays nil and only EXIF+XMP are written — the same fallback pattern used
-// by SetKeywords.
+// is not created and only EXIF+XMP are written — the same fallback pattern
+// used by SetKeywords. A PNG whose "Raw profile type iptc" chunk was read has
+// a non-nil m.IPTC, which is updated as well.
 func (m *Metadata) SetDateTimeOriginal(t time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

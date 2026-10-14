@@ -104,9 +104,9 @@ for cross-checking only).
   uppercase hexadecimal MD5 digest of the extended serialisation written without a packet wrapper; the TIFF-to-XMP
   mapping tables of the primary, Exif and GPS directories with their export modes, and the IIM DataSet table with its
   mapping forms and length limits, transcribed row by row into Go tables; the XMP text of a SHORT, LONG, RATIONAL,
-  SRATIONAL and ASCII tag; the read order of the three-way fields (XMP, then IIM, then EXIF) and of the two-way IIM
-  fields, with the IIM value preferred when the IPTC digest does not match and the IIM differs from the value
-  predicted from the XMP; and the tolerant parse and the export form of the IIM date and time)
+  SRATIONAL and ASCII tag; the read order of the three-way fields (EXIF, then XMP, then IIM, per MWG v2.0 §4.2.3) and of
+  the two-way IIM fields (XMP, then IIM), with the IIM value preferred over all others when the IPTC digest does not
+  match and the IIM differs from the value predicted from the XMP; and the tolerant parse and the export form of the IIM date and time)
 - Notes: the source files carry the header "Adobe permits you to use, modify, and distribute
   this file in accordance with the terms of the Adobe license agreement accompanying it",
   while the repository root `LICENSE` is the BSD 3-Clause licence. The accompanying licence
