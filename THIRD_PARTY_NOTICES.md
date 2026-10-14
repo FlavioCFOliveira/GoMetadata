@@ -91,3 +91,15 @@ for cross-checking only).
   changes: bounds checks in uint64, resources returned as sub-slices instead of copies,
   a digest refreshed only when one already exists, and the stale-digest signal kept when
   the IPTC is not modified (see the header of `internal/irb/irb.go`).
+
+## libavif
+
+- URL: https://github.com/AOMediaCodec/libavif
+- Source commit: `ab37e2946dfb6d2cc52886f39cb0fbf701db98e1`
+- Licence: BSD-2-Clause (see `LICENSES/BSD-2-Clause.txt`), SPDX-License-Identifier: `BSD-2-Clause`
+- Copyright: Copyright 2019 Joe Drago. All rights reserved.
+- Source files: `src/read.c` (`avifParseItemLocationBox`, `avifDecoderItemRead`)
+- Destination files: `format/heif/iloc.go`
+- Adapted: yes (the item location box field order, including the 16-bit `data_reference_index` of every version, the
+  field-width validation, and the concatenation of an item's extents, re-implemented as allocation-free Go)
+- Notes: the changes made are stated in the header of each destination file.

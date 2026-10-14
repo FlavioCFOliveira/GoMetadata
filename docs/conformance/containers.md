@@ -81,7 +81,8 @@ than parent; box-vs-FullBox confusion; duplicate ftyp.
 **(b)** ftyp major_brand ∈ {heic, heix, heim, heis, hevc, mif1, msf1} (or in compatible_brands).
 **(c)** Inside `meta`: `hdlr` handler `pict`; `pitm` primary item ID; `iinf` entry_count + `infe`
 per item (item_ID, type e.g. hvc1/Exif/mime/grid, name; FullBox v≥2); `iloc` item byte locations
-(construction_method, base_offset, extents: extent_offset/extent_length); `iref` typed refs
+(construction_method, data_reference_index — present in every iloc version, ISO/IEC 14496-12
+§8.11.3.2 — base_offset, extents: extent_offset/extent_length); `iref` typed refs
 (dimg/thmb/cdsc); `iprp`/`ipco`/`ipma` item properties (ispe/colr/hvcC/pixi/irot).
 **(d)** EXIF item: `infe` item_type `Exif`; payload via iloc is an ExifDataBlock = **4-byte u32 BE
 `exif_tiff_header_offset`** then EXIF (`Exif\0\0`+TIFF or directly TIFF). XMP item: `infe`
