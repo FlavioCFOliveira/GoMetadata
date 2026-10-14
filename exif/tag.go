@@ -335,6 +335,15 @@ func init() { //nolint:funlen // justified: tag registry must enumerate all ~140
 		TagStandardOutputSensitivity: {"StandardOutputSensitivity", TypeLong, 1},
 		TagDeviceSettingDescription:  {"DeviceSettingDescription", TypeUndefined, 0},
 	}
+	// Merge the extended TIFF/EXIF/DNG tags (tag_extended.go). The map grows
+	// once here, at init time, so TagName stays a single allocation-free map
+	// lookup. An ID already registered above is never overridden.
+	for i := range extendedTags {
+		e := &extendedTags[i]
+		if _, dup := tagRegistry[e.id]; !dup {
+			tagRegistry[e.id] = e.info
+		}
+	}
 }
 
 // TagName returns the human-readable name of a tag ID, or an empty string
