@@ -1044,16 +1044,31 @@ func (e *EXIF) SetMake(s string) {
 }
 
 // SetDateTimeOriginal sets ExifIFD tag 0x9003 (DateTimeOriginal, EXIF §4.6.5)
-// from t, using the EXIF datetime format "YYYY:MM:DD HH:MM:SS\x00" (20 bytes).
+// from t, using the EXIF datetime format "YYYY:MM:DD HH:MM:SS\x00" (20 bytes),
+// and keeps the two tags that qualify it consistent with t:
+//
+//   - 0x9011 OffsetTimeOriginal is set to the UTC offset of t, "±HH:MM" (EXIF
+//     2.31+, CIPA DC-008-2023 §4.6.5: ASCII, count 7, the offset of
+//     DateTimeOriginal from UTC). A UTC time is written "+00:00".
+//   - 0x9291 SubSecTimeOriginal is removed: it records the fraction of the
+//     second of DateTimeOriginal, which the datetime format above does not
+//     carry, so a fraction left from an earlier value would be wrong.
+//
+// DateTimeOriginal then reads back the same instant as t, to the second.
 func (e *EXIF) SetDateTimeOriginal(t time.Time) {
 	if e == nil || e.IFD0 == nil {
 		return
 	}
 	e.ensureExifIFD()
+	big := e.ifd0BigEndian()
 	// EXIF §4.6.5: DateTimeOriginal is a 20-byte ASCII field including the NUL.
 	formatted := t.Format("2006:01:02 15:04:05") + "\x00"
 	v := []byte(formatted)
-	e.ExifIFD.set(TagDateTimeOriginal, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
+	e.ExifIFD.set(TagDateTimeOriginal, TypeASCII, uint32(len(v)), v, big) //nolint:gosec // G115: string length bounded by input
+	// "-07:00" renders "+00:00" for UTC; the NUL makes the count 7.
+	off := append(t.AppendFormat(make([]byte, 0, 7), "-07:00"), 0)
+	e.ExifIFD.set(TagOffsetTimeOriginal, TypeASCII, uint32(len(off)), off, big) //nolint:gosec // G115: 7 bytes
+	e.ExifIFD.remove(TagSubSecTimeOriginal)
 }
 
 // SetExposureTime sets ExifIFD tag 0x829A (ExposureTime, EXIF §4.6.5).

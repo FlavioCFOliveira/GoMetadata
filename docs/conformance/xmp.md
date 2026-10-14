@@ -94,12 +94,12 @@ are used verbatim as Go sub-test names. 69 rules total.
 - **HEIF-03** Wrapper not required; handle both.
 
 ## Section 4: Reconciliation / MWG (v2.0)
-- **MWG-01** Read priority XMP > EXIF > IPTC-IIM on conflict.
-- **MWG-02** IPTC digest (Photoshop resource `0x0425`): match → XMP priority; mismatch → elevate IIM trust.
-- **MWG-03** dc:description[x-default] ↔ EXIF UserComment `0x9286` ↔ IIM 2:120; sync all on write.
+- **MWG-01** Read priority EXIF > XMP > IPTC-IIM on conflict (MWG §4.2.3.1, §4.2.3.3) for the fields mapped in all three formats (description, copyright, creator, date/time original); XMP > IPTC-IIM for keywords (§5.1). A value of only spaces or NULs is absent (§4.2.3.3).
+- **MWG-02** IPTC digest (Photoshop resource `0x0425`): match or absent → MWG-01 priority; mismatch → an IIM value that differs from the value predicted from XMP wins over EXIF and XMP (§4.2.3.2 scenario 4, §4.2.3.3).
+- **MWG-03** dc:description[x-default] ↔ EXIF ImageDescription `0x010E` ↔ IIM 2:120 (MWG §5.2); sync all on write.
 - **MWG-04** dc:creator[1] ↔ EXIF Artist `0x013B` ↔ IIM 2:80; sync all on write.
 - **MWG-05** dc:rights[x-default] ↔ EXIF Copyright `0x8298` ↔ IIM 2:116; sync all on write.
-- **MWG-06** photoshop:DateCreated ↔ EXIF DateTimeOriginal `0x9003`+SubSec `0x9291` ↔ IIM 2:55+2:60; combine/split.
+- **MWG-06** photoshop:DateCreated ↔ EXIF DateTimeOriginal `0x9003`+SubSec `0x9291` (+OffsetTime `0x9011`) ↔ IIM 2:55+2:60; combine/split (MWG §5.3).
 - **MWG-07** dc:subject ↔ IIM 2:25 keywords (no EXIF equivalent); sync both.
 - **MWG-08** exif:GPS* (XMP) ↔ EXIF GPS IFD `0x0002/0x0004/0x0006/0x0005`; decimal degrees in XMP.
 - **MWG-09** Write sync scope: update all formats present unless API requests a format-specific mode.

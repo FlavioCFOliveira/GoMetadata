@@ -737,11 +737,13 @@ func ExampleWriteFile_orientation() {
 
 // ExampleMetadata_subjectPriority demonstrates the source-priority policy
 // applied by GoMetadata when the same field appears in multiple metadata layers.
-// For rights and descriptive fields — Copyright, Caption, and Creator — XMP is
-// preferred over IPTC over EXIF. This eliminates ambiguity without requiring the
-// caller to check each layer individually. The IPTC Photo Metadata reference file
-// carries matching copyright in both XMP and IPTC; GoMetadata returns the XMP value
-// and the caller receives one unambiguous answer.
+// For rights and descriptive fields — Copyright, Caption, and Creator — EXIF is
+// preferred over XMP over IPTC (Metadata Working Group Guidelines v2.0
+// §4.2.3.3), and an IPTC value edited behind a stale IPTC digest wins over
+// both. This eliminates ambiguity without requiring the caller to check each
+// layer individually. The IPTC Photo Metadata reference file carries no EXIF
+// copyright and matching copyright in XMP and IPTC; GoMetadata returns the XMP
+// value and the caller receives one unambiguous answer.
 func ExampleMetadata_subjectPriority() {
 	m, err := gometadata.ReadFile("testdata/fixtures/IPTC-PhotometadataRef-Std2021.1.jpg")
 	if err != nil {
@@ -753,7 +755,8 @@ func ExampleMetadata_subjectPriority() {
 	fmt.Println("XMP present: ", m.XMP != nil)
 	fmt.Println("IPTC present:", m.IPTC != nil)
 
-	// Copyright follows XMP > IPTC > EXIF priority; the XMP value wins here.
+	// Copyright follows EXIF > XMP > IPTC priority; without an EXIF value,
+	// the XMP value wins here.
 	fmt.Println("copyright source: XMP")
 	fmt.Println("copyright:", m.Copyright())
 	// Output:

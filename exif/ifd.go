@@ -2234,6 +2234,17 @@ func (ifd *IFD) set(tag TagID, typ DataType, count uint32, value []byte, bigEndi
 	ifd.Entries = slices.Insert(ifd.Entries, i, entry)
 }
 
+// remove deletes the entry of tag from the IFD, if present, keeping the
+// entries sorted. It shifts the following entries within the slice and never
+// grows it, so it is safe on entries that share a backing array with other
+// IFDs (the parse arena gives each IFD its own region).
+func (ifd *IFD) remove(tag TagID) {
+	i := sort.Search(len(ifd.Entries), func(i int) bool { return ifd.Entries[i].Tag >= tag })
+	if i < len(ifd.Entries) && ifd.Entries[i].Tag == tag {
+		ifd.Entries = slices.Delete(ifd.Entries, i, i+1)
+	}
+}
+
 // asciiValue encodes s as a NUL-terminated ASCII byte slice suitable for
 // IFDEntry.Value (TypeASCII, TIFF §2).
 func asciiValue(s string) []byte {

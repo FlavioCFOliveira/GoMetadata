@@ -81,10 +81,17 @@ for cross-checking only).
   policy), `XMPFiles/source/FormatSupport/ReconcileIPTC.cpp` (`ComputeIPTCDigest`, `SetIPTCDigest`),
   `XMPFiles/source/FileHandlers/TIFF_Handler.cpp` (`TIFF_MetaHandler::ProcessXMP`);
   `XMPFiles/source/FileHandlers/JPEG_Handler.cpp` (`JPEG_MetaHandler::ProcessXMP`), `XMPCore/source/XMPUtils.cpp`
-  (`XMPUtils::MergeFromJPEG`, `XMPUtils::PackageForJPEG`)
+  (`XMPUtils::MergeFromJPEG`, `XMPUtils::PackageForJPEG`);
+  `XMPFiles/source/FormatSupport/ReconcileTIFF.cpp` (`TIFF_MappingToXMP`, `kExport_*`, `sPrimaryIFDMappings`,
+  `sExifIFDMappings`, `sGPSInfoIFDMappings`, `ImportSingleTIFF_*`, `PhotoDataUtils::Import3WayItems`),
+  `XMPFiles/source/FormatSupport/IPTC_Support.hpp` (`DataSetCharacteristics`, `kIPTC_Map*`),
+  `XMPFiles/source/FormatSupport/IPTC_Support.cpp` (`kKnownDataSets`),
+  `XMPFiles/source/FormatSupport/ReconcileIPTC.cpp` (`PhotoDataUtils::Import2WayIPTC`,
+  `PhotoDataUtils::ImportIPTC_Date`, `ExportIPTC_Date`)
 - Destination files: `xmp/namespace_toolkit.go`, `xmp/namespace_toolkit_test.go`; `xmp/parserdf.go`, `xmp/tree.go`,
   `xmp/serialize.go`, `xmp/xmlscan.go`; `internal/irb/irb.go`, `internal/tiffscan/tiffscan.go`; `xmp/extended.go`,
-  `format/jpeg/extxmp.go`
+  `format/jpeg/extxmp.go`; `internal/reconcile/tables.go`, `internal/reconcile/reconcile.go`,
+  `internal/reconcile/policy.go`, `reconcile.go`
 - Adapted: yes (namespace URIs, prefixes and alias definitions, transcribed to Go tables; the Photoshop image resource
   walk, the MD5 IPTC digest computation and check, and the TIFF IPTC source precedence of tag 0x83BB over tag 0x8649,
   re-implemented in Go; the duplicate-resource policy — first resource of an ID wins, a later non-empty one replaces
@@ -94,7 +101,12 @@ for cross-checking only).
   verbose (rdf:parseType="Resource") form of each node — re-implemented in Go over an index-linked node list; the
   compatibility mapping of an unqualified about/ID attribute of rdf:Description; the recomposition of the standard and
   extended XMP of a JPEG file into one tree without xmpNote:HasExtendedXMP, and the extended XMP GUID computed as the
-  uppercase hexadecimal MD5 digest of the extended serialisation written without a packet wrapper)
+  uppercase hexadecimal MD5 digest of the extended serialisation written without a packet wrapper; the TIFF-to-XMP
+  mapping tables of the primary, Exif and GPS directories with their export modes, and the IIM DataSet table with its
+  mapping forms and length limits, transcribed row by row into Go tables; the XMP text of a SHORT, LONG, RATIONAL,
+  SRATIONAL and ASCII tag; the read order of the three-way fields (XMP, then IIM, then EXIF) and of the two-way IIM
+  fields, with the IIM value preferred when the IPTC digest does not match and the IIM differs from the value
+  predicted from the XMP; and the tolerant parse and the export form of the IIM date and time)
 - Notes: the source files carry the header "Adobe permits you to use, modify, and distribute
   this file in accordance with the terms of the Adobe license agreement accompanying it",
   while the repository root `LICENSE` is the BSD 3-Clause licence. The accompanying licence
@@ -115,7 +127,12 @@ for cross-checking only).
   portions are parsed into one tree, the extended serialisation first, so that a property present in both takes the
   extended value as `XMPUtils::MergeFromJPEG` gives it, but the extended properties precede the standard ones in their
   schema; and the writer keeps only xmpNote:HasExtendedXMP in the standard packet instead of moving the largest
-  top-level properties out of it (see the headers of `xmp/extended.go` and `format/jpeg/extxmp.go`).
+  top-level properties out of it (see the headers of `xmp/extended.go` and `format/jpeg/extxmp.go`). The reconciliation
+  differs from the Toolkit in these points: the import policy is applied when a convenience getter reads a value instead
+  of being merged into the XMP; an XMP copy of an EXIF camera setting is refreshed only when it already exists, instead
+  of the tiff: and exif: namespaces being rewritten from the native tags; the predicted IIM value is the value the iptc
+  package writes (no CR/LF conversion); and out-of-range IIM date fields are rejected instead of clamped (see the
+  headers of `internal/reconcile/policy.go` and `reconcile.go`).
 
 ## libavif
 
