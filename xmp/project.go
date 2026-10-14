@@ -5,6 +5,28 @@ import (
 	"unsafe"
 )
 
+// Budget for the composed keys of the flat Properties view (task #277).
+//
+// A struct field is exposed in Properties under the key "P.F" and a field of
+// a struct array item under "P[N].F". Each key repeats the property name P,
+// so their total size grows with items × len(P) — quadratically in the
+// document size for an adversarial document that pairs a long property name
+// with many items. The tree that Parse builds is linear in the document size
+// and holds every node regardless of this budget; the budget only limits how
+// many composed keys are mirrored into Properties. Once it is spent, further
+// composed keys are not added to Properties (whole entries are skipped, a
+// name is never truncated), and the affected properties stay in the retained
+// tree, so Encode still writes them back unchanged.
+//
+// Real documents use a small fraction of the budget: a key is typically a few
+// dozen bytes, while the RDF of the field it names (start tag, value, end
+// tag, and the rdf:li wrapper of an array item) is about as long or longer.
+// The slack covers tiny documents whose markup is minimal.
+const (
+	composedKeyFactor = 4
+	composedKeySlack  = 4 << 10
+)
+
 // finish fills x.Properties from the parse tree and keeps, in x.nodes, every
 // top-level property that the flat view cannot reproduce exactly.
 //
@@ -12,8 +34,9 @@ import (
 // nodes — is copied into x.arena at this point and only at this point; the
 // parse tree itself holds transient views of the input (see
 // transientAliasString).
-func (p *rdfParser) finish() {
-	if need := p.arenaNeed(); need > 0 {
+func (p *rdfParser) finish(docLen int) {
+	budget := composedKeyFactor*docLen + composedKeySlack
+	if need := p.arenaNeed(budget); need > 0 {
 		p.x.arena = make([]byte, 0, need)
 	}
 	p.x.about = p.x.intern(p.about)
@@ -35,7 +58,7 @@ func (p *rdfParser) finish() {
 		var m map[string]string
 		keep := false
 		for prop := p.t[s].firstChild; prop != noNode; prop = p.t[prop].next {
-			m = p.project(s, prop, m)
+			m = p.project(s, prop, m, &budget)
 			if !p.representable(ns, table, prop) {
 				p.t[prop].flags |= nodeRetain
 				retained += p.t.subtreeSize(prop)
@@ -56,10 +79,11 @@ func (p *rdfParser) finish() {
 // superseded backing array of a regrown arena stays alive as long as a string
 // points into it, which can double the retained memory. The tree builder
 // accumulates the names and values of every node, a copy of every array item
-// for its joined value, the composed keys, and the first few distinct
-// namespaces; the strings recorded outside the tree are added here.
-func (p *rdfParser) arenaNeed() int {
-	n := p.est + p.composed + len(p.about) + len(p.toolkit)
+// for its joined value, the composed keys (bounded here by budget), and the
+// first few distinct namespaces; the strings recorded outside the tree are
+// added here.
+func (p *rdfParser) arenaNeed(budget int) int {
+	n := p.est + min(p.composed, budget) + len(p.about) + len(p.toolkit)
 	for ns, pfx := range p.s.prefixed {
 		n += len(ns) + len(pfx)
 	}
@@ -71,7 +95,7 @@ func (p *rdfParser) arenaNeed() int {
 // the documented Properties conventions (see XMP.Properties). A node whose
 // key is stored is marked nodeOwner; a key that is already present is left
 // unchanged (first one wins), and its node is not an owner.
-func (p *rdfParser) project(s, prop int32, m map[string]string) map[string]string { //nolint:cyclop,gocyclo // one case per node form of the documented key conventions
+func (p *rdfParser) project(s, prop int32, m map[string]string, budget *int) map[string]string { //nolint:cyclop,gocyclo // one case per node form of the documented key conventions
 	n := &p.t[prop]
 	switch {
 	case n.isSimple():
@@ -84,7 +108,7 @@ func (p *rdfParser) project(s, prop int32, m map[string]string) map[string]strin
 	case n.isStruct():
 		for f := n.firstChild; f != noNode; f = p.t[f].next {
 			if p.t[f].isSimple() {
-				p.projectField(s, &m, prop, -1, f)
+				p.projectField(s, &m, prop, -1, f, budget)
 			}
 		}
 	default: // array
@@ -98,7 +122,7 @@ func (p *rdfParser) project(s, prop int32, m map[string]string) map[string]strin
 			if p.t[it].isStruct() {
 				for f := p.t[it].firstChild; f != noNode; f = p.t[f].next {
 					if p.t[f].isSimple() {
-						p.projectField(s, &m, prop, idx, f)
+						p.projectField(s, &m, prop, idx, f, budget)
 					}
 				}
 			}
@@ -130,8 +154,8 @@ func (p *rdfParser) put(s int32, m *map[string]string, key string, composed bool
 }
 
 // projectField stores the simple field f of prop under "P.F" (item < 0) or
-// "P[item].F".
-func (p *rdfParser) projectField(s int32, m *map[string]string, prop int32, item int, f int32) {
+// "P[item].F", subject to the composed-key budget.
+func (p *rdfParser) projectField(s int32, m *map[string]string, prop int32, item int, f int32, budget *int) {
 	kb := p.s.keyBuf[:0]
 	kb = append(kb, p.t[prop].name...)
 	if item >= 0 {
@@ -142,9 +166,13 @@ func (p *rdfParser) projectField(s int32, m *map[string]string, prop int32, item
 	kb = append(kb, '.')
 	kb = append(kb, p.t[f].name...)
 	p.s.keyBuf = kb
+	if len(kb) > *budget {
+		return
+	}
 	if !p.put(s, m, transientAliasString(kb), true) {
 		return
 	}
+	*budget -= len(kb)
 	key := p.x.intern(transientAliasString(kb))
 	p.internValue(f)
 	(*m)[key] = p.t[f].value

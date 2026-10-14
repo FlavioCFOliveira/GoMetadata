@@ -12,8 +12,11 @@
 // Parse exposes the properties of a packet in XMP.Properties under flat
 // keys: "name" for a simple value or an array of simple items, "parent.field"
 // for a struct field, and "parent[N].field" for a field of a struct array
-// item (see XMP.Properties). Everything that has no flat key — deeper
-// structures and qualifiers — is kept internally and written back unchanged.
+// item (see XMP.Properties). The composed keys ("parent.field",
+// "parent[N].field") are limited to 4 × the document size + 4 KiB in total;
+// keys past that limit are omitted from Properties, and Encode still writes
+// their properties back. Everything that has no flat key — deeper structures
+// and qualifiers — is kept internally and written back unchanged.
 package xmp
 
 import (
@@ -57,6 +60,11 @@ type XMP struct {
 	// other than xml:lang have no key either; Parse keeps them in an internal
 	// tree and Encode writes them back unchanged, together with every
 	// property whose keys were not modified.
+	//
+	// The composed keys ("parent.field", "parent[N].field") repeat the
+	// property name, so their total size is limited to 4 × the document size
+	// + 4 KiB. Keys past that limit are omitted from this map; Encode still
+	// writes their properties back. Real documents stay far below the limit.
 	Properties map[string]map[string]string
 
 	// nodes is the retained part of the parsed XMP data model tree
@@ -64,8 +72,8 @@ type XMP struct {
 	// nodes, and their children are the top-level properties that the flat
 	// Properties view cannot reproduce exactly — properties with qualifiers,
 	// nested structures, URI values, empty items, a container other than the
-	// one Encode would choose, or keys that could not be stored (task #303).
-	// Every other property lives only in Properties. nodes is nil
+	// one Encode would choose, or keys that exceed the budget above (tasks
+	// #303, #277). Every other property lives only in Properties. nodes is nil
 	// when the whole document is representable by Properties, and for every
 	// XMP value built by a caller rather than by Parse.
 	//
@@ -96,7 +104,9 @@ type XMP struct {
 	// it, never eagerly while scanning: comments, whitespace, markup, unused
 	// namespace declarations and ignored attributes never reach arena. A
 	// namespace URI is copied once per Parse call however many nodes use it
-	// (XMPARENA-NS-REINTERN-01).
+	// (XMPARENA-NS-REINTERN-01), and composed keys are bounded by the budget
+	// described on Properties (task #277), so arena stays proportional to the
+	// input size.
 	//
 	// Safety invariants — ALL must hold for the lifetime of the returned *XMP:
 	//  1. arena is never handed to a sync.Pool or any other buffer reuse

@@ -221,7 +221,7 @@ func parseRDF(b []byte, x *XMP) error {
 	p := rdfParser{x: x, d: &s.doc, s: s, t: s.nodes[:0]}
 	p.t.add("", "", "", 0) // root
 	p.walk(0)
-	p.finish()
+	p.finish(len(b))
 	s.nodes = p.t
 	return nil
 }
