@@ -146,25 +146,27 @@ func zlibDecompress(data []byte) ([]byte, error) {
 }
 
 // processExtractChunk dispatches a single PNG chunk during Extract, updating
-// rawEXIF and rawXMP as appropriate. It returns (rawEXIF, rawXMP, done, err)
-// where done is true when IEND signals the end of the chunk stream.
-// data is backed by a pooled buffer; any slice that must outlive this call is
-// cloned here or in its callees before being returned as rawEXIF/rawXMP.
-func processExtractChunk(chunkType [4]byte, data, rawEXIF, rawXMP []byte) ([]byte, []byte, bool, error) {
+// st as appropriate. It returns done = true when IEND signals the end of the
+// chunk stream. data is backed by a pooled buffer; any slice that must outlive
+// this call is cloned here or in its callees before being stored in st.
+func processExtractChunk(chunkType [4]byte, data []byte, st *extractState) (done bool, err error) {
 	switch chunkType {
 	case chunkEXIf:
 		// Clone: data is pooled and will be returned to the pool after this call.
-		return bytes.Clone(data), rawXMP, false, nil
+		st.exif = bytes.Clone(data)
 	case chunkITXt, chunkTEXt, chunkZTXt:
-		xmp, err := handleXMPChunk(chunkType, data, rawXMP)
+		xmp, err := handleXMPChunk(chunkType, data, st.xmp)
 		if err != nil {
-			return rawEXIF, rawXMP, false, err
+			return false, err
 		}
-		return rawEXIF, xmp, false, nil
+		st.xmp = xmp
+		// "Raw profile type ..." chunks: decodeRawProfile always returns a fresh
+		// buffer, so nothing aliases the pooled data.
+		st.addRawProfile(chunkType, data)
 	case chunkIEND:
-		return rawEXIF, rawXMP, true, nil
+		return true, nil
 	}
-	return rawEXIF, rawXMP, false, nil
+	return false, nil
 }
 
 // extractIgnores reports whether Extract's chunk-scanning loop can skip a
@@ -273,13 +275,14 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	// #288: hdr is hoisted out of the loop and reused for every chunk header
 	// instead of being declared fresh per call.
 	var hdr [8]byte
+	var st extractState
 	pos := int64(len(pngSig))
 	var done bool
 	for !done {
 		var n int64
 		n, err = readOrSkipChunk(r, &hdr, pos, total, func(chunkType [4]byte, data []byte) error {
 			var perr error
-			rawEXIF, rawXMP, done, perr = processExtractChunk(chunkType, data, rawEXIF, rawXMP)
+			done, perr = processExtractChunk(chunkType, data, &st)
 			return perr
 		})
 		pos = n
@@ -296,7 +299,8 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 			return nil, nil, nil, err
 		}
 	}
-	return rawEXIF, nil, rawXMP, nil
+	rawEXIF, rawIPTC, rawXMP = st.result()
+	return rawEXIF, rawIPTC, rawXMP, nil
 }
 
 // readOrSkipChunk reads one PNG chunk header at the reader's current
