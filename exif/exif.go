@@ -144,13 +144,13 @@ func AcceptRAWMagic(magic uint16) ParseOption {
 //  2. b is never mutated in place.
 //
 // Without this option (the default), every ThumbnailData is an independent
-// copy and b may be freely discarded, reused, or pooled the instant Parse
-// returns — Parse's long-standing default contract. This option is for
-// gometadata.Read's own internal use, where the buffer passed to Parse is
-// always Metadata.rawEXIF, a field retained unmodified for the *Metadata's
-// entire lifetime (see Metadata.RawEXIF's defensive bytes.Clone for external
-// callers, which exists precisely because the internal field is never
-// copied-on-read). Passing this option with a transient or mutable buffer
+// copy. Entry values and MakerNote alias b in either case (see Parse), so b
+// must not be modified, reused, or pooled while the result is in use. This
+// option is for gometadata.Read's own internal use, where the buffer passed
+// to Parse is always Metadata.rawEXIF, a field retained unmodified for the
+// *Metadata's entire lifetime (see Metadata.RawEXIF's defensive bytes.Clone
+// for external callers, which exists precisely because the internal field is
+// never copied-on-read). Passing this option with a transient or mutable buffer
 // will corrupt or invalidate the returned ThumbnailData once that buffer is
 // released or modified.
 //
@@ -387,6 +387,10 @@ const bigTIFFMinHeader = 16
 // profile.  The BigTIFF path uses separate traversal functions
 // (traverseBigTIFF, parseSingleIFDBigTIFF, parseIFDEntryBigTIFF) that share
 // the same IFD/IFDEntry types with the classic path.
+//
+// Parse does not copy value bytes: every IFDEntry.Value and EXIF.MakerNote
+// of the result is a view of b (task #296). b must stay unmodified while the
+// result is in use, and the views are read-only — see IFDEntry.Value.
 func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cyclop,funlen // multi-format TIFF/BigTIFF dispatch; branches are inherent in format detection
 	var cfg parseConfig
 	for _, o := range opts {

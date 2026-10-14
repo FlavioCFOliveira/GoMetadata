@@ -72,6 +72,14 @@ type Metadata struct {
 	// Must not be copied after first use — always use *Metadata.
 	mu sync.Mutex
 
+	// EXIF, IPTC and XMP are the parsed metadata, each nil when absent.
+	//
+	// The entry values of EXIF (exif.IFDEntry.Value, EXIF.MakerNote) are
+	// zero-copy views of the raw EXIF bytes that Read retains and that Write
+	// uses as the source of everything it copies from the original file
+	// (task #296). Treat them as read-only: change a value with the Set*
+	// methods, or by assigning a new slice to IFDEntry.Value (and updating
+	// IFDEntry.Count); never write into the bytes of an existing Value.
 	EXIF *exif.EXIF
 	IPTC *iptc.IPTC
 	XMP  *xmp.XMP

@@ -61,4 +61,11 @@
 //	}
 //	fmt.Println(m.CameraModel())
 //	lat, lon, ok := m.GPS()
+//
+// # Parsed EXIF values
+//
+// Read does not copy EXIF values: every exif.IFDEntry.Value is a read-only
+// view of the raw EXIF bytes that Write later copies the file from. Change a
+// value through a Set* method or by assigning a new slice, never by writing
+// into an existing Value.
 package gometadata
