@@ -106,3 +106,18 @@ for cross-checking only).
   allocation-free Go; the layout of a new Exif or XMP item — infe version 2, item name, XMP content type, iref `cdsc`
   reference to the primary item, iloc entry with construction method 0 — re-implemented to edit an existing file)
 - Notes: the changes made are stated in the header of each destination file.
+
+## libwebp
+
+- URL: https://chromium.googlesource.com/webm/libwebp
+- Source commit: `0c7ffd17e9b89eb6ec4219a976886867880b0f25`
+- Licence: BSD-3-Clause (see `LICENSES/BSD-3-Clause.txt`), SPDX-License-Identifier: `BSD-3-Clause`
+- Copyright: Copyright (c) 2010, Google Inc. All rights reserved. (repository `COPYING`); Copyright 2010, 2011 and 2012
+  Google Inc. (source file headers)
+- Source files: `src/dec/vp8_dec.c` (`VP8GetInfo`), `src/dec/vp8l_dec.c` (`VP8LGetInfo`, `ReadImageInfo`),
+  `src/mux/muxedit.c` (`CreateVP8XChunk`)
+- Destination files: `format/webp/vp8x.go`
+- Adapted: yes (the VP8 key frame and VP8L header checks that yield the image width, height and alpha hint, and the
+  VP8X feature flags and 24-bit canvas fields of a still image, re-implemented in Go)
+- Notes: libwebp also ships an additional patent grant (`PATENTS`); no codec code is copied. The changes made are
+  stated in the header of the destination file.

@@ -303,8 +303,7 @@ func buildWebPBody(original, rawEXIF, rawXMP []byte) *bytes.Buffer {
 
 	// Write VP8X if needed (EXIF or XMP present, or was already extended).
 	if hasEXIF || hasXMP || origVP8XData != nil {
-		vp8xData := buildVP8XFlags(hasEXIF, hasXMP, origVP8XData)
-		writeRIFFChunk(body, fourCCVP8X, vp8xData)
+		writeVP8XChunk(body, chunks, hasEXIF, hasXMP, origVP8XData)
 	}
 
 	// Write original image chunks.
@@ -402,12 +401,34 @@ func collectOriginalChunks(original []byte) (chunks []webpOriginalChunk, origVP8
 	return chunks, origVP8XData
 }
 
+// writeVP8XChunk writes the VP8X chunk of the output.
+//
+// When the source already has a VP8X chunk, its canvas and feature flags are
+// kept and only the EXIF and XMP flags are updated (buildVP8XFlags). When the
+// source is a simple-format file (VP8 or VP8L only, no VP8X), the chunk is
+// built from the image bitstream (newVP8XPayload, task #299): the WebP
+// Container Specification requires the VP8X canvas to match the image
+// dimensions, and libwebp's decoder rejects a mismatch as BITSTREAM_ERROR
+// (src/dec/webp_dec.c ParseHeadersInternal: canvas_width != image_width).
+// Only when no image chunk has a decodable header — a malformed source with
+// no valid canvas size to copy — does it fall back to buildVP8XFlags' zero
+// canvas.
+func writeVP8XChunk(body *bytes.Buffer, chunks []webpOriginalChunk, hasEXIF, hasXMP bool, origVP8XData []byte) {
+	if origVP8XData == nil {
+		if payload, ok := newVP8XPayload(chunks, hasEXIF, hasXMP); ok {
+			writeRIFFChunk(body, fourCCVP8X, payload[:])
+			return
+		}
+	}
+	writeRIFFChunk(body, fourCCVP8X, buildVP8XFlags(hasEXIF, hasXMP, origVP8XData))
+}
+
 // buildVP8XFlags constructs a 10-byte VP8X chunk payload with the EXIF (bit 3)
 // and XMP (bit 2) feature flags set or cleared according to hasEXIF/hasXMP.
 // All other bits and the canvas dimension fields are copied from origVP8XData
 // when present, preserving ICC, animation, alpha, and dimension information.
 func buildVP8XFlags(hasEXIF, hasXMP bool, origVP8XData []byte) []byte {
-	vp8xData := make([]byte, 10)
+	vp8xData := make([]byte, vp8xChunkSize)
 	// Guard: only copy from origVP8XData when it is known to hold at least 10
 	// bytes. collectOriginalChunks now enforces this invariant at capture time,
 	// but the explicit len check here makes the safety guarantee local and
@@ -418,14 +439,14 @@ func buildVP8XFlags(hasEXIF, hasXMP bool, origVP8XData []byte) []byte {
 	// Update only the EXIF (bit 3) and XMP (bit 2) feature flags.
 	flags := binary.LittleEndian.Uint32(vp8xData[0:])
 	if hasXMP {
-		flags |= 0x04
+		flags |= vp8xFlagXMP
 	} else {
-		flags &^= 0x04
+		flags &^= vp8xFlagXMP
 	}
 	if hasEXIF {
-		flags |= 0x08
+		flags |= vp8xFlagEXIF
 	} else {
-		flags &^= 0x08
+		flags &^= vp8xFlagEXIF
 	}
 	binary.LittleEndian.PutUint32(vp8xData[0:], flags)
 	return vp8xData

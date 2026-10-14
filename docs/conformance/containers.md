@@ -58,6 +58,9 @@ chunk (`58 4D 50 20`, 4th byte is space `0x20`), raw packet. IPTC → via XMP. M
 VP8X (extended) format.
 **(e)** Adding EXIF/XMP requires VP8X + set flag; Chunk-Size = exact payload; pad byte iff odd;
 update RIFF File-Size; reserved bits 0; ICCP before image data; do not reorder reconstruction chunks.
+A VP8X added to a simple-format file takes its canvas (u24 LE width−1, height−1) from the VP8/VP8L
+bitstream header and sets Alpha when the image has alpha (VP8L `alpha_is_used`, or an `ALPH` chunk);
+libwebp rejects a canvas that differs from the image size (`VP8_STATUS_BITSTREAM_ERROR`).
 **(f)** File-Size mismatch; Chunk-Size past EOF; odd size missing/non-zero pad; chunk present but
 flag unset (read lenient, write correct); truncated VP8X; `XMP` without trailing space; duplicate
 metadata chunks; metadata before image data.
