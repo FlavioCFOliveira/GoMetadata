@@ -1454,14 +1454,14 @@ func TestMakeTrailingSpaceFullParsePath(t *testing.T) {
 	//   [54..]     MakerNote payload (Fujifilm format)
 
 	// Fujifilm MakerNote with an IFD at byte 16.
-	// Layout: "FUJIFILM"(8) + "0100"(4) + ifdOff(4=16) + ifd_count(2) + next(4)
+	// Layout: "FUJIFILM"(8) + ifdOff(4=16) + filler(4) + ifd_count(2) + next(4)
 	fujiPayload := func() []byte {
 		b := make([]byte, 22)
 		copy(b[0:], "FUJIFILM")
-		copy(b[8:], "0100")
-		binary.LittleEndian.PutUint32(b[12:], 16) // IFD at byte 16
-		binary.LittleEndian.PutUint16(b[16:], 0)  // 0 entries (minimal valid IFD)
-		binary.LittleEndian.PutUint32(b[18:], 0)  // next IFD = 0
+		binary.LittleEndian.PutUint32(b[8:], 16) // IFD at byte 16
+		copy(b[12:], "0100")
+		binary.LittleEndian.PutUint16(b[16:], 0) // 0 entries (minimal valid IFD)
+		binary.LittleEndian.PutUint32(b[18:], 0) // next IFD = 0
 		return b
 	}()
 

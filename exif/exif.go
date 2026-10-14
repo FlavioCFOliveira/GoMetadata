@@ -33,10 +33,10 @@ import (
 // 32-bit file offsets) may safely continue using MakerNoteOffset.
 //
 // These fields are informational: callers can use them to detect whether Encode
-// has moved the MakerNote to a different position.  Manufacturers that store
-// MakerNote-internal offsets relative to the parent TIFF start (e.g. certain
-// Nikon bodies) will produce stale internal offsets if the MakerNote moves;
-// full offset rebasing is not yet implemented.  EXIF §4.6.5, tag 0x927C.
+// has moved the MakerNote to a different position.  Encode copies the
+// MakerNote verbatim; when its layout counts value offsets from the TIFF
+// header (EXIF.MakerNoteLayout), a writer that moves it must rebase them, as
+// the TIFF-family writers of format/tiff do.  EXIF §4.6.5, tag 0x927C.
 // BigTIFF spec §2 (Aware Systems / libtiff); fix for audit finding #142.
 //
 // BigTIFF is true when the EXIF was parsed from a BigTIFF source (magic 0x002B,
@@ -238,7 +238,9 @@ func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseCon
 			if makeEntry := ifd0.Get(TagMake); makeEntry != nil {
 				makeValue = makeEntry.Value
 			}
-			makerNoteIFD = makerNoteDispatch(makeValue, order, mn.Value)
+			// Task #312: b is passed so that a layout whose value offsets
+			// count from the TIFF header resolves them against b.
+			makerNoteIFD = makerNoteDispatchAt(makeValue, order, mn.Value, b, mn.rawOffset)
 		}
 	}
 

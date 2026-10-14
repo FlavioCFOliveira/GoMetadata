@@ -31,7 +31,8 @@ import (
 // reference does not list, is kept with its IFD at offset 10; the binary,
 // non-IFD layouts (Kodak "KDK", Reconyx) are recognised but yield no IFD,
 // because their tag tables are outside this package's scope; and the offset
-// base is reported but not applied (see mnBase).
+// base is applied: a layout whose value offsets count from the TIFF header is
+// parsed against the enclosing TIFF stream (see mnBase and mnView).
 
 // mnBase tells which origin the value offsets of a MakerNote IFD use.
 type mnBase uint8
@@ -42,17 +43,19 @@ const (
 	// Sanyo, Fujifilm, Nikon Type 3 relative to its embedded TIFF header).
 	mnBaseBlob mnBase = iota
 	// mnBaseTIFF: value offsets count from the start of the enclosing TIFF
-	// stream (Canon, Sony, Casio, Kyocera, "OLYMP\0", plain-IFD layouts).
-	// Parsing works on the MakerNote bytes alone, as it always has, so an
-	// out-of-line value of such a layout is resolved only when it lies inside
-	// the MakerNote; inline values are always exact.
+	// stream (Canon, Sony, Casio, Kyocera, Panasonic, "OLYMP\0", plain-IFD
+	// layouts). When the caller supplies that stream (makerNoteDispatch from
+	// Parse) the IFD is read from it, as metadata-extractor's
+	// processMakernote does (processIfd with tiffHeaderOffset as the base), so
+	// a value stored outside the MakerNote is resolved (task #312); otherwise
+	// only values that lie inside the MakerNote are.
 	mnBaseTIFF
 	// mnBaseNone: the layout is not an IFD (Kodak, Reconyx).
 	mnBaseNone
 )
 
-// makerNoteParserFunc parses the raw MakerNote into an IFD, or returns nil.
-type makerNoteParserFunc = func([]byte, binary.ByteOrder) *IFD
+// makerNoteParserFunc parses the MakerNote of v into an IFD, or returns nil.
+type makerNoteParserFunc = func(v mnView, parent binary.ByteOrder) *IFD
 
 // makerNoteFormat is the result of detectMakerNote. It is a small value type:
 // detection allocates nothing.
@@ -190,26 +193,20 @@ func hasPrefixFold[T ~string | ~[]byte](s T, prefix string) bool {
 	return true
 }
 
-// parseAtOffset parses a MakerNote IFD that starts at off within b, using
-// order. It is the common tail of every layout that needs no vendor-specific
-// validation.
-func parseAtOffset(b []byte, off int, order binary.ByteOrder) *IFD {
-	// An IFD needs at least its 2-byte entry count.
-	if len(b) < off+2 {
-		return nil
-	}
-	ifd, _, err := traverse(b, uint32(off), order, nil, false) //nolint:gosec // G115: off is a small constant layout offset
-	if err != nil {
-		return nil
-	}
-	return ifd
+// parseAtOffset parses a MakerNote IFD that starts at off within the
+// MakerNote, using order. It is the common tail of every layout that needs no
+// vendor-specific validation.
+func parseAtOffset(v mnView, off int, order binary.ByteOrder) *IFD {
+	return v.ifdAt(off, order)
 }
 
 // parsePlausibleIFD is parseAtOffset for layouts that have no signature to
 // vouch for them (Make-only detection of Minolta and signature-less Pentax):
 // the IFD is accepted only when its entry count is non-zero and every entry
-// fits inside b, so an arbitrary blob is not reinterpreted as an IFD.
-func parsePlausibleIFD(b []byte, off int, order binary.ByteOrder) *IFD {
+// fits inside the MakerNote, so an arbitrary blob is not reinterpreted as an
+// IFD.
+func parsePlausibleIFD(v mnView, off int, order binary.ByteOrder) *IFD {
+	b := v.bytes()
 	if len(b) < off+2 {
 		return nil
 	}
@@ -217,69 +214,70 @@ func parsePlausibleIFD(b []byte, off int, order binary.ByteOrder) *IFD {
 	if n == 0 || off+2+n*12 > len(b) {
 		return nil
 	}
-	return parseAtOffset(b, off, order)
+	return parseAtOffset(v, off, order)
 }
 
 // Layouts whose IFD sits at a fixed offset behind a signature. The offsets
 // follow metadata-extractor's processMakernote; every function is a plain
 // function value (no captures), so none allocates.
-func parseOlympusOldMN(b []byte, parent binary.ByteOrder) *IFD { return parseAtOffset(b, 8, parent) }
-func parseNikonType1HeaderMN(b []byte, parent binary.ByteOrder) *IFD {
-	return parseAtOffset(b, 8, parent)
+func parseOlympusOldMN(v mnView, parent binary.ByteOrder) *IFD { return parseAtOffset(v, 8, parent) }
+func parseNikonType1HeaderMN(v mnView, parent binary.ByteOrder) *IFD {
+	return parseAtOffset(v, 8, parent)
 }
-func parseSonyCamMN(b []byte, parent binary.ByteOrder) *IFD { return parseAtOffset(b, 12, parent) }
-func parseKyoceraMN(b []byte, parent binary.ByteOrder) *IFD { return parseAtOffset(b, 22, parent) }
-func parseSanyoMN(b []byte, parent binary.ByteOrder) *IFD   { return parseAtOffset(b, 8, parent) }
-func parsePlainIFDMN(b []byte, parent binary.ByteOrder) *IFD {
-	return parsePlausibleIFD(b, 0, parent)
+func parseSonyCamMN(v mnView, parent binary.ByteOrder) *IFD { return parseAtOffset(v, 12, parent) }
+func parseKyoceraMN(v mnView, parent binary.ByteOrder) *IFD { return parseAtOffset(v, 22, parent) }
+func parseSanyoMN(v mnView, parent binary.ByteOrder) *IFD   { return parseAtOffset(v, 8, parent) }
+func parsePlainIFDMN(v mnView, parent binary.ByteOrder) *IFD {
+	return parsePlausibleIFD(v, 0, parent)
 }
 
 // parseSemcMN: Sony Ericsson "SEMC MS\0\0\0\0\0" header, big-endian IFD at 20.
-func parseSemcMN(b []byte, _ binary.ByteOrder) *IFD { return parseAtOffset(b, 20, binary.BigEndian) }
+func parseSemcMN(v mnView, _ binary.ByteOrder) *IFD { return parseAtOffset(v, 20, binary.BigEndian) }
 
 // parseRicohMN: "Ricoh" header, big-endian IFD at 8.
-func parseRicohMN(b []byte, _ binary.ByteOrder) *IFD { return parseAtOffset(b, 8, binary.BigEndian) }
+func parseRicohMN(v mnView, _ binary.ByteOrder) *IFD { return parseAtOffset(v, 8, binary.BigEndian) }
 
 // parseAppleMN: "Apple iOS\0" header, big-endian IFD at 14.
-func parseAppleMN(b []byte, _ binary.ByteOrder) *IFD { return parseAtOffset(b, 14, binary.BigEndian) }
+func parseAppleMN(v mnView, _ binary.ByteOrder) *IFD { return parseAtOffset(v, 14, binary.BigEndian) }
 
 // parseOMSystemMN: "OM SYSTEM\0\0\0" + "II"/"MM" byte-order mark, IFD at 14.
-func parseOMSystemMN(b []byte, _ binary.ByteOrder) *IFD {
+func parseOMSystemMN(v mnView, _ binary.ByteOrder) *IFD {
+	b := v.bytes()
 	if len(b) < 14 {
 		return nil
 	}
 	switch {
 	case b[12] == 'I' && b[13] == 'I':
-		return parseAtOffset(b, 14, binary.LittleEndian)
+		return parseAtOffset(v, 14, binary.LittleEndian)
 	case b[12] == 'M' && b[13] == 'M':
-		return parseAtOffset(b, 14, binary.BigEndian)
+		return parseAtOffset(v, 14, binary.BigEndian)
 	}
 	return nil
 }
 
 // parseBinaryMN is the parser of recognised layouts that are not IFDs (Kodak
 // "KDK" blocks, Reconyx fixed records): there is no IFD to return.
-func parseBinaryMN(_ []byte, _ binary.ByteOrder) *IFD { return nil }
+func parseBinaryMN(_ mnView, _ binary.ByteOrder) *IFD { return nil }
 
-func parseNikonMN(b []byte, _ binary.ByteOrder) *IFD       { return parseNikonMakerNote(b) }
-func parseOlympusMN(b []byte, _ binary.ByteOrder) *IFD     { return parseOlympusMakerNote(b) }
-func parseFujifilmMN(b []byte, _ binary.ByteOrder) *IFD    { return parseFujifilmMakerNote(b) }
-func parsePanasonicMN(b []byte, _ binary.ByteOrder) *IFD   { return parsePanasonicMakerNote(b) }
-func parsePentaxMN(b []byte, _ binary.ByteOrder) *IFD      { return parsePentaxMakerNote(b) }
-func parseSigmaMN(b []byte, _ binary.ByteOrder) *IFD       { return parseSigmaMakerNote(b) }
-func parsePentaxPlainMN(b []byte, p binary.ByteOrder) *IFD { return parsePentaxOrPlain(b, p) }
+func parseNikonMN(v mnView, _ binary.ByteOrder) *IFD       { return nikonMakerNote(v) }
+func parseOlympusMN(v mnView, _ binary.ByteOrder) *IFD     { return olympusMakerNote(v) }
+func parseFujifilmMN(v mnView, _ binary.ByteOrder) *IFD    { return fujifilmMakerNote(v) }
+func parsePanasonicMN(v mnView, _ binary.ByteOrder) *IFD   { return panasonicMakerNote(v) }
+func parsePentaxMN(v mnView, _ binary.ByteOrder) *IFD      { return pentaxMakerNote(v) }
+func parseSigmaMN(v mnView, _ binary.ByteOrder) *IFD       { return sigmaMakerNote(v) }
+func parsePentaxPlainMN(v mnView, p binary.ByteOrder) *IFD { return parsePentaxOrPlain(v, p) }
 
 // parsePentaxOrPlain handles a Pentax/Asahi MakerNote: the AOC and PENTAX
 // signatures when present, otherwise a plain IFD at offset 0 (PENTAX Optio 330
 // and 430 write no signature; metadata-extractor processMakernote).
-func parsePentaxOrPlain(b []byte, parent binary.ByteOrder) *IFD {
-	if ifd := parsePentaxMakerNote(b); ifd != nil {
+func parsePentaxOrPlain(v mnView, parent binary.ByteOrder) *IFD {
+	if ifd := pentaxMakerNote(v); ifd != nil {
 		return ifd
 	}
-	if bytes.HasPrefix(b, []byte("AOC\x00")) || bytes.HasPrefix(b, []byte("PENTAX \x00")) {
+	if bytes.HasPrefix(v.bytes(), []byte("AOC\x00")) || bytes.HasPrefix(v.bytes(), []byte("PENTAX \x00")) {
 		return nil // signed but unparsable: do not reinterpret as a plain IFD
 	}
-	return parsePlausibleIFD(b, 0, parent)
+	return parsePlausibleIFD(v, 0, parent)
 }
 
 // detectBySignature identifies a MakerNote from its leading bytes. The order
@@ -356,12 +354,12 @@ func detectBySignature(mn []byte) mnLayout {
 	return mnNone
 }
 
-func parseCasioMN(b []byte, parent binary.ByteOrder) *IFD   { return parseCasioMakerNote(b, parent) }
-func parseLeicaMN(b []byte, parent binary.ByteOrder) *IFD   { return parseLeicaMakerNote(b, parent) }
-func parseCanonMN(b []byte, parent binary.ByteOrder) *IFD   { return parseCanonMakerNote(b, parent) }
-func parseSonyMN(b []byte, parent binary.ByteOrder) *IFD    { return parseSonyMakerNote(b, parent) }
-func parseSamsungMN(b []byte, parent binary.ByteOrder) *IFD { return parseSamsungMakerNote(b, parent) }
-func parseDJIMN(b []byte, parent binary.ByteOrder) *IFD     { return parseDJIMakerNote(b, parent) }
+func parseCasioMN(v mnView, parent binary.ByteOrder) *IFD   { return casioMakerNote(v, parent) }
+func parseLeicaMN(v mnView, parent binary.ByteOrder) *IFD   { return leicaMakerNote(v, parent) }
+func parseCanonMN(v mnView, parent binary.ByteOrder) *IFD   { return plainMakerNote(v, parent) }
+func parseSonyMN(v mnView, parent binary.ByteOrder) *IFD    { return plainMakerNote(v, parent) }
+func parseSamsungMN(v mnView, parent binary.ByteOrder) *IFD { return plainMakerNote(v, parent) }
+func parseDJIMN(v mnView, parent binary.ByteOrder) *IFD     { return djiMakerNote(v, parent) }
 
 // detectByMake identifies a signature-less MakerNote from the Make string:
 // case-insensitive family prefixes, as in metadata-extractor, so "NIKON

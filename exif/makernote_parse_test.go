@@ -68,7 +68,7 @@ func buildNikonType3(order binary.ByteOrder, entries [][4]uint32) []byte {
 // buildFujifilmMakerNote builds a Fujifilm MakerNote payload.
 // Uses a non-zero IFD offset so traverse works.
 func buildFujifilmMakerNote(entries [][4]uint32) []byte {
-	// [0..7] "FUJIFILM", [8..11] version "0100", [12..15] LE uint32 IFD offset.
+	// [0..7] "FUJIFILM", [8..11] LE uint32 IFD offset, [12..15] filler.
 	// IFD is placed immediately after the 16-byte header.
 	const ifdStart = 16
 	n := len(entries)
@@ -76,8 +76,8 @@ func buildFujifilmMakerNote(entries [][4]uint32) []byte {
 	buf := make([]byte, ifdStart+ifdSize)
 
 	copy(buf[0:8], "FUJIFILM")
-	copy(buf[8:12], "0100")
-	binary.LittleEndian.PutUint32(buf[12:16], uint32(ifdStart))
+	binary.LittleEndian.PutUint32(buf[8:12], uint32(ifdStart))
+	copy(buf[12:16], "0100")
 
 	order := binary.LittleEndian
 	ifd := buf[ifdStart:]

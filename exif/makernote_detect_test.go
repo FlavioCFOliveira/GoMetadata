@@ -52,9 +52,11 @@ func TestDetectMakerNote_Signatures(t *testing.T) {
 	binary.LittleEndian.PutUint32(nikon3[14:], 8)
 	copy(nikon3[18:], mnBlob(le, "", 0))
 
-	// fujifilm: IFD offset stored LE at [12:16].
-	fuji := mnBlob(le, "FUJIFILM0100", 16)
-	binary.LittleEndian.PutUint32(fuji[12:], 16)
+	// fujifilm: IFD offset stored LE at [8:12] (metadata-extractor
+	// processMakernote; task #312), bytes 12..15 are filler.
+	fuji := mnBlob(le, "FUJIFILM", 16)
+	binary.LittleEndian.PutUint32(fuji[8:], 16)
+	copy(fuji[12:], "0100")
 
 	tests := []struct {
 		name   string

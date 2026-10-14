@@ -35,11 +35,16 @@ for cross-checking only).
 - Licence: Apache-2.0 (see `LICENSES/Apache-2.0.txt`), SPDX-License-Identifier: `Apache-2.0`
 - Copyright: Copyright 2002-2019 Drew Noakes and contributors
 - Source files: `Source/com/drew/metadata/exif/ExifDirectoryBase.java` (`TAG_*` constants);
-  `Source/com/drew/metadata/exif/ExifTiffHandler.java` (`processMakernote`)
-- Destination files: `exif/tag_extended.go`, `exif/tag_extended_test.go`; `exif/makernote_detect.go`
+  `Source/com/drew/metadata/exif/ExifTiffHandler.java` (`processMakernote`);
+  `Source/com/drew/imaging/tiff/TiffReader.java` (`processIfd`, byte-swapped entry count)
+- Destination files: `exif/tag_extended.go`, `exif/tag_extended_test.go`; `exif/makernote_detect.go`;
+  `exif/makernote_parse.go`
 - Adapted: yes (tag IDs and names of the tags that libtiff does not list; the rest of the table is used for cross-checking.
   MakerNote detection: the order of the signature and Make tests, the signatures, and the IFD offset and offset base of
-  each layout, re-implemented as allocation-free Go; MakerNote tag tables are not copied)
+  each layout, re-implemented as allocation-free Go; the offset base is applied when a MakerNote is read, and the
+  Fujifilm IFD offset is read from the 4 bytes after "FUJIFILM", as `processMakernote` does. MakerNote byte order: the
+  byte-swapped entry-count heuristic of `processIfd`, applied to MakerNote IFDs only. MakerNote tag tables are not
+  copied)
 - Notes: the repository has no `NOTICE` file. The changes made are stated in the
   header of each destination file. No descriptor marked as converted from ExifTool is used.
 
