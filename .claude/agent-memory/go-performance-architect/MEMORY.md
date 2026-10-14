@@ -1,5 +1,6 @@
 # Memory Index
 
+- [Sprint 45 E4b (2026-10-14)](project_sprint45_e4b_extxmp_aliasing.md) — xmp.ParseExtended one-tree merge, MD5 GUID, xmpNote URI, IFDEntry.Value caps; spec facts + measured costs
 - [Sprint 45 E4a (2026-10-14)](project_sprint45_e4a_xmp_tree.md) — XMP tree model (#303/#283/#277): Toolkit port, retained-subset design, perf traps, fuzz finds, unfixed defects
 - [Sprint 45 E3 (2026-10-14)](project_sprint45_e3_heif_cr3_webp.md) — iloc data_reference_index, HEIF item creation, CR3 XMP uuid/CMT4 split, WebP VP8X; fuzz finds + Read perf trap
 - [Sprint 45 E2b (2026-10-14)](project_sprint45_e2b_subifd_makernote_irb.md) — SubIFD tree+chains, MakerNote base/footer, IRB first-wins; TypeUTF8=13 vs 129 finding
