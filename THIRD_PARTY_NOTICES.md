@@ -68,13 +68,15 @@ for cross-checking only).
 - Copyright: Copyright (c) 2020, Adobe (repository `LICENSE`); Copyright 2002-2003 Adobe and Copyright 2006 Adobe (source file headers)
 - Source files: `public/include/XMP_Const.h` (`kXMP_NS_*`), `XMPCore/source/XMPMeta.cpp` (`XMPMeta::Initialize`, `RegisterStandardAliases`);
   `XMPFiles/source/FormatSupport/PSIR_MemoryReader.cpp` (`PSIR_MemoryReader::ParseMemoryResources`),
-  `XMPFiles/source/FormatSupport/ReconcileIPTC.cpp` (`ComputeIPTCDigest`, `SetIPTCDigest`),
+  `XMPFiles/source/FormatSupport/PSIR_FileWriter.cpp` (`PSIR_FileWriter::ParseMemoryResources`, duplicate-resource
+  policy), `XMPFiles/source/FormatSupport/ReconcileIPTC.cpp` (`ComputeIPTCDigest`, `SetIPTCDigest`),
   `XMPFiles/source/FileHandlers/TIFF_Handler.cpp` (`TIFF_MetaHandler::ProcessXMP`)
 - Destination files: `xmp/namespace_toolkit.go`, `xmp/namespace_toolkit_test.go`; `internal/irb/irb.go`,
   `internal/tiffscan/tiffscan.go`
 - Adapted: yes (namespace URIs, prefixes and alias definitions, transcribed to Go tables; the Photoshop image resource
   walk, the MD5 IPTC digest computation and check, and the TIFF IPTC source precedence of tag 0x83BB over tag 0x8649,
-  re-implemented in Go)
+  re-implemented in Go; the duplicate-resource policy — first resource of an ID wins, a later non-empty one replaces
+  an empty first one, one resource per ID on write — applied to every reader and to the splice of `internal/irb`)
 - Notes: the source files carry the header "Adobe permits you to use, modify, and distribute
   this file in accordance with the terms of the Adobe license agreement accompanying it",
   while the repository root `LICENSE` is the BSD 3-Clause licence. The accompanying licence

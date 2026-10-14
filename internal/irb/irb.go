@@ -17,7 +17,10 @@
 //     the Toolkit always creates it (task #284: never add a digest where none
 //     existed), and a stale digest is kept when the IPTC is not modified;
 //   - the digest check also accepts the zero-padded form of a TIFF tag 0x83BB
-//     value (DigestCurrent), as the Toolkit's TIFF handler does.
+//     value (DigestCurrent), as the Toolkit's TIFF handler does;
+//   - duplicate resources follow the Toolkit's policy (first copy wins, a later
+//     non-empty copy replaces an empty first one) in every reader and in the
+//     splice, which keeps one 0x0404 resource (task #313).
 //
 // Layout of one resource (Adobe Photoshop File Formats Specification,
 // "Image Resource Blocks"; EXIF/IPTC conformance notes iptc.md §2):
@@ -28,6 +31,7 @@
 package irb
 
 // Adapted from Adobe XMP-Toolkit-SDK XMPFiles/source/FormatSupport/PSIR_MemoryReader.cpp:PSIR_MemoryReader::ParseMemoryResources, Copyright 2006 Adobe, SPDX-License-Identifier: BSD-3-Clause
+// Adapted from Adobe XMP-Toolkit-SDK XMPFiles/source/FormatSupport/PSIR_FileWriter.cpp:PSIR_FileWriter::ParseMemoryResources, Copyright 2006 Adobe, SPDX-License-Identifier: BSD-3-Clause
 // Adapted from Adobe XMP-Toolkit-SDK XMPFiles/source/FormatSupport/ReconcileIPTC.cpp:ComputeIPTCDigest,SetIPTCDigest, Copyright 2006 Adobe, SPDX-License-Identifier: BSD-3-Clause
 // Adapted from Adobe XMP-Toolkit-SDK XMPFiles/source/FileHandlers/TIFF_Handler.cpp:TIFF_MetaHandler::ProcessXMP, Copyright 2006 Adobe, SPDX-License-Identifier: BSD-3-Clause
 
@@ -161,39 +165,73 @@ func (s *scanner) next() (resource, bool) {
 	return resource{}, false
 }
 
-// FindIPTC returns the data of the first 0x0404 resource in b, or nil when
-// the stream holds none. The result aliases b.
-//
-// The read-path walkers (FindIPTC, IPTCAndDigest, FindDigest) loop over
-// ParseEntry directly instead of using scanner: returning the multi-word
-// resource struct from a function called per resource measurably slowed
-// JPEG extraction on arm64 (BenchmarkJPEGExtract, +10%).
-func FindIPTC(b []byte) []byte {
+// Duplicate resources. An IRB should hold at most one resource of each ID,
+// but streams with two 0x0404 resources occur in the field (one of them often
+// empty). Every reader and writer of this package resolves them with the
+// policy of the Adobe XMP Toolkit
+// (PSIR_FileWriter.cpp:PSIR_FileWriter::ParseMemoryResources): the first
+// resource of an ID wins, except that a later non-empty resource replaces an
+// empty first one. For the digest (0x0425) only resources of exactly
+// DigestSize bytes are candidates, so the first such resource wins.
+
+// iptcWinner returns the start offset and data of the 0x0404 resource the
+// duplicate policy selects, and false when b holds none. Like the other
+// read-path walkers it loops over ParseEntry directly (see FindIPTC).
+func iptcWinner(b []byte) (start int, data []byte, ok bool) {
 	pos := 0
 	for pos < len(b) {
-		id, data, newPos, ok := ParseEntry(b, pos)
-		if !ok {
+		id, d, newPos, valid := ParseEntry(b, pos)
+		if !valid {
 			if newPos == pos {
 				pos++ // signature mismatch: scan forward
 				continue
 			}
 			break // structural failure
 		}
-		if id == ResourceIPTC {
-			return data
+		if id == ResourceIPTC && preferIPTC(ok, data, d) {
+			start, data, ok = pos, d, true
+			if len(d) > 0 {
+				return start, data, true // a non-empty first copy is final
+			}
 		}
-		pos = next(b, newPos, len(data))
+		pos = next(b, newPos, len(d))
 	}
-	return nil
+	return start, data, ok
+}
+
+// preferIPTC reports whether the 0x0404 resource cand replaces the current
+// choice cur under the duplicate policy: it is the first one (have false), or
+// cur is empty and cand is not.
+func preferIPTC(have bool, cur, cand []byte) bool {
+	return !have || (len(cur) == 0 && len(cand) > 0)
+}
+
+// FindIPTC returns the data of the 0x0404 resource of b selected by the
+// duplicate policy (the first one, or the first non-empty one when the first
+// is empty), or nil when the stream holds none. The result aliases b.
+//
+// The read-path walkers (FindIPTC, IPTCAndDigest, FindDigest) loop over
+// ParseEntry directly instead of using scanner: returning the multi-word
+// resource struct from a function called per resource measurably slowed
+// JPEG extraction on arm64 (BenchmarkJPEGExtract, +10%).
+func FindIPTC(b []byte) []byte {
+	_, data, _ := iptcWinner(b)
+	return data
 }
 
 // IPTCAndDigest scans b for the IPTC-NAA resource (0x0404) and the IPTC
-// digest resource (0x0425). Either result may be nil. When a resource occurs
-// more than once the last one wins, which is the behaviour the JPEG reader
-// has always had. A 0x0425 resource whose data is not exactly 16 bytes is
-// ignored (MWG Guidelines v2.0 §3.3.1). The results alias b.
+// digest resource (0x0425). Either result may be nil. Duplicates are resolved
+// by the duplicate policy (see iptcWinner): the first 0x0404 resource wins
+// unless it is empty and a later one is not, and the first 0x0425 resource of
+// exactly 16 bytes wins; a 0x0425 resource of any other size is ignored (MWG
+// Guidelines v2.0 §3.3.1). The results alias b.
+//
+// Task #313: this function used to keep the last copy of each resource while
+// FindIPTC kept the first, so a stream with two 0x0404 resources read
+// differently through the JPEG and the TIFF paths.
 func IPTCAndDigest(b []byte) (iptcData, digest []byte) {
 	pos := 0
+	haveIPTC := false
 	for pos < len(b) {
 		id, data, newPos, ok := ParseEntry(b, pos)
 		if !ok {
@@ -204,9 +242,9 @@ func IPTCAndDigest(b []byte) (iptcData, digest []byte) {
 			break
 		}
 		switch {
-		case id == ResourceIPTC:
-			iptcData = data
-		case id == ResourceIPTCDigest && len(data) == DigestSize:
+		case id == ResourceIPTC && preferIPTC(haveIPTC, iptcData, data):
+			iptcData, haveIPTC = data, true
+		case id == ResourceIPTCDigest && digest == nil && len(data) == DigestSize:
 			digest = data
 		}
 		pos = next(b, newPos, len(data))
@@ -328,9 +366,13 @@ func splicedDigest(orig, newIPTC []byte) (digest [DigestSize]byte, refresh bool)
 // AppendSpliced appends to dst an IRB identical to orig except that the
 // 0x0404 resource is replaced by a fresh block wrapping newIPTC; every other
 // resource is copied verbatim, with its Pascal name, reserved bytes and
-// padding. When newIPTC is nil the 0x0404 resource is removed instead. When
+// padding. When newIPTC is nil every 0x0404 resource is removed instead. When
 // orig holds no 0x0404 resource and newIPTC is non-nil the new block is
-// appended at the end.
+// appended at the end. Duplicate 0x0404 resources are resolved as described
+// at iptcWinner: the new block takes the place of the selected copy and the
+// other copies are dropped, as the XMP Toolkit's writer keeps one resource
+// per ID (PSIR_FileWriter.cpp:PSIR_FileWriter::UpdateMemoryResources), so no
+// stale copy of the IIM survives the write (task #313).
 //
 // Digest refresh (task #284, MWG Guidelines v2.0 §3.3.1): when newIPTC is
 // non-nil and differs from the IPTC the stream already holds, an existing
@@ -343,17 +385,29 @@ func splicedDigest(orig, newIPTC []byte) (digest [DigestSize]byte, refresh bool)
 // XMP, which a refresh would erase. Derived from
 // ReconcileIPTC.cpp:SetIPTCDigest (MD5 over the full IPTC block).
 func AppendSpliced(dst, orig, newIPTC []byte) []byte {
-	replaced := false
 	digest, refresh := splicedDigest(orig, newIPTC)
+	if !refresh {
+		return AppendSplicedDigest(dst, orig, newIPTC, nil)
+	}
+	return AppendSplicedDigest(dst, orig, newIPTC, &digest)
+}
+
+// AppendSplicedDigest is AppendSpliced with the digest decision taken by the
+// caller: when digest is non-nil, the data of every 0x0425 resource of
+// exactly DigestSize bytes is replaced by *digest; when it is nil, every
+// 0x0425 resource is copied verbatim. A digest is never created. The TIFF
+// writer uses it because its digest covers the zero-padded value of tag
+// 0x83BB (Digest with align 4), not the IIM alone.
+func AppendSplicedDigest(dst, orig, newIPTC []byte, digest *[DigestSize]byte) []byte {
+	winStart, _, found := iptcWinner(orig)
 	s := scanner{b: orig}
 	for r, ok := s.next(); ok; r, ok = s.next() {
 		switch {
 		case r.id == ResourceIPTC:
-			if newIPTC != nil {
+			if newIPTC != nil && r.start == winStart {
 				dst = AppendBlock(dst, ResourceIPTC, newIPTC)
 			}
-			replaced = true
-		case r.id == ResourceIPTCDigest && refresh && len(r.data) == DigestSize:
+		case r.id == ResourceIPTCDigest && digest != nil && len(r.data) == DigestSize:
 			// Header up to the data (signature, ID, name, size) verbatim, then
 			// the fresh digest; 16 bytes need no pad byte.
 			dst = append(dst, orig[r.start:r.dataStart]...)
@@ -362,7 +416,7 @@ func AppendSpliced(dst, orig, newIPTC []byte) []byte {
 			dst = append(dst, orig[r.start:r.end]...)
 		}
 	}
-	if !replaced && newIPTC != nil {
+	if !found && newIPTC != nil {
 		dst = AppendBlock(dst, ResourceIPTC, newIPTC)
 	}
 	return dst
