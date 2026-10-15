@@ -1,5 +1,6 @@
 # Memory Index
 
+- [Sprint 46 E4 (2026-10-15)](project_sprint46_e4_heif_cr3_334_337.md) — HEIF largesize/iloc width 0/no-silent-drop; CR3 CMT2 read+write, CMT4 removal; ExifTool -G3:1 count trap
 - [Sprint 46 E2 (2026-10-14)](project_sprint46_e2_xmp_bugs.md) — XMP #326-#331: alias fold, strict scanner, unparsed-packet carry, verbatim text; Go slice-header eval-order trap
 - [Sprint 45 E5 (2026-10-14)](project_sprint45_e5_reconcile_tables.md) — internal/reconcile Toolkit tables + MWG EXIF>XMP>IIM read order (user-chosen); real MWG § numbers, perf cost accepted, corpus defects
 - [Sprint 45 E4b (2026-10-14)](project_sprint45_e4b_extxmp_aliasing.md) — xmp.ParseExtended one-tree merge, MD5 GUID, xmpNote URI, IFDEntry.Value caps; spec facts + measured costs
