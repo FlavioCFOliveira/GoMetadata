@@ -200,7 +200,7 @@ func relocateTIFFFromParsedRW2(base []byte, fileLen uint64, e *exif.EXIF, rawIPT
 
 	// ── Step 2: upsert metadata tags in IFD0 ─────────────────────────────────
 	if rawIPTC != nil {
-		upsertIPTC(e.IFD0, rawIPTC)
+		upsertIPTC(e.IFD0, rawIPTC, rawXMP)
 	}
 	if rawXMP != nil {
 		upsertIFD0Entry(e.IFD0, exif.TagXMP, exif.TypeByte, rawXMP)

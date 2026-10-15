@@ -23,3 +23,9 @@ var ErrDocumentTooLarge = errors.New("xmp: document exceeds maximum size")
 // tag, a malformed start tag, or an element that is never closed (XML 1.0 §3;
 // ISO 16684-1:2019 §7.1). The error text names the offending element.
 var ErrXMLNotWellFormed = errors.New("xmp: XML is not well-formed")
+
+// ErrTooLargeForJPEG is returned by PackageForJPEG when the standard XMP
+// packet cannot be reduced to the size that fits a JPEG APP1 segment even
+// after every movable top-level property has moved to the extended portion
+// (the Adobe XMP Toolkit's kXMPErr_TooLargeForJPEG).
+var ErrTooLargeForJPEG = errors.New("xmp: standard XMP cannot be reduced enough for a JPEG file")

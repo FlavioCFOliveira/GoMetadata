@@ -80,6 +80,10 @@ are used verbatim as Go sub-test names. 74 rules total.
 - **JPEG-08** Merge extended `rdf:Description` into primary model without duplicating props; a top-level property present in both portions takes the extended value as a whole (Adobe XMP Toolkit `XMPUtils::MergeFromJPEG`).
 - **JPEG-09** ExtendedXMP serialized without a packet wrapper; GUID written as 32 hex digits with capital A–F (S3 §1.1.3.1).
 - **JPEG-10** Reader recomposes StandardXMP and ExtendedXMP into one data model tree and removes `xmpNote:HasExtendedXMP`; the xmpNote namespace URI is `http://ns.adobe.com/xmp/note/` (S3 §1.1.3.1).
+- **JPEG-11** Writer avoids partitioning (S3 §1.1.3.2 p. 15, task #332): a packet whose compact serialisation fits one APP1 segment (65502 bytes, S3 §1.1.3.1 p. 14) is written whole, without its padding; the packet padding alone never causes a split. `TestTask332_CompactNotSplit`, `TestTask332_PaddedPacketThatFitsUnpadded`.
+- **JPEG-12** Writer partitions as S3 §1.1.3.2 (p. 15) recommends: StandardXMP at most 65000 bytes, compact, carrying `xmpNote:HasExtendedXMP` (added with a 32-byte dummy before the size is measured, S3 §1.1.3.1 p. 15); properties move to ExtendedXMP in order xmp:Thumbnails, the Camera Raw namespace, photoshop:History, then top-level properties by estimated size, largest first, until it fits; the two portions recompose into the original XMP. Divergence from the Toolkit (`XMPUtils::PackageForJPEG`), documented: xmp:Thumbnails moves instead of being deleted. `TestPackageForJPEG_*` (xmp), `TestTask332_PartitionKeepsStandardScalars`.
+- **JPEG-13** The extended serialisation has no packet wrapper and its GUID is the uppercase MD5 of its bytes (JPEG-09, JPEG-06); an XMP that cannot be parsed, or whose standard portion cannot fit, is stored whole as extended XMP behind a stub (fallback). `TestTask332_FallbackExtendedWrite`, `TestTask295_ExtendedXMPWriteDeterministic`.
+- **JPEG-14** Reader removes `xmpNote:HasExtendedXMP` from the StandardXMP also when extended chunks exist but none matches its GUID, or the matching chunks do not recompose, as the Toolkit does (`JPEG_Handler.cpp:ProcessXMP`); a write of that XMP does not bring it back. `TestTask332_UnmatchedLinkRemoved`, `TestStripExtendedLink`.
 
 ### 3.2 TIFF — XMP Part 3 §1.3
 - **TIFF-01** XMP in tag 700 (`0x02BC`); type BYTE(1) or UNDEFINED(7); accept both, write BYTE.
@@ -92,6 +96,7 @@ are used verbatim as Go sub-test names. 74 rules total.
 - **PNG-03** Packet end attribute = `r` for PNG embedding.
 - **PNG-04** Exactly one XMP iTXt; reader uses first.
 - **PNG-05** Language tag + translated keyword empty (two NULs); accept any on read.
+- **PNG-06** No more than one chunk containing XMP (S3 §1.1.5 p. 16, task #325): an XMP packet read from a `Raw profile type xmp` text chunk (or an `APP1` profile that carries a packet) is the fallback when no native iTXt exists; a write that emits the XMP iTXt chunk drops that profile, so one current copy remains. A profile that cannot be decoded is kept, and a nil XMP payload leaves it. `TestInject_RawProfileXMPDropped`, `TestExtract_RawProfileXMP`, `TestCorpus_PNGRawProfiles`.
 
 ### 3.4 HEIF / ISO BMFF — XMP Part 3 §1.8
 - **HEIF-01** XMP item: `item_type='mime'`, `content_type='application/rdf+xml'`; identify by these, not item ID.

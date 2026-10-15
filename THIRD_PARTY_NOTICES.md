@@ -36,15 +36,18 @@ for cross-checking only).
 - Copyright: Copyright 2002-2019 Drew Noakes and contributors
 - Source files: `Source/com/drew/metadata/exif/ExifDirectoryBase.java` (`TAG_*` constants);
   `Source/com/drew/metadata/exif/ExifTiffHandler.java` (`processMakernote`);
-  `Source/com/drew/imaging/tiff/TiffReader.java` (`processIfd`, byte-swapped entry count)
+  `Source/com/drew/imaging/tiff/TiffReader.java` (`processIfd`, byte-swapped entry count);
+  `Source/com/drew/metadata/webp/WebpRiffHandler.java` (`processChunk`, the "Exif\0\0" identifier of an EXIF chunk)
 - Destination files: `exif/tag_extended.go`, `exif/tag_extended_test.go`; `exif/makernote_detect.go`;
-  `exif/makernote_parse.go`
+  `exif/makernote_parse.go`; `format/webp/webp.go`
 - Adapted: yes (tag IDs and names of the tags that libtiff does not list; the rest of the table is used for cross-checking.
   MakerNote detection: the order of the signature and Make tests, the signatures, and the IFD offset and offset base of
   each layout, re-implemented as allocation-free Go; the offset base is applied when a MakerNote is read, and the
   Fujifilm IFD offset is read from the 4 bytes after "FUJIFILM", as `processMakernote` does. MakerNote byte order: the
   byte-swapped entry-count heuristic of `processIfd`, applied to MakerNote IFDs only. MakerNote tag tables are not
-  copied)
+  copied. WebP: an EXIF chunk that starts with the "Exif\0\0" identifier is read as the TIFF stream after it, as
+  `processChunk` does, re-implemented in Go; the reader here also takes the FourCC "XMP\0" as XMP, and the writer drops
+  the identifier and that FourCC)
 - Notes: the repository has no `NOTICE` file. The changes made are stated in the
   header of each destination file. No descriptor marked as converted from ExifTool is used.
 
@@ -59,7 +62,9 @@ for cross-checking only).
 - Destination files: `iptc/dataset_table.go` (cross-check only), `iptc/dataset_table_test.go` (reference list of 116 datasets);
   `format/png/rawprofile.go`
 - Adapted: yes for the test reference list and for the raw profile chunk decoding (keyword match, header skip, hex
-  decode), which was extended to tEXt and iTXt chunks, the "exif" and "APP1" keywords, and declared-length validation;
+  decode), which was extended to tEXt and iTXt chunks, the "exif", "APP1" and "xmp" keywords, and declared-length
+  validation; the reference only reads, so the rewrite of the IPTC profile and the removal of a profile that a standard
+  chunk replaces are original;
   no for the production dataset table
 - Notes: the production table is transcribed from the IPTC-NAA Information Interchange
   Model 4.2. The upstream JSON file is itself generated from ExifTool documentation, so no
@@ -84,7 +89,8 @@ for cross-checking only).
   policy), `XMPFiles/source/FormatSupport/ReconcileIPTC.cpp` (`ComputeIPTCDigest`, `SetIPTCDigest`),
   `XMPFiles/source/FileHandlers/TIFF_Handler.cpp` (`TIFF_MetaHandler::ProcessXMP`);
   `XMPFiles/source/FileHandlers/JPEG_Handler.cpp` (`JPEG_MetaHandler::ProcessXMP`), `XMPCore/source/XMPUtils.cpp`
-  (`XMPUtils::MergeFromJPEG`, `XMPUtils::PackageForJPEG`);
+  (`XMPUtils::MergeFromJPEG`, `XMPUtils::PackageForJPEG`, `EstimateSizeForJPEG`, `CreateEstimatedSizeMap`,
+  `MoveLargestProperty`);
   `XMPFiles/source/FormatSupport/ReconcileTIFF.cpp` (`TIFF_MappingToXMP`, `kExport_*`, `sPrimaryIFDMappings`,
   `sExifIFDMappings`, `sGPSInfoIFDMappings`, `ImportSingleTIFF_*`, `PhotoDataUtils::Import3WayItems`),
   `XMPFiles/source/FormatSupport/IPTC_Support.hpp` (`DataSetCharacteristics`, `kIPTC_Map*`),
@@ -93,7 +99,7 @@ for cross-checking only).
   `PhotoDataUtils::ImportIPTC_Date`, `ExportIPTC_Date`)
 - Destination files: `xmp/namespace_toolkit.go`, `xmp/namespace_toolkit_test.go`; `xmp/parserdf.go`, `xmp/tree.go`,
   `xmp/serialize.go`, `xmp/xmlscan.go`, `xmp/alias.go`, `xmp/encoding.go`, `xmp/xmp.go`; `internal/irb/irb.go`, `internal/tiffscan/tiffscan.go`; `xmp/extended.go`,
-  `format/jpeg/extxmp.go`; `internal/reconcile/tables.go`, `internal/reconcile/reconcile.go`,
+  `format/jpeg/extxmp.go`, `format/jpeg/jpeg.go`, `xmp/jpegpackage.go`; `internal/reconcile/tables.go`, `internal/reconcile/reconcile.go`,
   `internal/reconcile/policy.go`, `reconcile.go`
 - Adapted: yes (namespace URIs, prefixes and alias definitions, transcribed to Go tables; the Photoshop image resource
   walk, the MD5 IPTC digest computation and check, and the TIFF IPTC source precedence of tag 0x83BB over tag 0x8649,
@@ -104,7 +110,10 @@ for cross-checking only).
   verbose (rdf:parseType="Resource") form of each node — re-implemented in Go over an index-linked node list; the
   compatibility mapping of an unqualified about/ID attribute of rdf:Description; the recomposition of the standard and
   extended XMP of a JPEG file into one tree without xmpNote:HasExtendedXMP, and the extended XMP GUID computed as the
-  uppercase hexadecimal MD5 digest of the extended serialisation written without a packet wrapper; the TIFF-to-XMP
+  uppercase hexadecimal MD5 digest of the extended serialisation written without a packet wrapper; the partition of
+  the XMP of a JPEG file into a standard packet of at most 65000 bytes and an extended serialisation, moving
+  xmp:Thumbnails, the Camera Raw namespace, photoshop:History and then the top-level properties by estimated size,
+  largest first, and the removal of xmpNote:HasExtendedXMP when no extended chunk matches; the TIFF-to-XMP
   mapping tables of the primary, Exif and GPS directories with their export modes, and the IIM DataSet table with its
   mapping forms and length limits, transcribed row by row into Go tables; the XMP text of a SHORT, LONG, RATIONAL,
   SRATIONAL and ASCII tag; the read order of the three-way fields (EXIF, then XMP, then IIM, per MWG v2.0 §4.2.3) and of
@@ -120,8 +129,9 @@ for cross-checking only).
   tables only facts (URIs, prefixes, alias pairs) are transcribed. The image resource
   and IPTC digest logic is re-implemented from the Toolkit's algorithm, with these
   changes: bounds checks in uint64, resources returned as sub-slices instead of copies,
-  a digest refreshed only when one already exists, and the stale-digest signal kept when
-  the IPTC is not modified (see the header of `internal/irb/irb.go`). The RDF parser and
+  a digest created only when the caller also writes XMP, refreshed only when it matched
+  the IIM it replaces, and kept stale otherwise, where the Toolkit always rewrites it
+  (see the header of `internal/irb/irb.go`). The RDF parser and
   serialiser differ from the Toolkit in these points: recoverable errors are skipped
   silently instead of being reported; the element tree is built by an original
   allocation-free scanner instead of Expat; rdf:parseType="Literal" without markup and
@@ -132,8 +142,12 @@ for cross-checking only).
   `xmp/serialize.go`). The extended XMP of a JPEG file differs from the Toolkit in these points: the two
   portions are parsed into one tree, the extended serialisation first, so that a property present in both takes the
   extended value as `XMPUtils::MergeFromJPEG` gives it, but the extended properties precede the standard ones in their
-  schema; and the writer keeps only xmpNote:HasExtendedXMP in the standard packet instead of moving the largest
-  top-level properties out of it (see the headers of `xmp/extended.go` and `format/jpeg/extxmp.go`). The reconciliation
+  schema; the writer partitions the XMP as `PackageForJPEG` does, except that xmp:Thumbnails moves to the extended
+  portion instead of being deleted, the compact form omits formatting white space but does not use attribute shorthand,
+  the HasExtendedXMP dummy is added before the first measurement, and a property that refers to a blank node block stays
+  in the standard packet; the unparseable packet is stored whole as extended XMP, behind a standard packet that carries
+  only xmpNote:HasExtendedXMP (see the headers of `xmp/extended.go`, `xmp/jpegpackage.go`, `format/jpeg/extxmp.go` and
+  `format/jpeg/jpeg.go`). The reconciliation
   differs from the Toolkit in these points: the import policy is applied when a convenience getter reads a value instead
   of being merged into the XMP; an XMP copy of an EXIF camera setting is refreshed only when it already exists, instead
   of the tiff: and exif: namespaces being rewritten from the native tags; the predicted IIM value is the value the iptc

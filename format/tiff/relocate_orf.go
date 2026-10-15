@@ -584,7 +584,7 @@ func orfRelocateWithOLYMP(
 	}
 	if rawIPTC != nil {
 		// Adobe XMP Spec / ExifTool convention: IPTC-NAA (0x83BB) as TypeLong.
-		upsertIPTC(e.IFD0, rawIPTC)
+		upsertIPTC(e.IFD0, rawIPTC, rawXMP)
 	}
 	if rawXMP != nil {
 		// Adobe XMP Spec (TIFF Technical Note 3): XMP (0x02BC) as TypeByte.

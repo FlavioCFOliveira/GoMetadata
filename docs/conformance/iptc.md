@@ -139,7 +139,8 @@ Namespaces: `Iptc4xmpCore` = `http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/`,
   equals the IIM value predicted from the XMP value (the XMP value truncated
   to the DataSet length limit; for dates, the IIM export of the XMP date).
   Digest match, or resource absent, ⇒ MWG-01 applies unchanged. A value of
-  only spaces or NULs is absent (MWG §4.2.3.3). Proven by
+  only spaces or NULs is absent (MWG §4.2.3.3). The write side of the digest
+  (creation, refresh, a stale digest kept stale) is RECONCILE-06. Proven by
   `TestConformance_MWG02` (metadata_conformance_test.go),
   `TestPrecedence_ExplicitPolicyComment` (root_task50_test.go) and
   `TestTask308_ReadPolicy_Text`, `TestTask308_ReadPolicy_Keywords`,
@@ -168,6 +169,51 @@ Namespaces: `Iptc4xmpCore` = `http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/`,
   non-default `xml:lang` alternative present in the XMP `rdf:Alt` is preserved
   on the XMP side but has no IIM representation (IIM carries one un-tagged
   string) and MUST be dropped, not concatenated, when the value flows into IIM.
+
+- **RECONCILE-06** IPTC digest on write (MWG Guidelines v2.0 §4.2.3.2, pp.
+  26-29; task #323): the digest is the MD5 of the entire IIM block, stored as a
+  16-byte value in PSIR `0x0425`. When a write stores the IIM and XMP together
+  (JPEG APP13 with an XMP packet written or present; TIFF tag `0x83BB` with
+  XMP written or tag `0x02BC` present) and the Photoshop block holds no digest,
+  the digest is **created** (a new `0x8649` block holding only it, for TIFF).
+  A digest that matches the IIM being replaced is **refreshed** to the MD5 of
+  the IIM written (TIFF: of the stored tag `0x83BB` value including its LONG
+  zero padding). A digest that does not match the IIM being replaced is
+  **kept stale**, whether or not the IIM changes: it is the signal (scenario
+  4, p. 28) that a non-compliant Changer edited the IIM without updating XMP,
+  and a refresh would erase it for every property the write did not reconcile;
+  the stale digest keeps the reader policy of RECONCILE-02 (the written IIM
+  value wins). An IIM-only write (no XMP) creates no digest, and removing the
+  IIM leaves the digest. Deviation, documented: MWG p. 29 says a Changer "MUST
+  create or update the checksum" when both are present "whether changed or
+  not"; keeping a stale digest follows the Adobe XMP Toolkit's reconciliation
+  intent (ExifTool `MWG.pm` also updates only an absent or matching digest) and
+  the library does not reconcile all properties on write. Proven by
+  `TestAppendSpliced_DigestPolicy` (internal/irb), `TestUpsertIPTC_DigestPolicy`
+  (format/tiff), `TestWrite_JPEGIPTCDigestCreated`,
+  `TestWrite_JPEGStaleIPTCDigestStaysStale` (iptc_photoshop_irb_test.go) and
+  `TestCorpus_IPTCDigest`.
+- **IIM-COPY-01** IPTC copy in a JPEG trailer (task #322): an AFCP trailer
+  (AXS File Concatenation Protocol, 1992) whose directory has an `IPTC` data
+  set, and a FotoStation trailer whose tag 1 record holds the IIM, are
+  rewritten with the IIM written to APP13 when a write replaces it; a nil IIM
+  leaves them. A trailer is found only right after EOI (FotoStation also right
+  after the AFCP trailer) and only when consistent; otherwise it is copied
+  unchanged. `TestTrailers_AFCPRewrite`, `TestTrailers_FollowedByOtherData`,
+  `TestTrailers_FotoStationOnly`, `TestTrailers_Malformed`,
+  `TestTrailers_Corpus`.
+- **IIM-COPY-02** AFCP offsets (task #322; AFCP specification): the directory
+  offsets and the EOF record are absolute file offsets. When the trailer moves
+  they are rewritten for its position in the output, entries keep their order
+  and data, reserved fields are zero; a write that moves nothing and changes no
+  IPTC copy keeps the trailer byte for byte (CLAUDE.md §5). `TestTrailers_*`
+  (`checkAFCPConsistent`), `TestTrailers_UnchangedIsByteIdentical`.
+- **IIM-COPY-03** IPTC copy in the Nikon Capture data (task #322): the IPTC
+  entry (`0x9EF5F6E0`) of MakerNote tag `0x0E01` of a NEF is rewritten with the
+  IIM written to tag `0x83BB`: in place with zero padding when it fits its
+  capacity (no size or offset changes), otherwise rebuilt and moved to the end
+  of the MakerNote with the count and offset of `0x0E01` updated, the old bytes
+  cleared. `TestRewriteNikonMakerNoteIPTC`, `TestNEF_NikonCaptureCorpus`.
 
 ## Section 5: Robustness Cases (MUST NOT crash)
 - **ROBUST-01** Oversized standard length, value truncated by EOF → Truncated, rescan.

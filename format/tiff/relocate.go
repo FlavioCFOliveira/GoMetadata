@@ -391,7 +391,7 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte, f
 	if len(rawIPTC) > 0 {
 		// Adobe XMP Spec / ExifTool convention: IPTC-NAA (0x83BB) as TypeLong.
 		// upsertIFD0Entry pads value to 4-byte boundary; Count = nLongs.
-		upsertIPTC(e.IFD0, rawIPTC)
+		upsertIPTC(e.IFD0, rawIPTC, rawXMP)
 	}
 	if len(rawXMP) > 0 {
 		// Adobe XMP Spec (TIFF Technical Note 3): XMP (0x02BC) as TypeByte.

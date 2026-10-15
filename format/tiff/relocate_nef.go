@@ -750,6 +750,12 @@ func relocateTIFFFromParsedNEF(base []byte, r io.ReadSeeker, fileLen uint64, e *
 		return nil, nil, fmt.Errorf("nef: extract Nikon preview info: %w", err)
 	}
 
+	// #322: the Nikon Capture data of the MakerNote holds a copy of the IPTC;
+	// keep it in step with the IIM written to tag 0x83BB. After the extension
+	// above, so that data appended to the blob follows the structures that
+	// the extension covers.
+	rewriteNikonCaptureIPTC(e, rawIPTC)
+
 	if info == nil {
 		// No Nikon-specific preprocessing needed; use the standard path.
 		return relocateTIFFFromParsed(base, e, rawIPTC, rawXMP, fileLen)
@@ -782,7 +788,7 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	if rawIPTC != nil {
 		// Adobe XMP Spec / ExifTool convention: IPTC-NAA (0x83BB) as TypeLong.
 		// upsertIFD0Entry pads value to 4-byte boundary; Count = nLongs.
-		upsertIPTC(e.IFD0, rawIPTC)
+		upsertIPTC(e.IFD0, rawIPTC, rawXMP)
 	}
 	if rawXMP != nil {
 		// Adobe XMP Spec (TIFF Technical Note 3): XMP (0x02BC) as TypeByte.

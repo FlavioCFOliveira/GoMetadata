@@ -35,11 +35,12 @@ length/padding; fill bytes (`FF FF…`).
 (ancillary/private/reserved/safe-to-copy) (§5.4). IHDR first, IEND last; IDATs consecutive;
 PLTE before first IDAT (§5.6, §11). CRC-32 poly `0xEDB88320` reflected, init `0xFFFFFFFF`, final
 ones-complement, over Type+Data (not Length) (§5.5).
-**(d)** EXIF → `eXIf` chunk; raw TIFF stream **with no `Exif\0\0` prefix** (PNG-3 §11.3.4.4).
+**(d)** EXIF → `eXIf` chunk; raw TIFF stream **with no `Exif\0\0` prefix** (PNG-3 §11.3.4.5, eXIf: "Only one eXIf chunk is allowed").
 XMP → `iTXt` keyword `XML:com.adobe.xmp`, compression 0, empty lang/translated keyword. Text →
 `tEXt`/`zTXt`. IPTC → via XMP (no native chunk).
 **(e)** Length = data length; recompute CRC over Type+Data; insert ancillary chunks between
 IHDR and IEND (eXIf/text before IDAT recommended); preserve unknown safe-to-copy chunks.
+**PNG-EXIF-01** (task #325) A write that emits the eXIf chunk drops a `Raw profile type exif` or `APP1` text chunk (tEXt, zTXt or iTXt) whose decoded profile is the EXIF it replaces (PNG-3 §11.3.4.5: one eXIf chunk), so one current copy remains; an undecodable profile, a profile of another kind and a nil EXIF payload leave the chunk byte-identical. `TestInject_RawProfileEXIFDropped`, `TestInject_RawProfileKeptWhenNotSuperseded`, `TestInject_RawProfilesAllKinds`. (`Raw profile type iptc` is rewritten in place: task #314.)
 **(f)** Bad signature; truncated chunk; Length past EOF; CRC mismatch (detect, no crash);
 Length > 2³¹−1; zero-length data (legal); duplicate IHDR/IEND; chunks after IEND; bad iTXt
 zlib/separators; non-UTF-8 XMP; bad eXIf TIFF header.
@@ -61,6 +62,9 @@ update RIFF File-Size; reserved bits 0; ICCP before image data; do not reorder r
 A VP8X added to a simple-format file takes its canvas (u24 LE width−1, height−1) from the VP8/VP8L
 bitstream header and sets Alpha when the image has alpha (VP8L `alpha_is_used`, or an `ALPH` chunk);
 libwebp rejects a canvas that differs from the image size (`VP8_STATUS_BITSTREAM_ERROR`).
+**WEBP-01** (task #333) An `EXIF` chunk that starts with `Exif\0\0` is read as the TIFF stream after the identifier (metadata-extractor `WebpRiffHandler`); a write emits the TIFF stream without the identifier, as checklist item (d) of this section requires. `TestExtract_ExifPreambleAndXMPNul`.
+**WEBP-02** A chunk with the non-standard FourCC `XMP\0` is read as XMP; the standard `XMP ` chunk wins when both exist. `TestExtract_ExifPreambleAndXMPNul`.
+**WEBP-03** A write emits exactly one `EXIF` and one `XMP ` chunk (RFC 9649 §2.7.1.5: at most one of each) and no `XMP\0` chunk, with the VP8X flags to match; a nil XMP payload removes the `XMP\0` chunk too. `TestInject_OneStandardChunkEach`, `TestCorpus_WebPExifPreambleXMPNul`.
 **(f)** File-Size mismatch; Chunk-Size past EOF; odd size missing/non-zero pad; chunk present but
 flag unset (read lenient, write correct); truncated VP8X; `XMP` without trailing space; duplicate
 metadata chunks; metadata before image data.

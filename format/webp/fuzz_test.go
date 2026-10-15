@@ -28,6 +28,11 @@ func FuzzWebPExtract(f *testing.F) {
 	}
 	f.Add(withVP8)
 
+	// Seeds (task #333): an EXIF chunk with the "Exif\0\0" identifier and a
+	// chunk with the non-standard FourCC "XMP\0".
+	f.Add(webpOf(rawChunk{"VP8X", vp8xPayloadFlags(0x08)}, rawChunk{"VP8 ", vp8Payload},
+		rawChunk{"EXIF", append([]byte("Exif\x00\x00"), tiffStream...)}, rawChunk{"XMP\x00", xmpPacket}))
+
 	// Seed: empty input.
 	f.Add([]byte{})
 

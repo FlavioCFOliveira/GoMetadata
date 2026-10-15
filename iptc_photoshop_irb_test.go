@@ -110,7 +110,7 @@ func TestRead_TIFFPaddedIPTCDigestIsCurrent(t *testing.T) {
 			t.Fatalf("Read: %v", err)
 		}
 		if !m.iptcTrustElev {
-			t.Error("a stale digest did not elevate IPTC trust (MWG §3.3.1)")
+			t.Error("a stale digest did not elevate IPTC trust (MWG §4.2.3.2)")
 		}
 	})
 }
@@ -166,7 +166,7 @@ func writeCaption(t *testing.T, data []byte, caption string) []byte {
 
 // TestWrite_JPEGIPTCDigestRefreshed (task #284): after an IPTC write the
 // APP13 digest equals the MD5 of the written IIM block, and the written file
-// reads back with XMP priority (digest current, MWG §3.3.1).
+// reads back with XMP priority (digest current, MWG §4.2.3.2).
 func TestWrite_JPEGIPTCDigestRefreshed(t *testing.T) {
 	t.Parallel()
 	i := &iptc.IPTC{}
@@ -196,9 +196,11 @@ func TestWrite_JPEGIPTCDigestRefreshed(t *testing.T) {
 	}
 }
 
-// TestWrite_JPEGWithoutIPTCDigestStaysWithout (task #284): a file whose IRB
-// has no 0x0425 resource gets none on write.
-func TestWrite_JPEGWithoutIPTCDigestStaysWithout(t *testing.T) {
+// TestWrite_JPEGIPTCDigestCreated (task #323, MWG Guidelines v2.0 §4.2.3.2):
+// a file whose IRB has no 0x0425 resource gets one when IPTC and XMP are
+// written together, holding the MD5 of the written IIM, and reads back with
+// XMP priority (digest current).
+func TestWrite_JPEGIPTCDigestCreated(t *testing.T) {
 	t.Parallel()
 	data, err := os.ReadFile("testdata/fixtures/IPTC-PhotometadataRef-Std2021.1.jpg")
 	if err != nil {
@@ -207,16 +209,59 @@ func TestWrite_JPEGWithoutIPTCDigestStaysWithout(t *testing.T) {
 	if _, _, d, _, _, _, err := jpeg.ExtractFull(bytes.NewReader(data)); err != nil || d != nil {
 		t.Fatalf("fixture precondition: digest %x, err %v", d, err)
 	}
-	out := writeCaption(t, data, "no digest please")
+	out := writeCaption(t, data, "digest please")
+	_, rawIPTC, digest, rawXMP, _, _, err := jpeg.ExtractFull(bytes.NewReader(out))
+	if err != nil {
+		t.Fatalf("ExtractFull: %v", err)
+	}
+	if rawIPTC == nil || rawXMP == nil {
+		t.Fatalf("IPTC (%v) or XMP (%v) lost on write", rawIPTC != nil, rawXMP != nil)
+	}
+	want := md5.Sum(rawIPTC) //nolint:gosec // G401: MWG digest
+	if !bytes.Equal(digest, want[:]) {
+		t.Errorf("digest = %x, want MD5 of the written IIM %x", digest, want)
+	}
+	m, err := Read(bytes.NewReader(out))
+	if err != nil {
+		t.Fatalf("Read output: %v", err)
+	}
+	if m.iptcTrustElev || m.Caption() != "digest please" {
+		t.Errorf("read-back: trust elevated %v, caption %q", m.iptcTrustElev, m.Caption())
+	}
+}
+
+// TestWrite_JPEGStaleIPTCDigestStaysStale (task #323): a digest that did not
+// match the IIM before the write still does not match it afterwards, so MWG
+// consumers keep detecting the out-of-sync IIM, and the written caption wins
+// on read (internal/reconcile: with a stale digest the IIM value wins).
+func TestWrite_JPEGStaleIPTCDigestStaysStale(t *testing.T) {
+	t.Parallel()
+	i := &iptc.IPTC{}
+	i.SetCaption("before")
+	oldIIM, err := iptc.Encode(i)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := bytes.Repeat([]byte{0x5A}, 16)
+	src := jpegWithAPP13(t, append(irb.AppendBlock(nil, irb.ResourceIPTCDigest, stale), irb.AppendBlock(nil, irb.ResourceIPTC, oldIIM)...))
+
+	out := writeCaption(t, src, "after")
 	_, rawIPTC, digest, _, _, _, err := jpeg.ExtractFull(bytes.NewReader(out))
 	if err != nil {
 		t.Fatalf("ExtractFull: %v", err)
 	}
-	if rawIPTC == nil {
-		t.Fatal("IPTC lost on write")
+	if !bytes.Equal(digest, stale) {
+		t.Errorf("digest = %x, want the stale digest %x kept", digest, stale)
 	}
-	if digest != nil {
-		t.Errorf("a digest was created: %x", digest)
+	if cur := md5.Sum(rawIPTC); bytes.Equal(digest, cur[:]) { //nolint:gosec // G401: MWG digest
+		t.Error("the stale digest became current")
+	}
+	m, err := Read(bytes.NewReader(out))
+	if err != nil {
+		t.Fatalf("Read output: %v", err)
+	}
+	if !m.iptcTrustElev || m.Caption() != "after" {
+		t.Errorf("read-back: trust elevated %v, caption %q", m.iptcTrustElev, m.Caption())
 	}
 }
 
