@@ -544,44 +544,52 @@ func isXMPContentType(rest []byte) bool {
 	return string(ct) == xmpContentType
 }
 
-// metaFullBoxMinSize is the minimum valid size for a meta FullBox:
-// 4 bytes box-header-size + 4 bytes box-type + 4 bytes FullBox version/flags = 12 bytes.
-// A meta box with size < 12 bytes cannot contain valid FullBox metadata.
-// ISO 14496-12 §8.11.1: meta is a FullBox; its minimum declared size is 12.
-const metaFullBoxMinSize = 12
+// fullBoxFieldsLen is the byte length of the FullBox version(8) + flags(24)
+// fields that follow the box header (ISO 14496-12 §4.2.2 FullBox).
+const fullBoxFieldsLen = 4
 
 // findMetaBoxAbs finds the 'meta' FullBox in the file and returns its
-// absolute start, end, and the offset where its content begins (after header+version/flags).
-// Returns found=false when the meta box is absent or smaller than metaFullBoxMinSize
-// (an under-sized FullBox cannot contain usable content and would otherwise cause
-// buildInjectComponents to slice data[12:8] → panic; regression gate:
-// TestHEIFInjectMetaTooSmallForFullBox).
-// ISO 14496-12 §8.11.1: meta FullBox minimum size = 12 bytes.
+// absolute start, end, and the offset where its content begins (after the box
+// header and the FullBox version/flags).
+//
+// The box header is 8 bytes, or 16 bytes when the box uses the 64-bit
+// largesize form (size == 1): contentOff = absStart + headerLen + 4. The
+// header length of the meta box and of the moov box that may wrap it comes
+// from parseHEIFBoxHeader, never from an assumed constant (task #334; libavif
+// src/stream.c avifROStreamReadBoxHeaderPartial reads the largesize the same
+// way, ISO 14496-12 §4.2).
+//
+// Returns found=false when the meta box is absent or smaller than its header
+// plus the FullBox fields: 12 bytes with the 8-byte header, 20 with the
+// 16-byte one (an under-sized FullBox cannot contain usable content and would
+// otherwise cause buildInjectComponents to slice data[12:8] → panic; regression
+// gate: TestHEIFInjectMetaTooSmallForFullBox).
+// ISO 14496-12 §8.11.1: meta FullBox minimum size = header + 4 bytes.
 func findMetaBoxAbs(data []byte) (absStart, absEnd, contentOff int, found bool) {
 	// Search at top level first.
-	if s, e, ok := flatBoxRangeInFile(data, boxTypeMeta); ok {
-		if e-s < metaFullBoxMinSize {
+	if s, e, hl, ok := flatBoxRangeHdr(data, boxTypeMeta); ok {
+		if e-s < hl+fullBoxFieldsLen {
 			// #169 fix: meta box too small to be a valid FullBox.
-			// ISO 14496-12 §8.11.1: meta is a FullBox (header[8]+version/flags[4]=12 bytes minimum).
-			// If size < 12, contentOff = s+12 would exceed e, causing data[s+12:e] to panic.
+			// ISO 14496-12 §8.11.1: meta is a FullBox (header + version/flags).
+			// If size < header+4, contentOff would exceed e, causing data[contentOff:e] to panic.
 			return 0, 0, 0, false
 		}
-		return s, e, s + 8 + 4, true // +8 header, +4 FullBox version/flags
+		return s, e, s + hl + fullBoxFieldsLen, true
 	}
 	// Search inside moov.
-	ms, me, ok := flatBoxRangeInFile(data, boxTypeMoov)
+	ms, me, mhl, ok := flatBoxRangeHdr(data, boxTypeMoov)
 	if !ok {
 		return 0, 0, 0, false
 	}
-	moovContent := data[ms+8 : me]
-	if s, e, ok := flatBoxRangeInFile(moovContent, boxTypeMeta); ok {
-		if e-s < metaFullBoxMinSize {
+	moovContent := data[ms+mhl : me]
+	if s, e, hl, ok := flatBoxRangeHdr(moovContent, boxTypeMeta); ok {
+		if e-s < hl+fullBoxFieldsLen {
 			// Same size guard for the moov-nested meta box.
 			return 0, 0, 0, false
 		}
-		absS := ms + 8 + s
-		absE := ms + 8 + e
-		return absS, absE, absS + 8 + 4, true
+		absS := ms + mhl + s
+		absE := ms + mhl + e
+		return absS, absE, absS + hl + fullBoxFieldsLen, true
 	}
 	return 0, 0, 0, false
 }
@@ -589,18 +597,25 @@ func findMetaBoxAbs(data []byte) (absStart, absEnd, contentOff int, found bool) 
 // flatBoxRangeInFile performs a flat scan and returns start+end of the first
 // box matching boxType. Returns (0, 0, false) if not found.
 func flatBoxRangeInFile(data []byte, boxType [4]byte) (start, end int, found bool) {
+	start, end, _, found = flatBoxRangeHdr(data, boxType)
+	return start, end, found
+}
+
+// flatBoxRangeHdr is flatBoxRangeInFile that also returns the box's header
+// length (8, or 16 for a 64-bit largesize box, ISO 14496-12 §4.2).
+func flatBoxRangeHdr(data []byte, boxType [4]byte) (start, end, headerLen int, found bool) {
 	pos := 0
 	for pos < len(data) {
-		size, typ, _, ok := parseHEIFBoxHeader(data, pos)
+		size, typ, hl, ok := parseHEIFBoxHeader(data, pos)
 		if !ok {
 			break
 		}
 		if typ == boxType {
-			return pos, pos + int(size), true //nolint:gosec // G115: ISOBMFF box size bounded by file size
+			return pos, pos + int(size), int(hl), true //nolint:gosec // G115: ISOBMFF box size bounded by file size; hl is 8 or 16
 		}
 		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 	}
-	return 0, 0, false
+	return 0, 0, 0, false
 }
 
 // findInnerBox searches for a box of the given type within data (flat scan).

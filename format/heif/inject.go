@@ -1,6 +1,6 @@
 package heif
 
-// Adapted from libavif src/write.c:avifEncoderDataCreateExifItem,avifEncoderDataCreateXMPItem,avifEncoderFinish, Copyright 2019 Joe Drago, SPDX-License-Identifier: BSD-2-Clause
+// Adapted from libavif src/write.c:avifEncoderDataCreateExifItem,avifEncoderDataCreateXMPItem,avifEncoderFinish,avifEncoderWriteTrackMetaBox, Copyright 2019 Joe Drago, SPDX-License-Identifier: BSD-2-Clause
 //
 // Changes from libavif: libavif writes a new file, whereas Inject edits an
 // existing one. A missing Exif or XMP item is created the way libavif creates
@@ -12,7 +12,9 @@ package heif
 // versions and field widths. The payloads are stored in a new 'mdat' box at
 // the end of the file, and every file offset that the growth of the meta box
 // moves (iloc file-offset extents and stco/co64 chunk offsets) is shifted by
-// the same amount.
+// the same amount. libavif writes every iloc box with offset_size and
+// length_size 4; Inject keeps the field widths of the existing iloc box but
+// widens a width of 0 to 4, so that the new item locations fit (task #335).
 
 import (
 	"encoding/binary"
@@ -121,6 +123,14 @@ func (p pendingPayload) appendTo(dst []byte) []byte {
 // mdat, etc.) are structurally mandatory; there is no concept of an "unknown
 // optional segment" analogous to JPEG's APPn. Passing false returns
 // ErrPreserveUnknownSegmentsNotSupported.
+//
+// A write is never silently skipped: when rawEXIF or rawXMP is non-nil, Inject
+// either stores it or returns an error. ErrNoMetadataContainer reports a file
+// without a valid metadata container box; ErrUnreadableItemLocations reports
+// an item location table that is missing or cannot be rewritten without
+// dropping items. Only when both payloads are nil is the file copied through
+// unchanged. rawIPTC is never stored: HEIF and AVIF have no IPTC carrier, so
+// IPTC travels in the XMP packet.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error { //nolint:cyclop,gocyclo // sequential guard clauses (option, wire-frame, size cap, pass-through cases); each is a distinct, independently tested branch
 	// Reject PreserveUnknownSegments(false) for HEIF/AVIF: ISOBMFF boxes are
 	// structurally mandatory. There is no concept of "unknown optional segment"
@@ -154,24 +164,25 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 		return fmt.Errorf("heif: read: %w", err)
 	}
 
+	// Nothing was requested (rawIPTC is never stored: HEIF/AVIF have no IPTC
+	// carrier, IPTC travels in XMP): the only case in which the file is copied
+	// through unchanged. Every other branch below either writes the requested
+	// payloads or returns an error (task #335).
 	if rawEXIF == nil && rawXMP == nil {
 		return writePassThrough(w, data)
 	}
 
 	metaAbsStart, metaAbsEnd, metaContentOff, found := findMetaBoxAbs(data)
-	if !found || metaAbsEnd > len(data) {
-		return writePassThrough(w, data)
+	if !found {
+		return ErrNoMetadataContainer
 	}
 
 	// data is owned by Inject (iobuf.ReadAll allocates it), so every edit
 	// buildInjectComponents makes is made in place — and only once it has
-	// decided to rebuild the file, so a pass-through stays byte-identical.
-	comp, ok, err := buildInjectComponents(data, metaAbsStart, metaAbsEnd, metaContentOff, rawEXIF, rawXMP)
+	// decided to rebuild the file, so a refused write leaves no partial output.
+	comp, err := buildInjectComponents(data, metaAbsStart, metaAbsEnd, metaContentOff, rawEXIF, rawXMP)
 	if err != nil {
 		return err
-	}
-	if !ok {
-		return writePassThrough(w, data)
 	}
 
 	return writeHEIFOutput(w, comp.outputPrefix, comp.finalMetaBox, comp.suffix, comp.mdatBox)
@@ -180,10 +191,10 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 // buildInjectComponents parses the existing meta box, maps pending items,
 // creates the missing Exif/XMP items, computes the final output prefix (with
 // patched ancestor sizes and shifted offsets), and builds the final meta box
-// with correct iloc offsets. Returns false if injection cannot proceed
-// (unreadable iloc, or an iloc whose offset or length width is 0, so no
-// relocated location can be stored) — the caller passes the file through
-// unchanged. data is edited in place.
+// with correct iloc offsets. It returns an error when the injection cannot
+// proceed (an unreadable iloc box: ErrUnreadableItemLocations); it never
+// declines silently. data is edited in place, and only after planInject has
+// accepted the file.
 //
 // Payload placement (task #282): every pending payload is stored in ONE new
 // 'mdat' box appended after the last top-level box of the file. ISO/IEC
@@ -207,10 +218,13 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 // upfront, planMetaParts lists every other part of the rebuilt meta box, and
 // the final length is pure arithmetic — enough to shift offsets, patch
 // ancestor sizes and place the payloads before the iloc bytes exist.
-func buildInjectComponents(data []byte, metaAbsStart, metaAbsEnd, metaContentOff int, rawEXIF, rawXMP []byte) (injectComponents, bool, error) {
-	plan, ok, err := planInject(data[metaContentOff:metaAbsEnd], rawEXIF, rawXMP)
-	if err != nil || !ok {
-		return injectComponents{}, ok, err
+func buildInjectComponents(data []byte, metaAbsStart, metaAbsEnd, metaContentOff int, rawEXIF, rawXMP []byte) (injectComponents, error) {
+	// The meta box header is 8 bytes, or 16 for a 64-bit largesize box
+	// (ISO 14496-12 §4.2); the rebuilt box keeps the form of the source.
+	metaHeaderLen := metaContentOff - fullBoxFieldsLen - metaAbsStart
+	plan, err := planInject(data[metaContentOff:metaAbsEnd], metaHeaderLen, rawEXIF, rawXMP)
+	if err != nil {
+		return injectComponents{}, err
 	}
 	metaDelta := plan.metaLen - (metaAbsEnd - metaAbsStart)
 
@@ -221,9 +235,9 @@ func buildInjectComponents(data []byte, metaAbsStart, metaAbsEnd, metaContentOff
 	// versionFlags is captured before data is edited below (it lies inside
 	// the meta box, which no edit touches, but taking it first keeps that
 	// independent of the edit order).
-	versionFlags := data[metaAbsStart+8 : metaContentOff] // 4 bytes: version + flags
+	versionFlags := data[metaContentOff-fullBoxFieldsLen : metaContentOff] // 4 bytes: version + flags
 	if derr := applyMetaDelta(data, plan.ilocInfo, plan.pendingByID, metaAbsStart, metaAbsEnd, metaContentOff, metaDelta); derr != nil {
-		return injectComponents{}, false, derr
+		return injectComponents{}, derr
 	}
 
 	// The prefix and suffix alias data (no copy): data is not edited again.
@@ -233,13 +247,13 @@ func buildInjectComponents(data []byte, metaAbsStart, metaAbsEnd, metaContentOff
 	mdatStart := uint64(len(outputPrefix)) + uint64(plan.metaLen) + uint64(len(suffix)) //nolint:gosec // G115: lengths are non-negative and bounded by maxFileSize
 	mdatBox, err := placePayloads(plan, mdatStart)
 	if err != nil {
-		return injectComponents{}, false, err
+		return injectComponents{}, err
 	}
 
 	plan.parts[plan.ilocIdx] = buildIlocBox(plan.ilocInfo, plan.ilocInfo.items)
-	finalMetaBox := buildMetaBox(versionFlags, plan.parts, plan.metaLen)
+	finalMetaBox := buildMetaBox(versionFlags, plan.parts, plan.metaLen, metaHeaderLen)
 	if len(finalMetaBox) != plan.metaLen {
-		return injectComponents{}, false, errMetaLayout
+		return injectComponents{}, errMetaLayout
 	}
 
 	return injectComponents{
@@ -247,7 +261,7 @@ func buildInjectComponents(data []byte, metaAbsStart, metaAbsEnd, metaContentOff
 		finalMetaBox: finalMetaBox,
 		suffix:       suffix,
 		mdatBox:      mdatBox,
-	}, true, nil
+	}, nil
 }
 
 // injectPlan is the item-level plan of an Inject call: the rebuilt iloc
@@ -261,35 +275,65 @@ type injectPlan struct {
 	metaLen     int
 }
 
-// planInject builds the injectPlan for metaContent. ok is false when the
-// file must pass through unchanged: an unreadable iloc box, an iloc offset or
-// length field of width 0 (ISO 14496-12 §8.11.3.3: no relocated location can
-// be stored), or nothing to write.
-func planInject(metaContent, rawEXIF, rawXMP []byte) (plan injectPlan, ok bool, err error) {
+// planInject builds the injectPlan for metaContent, whose box header is
+// metaHeaderLen bytes long. It returns ErrUnreadableItemLocations when the
+// iloc box is missing or cannot be rewritten without dropping items.
+//
+// An iloc offset_size or length_size of 0 is legal (ISO 14496-12 §8.11.3.3:
+// the sizes are taken from {0, 4, 8}; 0 means the field is absent and its
+// value is 0) but leaves no field to hold the new payload location. The iloc
+// box is rebuilt anyway, so the zero widths are widened to 4 bytes
+// (widenIlocFields) instead of declining to write (task #335; libavif
+// src/write.c lines 936-967, avifEncoderWriteTrackMetaBox, and 3582-3584,
+// avifEncoderFinish, write offset_size = length_size = 4).
+func planInject(metaContent []byte, metaHeaderLen int, rawEXIF, rawXMP []byte) (plan injectPlan, err error) {
 	itemTypes := parseIinf(metaContent)
 	info, ilocOK := parseIlocFull(metaContent)
-	if !ilocOK || info.offsetSize == 0 || info.lengthSize == 0 {
-		return plan, false, nil
+	if !ilocOK {
+		return plan, ErrUnreadableItemLocations
 	}
+	widenIlocFields(&info)
 	pendingByID, hasEXIF, hasXMP := mapPendingItems(itemTypes, rawEXIF, rawXMP)
 	newItems, err := planNewItems(metaContent, info.items, rawEXIF != nil && !hasEXIF, rawXMP != nil && !hasXMP, rawEXIF, rawXMP, pendingByID)
-	if err != nil || len(pendingByID) == 0 {
-		return plan, false, err
+	if err != nil {
+		return plan, err
+	}
+	if len(pendingByID) == 0 {
+		// Unreachable: a non-nil payload either maps to an existing item or
+		// creates one. Reported rather than passed through, so that a future
+		// change cannot reintroduce a silent drop.
+		return plan, errMetaLayout
 	}
 	iinfBox, irefBox, err := buildItemBoxes(metaContent, newItems)
 	if err != nil {
-		return plan, false, err
+		return plan, err
 	}
 
 	info.items = preparePendingIlocItems(info.items, pendingByID)
 
 	plan = injectPlan{ilocInfo: info, pendingByID: pendingByID}
 	plan.parts, plan.ilocIdx = planMetaParts(metaContent, iinfBox, irefBox)
-	plan.metaLen = 8 + 4 + ilocBoxSize(info, info.items)
+	plan.metaLen = metaHeaderLen + fullBoxFieldsLen + ilocBoxSize(info, info.items)
 	for _, p := range plan.parts {
 		plan.metaLen += len(p)
 	}
-	return plan, true, nil
+	return plan, nil
+}
+
+// widenIlocFields widens an iloc offset_size or length_size of 0 to 4 bytes.
+// A width of 0 means the field is absent and reads as 0, so writing a 4-byte
+// 0 into every existing extent keeps its meaning (ISO 14496-12 §8.11.3.3);
+// the new payload locations need a field that can hold them. 4 bytes always
+// suffice: Inject accepts files up to maxFileSize (256 MiB), so every offset
+// and length it assigns fits 32 bits; assignItemOffsets still reports
+// errIlocFieldOverflow, never a truncated value, if that ever changed.
+func widenIlocFields(info *ilocBoxInfo) {
+	if info.offsetSize == 0 {
+		info.offsetSize = 4
+	}
+	if info.lengthSize == 0 {
+		info.lengthSize = 4
+	}
 }
 
 // placePayloads assigns every pending item its extent inside the new 'mdat'
@@ -709,15 +753,22 @@ func replacementOr(repl, orig []byte) []byte {
 
 // buildMetaBox serialises a meta FullBox of exactly total bytes from its
 // 4-byte version+flags and the child boxes of parts, into one pre-sized
-// buffer.
-func buildMetaBox(versionFlags []byte, parts [][]byte, total int) []byte {
-	buf := make([]byte, 8, total)
+// buffer. headerLen is the box header length: 8, or 16 when the source meta
+// box used the 64-bit largesize form (size field 1 followed by the 64-bit
+// size, ISO 14496-12 §4.2), which the rebuilt box keeps.
+func buildMetaBox(versionFlags []byte, parts [][]byte, total, headerLen int) []byte {
+	buf := make([]byte, headerLen, total)
 	buf[4], buf[5], buf[6], buf[7] = 'm', 'e', 't', 'a'
 	buf = append(buf, versionFlags...)
 	for _, p := range parts {
 		buf = append(buf, p...)
 	}
-	binary.BigEndian.PutUint32(buf[0:4], uint32(len(buf))) //nolint:gosec // G115: ISOBMFF box size bounded by body length
+	if headerLen == 16 {
+		binary.BigEndian.PutUint32(buf[0:4], 1)
+		binary.BigEndian.PutUint64(buf[8:16], uint64(len(buf)))
+	} else {
+		binary.BigEndian.PutUint32(buf[0:4], uint32(len(buf))) //nolint:gosec // G115: ISOBMFF box size bounded by body length
+	}
 	return buf
 }
 

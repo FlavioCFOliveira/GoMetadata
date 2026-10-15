@@ -16,11 +16,11 @@ import (
 
 // cr3Fixture describes a synthetic CR3 file for buildTask300CR3.
 type cr3Fixture struct {
-	cmt1, cmt3, cmt4 []byte // nil = sub-box absent
-	legacyXMP        []byte // "XMP " sub-box of the Canon uuid box
-	topXMP           []byte // top-level XMP uuid box payload
-	xmpBeforeMoov    bool   // place the XMP uuid box before moov
-	mdat             []byte
+	cmt1, cmt2, cmt3, cmt4 []byte // nil = sub-box absent
+	legacyXMP              []byte // "XMP " sub-box of the Canon uuid box
+	topXMP                 []byte // top-level XMP uuid box payload
+	xmpBeforeMoov          bool   // place the XMP uuid box before moov
+	mdat                   []byte
 }
 
 // buildTask300CR3 assembles ftyp + moov{Canon uuid{CMT1..CMT4, XMP }, trak
@@ -31,6 +31,9 @@ func buildTask300CR3(fx cr3Fixture) []byte {
 		var canon []byte
 		if fx.cmt1 != nil {
 			canon = append(canon, buildBox("CMT1", fx.cmt1)...)
+		}
+		if fx.cmt2 != nil {
+			canon = append(canon, buildBox("CMT2", fx.cmt2)...)
 		}
 		if fx.cmt3 != nil {
 			canon = append(canon, buildBox("CMT3", fx.cmt3)...)
@@ -235,7 +238,8 @@ func TestTask300ChunkShiftComparesSourceOffsets(t *testing.T) {
 // TestTask300GPSGoesToCMT4: a GPS IFD in rawEXIF is written to CMT4, never
 // behind a GPS pointer in CMT1; an unchanged GPS IFD keeps the source CMT4
 // byte for byte; a changed one replaces it; a missing CMT4 is created after
-// the last CMT box.
+// the last CMT box; a rawEXIF without a GPS IFD removes the source CMT4
+// (task #337, see TestTask337GPSRemoval for the cases that keep it).
 func TestTask300GPSGoesToCMT4(t *testing.T) {
 	t.Parallel()
 	cmt4 := gpsCMT4(t)
@@ -258,11 +262,11 @@ func TestTask300GPSGoesToCMT4(t *testing.T) {
 		srcCMT4   []byte
 		rawEXIF   []byte
 		wantSame  bool   // CMT4 kept byte for byte
-		wantGPSVr []byte // GPSVersionID in the output CMT4
+		wantGPSVr []byte // GPSVersionID in the output CMT4; nil = CMT4 removed
 	}{
 		{"unchanged GPS keeps CMT4", cmt4, encode(gpsIFD), true, []byte{2, 3, 0, 0}},
 		{"changed GPS replaces CMT4", cmt4, encode(changedGPS), false, []byte{2, 2, 0, 0}},
-		{"no GPS keeps CMT4", cmt4, encode(nil), true, []byte{2, 3, 0, 0}},
+		{"no GPS removes CMT4", cmt4, encode(nil), false, nil},
 		{"GPS without CMT4 creates it", nil, encode(changedGPS), false, []byte{2, 2, 0, 0}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -286,6 +290,12 @@ func TestTask300GPSGoesToCMT4(t *testing.T) {
 			}
 			if e.CameraModel() != "Model" {
 				t.Errorf("CMT1 Model = %q", e.CameraModel())
+			}
+			if tc.wantGPSVr == nil {
+				if seg.GPS != nil {
+					t.Error("CMT4 was kept although rawEXIF has no GPS IFD")
+				}
+				return
 			}
 			if tc.wantSame && !bytes.Equal(seg.GPS, tc.srcCMT4) {
 				t.Error("unchanged CMT4 was rewritten")

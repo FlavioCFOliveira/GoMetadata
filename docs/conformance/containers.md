@@ -98,6 +98,21 @@ corruption risk); content_type exactly `application/rdf+xml\0`.
 4-byte prefix or bad offset; iinf entry_count mismatch; missing cdsc; multiple EXIF items;
 truncated meta (CRITICAL HEIF panic — fuzz the meta/iloc/iinf walk).
 
+**Rule IDs (HEIF / AVIF write path; sub-test names).**
+- **HEIF-BOX-LARGESIZE-01** The `meta` box, and the `moov` box that may wrap it, may use the 64-bit
+  largesize header (size field 1, then the type, then a 64-bit size: 16 bytes). The meta content starts
+  after the header plus the 4 FullBox bytes; a rewrite keeps the header form of the source and patches
+  the size of an enclosing box in its own form. A meta box smaller than its header + 4 is not a FullBox.
+  ISO/IEC 14496-12 §4.2 (box header), §8.11.1 (`meta` FullBox).
+- **HEIF-ILOC-WIDTH0-01** An `iloc` `offset_size` or `length_size` of 0 is legal (the sizes are taken from
+  {0, 4, 8}; the absent field reads as 0). A write widens a zero width to 4 bytes, keeping every existing
+  extent value, and stores the new item locations. ISO/IEC 14496-12 §8.11.3.3. Reference: libavif
+  `src/write.c` writes both sizes as 4.
+- **HEIF-WRITE-NODROP-01** `Inject` never returns nil without storing a requested EXIF or XMP payload: it
+  writes it or returns `ErrNoMetadataContainer` (no valid `meta` box) or `ErrUnreadableItemLocations`
+  (`iloc` missing, unsupported version or field size, truncated, or too large to rewrite without dropping
+  items). Only a request with no payload copies the file through unchanged.
+
 ## 6. AVIF
 **(a)** AOM "AV1 Image File Format (AVIF)" v1.2.0 (on HEIF + MIAF ISO/IEC 23000-22). Ref: libavif.
 **(b)** ftyp major_brand `avif` (still) or `avis` (sequence); often also mif1/miaf/MA1B.
@@ -153,6 +168,18 @@ write. CR2: preserve `CR 02 00` at offset 8. Even-byte alignment; tag-sorted IFD
 relative-vs-absolute; encrypted Sony tags; truncated MakerNote; ORF magic not in {IIRO,IIRS}
 → degrade to generic TIFF; RW2 0x0055 misread; CR3 missing/extra CMT* boxes, malformed
 moov/uuid; BigTIFF RAW (8-byte offsets, 20-byte entries, u64 counts).
+
+**Rule IDs (CR3; sub-test names).**
+- **CR3-CMT2-READ-01** CMT2 is a stand-alone TIFF stream whose first IFD is the Exif IFD (with the
+  Interoperability IFD behind its `0xA005` pointer); it is parsed into the EXIF model's Exif IFD, in the
+  byte order of CMT1. CMT1 holds no `ExifIFD` pointer. Reference: lclevy canon_cr3 (CMT2 = Exif IFD);
+  imagemeta `readCrxMoovBox`; ExifTool (`ExifIFD directory with N entries` read from CMT2).
+- **CR3-CMT2-WRITE-01** A write stores the Exif IFD in CMT2 (replaced when changed, kept byte for byte
+  when unchanged, created after CMT1 when missing) and never as a second Exif IFD inside CMT1.
+- **CR3-CMT4-DELETE-01** Deleting the GPS IFD removes the CMT4 box (as ExifTool's `-GPS:all=` does; Canon
+  firmware writes a CMT4 holding only `GPSVersionID` when there is no fix, so an empty IFD would still read
+  as GPS present). An unchanged GPS IFD keeps CMT4 byte for byte. A CMT4 that the reader does not expose
+  (no CMT1, unreadable, other byte order) is kept. The same rule removes CMT2 when the Exif IFD is deleted.
 
 ## Cross-cutting: EXIF payload-prefix matrix (high-value test)
 | Container | EXIF location | Prefix before TIFF header |

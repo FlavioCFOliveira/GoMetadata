@@ -156,12 +156,16 @@ for cross-checking only).
 - Licence: BSD-2-Clause (see `LICENSES/BSD-2-Clause.txt`), SPDX-License-Identifier: `BSD-2-Clause`
 - Copyright: Copyright 2019 Joe Drago. All rights reserved.
 - Source files: `src/read.c` (`avifParseItemLocationBox`, `avifDecoderItemRead`); `src/write.c`
-  (`avifEncoderDataCreateExifItem`, `avifEncoderDataCreateXMPItem`, `avifEncoderFinish`)
+  (`avifEncoderDataCreateExifItem`, `avifEncoderDataCreateXMPItem`, `avifEncoderFinish`,
+  `avifEncoderWriteTrackMetaBox`); `src/stream.c` (`avifROStreamReadBoxHeaderPartial`, consulted for the 64-bit
+  largesize box header)
 - Destination files: `format/heif/iloc.go`, `format/heif/inject.go`
 - Adapted: yes (the item location box field order, including the 16-bit `data_reference_index` of every version, the
   field-width validation, the concatenation of an item's extents and the idat construction method, re-implemented as
   allocation-free Go; the layout of a new Exif or XMP item — infe version 2, item name, XMP content type, iref `cdsc`
-  reference to the primary item, iloc entry with construction method 0 — re-implemented to edit an existing file)
+  reference to the primary item, iloc entry with construction method 0 — re-implemented to edit an existing file; the
+  4-byte `offset_size` and `length_size` of the written iloc box, applied by widening the zero field widths of an
+  existing iloc box)
 - Notes: the changes made are stated in the header of each destination file.
 
 ## libwebp
@@ -185,8 +189,10 @@ for cross-checking only).
 - Source commit: `96e0dc74b3f3cea41c97a6029fb439f7f2f159c5`
 - Licence: MIT (see `LICENSES/MIT.txt`), SPDX-License-Identifier: `MIT`
 - Copyright: Copyright (c) 2019-2023 Evan Oberholster
-- Source files: `meta/isobmff/crx.go` (`cr3MetaBoxUUID`, `cr3XPacketUUID`, `readUUIDBox`, `readCrxMoovBox`)
+- Source files: `meta/isobmff/crx.go` (`cr3MetaBoxUUID`, `cr3XPacketUUID`, `readUUIDBox`, `readCrxMoovBox`,
+  `readCMTBox`)
 - Destination files: `format/raw/cr3/cr3.go`
 - Adapted: yes (the UUID of the CR3 XMP packet box, and the mapping of the Canon uuid sub-boxes CMT1, CMT2, CMT3 and
-  CMT4 to IFD0, the Exif IFD, the MakerNote IFD and the GPS IFD, applied to the in-memory reader and to the writer)
+  CMT4 to IFD0, the Exif IFD, the MakerNote IFD and the GPS IFD, applied to the in-memory reader and to the writer;
+  CMT2 parsed and written as a stand-alone TIFF stream whose first IFD is the Exif IFD)
 - Notes: the changes made are stated in the header of the destination file.

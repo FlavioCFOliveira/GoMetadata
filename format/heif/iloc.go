@@ -480,6 +480,14 @@ type ilocExtent struct {
 
 // parseIlocFull parses the 'iloc' FullBox found within metaContent and returns
 // its complete structure including all per-item extents.
+//
+// ok is false when the iloc box is missing, has an unsupported version or an
+// illegal field width, declares more items than maxIlocItems, or cannot be
+// parsed in full: a truncated item list or extent list, or an item with more
+// than maxIlocExtentsPerItem extents. The structure feeds buildIlocBox, which
+// re-serialises every item; accepting a partial parse would silently drop the
+// items and extents that were not read from the rewritten file, so the write
+// path reports the file as unwritable instead (ErrUnreadableItemLocations).
 func parseIlocFull(metaContent []byte) (ilocBoxInfo, bool) {
 	var info ilocBoxInfo
 	ilocData := findInnerBox(metaContent, boxTypeIloc)
@@ -497,7 +505,7 @@ func parseIlocFull(metaContent []byte) (ilocBoxInfo, bool) {
 	for range h.itemCount {
 		item, updatedPos, itemOK := parseIlocFullItem(ilocData, pos, &h)
 		if !itemOK {
-			break
+			return info, false
 		}
 		pos = updatedPos
 		info.items = append(info.items, item)
@@ -518,45 +526,39 @@ func parseIlocFullItem(ilocData []byte, pos int, h *ilocHeader) (ilocFullItem, i
 		dataRefIdx:      hdr.dataRefIdx,
 		baseOffset:      hdr.baseOffset,
 	}
-	item.extents, pos = readIlocFullExtents(ilocData, extPos, hdr.extentCount, h)
-	return item, pos, true
+	item.extents, pos, ok = readIlocFullExtents(ilocData, extPos, hdr.extentCount, h)
+	return item, pos, ok
 }
 
 // readIlocFullExtents reads extentCount extents from ilocData at pos using the
-// field sizes in h. Returns the populated extents and updated position.
-// If the data is truncated before all extents are read, parsing stops early
-// and only the extents read so far are returned.
+// field sizes in h. Returns the populated extents, the updated position, and
+// whether every extent was read: ok is false when the data is truncated before
+// all extents are read or when extentCount exceeds maxIlocExtentsPerItem.
 //
-// Security (CWE-770/834): extents beyond maxIlocExtentsPerItem are dropped —
-// NOT merely capped at the pre-allocation stage — by guarding the append with
-// a length check; the position is still advanced for every extent that
-// genuinely consumes input bytes, so the caller correctly lands at the next
-// item. Additionally, when every per-extent field width is zero
-// (indexSize == offsetSize == lengthSize == 0), no iteration consumes any
-// input byte at all, so an attacker-controlled extent_count of up to 65535
-// would otherwise force 65535 no-op iterations per item at zero cost to the
-// attacker; the loop bound itself is capped at maxIlocExtentsPerItem in that
-// degenerate case (task: security audit FIX 1, HEIF-ILOC-EXTENT-AMPLIFICATION).
+// Security (CWE-770/834): extentCount is checked against maxIlocExtentsPerItem
+// BEFORE any allocation or loop, so an attacker-controlled extent_count of up
+// to 65535 cannot force a large allocation or, when every per-extent field
+// width is zero (indexSize == offsetSize == lengthSize == 0, so no iteration
+// consumes any input byte), 65535 no-op iterations per item (security audit
+// FIX 1, HEIF-ILOC-EXTENT-AMPLIFICATION). The former behaviour of dropping the
+// surplus extents was a silent data loss on write (the rewritten iloc listed
+// fewer extents than the source); an item that large is reported instead.
 // ISO 14496-12 §8.11.3.
-func readIlocFullExtents(ilocData []byte, pos, extentCount int, h *ilocHeader) (extents []ilocExtent, newPos int) {
-	extents = make([]ilocExtent, 0, min(extentCount, maxIlocExtentsPerItem))
+func readIlocFullExtents(ilocData []byte, pos, extentCount int, h *ilocHeader) (extents []ilocExtent, newPos int, ok bool) {
+	if extentCount > maxIlocExtentsPerItem {
+		return nil, pos, false
+	}
+	extents = make([]ilocExtent, 0, extentCount)
 
 	extSize := h.extentSize()
-	loopCount := extentCount
-	if extSize == 0 && loopCount > maxIlocExtentsPerItem {
-		loopCount = maxIlocExtentsPerItem
-	}
-	for range loopCount {
+	for range extentCount {
 		if pos+extSize > len(ilocData) {
-			return extents, pos
+			return extents, pos, false
 		}
-		ext := decodeIlocExtent(ilocData, pos, h)
+		extents = append(extents, decodeIlocExtent(ilocData, pos, h))
 		pos += extSize
-		if len(extents) < maxIlocExtentsPerItem {
-			extents = append(extents, ext)
-		}
 	}
-	return extents, pos
+	return extents, pos, true
 }
 
 // ilocBoxSize returns the exact total byte length (including the 8-byte box

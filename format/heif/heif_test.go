@@ -3,6 +3,7 @@ package heif
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"math"
 	"testing"
@@ -2082,8 +2083,11 @@ func TestHEIFInjectLargeExtentCountBounded(t *testing.T) {
 			0x00, 0x00, 0x00, 0x10, // offset = 16
 			0x00, 0x00, 0x00, 0x08, // length = 8
 		}
-		extents, _ := readIlocFullExtents(ilocData, 0, largeExtentCount, &h)
-		// The pre-allocated capacity must be capped.
+		extents, _, ok := readIlocFullExtents(ilocData, 0, largeExtentCount, &h)
+		// An extent_count above the cap is refused before any allocation.
+		if ok {
+			t.Error("readIlocFullExtents accepted extent_count 65535, want ok=false (task #335: surplus extents are refused, not silently dropped)")
+		}
 		if cap(extents) > maxIlocExtentsPerItem {
 			t.Errorf("readIlocFullExtents allocated cap=%d, want <= %d (maxIlocExtentsPerItem)",
 				cap(extents), maxIlocExtentsPerItem)
@@ -2096,10 +2100,16 @@ func TestHEIFInjectLargeExtentCountBounded(t *testing.T) {
 		data := buildIlocWithLargeExtentCount(xmpPayload, largeExtentCount)
 		newXMP := []byte(`<?xpacket begin="" id="x"?><x:xmpmeta><new/></x:xmpmeta><?xpacket end="r"?>`)
 		var out bytes.Buffer
-		// Must not panic, OOM, or hang.
-		_ = Inject(bytes.NewReader(data), &out, nil, nil, newXMP, true)
-		// We do not assert a specific return value — the crafted truncated iloc
-		// may cause graceful early-termination. The key invariant is: no crash.
+		// Must not panic, OOM, or hang, and — since an item with this many
+		// extents cannot be rewritten without dropping extents — must refuse
+		// the write with an explicit error (task #335).
+		err := Inject(bytes.NewReader(data), &out, nil, nil, newXMP, true)
+		if !errors.Is(err, ErrUnreadableItemLocations) {
+			t.Errorf("Inject error = %v, want ErrUnreadableItemLocations", err)
+		}
+		if out.Len() != 0 {
+			t.Errorf("Inject wrote %d bytes before refusing", out.Len())
+		}
 	})
 }
 
@@ -2214,8 +2224,11 @@ func TestHEIFIlocZeroFieldSizeAmplificationBounded(t *testing.T) {
 		t.Parallel()
 		h := ilocHeader{version: 1} // offsetSize=lengthSize=indexSize=0 (zero value)
 		start := time.Now()
-		extents, pos := readIlocFullExtents(nil, 0, extentCount, &h)
+		extents, pos, ok := readIlocFullExtents(nil, 0, extentCount, &h)
 		elapsed := time.Since(start)
+		if ok {
+			t.Error("readIlocFullExtents accepted extent_count 65535, want ok=false")
+		}
 		if len(extents) > maxIlocExtentsPerItem {
 			t.Errorf("readIlocFullExtents returned %d extents, want <= %d (maxIlocExtentsPerItem)",
 				len(extents), maxIlocExtentsPerItem)
@@ -2283,7 +2296,9 @@ func TestHEIFIlocZeroFieldSizeAmplificationBounded(t *testing.T) {
 			t.Errorf("Inject took %v on a %d-byte crafted file, want well under 2s (amplification not bounded)",
 				elapsed, len(data))
 		}
-		_ = err // no specific error expected; absence of a hang/OOM is the invariant under test
+		if !errors.Is(err, ErrUnreadableItemLocations) {
+			t.Errorf("Inject error = %v, want ErrUnreadableItemLocations", err)
+		}
 	})
 
 	// --- White-box: parseIlocFull rejects an oversized item_count outright ---

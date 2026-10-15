@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"io"
 	"testing"
+
+	"github.com/FlavioCFOliveira/GoMetadata/exif"
 )
 
 func FuzzCR3Extract(f *testing.F) {
@@ -30,9 +32,16 @@ func FuzzCR3Extract(f *testing.F) {
 		legacyXMP: []byte("<x/>"), topXMP: []byte("<x:xmpmeta/>"), mdat: []byte("RAWDATA"),
 	}))
 
+	// Seed (task #336): a CMT2 stream.
+	f.Add(buildTask300CR3(cr3Fixture{cmt1: minTIFF(), cmt2: minTIFF(), mdat: []byte("RAWDATA")}))
+
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic regardless of input.
 		_, _, _, _ = Extract(bytes.NewReader(data))
+		// Nor may parsing the CMT2 stream it returns.
+		if seg, err := ExtractSegments(bytes.NewReader(data)); err == nil && seg.ExifIFD != nil {
+			_, _, _, _ = ParseExifStream(seg.ExifIFD)
+		}
 	})
 }
 
@@ -131,10 +140,32 @@ func FuzzCR3Inject(f *testing.F) {
 		legacyXMP: []byte("<x/>"), topXMP: []byte("<x:xmpmeta/>"), mdat: []byte("RAWDATA"),
 	}))
 
+	// Seeds (tasks #336, #337): a CMT2 stream, a CMT4 stream, and a rich
+	// EXIF payload (Exif, Interoperability and GPS IFDs) that splits into
+	// CMT1, CMT2 and CMT4, so the fuzzer reaches the CMT2/CMT4 rebuild,
+	// compare and removal paths.
+	richEXIF, err := exif.Encode(task336Model(true, true))
+	if err != nil {
+		f.Fatal(err)
+	}
+	richStreams, err := splitEXIF(richEXIF)
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(buildTask300CR3(cr3Fixture{cmt1: richStreams.cmt1, cmt2: richStreams.cmt2, cmt3: buildMinimalCR3Seed(), cmt4: richStreams.cmt4, mdat: []byte("RAWDATA")}))
+	f.Add(buildTask300CR3(cr3Fixture{cmt1: richStreams.cmt1, cmt2: []byte("not a TIFF stream"), cmt4: richStreams.cmt4, mdat: []byte("RAWDATA")}))
+
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic regardless of input. Inject must return an error or
 		// write valid output — a panic is always a bug in the write path.
 		err := Inject(bytes.NewReader(data), io.Discard, rawEXIF, nil, rawXMP, true)
+		_ = err
+		// The same with an EXIF stream that is split into CMT1, CMT2 and CMT4.
+		err = Inject(bytes.NewReader(data), io.Discard, richEXIF, nil, nil, true)
+		_ = err
+		// And with one that has no Exif or GPS IFD, which removes CMT2 and
+		// CMT4 when the source exposes them.
+		err = Inject(bytes.NewReader(data), io.Discard, minimalTIFF(), nil, nil, true)
 		_ = err
 	})
 }
