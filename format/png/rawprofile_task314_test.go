@@ -7,9 +7,11 @@ package png
 
 import (
 	"bytes"
+	"crypto/md5" //nolint:gosec // G501: MD5 is the MWG IPTC digest algorithm, not used for security
 	"encoding/binary"
 	"testing"
 
+	"github.com/FlavioCFOliveira/GoMetadata/internal/irb"
 	"github.com/FlavioCFOliveira/GoMetadata/iptc"
 )
 
@@ -116,6 +118,58 @@ func TestInject_RawProfileIPTCUnchanged(t *testing.T) {
 	}
 }
 
+// TestInject_RawProfileIPTCDigest (task #323; MWG Guidelines v2.0 §4.2.3.2,
+// p. 29): when the PNG carries XMP as well, a raw profile in the Photoshop IRB
+// form gets the IPTC digest of the IIM written, created when absent and
+// refreshed when present (a stale one included), also when the IIM is
+// unchanged; without XMP the profile is left as it is.
+func TestInject_RawProfileIPTCDigest(t *testing.T) {
+	t.Parallel()
+	old := sampleIIM(t)
+	updated := newIIM(t, "rewritten caption")
+	sum := func(b []byte) []byte { s := md5.Sum(b); return s[:] } //nolint:gosec // G401: MWG digest
+	stale := bytes.Repeat([]byte{0x5A}, 16)
+	xmpPacket := []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"/>`)
+	withDigest := func(digest []byte) []byte {
+		var b []byte
+		if digest != nil {
+			b = irb.AppendBlock(b, irb.ResourceIPTCDigest, digest)
+		}
+		return irb.AppendBlock(b, irb.ResourceIPTC, old)
+	}
+	cases := []struct {
+		name       string
+		digest     []byte
+		iim        []byte
+		xmp        []byte
+		wantDigest []byte
+	}{
+		{"RECONCILE-06 absent digest is created", nil, updated, xmpPacket, sum(updated)},
+		{"RECONCILE-06 matching digest is refreshed", sum(old), updated, xmpPacket, sum(updated)},
+		{"RECONCILE-06 stale digest is refreshed", stale, updated, xmpPacket, sum(updated)},
+		{"RECONCILE-06 stale digest of an unchanged IIM is refreshed", stale, old, xmpPacket, sum(old)},
+		{"RECONCILE-06 no XMP: stale digest kept as it is", stale, updated, nil, stale},
+		{"RECONCILE-06 no XMP: no digest created", nil, updated, nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			in := pngWithChunks([2]any{"zTXt", textChunk("zTXt", "Raw profile type iptc", rawProfileHexText("IPTC profile", withDigest(tc.digest)))})
+			var out bytes.Buffer
+			if err := Inject(bytes.NewReader(in), &out, nil, tc.iim, tc.xmp, true); err != nil {
+				t.Fatalf("Inject: %v", err)
+			}
+			iim, digest := irb.IPTCAndDigest(profileOf(t, out.Bytes()))
+			if !bytes.Equal(iim, tc.iim) {
+				t.Errorf("IIM = %x, want %x", iim, tc.iim)
+			}
+			if !bytes.Equal(digest, tc.wantDigest) {
+				t.Errorf("digest = %x, want %x", digest, tc.wantDigest)
+			}
+		})
+	}
+}
+
 // TestAppendRawProfileText pins the ImageMagick text layout the writer emits
 // (the layout ExifTool writes: name line, 8-column length, 72 hex digits per
 // line), which rawProfileHexText (the reader-side fixture builder) also uses.
@@ -168,7 +222,7 @@ func FuzzRewriteRawProfileIPTC(f *testing.F) {
 	newIIM := []byte{0x1C, 0x02, 0x78, 0x00, 0x05, 'f', 'u', 'z', 'z', '!'}
 	f.Fuzz(func(t *testing.T, sel byte, data []byte) {
 		ct := types[int(sel)%len(types)]
-		payload, ok, err := rewriteRawProfileIPTC(ct, data, newIIM)
+		payload, ok, err := rewriteRawProfileIPTC(ct, data, newIIM, sel%2 == 0)
 		if err != nil || !ok {
 			return
 		}

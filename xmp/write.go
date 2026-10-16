@@ -184,7 +184,7 @@ func writePacketHead(buf *bytes.Buffer, x *XMP, wrapper bool) {
 		// XMP Part 1 §7.3.3: x:xmptk names the toolkit that wrote the packet;
 		// a parsed value is kept so that a round trip does not lose it.
 		buf.WriteString(" x:xmptk=\"")
-		writeXMLEscaped(buf, x.toolkit)
+		writeXMLAttrEscaped(buf, x.toolkit)
 		buf.WriteByte('"')
 	}
 	buf.WriteString(">\n")
@@ -289,7 +289,7 @@ func releaseEncScratch(sc *encScratch) {
 func (e *encoder) startDescription(ns, prefix string, extra []string) {
 	buf := e.buf
 	buf.WriteString("  <rdf:Description rdf:about=\"")
-	writeXMLEscaped(buf, e.x.about)
+	writeXMLAttrEscaped(buf, e.x.about)
 	buf.WriteString("\" xmlns:")
 	buf.WriteString(prefix)
 	buf.WriteString("=\"")
@@ -299,7 +299,7 @@ func (e *encoder) startDescription(ns, prefix string, extra []string) {
 	// untrusted XMP), which would break the attribute boundary and inject
 	// arbitrary XML.  writeXMLEscaped handles all five XML entities plus C0
 	// control chars, making the value safe for attribute context.
-	writeXMLEscaped(buf, ns)
+	writeXMLAttrEscaped(buf, ns)
 	buf.WriteByte('"')
 	for _, u := range extra {
 		if u == ns {
@@ -308,7 +308,7 @@ func (e *encoder) startDescription(ns, prefix string, extra []string) {
 		buf.WriteString(" xmlns:")
 		buf.WriteString(e.pf.prefix(u))
 		buf.WriteString("=\"")
-		writeXMLEscaped(buf, u)
+		writeXMLAttrEscaped(buf, u)
 		buf.WriteByte('"')
 	}
 	buf.WriteString(">\n")
@@ -516,7 +516,7 @@ func writeMultiValuedProperty(buf *bytes.Buffer, prefix, local, val, ctype strin
 			lang, altVal, hasLang := strings.Cut(v, "|")
 			if hasLang {
 				buf.WriteString("     <rdf:li xml:lang=\"")
-				writeXMLEscaped(buf, lang)
+				writeXMLAttrEscaped(buf, lang)
 				buf.WriteString("\">")
 				writeXMLEscaped(buf, altVal)
 			} else {
@@ -879,6 +879,36 @@ func writeXMLEscaped(buf *bytes.Buffer, s string) { //nolint:cyclop,gocyclo // X
 		last = i + 1
 	}
 	buf.WriteString(s[last:])
+}
+
+// writeXMLAttrEscaped is writeXMLEscaped for the value of an attribute. XML
+// 1.0 §3.3.3 makes a parser turn a literal TAB, LF or CR in an attribute value
+// into a space, so those characters are written as character references,
+// which a parser expands to the characters themselves; the value then
+// survives a parse unchanged. writeXMLEscaped already writes CR as &#xD;, so
+// only TAB (&#9;) and LF (&#10;) are handled here. A value without them, the
+// usual case, goes straight to writeXMLEscaped.
+func writeXMLAttrEscaped(buf *bytes.Buffer, s string) {
+	if strings.IndexByte(s, '\t') < 0 && strings.IndexByte(s, '\n') < 0 {
+		writeXMLEscaped(buf, s)
+		return
+	}
+	last := 0
+	for i := range len(s) {
+		var ref string
+		switch s[i] {
+		case '\t':
+			ref = "&#9;"
+		case '\n':
+			ref = "&#10;"
+		default:
+			continue
+		}
+		writeXMLEscaped(buf, s[last:i])
+		buf.WriteString(ref)
+		last = i + 1
+	}
+	writeXMLEscaped(buf, s[last:])
 }
 
 // compactMarkup removes, in place, the formatting white space that serialise

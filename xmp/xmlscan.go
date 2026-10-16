@@ -174,19 +174,22 @@ func canonicalNS(uri string) string {
 }
 
 // resolve returns the URI bound to prefix by the innermost in-scope
-// declaration, or "" when prefix is empty or unbound. XMP does not use
-// default namespaces, so an unprefixed name has no namespace (as before).
-func (d *xmlDoc) resolve(prefix []byte) string {
+// declaration. An empty prefix has no namespace (XMP does not use default
+// namespaces, so an unprefixed name is in none) and resolves to ("", true);
+// a prefix that no in-scope declaration binds resolves to ("", false), the
+// violation of Namespaces in XML 1.0 §5, Namespace Constraint "Prefix
+// Declared" (the 'xml' prefix is always bound, see reset).
+func (d *xmlDoc) resolve(prefix []byte) (uri string, bound bool) {
 	if len(prefix) == 0 {
-		return ""
+		return "", true
 	}
 	for _, b := range slices.Backward(d.scope) {
 		// Length and first byte reject most bindings before bytes.Equal.
 		if q := b.prefix; len(q) == len(prefix) && q[0] == prefix[0] && bytes.Equal(q, prefix) {
-			return b.uri
+			return b.uri, true
 		}
 	}
-	return ""
+	return "", false
 }
 
 // scanXML builds the element tree of b into d.
@@ -273,6 +276,15 @@ func scanXML(b []byte, d *xmlDoc) error { //nolint:cyclop,gocyclo // one branch 
 	return nil
 }
 
+// errUnboundPrefix reports a name whose prefix no namespace declaration in
+// scope binds: Namespaces in XML 1.0 §5, Namespace Constraint "Prefix
+// Declared" (ISO 16684-1:2019 §7.1 and XMP Part 1 §7.1 require the packet to
+// be well-formed XML with namespaces). kind is "element" or "attribute". It
+// allocates, and runs only on an ill-formed document.
+func errUnboundPrefix(kind string, prefix, local []byte) error {
+	return fmt.Errorf("%w: namespace prefix %q of %s %q is not declared", ErrXMLNotWellFormed, prefix, kind, string(prefix)+":"+string(local))
+}
+
 // qualifiedName returns the qualified name "prefix:local" of e as written in
 // the source. It allocates, and is meant for error messages only.
 func qualifiedName(e *xelem) string {
@@ -339,7 +351,10 @@ func (d *xmlDoc) startElem(b []byte, pos int) (int, error) { //nolint:cyclop,goc
 	attrHi := int32(len(d.attrs)) //nolint:gosec // G115: bounded by the 16 MiB document cap
 	for i := attrLo; i < attrHi; i++ {
 		a := &d.attrs[i]
-		a.ns = d.resolve(a.prefix)
+		var bound bool
+		if a.ns, bound = d.resolve(a.prefix); !bound {
+			return 0, errUnboundPrefix("attribute", a.prefix, a.local)
+		}
 		a.term = rdfTermKind(a.ns, a.local)
 	}
 
@@ -359,7 +374,10 @@ func (d *xmlDoc) startElem(b []byte, pos int) (int, error) { //nolint:cyclop,goc
 		pos++
 	}
 
-	ns := d.resolve(prefix)
+	ns, bound := d.resolve(prefix)
+	if !bound {
+		return 0, errUnboundPrefix("element", prefix, local)
+	}
 	if ns == NSrdf && string(local) == "Description" {
 		// Compatibility with pre-standard XMP (ExpatAdapter.cpp:SetQualName):
 		// an unqualified "about" or "ID" attribute of rdf:Description means

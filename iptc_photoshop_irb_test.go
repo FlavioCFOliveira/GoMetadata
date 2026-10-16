@@ -230,11 +230,12 @@ func TestWrite_JPEGIPTCDigestCreated(t *testing.T) {
 	}
 }
 
-// TestWrite_JPEGStaleIPTCDigestStaysStale (task #323): a digest that did not
-// match the IIM before the write still does not match it afterwards, so MWG
-// consumers keep detecting the out-of-sync IIM, and the written caption wins
-// on read (internal/reconcile: with a stale digest the IIM value wins).
-func TestWrite_JPEGStaleIPTCDigestStaysStale(t *testing.T) {
+// TestWrite_JPEGStaleIPTCDigestRefreshed (task #323, MWG Guidelines v2.0
+// §4.2.3.2, p. 29: "If IPTC-IIM and XMP are both present, whether changed or
+// not, a Changer MUST create or update the checksum value"): a digest that did
+// not match the IIM before the write matches the IIM written, and the file
+// reads back with XMP priority.
+func TestWrite_JPEGStaleIPTCDigestRefreshed(t *testing.T) {
 	t.Parallel()
 	i := &iptc.IPTC{}
 	i.SetCaption("before")
@@ -250,17 +251,14 @@ func TestWrite_JPEGStaleIPTCDigestStaysStale(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExtractFull: %v", err)
 	}
-	if !bytes.Equal(digest, stale) {
-		t.Errorf("digest = %x, want the stale digest %x kept", digest, stale)
-	}
-	if cur := md5.Sum(rawIPTC); bytes.Equal(digest, cur[:]) { //nolint:gosec // G401: MWG digest
-		t.Error("the stale digest became current")
+	if cur := md5.Sum(rawIPTC); !bytes.Equal(digest, cur[:]) { //nolint:gosec // G401: MWG digest
+		t.Errorf("digest = %x, want MD5 of the written IIM %x (the stale digest %x must be refreshed)", digest, cur, stale)
 	}
 	m, err := Read(bytes.NewReader(out))
 	if err != nil {
 		t.Fatalf("Read output: %v", err)
 	}
-	if !m.iptcTrustElev || m.Caption() != "after" {
+	if m.iptcTrustElev || m.Caption() != "after" {
 		t.Errorf("read-back: trust elevated %v, caption %q", m.iptcTrustElev, m.Caption())
 	}
 }

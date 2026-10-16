@@ -106,7 +106,7 @@ func TestFindIPTCAndDigest(t *testing.T) {
 	if got := FindDigest(stream); !bytes.Equal(got, dig) {
 		t.Errorf("FindDigest = %x, want %x", got, dig)
 	}
-	// A 0x0425 resource that is not 16 bytes is ignored (MWG §3.3.1).
+	// A 0x0425 resource that is not 16 bytes is ignored (the digest has 16 bytes: MWG §4.2.3.2, p. 26).
 	bad := block(ResourceIPTCDigest, "", dig[:15])
 	if _, d := IPTCAndDigest(bad); d != nil {
 		t.Errorf("15-byte digest accepted: %x", d)
@@ -163,9 +163,11 @@ func TestRefreshDigest(t *testing.T) {
 	}
 }
 
-// TestAppendSpliced_DigestPolicy pins the digest rules of the JPEG IRB
-// (tasks #284 and #323; MWG Guidelines v2.0 §4.2.3.2): created when absent and
-// XMP is written, refreshed when it matched the replaced IIM, kept when stale.
+// TestAppendSpliced_DigestPolicy pins the digest rules of the IRB splice
+// (tasks #284 and #323; MWG Guidelines v2.0 §4.2.3.2, p. 29): when IIM and XMP
+// are both written, the digest is created when absent and rewritten to the MD5
+// of the IIM written when present, a stale one included, whether the IIM
+// changes or not; without XMP, or when the IIM is removed, digests are kept.
 func TestAppendSpliced_DigestPolicy(t *testing.T) {
 	t.Parallel()
 	stale := bytes.Repeat([]byte{0xAB}, DigestSize)
@@ -173,7 +175,7 @@ func TestAppendSpliced_DigestPolicy(t *testing.T) {
 		name       string
 		orig       []byte
 		newIPTC    []byte
-		create     bool
+		withXMP    bool
 		wantDigest []byte // nil: no 0x0425 resource expected
 		wantIPTC   []byte
 	}{
@@ -181,6 +183,7 @@ func TestAppendSpliced_DigestPolicy(t *testing.T) {
 			name:       "RECONCILE-06 matching digest is refreshed",
 			orig:       append(block(ResourceIPTCDigest, "", md5Of(iimOld)), block(ResourceIPTC, "", iimOld)...),
 			newIPTC:    iimNew,
+			withXMP:    true,
 			wantDigest: md5Of(iimNew),
 			wantIPTC:   iimNew,
 		},
@@ -188,37 +191,47 @@ func TestAppendSpliced_DigestPolicy(t *testing.T) {
 			name:       "RECONCILE-06 matching digest after the IPTC resource is refreshed",
 			orig:       append(block(ResourceIPTC, "", iimOld), block(ResourceIPTCDigest, "", md5Of(iimOld))...),
 			newIPTC:    iimNew,
+			withXMP:    true,
 			wantDigest: md5Of(iimNew),
 			wantIPTC:   iimNew,
 		},
 		{
-			name:       "RECONCILE-06 stale digest stays stale when the IPTC changes",
+			name:       "RECONCILE-06 stale digest is refreshed when the IPTC changes",
 			orig:       append(block(ResourceIPTCDigest, "", stale), block(ResourceIPTC, "", iimOld)...),
 			newIPTC:    iimNew,
-			create:     true,
-			wantDigest: stale,
+			withXMP:    true,
+			wantDigest: md5Of(iimNew),
 			wantIPTC:   iimNew,
 		},
 		{
-			name:       "RECONCILE-06 stale digest stays stale when the IPTC is unchanged",
+			name:       "RECONCILE-06 stale digest is refreshed when the IPTC is unchanged",
 			orig:       append(block(ResourceIPTCDigest, "", stale), block(ResourceIPTC, "", iimOld)...),
 			newIPTC:    iimOld,
-			wantDigest: stale,
+			withXMP:    true,
+			wantDigest: md5Of(iimOld),
 			wantIPTC:   iimOld,
 		},
 		{
-			name:       "RECONCILE-06 digest without IIM is stale and kept",
+			name:       "RECONCILE-06 current digest of an unchanged IPTC stays",
+			orig:       append(block(ResourceIPTCDigest, "", md5Of(iimOld)), block(ResourceIPTC, "", iimOld)...),
+			newIPTC:    iimOld,
+			withXMP:    true,
+			wantDigest: md5Of(iimOld),
+			wantIPTC:   iimOld,
+		},
+		{
+			name:       "RECONCILE-06 digest without IIM is refreshed to the IIM written",
 			orig:       block(ResourceIPTCDigest, "", stale),
 			newIPTC:    iimNew,
-			create:     true,
-			wantDigest: stale,
+			withXMP:    true,
+			wantDigest: md5Of(iimNew),
 			wantIPTC:   iimNew,
 		},
 		{
 			name:       "RECONCILE-06 absent digest is created beside an existing IIM",
 			orig:       block(ResourceIPTC, "", iimOld),
 			newIPTC:    iimNew,
-			create:     true,
+			withXMP:    true,
 			wantDigest: md5Of(iimNew),
 			wantIPTC:   iimNew,
 		},
@@ -226,7 +239,7 @@ func TestAppendSpliced_DigestPolicy(t *testing.T) {
 			name:       "RECONCILE-06 absent digest is created when the whole IRB is new",
 			orig:       nil,
 			newIPTC:    iimNew,
-			create:     true,
+			withXMP:    true,
 			wantDigest: md5Of(iimNew),
 			wantIPTC:   iimNew,
 		},
@@ -234,7 +247,7 @@ func TestAppendSpliced_DigestPolicy(t *testing.T) {
 			name:       "RECONCILE-06 absent digest is created beside sibling resources",
 			orig:       block(0x040C, "", []byte("thumb")),
 			newIPTC:    iimNew,
-			create:     true,
+			withXMP:    true,
 			wantDigest: md5Of(iimNew),
 			wantIPTC:   iimNew,
 		},
@@ -245,24 +258,31 @@ func TestAppendSpliced_DigestPolicy(t *testing.T) {
 			wantIPTC: iimNew,
 		},
 		{
+			name:       "RECONCILE-06 digest is kept as it is without XMP",
+			orig:       append(block(ResourceIPTCDigest, "", stale), block(ResourceIPTC, "", iimOld)...),
+			newIPTC:    iimNew,
+			wantDigest: stale,
+			wantIPTC:   iimNew,
+		},
+		{
 			name:       "RECONCILE-06 IPTC removed keeps digest",
 			orig:       append(block(ResourceIPTCDigest, "", md5Of(iimOld)), block(ResourceIPTC, "", iimOld)...),
 			newIPTC:    nil,
-			create:     true,
+			withXMP:    true,
 			wantDigest: md5Of(iimOld),
 		},
 		{
 			name:     "RECONCILE-06 IPTC removed creates no digest",
 			orig:     block(ResourceIPTC, "", iimOld),
 			newIPTC:  nil,
-			create:   true,
+			withXMP:  true,
 			wantIPTC: nil,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			out := AppendSpliced(nil, tc.orig, tc.newIPTC, tc.create)
+			out := AppendSpliced(nil, tc.orig, tc.newIPTC, tc.withXMP)
 			iim, d := IPTCAndDigest(out)
 			if !bytes.Equal(d, tc.wantDigest) {
 				t.Errorf("digest = %x, want %x", d, tc.wantDigest)

@@ -56,6 +56,7 @@ func TestUpsertIPTC_DigestPolicy(t *testing.T) {
 	stale := bytes.Repeat([]byte{0xEE}, 16)
 	oldMD5 := md5.Sum(oldIIM) //nolint:gosec // G401: MWG digest
 
+	xmpOn := []byte("<x/>")
 	cases := []struct {
 		name    string
 		ifd     *exif.IFD
@@ -63,17 +64,20 @@ func TestUpsertIPTC_DigestPolicy(t *testing.T) {
 		rawXMP  []byte // XMP written in the same pass (nil: none)
 		want    []byte // expected digest; nil: no digest resource
 	}{
-		{"RECONCILE-06 changed IIM, matching digest refreshes", ifdWith(oldIIM, psirWith(nil, oldMD5[:])), newIIM, nil, paddedMD5(newIIM)},
-		{"RECONCILE-06 changed IIM, stale digest stays stale", ifdWith(oldIIM, psirWith(nil, stale)), newIIM, nil, stale},
-		{"RECONCILE-06 IIM only in 0x8649, changed", ifdWith(nil, psirWith(oldIIM, oldMD5[:])), newIIM, nil, paddedMD5(newIIM)},
-		{"RECONCILE-06 unchanged IIM, current digest kept current", ifdWith(newIIM, psirWith(nil, paddedMD5(newIIM))), newIIM, nil, paddedMD5(newIIM)},
-		{"RECONCILE-06 unchanged IIM, unpadded digest rewritten padded", ifdWith(nil, psirWith(newIIM, md5Sum(newIIM))), newIIM, nil, paddedMD5(newIIM)},
-		{"RECONCILE-06 unchanged IIM, stale digest kept stale", ifdWith(oldIIM, psirWith(nil, stale)), oldIIM, nil, stale},
+		{"RECONCILE-06 changed IIM, matching digest refreshes", ifdWith(oldIIM, psirWith(nil, oldMD5[:])), newIIM, xmpOn, paddedMD5(newIIM)},
+		{"RECONCILE-06 changed IIM, stale digest refreshes", ifdWith(oldIIM, psirWith(nil, stale)), newIIM, xmpOn, paddedMD5(newIIM)},
+		{"RECONCILE-06 IIM only in 0x8649, changed", ifdWith(nil, psirWith(oldIIM, oldMD5[:])), newIIM, xmpOn, paddedMD5(newIIM)},
+		{"RECONCILE-06 unchanged IIM, current digest kept current", ifdWith(newIIM, psirWith(nil, paddedMD5(newIIM))), newIIM, xmpOn, paddedMD5(newIIM)},
+		{"RECONCILE-06 unchanged IIM, unpadded digest rewritten padded", ifdWith(nil, psirWith(newIIM, md5Sum(newIIM))), newIIM, xmpOn, paddedMD5(newIIM)},
+		{"RECONCILE-06 unchanged IIM, stale digest refreshes", ifdWith(oldIIM, psirWith(nil, stale)), oldIIM, xmpOn, paddedMD5(oldIIM)},
+		{"RECONCILE-06 no XMP: matching digest kept as it is", ifdWith(oldIIM, psirWith(nil, oldMD5[:])), newIIM, nil, oldMD5[:]},
+		{"RECONCILE-06 no XMP: stale digest kept as it is", ifdWith(oldIIM, psirWith(nil, stale)), newIIM, nil, stale},
 		{"RECONCILE-06 no digest, no XMP: none created", ifdWith(oldIIM, psirWith(nil, nil)), newIIM, nil, nil},
-		{"RECONCILE-06 no digest, XMP written: created", ifdWith(oldIIM, psirWith(nil, nil)), newIIM, []byte("<x/>"), paddedMD5(newIIM)},
+		{"RECONCILE-06 no digest, XMP written: created", ifdWith(oldIIM, psirWith(nil, nil)), newIIM, xmpOn, paddedMD5(newIIM)},
 		{"RECONCILE-06 no digest, XMP in IFD0: created", ifdWithXMP(ifdWith(oldIIM, psirWith(nil, nil))), newIIM, nil, paddedMD5(newIIM)},
-		{"RECONCILE-06 no digest, IIM copy in 0x8649, XMP written: created", ifdWith(nil, psirWith(oldIIM, nil)), newIIM, []byte("<x/>"), paddedMD5(newIIM)},
-		{"RECONCILE-06 no digest, 0x8649 IIM equals new IIM, XMP written: created without a second IIM", ifdWith(nil, psirWith(newIIM, nil)), newIIM, []byte("<x/>"), paddedMD5(newIIM)},
+		{"RECONCILE-06 stale digest, XMP in IFD0: refreshed", ifdWithXMP(ifdWith(oldIIM, psirWith(nil, stale))), newIIM, nil, paddedMD5(newIIM)},
+		{"RECONCILE-06 no digest, IIM copy in 0x8649, XMP written: created", ifdWith(nil, psirWith(oldIIM, nil)), newIIM, xmpOn, paddedMD5(newIIM)},
+		{"RECONCILE-06 no digest, 0x8649 IIM equals new IIM, XMP written: created without a second IIM", ifdWith(nil, psirWith(newIIM, nil)), newIIM, xmpOn, paddedMD5(newIIM)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -152,7 +156,7 @@ func TestInject_PSIRDigestRefreshed(t *testing.T) {
 	}
 	newIIM := []byte{0x1C, 0x02, 0x78, 0x00, 0x05, 'h', 'e', 'l', 'l', 'o'}
 	var out bytes.Buffer
-	if err := InjectWithEXIFStream(bytes.NewReader(data), data, true, e, newIIM, nil, &out); err != nil {
+	if err := InjectWithEXIFStream(bytes.NewReader(data), data, true, e, newIIM, []byte("<x/>"), &out); err != nil {
 		t.Fatalf("InjectWithEXIFStream: %v", err)
 	}
 	got, err := exif.Parse(out.Bytes())

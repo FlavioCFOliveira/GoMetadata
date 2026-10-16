@@ -62,7 +62,16 @@ var identPS = []byte("Photoshop 3.0\x00") //nolint:gochecknoglobals // package-l
 // JPEG ISO/IEC 10918-1 §B.1.1.4: length field is 2 bytes and includes itself,
 // so the maximum payload is 65535 − 2 = 65533 bytes.
 //
-// maxXMPPayload: max XMP packet bytes in a standard (non-extended) APP1.
+// maxXMPPayload: max XMP packet bytes the writer puts in a standard
+// (non-extended) APP1 segment. Adobe XMP Specification Part 3 (2020) §1.1.3.1,
+// p. 14: "If the XMP packet is not split across multiple APP1 sections, the
+// size of the XMP packet can be at most 65502 bytes." (task #351). The segment
+// itself could hold 65504 bytes (65533 − len(identXMP) = 65504), which is
+// where earlier releases set the limit; the writer follows the specification,
+// which is 2 bytes stricter, so that no packet it writes can exceed what a
+// conforming reader accepts. The reader applies no such limit: it accepts the
+// packet of any APP1 segment, so files written with up to 65504 bytes still
+// read.
 // maxExtChunkSize: max chunk data per extended XMP APP1 (Adobe XMP Spec Part 3 §1.1.4).
 //
 //	Extended APP1 layout: identXMPNote(35) + GUID(32) + fullLen(4) + offset(4) + chunk
@@ -84,7 +93,7 @@ var identPS = []byte("Photoshop 3.0\x00") //nolint:gochecknoglobals // package-l
 // non-conforming files while bounding worst-case memory to 64 MiB.
 const (
 	maxAPP1Payload      = 65533               // 65535 − 2 (length field)
-	maxXMPPayload       = maxAPP1Payload - 29 // − len(identXMP)
+	maxXMPPayload       = 65502               // XMP Part 3 §1.1.3.1, p. 14
 	maxExtChunkSize     = maxAPP1Payload - 75 // − len(identXMPNote)+GUID+fullLen+offset overhead
 	maxExtendedXMPTotal = 16 << 20            // 16 MiB aggregate cap per GUID (#40 DoS mitigation)
 	maxExtendedXMPGUIDs = 4                   // cap on distinct GUIDs per file (spec: 1; we allow 4)
@@ -391,12 +400,43 @@ func buildXMPResult(rawXMP []byte, extended map[string][]extChunk, extFullLens m
 	// always served.
 	reassembled := reassembleExtendedXMPByParse(rawXMP, extBytes)
 	if reassembled == nil {
-		// xmp.Parse fallback: use the old byte-splice method.
 		extMap := map[string][]extChunk{guid: {{offset: 0, data: extBytes}}}
-		reassembled = reassembleExtendedXMP(rawXMP, extMap)
+		var merged bool
+		reassembled, merged = spliceExtendedXMP(rawXMP, extMap)
+		if !merged {
+			// #350: the extended content could not be merged. The packet
+			// returned must not point at it: the link is removed, as the XMP
+			// Toolkit does before it tries the merge and keeps the standard
+			// XMP when the merge fails (JPEG_Handler.cpp:ProcessXMP, which
+			// deletes xmpNote:HasExtendedXMP first and ignores a failed
+			// MergeFromJPEG; Part 3 §1.1.3.1, p. 15: the property exists
+			// only in the file). The caller is told through truncated, so a
+			// ParseWarning reports that the extended content was dropped; it
+			// stays in the wire-frame, so an unmodified write keeps it.
+			return xmpResult{rawXMP: stripExtendedLink(rawXMP, true), rawXMPWire: wire, truncated: true}
+		}
 	}
 
 	return xmpResult{rawXMP: reassembled, rawXMPWire: wire, truncated: extTruncated}
+}
+
+// spliceExtendedXMP is the fallback of buildXMPResult: it splices the
+// extended content into the standard packet main as reassembleExtendedXMP
+// does, removes the link property from the result (Part 3 §1.1.3.1, p. 15)
+// and reports whether that gave a well-formed packet that holds the extended
+// content. It returns main and false when the splice changed nothing or its
+// result cannot be parsed, so that a malformed extended document is never
+// written into the packet.
+func spliceExtendedXMP(main []byte, extended map[string][]extChunk) (packet []byte, merged bool) {
+	spliced := reassembleExtendedXMP(main, extended)
+	if bytes.Equal(spliced, main) {
+		return main, false
+	}
+	stripped, err := xmppkg.StripExtendedLink(spliced)
+	if err != nil {
+		return main, false
+	}
+	return stripped, true
 }
 
 // stripExtendedLink returns the main XMP packet main without its
@@ -430,7 +470,7 @@ func readSOI(soi []byte) error {
 // encoding (for lossless passthrough writes when extended XMP is present).
 //
 // iptcDigest is a 16-byte MD5 slice when the IRB contained a 0x0425 resource,
-// or nil when absent. MWG §3.3.1.
+// or nil when absent. MWG §4.2.3.2, p. 26.
 //
 // err is non-nil only for ErrFileTooLarge (task #262): either the cumulative
 // bytes read from r exceeded maxFileSize (countingReader, limits.go), or the
@@ -531,8 +571,8 @@ func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte, wantIPTC, wan
 // and returns the 0x0404 IPTC-NAA data and the 0x0425 IPTC-Digest data; the
 // shared parser lives in internal/irb. Either result may be nil.
 //
-// MWG §3.3.1: the 0x0425 resource carries the 16-byte MD5 of the raw 0x0404
-// IIM stream at the time XMP was last written.
+// MWG §4.2.3.2, p. 26: the 0x0425 resource (PSIR 1061) carries the 16-byte MD5
+// of the entire IPTC-IIM block at the time XMP was last written.
 func parseIRBForIPTCAndDigest(b []byte) (iptcData, digestData []byte) {
 	return irbpkg.IPTCAndDigest(b)
 }
@@ -549,7 +589,7 @@ func parseIRBForIPTCAndDigest(b []byte) (iptcData, digestData []byte) {
 //
 // IRB-APP13-09: all APP13 Photoshop 3.0 payloads are treated as a single
 // logical IRB stream; both resources may appear in any segment.
-// MWG §3.3.1: the digest enables IPTC/XMP precedence reconciliation.
+// MWG §4.2.3.2, pp. 26-28: the digest enables IPTC/XMP precedence reconciliation.
 func extractIPTCAndDigestFromIRBPayloads(payloads [][]byte, wantDigest bool) (rawIPTC, iptcDigest []byte) {
 	if len(payloads) == 0 {
 		return nil, nil
@@ -638,7 +678,7 @@ func ExtractWithWire(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP, rawXMPWire []by
 // When xmpTruncated is true rawXMP contains the main (standard) XMP packet only;
 // callers that surface warnings should record ErrExtendedXMPTruncated.
 //
-// MWG Guidelines v2.0 §3.3.1: the caller should compare the digest to
+// MWG Guidelines v2.0 §4.2.3.2, pp. 27-28: the caller should compare the digest to
 // iptc.Digest(rawIPTC) to determine whether IPTC or XMP has read priority.
 // Use Extract for callers that do not need the digest, the wire-frame, or the
 // truncation flag.
@@ -977,9 +1017,10 @@ func buildIRB(iptcData []byte) []byte {
 // except the 0x0404 (IPTC-NAA) resource block is replaced with a freshly
 // built block wrapping newIPTCData; every other 8BIM block is copied
 // verbatim. When newIPTCData is nil the 0x0404 block is removed and all
-// siblings survive (#174). The 0x0425 digest is created, refreshed or kept
-// stale according to irbpkg.AppendSpliced (#284, #323); createDigest is true
-// when XMP is written together with the IPTC (MWG Guidelines v2.0 §4.2.3.2).
+// siblings survive (#174). The 0x0425 digest is created or rewritten to the
+// MD5 of newIPTCData according to irbpkg.AppendSpliced (#284, #323);
+// createDigest is true when XMP is written together with the IPTC (MWG
+// Guidelines v2.0 §4.2.3.2, p. 29).
 //
 // #218: appends directly onto the caller's buffer (typically a pooled
 // segment buffer) instead of allocating a new one.
@@ -1405,8 +1446,9 @@ func prepareInject(cr io.ReadSeeker, w io.Writer, scratch *[]byte, rawIPTC []byt
 // source has no APP13 at all, no APP13 is emitted in the output.
 //
 // The IPTC digest (resource 0x0425) follows the policy of irb.AppendSpliced:
-// it is created when rawXMP is written together with rawIPTC, refreshed when it
-// matched the IIM being replaced, and left stale otherwise (#323). An AFCP
+// when rawXMP is written together with rawIPTC it is created, or rewritten to
+// the MD5 of rawIPTC, a stale digest included (MWG Guidelines v2.0 §4.2.3.2,
+// p. 29); without rawXMP, or with a nil rawIPTC, it is left as it is (#323). An AFCP
 // trailer and a FotoStation trailer after the image data hold copies of the
 // IPTC: they are rewritten with rawIPTC (left as they are when it is nil), and
 // the AFCP offsets follow the trailer to its position in the output (#322; see

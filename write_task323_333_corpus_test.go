@@ -30,7 +30,7 @@ func corpusBytes(t *testing.T, parts ...string) []byte {
 }
 
 // TestCorpus_IPTCDigest (task #323): the digest is created for a file that has
-// none, and a stale digest stays stale.
+// none, and a stale digest is refreshed (MWG Guidelines v2.0 §4.2.3.2, p. 29).
 func TestCorpus_IPTCDigest(t *testing.T) {
 	t.Parallel()
 	t.Run("created", func(t *testing.T) {
@@ -49,7 +49,7 @@ func TestCorpus_IPTCDigest(t *testing.T) {
 			t.Errorf("digest = %x, want MD5 of the IIM %x", d, want)
 		}
 	})
-	t.Run("stale stays stale", func(t *testing.T) {
+	t.Run("stale is refreshed", func(t *testing.T) {
 		t.Parallel()
 		src := corpusBytes(t, "jpeg", "exiftool", "ExifTool.jpg")
 		_, oldIIM, oldDigest, _, _, _, err := jpeg.ExtractFull(bytes.NewReader(src))
@@ -64,8 +64,8 @@ func TestCorpus_IPTCDigest(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cur := md5.Sum(iim); !bytes.Equal(d, oldDigest) || bytes.Equal(d, cur[:]) { //nolint:gosec // G401: MWG digest
-			t.Errorf("digest = %x, want the stale %x", d, oldDigest)
+		if cur := md5.Sum(iim); !bytes.Equal(d, cur[:]) { //nolint:gosec // G401: MWG digest
+			t.Errorf("digest = %x, want MD5 of the written IIM %x (the stale %x must be refreshed)", d, cur, oldDigest)
 		}
 	})
 }

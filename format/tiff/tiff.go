@@ -1231,23 +1231,22 @@ const tagPhotoshopIRB = exif.TagID(tiffscan.PSIRTag)
 // 0x83BB and the digest for TIFF; it is not followed here because a stale
 // copy would contradict the IPTC just written.
 //
-// Digest (tasks #284, #323). MWG Guidelines v2.0 §4.2.3.2 (pp. 26-29): the
-// digest is the MD5 of the IPTC-IIM block, and a Creator or Changer that
-// writes IPTC-IIM and XMP together MUST create it. The digest covers the
-// stored value of tag 0x83BB including its LONG zero padding, the bytes
-// Photoshop and ExifTool hash (irb.Digest with align 4). Policy, shared with
-// the JPEG writer (irb.AppendSpliced):
-//   - no digest resource and XMP is written or present (rawXMP non-empty or
-//     tag 0x02BC in the IFD): one is created, in a new resource block (tag
-//     0x8649) when the IFD has none;
-//   - a digest that matches the IIM being replaced is refreshed (also when the
-//     IIM is unchanged, which rewrites it in the padded form that is current
-//     for ExifTool as well);
-//   - a digest that does not match it (stale) is left stale, whether or not
-//     the IIM changes, because a stale digest is the MWG signal that the IIM
-//     was edited without updating XMP.
+// Digest (tasks #284, #323). MWG Guidelines v2.0 §4.2.3.2: the digest is the
+// MD5 of the IPTC-IIM block (p. 26), and "If IPTC-IIM and XMP are both
+// present, whether changed or not, a Changer MUST create or update the
+// checksum value" (p. 29). The digest covers the stored value of tag 0x83BB
+// including its LONG zero padding, the bytes Photoshop and ExifTool hash
+// (irb.Digest with align 4). Policy, shared with the JPEG writer
+// (irb.AppendSpliced):
+//   - XMP is written or present (rawXMP non-empty or tag 0x02BC in the IFD):
+//     the digest is set to that of the IIM written: created when the block
+//     holds none (in a new resource block, tag 0x8649, when the IFD has none),
+//     otherwise rewritten, a stale digest included and also when the IIM is
+//     unchanged (which also rewrites an unpadded digest in the padded form
+//     that is current for ExifTool as well);
+//   - no XMP in the IFD or written: the digest is left as it is and none is
+//     created, because the IIM and XMP are not both present.
 func upsertIPTC(ifd *exif.IFD, rawIPTC, rawXMP []byte) {
-	oldIPTC := currentIPTC(ifd)
 	upsertIFD0Entry(ifd, exif.TagIPTC, exif.TypeLong, rawIPTC)
 	withXMP := len(rawXMP) > 0 || ifd.Get(exif.TagXMP) != nil
 
@@ -1263,7 +1262,7 @@ func upsertIPTC(ifd *exif.IFD, rawIPTC, rawXMP []byte) {
 	// Specification, TIFF tag 34377: BYTE or UNDEFINED); any other declared
 	// type is left alone, as its Count would not be a byte count.
 	byteTyped := psir.Type == exif.TypeByte || psir.Type == exif.TypeUndefined
-	digest, plan := iptcDigestUpdate(psir.Value, oldIPTC, rawIPTC, withXMP && byteTyped)
+	digest, plan := iptcDigestUpdate(psir.Value, rawIPTC, withXMP && byteTyped)
 	updatePSIR(psir, rawIPTC, byteTyped, digest, plan)
 }
 
@@ -1301,45 +1300,23 @@ func updatePSIR(psir *exif.IFDEntry, rawIPTC []byte, byteTyped bool, digest [irb
 }
 
 // iptcDigestUpdate applies the digest policy of upsertIPTC to the resource
-// block psir when the IIM goes from oldIPTC to rawIPTC: it returns the digest
-// to store and what to do with it (irb.DigestRefresh, irb.DigestCreate when
-// the block holds no digest and create is true, irb.DigestKeep otherwise).
-func iptcDigestUpdate(psir, oldIPTC, rawIPTC []byte, create bool) (digest [irb.DigestSize]byte, plan irb.DigestPlan) {
-	stored := irb.FindDigest(psir)
-	if stored == nil {
-		if !create {
-			return digest, irb.DigestKeep
-		}
-		return irb.Digest(rawIPTC, 4), irb.DigestCreate
-	}
-	if !irb.DigestCurrent(oldIPTC, stored, 4) {
-		return digest, irb.DigestKeep // stale digest: keep the MWG signal
+// block psir when the IIM written is rawIPTC: it returns the digest to store
+// and what to do with it (irb.DigestCreate when the block holds no digest,
+// irb.DigestRefresh when it holds one that differs from the digest of rawIPTC,
+// irb.DigestKeep when it already holds that digest or withXMP is false).
+func iptcDigestUpdate(psir, rawIPTC []byte, withXMP bool) (digest [irb.DigestSize]byte, plan irb.DigestPlan) {
+	if !withXMP {
+		return digest, irb.DigestKeep
 	}
 	digest = irb.Digest(rawIPTC, 4)
-	if bytes.Equal(stored, digest[:]) {
+	stored := irb.FindDigest(psir)
+	switch {
+	case stored == nil:
+		return digest, irb.DigestCreate
+	case bytes.Equal(stored, digest[:]):
 		return digest, irb.DigestKeep
 	}
 	return digest, irb.DigestRefresh
-}
-
-// currentIPTC returns the IIM stream ifd holds before an IPTC write: the
-// value of tag 0x83BB without its LONG padding, or, when that tag is absent
-// or empty, the 0x0404 resource of tag 0x8649 (the read precedence of
-// tiffscan.WithPSIRFallback).
-func currentIPTC(ifd *exif.IFD) []byte {
-	if e := ifd.Get(exif.TagIPTC); e != nil {
-		v := e.Value
-		if e.Type == exif.TypeLong {
-			v = tiffscan.TrimIPTCLongPadding(v)
-		}
-		if len(v) > 0 {
-			return v
-		}
-	}
-	if p := ifd.Get(tagPhotoshopIRB); p != nil {
-		return irb.FindIPTC(p.Value)
-	}
-	return nil
 }
 
 // byteOrder determines the TIFF byte order from the first 2 bytes.

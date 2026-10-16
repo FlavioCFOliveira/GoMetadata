@@ -129,8 +129,8 @@ for cross-checking only).
   tables only facts (URIs, prefixes, alias pairs) are transcribed. The image resource
   and IPTC digest logic is re-implemented from the Toolkit's algorithm, with these
   changes: bounds checks in uint64, resources returned as sub-slices instead of copies,
-  a digest created only when the caller also writes XMP, refreshed only when it matched
-  the IIM it replaces, and kept stale otherwise, where the Toolkit always rewrites it
+  a digest created or rewritten only when the caller also writes XMP, where the Toolkit
+  also writes it for an IIM-only write
   (see the header of `internal/irb/irb.go`). The RDF parser and
   serialiser differ from the Toolkit in these points: recoverable errors are skipped
   silently instead of being reported; the element tree is built by an original

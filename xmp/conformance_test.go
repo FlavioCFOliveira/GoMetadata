@@ -967,18 +967,19 @@ func TestConformanceJPEG01(t *testing.T) {
 	})
 }
 
-// TestConformance_JPEG-02 verifies max standard XMP data size (65535 − 2 − 29 = 65504 bytes).
+// TestConformance_JPEG-02 verifies max standard XMP data size (65502 bytes, XMP Part 3 §1.1.3.1, p. 14).
+// The boundary itself is tested in format/jpeg (TestTask351_StandardPacketLimit).
 // XMP Part 3 §1.1.
 func TestConformanceJPEG02(t *testing.T) {
 	t.Parallel()
 	t.Run("JPEG-02", func(t *testing.T) {
 		t.Parallel()
 		// The XMP package's job here: serialised output for a normal packet should
-		// fit well within 65504 bytes. Build a minimal XMP and confirm.
+		// fit well within 65502 bytes. Build a minimal XMP and confirm.
 		x := &XMP{Properties: map[string]map[string]string{NStiff: {"Model": "JPEG02"}}}
 		enc := mustEncode(t, x)
-		if len(enc) > 65504 {
-			t.Errorf("JPEG-02: encoded XMP too large for standard APP1: %d > 65504", len(enc))
+		if len(enc) > 65502 {
+			t.Errorf("JPEG-02: encoded XMP too large for standard APP1: %d > 65502", len(enc))
 		}
 	})
 }

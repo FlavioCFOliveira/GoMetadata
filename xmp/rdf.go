@@ -2,6 +2,7 @@ package xmp
 
 import (
 	"bytes"
+	"encoding/binary"
 	"strings"
 	"sync"
 	"unicode"
@@ -337,11 +338,79 @@ func readQuotedValue(b []byte, pos int, quote byte) (val string, newPos int) {
 	} else {
 		pos = len(b)
 	}
-	val = unescapeXML(b[valStart:pos])
+	val = unescapeAttrValue(b[valStart:pos])
 	if pos < len(b) {
 		pos++ // skip closing quote
 	}
 	return val, pos
+}
+
+// unescapeAttrValue returns the value of an attribute whose literal text is b:
+// normalised as XML 1.0 §3.3.3 requires (see normaliseAttrValue) and then
+// unescaped like any character data (see unescapeXML). A value with no
+// '&', TAB, LF or CR, the usual case, is returned as a transient alias of b.
+func unescapeAttrValue(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	if indexAttrSpace(b) < 0 {
+		return unescapeXML(b)
+	}
+	return unescapeXML(normaliseAttrValue(b))
+}
+
+// normaliseAttrValue applies the attribute-value normalisation of XML 1.0
+// §3.3.3 to the literal text b of an attribute value, before entity and
+// character references are expanded: every literal TAB (#x9), LF (#xA) and CR
+// (#xD) becomes one space (#x20), and the two characters of a CR LF pair
+// become one space, because §2.11 has already reduced the pair to a single
+// LF when the processor hands the text to the normaliser. Attributes of
+// type CDATA (all attributes of an XMP packet: it has no DTD, so none is
+// declared with another type) receive no further normalisation. A character
+// reference to one of the three characters (&#9; &#10; &#13;) is expanded
+// later and so stays that character. It returns b itself, without copying,
+// when b holds none of the three characters, which is the common case.
+func normaliseAttrValue(b []byte) []byte {
+	i := indexAttrSpace(b)
+	if i < 0 {
+		return b
+	}
+	out := make([]byte, 0, len(b))
+	out = append(out, b[:i]...)
+	for ; i < len(b); i++ {
+		c := b[i]
+		if c == '\r' && i+1 < len(b) && b[i+1] == '\n' {
+			i++ // CR LF is one line end (XML 1.0 §2.11), so one space
+		}
+		if c == '\t' || c == '\n' || c == '\r' {
+			c = ' '
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// indexAttrSpace returns the index of the first TAB, LF or CR of b, or -1. It
+// first tests eight bytes at a time whether any byte is below 0x0E, the exact
+// "has a byte less than n" test of Hacker's Delight §6-1, which holds for TAB,
+// LF and CR and for the C0 controls that XML forbids in a document; the usual
+// attribute value has none, and costs one test per eight bytes (task #344).
+// A word with such a byte sends the rest of b to the byte loop.
+func indexAttrSpace(b []byte) int {
+	const ones, highs = 0x0101010101010101, 0x8080808080808080
+	i := 0
+	for ; i+8 <= len(b); i += 8 {
+		w := binary.LittleEndian.Uint64(b[i:])
+		if (w-ones*0x0E)&^w&highs != 0 {
+			break
+		}
+	}
+	for ; i < len(b); i++ {
+		if c := b[i]; c == '\t' || c == '\n' || c == '\r' {
+			return i
+		}
+	}
+	return -1
 }
 
 // parseAttributeValue skips optional whitespace, reads a quoted attribute

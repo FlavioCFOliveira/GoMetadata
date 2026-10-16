@@ -632,7 +632,7 @@ func writeTextChunk(w io.Writer, hdr *[8]byte, chunkType [4]byte, data []byte, c
 		return nil
 	}
 	if rawIPTC != nil {
-		payload, ok, err := rewriteRawProfileIPTC(chunkType, data, rawIPTC)
+		payload, ok, err := rewriteRawProfileIPTC(chunkType, data, rawIPTC, rawXMP != nil)
 		if err != nil {
 			return err
 		}

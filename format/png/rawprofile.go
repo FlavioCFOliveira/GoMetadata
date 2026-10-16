@@ -351,8 +351,12 @@ const rawProfileHexLine = 36
 // a text chunk of type chunkType, so that its IPTC raw profile holds newIIM;
 // ok is false when data must be kept as is: it is not an IPTC raw profile, it
 // cannot be decoded (a malformed chunk is preserved, never repaired), its
-// payload form is not one profileIPTC reads, or it already holds newIIM.
-func rewriteRawProfileIPTC(chunkType [4]byte, data, newIIM []byte) (payload []byte, ok bool, err error) {
+// payload form is not one profileIPTC reads, or it would not change. withXMP
+// is true when the PNG carries XMP as well: a profile in the Photoshop IRB form
+// then also gets the IPTC digest (resource 0x0425) of newIIM, created or
+// refreshed (irb.AppendSpliced; MWG Guidelines v2.0 §4.2.3.2, p. 29), even
+// when the IIM itself is unchanged.
+func rewriteRawProfileIPTC(chunkType [4]byte, data, newIIM []byte, withXMP bool) (payload []byte, ok bool, err error) {
 	kind, kwLen := isRawProfileKeyword(data)
 	if kind != rawProfileIPTC {
 		return nil, false, nil
@@ -363,16 +367,21 @@ func rewriteRawProfileIPTC(chunkType [4]byte, data, newIIM []byte) (payload []by
 	}
 	p := decodeRawProfile(text)
 	cur := profileIPTC(p)
-	if cur == nil || bytes.Equal(cur, newIIM) {
+	if cur == nil || (bytes.Equal(cur, newIIM) && !withXMP) {
 		return nil, false, nil
 	}
-	newText := appendRawProfileText(nil, text, splicedProfile(p, newIIM))
+	newProfile := splicedProfile(p, newIIM, withXMP)
+	if bytes.Equal(newProfile, p) {
+		return nil, false, nil
+	}
+	newText := appendRawProfileText(nil, text, newProfile)
 	return rawProfileChunk(chunkType, data, kwLen, newText)
 }
 
 // splicedProfile returns profile p (a form profileIPTC reads) with its IIM
-// replaced by newIIM.
-func splicedProfile(p, newIIM []byte) []byte {
+// replaced by newIIM and, in the Photoshop IRB form, its IPTC digest set as
+// irb.AppendSpliced does for withXMP.
+func splicedProfile(p, newIIM []byte, withXMP bool) []byte {
 	body := bytes.TrimPrefix(p, identPhotoshop)
 	if !bytes.HasPrefix(body, []byte("8BIM")) {
 		return newIIM // bare IIM stream
@@ -380,7 +389,7 @@ func splicedProfile(p, newIIM []byte) []byte {
 	ident := p[:len(p)-len(body)]
 	out := make([]byte, 0, len(p)+len(newIIM))
 	out = append(out, ident...)
-	return irb.AppendSpliced(out, body, newIIM, false)
+	return irb.AppendSpliced(out, body, newIIM, withXMP)
 }
 
 // appendRawProfileText appends to dst the raw profile text of profile, keeping

@@ -13,10 +13,9 @@
 //     the end of the walk;
 //   - resources are returned as sub-slices of the input (zero copy) instead
 //     of being copied into a map;
-//   - the digest is created only when the caller also writes XMP, and an
-//     existing digest is refreshed only when it matched the IIM it replaces; a
-//     stale digest stays stale (tasks #284, #323), whereas the Toolkit always
-//     rewrites it;
+//   - the digest is created or rewritten only when the caller also writes XMP
+//     (tasks #284, #323; MWG Guidelines v2.0 §4.2.3.2, p. 29), whereas the
+//     Toolkit also writes it for an IIM-only write;
 //   - the digest check also accepts the zero-padded form of a TIFF tag 0x83BB
 //     value (DigestCurrent), as the Toolkit's TIFF handler does;
 //   - duplicate resources follow the Toolkit's policy (first copy wins, a later
@@ -224,8 +223,8 @@ func FindIPTC(b []byte) []byte {
 // digest resource (0x0425). Either result may be nil. Duplicates are resolved
 // by the duplicate policy (see iptcWinner): the first 0x0404 resource wins
 // unless it is empty and a later one is not, and the first 0x0425 resource of
-// exactly 16 bytes wins; a 0x0425 resource of any other size is ignored (MWG
-// Guidelines v2.0 §3.3.1). The results alias b.
+// exactly 16 bytes wins; a 0x0425 resource of any other size is ignored (the
+// digest is a 16-byte value: MWG Guidelines v2.0 §4.2.3.2, p. 26). The results alias b.
 //
 // Task #313: this function used to keep the last copy of each resource while
 // FindIPTC kept the first, so a stream with two 0x0404 resources read
@@ -365,40 +364,6 @@ const (
 	DigestCreate
 )
 
-// splicedDigest decides, before the splice, what AppendSpliced does with the
-// digest (the 0x0425 resource may precede 0x0404). With newIPTC nil nothing
-// changes. Otherwise:
-//   - orig holds no 16-byte digest: it is created when create is true (the
-//     caller writes XMP as well; MWG Guidelines v2.0 §4.2.3.2, p. 29);
-//   - orig holds a digest that matches the IIM it holds now: it is refreshed
-//     to the MD5 of newIPTC, so it keeps describing the IIM that is written;
-//   - orig holds a digest that does not match the IIM it holds (stale, or no
-//     IIM to match): it is kept stale, because a stale digest is the signal
-//     that the IIM was edited by a tool that ignored XMP (MWG §4.2.3.2,
-//     scenario 4, p. 28) and refreshing it would erase that signal for every
-//     property this write did not reconcile.
-func splicedDigest(orig, newIPTC []byte, create bool) (digest [DigestSize]byte, plan DigestPlan) {
-	if newIPTC == nil {
-		return digest, DigestKeep
-	}
-	stored := FindDigest(orig)
-	if stored == nil {
-		if create {
-			return Digest(newIPTC, 1), DigestCreate
-		}
-		return digest, DigestKeep
-	}
-	old := FindIPTC(orig)
-	if old == nil || !DigestCurrent(old, stored, 1) {
-		return digest, DigestKeep
-	}
-	digest = Digest(newIPTC, 1)
-	if bytes.Equal(stored, digest[:]) {
-		return digest, DigestKeep
-	}
-	return digest, DigestRefresh
-}
-
 // AppendSpliced appends to dst an IRB identical to orig except that the
 // 0x0404 resource is replaced by a fresh block wrapping newIPTC; every other
 // resource is copied verbatim, with its Pascal name, reserved bytes and
@@ -410,29 +375,35 @@ func splicedDigest(orig, newIPTC []byte, create bool) (digest [DigestSize]byte, 
 // per ID (PSIR_FileWriter.cpp:PSIR_FileWriter::UpdateMemoryResources), so no
 // stale copy of the IIM survives the write (task #313).
 //
-// Digest (tasks #284, #323; MWG Guidelines v2.0 §4.2.3.2, pp. 26-29: the
-// digest is the MD5 of the whole IPTC-IIM block, stored in resource 1061, and
-// a Creator or Changer that writes IPTC-IIM and XMP together MUST create it):
-//   - createDigest true and no 16-byte 0x0425 resource: one is appended after
-//     the IIM block, holding the MD5 of newIPTC. Callers pass true when XMP is
-//     written or present as well; ReconcileIPTC.cpp:SetIPTCDigest creates the
-//     resource unconditionally, which this package restricts to that case so
-//     an IIM-only write does not claim an XMP that does not exist;
-//   - an existing digest that matches the IIM already in orig is rewritten
-//     with the MD5 of newIPTC;
-//   - an existing digest that does not match it (stale) is left untouched, as
-//     is every digest when newIPTC is nil. A stale digest is the signal MWG
-//     reconciliation uses to detect IPTC edits made behind the back of XMP;
-//     the ExifTool rule (MWG.pm:ReconcileIPTCDigest updates only an absent or
-//     matching digest) agrees.
+// Digest (tasks #284, #323). MWG Guidelines v2.0 §4.2.3.2: the digest is the
+// MD5 of the whole IPTC-IIM block, stored in resource 1061 as 16 binary
+// bytes (p. 26 and p. 29, "IPTC-IIM checksum"), and "If IPTC-IIM and XMP are
+// both present, whether changed or not, a Changer MUST create or update the
+// checksum value" (p. 29); a Creator that writes both MUST create it (p. 28).
+// So, when withXMP is true (the output carries XMP, written now or present
+// already) and newIPTC is non-nil:
+//   - every 16-byte 0x0425 resource is rewritten with the MD5 of newIPTC, a
+//     stale digest included, because the writer has just consumed the IIM and
+//     the XMP together (p. 28, Changer: "XMP and IPTC-IIM SHOULD be consumed
+//     according to the reconciliation guidance") and so the digest must
+//     describe the IIM now written;
+//   - when there is none, one is appended after the IIM block.
+//
+// When withXMP is false, or newIPTC is nil (the IIM is removed), the two
+// conditions of the MUST are not met: an IIM written without XMP in the
+// output is not "both present", and the guidance for an IIM-only file is
+// silent. Every 0x0425 resource is then copied verbatim and none is created
+// (ReconcileIPTC.cpp:SetIPTCDigest of the Adobe XMP Toolkit, which writes the
+// digest unconditionally, is therefore not followed for an IIM-only write:
+// the digest would claim an XMP that does not exist).
 //
 // Derived from ReconcileIPTC.cpp:SetIPTCDigest (MD5 over the full IPTC block).
-func AppendSpliced(dst, orig, newIPTC []byte, createDigest bool) []byte {
-	digest, plan := splicedDigest(orig, newIPTC, createDigest)
-	if plan == DigestKeep {
+func AppendSpliced(dst, orig, newIPTC []byte, withXMP bool) []byte {
+	if newIPTC == nil || !withXMP {
 		return AppendSplicedDigest(dst, orig, newIPTC, nil, false)
 	}
-	return AppendSplicedDigest(dst, orig, newIPTC, &digest, plan == DigestCreate)
+	digest := Digest(newIPTC, 1)
+	return AppendSplicedDigest(dst, orig, newIPTC, &digest, true)
 }
 
 // AppendSplicedDigest is AppendSpliced with the digest decision taken by the

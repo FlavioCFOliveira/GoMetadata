@@ -162,12 +162,16 @@ const maxXMPDocumentBytes = 16 << 20 // 16 MiB
 // UTF-16BE).
 //
 // Parse returns an error that wraps ErrXMLNotWellFormed, and names the
-// element, when the packet is not well-formed XML: a mismatched or stray end
-// tag, a malformed start tag, or an element that is never closed. It never
-// returns a tree built from part of such a packet.
+// element or the namespace prefix, when the packet is not well-formed XML: a
+// mismatched or stray end tag, a malformed start tag, an element that is never
+// closed, or an element or attribute whose namespace prefix is not declared
+// (Namespaces in XML 1.0 §5). It never returns a tree built from part of such
+// a packet.
 //
 // The values of literal property elements are verbatim, white space
-// included (XML 1.0 §2.10). A property that is one of the 35 registered
+// included (XML 1.0 §2.10). The values of attributes are normalised as XML
+// 1.0 §3.3.3 requires: each literal TAB, LF and CR becomes a space, while a
+// character reference to one of them (&#9;) stays the character. A property that is one of the 35 registered
 // aliases (see ResolveAlias) is folded into its base property, as the Adobe
 // XMP Toolkit does (Adobe XMP Specification Part 2 §1.1.1): after Parse a
 // document holds one value for it, at the base property.

@@ -20,8 +20,10 @@ var ErrDocumentTooLarge = errors.New("xmp: document exceeds maximum size")
 
 // ErrXMLNotWellFormed is returned when an XMP packet is not well-formed XML:
 // an end tag that does not match its start tag, an end tag without a start
-// tag, a malformed start tag, or an element that is never closed (XML 1.0 §3;
-// ISO 16684-1:2019 §7.1). The error text names the offending element.
+// tag, a malformed start tag, an element that is never closed, or an element or
+// attribute whose namespace prefix is not declared (XML 1.0 §3; Namespaces in
+// XML 1.0 §5; ISO 16684-1:2019 §7.1). The error text names the offending
+// element or prefix.
 var ErrXMLNotWellFormed = errors.New("xmp: XML is not well-formed")
 
 // ErrTooLargeForJPEG is returned by PackageForJPEG when the standard XMP

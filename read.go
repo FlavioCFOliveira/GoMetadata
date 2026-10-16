@@ -57,7 +57,7 @@ func isTIFFFamily(fmtID format.FormatID) bool {
 	}
 }
 
-// setIPTCTrust computes the MWG §3.3.1 IPTC-trust-elevation decision for m
+// setIPTCTrust computes the MWG §4.2.3.2 (pp. 26-28) IPTC-trust-elevation decision for m
 // and caches it in m.iptcTrustElev (#208: exactly once, by Read). For the
 // TIFF family the digest is first read from the 0x0425 resource of the
 // Photoshop IRB in tag 0x8649 of rawEXIF (task #301), the check the Adobe XMP
@@ -128,7 +128,7 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 	// lossless passthrough writes when the XMP is not modified.
 	// rawIPTCDigest carries the 16-byte MD5 from Photoshop resource 0x0425 when
 	// the JPEG extractor finds it (nil for all other formats; the TIFF family
-	// is handled below). MWG §3.3.1.
+	// is handled below). MWG §4.2.3.2, p. 26.
 	// xmpTruncated is set when extended XMP was capped or had invalid layout (#134).
 	// noCMT1Box is set when a CR3 file has no CMT1 sub-box (audit #138).
 	// #238: pass the wanted-segments mask so extraction can skip work that
@@ -158,7 +158,7 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 		// from the IRB in tag 0x8649 (task #301).
 		rawIPTCDigest: rawIPTCDigest,
 	}
-	// #208: compute the MWG §3.3.1 IPTC-trust-elevation decision exactly once,
+	// #208: compute the MWG §4.2.3.2 (pp. 26-28) IPTC-trust-elevation decision exactly once,
 	// here, and cache it. rawIPTC and rawIPTCDigest are final once
 	// setIPTCTrust has read the TIFF-family digest, and never change for the
 	// rest of m's lifetime, so every later iptcTrustElevated() call
@@ -418,7 +418,11 @@ func nonStandardRAWMagic(raw []byte) (magic uint16, ok bool) {
 // nonStandardRAWMagic detects it and exif.AcceptRAWMagic lets exif.Parse
 // consume raw directly — no clone, no retained copy of the whole file.
 func parseEXIF(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
-	if raw == nil || cfg.lazyEXIF {
+	if raw == nil {
+		return nil
+	}
+	if cfg.lazyEXIF {
+		m.exifOpaque = true // Write keeps the EXIF the caller did not load (task #343)
 		return nil
 	}
 	// Task #297: a fixed-size array assembled via direct indexed assignment,
@@ -470,7 +474,11 @@ func parseEXIF(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
 // parseIPTC attempts to parse rawIPTC into m.IPTC when raw is non-nil and not lazy.
 // Returns a *ParseSegmentError on parse failure, nil on success or skip.
 func parseIPTC(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
-	if raw == nil || cfg.lazyIPTC {
+	if raw == nil {
+		return nil
+	}
+	if cfg.lazyIPTC {
+		m.iptcOpaque = true // Write keeps the IPTC the caller did not load (task #343)
 		return nil
 	}
 	i, err := iptc.Parse(raw)
@@ -484,12 +492,16 @@ func parseIPTC(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
 // parseXMP attempts to parse rawXMP into m.XMP when raw is non-nil and not lazy.
 // Returns a *ParseSegmentError on parse failure, nil on success or skip.
 func parseXMP(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
-	if raw == nil || cfg.lazyXMP {
+	if raw == nil {
+		return nil
+	}
+	if cfg.lazyXMP {
+		m.xmpOpaque = true // Write keeps the packet the caller did not load (task #343)
 		return nil
 	}
 	x, err := xmppkg.Parse(raw)
 	if err != nil {
-		m.xmpUnparsed = true // Write keeps the packet unchanged (task #327)
+		m.xmpOpaque = true // Write keeps the packet unchanged (task #327)
 		return &ParseSegmentError{Segment: "XMP", Err: err}
 	}
 	m.XMP = x
@@ -510,7 +522,7 @@ func ReadFile(path string, opts ...ReadOption) (*Metadata, error) {
 // extractByFormat dispatches to the correct container handler for raw segment
 // extraction. For JPEG it calls ExtractFull so that both extended XMP
 // (byte-stable passthrough) and the Photoshop 0x0425 IPTC digest are surfaced.
-// MWG §3.3.1: the digest is used by iptcTrustElevated() in metadata.go.
+// MWG §4.2.3.2, pp. 27-28: the digest is used by iptcTrustElevated() in metadata.go.
 //
 // xmpTruncated is true when the JPEG extended XMP was capped or had invalid
 // chunk layout (#134). The caller converts it to a ParseWarning so it is

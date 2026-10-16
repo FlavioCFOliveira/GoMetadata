@@ -562,12 +562,12 @@ func TestExtractBareJPEGAllNil(t *testing.T) {
 // --- Extended XMP write: TestInjectExtendedXMP ---
 
 // TestInjectExtendedXMP verifies that Inject correctly splits an XMP packet
-// larger than maxXMPPayload (65504 bytes) across a main APP1 and one or more
+// larger than maxXMPPayload (65502 bytes) across a main APP1 and one or more
 // extended APP1 segments (Adobe XMP Specification Part 3 §1.1.4), and that
 // the subsequent Extract call reassembles the full XMP content.
 func TestInjectExtendedXMP(t *testing.T) {
 	t.Parallel()
-	// Build a rawXMP that is larger than maxXMPPayload (65504 bytes).
+	// Build a rawXMP that is larger than maxXMPPayload (65502 bytes).
 	// We use a valid XMP envelope so that Extract's reassembleExtendedXMP can
 	// splice the extended content into it correctly.
 	const extraContentSize = 66000

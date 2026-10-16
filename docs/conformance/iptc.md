@@ -134,13 +134,13 @@ Namespaces: `Iptc4xmpCore` = `http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/`,
   XMP > IIM for Keywords, which EXIF does not carry (MWG §5.1). Exception
   (MWG §4.2.3.2, scenario 4, "MWG-02"): when Photoshop IRB resource `0x0425`
   ("IPTC Digest") is present, compare `MD5(raw 0x0404 IIM stream)` to the
-  stored 16-byte value. All-zero stored digest ("unknown" sentinel) OR a
-  computed/stored mismatch ⇒ the IIM value wins over EXIF and XMP unless it
+  stored 16-byte value. All-zero stored digest (an "unknown" sentinel of this
+  library; MWG §4.2.3.2, pp. 26-29, defines none) OR a computed/stored mismatch ⇒ the IIM value wins over EXIF and XMP unless it
   equals the IIM value predicted from the XMP value (the XMP value truncated
   to the DataSet length limit; for dates, the IIM export of the XMP date).
   Digest match, or resource absent, ⇒ MWG-01 applies unchanged. A value of
   only spaces or NULs is absent (MWG §4.2.3.3). The write side of the digest
-  (creation, refresh, a stale digest kept stale) is RECONCILE-06. Proven by
+  (creation and refresh) is RECONCILE-06. Proven by
   `TestConformance_MWG02` (metadata_conformance_test.go),
   `TestPrecedence_ExplicitPolicyComment` (root_task50_test.go) and
   `TestTask308_ReadPolicy_Text`, `TestTask308_ReadPolicy_Keywords`,
@@ -171,28 +171,33 @@ Namespaces: `Iptc4xmpCore` = `http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/`,
   string) and MUST be dropped, not concatenated, when the value flows into IIM.
 
 - **RECONCILE-06** IPTC digest on write (MWG Guidelines v2.0 §4.2.3.2, pp.
-  26-29; task #323): the digest is the MD5 of the entire IIM block, stored as a
-  16-byte value in PSIR `0x0425`. When a write stores the IIM and XMP together
-  (JPEG APP13 with an XMP packet written or present; TIFF tag `0x83BB` with
-  XMP written or tag `0x02BC` present) and the Photoshop block holds no digest,
-  the digest is **created** (a new `0x8649` block holding only it, for TIFF).
-  A digest that matches the IIM being replaced is **refreshed** to the MD5 of
-  the IIM written (TIFF: of the stored tag `0x83BB` value including its LONG
-  zero padding). A digest that does not match the IIM being replaced is
-  **kept stale**, whether or not the IIM changes: it is the signal (scenario
-  4, p. 28) that a non-compliant Changer edited the IIM without updating XMP,
-  and a refresh would erase it for every property the write did not reconcile;
-  the stale digest keeps the reader policy of RECONCILE-02 (the written IIM
-  value wins). An IIM-only write (no XMP) creates no digest, and removing the
-  IIM leaves the digest. Deviation, documented: MWG p. 29 says a Changer "MUST
-  create or update the checksum" when both are present "whether changed or
-  not"; keeping a stale digest follows the Adobe XMP Toolkit's reconciliation
-  intent (ExifTool `MWG.pm` also updates only an absent or matching digest) and
-  the library does not reconcile all properties on write. Proven by
-  `TestAppendSpliced_DigestPolicy` (internal/irb), `TestUpsertIPTC_DigestPolicy`
-  (format/tiff), `TestWrite_JPEGIPTCDigestCreated`,
-  `TestWrite_JPEGStaleIPTCDigestStaysStale` (iptc_photoshop_irb_test.go) and
-  `TestCorpus_IPTCDigest`.
+  26-29; task #323). The digest is the MD5 of the entire IIM block, stored as a
+  16-byte binary value in Photoshop resource 1061 (`0x0425`; p. 26 and the
+  "IPTC-IIM checksum" paragraph, p. 29). The rule is the one of p. 29: "If
+  IPTC-IIM and XMP are both present, whether changed or not, a Changer MUST
+  create or update the checksum value" (a Creator that writes both MUST create
+  it, p. 28). So, on every write that stores the IIM and has XMP in the output
+  (written now or present in the file; JPEG: an XMP packet is written; TIFF:
+  XMP written or tag `0x02BC` present; PNG: XMP written, for a raw profile in
+  the Photoshop IRB form), the digest is set to the MD5 of the IIM written
+  (TIFF: of the stored tag `0x83BB` value including its LONG zero padding): it
+  is **created** when the Photoshop block holds none (in a new `0x8649` block
+  holding only it, for TIFF) and **rewritten** when it holds one, a stale
+  digest and an unchanged IIM included. When the output has no XMP, or the IIM
+  is removed, the two conditions of the MUST are not both met and MWG gives no
+  rule for an IIM-only file (its Changer guidance, p. 28, is to write IIM and
+  XMP together): every digest is then left as it is and none is created. The
+  read side is unchanged: a stale digest found in a source file still elevates
+  the IIM value on read (RECONCILE-02), but a write that stores IIM and XMP
+  together has reconciled both and so refreshes it. Where reference
+  implementations diverge, the specification wins: ExifTool `MWG.pm` updates
+  only an absent or matching digest, and the Adobe XMP Toolkit
+  (`ReconcileIPTC.cpp:SetIPTCDigest`) writes it unconditionally, also for an
+  IIM-only write. Proven by `TestAppendSpliced_DigestPolicy` (internal/irb),
+  `TestInject_IPTCDigestPolicy` (format/jpeg), `TestUpsertIPTC_DigestPolicy`
+  (format/tiff), `TestInject_RawProfileIPTCDigest` (format/png),
+  `TestWrite_JPEGIPTCDigestCreated`, `TestWrite_JPEGStaleIPTCDigestRefreshed`
+  (iptc_photoshop_irb_test.go) and `TestCorpus_IPTCDigest`.
 - **IIM-COPY-01** IPTC copy in a JPEG trailer (task #322): an AFCP trailer
   (AXS File Concatenation Protocol, 1992) whose directory has an `IPTC` data
   set, and a FotoStation trailer whose tag 1 record holds the IIM, are

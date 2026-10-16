@@ -6,7 +6,7 @@ package gometadata
 // battery is machine-parseable. This file covers rules that live in the root
 // reconciliation layer rather than inside a single format package.
 //
-// Spec citation: MWG Guidelines v2.0 §3.3.1 (IPTC Digest reconciliation).
+// Spec citation: MWG Guidelines v2.0 §4.2.3.2 (Handling IPTC-IIM and XMP, pp. 26-29): IPTC digest reconciliation.
 
 import (
 	"bytes"
@@ -138,7 +138,7 @@ func buildMWG02JPEG(iptcCaption, xmpCaption string, digestBytes []byte) []byte {
 // under the IPTC↔XMP reconciliation rule numbering. No new test is added for
 // RECONCILE-02 — this doc comment is the traceability link.
 //
-// MWG Guidelines v2.0 §3.3.1: the Photoshop resource 0x0425 stores an MD5
+// MWG Guidelines v2.0 §4.2.3.2, p. 26: the Photoshop resource 1061 (0x0425) stores an MD5
 // digest of the raw 0x0404 IIM stream at the time XMP was last written.
 //
 //   - Digest match     → XMP has read priority (default MWG-01 behaviour).
@@ -155,7 +155,7 @@ func TestConformance_MWG02(t *testing.T) {
 	// --- (a) Digest match → XMP keeps read priority ---
 	t.Run("MWG-02/digest-match-xmp-wins", func(t *testing.T) {
 		t.Parallel()
-		// MWG §3.3.1: match means XMP was written after the last IPTC edit; XMP is authoritative.
+		// MWG §4.2.3.2, p. 27 (scenario 3): the checksum matches the IPTC-IIM block, so an existing XMP value is preferred.
 		rawIPTC := buildIPTCIIMBytes(iptcValue)
 		digest := iptc.Digest(rawIPTC)
 
@@ -172,7 +172,7 @@ func TestConformance_MWG02(t *testing.T) {
 	// --- (b) Digest mismatch → IPTC trust elevated; IPTC wins ---
 	t.Run("MWG-02/digest-mismatch-iptc-wins", func(t *testing.T) {
 		t.Parallel()
-		// MWG §3.3.1: mismatch means IPTC was edited independently of XMP; elevate IPTC.
+		// MWG §4.2.3.2, p. 28 (scenario 4): a mismatch means an XMP-unaware Changer edited the IPTC-IIM block; elevate IPTC.
 		// Use a wrong digest (all 0xAB) so it cannot accidentally match.
 		wrongDigest := [16]byte{0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB,
 			0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB}
@@ -190,7 +190,7 @@ func TestConformance_MWG02(t *testing.T) {
 	// --- (c) Digest absent → default MWG-01 (XMP priority) ---
 	t.Run("MWG-02/digest-absent-xmp-wins", func(t *testing.T) {
 		t.Parallel()
-		// MWG §3.3.1: when resource 0x0425 is missing, fall back to MWG-01 priority.
+		// MWG §4.2.3.2, p. 27 (scenario 3): when the checksum does not exist, an existing XMP value is preferred (MWG-01 priority).
 		jpegBytes := buildMWG02JPEG(iptcValue, xmpValue, nil /* no digest block */)
 		m, err := Read(bytes.NewReader(jpegBytes))
 		if err != nil {
@@ -204,8 +204,9 @@ func TestConformance_MWG02(t *testing.T) {
 	// --- (d) All-zero digest sentinel → IPTC trust elevated ---
 	t.Run("MWG-02/zero-digest-sentinel-iptc-wins", func(t *testing.T) {
 		t.Parallel()
-		// MWG §3.3.1: the all-zero digest (16 zero bytes) is the "unknown" sentinel;
-		// treat as mismatch and elevate IPTC trust.
+		// The all-zero digest (16 zero bytes) is this library's "unknown" sentinel; MWG
+		// §4.2.3.2 (pp. 26-29) defines no such value. It is treated as a mismatch and
+		// elevates IPTC trust.
 		zeroDigest := make([]byte, 16) // all zero
 
 		jpegBytes := buildMWG02JPEG(iptcValue, xmpValue, zeroDigest)

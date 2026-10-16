@@ -174,7 +174,7 @@ func psirIPTC(iptc, psir []byte) []byte {
 const PSIRTag = tagPSIR
 
 // IPTCDigest returns the 16-byte IPTC digest (Photoshop resource 0x0425, MWG
-// Guidelines v2.0 §3.3.1) stored in the Photoshop IRB (tag 0x8649) of IFD0 of
+// Guidelines v2.0 §4.2.3.2, p. 26; for TIFF, §4.2.3.4, p. 31) stored in the Photoshop IRB (tag 0x8649) of IFD0 of
 // the classic TIFF or BigTIFF stream data, or nil when the stream carries no
 // such resource. The result aliases data. data is a TIFF stream or its
 // metadata prefix (format/tiff Extract's rawEXIF); the magic number is not
