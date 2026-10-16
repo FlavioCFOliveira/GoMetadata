@@ -1,5 +1,6 @@
 # Memory Index
 
+- [Sprint 46 E6 (2026-10-16, done)](project_sprint46_e6_progress.md) — #358-#365: iinf count, bmff open-ended, Samsung rigid piece, Olympus MN-relative preview offset, KodakIFD, ExifVersion table, headerless Nikon, JPEG DNL
 - [Sprint 46 E1 (2026-10-16, done)](project_sprint46_e1_exif_mn_ifd1_type_mandatory_tail.md) — #317-#321,#360: EncodeRebased, IFD1 pointers, TypeUTF8=129, mandatory tags, TIFF tail; harness, perf, unfixed defects
 - [Sprint 46 E5b (2026-10-16)](project_sprint46_e5b_trailers_heif_cr3_nef_extxmp.md) — internal/trailer, heif meta selection, cr3 no-drop, NEF 0E0E, keep-ext-XMP frame; perf traps, unfixed defects
 - [Sprint 46 E5a (2026-10-15)](project_sprint46_e5a_digest_rework_xmp_xml_343_352.md) — MWG digest literal rule #323, opaque-segment guard #343, XML attr normalisation #344, unbound prefix #345, 65502 #351; perf +2%
