@@ -110,6 +110,15 @@ func putBytesReader(br *bytes.Reader) {
 // on every return path rather than defer, so the function stays simple to
 // reason about at every exit point.
 func zlibDecompress(data []byte) ([]byte, error) {
+	return zlibDecompressLimit(data, maxZlibDecompressSize)
+}
+
+// zlibDecompressLimit is zlibDecompress with the output capped at limit bytes
+// (at most maxZlibDecompressSize): a larger output is errDecompressBomb when
+// limit is the per-chunk cap, and ErrRawProfileBudget when it is a smaller
+// budget, in which case the inflate stops one byte past the limit.
+func zlibDecompressLimit(data []byte, limit int64) ([]byte, error) {
+	limit = min(limit, maxZlibDecompressSize)
 	br := bytesReaderPool.Get().(*bytes.Reader) //nolint:forcetypeassert,revive // bytesReaderPool.New always stores *bytes.Reader; pool invariant
 	br.Reset(data)
 
@@ -131,7 +140,7 @@ func zlibDecompress(data []byte) ([]byte, error) {
 	// Cap decompressed output to prevent decompression bombs: a crafted zlib
 	// stream with a tiny compressed payload can expand to gigabytes of output.
 	// Reading one byte beyond the limit lets us detect overflow without reading it all.
-	out, err := io.ReadAll(io.LimitReader(zr, maxZlibDecompressSize+1))
+	out, err := io.ReadAll(io.LimitReader(zr, limit+1))
 	// Return both pooled values now that reading has fully completed; zr is
 	// returned without closing so it can be Reset on next use.
 	zlibPool.Put(zr)
@@ -139,7 +148,10 @@ func zlibDecompress(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("png: zlib decompress: %w", err)
 	}
-	if int64(len(out)) > maxZlibDecompressSize {
+	if int64(len(out)) > limit {
+		if limit < maxZlibDecompressSize {
+			return nil, ErrRawProfileBudget
+		}
 		return nil, errDecompressBomb
 	}
 	return out, nil
@@ -162,7 +174,9 @@ func processExtractChunk(chunkType [4]byte, data []byte, st *extractState) (done
 		st.xmp = xmp
 		// "Raw profile type ..." chunks: decodeRawProfile always returns a fresh
 		// buffer, so nothing aliases the pooled data.
-		st.addRawProfile(chunkType, data)
+		if err := st.addRawProfile(chunkType, data); err != nil {
+			return false, err
+		}
 	case chunkIEND:
 		return true, nil
 	}
@@ -558,7 +572,7 @@ func writeVerbatimChunk(w io.Writer, hdr *[8]byte, data []byte, crcB [4]byte) er
 // rejected here rather than silently accepted.
 //
 //nolint:cyclop,gocyclo // straight-line chunk-type dispatch; splitting would obscure the shared bounds check every branch needs
-func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64, rawEXIF, rawIPTC, rawXMP []byte) (int64, error) {
+func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64, rawEXIF, rawIPTC, rawXMP []byte, budget *profileBudget) (int64, error) {
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return pos, fmt.Errorf("png: read chunk header: %w", err)
 	}
@@ -598,7 +612,7 @@ func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64
 		if err != nil {
 			return pos, fmt.Errorf("png: chunk %q: %w", chunkTypeStr(chunkType), err)
 		}
-		werr := writeTextChunk(w, hdr, chunkType, data, crcB, rawEXIF, rawIPTC, rawXMP)
+		werr := writeTextChunk(w, hdr, chunkType, data, crcB, rawEXIF, rawIPTC, rawXMP, budget)
 		release()
 		if werr != nil {
 			return pos, werr
@@ -627,12 +641,22 @@ func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64
 // task #325); an IPTC raw profile chunk is rewritten with rawIPTC when it
 // holds another IIM (rewriteRawProfileIPTC; a fresh CRC is computed); and any
 // other chunk is copied through byte-identical, original CRC included.
-func writeTextChunk(w io.Writer, hdr *[8]byte, chunkType [4]byte, data []byte, crcB [4]byte, rawEXIF, rawIPTC, rawXMP []byte) error {
-	if shouldDropChunk(chunkType, data) || rawProfileSuperseded(chunkType, data, rawEXIF != nil, rawXMP != nil) {
+//
+// budget bounds the text that all the raw profile chunks of the file inflate
+// to (security audit F-08); ErrRawProfileBudget is returned when it runs out.
+func writeTextChunk(w io.Writer, hdr *[8]byte, chunkType [4]byte, data []byte, crcB [4]byte, rawEXIF, rawIPTC, rawXMP []byte, budget *profileBudget) error {
+	if shouldDropChunk(chunkType, data) {
+		return nil
+	}
+	superseded, serr := rawProfileSupersededB(chunkType, data, rawEXIF != nil, rawXMP != nil, budget)
+	if serr != nil {
+		return serr
+	}
+	if superseded {
 		return nil
 	}
 	if rawIPTC != nil {
-		payload, ok, err := rewriteRawProfileIPTC(chunkType, data, rawIPTC, rawXMP != nil)
+		payload, ok, err := rewriteRawProfileIPTCB(chunkType, data, rawIPTC, rawXMP != nil, budget)
 		if err != nil {
 			return err
 		}
@@ -716,9 +740,10 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 
 	var hdr [8]byte
 	pos := int64(len(pngSig))
+	budget := newProfileBudget()
 	for {
 		var err error
-		pos, err = injectOneChunk(r, w, &hdr, pos, total, rawEXIF, rawIPTC, rawXMP)
+		pos, err = injectOneChunk(r, w, &hdr, pos, total, rawEXIF, rawIPTC, rawXMP, &budget)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break

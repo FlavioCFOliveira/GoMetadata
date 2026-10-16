@@ -12,6 +12,12 @@ import (
 // FuzzParseEXIF exercises the EXIF parser against arbitrary byte inputs.
 // Run with: go test -fuzz=FuzzParseEXIF -fuzztime=60s ./exif/...
 func FuzzParseEXIF(f *testing.F) {
+	// Security audit 2026-10-16: F-06a (IFDs of a chain addressing one
+	// thumbnail range) and F-06b (IFD0 entries addressing private IFDs whose
+	// data cannot all be carried), scaled down.
+	f.Add(auditThumbChain(40, 4096, func(int) int { return 0 }, 4096))
+	f.Add(auditPrivateIFDs(8, func(int) (int, int) { return 0, 4000 }, 4096))
+	f.Add(auditPrivateIFDs(3, func(i int) (int, int) { return i * 100, 100 }, 400))
 	// Seed corpus: minimal valid little-endian TIFF header.
 	f.Add([]byte("II\x2A\x00\x08\x00\x00\x00"))
 	// Seed corpus: minimal valid big-endian TIFF header.

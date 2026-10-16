@@ -1332,6 +1332,11 @@ func budgetValue(b *imageBlockBudget) imageBlockBudget {
 	return *b
 }
 
+// subIFDBudgetCost is the number of imageBlockBudget units one SubIFD visited
+// costs (see subIFDWalker.visit): at most maxAggregateImageBlocks/4 = 65536 of
+// them are built per write.
+const subIFDBudgetCost = 4
+
 // maxSubIFDChain bounds the main-chain IFDs whose SubIFDs enumerateSubIFDs
 // visits. exif.Parse follows at most 512 chained IFDs (maxTraverseChainIFDs);
 // real files chain a handful (a CR2 chains four).
@@ -1461,6 +1466,16 @@ func (w *subIFDWalker) visit(off uint64, depth int) (si *subIFDInfo, ok bool, er
 	}
 	if found := w.lookup(off); found != nil {
 		return found, true, nil
+	}
+	// Every SubIFD built costs subIFDBudgetCost units of the aggregate budget, whether it is
+	// named by a 0x014A array or only linked by a next-IFD pointer (security
+	// audit F-07b: array charges the pointers it reads, but the SubIFDs that
+	// chain follows from them were free, so 1024 heads x 512 links built 524288
+	// SubIFDs from a 3 MiB file). Each one allocates a parsed IFD and a raw
+	// copy, about 280 bytes against the 64 of an image block, hence the weight;
+	// a real file has a handful (DNG: one to four, plus a chain of previews).
+	if !w.budget.spend(subIFDBudgetCost) {
+		return nil, false, fmt.Errorf("tiff: SubIFD at offset %d: %w", off, ErrTooManyImageBlocks)
 	}
 	raw := rawSubIFD(w.base, off, w.bigTIFF, w.order)
 	if raw == nil {

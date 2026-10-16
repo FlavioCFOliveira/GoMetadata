@@ -49,12 +49,22 @@ const (
 // An IFD with a JPEG thumbnail, or without StripOffsets, is left alone. A
 // thumbnail whose strips cannot be carried is left as parsed and reported in
 // e.Warnings: Encode then writes its entries unchanged.
+//
+// The strips of all the IFDs together are bounded by the length of b, as the
+// JPEG thumbnails are (traverseBudget.chargeThumbnail): strips are disjoint
+// ranges of b, so a valid file never needs more, and without the bound the
+// IFDs of a chain addressing one range would be carried, and written by Encode,
+// once each (security audit F-06a).
 func attachThumbnailStrips(b []byte, e *EXIF, alias bool) {
+	remaining := len(b)
 	for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
 		if ifd.ThumbnailData != nil || ifd.Get(TagStripOffsets) == nil {
 			continue
 		}
-		strips, reason := readThumbnailStrips(b, ifd, alias)
+		strips, reason := readThumbnailStrips(b, ifd, alias, remaining)
+		for _, s := range strips {
+			remaining -= len(s)
+		}
 		if strips == nil {
 			e.Warnings = append(e.Warnings, "exif: thumbnail image data not carried: "+reason)
 			continue
@@ -68,7 +78,9 @@ func attachThumbnailStrips(b []byte, e *EXIF, alias bool) {
 
 // readThumbnailStrips returns the strips that the StripOffsets and
 // StripByteCounts entries of ifd address inside b, or nil and the reason.
-func readThumbnailStrips(b []byte, ifd *IFD, alias bool) (strips [][]byte, reason string) {
+//
+// limit bounds the total strip bytes (the allowance left to the chain).
+func readThumbnailStrips(b []byte, ifd *IFD, alias bool, limit int) (strips [][]byte, reason string) {
 	offE, cntE := ifd.Get(TagStripOffsets), ifd.Get(TagStripByteCounts)
 	n, reason := stripCount(offE, cntE)
 	if reason != "" {
@@ -84,6 +96,9 @@ func readThumbnailStrips(b []byte, ifd *IFD, alias bool) (strips [][]byte, reaso
 		total += size // size is bounded below before the next addition can overflow
 		if size > maxThumbnailStripBytes || total > maxThumbnailStripBytes {
 			return nil, "the strip data exceeds " + strconv.Itoa(maxThumbnailStripBytes) + " bytes"
+		}
+		if total > uint64(max(limit, 0)) {
+			return nil, "the strip data of the IFD chain exceeds the size of the Exif data"
 		}
 		if !boundscheck.Fits(off, size, uint64(len(b))) {
 			return nil, "a strip lies outside the Exif data"

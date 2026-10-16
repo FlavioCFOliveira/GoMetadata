@@ -398,8 +398,7 @@ func applyMetaDelta(data []byte, ilocInfo ilocBoxInfo, pendingByID map[uint16]pe
 	// Applied to the whole file (not a truncated prefix copy) so that a box
 	// wrapping the meta box, which ends beyond metaAbsStart, is seen whole
 	// and its size patched.
-	patchAncestorSize(data, metaAbsStart, delta)
-	return nil
+	return patchAncestorSize(data, metaAbsStart, delta)
 }
 
 // ---------------------------------------------------------------------------
@@ -968,11 +967,19 @@ func shiftChunkOffset(p []byte, wide bool, threshold, delta int64) error {
 	return nil
 }
 
+// errMalformedAncestorBox reports a top-level box whose declared size cannot
+// be valid: below its own header length, or an extended size below 16.
+var errMalformedAncestorBox = errors.New("heif: malformed box size before the metadata box")
+
 // patchAncestorSize adds delta to the size field of any top-level container
 // box in data whose byte range contains metaAbsStart (i.e. wraps the meta
 // box). This is needed when meta is nested inside moov and meta changes size.
 // data must be the whole file: a box that wraps the meta box ends beyond
 // metaAbsStart and is skipped when data is truncated before its end.
+//
+// Only boxes that START before metaAbsStart are walked: a box that wraps the
+// meta box necessarily begins before it, so the boxes after it (and any
+// trailing bytes) are never examined (security audit F-02).
 //
 // Both 32-bit and 64-bit extended-size (size==1) boxes are handled:
 //   - 32-bit: if the updated size would exceed 0xFFFFFFFF the patch is skipped
@@ -980,61 +987,82 @@ func shiftChunkOffset(p []byte, wide bool, threshold, delta int64) error {
 //     the size field would be worse than leaving it stale).
 //   - 64-bit (size field == 1): the 8-byte largesize at bytes [pos+8:pos+16] is
 //     read, incremented by delta, and written back.
-func patchAncestorSize(data []byte, metaAbsStart, delta int) {
+//
+// A box whose declared size is smaller than its own header never advances the
+// walk; it returns errMalformedAncestorBox. ISO/IEC 14496-12 §4.2: size is
+// "the entire box, including the box header"; a value of 2..7, or an extended
+// size below 16, cannot describe a box. Reference: libheif
+// BoxHeader::parse_header rejects the same sizes.
+func patchAncestorSize(data []byte, metaAbsStart, delta int) error {
 	pos := 0
-	for pos+8 <= len(data) {
-		rawSize32 := binary.BigEndian.Uint32(data[pos:])
-		if rawSize32 == 1 {
-			advanced, done := patchAncestorSizeExtended(data, pos, metaAbsStart, delta)
-			if done {
-				return
-			}
-			pos = advanced
-			continue
+	for pos+8 <= len(data) && pos < metaAbsStart {
+		var (
+			advanced int
+			done     bool
+			err      error
+		)
+		if binary.BigEndian.Uint32(data[pos:]) == 1 {
+			advanced, done, err = patchAncestorSizeExtended(data, pos, metaAbsStart, delta)
+		} else {
+			advanced, done, err = patchAncestorSize32(data, pos, metaAbsStart, delta)
 		}
-		advanced, done := patchAncestorSize32(data, pos, metaAbsStart, delta)
+		if err != nil {
+			return err
+		}
 		if done {
-			return
+			return nil
+		}
+		if advanced <= pos { // defensive: the walk must always make progress
+			return errMalformedAncestorBox
 		}
 		pos = advanced
 	}
+	return nil
 }
 
 // patchAncestorSizeExtended handles the extended 64-bit size (size==1) branch
-// of patchAncestorSize. Returns (newPos, true) when scanning must stop (box
-// wraps metaAbsStart or data is truncated); returns (newPos, false) to advance.
+// of patchAncestorSize. Returns (newPos, true, nil) when scanning must stop
+// (box wraps metaAbsStart or data is truncated); returns (newPos, false, nil)
+// to advance.
 // ISO 14496-12 §4.2: if size==1, the 64-bit largesize follows the 4-byte type.
-func patchAncestorSizeExtended(data []byte, pos, metaAbsStart, delta int) (newPos int, done bool) {
+func patchAncestorSizeExtended(data []byte, pos, metaAbsStart, delta int) (newPos int, done bool, err error) {
 	if pos+16 > len(data) {
-		return pos, true
+		return pos, true, nil
 	}
 	size64 := binary.BigEndian.Uint64(data[pos+8:])
-	if uint64(pos)+size64 > uint64(len(data)) { //nolint:gosec // G115: pos is non-negative (loop guard)
-		return pos, true
+	if size64 < 16 { // header is 16 bytes: a smaller largesize never advances
+		return pos, true, errMalformedAncestorBox
 	}
-	boxEnd := pos + int(size64) //nolint:gosec // G115: ISOBMFF box size bounded by file size
+	// Bound by the remaining length, not pos+size64, which can wrap uint64.
+	if size64 > uint64(len(data)-pos) { //nolint:gosec // G115: pos <= len(data) (loop guard)
+		return pos, true, nil
+	}
+	boxEnd := pos + int(size64) //nolint:gosec // G115: size64 <= len(data)-pos
 	if pos < metaAbsStart && metaAbsStart < boxEnd {
 		newSize64 := int64(size64) + int64(delta) //nolint:gosec // G115: delta bounded by meta box size change
 		if newSize64 > 0 {
 			binary.BigEndian.PutUint64(data[pos+8:], uint64(newSize64))
 		}
-		return pos, true
+		return pos, true, nil
 	}
-	return pos + int(size64), false //nolint:gosec // G115: ISOBMFF box size bounded by file size
+	return boxEnd, false, nil
 }
 
 // patchAncestorSize32 handles the 32-bit size branch of patchAncestorSize.
-// Returns (newPos, true) when scanning must stop; returns (newPos, false) to
-// advance to the next box.
-func patchAncestorSize32(data []byte, pos, metaAbsStart, delta int) (newPos int, done bool) {
+// Returns (newPos, true, nil) when scanning must stop; returns
+// (newPos, false, nil) to advance to the next box.
+func patchAncestorSize32(data []byte, pos, metaAbsStart, delta int) (newPos int, done bool, err error) {
 	size := uint64(binary.BigEndian.Uint32(data[pos:]))
 	if size == 0 {
 		size = uint64(len(data) - pos) //nolint:gosec // G115: len(data)-pos is non-negative (guarded above)
 	}
-	if uint64(pos)+size > uint64(len(data)) { //nolint:gosec // G115: pos is non-negative (loop guard)
-		return pos, true
+	if size < 8 { // header is 8 bytes: 2..7 cannot describe a box
+		return pos, true, errMalformedAncestorBox
 	}
-	boxEnd := pos + int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
+	if size > uint64(len(data)-pos) { //nolint:gosec // G115: pos <= len(data) (loop guard)
+		return pos, true, nil
+	}
+	boxEnd := pos + int(size) //nolint:gosec // G115: size <= len(data)-pos
 	if pos < metaAbsStart && metaAbsStart < boxEnd {
 		// Guard against uint32 overflow: if newSize > 0xFFFFFFFF, skip the
 		// patch rather than silently truncating. ISO 14496-12 §4.2: boxes
@@ -1043,9 +1071,9 @@ func patchAncestorSize32(data []byte, pos, metaAbsStart, delta int) (newPos int,
 		if newSize > 0 && uint64(newSize) <= 0xFFFFFFFF {
 			binary.BigEndian.PutUint32(data[pos:], uint32(newSize))
 		}
-		return pos, true
+		return pos, true, nil
 	}
-	return pos + int(size), false //nolint:gosec // G115: ISOBMFF box size bounded by file size
+	return boxEnd, false, nil
 }
 
 // ---------------------------------------------------------------------------

@@ -68,13 +68,24 @@ import (
 // it for the writer of the container, which knows where the data lands. The
 // strips of an uncompressed thumbnail are written by Encode itself when Parse
 // read them (CarryThumbnailStrips, task #368).
+//
+// The data carried from src, for the MakerNote and the private IFDs together,
+// is bounded by the length of src (16 MiB at most); a stream whose private IFDs
+// address more makes EncodeRebased return ErrCarriedDataTooLarge instead of
+// writing pointers that no longer address their data.
 func EncodeRebased(e *EXIF, src []byte) ([]byte, error) {
-	plan := planMakerNote(e, src)
+	// One allowance for everything carried from src, the MakerNote data and
+	// every private IFD together: valid data are disjoint ranges of src, so a
+	// valid stream never needs more than len(src) (security audit F-06b: 40
+	// private IFDs, each with its own 16 MiB allowance, grew a 15 MiB stream to
+	// 639 MiB).
+	carry := min(len(src), maxMakerNoteCarry)
+	plan := planMakerNote(e, src, &carry)
 	out, _, err := serialise(nil, e, false, plan)
 	if err != nil {
 		return nil, err
 	}
-	return appendPrivateIFD(out, e, src), nil // the private IFD of IFD0, if any (private_ifd.go)
+	return appendPrivateIFD(out, e, src, &carry) // the private IFDs of IFD0, if any (private_ifd.go)
 }
 
 // mnFix is one pointer of a TIFF-relative MakerNote IFD: the 4-byte field at
@@ -135,7 +146,10 @@ func holdsMakerNote(src []byte, off uint64, mn []byte) bool {
 // the MakerNote needs none (absent, inline, not an IFD, BigTIFF, or a layout
 // that moves unchanged and addresses nothing outside itself). src is the
 // stream e was parsed from, or nil.
-func planMakerNote(e *EXIF, src []byte) *mnPlan {
+//
+// carry is the allowance of bytes that may be copied from src; the walk spends
+// from it.
+func planMakerNote(e *EXIF, src []byte, carry *int) *mnPlan {
 	mn, mk := makerNoteOf(e)
 	if mn == nil {
 		return nil
@@ -155,9 +169,10 @@ func planMakerNote(e *EXIF, src []byte) *mnPlan {
 	w.init(mn, lay, int64(mnOff)) //nolint:gosec // G115: a classic TIFF offset, below 2^32
 	if holdsMakerNote(src, mnOff, mn) {
 		w.src = src // the data to carry
-		w.budget = min(len(src), maxMakerNoteCarry)
 	}
+	w.budget = *carry // spent only when w.src can be read, see mnWalker.carry
 	w.walkIFD(lay.IFDOffset, 0)
+	*carry = w.budget
 	if !w.tiffRel && !w.copied {
 		return nil // nothing changed: the MakerNote moves as it is
 	}

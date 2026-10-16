@@ -206,6 +206,7 @@ type mnWalker struct {
 	origin  int64  // TIFF offset that the TIFF-relative pointers were written for: mnOff, or the Canon footer
 	src     []byte // the source stream; nil when it cannot be trusted
 	budget  int    // bytes that may still be carried
+	over    bool   // a value to carry was refused because it exceeds budget
 	steps   int
 	copied  bool
 	nikon   bool // a Nikon note: Type 1, 2 (headerless) or 3
@@ -420,7 +421,11 @@ func (w *mnWalker) carry(target, total int64) (int, bool) {
 		return 0, false
 	}
 	pos := w.mnOff + target
-	if pos < 0 || total > int64(len(w.src)) || pos > int64(len(w.src))-total || total > int64(w.budget) {
+	if pos < 0 || total > int64(len(w.src)) || pos > int64(len(w.src))-total {
+		return 0, false
+	}
+	if total > int64(w.budget) {
+		w.over = true
 		return 0, false
 	}
 	key := [2]int64{pos, total}

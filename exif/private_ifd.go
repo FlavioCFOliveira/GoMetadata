@@ -49,6 +49,11 @@ import (
 // of Kodak images (see the top of this file).
 const tagKodakIFD = TagID(0x8290)
 
+// maxPrivateIFDsCarried bounds the private IFDs that one EncodeRebased call
+// carries, over all the entries of IFD0 together (ExifTool: MaxSubdirs => 10
+// for one SubIFD entry, and a real file has one or two such entries).
+const maxPrivateIFDsCarried = 64
+
 // privateIFDTags are the LONG tags of IFD0 that hold the offset of an IFD
 // without being of type IFD (see the top of this file).
 var privateIFDTags = [...]TagID{TagSubIFDs, 0x0190, tagKodakIFD, 0x888A, 0xFE00} //nolint:gochecknoglobals // read-only registry
@@ -85,36 +90,53 @@ const maxPrivateIFDEntries = 255
 // does not address a plausible IFD in src (that entry is left as it is), or src
 // is not the stream e was parsed from (nil). BigTIFF is not handled, as for the
 // MakerNote.
-func appendPrivateIFD(out []byte, e *EXIF, src []byte) []byte {
+//
+// carry is the allowance of bytes that may still be copied from src, shared with
+// the MakerNote (EncodeRebased); the IFDs and values carried are spent from it.
+// ErrCarriedDataTooLarge is returned when a private IFD or its data does not
+// fit the allowance, or when IFD0 points to more than maxPrivateIFDsCarried.
+func appendPrivateIFD(out []byte, e *EXIF, src []byte, carry *int) ([]byte, error) {
 	if e == nil || e.BigTIFF || e.IFD0 == nil || src == nil || len(out) < 8 {
-		return out
+		return out, nil
 	}
 	order := e.ifd0ByteOrder()
+	carried := 0
 	for i := range e.IFD0.Entries {
-		if ent := &e.IFD0.Entries[i]; isPrivateIFDPointer(ent) {
-			out = appendEntryIFDs(out, ent, src, order)
+		ent := &e.IFD0.Entries[i]
+		if !isPrivateIFDPointer(ent) {
+			continue
+		}
+		var err error
+		if out, err = appendEntryIFDs(out, ent, src, order, carry, &carried); err != nil {
+			return nil, err
 		}
 	}
-	return out
+	return out, nil
 }
 
 // appendEntryIFDs carries the IFD that each offset of the IFD0 entry ent
-// addresses (see appendPrivateIFD).
-func appendEntryIFDs(out []byte, ent *IFDEntry, src []byte, order binary.ByteOrder) []byte {
+// addresses (see appendPrivateIFD); carried counts the IFDs carried so far.
+func appendEntryIFDs(out []byte, ent *IFDEntry, src []byte, order binary.ByteOrder, carry, carried *int) ([]byte, error) {
 	field, ok := findIFD0EntryField(out, ent.Tag, order)
 	if !ok {
-		return out
+		return out, nil
 	}
 	for k := range int(ent.Count) {
-		w, ok := carryPrivateIFD(ent, k, src, order)
+		w, ok, err := carryPrivateIFD(ent, k, src, order, carry)
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
 			continue
+		}
+		if *carried++; *carried > maxPrivateIFDsCarried {
+			return nil, ErrCarriedDataTooLarge
 		}
 		if at, ok := elementField(out, field, int(ent.Count), k, order); ok {
 			out = placePrivateIFD(out, w, at, order)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // elementField returns the position in out of the 4-byte offset k of the entry
@@ -152,13 +174,18 @@ func placePrivateIFD(out []byte, w *mnWalker, at int, order binary.ByteOrder) []
 // carryPrivateIFD walks the IFD that offset k of the IFD0 entry ent points to
 // and returns the walker that holds its bytes, with the values it addresses
 // outside it appended, and the pointers to set once the block has a position.
-func carryPrivateIFD(ent *IFDEntry, k int, src []byte, order binary.ByteOrder) (*mnWalker, bool) {
+// The block and the values are spent from carry; ErrCarriedDataTooLarge is
+// returned when they do not fit it.
+func carryPrivateIFD(ent *IFDEntry, k int, src []byte, order binary.ByteOrder, carry *int) (*mnWalker, bool, error) {
 	off := int64(order.Uint32(ent.Value[4*k:]))
 	n, ok := privateIFDEntries(src, off, order)
 	if !ok {
-		return nil, false
+		return nil, false, nil
 	}
 	size := 2 + 12*n + 4 // TIFF 6.0 §2: count, entries, next-IFD offset
+	if size > *carry {
+		return nil, false, ErrCarriedDataTooLarge
+	}
 	blob := bytes.Clone(src[off : off+int64(size)])
 	clear(blob[size-4:]) // the next-IFD offset addresses a chain that is not carried
 
@@ -168,9 +195,13 @@ func carryPrivateIFD(ent *IFDEntry, k int, src []byte, order binary.ByteOrder) (
 	w.origin = off // the pointers count from the TIFF header, whatever the end of the IFD holds
 	w.noCarry = countCrossing(blob, lay, w.origin) > 0
 	w.src = src
-	w.budget = min(len(src), maxMakerNoteCarry)
+	w.budget = *carry - size
 	w.walkIFD(0, 0)
-	return w, true
+	if w.over {
+		return nil, false, ErrCarriedDataTooLarge
+	}
+	*carry = w.budget
+	return w, true, nil
 }
 
 // privateIFDEntries returns the entry count of the plausible IFD at offset off

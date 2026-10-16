@@ -23,7 +23,7 @@ import (
 // fixtureU32 converts a fixture offset or length, which is small by
 // construction, to uint32 with an explicit clamp, so that the conversion is
 // provably safe.
-func fixtureU32(n int) uint32 { return uint32(max(0, min(n, math.MaxUint32))) }
+func fixtureU32(n int) uint32 { return uint32(max(int64(0), min(int64(n), math.MaxUint32))) }
 
 // cr2Fixture builds a synthetic Canon CR2 following the lclevy CR2 layout:
 // 16-byte header (TIFF header, "CR\x02\x00", RAW IFD offset), IFD0 (main

@@ -59,3 +59,12 @@ var ErrBigTIFFPointerOverflow = errors.New("exif: BigTIFF sub-IFD or thumbnail p
 //
 // BigTIFF spec §2 (Aware Systems / libtiff); task #264.
 var ErrBigTIFFEncodeSizeExceeded = errors.New("exif: encoded BigTIFF size exceeds the sanity ceiling")
+
+// ErrCarriedDataTooLarge is returned by EncodeRebased when the data that the
+// private IFDs of IFD0 address outside their own structures, together with the
+// data of the MakerNote, is larger than the Exif stream it was read from (the
+// data of a valid stream are disjoint ranges of it), or when IFD0 points to
+// more private IFDs than any real file has. Writing the stream anyway would
+// leave pointers that no longer address their data, or let a small stream
+// grow without bound (CWE-400).
+var ErrCarriedDataTooLarge = errors.New("exif: the data referenced by the metadata is larger than the Exif block it was read from")

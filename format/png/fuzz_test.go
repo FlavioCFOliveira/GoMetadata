@@ -8,6 +8,12 @@ import (
 )
 
 func FuzzPNGExtract(f *testing.F) {
+	// Security audit 2026-10-16 F-08: repeated raw profile zlib bombs, scaled
+	// down to 1 MiB each (the budget logic is size independent).
+	{
+		bomb := auditProfileBomb(1)
+		f.Add(pngWithChunks([2]any{"zTXt", bomb}, [2]any{"zTXt", bomb}, [2]any{"zTXt", bomb}))
+	}
 	// Seed with a valid minimal PNG (signature + IHDR + IEND).
 	seed := buildPNG(nil, nil)
 	f.Add(seed)
@@ -73,6 +79,11 @@ func FuzzPNGExtract(f *testing.F) {
 // focuses on structural variation in the container bytes. rawIPTC is always
 // nil because PNG does not natively support IPTC (Inject ignores it).
 func FuzzPNGInject(f *testing.F) {
+	// Security audit 2026-10-16 F-08: repeated raw profile zlib bombs.
+	{
+		bomb := auditProfileBomb(1)
+		f.Add(pngWithChunks([2]any{"zTXt", bomb}, [2]any{"zTXt", bomb}))
+	}
 	// Seed 1: minimal valid PNG (signature + IHDR + IEND) — no existing
 	// metadata chunks.
 	f.Add(buildPNG(nil, nil))

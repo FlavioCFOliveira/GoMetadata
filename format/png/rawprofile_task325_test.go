@@ -234,7 +234,7 @@ func FuzzRawProfileSuperseded(f *testing.F) {
 			return
 		}
 		var st extractState
-		st.addRawProfile(ct, data)
+		_ = st.addRawProfile(ct, data)
 		if st.profEXIF == nil && st.profXMP == nil {
 			t.Fatalf("dropped a raw profile that Extract does not read: %q", data)
 		}

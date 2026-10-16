@@ -287,20 +287,21 @@ func metadataEnd(prefix []byte) uint64 {
 //nolint:gochecknoglobals // sync.Pool: reuse avoids two allocations per write
 var extentScanPool = sync.Pool{New: func() any { return &extentScan{seenIFD: make(map[uint64]bool, 16)} }}
 
-// writeHeaderAndBlocks writes header and then every block's bytes to w (see
-// writeRelocated).
-func writeHeaderAndBlocks(r io.ReadSeeker, w io.Writer, header []byte, blocks []*imageBlock, prefix []byte, wholeFile bool) error {
-	if _, err := w.Write(header); err != nil {
-		return fmt.Errorf("tiff: write header: %w", err)
-	}
-	if len(blocks) == 0 {
-		return nil
-	}
-	fileLen, err := resolveFileLen(r, prefix, wholeFile)
-	if err != nil {
-		return err
-	}
-
+// checkBlocks validates every block against the source's true total length and
+// against each other before anything is written: each block must lie inside the
+// source, and together the blocks must not hold more bytes than the source does.
+//
+// The second rule is what keeps the output proportional to the input. Image
+// data (strips, tiles, thumbnails) are disjoint byte ranges of the file (TIFF
+// 6.0 §7, p. 39: StripOffsets "for each strip, the byte offset of that strip";
+// libtiff TIFFReadDirectory validates each strip against the file size but a
+// repeated range is only ever READ again, never written again), so a valid
+// file's blocks add up to at most its length. A StripOffsets array that repeats
+// one range N times used to make Write copy it N times: a 1 MiB file wrote
+// 2000 MiB (security audit F-07a). Reference: Exiv2 TiffImage writes each
+// strip once per IFD entry it owns, and its sizes are bounded by the file.
+func checkBlocks(blocks []*imageBlock, fileLen uint64) error {
+	var total uint64
 	for _, blk := range blocks {
 		// fits (extent.go), not a raw `blk.srcOffset+blk.size > fileLen`
 		// comparison: a crafted BigTIFF LONG8 offset/size pair can wrap that
@@ -312,8 +313,33 @@ func writeHeaderAndBlocks(r io.ReadSeeker, w io.Writer, header []byte, blocks []
 			return fmt.Errorf("tiff: image block offset=%d size=%d: %w",
 				blk.srcOffset, blk.size, ErrBlockOutOfBounds)
 		}
+		// blk.size <= fileLen (fits), so the comparison cannot overflow.
+		if blk.size > fileLen-min(total, fileLen) {
+			return fmt.Errorf("tiff: image blocks add up to more than the %d bytes of the file: %w", fileLen, ErrImageBlocksOverlap)
+		}
+		total += blk.size
+	}
+	return nil
+}
+
+// writeHeaderAndBlocks writes header and then every block's bytes to w (see
+// writeRelocated).
+func writeHeaderAndBlocks(r io.ReadSeeker, w io.Writer, header []byte, blocks []*imageBlock, prefix []byte, wholeFile bool) error {
+	if len(blocks) > 0 {
+		fileLen, err := resolveFileLen(r, prefix, wholeFile)
+		if err != nil {
+			return err
+		}
+		if err := checkBlocks(blocks, fileLen); err != nil {
+			return err
+		}
+	}
+	if _, err := w.Write(header); err != nil {
+		return fmt.Errorf("tiff: write header: %w", err)
+	}
+	for _, blk := range blocks {
 		if wholeFile {
-			end := blk.srcOffset + blk.size // safe: fits() above proved this cannot overflow
+			end := blk.srcOffset + blk.size // safe: checkBlocks proved this cannot overflow
 			if _, err := w.Write(prefix[blk.srcOffset:end]); err != nil {
 				return fmt.Errorf("tiff: write image block: %w", err)
 			}

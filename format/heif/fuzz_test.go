@@ -8,6 +8,18 @@ import (
 )
 
 func FuzzHEIFExtract(f *testing.F) {
+	// Security audit 2026-10-16 F-01: extent lengths 100 + (2^64-50) wrap to 50.
+	f.Add(buildAuditFile([][]byte{bmffInfeV2(1, "Exif")}, []ilocTestEntry{
+		{id: 1, extents: [][2]uint64{{0, 100}, {0, ^uint64(0) - 49}}},
+	}))
+	// Security audit 2026-10-16 F-09: two items each claiming 250 MiB.
+	f.Add(buildAuditFile([][]byte{
+		bmffInfeV2(1, "Exif"),
+		bmffInfeV2WithContentType(2, "mime", "application/rdf+xml"),
+	}, []ilocTestEntry{
+		{id: 1, extents: [][2]uint64{{0, 250 << 20}}},
+		{id: 2, extents: [][2]uint64{{0, 250 << 20}}},
+	}))
 	// Seed with a minimal HEIF/ISOBMFF structure.
 	// ftyp box: size=20, type="ftyp", brand="heic", version=0, compat="mif1"
 	seed := []byte{
@@ -153,6 +165,9 @@ func FuzzHEIFExtract(f *testing.F) {
 // Both rawEXIF and rawXMP are fixed short payloads so the fuzzer focuses on
 // structural variation in the container bytes.
 func FuzzHEIFInject(f *testing.F) {
+	// Security audit 2026-10-16 F-02: a trailing box with a zero largesize.
+	f.Add(append(buildHEIF([]byte("II*\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00"), nil),
+		0, 0, 0, 4, 0, 0, 0, 1, 'a', 'b', 'c', 'd', 0, 0, 0, 0, 0, 0, 0, 0))
 	// Seed 1: minimal ftyp box only — no meta box; exercises the
 	// ErrNoMetadataContainer path (findMetaBoxAbs returns found=false).
 	f.Add([]byte{

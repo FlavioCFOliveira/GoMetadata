@@ -2,6 +2,7 @@ package xmp
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 )
 
@@ -42,6 +43,11 @@ func FuzzParseXMP(f *testing.F) {
 	f.Add(attrDoc("a\tb\nc\r\nd&#9;&#10;&#13;e", `"`))
 	f.Add(xmpDoc(`<rdf:Description rdf:about="urn:a&#9;b&#10;c" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Label="v"/>`))
 	f.Add(xmpDoc(`<rdf:Description rdf:about=""><zz:Foo>v</zz:Foo></rdf:Description>`))
+	// Security audit 2026-10-16: F-04 (namespace scope index), F-05 (element
+	// tree size), F-10 (CDATA chain), at sizes that cross nsIndexThreshold.
+	f.Add(auditNSXMLLang(3 * nsIndexThreshold))
+	f.Add(auditWrap(`<rdf:Description rdf:about="">` + strings.Repeat("<a/>", 4096) + `</rdf:Description>`))
+	f.Add(auditWrap(`<rdf:Description rdf:about="" xmlns:p="http://p/"><p:v>x` + strings.Repeat(`<!----><![CDATA[y]]>`, 512) + `</p:v></rdf:Description>`))
 
 	f.Fuzz(func(t *testing.T, b []byte) {
 		x, err := Parse(b)

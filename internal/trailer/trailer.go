@@ -103,9 +103,10 @@ const maxAFCPEntries = 4096
 const afcpIPTCTag = "IPTC"
 
 var (
-	afcpSigBE = []byte("AXS!")                 //nolint:gochecknoglobals // package-level constant bytes
-	afcpSigLE = []byte("AXS*")                 //nolint:gochecknoglobals // package-level constant bytes
-	fotoSig   = []byte{0xA1, 0xB2, 0xC3, 0xD4} //nolint:gochecknoglobals // package-level constant bytes
+	afcpSigBE     = []byte("AXS!")                 //nolint:gochecknoglobals // package-level constant bytes
+	afcpSigLE     = []byte("AXS*")                 //nolint:gochecknoglobals // package-level constant bytes
+	afcpSigPrefix = []byte("AXS")                  //nolint:gochecknoglobals // package-level constant bytes
+	fotoSig       = []byte{0xA1, 0xB2, 0xC3, 0xD4} //nolint:gochecknoglobals // package-level constant bytes
 )
 
 // FotoSig is the 4-byte signature that ends every FotoStation record.
@@ -274,40 +275,67 @@ type AFCP struct {
 	Entries    []AFCPEntry
 }
 
+// maxAFCPSignatures bounds the AFCP signatures ("AXS!" or "AXS*") that
+// FindAFCP examines in one region. A real trailer holds two (the header and
+// the EOF record) and the region follows the image data, so chance matches are
+// as rare as a 4-byte value occurring by accident; a region with more is not an
+// AFCP trailer but an attempt to make the candidate x EOF-record search
+// quadratic (security audit F-03: 15 s for 512 KiB), and it is left to the
+// caller to copy unchanged. The signatures are collected in ONE linear pass
+// and every later step works on that list, so FindAFCP costs O(len(region) +
+// maxAFCPSignatures^2 + maxAFCPSignatures*maxAFCPEntries) at worst.
+// Reference: ExifTool bounds the same search by reading only the last 12 bytes
+// of the file (lib/Image/ExifTool.pm IdentifyTrailer, AFCP.pm).
+const maxAFCPSignatures = 256
+
 // FindAFCP returns the AFCP trailer in region, the bytes of the file from the
 // absolute offset base to its end, or nil. A candidate must start with an
 // AFCP signature, hold a directory whose entries lie after it, and be closed
 // by an EOF record that carries the offset of the candidate (AFCP
 // specification: the EOF record "points to AFCP header").
 func FindAFCP(region []byte, base int64) *AFCP {
-	for from := 0; from < len(region); {
-		i := indexAFCPSig(region[from:])
-		if i < 0 {
-			return nil
-		}
-		at := from + i
-		if t := parseAFCP(region, base, at); t != nil {
+	var buf [maxAFCPSignatures]int
+	sigs := collectAFCPSigs(buf[:0], region)
+	if sigs == nil {
+		return nil // more than maxAFCPSignatures signatures: see the constant
+	}
+	for ci, at := range sigs {
+		if t := parseAFCP(region, base, at, sigs[ci+1:]); t != nil {
 			return t
 		}
-		from = at + 1
 	}
 	return nil
 }
 
-// indexAFCPSig returns the index of the first AFCP signature of b, or -1.
-func indexAFCPSig(b []byte) int {
-	be, le := bytes.Index(b, afcpSigBE), bytes.Index(b, afcpSigLE)
-	switch {
-	case be < 0:
-		return le
-	case le < 0:
-		return be
+// collectAFCPSigs appends to dst the offsets, in ascending order, of every
+// AFCP signature of region, in one pass. It returns nil when there are more
+// than cap(dst); a non-nil dst[:0] therefore always yields a non-nil result.
+func collectAFCPSigs(dst []int, region []byte) []int {
+	sigs := dst[:0]
+	from := 0
+	for from < len(region) {
+		i := bytes.Index(region[from:], afcpSigPrefix)
+		if i < 0 {
+			break
+		}
+		at := from + i
+		from = at + 1
+		if at+4 > len(region) || (region[at+3] != '!' && region[at+3] != '*') {
+			continue
+		}
+		if len(sigs) == cap(sigs) {
+			return nil
+		}
+		sigs = append(sigs, at)
+		from = at + 4 // a signature cannot overlap another one
 	}
-	return min(be, le)
+	return sigs
 }
 
 // parseAFCP parses the candidate AFCP trailer at region[at:], or returns nil.
-func parseAFCP(region []byte, base int64, at int) *AFCP {
+// later holds the offsets of the signatures that follow at, the places the EOF
+// record can be.
+func parseAFCP(region []byte, base int64, at int, later []int) *AFCP {
 	rem := region[at:]
 	if len(rem) < 24 { // header and EOF record
 		return nil
@@ -319,58 +347,75 @@ func parseAFCP(region []byte, base int64, at int) *AFCP {
 		t.Order = binary.BigEndian
 	}
 	copy(t.Version[:], rem[4:6])
-	dataEnd, ok := t.parseDirectory(rem)
+	count, dataEnd, ok := t.checkDirectory(rem)
 	if !ok {
 		return nil
 	}
-	rec, ok := t.findEOFRecord(rem, dataEnd)
+	rec, ok := t.findEOFRecord(region, at, dataEnd, later)
 	if !ok {
 		return nil
 	}
 	t.End = t.Start + rec + 12
+	t.readEntries(rem, count) // only a trailer that is accepted allocates
 	return t
 }
 
-// parseDirectory reads the directory entries of the trailer whose bytes start
-// at rem[0], and returns the end of the data they name, relative to the
-// trailer. The entries must lie after the directory and inside rem.
-func (t *AFCP) parseDirectory(rem []byte) (dataEnd int64, ok bool) {
-	count := int(t.Order.Uint16(rem[6:]))
+// checkDirectory validates the directory entries of the trailer whose bytes
+// start at rem[0], without allocating, and returns their count and the end of
+// the data they name, relative to the trailer. The entries must lie after the
+// directory and inside rem.
+func (t *AFCP) checkDirectory(rem []byte) (count int, dataEnd int64, ok bool) {
+	count = int(t.Order.Uint16(rem[6:]))
 	dirEnd := 12 + 12*count
 	if count > maxAFCPEntries || dirEnd+12 > len(rem) {
-		return 0, false
+		return 0, 0, false
 	}
 	dataEnd = int64(dirEnd)
 	for i := range count {
 		d := rem[12+12*i:]
-		var e AFCPEntry
-		copy(e.Tag[:], d[:4])
 		n := int64(t.Order.Uint32(d[4:]))
 		off := int64(t.Order.Uint32(d[8:])) - t.Start // relative to the trailer
 		if off < int64(dirEnd) || n > int64(len(rem)) || off > int64(len(rem))-n {
-			return 0, false
+			return 0, 0, false
 		}
-		e.Data = rem[off : off+n]
-		t.Entries = append(t.Entries, e)
 		dataEnd = max(dataEnd, off+n)
 	}
-	return dataEnd, true
+	return count, dataEnd, true
+}
+
+// readEntries fills t.Entries from the directory that checkDirectory accepted.
+func (t *AFCP) readEntries(rem []byte, count int) {
+	if count == 0 {
+		return
+	}
+	t.Entries = make([]AFCPEntry, count)
+	for i := range count {
+		d := rem[12+12*i:]
+		e := &t.Entries[i]
+		copy(e.Tag[:], d[:4])
+		n := int64(t.Order.Uint32(d[4:]))
+		off := int64(t.Order.Uint32(d[8:])) - t.Start
+		e.Data = rem[off : off+n]
+	}
 }
 
 // findEOFRecord returns the offset, relative to the trailer, of the EOF
-// record: a record that follows the data (a gap with other bytes is allowed)
-// and carries the offset of the header.
-func (t *AFCP) findEOFRecord(rem []byte, dataEnd int64) (int64, bool) {
-	for q := dataEnd; q+12 <= int64(len(rem)); {
-		j := bytes.Index(rem[q:], t.Sig[:])
-		if j < 0 || q+int64(j)+12 > int64(len(rem)) {
-			return 0, false
+// record: a record that follows the data (a gap with other bytes is allowed),
+// carries the same signature as the header, and carries the offset of the
+// header. later lists the offsets of the signatures after the header, so the
+// search never rescans the region.
+func (t *AFCP) findEOFRecord(region []byte, at int, dataEnd int64, later []int) (int64, bool) {
+	for _, rec := range later {
+		rel := int64(rec - at)
+		if rel < dataEnd || region[rec+3] != t.Sig[3] {
+			continue
 		}
-		rec := q + int64(j)
-		if int64(t.Order.Uint32(rem[rec+4:])) == t.Start {
-			return rec, true
+		if rec+12 > len(region) {
+			return 0, false // this and every later signature is too close to the end
 		}
-		q = rec + 1
+		if int64(t.Order.Uint32(region[rec+4:])) == t.Start {
+			return rel, true
+		}
 	}
 	return 0, false
 }

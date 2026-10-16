@@ -107,6 +107,17 @@ const (
 	//   (buf len %d); chain terminated - resource-exhaustion guard (EXIF-IFDCHAIN-01)"
 	// Fields: offHi32, offLo32, bufLen32.
 	warnBigTIFFTraverseBudgetExceeded
+
+	// warnThumbnailBudgetExceeded (security audit F-06a): the JPEG thumbnail
+	// of an IFD was dropped because the thumbnails of the IFDs read before it
+	// already account for as many bytes as the buffer holds, which valid
+	// thumbnails (disjoint byte ranges of the buffer) never do. Several IFDs
+	// of a chain pointing at one range would otherwise be written once each
+	// by Encode.
+	// Message: "exif: thumbnail of %d bytes of the IFD at offset %d dropped:
+	//   the thumbnails of the IFD chain exceed the buffer (len %d)"
+	// Fields: offset32, thumbLen32, bufLen32.
+	warnThumbnailBudgetExceeded
 )
 
 // parseWarn is a compact, allocation-free record of a single parse warning.
@@ -155,6 +166,7 @@ const (
 //	warnBigTIFFNextOutOfBounds:val1=offHi32    val2=offLo32      val3=bufLen
 //	warnTraverseBudgetExceeded:        val1=offset     val2=bufLen
 //	warnBigTIFFTraverseBudgetExceeded: val1=offHi32    val2=offLo32     val3=bufLen
+//	warnThumbnailBudgetExceeded:       val1=offset     val2=thumbLen    val3=bufLen
 //
 // task #200: performance audit 2026-06-10.
 // EXIF-IFDCHAIN-01: warnTraverseBudgetExceeded / warnBigTIFFTraverseBudgetExceeded
@@ -279,6 +291,15 @@ func warnString(r parseWarn) string { //nolint:cyclop,gocyclo,funlen // one case
 		b = append(b, " (buf len "...)
 		b = strconv.AppendUint(b, uint64(r.val3), 10)
 		b = append(b, "); chain terminated \xe2\x80\x94 resource-exhaustion guard (EXIF-IFDCHAIN-01)"...)
+	case warnThumbnailBudgetExceeded:
+		// "exif: thumbnail of %d bytes of the IFD at offset %d dropped: the thumbnails of the IFD chain exceed the buffer (len %d)"
+		b = append(b, "exif: thumbnail of "...)
+		b = strconv.AppendUint(b, uint64(r.val2), 10)
+		b = append(b, " bytes of the IFD at offset "...)
+		b = strconv.AppendUint(b, uint64(r.val1), 10)
+		b = append(b, " dropped: the thumbnails of the IFD chain exceed the buffer (len "...)
+		b = strconv.AppendUint(b, uint64(r.val3), 10)
+		b = append(b, ')')
 	}
 	return string(b)
 }
@@ -1249,13 +1270,46 @@ const (
 type traverseBudget struct {
 	entries int // remaining cumulative entry budget
 	ifds    int // remaining cumulative chain-length budget
+	thumb   int // remaining bytes of JPEG thumbnails that may be kept (see chargeThumbnail)
 }
 
 // newTraverseBudget returns a traverseBudget sized for a buffer of length n.
 // EXIF-IFDCHAIN-01; CWE-400/CWE-405/CWE-834.
 func newTraverseBudget(n int) traverseBudget {
 	entries := max(n/traverseEntryBudgetDivisor, traverseEntryBudgetFloor)
-	return traverseBudget{entries: entries, ifds: maxTraverseChainIFDs}
+	return traverseBudget{entries: entries, ifds: maxTraverseChainIFDs, thumb: n}
+}
+
+// chargeThumbnail charges the JPEG thumbnail of ifd, just parsed, to the
+// thumbnail allowance, which is the length of the buffer: thumbnails are
+// disjoint byte ranges of the buffer (Exif 3.1 §4.5.5, p. 24: JPEGInterchange-
+// Format "points to the start of the JPEG thumbnail", one thumbnail in the 1st
+// IFD), so a valid file never needs more. When the allowance is exhausted the
+// thumbnail is dropped, with its JPEGInterchangeFormat and
+// JPEGInterchangeFormatLength entries (their offsets would address nothing in
+// the stream Encode writes), and its length is returned (0 when kept).
+//
+// Security audit F-06a: 512 IFDs of a chain, each addressing one 1 MiB range,
+// made Parse copy it 512 times and Encode write it 512 times (a 1 MiB EXIF
+// re-encoded to 499 MiB). Only a thumbnail that Encode writes is charged:
+// carried is false for the first IFD of a traversal (IFD0 for the main chain,
+// whose thumbnail Encode never writes, so it must not use up the allowance
+// of IFD1), which is kept as parsed. Reference: Exiv2 reads only the thumbnail of IFD1
+// (TiffDecoder::decodeThumb); ExifTool extracts the first one it meets.
+func (bud *traverseBudget) chargeThumbnail(ifd *IFD, carried bool) (dropped int) {
+	n := len(ifd.ThumbnailData)
+	if n == 0 || bud == nil || !carried {
+		return 0
+	}
+	if n <= bud.thumb {
+		bud.thumb -= n
+		return 0
+	}
+	ifd.ThumbnailData = nil
+	ifd.Entries = slices.DeleteFunc(ifd.Entries, func(e IFDEntry) bool {
+		return e.Tag == TagJPEGInterchangeFormat || e.Tag == TagJPEGInterchangeFormatLength
+	})
+	return n
 }
 
 // exhausted reports whether the budget has no capacity left to visit
@@ -1404,6 +1458,9 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder, budget *traverseB
 		// backing-array growth already happened. See parseSingleIFD's doc
 		// comment for the amplification this closes.
 		budget.spend(parsedCount)
+		if n := budget.chargeThumbnail(ifd, ifd != root); n > 0 {
+			warnings = append(warnings, parseWarn{kind: warnThumbnailBudgetExceeded, val1: cur, val2: uint32(n), val3: uint32(len(b))}) //nolint:gosec // G115: n <= len(b) < 2^32 for a classic TIFF stream
+		}
 
 		// Audit finding #131: if the next pointer is non-zero but falls outside the
 		// buffer, record a warning and stop following the chain. parseSingleIFD will
@@ -1622,6 +1679,9 @@ func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *p
 		// count, not len(ifd.Entries) — see traverse()'s equivalent comment
 		// and parseSingleIFD's doc comment for the amplification this closes.
 		budget.spend(parsedCount)
+		if n := budget.chargeThumbnail(ifd, ifd != root); n > 0 {
+			warnings = append(warnings, parseWarn{kind: warnThumbnailBudgetExceeded, val1: cur, val2: uint32(n), val3: uint32(len(b))}) //nolint:gosec // G115: n <= len(b) < 2^32 for a classic TIFF stream
+		}
 
 		// Audit finding #131: if the next pointer is non-zero but falls outside the
 		// buffer, record a warning and stop following the chain. parseSingleIFD will
@@ -1986,6 +2046,9 @@ func traverseBigTIFF(b []byte, offset uint64, order binary.ByteOrder, budget *tr
 		// and parseSingleIFD's doc comment for the amplification this closes.
 		// parsedCount ≤ bigTIFFMaxEntries (65535) so narrowing to int is safe.
 		budget.spend(int(parsedCount)) //nolint:gosec // G115: parsedCount ≤ bigTIFFMaxEntries (65535); safe narrowing
+		if n := budget.chargeThumbnail(ifd, ifd != root); n > 0 {
+			warnings = append(warnings, parseWarn{kind: warnThumbnailBudgetExceeded, val1: uint32(cur), val2: uint32(n), val3: uint32(len(b))}) //nolint:gosec // G115: low 32 bits of the offset and of the lengths, for the message only
+		}
 
 		// Audit finding #131: next pointer OOB → warn and stop.
 		// task #200: val1=offHi32, val2=offLo32 for 64-bit offset; val3=bufLen.

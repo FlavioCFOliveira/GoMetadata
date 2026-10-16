@@ -104,3 +104,11 @@ var ErrSubIFDCountMismatch = errors.New("tiff: 0x014A SubIFDs count mismatch bet
 // maxSubIFDsPerEntry, maxAggregateImageBlocks, imageBlockBudget) for the cap
 // constants and the full rationale.
 var ErrTooManyImageBlocks = errors.New("tiff: too many image blocks or SubIFD entries declared for a single write")
+
+// ErrImageBlocksOverlap is returned by a TIFF-family write when the image data
+// blocks (strips, tiles, JPEG previews) that the IFDs address add up to more
+// bytes than the source file holds. The blocks of a valid file are disjoint
+// ranges of it, so this happens only when several entries address the same
+// range; copying each of them would make the output many times the size of the
+// input (CWE-409, security audit F-07a). The file is left unwritten.
+var ErrImageBlocksOverlap = errors.New("tiff: the image data blocks overlap: they hold more bytes than the file")
