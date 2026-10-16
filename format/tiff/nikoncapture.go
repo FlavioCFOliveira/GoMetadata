@@ -135,6 +135,13 @@ func findNikonCaptureEntry(blob []byte, hdr int, order binary.ByteOrder) (ent in
 		if n <= 4 || off+n > uint64(len(blob)) {
 			return 0, 0, 0, false
 		}
+		// The data must not overlap the embedded TIFF header or the IFD
+		// (count, entries, next-IFD offset): the rewrite clears the old data,
+		// which would destroy the entry of tag 0x0E01 itself.
+		ifdEnd := ifd + 2 + 12*count + 4
+		if off < uint64(hdr)+8 || (off < ifdEnd && off+n > ifd) { //nolint:gosec // G115: hdr is a small non-negative offset
+			return 0, 0, 0, false
+		}
 		return int(at), off, n, true //nolint:gosec // G115: at < len(blob)
 	}
 	return 0, 0, 0, false

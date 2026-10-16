@@ -299,3 +299,68 @@ func FuzzRewriteNikonMakerNoteIPTC(f *testing.F) {
 		}
 	})
 }
+
+// TestRewriteNikonMakerNoteIPTC_DataOverlapsIFD is the regression test of the
+// task #371 fuzz finding: when the data named by tag 0x0E01 overlaps the IFD
+// or the embedded TIFF header, clearing the old data destroyed the entry of
+// the tag itself. Such a blob is malformed and must be left untouched.
+func TestRewriteNikonMakerNoteIPTC_DataOverlapsIFD(t *testing.T) {
+	t.Parallel()
+	capture := ncData(0, 0, ncEntry(nikonCaptureIPTCTag, ncCapacity(ncOldIIM, 30)))
+	long := append(bytes.Clone(ncNewIIM), bytes.Repeat([]byte("L"), 100)...)
+	// Offsets are relative to the embedded TIFF header (10); the IFD is at 8.
+	for name, off := range map[string]uint32{
+		"data starts inside the IFD":         8 + 2 + 12,
+		"data starts before the IFD":         2,
+		"data starts at the TIFF header":     0,
+		"data starts at the IFD entry table": 8 + 2,
+	} {
+		blob, _ := nikonBlob(capture)
+		hdr, _ := findNikonMNTIFFHeader(blob)
+		binary.BigEndian.PutUint32(blob[hdr+8+2+24+8:], off)
+		orig := bytes.Clone(blob)
+		for _, iim := range [][]byte{ncNewIIM, long} {
+			if out, ok := rewriteNikonMakerNoteIPTC(blob, iim); ok {
+				t.Errorf("%s: rewritten (%d bytes)", name, len(out))
+			}
+		}
+		if !bytes.Equal(blob, orig) {
+			t.Errorf("%s: input modified", name)
+		}
+	}
+}
+
+// TestRewriteNikonMakerNoteIPTC_ValidDataOverlapsIFD is the 4e472a028c803fe0
+// fuzz finding of task #371 in well-formed form: the padding of a valid Nikon
+// Capture data block contains the IFD of the MakerNote, so growing the block
+// cleared the entry of tag 0x0E01 itself.
+func TestRewriteNikonMakerNoteIPTC_ValidDataOverlapsIFD(t *testing.T) {
+	t.Parallel()
+	const ifdLen = 2 + 3*12 + 4
+	capture := ncData(0, ifdLen, ncEntry(nikonCaptureIPTCTag, ncCapacity(ncOldIIM, 14)))
+	b := []byte("Nikon\x00\x02\x10\x00\x00")
+	b = append(b, 'M', 'M', 0, 42)
+	b = binary.BigEndian.AppendUint32(b, uint32(8+len(capture)-ifdLen)) //nolint:gosec // G115: test sizes are small
+	b = append(b, capture...)
+	ifdAt := len(b) - ifdLen
+	binary.BigEndian.PutUint16(b[ifdAt:], 3)
+	for i, tag := range []uint16{0x0001, 0x0011, 0x0E01} {
+		at := ifdAt + 2 + 12*i
+		binary.BigEndian.PutUint16(b[at:], tag)
+		binary.BigEndian.PutUint16(b[at+2:], 7)
+		binary.BigEndian.PutUint32(b[at+4:], 1)
+	}
+	at := ifdAt + 2 + 24
+	binary.BigEndian.PutUint32(b[at+4:], uint32(len(capture))) //nolint:gosec // G115: test sizes are small
+	binary.BigEndian.PutUint32(b[at+8:], 8)
+	long := append(bytes.Clone(ncNewIIM), bytes.Repeat([]byte("L"), 100)...)
+	orig := bytes.Clone(b)
+	for _, iim := range [][]byte{ncNewIIM, long} {
+		if out, ok := rewriteNikonMakerNoteIPTC(b, iim); ok {
+			t.Errorf("rewritten (%d bytes)", len(out))
+		}
+	}
+	if !bytes.Equal(b, orig) {
+		t.Error("input modified")
+	}
+}

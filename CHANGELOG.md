@@ -88,6 +88,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Fixed
 
+- **TIFF/NEF: a Nikon Capture data block that overlapped the MakerNote IFD lost tag `0x0E01` on a write** (`format/tiff/nikoncapture.go`, #371): when the data named by tag `0x0E01` overlapped the embedded TIFF header or the IFD, the rewrite of the IPTC copy cleared the old data, including the IFD entry of the tag itself. Such a MakerNote is malformed and is now left unchanged.
 - **EXIF: a write into JPEG, PNG, WebP or HEIF/AVIF left the TIFF-relative offsets of a MakerNote stale** (`write.go`, `exif/makernote_rebase.go`, #317): ExifTool reported "Adjusted MakerNotes base" and "Possibly incorrect maker notes offsets" for 226 corpus files; the Canon, Sony, Panasonic, Olympus "OLYMP" and Nikon Type 2 notes and Canon's footer follow the move.
 - **EXIF: a write lost MakerNote data stored outside the declared MakerNote range** (`exif/makernote_rebase.go`, #318): Olympus C-720UZ CameraType, CameraID and ISOValue were garbage and the Nikon Coolpix P7000 PreviewImage was empty (JPEG and WebP).
 - **EXIF: `Encode` wrote the Exif and GPS pointers of IFD1 with source offsets** (`exif/chain.go`, #319): ExifTool reported "Bad ExifIFD directory" and "Bad GPSInfo SubDirectory start" for the Olympus μ Digital 800 and 44 Exif IFD lines became 22.
