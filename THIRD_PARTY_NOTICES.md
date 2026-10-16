@@ -38,7 +38,9 @@ for cross-checking only).
   `Source/com/drew/metadata/exif/ExifTiffHandler.java` (`processMakernote`);
   `Source/com/drew/imaging/tiff/TiffReader.java` (`processIfd`, byte-swapped entry count);
   `Source/com/drew/metadata/webp/WebpRiffHandler.java` (`processChunk`, the "Exif\0\0" identifier of an EXIF chunk);
-  `Source/com/drew/metadata/jpeg/JpegDnlReader.java` (`extract`)
+  `Source/com/drew/metadata/jpeg/JpegDnlReader.java` (`extract`);
+  `Source/com/drew/metadata/exif/makernotes/OlympusMakernoteDirectory.java` (`TAG_PREVIEW_IMAGE_START`, `TAG_PREVIEW_IMAGE_LENGTH`,
+  consulted for task #370: cross-check of the tag IDs `0x1036` and `0x1037`, no content copied)
 - Destination files: `exif/tag_extended.go`, `exif/tag_extended_test.go`; `exif/makernote_detect.go`;
   `exif/makernote_parse.go`; `format/webp/webp.go`; `format/jpeg/size.go`
 - Adapted: yes (tag IDs and names of the tags that libtiff does not list; the rest of the table is used for cross-checking.
@@ -220,3 +222,18 @@ for cross-checking only).
   CMT4 to IFD0, the Exif IFD, the MakerNote IFD and the GPS IFD, applied to the in-memory reader and to the writer;
   CMT2 parsed and written as a stand-alone TIFF stream whose first IFD is the Exif IFD)
 - Notes: the changes made are stated in the header of the destination file.
+
+## Apache Commons Imaging
+
+- URL: https://github.com/apache/commons-imaging
+- Source commit: `439b7722a5a2b52adb5c3ff0754705873648defb`
+- Licence: Apache-2.0 (see `LICENSES/Apache-2.0.txt`), SPDX-License-Identifier: `Apache-2.0`
+- Copyright: Copyright 2007-2026 The Apache Software Foundation (NOTICE.txt)
+- Source files: `src/main/java/org/apache/commons/imaging/formats/tiff/write/TiffOutputDirectory.java` (`getOutputItems`,
+  lines 757-794); `src/main/java/org/apache/commons/imaging/formats/tiff/write/TiffOutputSummary.java` (`updateOffsets`,
+  lines 63-72)
+- Destination files: `exif/thumbnail_strips.go`
+- Adapted: no (design consulted for task #368: the strips of an image directory are written as output items after it and
+  StripOffsets is rewritten as a LONG array of their final positions; the code of this repository is original)
+- Notes: the project has a `NOTICE.txt` file; its requirements do not apply to a
+  design that is not copied.

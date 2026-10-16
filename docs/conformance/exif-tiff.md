@@ -173,7 +173,7 @@ produces the IFD skeleton.
   `testdata/corpus/tiff/metadata-extractor/BigTIFFSubIFD4.tif` (type 13),
   `BigTIFFSubIFD8.tif` (type 18).
 
-### 2.9 Exif 3.1 target: text type, mandatory tags, IFD1 pointers, ExifVersion — **S-44..S-49** (tasks #320, #321, #319, #363)
+### 2.9 Exif 3.1 target: text type, mandatory tags, IFD1 pointers, ExifVersion, thumbnail strips — **S-44..S-50** (tasks #320, #321, #319, #363, #368)
 
 - **S-44** (#320) An entry of type 129 survives `Encode` with its type, count and value bytes unchanged, in classic
   TIFF and BigTIFF, in both byte orders. — Exif 3.1 §4.6.2, p. 28. `TestUTF8Type_S21_Code129IsUTF8`.
@@ -227,6 +227,28 @@ produces the IFD skeleton.
   `TestRequireExifVersionRaisesAndNeverLowers`, `TestVersionRaisedBySetters`,
   `TestWrite_Task363_SetDateTimeOriginalRaisesExifVersion`.
 
+- **S-50** (#368) An uncompressed thumbnail of the 1st IFD keeps its image data on a write. Exif 3.1 §4.5.8, pp. 25-26:
+  thumbnails are recorded in the 1st IFD, "when thumbnails are recorded in uncompressed format, they are to be recorded
+  in the 1st IFD in conformance with Baseline TIFF Rev. 6.0 RGB Full Color Images or TIFF Rev. 6.0 Extensions YCbCr
+  Images", and an uncompressed thumbnail is possible with a compressed primary image (Table 3, p. 26); Table 21,
+  pp. 98-99: StripOffsets (`0x0111`), RowsPerStrip and StripByteCounts (`0x0117`) are mandatory for it; §4.6.5.2.1-3,
+  pp. 39-40: SHORT or LONG, one value per strip (StripsPerImage, or SamplesPerPixel x StripsPerImage for planar data).
+  `Parse` with the option `exif.CarryThumbnailStrips` reads the strips of every IFD after IFD0 into `IFD.Sub.ThumbnailStrips`
+  (in strip order, whatever their order in the source), and `Encode` and `EncodeRebased` write them after the IFD, each
+  on an even offset (TIFF 6.0 §2), and set StripOffsets as a LONG array of the new positions; StripByteCounts is
+  unchanged. `Read` gives the option for every container whose EXIF stream is encoded again on its own (JPEG, PNG, WebP,
+  HEIF/AVIF, CR3), and not for a TIFF-based file, whose writer relocates the image data of every IFD itself and would
+  write the strips twice. The strips are carried when they lie inside the parsed stream, are at most 4096, and total at
+  most 1 MiB; otherwise `Parse` adds the warning "thumbnail image data not carried: ..." and the IFD is written as it
+  was. A JPEG APP1 segment is limited to 64 KB (JPEG-EXIF limit): a thumbnail that does not fit makes the write fail
+  with `ErrEXIFPayloadTooLarge`, never silently drop it. The Kodak ProBack of the corpus (156x111 RGB, one strip of
+  51948 bytes at offset 4944; the EXIF shrank from 56.9 KB to 5 KB and StripOffsets was stale) now keeps the strip byte
+  for byte. Reference: Apache Commons Imaging `TiffOutputDirectory.getOutputItems` (lines 757-794) and
+  `TiffOutputSummary.updateOffsets` (lines 63-72) rewrite StripOffsets as a LONG array of the final positions (design
+  only, Apache-2.0). `TestThumbnailStrips_S50_ParseAndRoundTrip`, `TestThumbnailStrips_S50_BigTIFFAndSubIFDs`,
+  `TestThumbnailStrips_S50_NotCarried`, `TestThumbnailStrips_S50_JPEGThumbnailAndDefault`,
+  `TestWrite_Task368_KodakProBackThumbnailStrips`, `TestWrite_Task368_StripsOfEveryContainer`, `FuzzParseEXIF`.
+
 ## Section 3: Value-Level Conformance
 - **V-01** RATIONAL [num@0..3, den@4..7] in stream byte order; guard den==0 before float. SRATIONAL = two i32.
 - **V-02** Signed tags (ShutterSpeedValue `0x9201`, BrightnessValue `0x9203`, ExposureBiasValue `0x9204`) MUST use SRational(); using Rational() misreads the sign bit.
@@ -266,7 +288,7 @@ produces the IFD skeleton.
 - **R-18 (BigTIFF container write, task #270)** Round-trip fidelity for standalone BigTIFF container write: extracting a real-world BigTIFF fixture (including one with SubIFDs and/or LONG8-typed strip/tile arrays), rewriting it via `tiff.Inject`/`tiff.InjectWithEXIF` with a metadata change that forces the copy-and-relocate path, and re-parsing the output MUST preserve every IFD0 tag value and every byte of every strip/tile/SubIFD image block untouched.
 - **R-19 (BigTIFF container write)** MakerNote OOL rebasing (the classic-TIFF R-11 contract, implemented by `rebaseGenericMakerNote`) is a documented, tested, fail-safe no-op — never a corruption — when the outer container is BigTIFF (`EXIF.BigTIFF == true`). No known real-world file combines a Sony plain-IFD or Olympus OLYMP-type MakerNote (both predate BigTIFF) with a genuinely BigTIFF outer container; full BigTIFF-aware outer-container MakerNote rebasing is a tracked follow-up, not a corruption risk in the interim.
 
-### 4.1 MakerNote repair for the containers that hold the EXIF stream (tasks #317, #318, #362, #364) — **R-20..R-30**
+### 4.1 MakerNote repair for the containers that hold the EXIF stream (tasks #317, #318, #362, #364, #369, #370) — **R-20..R-36**
 
 The MakerNote (tag `0x927C`) is vendor data (Exif 3.1 §4.6.6.4.1, p. 49); `exif.EncodeRebased(e, src)` is the encoder
 for JPEG APP1, PNG `eXIf`, WebP `EXIF` and HEIF/AVIF items. Layouts: `EXIF.MakerNoteLayout` (metadata-extractor
@@ -341,9 +363,82 @@ for JPEG APP1, PNG `eXIf`, WebP `EXIF` and HEIF/AVIF items. Layouts: `EXIF.Maker
   `TestNikonHeaderless_N1_EitherByteOrder`, `TestNikonHeaderless_N2_Refused`, `TestNikonHeaderless_N3_ParseOfTheStream`,
   `TestRead_Task364_HeaderlessLittleEndianNikon`.
 
-Known limits (not corrected by a write): a MakerNote in a BigTIFF (R-19); an Olympus offset to data before the first scan
-header or inside a rewritten trailer, and the Olympus E-1 CameraSettings stored as a value (R-27); private IFDs other
-than `0x8290` in IFD0.
+- **R-31** (#370) The other forms of the Olympus preview offset that `exif.ExternalOffsets` reports, with `Base` (the byte
+  the offset counts from), `MNStart`/`MNLen` (the MakerNote that holds the field) and `Target()`: (1) the pair
+  `0x1036` PreviewImageStart / `0x1037` PreviewImageLength in the MakerNote IFD itself, and the read-only pair `0x0088` /
+  `0x0089` (ExifTool `Olympus.pm`, IsOffset with an OffsetPair; metadata-extractor `OlympusMakernoteDirectory.java`
+  lines 216-218 names `0x1035-0x1037`; Exiv2 `olympusmn_int.cpp` line 292: study only); (2) CameraSettings stored as a
+  VALUE (tag `0x2020` UNDEFINED, the entries of the IFD are the value, the E-1 and E-300; ExifTool: "Olympus really
+  screwed up the format of the following subdirectories (for the E-1 and E-300 anyway)"); (3) the `OLYMP\0` layout,
+  whose offsets count from the TIFF header (`Base` 0), where the offset may address bytes inside the MakerNote
+  (corpus `OlympusE1.jpg`: PreviewImageStart 2556, PreviewImageLength 26, the text "<Dummy preview image data>" inside a
+  MakerNote of 5816 bytes at TIFF offset 1002). Exiv2 `preview.cpp` line 299 reads `Exif.OlympusCs.PreviewImageStart` with
+  `Exif.MakerNote.Offset` as the base, as here. A field outside the MakerNote, a length of 0 and a type other than LONG
+  are not reported. `jpeg.Inject` rewrites such an offset by where its data lands: (a) inside the MakerNote: it follows
+  the MakerNote (an offset counted from the MakerNote does not change, one counted from the TIFF header changes by the
+  distance the MakerNote moved); (b) inside a segment before the first scan header that the write copies unchanged:
+  it follows the segment (`measureShift` records the output position of each kept segment); (c) a JPEG stream after the
+  first scan header and inside the file: as in R-27. `TestExternalOffsets_X4`, `TestExternalOffsets_R31_E1PreviewInsideTheMakerNote`,
+  `TestExternalOffsets_R31_SegmentBeforeTheScan`, `TestExternalOffsets_R31_CorpusE1`, `TestWrite_Task370_OlympusJPEGCorpus`,
+  `FuzzParseEXIF`.
+- **R-32** (#370) Which IFD0 pointers `EncodeRebased` carries as private IFDs (R-28 generalised). The value of an unknown
+  LONG is a number, so the rule is closed: only an entry that is certain to address an IFD is carried, that is, an entry of
+  type IFD (13: Adobe PageMaker 6.0 TIFF Technical Notes, TIFF Tech Note 1, "IFD = 13"; libtiff `TIFF_IFD`; any tag), or a
+  LONG with a tag that ExifTool `Exif.pm` marks `Flags => 'SubIFD'` with a table of its own: `0x014A` SubIFDs (TIFF/EP and
+  DNG, "MaxSubdirs => 10"), `0x0190` GlobalParametersIFD, `0x8290` KodakIFD, `0x888A` LeafSubIFD, `0xFE00` KDC_IFD
+  (study only). Up to 10 offsets per entry, each carried separately (an array entry is rewritten element by element). The
+  Exif IFD, GPS and Interoperability pointers, which `Encode` writes itself, are outside the rule. An entry whose offsets
+  do not address a plausible IFD (1-255 entries, types 1-13, inside the source) is written as `Encode` writes it, as is an
+  entry of any other tag and type. The corpus has only `0x8290` (the Kodak ProBack); the others are tested with
+  synthetic streams. `TestPrivateIFD_R32_Registry`, `TestPrivateIFD_R32_ExifAndGPSPointersAreNotCarried`.
+- **R-33** (#370) An Olympus preview offset whose data cannot be placed is left as it is, and the write succeeds: the data is
+  in a segment that the write drops or replaces (an XMP APP1 segment), in the EXIF stream outside the MakerNote (the stream
+  is encoded again), inside a trailer that the write rewrites (AFCP, FotoStation: the new position of bytes inside a
+  rewritten trailer is not known), or outside the file (the truncated corpus `Olympus E-20.jpg`: PreviewImageStart 2419558
+  with a file of 2411039 bytes; ExifTool reports "Error reading PreviewImage from file" for the source). Corpus
+  `corrupted.jpg` (PreviewImageStart 1899600 from the MakerNote at TIFF offset 2020) keeps its preview.
+  `TestExternalOffsets_R33_LeftAsItIs`, `TestWrite_Task370_OlympusJPEGCorpus`.
+- **R-34** (#370) The Olympus preview offset in the TIFF family (TIFF, DNG, CR2 and ORF write through
+  `relocateTIFFFromParsed`, and the ORF `OLYMP\0` path through `orfRelocateWithOLYMP`). In every ORF of the corpus (E-M5,
+  E-M10, E-PM1, E-PL1, E-PL7, E-P3, E-30, E-410, E-600, XZ1, TG-4, TG-6, TG-7, OM-1) the MakerNote is large (1.4 MB for the
+  E-M5) and holds the preview (E-M5: MakerNote at 3264, PreviewImageStart 48960, preview at 52224 inside it), so it moves
+  with the MakerNote and `exiftool -b -PreviewImage` was already equal after a write. The offset can address three other
+  places, each now placed (`relocate_olympus_external.go`): inside an image block (it moves with the block); between the
+  IFDs and the end of the last image block and outside every block (the preview is carried as a block of its own, as for
+  the `ThumbnailImage` of an `OLYMP\0` MakerNote, and the offset points at the copy; the bytes must start with the JPEG SOI
+  marker where they can be read, ISO/IEC 10918-1 §B.1.1.3); after the last block, in the tail (it moves with the end of the
+  last block). A value whose data straddles the end of the MakerNote or a block, lies inside the metadata structures or
+  outside the file is left. Not detected: an AFCP or FotoStation trailer that starts inside the metadata structures moves the
+  start of the tail. `TestRelocateOlympusExternal_R34`, `TestRelocateOlympusExternal_R34_LeftAsItIs`,
+  `TestWrite_Task370_OlympusORFCorpus`, `FuzzTIFFInject`, `FuzzORFInject`.
+- **R-35** (#369) The Samsung Galaxy Note 4 (corpus `Samsung SM-N910F (Galaxy Note 4).jpg`): the MakerNote (98 bytes, 7
+  entries, `MakerNoteVersion` "0100") is byte-identical after a write. `exiftool -G1 -a -MakerNotes:all` lists five more
+  lines for the output than for the input, and the cause is in the SOURCE: the camera stores the IFD0 entries out of tag order
+  (ExifTool: "Entries in IFD0 are out of order", Make `0x010F` after the Exif IFD that holds the MakerNote), and ExifTool
+  decides the format of a MakerNote from the Make it has already read (`MakerNotes.pm`, `MakerNoteSamsung2`: `uc $$self{Make}
+  eq 'SAMSUNG'`), so in the source it finds an unknown note ("MakerNoteUnknown", the `Unknown_0x0001...` tags), and in the
+  output, where IFD0 is in ascending tag order (TIFF 6.0 §2, p. 15), the same bytes decode as Samsung Type2. The write is
+  right and keeps the order that the specification requires; the report cannot be met literally without writing an
+  out-of-order IFD0. The oracle is the number of entries that ExifTool finds, `MakerNotes directory with 7 entries` of
+  `exiftool -v3`, equal before and after. `TestWrite_Task369_SamsungNote4MakerNote`.
+- **R-36** (#370) The pointers inside the sub-IFDs of an `OLYMP\0` MakerNote follow it in the TIFF family: Equipment,
+  CameraSettings, RawDevelopment, ImageProcessing and FocusInfo (`0x2010-0x2050`, `0x3000`) stored as UNDEFINED values
+  (the E-1 and the compacts) hold entries whose out-of-line values and sub-IFD offsets count from the TIFF header, so they
+  change when the MakerNote moves; the pointers of the top IFD were rebased by the distance and the ones inside the
+  sub-IFDs were not, which made ExifTool read ColorMatrix2, CoringValues, the settings and CMExposureCompensation of the
+  corpus `Olympus SP350.orf`, `SP500UZ.orf` and `C8080.orf` (and their copies) wrongly after a write.
+  `exif.(*EXIF).RebaseMakerNoteSubIFDs` sets them from the walk of the MakerNote that `EncodeRebased` uses
+  (`makernote_walk.go`); `rebaseGenericMakerNote` and the ORF path call it. `exiftool -G1 -a -s -MakerNotes:all` of those
+  files is equal before and after, apart from the tags that hold a position or a size. `TestRebaseMakerNoteSubIFDs_R36`,
+  `TestRelocateOlympusSubIFD_R36`, `TestWrite_Task370_OlympusORFSubIFDValues`.
+
+Known limits (not corrected by a write): a MakerNote in a BigTIFF (R-19); an Olympus offset whose data is in a segment the
+write drops, in the EXIF stream outside the MakerNote or in a trailer the write rewrites (R-33); an IFD0 LONG of a tag that
+is not in the registry of R-32, which is a number to the library; the pointers of the sub-IFDs of the MakerNote layouts of
+other makers in the TIFF family (R-36 is for `OLYMP\0`); the Olympus `FE190/X750` TIFF of the corpus
+(`ce50e53224a3b62bb821bc294bf6a588.tif`), whose `OLYMP\0` MakerNote counts its offsets from the MakerNote while the layout
+table says the TIFF header (ExifTool reads it with "Possibly incorrect maker notes offsets (fix by 369478?)"): the TIFF
+writer rebases it as TIFF-relative.
 
 ## Section 5: Real-World Deviations (handle gracefully)
 1. Unsorted IFD entries (MUST sort/linear-search, not binary-search-on-unsorted).

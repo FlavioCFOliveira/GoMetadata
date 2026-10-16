@@ -120,7 +120,7 @@ const (
 // ifd.Entries itself (no copy).
 func chainEntries(e *EXIF, ifd *IFD) chainBlocks {
 	var cb chainBlocks
-	if ifd.ThumbnailData == nil && !chainHasPointers(ifd) {
+	if ifd.ThumbnailData == nil && ifd.thumbnailStrips() == nil && !chainHasPointers(ifd) {
 		cb.entries = ifd.Entries
 		return cb
 	}
@@ -150,7 +150,9 @@ func chainEntries(e *EXIF, ifd *IFD) chainBlocks {
 // chainBaseEntries copies the entries of ifd without its pointer tags (they
 // are re-added when they have a target), and gives the thumbnail tags their
 // 4-byte placeholder values, patched once the position is known (Exif 3.1
-// §4.5.5 / TIFF 6.0 §2: both are inline LONG values).
+// §4.5.5 / TIFF 6.0 §2: both are inline LONG values). StripOffsets of a
+// thumbnail with carried strips becomes a LONG entry with one placeholder per
+// strip (Exif 3.1 §4.6.5.2.1, p. 39: SHORT or LONG, StripsPerImage values).
 func chainBaseEntries(ifd *IFD) []IFDEntry {
 	entries := make([]IFDEntry, 0, len(ifd.Entries)+2)
 	for _, ent := range ifd.Entries {
@@ -165,7 +167,29 @@ func chainBaseEntries(ifd *IFD) []IFDEntry {
 			}
 		}
 	}
+	if ifd.thumbnailStrips() != nil {
+		if i, ok := slices.BinarySearchFunc(entries, TagStripOffsets, cmpEntryTag); ok {
+			entries[i].Type = TypeLong
+			entries[i].Count = uint32(len(ifd.thumbnailStrips())) //nolint:gosec // G115: at most maxThumbnailStrips
+			entries[i].Value = make([]byte, 4*len(ifd.thumbnailStrips()))
+		}
+	}
 	return entries
+}
+
+// thumbnailEnd returns the absolute end of the thumbnail payload of ifd that
+// starts at start: the JPEG thumbnail data, then the strips of an uncompressed
+// thumbnail, each starting on an even offset (TIFF 6.0 §2 requires even offsets
+// for IFDs and field values; strips are kept even too so that every reader that
+// assumes word-aligned image data reads them). The last strip is not padded:
+// the pad before the next IFD is the caller's.
+func thumbnailEnd(ifd *IFD, start uint64) uint64 {
+	p := start + uint64(len(ifd.ThumbnailData))
+	for _, s := range ifd.thumbnailStrips() {
+		p += p & 1
+		p += uint64(len(s))
+	}
+	return p
 }
 
 // ifdOf returns the sub-IFD of s for the pointer tag, or nil.
@@ -246,7 +270,7 @@ type chainLayout struct {
 func planChain(cb *chainBlocks, ifd *IFD, pos uint64, bigTIFF bool) chainLayout {
 	var l chainLayout
 	l.thumb = pos + ifdWrittenLen(cb.entries, pos, bigTIFF, false)
-	p := l.thumb + uint64(len(ifd.ThumbnailData))
+	p := thumbnailEnd(ifd, l.thumb)
 	more := ifd.Next != nil || cb.exif != nil || cb.gps != nil
 	if more && p&1 == 1 {
 		p++
@@ -287,6 +311,9 @@ func patchChain(cb *chainBlocks, ifd *IFD, l chainLayout, order binary.ByteOrder
 		put(cb.entries, TagJPEGInterchangeFormat, l.thumb)
 		put(cb.entries, TagJPEGInterchangeFormatLength, uint64(len(ifd.ThumbnailData)))
 	}
+	if ifd.thumbnailStrips() != nil && !patchStripOffsets(cb.entries, ifd, l.thumb, order) {
+		ok = false
+	}
 	put2 := func(to chainTarget, tag TagID, own, shared uint64) {
 		switch to {
 		case chainOwn:
@@ -302,6 +329,50 @@ func patchChain(cb *chainBlocks, ifd *IFD, l chainLayout, order binary.ByteOrder
 		put(cb.exif, TagInteropIFDPointer, l.interop)
 	}
 	return ok
+}
+
+// appendThumbnail appends the thumbnail payload of ifd (the JPEG data, then the
+// strips, each on an even offset, see thumbnailEnd) to out, which ends where the
+// payload starts (l.thumb), and the pad that the IFD after it needs.
+func appendThumbnail(out []byte, ifd *IFD, l chainLayout) []byte {
+	if ifd.ThumbnailData == nil && ifd.thumbnailStrips() == nil {
+		return out
+	}
+	out = append(out, ifd.ThumbnailData...)
+	p := l.thumb + uint64(len(ifd.ThumbnailData))
+	for _, s := range ifd.thumbnailStrips() {
+		if p&1 == 1 {
+			out = append(out, 0x00)
+			p++
+		}
+		out = append(out, s...)
+		p += uint64(len(s))
+	}
+	if p&1 == 1 && l.exif > p {
+		out = append(out, 0x00)
+	}
+	return out
+}
+
+// patchStripOffsets sets the placeholder values of StripOffsets in entries to
+// the positions of the strips of ifd, which follow the JPEG thumbnail data that
+// starts at thumb (see thumbnailEnd). It returns false when a position does not
+// fit the 32-bit offset (BigTIFF only).
+func patchStripOffsets(entries []IFDEntry, ifd *IFD, thumb uint64, order binary.ByteOrder) bool {
+	i, found := slices.BinarySearchFunc(entries, TagStripOffsets, cmpEntryTag)
+	if !found {
+		return true
+	}
+	p := thumb + uint64(len(ifd.ThumbnailData))
+	for k, s := range ifd.thumbnailStrips() {
+		p += p & 1
+		if p > math.MaxUint32 {
+			return false
+		}
+		order.PutUint32(entries[i].Value[4*k:], uint32(p))
+		p += uint64(len(s))
+	}
+	return true
 }
 
 // writeChainIFD appends one IFD of the chain after IFD0 to out, with its
@@ -322,12 +393,7 @@ func writeChainIFD(out []byte, e *EXIF, ifd *IFD, order binary.ByteOrder, bigTIF
 		next = l.end
 	}
 	out = writeIFDAt(out, cb.entries, order, bigTIFF, pos, next)
-	if ifd.ThumbnailData != nil {
-		out = append(out, ifd.ThumbnailData...)
-		if p := l.thumb + uint64(len(ifd.ThumbnailData)); p&1 == 1 && l.exif > p {
-			out = append(out, 0x00)
-		}
-	}
+	out = appendThumbnail(out, ifd, l)
 	if cb.exifTo == chainOwn {
 		out = writeIFDAt(out, cb.exif, order, bigTIFF, uint64(len(out)), 0)
 	}

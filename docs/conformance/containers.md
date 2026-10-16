@@ -210,10 +210,22 @@ truncated meta (CRITICAL HEIF panic — fuzz the meta/iloc/iinf walk).
 - **HEIF-BOX-OPENENDED-01** (task #359) `Inject` closes a child of `meta`, `iinf` or `iref` whose size field is 0 (or a
   largesize of 0) before it appends boxes after it, in the 32-bit and the 64-bit forms, through
   `bmff.Close` (BMFF-OPENENDED-01): the appended `iinf`, `iref`, `iloc` and `infe` boxes are read as boxes of their own
-  and every item re-reads. `FuzzHEIFInject` no longer exempts such sources or `iinf` version 1; the one exemption left is
-  a source whose top-level boxes end in bytes that do not parse as a box (the appended `mdat` can then complete a bogus
-  file-level `meta` header; reported separately). `TestTask359InjectClosesOpenEndedChild`,
+  and every item re-reads. `FuzzHEIFInject` no longer exempts such sources, `iinf` version 1, or (task #367) a source whose
+  top-level boxes end in bytes that do not parse as a box. `TestTask359InjectClosesOpenEndedChild`,
   `TestTask359OpenEndedChildContentKept`, `FuzzHEIFInject`.
+- **HEIF-TRAILING-BYTES-01** (task #367) Bytes after the last top-level box that do not parse as a box (a header whose size
+  exceeds what follows or is below its own length, a 64-bit size that does not fit, fewer than 8 bytes) are kept byte for
+  byte at the very end of the file, and `Inject` writes the new `mdat` box where the last real box ends, before them
+  (ISO/IEC 14496-12 §4.2: a file is a sequence of boxes, so a new box starts on a box boundary). Appended after them, the
+  new box header completed a bogus file-level `meta` header (for example a trailing `00 00 00 20 'meta'`) that reached
+  into the new box and hid the `meta` box inside `moov`: `Extract` read nothing. An item extent that points into the
+  trailing bytes lies outside every box and is not shifted. `Extract` keeps its tolerance: it stops at the first bytes that
+  are not a box and uses what it found. Other readers: libavif `src/read.c` `avifParse` (line 4912: a top-level header that
+  does not parse is `AVIF_RESULT_BMFF_PARSE_FAILED`, after the earlier boxes were handled), libheif `libheif/file_layout.cc`
+  (lines 105-125: once `meta`, `mini` or `moov` was found, a short tail is accepted; a header that does not parse is an
+  error) and heic-rs `src/boxes.rs` `BoxIter` (yields the earlier boxes, then an error); all three are stricter, none
+  reads a `meta` box out of the trailing bytes. `TestTask367TrailingBytesKept`, `TestTask367NoTrailingBytesUnchanged`,
+  `FuzzHEIFInject`.
 
 ## 6. AVIF
 **(a)** AOM "AV1 Image File Format (AVIF)" v1.2.0 (on HEIF + MIAF ISO/IEC 23000-22). Ref: libavif.

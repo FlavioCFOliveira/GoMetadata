@@ -60,11 +60,14 @@ import (
 // writers of this library need: they place the MakerNote and then fix it for
 // the position they chose.
 //
-// The stream also carries the private IFD that IFD0 tag 0x8290 (KodakIFD)
-// points to, with the values it addresses, after the end of the stream
-// (private_ifd.go, task #362). A MakerNote offset that addresses data outside
-// the stream (Olympus PreviewImageStart) is copied as it is: ExternalOffsets
-// finds it for the writer of the container, which knows where the data lands.
+// The stream also carries the private IFDs that IFD0 points to (tag 0x8290
+// KodakIFD and the other pointers that are certain to address an IFD, see
+// private_ifd.go, tasks #362 and #370), with the values they address, after the
+// end of the stream. A MakerNote offset that addresses data outside the
+// stream (Olympus PreviewImageStart) is copied as it is: ExternalOffsets finds
+// it for the writer of the container, which knows where the data lands. The
+// strips of an uncompressed thumbnail are written by Encode itself when Parse
+// read them (CarryThumbnailStrips, task #368).
 func EncodeRebased(e *EXIF, src []byte) ([]byte, error) {
 	plan := planMakerNote(e, src)
 	out, _, err := serialise(nil, e, false, plan)
@@ -281,4 +284,78 @@ func findEntryField(out []byte, ifd int, tag TagID, order binary.ByteOrder) (uin
 		}
 	}
 	return 0, false
+}
+
+// RebaseMakerNoteSubIFDs sets, in the classic TIFF stream tiff, the pointers
+// that lie inside the sub-IFDs of the MakerNote of e, for a MakerNote whose
+// offsets count from the TIFF header and that holds the sub-IFDs the walk of
+// this package knows (the Olympus "OLYMP\0" layout: Equipment, CameraSettings,
+// RawDevelopment, ImageProcessing and FocusInfo, stored as UNDEFINED values by
+// the E-1 and the compacts of its generation, or as offsets by later bodies;
+// ExifTool Olympus.pm, tags 0x2010-0x2050 and 0x3000; task #370). mnAt is the
+// position in tiff of the MakerNote, copied there byte for byte from the stream
+// e was parsed from; the pointers address the data inside it at its new
+// position (TIFF 6.0 §2: a value offset counts from the TIFF header).
+//
+// It is for the writers of the TIFF family (format/tiff), which copy the
+// MakerNote and rebase the pointers of its top IFD by the distance it moved:
+// the pointers of the top IFD that address out-of-line values (more than 4
+// bytes) are left to them, and the offsets of the sub-IFDs (inline) and every
+// pointer deeper are set here. Data outside the MakerNote is not carried, as
+// for the top IFD. It reports whether tiff holds such a MakerNote and a pointer
+// was set. tiff is modified only at the pointers; e is not modified.
+func (e *EXIF) RebaseMakerNoteSubIFDs(tiff []byte, mnAt int) bool {
+	lay, mnOff, ok := olympTIFFRelative(e)
+	if !ok || mnAt < 0 || mnAt+len(e.MakerNote) > len(tiff) {
+		return false
+	}
+	var w mnWalker
+	w.init(e.MakerNote, lay, int64(mnOff)) //nolint:gosec // G115: the MakerNote lies inside the source stream
+	w.walkIFD(lay.IFDOffset, 0)
+	set := false
+	for _, f := range w.fixes {
+		if !isTopOOLField(e.MakerNote, lay, f.field) && setPointer(tiff, mnAt, f, lay.ByteOrder) {
+			set = true
+		}
+	}
+	return set
+}
+
+// olympTIFFRelative returns the layout and the source position of the MakerNote
+// of e when it is an Olympus "OLYMP\0" note, whose offsets count from the TIFF
+// header. The prefix test comes first: it is all that most MakerNotes need, and
+// detecting the layout is the dearer part.
+func olympTIFFRelative(e *EXIF) (lay MakerNoteLayout, mnOff uint64, ok bool) {
+	if e == nil || e.BigTIFF || !bytes.HasPrefix(e.MakerNote, []byte("OLYMP\x00")) {
+		return lay, 0, false
+	}
+	lay, ok = e.MakerNoteLayout()
+	mnOff = makerNoteSourceOffset(e)
+	return lay, mnOff, ok && lay.TIFFRelative && lay.layout == mnOlympusOld && mnOff != 0
+}
+
+// setPointer sets the 4-byte pointer of fix f of the MakerNote at mnAt of tiff to
+// address the MakerNote byte f.target; false when the field or the value does not fit.
+func setPointer(tiff []byte, mnAt int, f mnFix, order binary.ByteOrder) bool {
+	pos := int64(mnAt) + int64(f.target)
+	if f.field < 0 || mnAt+f.field+4 > len(tiff) || pos > math.MaxUint32 {
+		return false
+	}
+	order.PutUint32(tiff[mnAt+f.field:], uint32(pos)) //nolint:gosec // G115: checked against MaxUint32 above
+	return true
+}
+
+// isTopOOLField reports whether the 4-byte field at offset field of mn is the
+// value-or-offset field of an out-of-line entry of the top IFD of the
+// MakerNote.
+func isTopOOLField(mn []byte, lay MakerNoteLayout, field int) bool {
+	n, ok := ifdEntryCount(mn, lay.IFDOffset, lay.ByteOrder)
+	if !ok {
+		return false
+	}
+	d := field - (lay.IFDOffset + 2 + 8) // entry i has its field at IFDOffset+2+12*i+8
+	if d < 0 || d%12 != 0 || d/12 >= n {
+		return false
+	}
+	return readMNEntry(mn, lay.IFDOffset+2+d, lay.ByteOrder).total > 4
 }

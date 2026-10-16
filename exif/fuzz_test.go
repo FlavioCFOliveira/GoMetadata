@@ -209,6 +209,19 @@ func FuzzParseEXIF(f *testing.F) {
 		}
 	}
 
+	// Seeds (task #368, #370): the strips of an uncompressed thumbnail, private
+	// IFD0 pointers, and the other forms of the Olympus preview offset.
+	for _, order := range []binary.ByteOrder{binary.LittleEndian, binary.BigEndian} {
+		strips, _ := rawStripStream(order, TypeLong, TypeLong, []int{50, 51, 0, 7}, []int{0, 3, 1}, false)
+		f.Add(strips)
+	}
+	shortStrips, _ := rawStripStream(binary.LittleEndian, TypeShort, TypeShort, []int{33, 34}, []int{0}, true)
+	f.Add(shortStrips)
+	privStream, _ := privateStream(ptrSpec{0x014A, 4, 3}, ptrSpec{0x0190, 4, 1}, ptrSpec{0xC000, 13, 1})
+	f.Add(privStream)
+	f.Add(olympStream([]testutil.MNEntry{{Tag: 0x2020, Type: 7, Count: 42, Value: previewIFDValue(5000, 321)}}))
+	f.Add(olympStream([]testutil.MNEntry{{Tag: 0x1036, Type: 4, Count: 1, Value: long(5000)}, {Tag: 0x1037, Type: 4, Count: 1, Value: long(321)}}))
+
 	f.Fuzz(func(t *testing.T, b []byte) {
 		// Must not panic on any input.
 		e, err := Parse(b)
@@ -268,13 +281,58 @@ func FuzzParseEXIF(f *testing.F) {
 			// Task #362: the data of the MakerNote that lies outside the EXIF
 			// stream is found without panicking, on the stream and on what the
 			// writer made of it, and leaves the stream as it was.
-			_ = ExternalOffsets(b)
+			for _, o := range ExternalOffsets(b) {
+				// Task #370: the field is inside the MakerNote, inside the stream.
+				if o.Field < o.MNStart || o.Field+4 > o.MNStart+o.MNLen || o.MNStart+o.MNLen > len(b) {
+					t.Errorf("ExternalOffsets: field %d outside the MakerNote [%d,+%d) of the %d-byte stream", o.Field, o.MNStart, o.MNLen, len(b))
+				}
+			}
 			if rbErr == nil {
 				_ = ExternalOffsets(rebased)
 			}
 			if !bytes.Equal(before, b) {
 				t.Error("ExternalOffsets modified its argument")
 			}
+			fuzzThumbnailStrips(t, b)
 		}
 	})
+}
+
+// fuzzThumbnailStrips checks the strips of the thumbnail (task #368): Parse with
+// CarryThumbnailStrips never panics; when it carries strips, Encode writes
+// them, EncodedSize agrees with the length, and a second parse of the output
+// reads the same strip bytes.
+func fuzzThumbnailStrips(t *testing.T, b []byte) {
+	t.Helper()
+	e, err := Parse(b, CarryThumbnailStrips())
+	if err != nil || e.IFD0 == nil {
+		return
+	}
+	var want [][]byte
+	for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
+		for _, s := range ifd.thumbnailStrips() {
+			want = append(want, bytes.Clone(s))
+		}
+	}
+	out, err := Encode(e)
+	if err != nil {
+		return
+	}
+	if n, sizeErr := EncodedSize(e); sizeErr != nil || n != len(out) {
+		t.Errorf("EncodedSize = %d, %v; len(Encode) = %d (with strips)", n, sizeErr, len(out))
+	}
+	if len(want) == 0 {
+		return
+	}
+	e2, err := Parse(out, CarryThumbnailStrips())
+	if err != nil {
+		t.Fatalf("Parse of an output with strips: %v", err)
+	}
+	var got [][]byte
+	for ifd := e2.IFD0.Next; ifd != nil; ifd = ifd.Next {
+		got = append(got, ifd.thumbnailStrips()...)
+	}
+	if !equalStrips(got, want) {
+		t.Errorf("the strips differ after Encode: %d before, %d after", len(want), len(got))
+	}
 }

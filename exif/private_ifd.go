@@ -1,7 +1,7 @@
 package exif
 
-// private_ifd.go — the private IFD that IFD0 of some Kodak images points to
-// (task #362).
+// private_ifd.go — the private IFDs that IFD0 of some images points to (tasks
+// #362 and #370).
 //
 // IFD0 tag 0x8290 (ExifTool Exif.pm: "KodakIFD", "used in various types of
 // Kodak images", a SubIFD whose table is Image::ExifTool::Kodak::IFD; study
@@ -18,48 +18,121 @@ package exif
 // would be lost. EncodeRebased carries the IFD and the values it addresses
 // from the source stream to the end of the new stream and points the entry
 // at the copy, as it does for the data a MakerNote addresses outside itself.
+//
+// Which IFD0 entries are pointers (task #370). The value of an unknown LONG is
+// a number, and rewriting it as an offset could corrupt it, so the rule is
+// closed: an entry is carried only when it is certain to address an IFD, that
+// is, when it is
+//
+//   - of type IFD (13), the 4-byte offset of an IFD (Adobe PageMaker 6.0 TIFF
+//     Technical Notes, TIFF Tech Note 1: "IFD = 13"; libtiff TIFF_IFD; see
+//     TypeIFD), whatever the tag is; or
+//   - a LONG whose tag ExifTool's Exif.pm marks "Flags => 'SubIFD'" with its own
+//     table: 0x0190 GlobalParametersIFD, 0x014A SubIFDs (TIFF/EP and DNG; up to
+//     10 offsets, "MaxSubdirs => 10"), 0x8290 KodakIFD, 0x888A LeafSubIFD and
+//     0xFE00 KDC_IFD (study only: these are the registry of the tags that real
+//     files hold; the corpus has only 0x8290).
+//
+// The pointers that Encode writes itself (Exif IFD 0x8769 and GPS IFD 0x8825,
+// whose IFDs are in the model) are not touched. An entry that does not address a
+// plausible IFD of the source (see privateIFDEntries) is written as Encode
+// writes it, as is an entry of any other tag and type.
 
 import (
 	"bytes"
 	"encoding/binary"
 	"math"
+	"slices"
 )
 
-// tagKodakIFD is the IFD0 tag whose LONG value is the offset of a private IFD
-// (see the top of this file).
+// tagKodakIFD is the IFD0 tag whose LONG value is the offset of the private IFD
+// of Kodak images (see the top of this file).
 const tagKodakIFD = TagID(0x8290)
+
+// privateIFDTags are the LONG tags of IFD0 that hold the offset of an IFD
+// without being of type IFD (see the top of this file).
+var privateIFDTags = [...]TagID{TagSubIFDs, 0x0190, tagKodakIFD, 0x888A, 0xFE00} //nolint:gochecknoglobals // read-only registry
+
+// maxPrivateIFDsPerTag bounds the offsets of one entry that are carried
+// (ExifTool: MaxSubdirs => 10 for SubIFD).
+const maxPrivateIFDsPerTag = 10
+
+// isPrivateIFDPointer reports whether the IFD0 entry ent is a pointer that
+// EncodeRebased carries: 1 to maxPrivateIFDsPerTag offsets, of type IFD, or LONG
+// with a tag of privateIFDTags.
+func isPrivateIFDPointer(ent *IFDEntry) bool {
+	if ent.Tag == TagExifIFDPointer || ent.Tag == TagGPSIFDPointer || ent.Tag == TagInteropIFDPointer {
+		return false
+	}
+	if ent.Count == 0 || ent.Count > maxPrivateIFDsPerTag || len(ent.Value) < 4*int(ent.Count) {
+		return false
+	}
+	if ent.Type == TypeIFD {
+		return true
+	}
+	return ent.Type == TypeLong && slices.Contains(privateIFDTags[:], ent.Tag)
+}
 
 // maxPrivateIFDEntries bounds the entries of a private IFD that is carried
 // (the largest IFD of a real file has a few hundred; MakerNote IFDs are below
 // 256 for metadata-extractor, TiffReader.processIfd).
 const maxPrivateIFDEntries = 255
 
-// appendPrivateIFD carries the private IFD that IFD0 of e points to (IFD0 tag
-// 0x8290) from the source stream src to the end of out, the stream serialise
-// wrote, sets its pointers for the new position and points the IFD0 entry at it.
-// It returns out unchanged when e has no such entry, the entry does not address
-// a plausible IFD in src, or src is not the stream e was parsed from (nil).
-// BigTIFF is not handled, as for the MakerNote.
+// appendPrivateIFD carries the private IFDs that IFD0 of e points to (see the
+// top of this file) from the source stream src to the end of out, the stream
+// serialise wrote, sets their pointers for the new position and points the IFD0
+// entries at them. It returns out unchanged when e has no such entry, an entry
+// does not address a plausible IFD in src (that entry is left as it is), or src
+// is not the stream e was parsed from (nil). BigTIFF is not handled, as for the
+// MakerNote.
 func appendPrivateIFD(out []byte, e *EXIF, src []byte) []byte {
 	if e == nil || e.BigTIFF || e.IFD0 == nil || src == nil || len(out) < 8 {
 		return out
 	}
 	order := e.ifd0ByteOrder()
-	w, ok := carryPrivateIFD(e, src, order)
+	for i := range e.IFD0.Entries {
+		if ent := &e.IFD0.Entries[i]; isPrivateIFDPointer(ent) {
+			out = appendEntryIFDs(out, ent, src, order)
+		}
+	}
+	return out
+}
+
+// appendEntryIFDs carries the IFD that each offset of the IFD0 entry ent
+// addresses (see appendPrivateIFD).
+func appendEntryIFDs(out []byte, ent *IFDEntry, src []byte, order binary.ByteOrder) []byte {
+	field, ok := findIFD0EntryField(out, ent.Tag, order)
 	if !ok {
 		return out
 	}
-	return placePrivateIFD(out, w, order)
+	for k := range int(ent.Count) {
+		w, ok := carryPrivateIFD(ent, k, src, order)
+		if !ok {
+			continue
+		}
+		if at, ok := elementField(out, field, int(ent.Count), k, order); ok {
+			out = placePrivateIFD(out, w, at, order)
+		}
+	}
+	return out
+}
+
+// elementField returns the position in out of the 4-byte offset k of the entry
+// of count offsets whose value field is at field: the field itself for a single
+// offset, otherwise element k of the array it points to (TIFF 6.0 §2).
+func elementField(out []byte, field, count, k int, order binary.ByteOrder) (int, bool) {
+	if count == 1 {
+		return field, field+4 <= len(out)
+	}
+	arr := int(order.Uint32(out[field:]))
+	at := arr + 4*k
+	return at, arr >= 8 && at+4 <= len(out)
 }
 
 // placePrivateIFD appends the block of w to out at an even offset, sets its
-// pointers for that position and points the IFD0 entry of out at it. It returns
-// out unchanged when IFD0 has no such entry or the block would not fit 32 bits.
-func placePrivateIFD(out []byte, w *mnWalker, order binary.ByteOrder) []byte {
-	field, ok := findIFD0EntryField(out, tagKodakIFD, order)
-	if !ok {
-		return out
-	}
+// pointers for that position and points the 4-byte field at of out at it. It
+// returns out unchanged when the block would not fit 32 bits.
+func placePrivateIFD(out []byte, w *mnWalker, at int, order binary.ByteOrder) []byte {
 	if len(out)&1 == 1 { // TIFF 6.0 §2: an IFD begins on a word boundary
 		out = append(out, 0)
 	}
@@ -72,19 +145,15 @@ func placePrivateIFD(out []byte, w *mnWalker, order binary.ByteOrder) []byte {
 			order.PutUint32(w.buf[f.field:], uint32(pos)+uint32(f.target)) //nolint:gosec // G115: bounded by the check above, and target is an offset in the block
 		}
 	}
-	order.PutUint32(out[field:], uint32(pos)) //nolint:gosec // G115: bounded by the check above
+	order.PutUint32(out[at:], uint32(pos)) //nolint:gosec // G115: bounded by the check above
 	return append(out, w.buf...)
 }
 
-// carryPrivateIFD walks the private IFD that IFD0 of e points to and returns
-// the walker that holds its bytes, with the values it addresses outside it
-// appended, and the pointers to set once the block has a position.
-func carryPrivateIFD(e *EXIF, src []byte, order binary.ByteOrder) (*mnWalker, bool) {
-	ent := e.IFD0.Get(tagKodakIFD)
-	if ent == nil || ent.Type != TypeLong || ent.Count != 1 || len(ent.Value) < 4 {
-		return nil, false
-	}
-	off := int64(order.Uint32(ent.Value))
+// carryPrivateIFD walks the IFD that offset k of the IFD0 entry ent points to
+// and returns the walker that holds its bytes, with the values it addresses
+// outside it appended, and the pointers to set once the block has a position.
+func carryPrivateIFD(ent *IFDEntry, k int, src []byte, order binary.ByteOrder) (*mnWalker, bool) {
+	off := int64(order.Uint32(ent.Value[4*k:]))
 	n, ok := privateIFDEntries(src, off, order)
 	if !ok {
 		return nil, false

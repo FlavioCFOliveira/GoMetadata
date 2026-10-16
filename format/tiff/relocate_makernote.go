@@ -76,6 +76,7 @@ func rebaseGenericMakerNote(finalTIFF []byte, e *exif.EXIF, order binary.ByteOrd
 		return
 	}
 	rebaseMakerNoteIFD(finalTIFF, newMNAbs+layout.IFDOffset, layout.ByteOrder, int64(newAbs)-int64(oldMNAbs), oldMNAbs) //nolint:gosec // G115: both are offsets in a classic TIFF, below 2^32
+	e.RebaseMakerNoteSubIFDs(finalTIFF, newMNAbs)                                                                       // task #370: the sub-IFDs of an Olympus "OLYMP\0" note
 	fixMakerNoteFooter(finalTIFF, newMNAbs, len(e.MakerNote), layout.ByteOrder, oldMNAbs, newAbs)
 }
 

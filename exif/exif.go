@@ -115,6 +115,7 @@ type parseConfig struct {
 	skipMakerNote  bool
 	extraMagic     uint16
 	aliasThumbnail bool
+	thumbStrips    bool
 }
 
 // SkipMakerNote skips parsing the manufacturer-specific MakerNote IFD.
@@ -177,6 +178,25 @@ func AcceptRAWMagic(magic uint16) ParseOption {
 func AliasThumbnail() ParseOption {
 	return func(c *parseConfig) { c.aliasThumbnail = true }
 }
+
+// CarryThumbnailStrips configures Parse to read the strips of an uncompressed
+// thumbnail (Exif 3.1 §4.5.8, pp. 25-26) into IFD.Sub.ThumbnailStrips for every IFD
+// of the chain after IFD0, so that Encode writes them again with valid
+// StripOffsets. Without this option the strip data is not read and Encode
+// writes the StripOffsets and StripByteCounts entries as they were parsed.
+//
+// Use it for a stream that is encoded again on its own (a JPEG APP1 segment, a
+// PNG eXIf chunk, a WebP or HEIF Exif item). Do not use it for a TIFF-based file
+// whose image data is relocated by format/tiff: that path carries the strips of
+// every IFD itself and would write them twice.
+//
+// The strips are carried when every strip lies inside the parsed bytes and the
+// total is at most 1 MiB in at most 4096 strips; otherwise Parse adds a warning
+// and leaves the IFD unchanged. With AliasThumbnail the strips alias the parsed
+// bytes (same contract).
+//
+//go:noinline
+func CarryThumbnailStrips() ParseOption { return func(c *parseConfig) { c.thumbStrips = true } }
 
 // parseByteOrder reads the two-byte byte-order marker at b[0:2] and returns
 // the corresponding binary.ByteOrder. Returns a CorruptMetadataError for any
@@ -550,6 +570,9 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 		// task #200: materialise all deferred warn records into []string ONCE here.
 		// On clean files warnRecs is nil so this is a nil-check + return nil (zero cost).
 		e.Warnings = materializeWarnings(warnRecs)
+		if cfg.thumbStrips && ifd0.Next != nil {
+			attachThumbnailStrips(b, e, cfg.aliasThumbnail)
+		}
 		return e, nil
 
 	case magic == 0x002B:
@@ -601,6 +624,9 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 
 		// task #200: materialise all deferred warn records into []string ONCE here.
 		e.Warnings = materializeWarnings(warnRecs)
+		if cfg.thumbStrips && ifd0.Next != nil {
+			attachThumbnailStrips(b, e, cfg.aliasThumbnail)
+		}
 		return e, nil
 
 	default:
@@ -622,6 +648,12 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 // remain fixed-width EXIF LONG fields in both containers; if a BigTIFF target
 // offset for one of these tags does not fit in 32 bits, Encode returns
 // ErrBigTIFFPointerOverflow rather than truncating it.
+//
+// The strips of an uncompressed thumbnail of an IFD after IFD0 (IFD.Sub.ThumbnailStrips,
+// read by Parse with CarryThumbnailStrips) are written after the IFD and
+// StripOffsets is set to their new positions (Exif 3.1 §4.5.8, task #368). Without
+// that option the entries StripOffsets and StripByteCounts are written as parsed,
+// and the strip data is not part of the stream.
 //
 // Round-trip fidelity guarantee:
 //   - Known-type inline entries (total value size ≤ 4 bytes) are perfectly preserved.

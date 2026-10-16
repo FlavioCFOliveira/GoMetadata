@@ -439,7 +439,7 @@ func parseEXIF(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
 	// defeat the compiler's own "non-capturing closure is a static value"
 	// optimisation — confirmed via `go build -gcflags="-m -m"` that both the
 	// closures AND this array's own backing storage stay off the heap.
-	var optsArr [3]exif.ParseOption
+	var optsArr [4]exif.ParseOption
 	n := 0
 	if cfg.skipMakerNote {
 		optsArr[n] = exif.SkipMakerNote()
@@ -457,6 +457,15 @@ func parseEXIF(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
 	// 151,236 B). See AliasThumbnail's own doc comment for the full contract.
 	optsArr[n] = exif.AliasThumbnail()
 	n++
+	// Task #368: the strips of an uncompressed thumbnail (Exif 3.1 §4.5.8) are
+	// carried so that the EXIF encoded for a JPEG, PNG, WebP or HEIF write keeps
+	// the thumbnail. A TIFF-based file is excluded: its image data, the strips of
+	// every IFD included, is relocated by format/tiff from the original bytes, and
+	// Encode must not write them a second time.
+	if !isTIFFBasedFormat(format.FormatID(m.format)) {
+		optsArr[n] = exif.CarryThumbnailStrips()
+		n++
+	}
 	opts := optsArr[:n]
 	e, err := exif.Parse(raw, opts...)
 	if err != nil {

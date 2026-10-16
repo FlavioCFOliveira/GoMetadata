@@ -24,9 +24,23 @@ package jpeg
 // Only streams that hold such an offset pay for this: exif.ExternalOffsets
 // answers nil for every other stream after one search of the stream.
 //
-// An offset is rewritten only when it addresses a JPEG stream (the SOI marker)
-// that lies after the first scan header and inside the file: the bytes there
-// are copied as they are. Anything else is left as it is.
+// What an offset addresses decides how it is rewritten (task #370):
+//
+//   - bytes of the MakerNote itself (the E-1 stores the preview, counted from the
+//     TIFF header, inside the MakerNote): they move with it, so the offset follows
+//     the MakerNote;
+//   - bytes of a segment before the first scan header that the write copies (an
+//     APPn segment): the offset follows the segment, whose new position
+//     measureShift records;
+//   - a JPEG stream (the SOI marker) after the first scan header and inside the
+//     file: the bytes there are copied as they are and move by the difference of
+//     the positions of the end of the scan header, plus the growth of every
+//     rewritten trailer before them.
+//
+// Anything else is left as it is, because the bytes it addresses are not copied
+// to a position that can be known: a segment that the write drops or replaces,
+// the EXIF stream outside the MakerNote (the stream is encoded again), a
+// trailer that is rewritten, and bytes outside the file.
 
 import (
 	"bytes"
@@ -56,11 +70,18 @@ func (c *countWriter) Write(p []byte) (int, error) {
 type shiftInfo struct {
 	sosEnd int64 // position in the source of the end of the first scan header
 	delta  int64 // position in the output minus position in the source of that point
+	// kept are the segments before the first scan header that the write copies
+	// unchanged, with their position in the output.
+	kept []keptSegment
 	// oldTIFF is the EXIF stream of the source (the first EXIF APP1 segment),
 	// and oldTIFFPos the position in the source of its first byte.
 	oldTIFF    []byte
 	oldTIFFPos int64
 }
+
+// keptSegment is a segment of the source (marker, length and data: positions
+// [src, end)) that the write copies unchanged to position out of the output.
+type keptSegment struct{ src, end, out int64 }
 
 // shiftExternalOffsets returns rawEXIF with the MakerNote offsets that address
 // data outside the EXIF stream (exif.ExternalOffsets) rewritten for the
@@ -124,19 +145,46 @@ func seekStart(r io.Seeker) error {
 
 // newValue returns the value that the offset o of the new stream must hold so
 // that it addresses the data that old addresses in the source, or false when
-// the data is not a JPEG stream that lies after the first scan header and
-// inside the source (size bytes), or its new position cannot be found.
+// the data cannot be placed (see the top of this file).
 func (s *shiftInfo) newValue(cr io.ReadSeeker, scratch *[]byte, old, o exif.ExternalOffset, size int64, plan *trailer.Plan) (uint32, bool) {
-	p := s.oldTIFFPos + int64(old.Base) + int64(old.Value) // where the data is in the source
-	if p < s.sosEnd || p+int64(old.Length) > size || !startsWithSOI(cr, p, scratch) {
-		return 0, false
-	}
-	q, ok := movedPosition(p, s.delta, plan)
-	nv := q - (int64(newEXIFTIFFPos) + int64(o.Base)) // counted from the MakerNote of the output
+	q, ok := s.outputPosition(cr, scratch, old, o, size, plan)
+	nv := q - (int64(newEXIFTIFFPos) + int64(o.Base)) // counted from the byte the new stream counts from
 	if !ok || nv < 0 || nv > math.MaxUint32 {
 		return 0, false
 	}
 	return uint32(nv), true
+}
+
+// outputPosition returns the position in the output of the data that old
+// addresses in the source (see the top of this file for the classes), or false.
+func (s *shiftInfo) outputPosition(cr io.ReadSeeker, scratch *[]byte, old, o exif.ExternalOffset, size int64, plan *trailer.Plan) (int64, bool) {
+	rel := old.Target() // position of the data in the EXIF stream of the source
+	p := s.oldTIFFPos + rel
+	n := int64(old.Length)
+	switch {
+	case rel >= int64(old.MNStart) && rel+n <= int64(old.MNStart)+int64(old.MNLen):
+		// Inside the MakerNote: it is copied as it is to the new stream.
+		return int64(newEXIFTIFFPos) + int64(o.MNStart) + (rel - int64(old.MNStart)), true
+	case rel >= 0 && rel < int64(len(s.oldTIFF)):
+		return 0, false // the EXIF stream outside the MakerNote is encoded again
+	case p < s.sosEnd:
+		return s.movedHeader(p, n)
+	case p+n > size || !startsWithSOI(cr, p, scratch):
+		return 0, false
+	}
+	return movedPosition(p, s.delta, plan)
+}
+
+// movedHeader returns the position in the output of the n bytes at position p of
+// the source, when they lie inside one segment before the first scan header that
+// the write copies unchanged.
+func (s *shiftInfo) movedHeader(p, n int64) (int64, bool) {
+	for _, k := range s.kept {
+		if p >= k.src && p+n <= k.end {
+			return k.out + (p - k.src), true
+		}
+	}
+	return 0, false
 }
 
 // startsWithSOI reports whether the two bytes of r at offset p are the SOI
@@ -207,6 +255,9 @@ func measureShift(cr io.ReadSeeker, scratch *[]byte, rawEXIF, rawIPTC, rawXMP, o
 		info.noteOldEXIF(marker, data, end)
 		if dropsSegment(marker, data, preserveUnknownSegments, keepGUID) {
 			continue
+		}
+		if marker != markerSOS { // the scan header is where the shift starts
+			info.kept = append(info.kept, keptSegment{src: end - int64(len(data)) - 4, end: end, out: out})
 		}
 		out += int64(len(data)) + 4 // marker, length and data
 		if marker == markerSOS {

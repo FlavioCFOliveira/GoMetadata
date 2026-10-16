@@ -271,6 +271,15 @@ func FuzzTIFFInject(f *testing.F) {
 	f.Add(buildSyntheticBigTIFF(binary.BigEndian, uint16(exif.TypeLong), 13)) // 0x014A as IFD (EXIF-3.0/TIFF-Extension type-13 collision case)
 	f.Add(buildSyntheticBigTIFF(binary.LittleEndian, uint16(exif.TypeLong), uint16(exif.TypeIFD8)))
 
+	// Seeds (task #370): Olympus MakerNotes whose preview offset addresses data
+	// inside the note and after the metadata, in both layouts.
+	for _, layout := range []string{"olympus", "olymp"} {
+		for _, place := range []string{"mn", "tail"} {
+			file, _, _ := olympusSource(f, layout, place)
+			f.Add(file)
+		}
+	}
+
 	// Seed 8: TIFF with max-value count entry — exercises overflow guards in
 	// exif.Parse field-width arithmetic.
 	{

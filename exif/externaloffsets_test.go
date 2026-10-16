@@ -92,12 +92,6 @@ func TestExternalOffsets_X2(t *testing.T) {
 		{"nil", nil},
 		{"not TIFF", []byte("OLYMPUS and some text that is no TIFF stream at all")},
 		{"Canon MakerNote", olympusStream("Canon", "", good)},
-		{"Olympus OLYMP layout counts from the TIFF header", func() []byte {
-			tiff, _ := testutil.MakerNoteTIFF(testutil.MNSpec{
-				Make: "OLYMPUS OPTICAL CO.,LTD", Order: binary.LittleEndian, Prefix: []byte("OLYMP\x00\x01\x00"), TIFFRelative: true, PadBefore: 6,
-				Entries: []testutil.MNEntry{{Tag: 0x2020, Sub: &testutil.MNSub{Entries: good}}}})
-			return tiff
-		}()},
 	} {
 		t.Run("R-27/"+tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -185,5 +179,95 @@ func BenchmarkAppendPrivateIFD(b *testing.B) {
 		if _, err := EncodeRebased(e, src); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// olympStream builds the EXIF stream of an Olympus "OLYMP\0" body, whose
+// offsets count from the TIFF header, with the given MakerNote entries.
+func olympStream(entries []testutil.MNEntry) []byte {
+	tiff, _ := testutil.MakerNoteTIFF(testutil.MNSpec{
+		Make: "OLYMPUS OPTICAL CO.,LTD", Order: binary.LittleEndian, Prefix: []byte("OLYMP\x00\x01\x00"), TIFFRelative: true, PadBefore: 6,
+		Entries: entries,
+	})
+	return tiff
+}
+
+// previewIFDValue returns the bytes of an IFD of entries with an inline LONG
+// start and length (the E-1 form of CameraSettings: the entries are the value).
+func previewIFDValue(start, length uint32) []byte {
+	v := binary.LittleEndian.AppendUint16(nil, 3) // three entries
+	for _, e := range [...]struct {
+		tag uint16
+		val uint32
+	}{{0x0100, 1}, {0x0101, start}, {0x0102, length}} {
+		v = binary.LittleEndian.AppendUint16(v, e.tag)
+		v = binary.LittleEndian.AppendUint16(v, 4)
+		v = binary.LittleEndian.AppendUint32(v, 1)
+		v = binary.LittleEndian.AppendUint32(v, e.val)
+	}
+	return binary.LittleEndian.AppendUint32(v, 0)
+}
+
+// TestExternalOffsets_X4 (task #370): the other forms of the Olympus preview
+// offset: the "OLYMP\0" layout (counted from the TIFF header), CameraSettings
+// stored as a value (E-1), and the pairs 0x1036/0x1037 and 0x0088/0x0089 of the
+// MakerNote IFD. R-31.
+func TestExternalOffsets_X4(t *testing.T) {
+	t.Parallel()
+	pair := func(a, b uint16) []testutil.MNEntry {
+		return []testutil.MNEntry{
+			{Tag: a, Type: 4, Count: 1, Value: long(5000)},
+			{Tag: b, Type: 4, Count: 1, Value: long(321)},
+		}
+	}
+	for _, tc := range []struct {
+		name     string
+		stream   []byte
+		want     int
+		tiffBase bool // Base is the TIFF header
+	}{
+		{"OLYMP CameraSettings IFD", olympStream([]testutil.MNEntry{{Tag: 0x2020, Sub: &testutil.MNSub{Entries: pair(0x0101, 0x0102)}}}), 1, true},
+		{"E-1 CameraSettings as a value", olympStream([]testutil.MNEntry{{Tag: 0x2020, Type: 7, Count: 42, Value: previewIFDValue(5000, 321)}}), 1, true},
+		{"main pair 0x1036", olympStream(pair(0x1036, 0x1037)), 1, true},
+		{"main pair 0x0088", olympStream(pair(0x0088, 0x0089)), 1, true},
+		{"OLYMPUS layout main pair", func() []byte {
+			tiff, _ := testutil.MakerNoteTIFF(testutil.MNSpec{
+				Make: "OLYMPUS IMAGING CORP.", Order: binary.LittleEndian, Prefix: []byte("OLYMPUS\x00II\x03\x00"), PadBefore: 6,
+				Entries: pair(0x1036, 0x1037)})
+			return tiff
+		}(), 1, false},
+		{"E-1 value, length 0", olympStream([]testutil.MNEntry{{Tag: 0x2020, Type: 7, Count: 42, Value: previewIFDValue(5000, 0)}}), 0, true},
+		{"CameraSettings of a SHORT type", olympStream([]testutil.MNEntry{{Tag: 0x2020, Type: 3, Count: 1, Value: []byte{9, 0}}}), 0, true},
+		{"sub-IFD that runs past the MakerNote", olympStream([]testutil.MNEntry{{Tag: 0x2020, Sub: &testutil.MNSub{Entries: pair(0x0101, 0x0102), CrossesEnd: true}}}), 0, true},
+	} {
+		t.Run("R-31/"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := ExternalOffsets(tc.stream)
+			if len(got) != tc.want {
+				t.Fatalf("ExternalOffsets = %+v, want %d offsets", got, tc.want)
+			}
+			if tc.want == 0 {
+				return
+			}
+			o := got[0]
+			if o.Value != 5000 || o.Length != 321 {
+				t.Errorf("offset = %+v, want value 5000, length 321", o)
+			}
+			if binary.LittleEndian.Uint32(tc.stream[o.Field:]) != 5000 {
+				t.Errorf("Field %d does not hold the value", o.Field)
+			}
+			if o.Field < o.MNStart || o.Field+4 > o.MNStart+o.MNLen {
+				t.Errorf("Field %d is outside the MakerNote [%d,+%d)", o.Field, o.MNStart, o.MNLen)
+			}
+			if tc.tiffBase && o.Base != 0 {
+				t.Errorf("Base = %d, want 0 (the TIFF header)", o.Base)
+			}
+			if !tc.tiffBase && o.Base != o.MNStart {
+				t.Errorf("Base = %d, want the MakerNote start %d", o.Base, o.MNStart)
+			}
+			if o.Target() != int64(o.Base)+5000 {
+				t.Errorf("Target = %d", o.Target())
+			}
+		})
 	}
 }

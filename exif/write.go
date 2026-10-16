@@ -319,7 +319,7 @@ func checkBigTIFFThumbnails(e *EXIF, ifd1Start uint64) error {
 // (see planChain) without writing it. An IFD without pointer tags or attached
 // IFDs is measured on its own entries, which allocates nothing.
 func chainLen(e *EXIF, ifd *IFD, pos uint64, bigTIFF bool) chainLayout {
-	if !chainHasPointers(ifd) {
+	if !chainHasPointers(ifd) && ifd.thumbnailStrips() == nil {
 		blockEnd := pos + ifdWrittenLen(ifd.Entries, pos, bigTIFF, ifd.ThumbnailData != nil)
 		return chainLayout{thumb: blockEnd, end: blockEnd + thumbnailSpan(ifd)}
 	}
@@ -544,8 +544,15 @@ func writeSubIFDs(out []byte, e *EXIF, exifIFDEntries []IFDEntry, order binary.B
 // be even ("The Image File Directory ... must begin on a word boundary"), so
 // the IFD that follows an odd-length thumbnail is placed after a pad byte.
 // BigTIFF uses the same rule (libtiff tif_dirwrite.c word-aligns every offset).
+//
+// It is exact for an IFD without thumbnail strips (chainLen then uses it); for
+// one with strips it is an upper bound (every strip may need a pad byte), used
+// only to size the buffer of classicCapacityHint.
 func thumbnailSpan(ifd *IFD) uint64 {
 	n := uint64(len(ifd.ThumbnailData))
+	for _, s := range ifd.thumbnailStrips() {
+		n += uint64(len(s)) + 1
+	}
 	if ifd.Next != nil && n&1 == 1 {
 		n++
 	}

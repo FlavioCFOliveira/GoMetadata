@@ -965,13 +965,28 @@ func cloneIFD(ifd *exif.IFD) *exif.IFD {
 	}
 }
 
+// cloneStrips returns a deep copy of strips; nil stays nil.
+func cloneStrips(strips [][]byte) [][]byte {
+	if strips == nil {
+		return nil
+	}
+	out := make([][]byte, len(strips))
+	for i, s := range strips {
+		out[i] = bytes.Clone(s)
+	}
+	return out
+}
+
 // cloneSubIFDs returns a clone of the IFDs that an IFD of the chain after IFD0
 // addresses itself (exif.SubIFDs, task #319).
 func cloneSubIFDs(s *exif.SubIFDs) *exif.SubIFDs {
 	if s == nil {
 		return nil
 	}
-	return &exif.SubIFDs{Exif: cloneIFD(s.Exif), GPS: cloneIFD(s.GPS), Interop: cloneIFD(s.Interop)}
+	// ThumbnailStrips is nil on every EXIF that reaches here (a TIFF-based file
+	// is parsed without CarryThumbnailStrips); copied anyway so that the clone
+	// stays equal to its source.
+	return &exif.SubIFDs{Exif: cloneIFD(s.Exif), GPS: cloneIFD(s.GPS), Interop: cloneIFD(s.Interop), ThumbnailStrips: cloneStrips(s.ThumbnailStrips)}
 }
 
 // writeTIFFNEF handles metadata injection for Nikon NEF files.

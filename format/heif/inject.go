@@ -83,6 +83,9 @@ type injectComponents struct {
 	// mdatBox is the media data box appended after suffix: its header and
 	// every pending payload in item order (see buildInjectComponents).
 	mdatBox []byte
+	// trailer holds the bytes after the last top-level box of the source, when
+	// they do not parse as a box. It is written after mdatBox, byte for byte.
+	trailer []byte
 }
 
 // pendingPayload is the new payload of an Exif or XMP item.
@@ -118,7 +121,9 @@ func (p pendingPayload) appendTo(dst []byte) []byte {
 // #309). The iloc box is fully rebuilt; every other item keeps its location,
 // shifted when the meta box changes size. Any enclosing container box sizes
 // (e.g. moov) are patched if the meta box size changes. New item payloads
-// are stored in a new 'mdat' box appended at the end of the output file.
+// are stored in a new 'mdat' box appended after the last box of the source; bytes
+// after that box that do not parse as a box stay at the very end of the file,
+// unchanged (task #367).
 //
 // preserveUnknownSegments must be true. HEIF/AVIF ISOBMFF boxes (ftyp, moov,
 // mdat, etc.) are structurally mandatory; there is no concept of an "unknown
@@ -186,7 +191,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 		return err
 	}
 
-	return writeHEIFOutput(w, comp.outputPrefix, comp.finalMetaBox, comp.suffix, comp.mdatBox)
+	return writeHEIFOutput(w, comp.outputPrefix, comp.finalMetaBox, comp.suffix, comp.mdatBox, comp.trailer)
 }
 
 // buildInjectComponents parses the existing meta box, maps pending items,
@@ -197,8 +202,9 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 // declines silently. data is edited in place, and only after planInject has
 // accepted the file.
 //
-// Payload placement (task #282): every pending payload is stored in ONE new
-// 'mdat' box appended after the last top-level box of the file. ISO/IEC
+// Payload placement (task #282, #367): every pending payload is stored in ONE new
+// 'mdat' box appended after the last top-level box of the file (before any
+// trailing bytes that do not parse as a box). ISO/IEC
 // 14496-12 §4.2 requires a file to be a sequence of boxes, and §8.1.1 allows
 // any number of 'mdat' boxes; bytes appended after the last box without a box
 // header are read by conformant parsers as a malformed box (ExifTool reports
@@ -231,7 +237,7 @@ func buildInjectComponents(data []byte, metaAbsStart, metaAbsEnd, metaContentOff
 
 	// The new payloads are appended as a new top-level box, so a last box
 	// that extends to the end of the file must first get an explicit size.
-	closeOpenEndedBox(data)
+	boxesEnd := closeOpenEndedBox(data)
 
 	// versionFlags is captured before data is edited below (it lies inside
 	// the meta box, which no edit touches, but taking it first keeps that
@@ -242,8 +248,19 @@ func buildInjectComponents(data []byte, metaAbsStart, metaAbsEnd, metaContentOff
 	}
 
 	// The prefix and suffix alias data (no copy): data is not edited again.
+	//
+	// Trailing bytes (task #367): bytes after the last top-level box that do
+	// not parse as a box are kept at the very end of the file, byte for byte,
+	// and the new 'mdat' box goes before them. Appended after them, the new
+	// box header could be read as the tail of a malformed header that starts in
+	// the trailing bytes: a bogus file-level 'meta' box reaching into the 'mdat'
+	// would hide the real one (ISO/IEC 14496-12 §4.2: a file is a sequence of
+	// boxes, so the new box must start on a box boundary, which only the end
+	// of the last box is). An extent that points into the trailing bytes is
+	// outside every box and is not shifted.
 	outputPrefix := data[:metaAbsStart]
-	suffix := data[metaAbsEnd:]
+	suffix := data[metaAbsEnd:boxesEnd]
+	trailer := data[boxesEnd:]
 
 	mdatStart := uint64(len(outputPrefix)) + uint64(plan.metaLen) + uint64(len(suffix)) //nolint:gosec // G115: lengths are non-negative and bounded by maxFileSize
 	mdatBox, err := placePayloads(plan, mdatStart)
@@ -262,6 +279,7 @@ func buildInjectComponents(data []byte, metaAbsStart, metaAbsEnd, metaContentOff
 		finalMetaBox: finalMetaBox,
 		suffix:       suffix,
 		mdatBox:      mdatBox,
+		trailer:      trailer,
 	}, nil
 }
 
@@ -1185,26 +1203,28 @@ func fitsIlocField(v uint64, width int) bool {
 // extends to the end of the file", which stops being true once a box is
 // appended after it. data is owned by the caller and edited in place; a size
 // that does not fit the 32-bit field (impossible below maxFileSize) is left
-// unchanged.
-func closeOpenEndedBox(data []byte) {
+// unchanged. It returns the offset at which the top-level boxes end: len(data),
+// or the start of the first bytes that do not parse as a box.
+func closeOpenEndedBox(data []byte) (boxesEnd int) {
 	pos := 0
 	for pos+8 <= len(data) {
 		size, _, _, ok := parseHEIFBoxHeader(data, pos)
 		if !ok {
-			return
+			return pos
 		}
 		if bmff.OpenEnded(data[pos:]) {
 			bmff.CloseInPlace(data[pos : pos+int(size)]) //nolint:gosec // G115: ISOBMFF box size bounded by file size
-			return
+			return pos + int(size)                       //nolint:gosec // G115: ISOBMFF box size bounded by file size
 		}
 		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 	}
+	return pos
 }
 
 // writeHEIFOutput writes the output sections to w: prefix (patched ancestor
-// sizes), meta box, suffix, then the new 'mdat' box holding every pending
-// payload.
-func writeHEIFOutput(w io.Writer, prefix, meta, suffix, mdat []byte) error {
+// sizes), meta box, suffix, the new 'mdat' box holding every pending payload,
+// then the trailing non-box bytes of the source.
+func writeHEIFOutput(w io.Writer, prefix, meta, suffix, mdat, trailer []byte) error {
 	if _, err := w.Write(prefix); err != nil {
 		return fmt.Errorf("heif: write prefix: %w", err)
 	}
@@ -1216,6 +1236,9 @@ func writeHEIFOutput(w io.Writer, prefix, meta, suffix, mdat []byte) error {
 	}
 	if _, err := w.Write(mdat); err != nil {
 		return fmt.Errorf("heif: write item payloads: %w", err)
+	}
+	if _, err := w.Write(trailer); err != nil {
+		return fmt.Errorf("heif: write trailing bytes: %w", err)
 	}
 	return nil
 }

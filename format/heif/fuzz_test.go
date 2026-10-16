@@ -277,6 +277,11 @@ func FuzzHEIFInject(f *testing.F) {
 	// iloc boxes whose offset_size / length_size is 0.
 	f.Add(buildTask334File(task334Layout{metaLarge: true, offsetSize: 4, lengthSize: 4}))
 	f.Add(buildTask334File(task334Layout{inMoov: true, moovLarge: true, metaLarge: true, offsetSize: 4, lengthSize: 4}))
+	// Task #367: sources whose top-level boxes end in bytes that do not parse as
+	// a box, the first of which becomes a 'meta' header when a box follows it.
+	for _, tail := range task367Trailers() {
+		f.Add(append(buildTask334File(task334Layout{withItems: true, inMoov: true, offsetSize: 4, lengthSize: 4}), tail...))
+	}
 	f.Add(buildTask334File(task334Layout{offsetSize: 0, lengthSize: 4, baseOffsetSize: 4}))
 	f.Add(buildTask334File(task334Layout{offsetSize: 4, lengthSize: 0}))
 
@@ -318,17 +323,9 @@ func FuzzHEIFInject(f *testing.F) {
 		// what Inject stored is what Extract reads back. Tasks #358 and #359:
 		// no exemption remains for an iinf box of version 1 (32-bit
 		// entry_count) or for a child of meta, iinf or iref with a size field
-		// of 0; Inject closes the open-ended child before appending.
-		//
-		// One input class stays out of the check: a source whose top-level
-		// boxes end in bytes that do not parse as a box. Inject appends the
-		// new 'mdat' box after those bytes, where a reader can take them as the
-		// header of a file-level 'meta' box that reaches into the new 'mdat'
-		// and prefer it to the 'moov' one the writer used (reported
-		// separately, not part of tasks #358 and #359).
-		if hasTrailingUnboxedBytes(data) {
-			return
-		}
+		// of 0; Inject closes the open-ended child before appending. Task
+		// #367: none remains for a source whose top-level boxes end in bytes
+		// that do not parse as a box; the new 'mdat' box goes before them.
 		gotEXIF, _, gotXMP, err := Extract(bytes.NewReader(out.Bytes()))
 		if err != nil {
 			return
@@ -343,20 +340,6 @@ func FuzzHEIFInject(f *testing.F) {
 			t.Fatal("Inject stored EXIF and XMP but Extract of the output reads neither")
 		}
 	})
-}
-
-// hasTrailingUnboxedBytes reports whether the top-level boxes of file stop
-// before its end because the next header does not parse as a box.
-func hasTrailingUnboxedBytes(file []byte) bool {
-	pos := 0
-	for pos < len(file) {
-		size, _, _, ok := parseHEIFBoxHeader(file, pos)
-		if !ok {
-			return true
-		}
-		pos += int(size) //nolint:gosec // G115: bounded by the slice length
-	}
-	return false
 }
 
 // assertHEIFExtentsWithinBounds parses output's meta/iloc box, if present,

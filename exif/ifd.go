@@ -578,15 +578,16 @@ gpsSection:
 // so that Encode can re-append the bytes at the correct new offset and patch
 // tag 0x0201 accordingly.  Nil means no JPEG thumbnail is attached.
 //
-// Sub holds the sub-IFDs addressed by the pointer tags of an IFD of the chain
-// that follows IFD0 (a thumbnail IFD, "1st IFD"): see SubIFDs. It is nil for
-// IFD0 (whose sub-IFDs are the ExifIFD, GPSIFD and InteropIFD fields of EXIF)
-// and for every chained IFD that has none of its own.
+// Sub holds what is attached to an IFD of the chain that follows IFD0 (a
+// thumbnail IFD, "1st IFD"): its sub-IFDs and the strips of an uncompressed
+// thumbnail, see SubIFDs. It is nil for IFD0 (whose sub-IFDs are the ExifIFD,
+// GPSIFD and InteropIFD fields of EXIF) and for every chained IFD that has
+// none of its own.
 type IFD struct {
 	Entries       []IFDEntry
 	Next          *IFD     // linked IFDs (e.g. IFD1 for thumbnail)
 	ThumbnailData []byte   // raw JPEG thumbnail bytes; non-nil when present
-	Sub           *SubIFDs // sub-IFDs of a chained IFD (see SubIFDs); nil when none
+	Sub           *SubIFDs // data attached to a chained IFD (see SubIFDs); nil when none
 }
 
 // SubIFDs holds the sub-IFDs that an IFD of the chain after IFD0 addresses
@@ -603,10 +604,30 @@ type IFD struct {
 // the IFD of IFD0 is rewritten by Encode to the block it writes for it; a
 // pointer that addresses an IFD that cannot be parsed is dropped (see
 // chainEntries).
+//
+// ThumbnailStrips holds the strips of an uncompressed thumbnail, in strip
+// order, when the IFD records its thumbnail as TIFF strips (Exif 3.1 §4.5.8,
+// pp. 25-26: an uncompressed thumbnail is recorded in the 1st IFD as a TIFF
+// image; tags 0x0111 StripOffsets and 0x0117 StripByteCounts, §4.6.5.2,
+// pp. 39-40). Parse fills it only when the CarryThumbnailStrips option is
+// given; Encode then writes the strips after the IFD and rewrites StripOffsets
+// to the new positions. Nil means no strips are carried (the default, and the
+// case when the strips lie outside the parsed bytes or exceed the carry
+// limits). It lives here and not in IFD so that the common IFD stays small.
 type SubIFDs struct {
-	Exif    *IFD
-	GPS     *IFD
-	Interop *IFD
+	Exif            *IFD
+	GPS             *IFD
+	Interop         *IFD
+	ThumbnailStrips [][]byte
+}
+
+// thumbnailStrips returns the strips of the uncompressed thumbnail of ifd (see
+// SubIFDs), or nil.
+func (ifd *IFD) thumbnailStrips() [][]byte {
+	if ifd.Sub == nil {
+		return nil
+	}
+	return ifd.Sub.ThumbnailStrips
 }
 
 // IFDEntry represents a single TIFF directory entry (TIFF §2, 12 bytes each).
