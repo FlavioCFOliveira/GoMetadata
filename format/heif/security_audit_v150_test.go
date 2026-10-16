@@ -108,8 +108,8 @@ func TestSecurityAuditV150HEIF(t *testing.T) {
 				if err != nil {
 					t.Errorf("trailer %d: Inject error = %v, want success", i, err)
 				}
-			case <-time.After(5 * time.Second):
-				t.Fatalf("trailer %d: Inject did not return within 5s (infinite loop)", i)
+			case <-time.After(30 * time.Second):
+				t.Fatalf("trailer %d: Inject did not return within 30s (infinite loop)", i)
 			}
 		}
 	})
@@ -127,7 +127,7 @@ func TestSecurityAuditV150HEIF(t *testing.T) {
 			go func() { done <- patchAncestorSize(bytes.Clone(data), len(data)-8, 4) }()
 			select {
 			case <-done:
-			case <-time.After(5 * time.Second):
+			case <-time.After(30 * time.Second):
 				t.Fatalf("%s: patchAncestorSize did not return", name)
 			}
 		}

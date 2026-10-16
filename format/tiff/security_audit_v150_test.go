@@ -92,17 +92,16 @@ func TestSecurityAuditV150(t *testing.T) {
 	t.Parallel()
 
 	// F-07a: 2000 StripOffsets entries addressing one 1 MiB range made Write
-	// emit 2000 MiB from a 1 MiB file.
+	// emit 2000 MiB from a 1 MiB file. The range is copied once now.
 	t.Run("F-07a", func(t *testing.T) {
 		t.Parallel()
 		in := auditDuplicateStrips(2000, 1<<20)
 		var out countingWriter
-		err := Inject(bytes.NewReader(in), &out, in, []byte("iptc"), nil, true)
-		if !errors.Is(err, ErrImageBlocksOverlap) {
-			t.Errorf("Inject error = %v, want ErrImageBlocksOverlap", err)
+		if err := Inject(bytes.NewReader(in), &out, in, []byte("iptc"), nil, true); err != nil {
+			t.Fatalf("Inject: %v", err)
 		}
 		if out.n > int64(len(in))+64<<10 {
-			t.Errorf("Inject wrote %d bytes for a %d-byte file before failing (limit input+64 KiB)", out.n, len(in))
+			t.Errorf("Inject wrote %d bytes for a %d-byte file (limit input+64 KiB)", out.n, len(in))
 		}
 	})
 
@@ -111,12 +110,52 @@ func TestSecurityAuditV150(t *testing.T) {
 		t.Parallel()
 		in := auditDuplicateStrips(300, 1<<16)
 		var out countingWriter
-		err := InjectWithEXIF(in, mustParseEXIF(t, in), []byte("iptc"), nil, &out)
-		if !errors.Is(err, ErrImageBlocksOverlap) {
-			t.Errorf("InjectWithEXIF error = %v, want ErrImageBlocksOverlap", err)
+		if err := InjectWithEXIF(in, mustParseEXIF(t, in), []byte("iptc"), nil, &out); err != nil {
+			t.Fatalf("InjectWithEXIF: %v", err)
 		}
 		if out.n > int64(len(in))+64<<10 {
 			t.Errorf("InjectWithEXIF wrote %d bytes for a %d-byte file", out.n, len(in))
+		}
+	})
+
+	// F-07a-overlap: a strip and tiles over the same bytes (the shape of a Sony
+	// ARW, which a valid camera file has) is written, with the bytes once, every
+	// tile at its place in the copy of the strip.
+	t.Run("F-07a-overlap", func(t *testing.T) {
+		t.Parallel()
+		const tiles, tileLen = 140, 4096
+		in, _ := auditOverlapTiles(tiles, tileLen)
+		var out bytes.Buffer
+		if err := Inject(bytes.NewReader(in), &out, in, []byte("iptc"), nil, true); err != nil {
+			t.Fatalf("Inject: %v", err)
+		}
+		if out.Len() > len(in)+64<<10 {
+			t.Errorf("output %d bytes for a %d-byte file (limit input+64 KiB)", out.Len(), len(in))
+		}
+		got := out.Bytes()
+		inOffs := ifd0Longs(t, in, 0x0144)
+		outOffs, outCnts := ifd0Longs(t, got, 0x0144), ifd0Longs(t, got, 0x0145)
+		if len(outOffs) != tiles || len(outCnts) != tiles {
+			t.Fatalf("tile entries: %d offsets, %d counts, want %d", len(outOffs), len(outCnts), tiles)
+		}
+		for i := range tiles {
+			if outCnts[i] != tileLen {
+				t.Fatalf("tile %d count = %d, want %d", i, outCnts[i], tileLen)
+			}
+			want := in[inOffs[i] : inOffs[i]+tileLen]
+			if !bytes.Equal(got[outOffs[i]:outOffs[i]+tileLen], want) {
+				t.Fatalf("tile %d: bytes at its output offset %d differ from the source", i, outOffs[i])
+			}
+		}
+		stripOff, stripCnt := ifd0Longs(t, got, 0x0111)[0], ifd0Longs(t, got, 0x0117)[0]
+		if stripCnt != tiles*tileLen || !bytes.Equal(got[stripOff:stripOff+stripCnt], in[len(in)-tiles*tileLen:]) {
+			t.Errorf("strip bytes at %d (%d bytes) differ from the source", stripOff, stripCnt)
+		}
+		// One copy: tile i sits at the strip offset plus its source distance.
+		for i := range tiles {
+			if outOffs[i] != stripOff+uint32(i*tileLen) {
+				t.Fatalf("tile %d at %d, want strip start %d + %d", i, outOffs[i], stripOff, i*tileLen)
+			}
 		}
 	})
 

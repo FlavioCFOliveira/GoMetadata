@@ -6,7 +6,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 )
 
 // Security audit 2026-10-16 (v1.5.0 pre-clearance), findings F-04, F-05, F-10.
@@ -32,48 +31,95 @@ func auditNSXMLLang(n int) []byte {
 	return auditWrap(sb.String())
 }
 
+// maxAuditChain bounds the longest hash chain of the binding index in the F-04
+// tests. The index keeps its load at or below 2 bindings per bucket, so a chain
+// of 24 is a Poisson tail of about 1e-12 per bucket: the bound does not flake,
+// and a degenerate index (one long chain, a linear scan) exceeds it by orders
+// of magnitude.
+const maxAuditChain = 24
+
+// auditIndexedDoc returns a document whose scope holds n bindings a0..a(n-1)
+// (uri u0..), indexed as the scanner indexes them.
+func auditIndexedDoc(n int) *xmlDoc {
+	d := &xmlDoc{}
+	d.reset()
+	for i := range n {
+		d.pushBinding([]byte(fmt.Sprintf("a%d", i)), fmt.Sprintf("u%d", i))
+	}
+	return d
+}
+
+// auditLongestChain returns the number of bindings on the longest chain of the
+// binding index of d.
+func auditLongestChain(d *xmlDoc) int {
+	longest := 0
+	for _, head := range d.nsHead {
+		n := 0
+		for i := head; i != noNode; i = d.scope[i].prev {
+			n++
+		}
+		longest = max(longest, n)
+	}
+	return longest
+}
+
 func TestSecurityAuditV150(t *testing.T) {
 	t.Parallel()
 
 	// F-04: resolve scanned the whole scope for every attribute: 5.5 s for
-	// 3.4 MiB. The binding index and the direct hit on the xml prefix make it
-	// near linear.
+	// 3.4 MiB. The binding index makes a lookup walk one short hash chain. The
+	// proof is structural, not a wall-clock bound (which is load-sensitive): the
+	// longest chain of an index of 100000 bindings stays a small constant, so N
+	// lookups cost O(N), and the xml and last-declared prefixes resolve.
 	t.Run("F-04", func(t *testing.T) {
 		t.Parallel()
-		doc := auditNSXMLLang(100_000)
-		start := time.Now()
+		const n = 100_000
+		d := auditIndexedDoc(n)
+		if !d.nsIndexed {
+			t.Fatal("binding index not built for a scope of 100000 bindings")
+		}
+		if longest := auditLongestChain(d); longest > maxAuditChain {
+			t.Errorf("longest hash chain = %d bindings, want <= %d (lookups would degrade towards a linear scan)", longest, maxAuditChain)
+		}
+		for _, p := range []string{"xml", "a0", fmt.Sprintf("a%d", n-1)} {
+			if _, ok := d.resolve([]byte(p)); !ok {
+				t.Errorf("prefix %q not resolved", p)
+			}
+		}
+		if _, ok := d.resolve([]byte("missing")); ok {
+			t.Error("undeclared prefix resolved")
+		}
+		doc := auditNSXMLLang(20_000)
 		if _, err := Parse(doc); err != nil {
 			t.Fatalf("Parse: %v", err)
-		}
-		// 100 ms is the acceptance bound on an idle machine; the test allows
-		// ten times that so that -race and a loaded CI host do not flake,
-		// while the unfixed code needs about 5 s.
-		if d := time.Since(start); d > time.Second {
-			t.Errorf("Parse of %d bytes took %v, want near-linear time", len(doc), d)
 		}
 	})
 
 	// F-04: a prefix declared early, resolved N times with N other bindings in
-	// scope, is the quadratic case that a fast path for "xml" alone misses.
+	// scope, is the quadratic case that a fast path for "xml" alone misses. The
+	// index serves it with the same bounded chain, whatever the prefix.
 	t.Run("F-04-late-lookup", func(t *testing.T) {
 		t.Parallel()
 		const n = 50_000
+		d := auditIndexedDoc(n)
+		if got, ok := d.resolve([]byte("a0")); !ok || got != "u0" {
+			t.Errorf("earliest prefix resolved to %q, %v", got, ok)
+		}
+		if longest := auditLongestChain(d); longest > maxAuditChain {
+			t.Errorf("longest hash chain = %d, want <= %d", longest, maxAuditChain)
+		}
 		var sb strings.Builder
 		sb.WriteString(`<rdf:Description rdf:about="" xmlns:p0="http://p0/"`)
-		for i := 1; i < n; i++ {
+		for i := 1; i < 5_000; i++ {
 			fmt.Fprintf(&sb, ` xmlns:p%d="u%d"`, i, i)
 		}
 		sb.WriteString(`>`)
-		for range n {
+		for range 5_000 {
 			sb.WriteString(`<p0:v>1</p0:v>`)
 		}
 		sb.WriteString(`</rdf:Description>`)
-		start := time.Now()
 		if _, err := Parse(auditWrap(sb.String())); err != nil {
 			t.Fatalf("Parse: %v", err)
-		}
-		if d := time.Since(start); d > 2*time.Second {
-			t.Errorf("Parse took %v, want near-linear time", d)
 		}
 	})
 
@@ -145,13 +191,9 @@ func TestSecurityAuditV150(t *testing.T) {
 		const n = 150_000
 		doc := auditWrap(`<rdf:Description rdf:about="" xmlns:p="http://p/"><p:v>x` +
 			strings.Repeat(`<!----><![CDATA[y]]>`, n) + `</p:v></rdf:Description>`)
-		start := time.Now()
-		x, err := Parse(doc)
+		x, err := Parse(doc) // linear cost is proved by the allocation bound of TestSecurityAuditV150Alloc/F-10
 		if err != nil {
 			t.Fatalf("Parse: %v", err)
-		}
-		if d := time.Since(start); d > time.Second {
-			t.Errorf("Parse of %d bytes took %v, want linear time", len(doc), d)
 		}
 		if got, want := x.Properties["http://p/"]["v"], "x"+strings.Repeat("y", n); got != want {
 			t.Errorf("value = %d bytes %.20q, want %d bytes", len(got), got, len(want))
@@ -185,7 +227,7 @@ func TestSecurityAuditV150(t *testing.T) {
 // parallel: a sequential test never overlaps the parallel ones.
 func TestSecurityAuditV150Alloc(t *testing.T) { //nolint:paralleltest // measures process-wide allocation; it must not overlap the parallel tests
 	// F-05: a packet of 3.9 million empty elements made Parse allocate 3 GiB.
-	t.Run("F-05", func(t *testing.T) {
+	t.Run("F-05", func(t *testing.T) { //nolint:paralleltest // process-wide allocation measurement
 		doc := []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="">` +
 			strings.Repeat("<a/>", (15<<20)/4) + `</rdf:Description></rdf:RDF></x:xmpmeta>`)
 		var m0, m1 runtime.MemStats
@@ -198,6 +240,28 @@ func TestSecurityAuditV150Alloc(t *testing.T) { //nolint:paralleltest // measure
 		// The unfixed code allocates 3028 MiB.
 		if got := m1.TotalAlloc - m0.TotalAlloc; got > 20*uint64(len(doc)) {
 			t.Errorf("Parse allocated %d MiB for a %d MiB document", got>>20, len(doc)>>20)
+		}
+	})
+
+	// F-10: e.extra += string(content) re-copied the text for every CDATA
+	// section that followed markup, so the bytes copied grew with the square of
+	// the section count (150000 sections: about 11 GB). The CDATA sections are
+	// joined once now, so the allocation is a small multiple of the document.
+	t.Run("F-10", func(t *testing.T) { //nolint:paralleltest // process-wide allocation measurement
+		const n = 150_000
+		doc := auditWrap(`<rdf:Description rdf:about="" xmlns:p="http://p/"><p:v>x` +
+			strings.Repeat(`<!----><![CDATA[y]]>`, n) + `</p:v></rdf:Description>`)
+		var m0, m1 runtime.MemStats
+		runtime.ReadMemStats(&m0)
+		_, err := Parse(doc)
+		runtime.ReadMemStats(&m1)
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		got := m1.TotalAlloc - m0.TotalAlloc
+		t.Logf("Parse of %d bytes allocated %d bytes", len(doc), got)
+		if got > 30*uint64(len(doc)) {
+			t.Errorf("Parse allocated %d MiB for a %d KiB document (limit 30x)", got>>20, len(doc)>>10)
 		}
 	})
 }

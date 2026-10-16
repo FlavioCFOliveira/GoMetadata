@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"testing"
-	"time"
 )
 
 var (
@@ -190,11 +189,20 @@ func TestSecurityAuditV150(t *testing.T) {
 	t.Parallel()
 
 	// F-03: FindAFCP was quadratic (candidate x EOF-record scan): 0.23 s at
-	// 64 KiB, 15 s at 512 KiB. It must now answer in linear time.
+	// 64 KiB, 15 s at 512 KiB. The work is bounded structurally now, which is
+	// what this test proves instead of a load-sensitive wall-clock limit: a
+	// region with more than maxAFCPSignatures signatures yields no candidate list
+	// at all (collectAFCPSigs returns nil), so no candidate is parsed and no EOF
+	// record is searched, however large the region; and a region with exactly
+	// maxAFCPSignatures is the worst case that is still examined, which is
+	// bounded by the constant, not by the region size.
 	t.Run("F-03", func(t *testing.T) {
 		t.Parallel()
 		region := afcpBomb(512 << 10)
-		start := time.Now()
+		var buf [maxAFCPSignatures]int
+		if sigs := collectAFCPSigs(buf[:0], region); sigs != nil {
+			t.Errorf("collectAFCPSigs kept %d signatures of a %d-signature region, want nil (over the cap)", len(sigs), len(region)/12)
+		}
 		if a := FindAFCP(region, 100); a != nil {
 			t.Errorf("FindAFCP accepted a repeated-signature region: %+v", a)
 		}
@@ -202,8 +210,12 @@ func TestSecurityAuditV150(t *testing.T) {
 		if len(plan.Spans) != 0 {
 			t.Errorf("PlanFromRegion planned %d spans for a repeated-signature region", len(plan.Spans))
 		}
-		if d := time.Since(start); d > 500*time.Millisecond {
-			t.Errorf("512 KiB repeated-signature region took %v, want linear time (< 50 ms typical)", d)
+		atCap := afcpBomb(maxAFCPSignatures * 12)
+		if sigs := collectAFCPSigs(buf[:0], atCap); len(sigs) != maxAFCPSignatures {
+			t.Errorf("collectAFCPSigs kept %d signatures of a region with exactly %d, want all", len(sigs), maxAFCPSignatures)
+		}
+		if a := FindAFCP(atCap, 100); a != nil {
+			t.Errorf("FindAFCP accepted a repeated-signature region at the cap: %+v", a)
 		}
 	})
 

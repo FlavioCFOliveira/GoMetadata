@@ -352,7 +352,8 @@ func relocateTIFF(base []byte, rawIPTC, rawXMP []byte) (header []byte, blocks []
 //     always small (bounded by metadata size), regardless of source file size.
 //   - blocks: every image-data block (strips, tiles, JPEG-in-TIFF), each
 //     already carrying its final newOffset (assigned by assignNewOffsets).
-//     blocks[i].newOffset == len(header) + sum(blocks[j].size for j < i): the
+//     blocks[i].newOffset == len(header) + sum(blocks[j].size for j < i) when the
+//     blocks are disjoint (overlapping blocks share one copy, see assignNewOffsets): the
 //     blocks, concatenated in slice order and appended immediately after
 //     header, reproduce EXACTLY the single-buffer result this function used
 //     to return directly (task #291).
@@ -1009,7 +1010,17 @@ func bytecountTagFor(offsetTag exif.TagID) exif.TagID {
 }
 
 // assignNewOffsets assigns a new absolute file offset to each image block,
-// placing them contiguously starting at imageStart.
+// placing the copied bytes contiguously starting at imageStart.
+//
+// Disjoint blocks (the usual case) are placed one after the other in slice
+// order. When blocks overlap, each source byte is copied once: the blocks are
+// coalesced into a union of source ranges (planBlocks), each range is placed at
+// the position of its first block, and every block is rebased into its range at
+// the same distance from the range start that it has in the source, so a tile
+// over a strip points inside the copy of the strip. This is the relocation that
+// libtiff's TIFFRewriteDirectory/_TIFFRewriteField and Exiv2's TiffImage
+// perform when they keep the strips as they are: the addressed data is written
+// once and each offset entry is updated to where it lands.
 //
 // TIFF 6.0 §2: all offsets are measured from byte 0 of the TIFF stream.
 //
@@ -1021,13 +1032,41 @@ func bytecountTagFor(offsetTag exif.TagID) exif.TagID {
 // at the ifdEnd/subIFDsSize overflow check for the full rationale.
 func assignNewOffsets(blocks []*imageBlock, imageStart uint64) {
 	cur := imageStart
-	for _, blk := range blocks {
-		blk.newOffset = cur
-		if blk.size > math.MaxUint32-cur {
-			// Saturate to prevent overflow; caller will detect the invalid offset.
+	if disjointAscending(blocks) {
+		for _, blk := range blocks {
+			blk.newOffset = cur
+			if blk.size > math.MaxUint32-cur {
+				// Saturate to prevent overflow; caller will detect the invalid offset.
+				blk.newOffset = math.MaxUint32
+			} else {
+				cur += blk.size
+			}
+		}
+		return
+	}
+	plan := planBlocks(blocks)
+	dst := make([]uint64, len(plan.ranges))
+	placed := 0
+	for i, blk := range blocks {
+		p := plan.of[i]
+		if p < 0 { // empty block: no bytes, at the position it has in the order
+			blk.newOffset = cur
+			continue
+		}
+		rg := plan.ranges[p]
+		if int(p) == placed { // first block of its range: place the range
+			placed++
+			if size := rg.end - rg.start; size > math.MaxUint32-cur {
+				dst[p] = math.MaxUint32 // saturate, as above
+			} else {
+				dst[p] = cur
+				cur += size
+			}
+		}
+		if dst[p] == math.MaxUint32 {
 			blk.newOffset = math.MaxUint32
 		} else {
-			cur += blk.size
+			blk.newOffset = dst[p] + (blk.srcOffset - rg.start)
 		}
 	}
 }

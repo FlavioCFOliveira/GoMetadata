@@ -5,8 +5,8 @@ import (
 	"compress/zlib"
 	"errors"
 	"io"
+	"runtime"
 	"testing"
-	"time"
 
 	"github.com/FlavioCFOliveira/GoMetadata/iptc"
 )
@@ -31,46 +31,58 @@ func auditProfileBomb(mib int) []byte {
 func TestSecurityAuditV150(t *testing.T) {
 	t.Parallel()
 
-	// F-08: 40 chunks that each inflate to 63 MiB cost 2.1 s of Read.
+	// F-08: 40 chunks that each inflate to 63 MiB cost 2.1 s of Read. The proof
+	// is a count, not a wall-clock bound: 40 chunks of 1 MiB of text that is no
+	// profile (so first-wins never skips them) exhaust the 32 MiB budget at
+	// exactly the 33rd chunk, which is rejected before any further chunk is
+	// inflated.
 	t.Run("F-08", func(t *testing.T) {
 		t.Parallel()
-		bomb := auditProfileBomb(63)
+		bomb := auditProfileBomb(1)
+		var st extractState
+		for i := range 40 {
+			err := st.addRawProfile(chunkZTXt, bomb)
+			if i < 32 {
+				if err != nil {
+					t.Fatalf("chunk %d: %v, want it inflated within the budget", i, err)
+				}
+				if want := int64(i+1) << 20; st.budget.used != want {
+					t.Fatalf("after chunk %d: budget used %d, want %d", i, st.budget.used, want)
+				}
+				continue
+			}
+			if !errors.Is(err, ErrRawProfileBudget) {
+				t.Fatalf("chunk %d: error = %v, want ErrRawProfileBudget", i, err)
+			}
+			if i != 32 {
+				t.Fatalf("budget exceeded at chunk %d, want 32", i)
+			}
+			if st.budget.used != maxRawProfileBudget {
+				t.Errorf("budget used %d after the rejected chunk, want %d (the rejected chunk is charged nothing)", st.budget.used, maxRawProfileBudget)
+			}
+			break
+		}
 		chunks := make([][2]any, 40)
 		for i := range chunks {
 			chunks[i] = [2]any{"zTXt", bomb}
 		}
-		in := pngWithChunks(chunks...)
-		start := time.Now()
-		_, _, _, err := Extract(bytes.NewReader(in))
-		d := time.Since(start)
-		t.Logf("Extract of 40 bombs: %v", d)
-		if !errors.Is(err, ErrRawProfileBudget) {
+		if _, _, _, err := Extract(bytes.NewReader(pngWithChunks(chunks...))); !errors.Is(err, ErrRawProfileBudget) {
 			t.Errorf("Extract error = %v, want ErrRawProfileBudget", err)
-		}
-		// One inflate of at most the budget (about 30 ms); the unfixed code
-		// inflated all 40 chunks (2.1 s). The bound allows -race and loaded hosts.
-		if d > time.Second {
-			t.Errorf("Extract took %v for 40 raw profile bombs", d)
 		}
 	})
 
 	// F-08: the same file through Inject (superseded and rewrite checks).
 	t.Run("F-08-inject", func(t *testing.T) {
 		t.Parallel()
-		bomb := auditProfileBomb(63)
+		bomb := auditProfileBomb(1)
 		chunks := make([][2]any, 40)
 		for i := range chunks {
 			chunks[i] = [2]any{"zTXt", bomb}
 		}
 		in := pngWithChunks(chunks...)
-		start := time.Now()
 		err := Inject(bytes.NewReader(in), io.Discard, tinyEXIF(t), sampleIIM(t), nil, true)
-		d := time.Since(start)
 		if !errors.Is(err, ErrRawProfileBudget) {
 			t.Errorf("Inject error = %v, want ErrRawProfileBudget", err)
-		}
-		if d > time.Second {
-			t.Errorf("Inject took %v for 40 raw profile bombs", d)
 		}
 	})
 
@@ -112,6 +124,45 @@ func TestSecurityAuditV150(t *testing.T) {
 			t.Errorf("profiles not read: exif=%d iptc=%d bytes", len(e), len(i))
 		}
 	})
+}
+
+// TestSecurityAuditV150Alloc proves, by allocation, that 40 chunks that each
+// inflate to 63 MiB are not inflated 40 times: the unfixed code allocated at
+// least 40 x 63 MiB (2.1 s of CPU); the budget allows one inflate of at most
+// 32 MiB. It measures process-wide allocation, so it is NOT parallel: a
+// sequential test never overlaps the parallel ones.
+func TestSecurityAuditV150Alloc(t *testing.T) { //nolint:paralleltest // measures process-wide allocation; it must not overlap the parallel tests
+	bomb := auditProfileBomb(63)
+	chunks := make([][2]any, 40)
+	for i := range chunks {
+		chunks[i] = [2]any{"zTXt", bomb}
+	}
+	in := pngWithChunks(chunks...)
+	exif, iim := tinyEXIF(t), sampleIIM(t)
+	// 8 budgets: room for the growth of one inflate buffer, far below the
+	// 2.5 GiB that 40 full inflates allocate.
+	const limit = 8 * uint64(maxRawProfileBudget)
+
+	for _, tc := range []struct {
+		name string
+		run  func() error
+	}{
+		{"F-08", func() error { _, _, _, err := Extract(bytes.NewReader(in)); return err }},
+		{"F-08-inject", func() error { return Inject(bytes.NewReader(in), io.Discard, exif, iim, nil, true) }},
+	} {
+		var m0, m1 runtime.MemStats
+		runtime.ReadMemStats(&m0)
+		err := tc.run()
+		runtime.ReadMemStats(&m1)
+		if !errors.Is(err, ErrRawProfileBudget) {
+			t.Errorf("%s: error = %v, want ErrRawProfileBudget", tc.name, err)
+		}
+		got := m1.TotalAlloc - m0.TotalAlloc
+		t.Logf("%s: %d MiB allocated", tc.name, got>>20)
+		if got > limit {
+			t.Errorf("%s: allocated %d MiB for 40 raw profile bombs (limit %d MiB)", tc.name, got>>20, limit>>20)
+		}
+	}
 }
 
 // BenchmarkExtractRawProfilesAuditV150 measures Extract of a PNG that repeats a

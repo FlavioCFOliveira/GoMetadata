@@ -287,21 +287,23 @@ func metadataEnd(prefix []byte) uint64 {
 //nolint:gochecknoglobals // sync.Pool: reuse avoids two allocations per write
 var extentScanPool = sync.Pool{New: func() any { return &extentScan{seenIFD: make(map[uint64]bool, 16)} }}
 
-// checkBlocks validates every block against the source's true total length and
-// against each other before anything is written: each block must lie inside the
-// source, and together the blocks must not hold more bytes than the source does.
+// checkBlocks validates every block against the source's true total length
+// before anything is written: each block must lie inside the source.
 //
-// The second rule is what keeps the output proportional to the input. Image
-// data (strips, tiles, thumbnails) are disjoint byte ranges of the file (TIFF
-// 6.0 §7, p. 39: StripOffsets "for each strip, the byte offset of that strip";
-// libtiff TIFFReadDirectory validates each strip against the file size but a
-// repeated range is only ever READ again, never written again), so a valid
-// file's blocks add up to at most its length. A StripOffsets array that repeats
-// one range N times used to make Write copy it N times: a 1 MiB file wrote
-// 2000 MiB (security audit F-07a). Reference: Exiv2 TiffImage writes each
-// strip once per IFD entry it owns, and its sizes are bounded by the file.
-func checkBlocks(blocks []*imageBlock, fileLen uint64) error {
-	var total uint64
+// A block's range may overlap another's: real files do (a Sony ARW holds one
+// StripOffsets strip and the TileOffsets tiles over the same bytes; several
+// TIFFs hold JPEGInterchangeFormat data inside a strip). The overlap is not
+// rejected: planBlocks coalesces the source ranges so that every source byte is
+// copied once, which keeps the output proportional to the input however many
+// entries repeat a range (security audit F-07a: 2000 StripOffsets entries over
+// one 1 MiB range used to write 2000 MiB). The copied union lies inside the
+// source (this check), so it is at most the length of the file.
+//
+// It reports whether the blocks are disjoint and ascending (disjointAscending),
+// found in the same pass.
+func checkBlocks(blocks []*imageBlock, fileLen uint64) (disjoint bool, err error) {
+	disjoint = true
+	var end uint64
 	for _, blk := range blocks {
 		// fits (extent.go), not a raw `blk.srcOffset+blk.size > fileLen`
 		// comparison: a crafted BigTIFF LONG8 offset/size pair can wrap that
@@ -310,47 +312,79 @@ func checkBlocks(blocks []*imageBlock, fileLen uint64) error {
 		// itself already exceeds cap(prefix) (security audit finding,
 		// 2026-09-26).
 		if !fits(blk.srcOffset, blk.size, fileLen) {
-			return fmt.Errorf("tiff: image block offset=%d size=%d: %w",
+			return false, fmt.Errorf("tiff: image block offset=%d size=%d: %w",
 				blk.srcOffset, blk.size, ErrBlockOutOfBounds)
 		}
-		// blk.size <= fileLen (fits), so the comparison cannot overflow.
-		if blk.size > fileLen-min(total, fileLen) {
-			return fmt.Errorf("tiff: image blocks add up to more than the %d bytes of the file: %w", fileLen, ErrImageBlocksOverlap)
+		if blk.size > 0 {
+			disjoint = disjoint && blk.srcOffset >= end
+			end = blk.srcOffset + blk.size // fits: cannot overflow
 		}
-		total += blk.size
 	}
-	return nil
+	return disjoint, nil
 }
 
-// writeHeaderAndBlocks writes header and then every block's bytes to w (see
-// writeRelocated).
+// writeHeaderAndBlocks writes header and then the bytes of the blocks to w (see
+// writeRelocated): each block in slice order when the blocks are disjoint, else
+// each range of the coalesced union (planBlocks) in the order assignNewOffsets
+// placed it.
 func writeHeaderAndBlocks(r io.ReadSeeker, w io.Writer, header []byte, blocks []*imageBlock, prefix []byte, wholeFile bool) error {
+	disjoint := true
 	if len(blocks) > 0 {
 		fileLen, err := resolveFileLen(r, prefix, wholeFile)
 		if err != nil {
 			return err
 		}
-		if err := checkBlocks(blocks, fileLen); err != nil {
+		if disjoint, err = checkBlocks(blocks, fileLen); err != nil {
 			return err
 		}
 	}
 	if _, err := w.Write(header); err != nil {
 		return fmt.Errorf("tiff: write header: %w", err)
 	}
+	return writeBlocks(r, w, blocks, prefix, wholeFile, disjoint)
+}
+
+// writeBlocks writes the bytes of the blocks to w: each block in slice order
+// when disjoint, else each range of the coalesced union (planBlocks).
+func writeBlocks(r io.ReadSeeker, w io.Writer, blocks []*imageBlock, prefix []byte, wholeFile, disjoint bool) error {
+	if !disjoint {
+		for _, rg := range planBlocks(blocks).ranges {
+			if err := writeSource(r, w, prefix, wholeFile, rg.start, rg.end-rg.start); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	for _, blk := range blocks {
-		if wholeFile {
-			end := blk.srcOffset + blk.size // safe: checkBlocks proved this cannot overflow
-			if _, err := w.Write(prefix[blk.srcOffset:end]); err != nil {
+		if wholeFile { // the common path, kept inline: it runs once per strip or tile
+			if _, err := w.Write(prefix[blk.srcOffset : blk.srcOffset+blk.size]); err != nil { // checkBlocks proved the range
 				return fmt.Errorf("tiff: write image block: %w", err)
 			}
 			continue
 		}
-		if _, err := r.Seek(int64(blk.srcOffset), io.SeekStart); err != nil { //nolint:gosec // G115: blk.srcOffset <= fileLen, itself bounded by maxFileSize (256 MiB), fits int64
-			return fmt.Errorf("tiff: seek image block at %d: %w", blk.srcOffset, err)
+		if err := writeSource(r, w, prefix, wholeFile, blk.srcOffset, blk.size); err != nil {
+			return err
 		}
-		if err := iobuf.StreamCopyN(r, w, int64(blk.size)); err != nil { //nolint:gosec // G115: blk.size <= fileLen, itself bounded by maxFileSize (256 MiB), fits int64
-			return fmt.Errorf("tiff: stream image block offset=%d size=%d: %w", blk.srcOffset, blk.size, err)
+	}
+	return nil
+}
+
+// writeSource writes the size source bytes at off to w: sliced from prefix when
+// it holds the whole file, otherwise streamed from r. checkBlocks proved that
+// the range lies inside the source.
+func writeSource(r io.ReadSeeker, w io.Writer, prefix []byte, wholeFile bool, off, size uint64) error {
+	if wholeFile {
+		end := off + size // safe: checkBlocks proved this cannot overflow
+		if _, err := w.Write(prefix[off:end]); err != nil {
+			return fmt.Errorf("tiff: write image block: %w", err)
 		}
+		return nil
+	}
+	if _, err := r.Seek(int64(off), io.SeekStart); err != nil { //nolint:gosec // G115: off <= fileLen, itself bounded by maxFileSize (256 MiB), fits int64
+		return fmt.Errorf("tiff: seek image block at %d: %w", off, err)
+	}
+	if err := iobuf.StreamCopyN(r, w, int64(size)); err != nil { //nolint:gosec // G115: size <= fileLen, itself bounded by maxFileSize (256 MiB), fits int64
+		return fmt.Errorf("tiff: stream image block offset=%d size=%d: %w", off, size, err)
 	}
 	return nil
 }
