@@ -3,6 +3,7 @@ package heif
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"math"
 	"testing"
@@ -831,17 +832,17 @@ func TestParsePitm(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// parseIinfItemCount
+// parseIinfEntryCount
 // ---------------------------------------------------------------------------
 
-// TestParseIinfItemCount tests version < 2 (uint16) and version 2 (uint32) paths.
+// TestParseIinfItemCount tests the version 0 (uint16) and version 2 (uint32) paths.
 func TestParseIinfItemCount(t *testing.T) {
 	t.Parallel()
 
 	t.Run("version 0 uint16", func(t *testing.T) {
 		t.Parallel()
 		data := []byte{0x00, 0x05}
-		count, newPos, ok := parseIinfItemCount(data, 0, 0)
+		count, newPos, ok := parseIinfEntryCount(data, 0, 0)
 		if !ok || count != 5 || newPos != 2 {
 			t.Errorf("v0: count=%d newPos=%d ok=%v, want 5 2 true", count, newPos, ok)
 		}
@@ -851,7 +852,7 @@ func TestParseIinfItemCount(t *testing.T) {
 		t.Parallel()
 		data := make([]byte, 4)
 		binary.BigEndian.PutUint32(data, 12)
-		count, newPos, ok := parseIinfItemCount(data, 0, 2)
+		count, newPos, ok := parseIinfEntryCount(data, 0, 2)
 		if !ok || count != 12 || newPos != 4 {
 			t.Errorf("v2: count=%d newPos=%d ok=%v, want 12 4 true", count, newPos, ok)
 		}
@@ -859,7 +860,7 @@ func TestParseIinfItemCount(t *testing.T) {
 
 	t.Run("version 2 too short", func(t *testing.T) {
 		t.Parallel()
-		_, _, ok := parseIinfItemCount([]byte{0x00}, 0, 2)
+		_, _, ok := parseIinfEntryCount([]byte{0x00}, 0, 2)
 		if ok {
 			t.Error("expected ok=false for too-short v2")
 		}
@@ -1322,7 +1323,7 @@ func TestInjectNormalizesConstructionMethod(t *testing.T) {
 	// Verify that the input really does encode construction_method=1.
 	// findBox returns meta box content with version+flags stripped (per its contract).
 	{
-		metaContent, err := findBox(input, boxTypeMeta, 0)
+		metaContent, err := findMetaContent(input)
 		if err != nil || len(metaContent) == 0 {
 			t.Fatalf("setup: meta box not found in synthetic input (err=%v)", err)
 		}
@@ -1345,7 +1346,7 @@ func TestInjectNormalizesConstructionMethod(t *testing.T) {
 	// Parse the output iloc and assert:
 	// 1. construction_method of the XMP item is 0 (file offset).
 	// 2. The extent_offset points at the appended XMP payload.
-	outMetaContent, err := findBox(output, boxTypeMeta, 0)
+	outMetaContent, err := findMetaContent(output)
 	if err != nil || len(outMetaContent) == 0 {
 		t.Fatalf("output: meta box not found (err=%v)", err)
 	}
@@ -1491,7 +1492,7 @@ func TestInjectMultiExtentItemCollapsesToOne(t *testing.T) {
 	data := buildHEIFTwoExtentEXIF(part1, part2)
 
 	// Sanity: the input really does carry 2 extents for the Exif item.
-	metaContent, err := findBox(data, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(data)
 	if err != nil || metaContent == nil {
 		t.Fatalf("setup: meta box not found (err=%v)", err)
 	}
@@ -1507,7 +1508,7 @@ func TestInjectMultiExtentItemCollapsesToOne(t *testing.T) {
 	}
 	output := out.Bytes()
 
-	outMetaContent, err := findBox(output, boxTypeMeta, 0)
+	outMetaContent, err := findMetaContent(output)
 	if err != nil || outMetaContent == nil {
 		t.Fatalf("output: meta box not found (err=%v)", err)
 	}
@@ -1658,7 +1659,7 @@ func TestInjectDuplicateIlocBoxesOffsetInBounds(t *testing.T) {
 	}
 	output := out.Bytes()
 
-	metaContent, err := findBox(output, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(output)
 	if err != nil || metaContent == nil {
 		t.Fatalf("output: meta box not found (err=%v)", err)
 	}
@@ -1798,7 +1799,7 @@ func TestInjectMetaWithTrailingUnparseableBytesOffsetInBounds(t *testing.T) {
 	}
 	output := out.Bytes()
 
-	metaContent, err := findBox(output, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(output)
 	if err != nil || metaContent == nil {
 		t.Fatalf("output: meta box not found (err=%v)", err)
 	}
@@ -1905,13 +1906,13 @@ func TestHEIFSlowPathMemory(t *testing.T) {
 
 	// Verify the file is large enough that meta is beyond 64 KB.
 	const headerWindow = 65536
-	metaData, err := findBox(fileData, boxTypeMeta, 0)
+	metaData, err := findMetaContent(fileData)
 	if err != nil || metaData == nil {
 		t.Fatalf("setup: meta box not found in slow-path synthetic HEIF")
 	}
 	// Confirm the meta box starts after headerWindow by checking that a quick
 	// scan of the first headerWindow bytes does NOT find the meta box.
-	quickMeta, _ := findBox(fileData[:headerWindow], boxTypeMeta, 0)
+	quickMeta, _ := findMetaContent(fileData[:headerWindow])
 	if quickMeta != nil {
 		t.Fatalf("setup: meta box found within first %d bytes — slow path will not be triggered", headerWindow)
 	}
@@ -2082,8 +2083,11 @@ func TestHEIFInjectLargeExtentCountBounded(t *testing.T) {
 			0x00, 0x00, 0x00, 0x10, // offset = 16
 			0x00, 0x00, 0x00, 0x08, // length = 8
 		}
-		extents, _ := readIlocFullExtents(ilocData, 0, largeExtentCount, &h)
-		// The pre-allocated capacity must be capped.
+		extents, _, ok := readIlocFullExtents(ilocData, 0, largeExtentCount, &h)
+		// An extent_count above the cap is refused before any allocation.
+		if ok {
+			t.Error("readIlocFullExtents accepted extent_count 65535, want ok=false (task #335: surplus extents are refused, not silently dropped)")
+		}
 		if cap(extents) > maxIlocExtentsPerItem {
 			t.Errorf("readIlocFullExtents allocated cap=%d, want <= %d (maxIlocExtentsPerItem)",
 				cap(extents), maxIlocExtentsPerItem)
@@ -2096,10 +2100,16 @@ func TestHEIFInjectLargeExtentCountBounded(t *testing.T) {
 		data := buildIlocWithLargeExtentCount(xmpPayload, largeExtentCount)
 		newXMP := []byte(`<?xpacket begin="" id="x"?><x:xmpmeta><new/></x:xmpmeta><?xpacket end="r"?>`)
 		var out bytes.Buffer
-		// Must not panic, OOM, or hang.
-		_ = Inject(bytes.NewReader(data), &out, nil, nil, newXMP, true)
-		// We do not assert a specific return value — the crafted truncated iloc
-		// may cause graceful early-termination. The key invariant is: no crash.
+		// Must not panic, OOM, or hang, and — since an item with this many
+		// extents cannot be rewritten without dropping extents — must refuse
+		// the write with an explicit error (task #335).
+		err := Inject(bytes.NewReader(data), &out, nil, nil, newXMP, true)
+		if !errors.Is(err, ErrUnreadableItemLocations) {
+			t.Errorf("Inject error = %v, want ErrUnreadableItemLocations", err)
+		}
+		if out.Len() != 0 {
+			t.Errorf("Inject wrote %d bytes before refusing", out.Len())
+		}
 	})
 }
 
@@ -2214,8 +2224,11 @@ func TestHEIFIlocZeroFieldSizeAmplificationBounded(t *testing.T) {
 		t.Parallel()
 		h := ilocHeader{version: 1} // offsetSize=lengthSize=indexSize=0 (zero value)
 		start := time.Now()
-		extents, pos := readIlocFullExtents(nil, 0, extentCount, &h)
+		extents, pos, ok := readIlocFullExtents(nil, 0, extentCount, &h)
 		elapsed := time.Since(start)
+		if ok {
+			t.Error("readIlocFullExtents accepted extent_count 65535, want ok=false")
+		}
 		if len(extents) > maxIlocExtentsPerItem {
 			t.Errorf("readIlocFullExtents returned %d extents, want <= %d (maxIlocExtentsPerItem)",
 				len(extents), maxIlocExtentsPerItem)
@@ -2283,7 +2296,9 @@ func TestHEIFIlocZeroFieldSizeAmplificationBounded(t *testing.T) {
 			t.Errorf("Inject took %v on a %d-byte crafted file, want well under 2s (amplification not bounded)",
 				elapsed, len(data))
 		}
-		_ = err // no specific error expected; absence of a hang/OOM is the invariant under test
+		if !errors.Is(err, ErrUnreadableItemLocations) {
+			t.Errorf("Inject error = %v, want ErrUnreadableItemLocations", err)
+		}
 	})
 
 	// --- White-box: parseIlocFull rejects an oversized item_count outright ---

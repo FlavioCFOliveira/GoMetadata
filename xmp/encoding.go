@@ -1,5 +1,11 @@
 package xmp
 
+// Adapted from Adobe XMP-Toolkit-SDK XMPCore/source/XMPMeta-Parse.cpp:DetermineInputEncoding, Copyright 2003 Adobe, SPDX-License-Identifier: BSD-3-Clause
+//
+// See THIRD_PARTY_NOTICES.md for the licence note on this file. Only the
+// decision table of detectEncoding is adapted, with the divergence documented
+// there; the transcoding is original.
+
 import (
 	"bytes"
 	"unicode"
@@ -14,16 +20,7 @@ var bomUTF32BE = []byte{0x00, 0x00, 0xFE, 0xFF} //nolint:gochecknoglobals // imm
 
 // bomUTF32LE is the UTF-32 little-endian byte order mark.
 // XMP Part 1 §7.2: a UTF-32 LE XMP packet begins with FF FE 00 00.
-// Note: checked before bomUTF16LE because FF FE 00 00 also starts with FF FE.
 var bomUTF32LE = []byte{0xFF, 0xFE, 0x00, 0x00} //nolint:gochecknoglobals // immutable BOM sentinel
-
-// bomUTF16BE is the UTF-16 big-endian byte order mark.
-// XMP Part 1 §7.2: a UTF-16 BE XMP packet begins with FE FF.
-var bomUTF16BE = []byte{0xFE, 0xFF} //nolint:gochecknoglobals // immutable BOM sentinel
-
-// bomUTF16LE is the UTF-16 little-endian byte order mark.
-// XMP Part 1 §7.2: a UTF-16 LE XMP packet begins with FF FE (when not UTF-32 LE).
-var bomUTF16LE = []byte{0xFF, 0xFE} //nolint:gochecknoglobals // immutable BOM sentinel
 
 // xmpEncoding classifies the character encoding of a raw XMP packet buffer.
 type xmpEncoding int
@@ -36,30 +33,69 @@ const (
 	encUTF32LE                    // UTF-32 little-endian (rare)
 )
 
-// detectEncoding probes the leading BOM bytes of b to determine the character
-// encoding of the XMP packet.
+// detectEncoding determines the character encoding of the XMP packet b from
+// its leading bytes.
 //
-// XMP Specification Part 1 §7.2 specifies that a compliant XMP packet MUST be
-// serialised as UTF-8, UTF-16, or UTF-32.  The encoding is declared by a BOM at
-// the start of the serialisation.  For UTF-8, a BOM is optional; for UTF-16/32 it
-// is mandatory.
+// XMP Specification Part 1 (ISO 16684-1:2019) §7.1 (p. 9) and §7.3.2: a packet
+// is UTF-8, UTF-16 or UTF-32, and the encoding is recognised from the first
+// bytes of the packet. The byte-order mark (BOM) is only an optional prefix:
+// the <?xpacket begin="..."?> processing instruction starts with the ASCII
+// character '<', and XML 1.0 Appendix F.1 ("Detection Without External
+// Encoding Information") identifies UTF-16 and UTF-32 from the pattern of the
+// NUL bytes of that first character even when no BOM is present (for example
+// 00 3C 00 3F for UTF-16BE "<?"). Packets without a BOM are common in the wild:
+// ExifTool's XMP.jpg fixture is one.
 //
-// Detection order matters:
-//  1. UTF-32 BOMs (4 bytes) are tested before UTF-16 BOMs (2 bytes) because the
-//     UTF-32 LE BOM (FF FE 00 00) is a superset of the UTF-16 LE BOM (FF FE).
-//  2. Absent a BOM, UTF-8 is assumed (the vast majority of real-world XMP packets).
-func detectEncoding(b []byte) xmpEncoding {
-	switch {
-	case bytes.HasPrefix(b, bomUTF32BE):
+// The decision table is a port of DetermineInputEncoding in the Adobe XMP
+// Toolkit (XMPCore/source/XMPMeta-Parse.cpp, lines 753-822), which assumes
+// that the first character is U+FEFF or ASCII and that U+0000 is not allowed:
+//
+//	EF BB BF        UTF-8 with BOM
+//	FE FF           UTF-16BE with BOM
+//	00 00 FE FF     UTF-32BE with BOM
+//	FF FE 00 00     UTF-32LE with BOM (tested before UTF-16LE, its prefix)
+//	FF FE           UTF-16LE with BOM
+//	00 00 00 nn     UTF-32BE without BOM
+//	00 nn           UTF-16BE without BOM
+//	nn 00 00 00     UTF-32LE without BOM
+//	nn 00           UTF-16LE without BOM
+//	anything else   UTF-8
+//
+// Divergence from the Toolkit, by design: the Toolkit sends every first byte
+// of 0x80 or more that is not EF or FE to its little-endian branch, so a UTF-8
+// document that starts with a non-ASCII character (for example C3 A9) is read
+// as UTF-16LE or UTF-32LE. XML 1.0 Appendix F.1 recognises only the BOMs and
+// the '<' patterns, so here such a document is UTF-8, and only an exact FF FE
+// is a little-endian BOM.
+func detectEncoding(b []byte) xmpEncoding { //nolint:gocyclo // one branch per row of the Toolkit decision table above
+	if len(b) < 2 {
+		return encUTF8
+	}
+	switch c := b[0]; {
+	case c == 0:
+		// 00 nn: UTF-16BE; 00 00 00 nn and 00 00 FE FF: UTF-32BE.
+		if len(b) < 4 || b[1] != 0 {
+			return encUTF16BE
+		}
 		return encUTF32BE
-	case bytes.HasPrefix(b, bomUTF32LE):
+	case c < 0x80:
+		// nn mm: UTF-8; nn 00 00 00: UTF-32LE; nn 00: UTF-16LE.
+		if b[1] != 0 {
+			return encUTF8
+		}
+		if len(b) < 4 || b[2] != 0 {
+			return encUTF16LE
+		}
 		return encUTF32LE
-	case bytes.HasPrefix(b, bomUTF16BE):
+	case c == 0xFE && b[1] == 0xFF:
 		return encUTF16BE
-	case bytes.HasPrefix(b, bomUTF16LE):
+	case c == 0xFF && b[1] == 0xFE:
+		if len(b) >= 4 && b[2] == 0 && b[3] == 0 {
+			return encUTF32LE
+		}
 		return encUTF16LE
 	default:
-		return encUTF8
+		return encUTF8 // EF BB BF, or non-BOM UTF-8
 	}
 }
 
@@ -128,19 +164,20 @@ func toUTF8(b []byte, enc xmpEncoding) []byte {
 	}
 }
 
-// decodeUTF32 decodes a UTF-32 encoded byte slice (with BOM) to UTF-8.
-// bigEndian selects byte order.  The leading 4-byte BOM is skipped.
+// decodeUTF32 decodes a UTF-32 encoded byte slice to UTF-8. bigEndian selects
+// byte order. A leading 4-byte BOM is skipped when present; a packet without a
+// BOM (XMP Part 1 §7.1 p. 9; XML 1.0 Appendix F.1) is decoded from its first
+// byte.
 //
 // XMP Part 1 §7.2: UTF-32 BE BOM = 00 00 FE FF; UTF-32 LE BOM = FF FE 00 00.
 // Each code point occupies exactly 4 bytes.  We validate that len(b) is a
 // multiple of 4 (after BOM), and cap output at maxUnescapedXMLBytes to prevent
 // unbounded allocation from crafted input.
 func decodeUTF32(b []byte, bigEndian bool) []byte { //nolint:cyclop // big/little-endian branch plus uint32 assembly are inherent to the spec; cannot be reduced
-	// Skip the 4-byte BOM.
 	if len(b) < 4 {
 		return nil
 	}
-	b = b[4:]
+	b = skipUTF32BOM(b, bigEndian)
 	if len(b)%4 != 0 {
 		return nil
 	}
@@ -154,9 +191,9 @@ func decodeUTF32(b []byte, bigEndian bool) []byte { //nolint:cyclop // big/littl
 	for i := 0; i < len(b); i += 4 {
 		var cp uint32
 		if bigEndian {
-			cp = uint32(b[i])<<24 | uint32(b[i+1])<<16 | uint32(b[i+2])<<8 | uint32(b[i+3]) //nolint:gosec // G602: loop step is 4 and len(b)%4==0 is validated above; b[i+1..i+3] are always in bounds
+			cp = uint32(b[i])<<24 | uint32(b[i+1])<<16 | uint32(b[i+2])<<8 | uint32(b[i+3])
 		} else {
-			cp = uint32(b[i+3])<<24 | uint32(b[i+2])<<16 | uint32(b[i+1])<<8 | uint32(b[i]) //nolint:gosec // G602: same invariant as above; all indices in bounds
+			cp = uint32(b[i+3])<<24 | uint32(b[i+2])<<16 | uint32(b[i+1])<<8 | uint32(b[i])
 		}
 		// #41: Validate code point before encoding.
 		// Unicode code points above U+10FFFF are not defined (Unicode 15.0 §3.9 D65).
@@ -178,6 +215,17 @@ func decodeUTF32(b []byte, bigEndian bool) []byte { //nolint:cyclop // big/littl
 		out = appendUTF8Rune(out, cp)
 	}
 	return out
+}
+
+// skipUTF32BOM returns b without its leading 4-byte BOM when it has the BOM
+// of the stated byte order. The pattern is that of the byte order, so U+FEFF
+// is never mistaken for the first character of a packet without a BOM.
+func skipUTF32BOM(b []byte, bigEndian bool) []byte {
+	bom := bomUTF32LE
+	if bigEndian {
+		bom = bomUTF32BE
+	}
+	return bytes.TrimPrefix(b, bom)
 }
 
 // appendUTF8Rune encodes the Unicode code point cp as UTF-8 and appends the

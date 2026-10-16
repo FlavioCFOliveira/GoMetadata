@@ -3,9 +3,20 @@
 //
 // WebP uses a RIFF container: "RIFF" + 4-byte size + "WEBP" + chunks.
 // Relevant chunks:
-//   - "EXIF": raw EXIF payload (VP8X feature bit 0x08).
-//   - "XMP ": XMP packet (VP8X feature bit 0x04).
+//   - "EXIF": raw EXIF payload (VP8X feature bit 0x08). A leading "Exif\0\0"
+//     identifier, written by some tools, is skipped on read and never written.
+//   - "XMP ": XMP packet (VP8X feature bit 0x04). The non-standard FourCC
+//     "XMP\0" is read as XMP too and replaced by "XMP " on write.
 package webp
+
+// Adapted from metadata-extractor Source/com/drew/metadata/webp/WebpRiffHandler.java:WebpRiffHandler.processChunk, Copyright 2002-2019 Drew Noakes and contributors, SPDX-License-Identifier: Apache-2.0
+//
+// Changes from the reference (Apache-2.0 §4(b)): the "Exif\0\0" identifier
+// test of ExifReader.startsWithJpegExifPreamble is re-implemented in Go as
+// stripExifPreamble, applied while the chunk is read; the reference ignores a
+// chunk with the FourCC "XMP\0", which is read here as XMP, and the write path
+// that the reference does not have drops both the identifier and that FourCC
+// (task #333). See THIRD_PARTY_NOTICES.md.
 
 import (
 	"bytes"
@@ -49,7 +60,11 @@ var xmpWireFrameMagic = [8]byte{0x00, 'X', 'M', 'P', 'E', 'X', 'T', 0x00} //noli
 var (
 	fourCCEXIF = [4]byte{'E', 'X', 'I', 'F'} //nolint:gochecknoglobals // immutable comparison constant
 	fourCCXMP  = [4]byte{'X', 'M', 'P', ' '} //nolint:gochecknoglobals // immutable comparison constant
-	fourCCVP8X = [4]byte{'V', 'P', '8', 'X'} //nolint:gochecknoglobals // immutable comparison constant
+	// fourCCXMPNul is the non-standard "XMP\0" FourCC (fourth byte NUL instead
+	// of a space) that some writers emit; ExifTool and other readers accept it
+	// as XMP (task #333). The standard FourCC is 'XMP ' (RFC 9649 §2.7.1.5).
+	fourCCXMPNul = [4]byte{'X', 'M', 'P', 0x00} //nolint:gochecknoglobals // immutable comparison constant
+	fourCCVP8X   = [4]byte{'V', 'P', '8', 'X'}  //nolint:gochecknoglobals // immutable comparison constant
 )
 
 // readWebPChunks iterates over the RIFF chunk list in r, accumulating EXIF and
@@ -84,7 +99,7 @@ func readWebPChunks(r io.ReadSeeker) (rawEXIF, rawXMP []byte, err error) {
 			return nil, nil, fmt.Errorf("webp: read chunk: %w", rerr)
 		}
 
-		if chunk.FourCC == fourCCEXIF || chunk.FourCC == fourCCXMP {
+		if chunk.FourCC == fourCCEXIF || chunk.FourCC == fourCCXMP || chunk.FourCC == fourCCXMPNul {
 			streamEnd, rawEXIF, rawXMP, err = readMetadataChunk(r, chunk, streamEnd, dataOffset, rawEXIF, rawXMP)
 			if err != nil {
 				return nil, nil, err
@@ -116,12 +131,35 @@ func readMetadataChunk(r io.ReadSeeker, chunk riff.Chunk, streamEnd, dataOffset 
 	if rerr != nil {
 		return streamEnd, rawEXIF, rawXMP, fmt.Errorf("webp: read %s chunk: %w", chunk.FourCCString(), rerr)
 	}
-	if chunk.FourCC == fourCCEXIF {
-		rawEXIF = data
-	} else {
-		rawXMP = data
+	switch chunk.FourCC {
+	case fourCCEXIF:
+		rawEXIF = stripExifPreamble(data)
+	case fourCCXMP:
+		rawXMP = data // the standard FourCC wins over a "XMP\0" chunk
+	default: // fourCCXMPNul
+		if rawXMP == nil {
+			rawXMP = data
+		}
 	}
 	return streamEnd, rawEXIF, rawXMP, nil
+}
+
+// exifPreamble is the "Exif\0\0" identifier of a JPEG APP1 Exif segment.
+var exifPreamble = []byte("Exif\x00\x00") //nolint:gochecknoglobals // immutable comparison constant
+
+// stripExifPreamble returns the TIFF stream of an 'EXIF' chunk payload. The
+// chunk holds the TIFF structure of the Exif data (Google WebP Container
+// Specification, "Metadata"; RFC 9649 §2.7.1.5), but writers exist that copy
+// a whole JPEG APP1 payload into it, "Exif\0\0" identifier included; as
+// metadata-extractor does (WebpRiffHandler.java:processChunk,
+// ExifReader.startsWithJpegExifPreamble), the identifier is skipped so the
+// payload parses as the TIFF stream it carries (task #333). A payload without
+// it is returned unchanged; the result aliases data.
+func stripExifPreamble(data []byte) []byte {
+	if bytes.HasPrefix(data, exifPreamble) {
+		return data[len(exifPreamble):]
+	}
+	return data
 }
 
 // measureStreamEnd seeks to the end of r to learn the total stream length,
@@ -388,8 +426,11 @@ func collectOriginalChunks(original []byte) (chunks []webpOriginalChunk, origVP8
 			if size >= 10 && nextPos <= len(original) && isEOFOrKnownFourCC(original, nextPos) {
 				origVP8XData = original[dataStart:nextPos]
 			}
-		case fourCCEXIF, fourCCXMP:
-			// Drop: caller will re-append updated versions.
+		case fourCCEXIF, fourCCXMP, fourCCXMPNul:
+			// Drop: caller will re-append updated versions in the standard
+			// 'EXIF' and 'XMP ' chunks (RFC 9649 §2.7.1.5: at most one chunk of
+			// each type); a non-standard "XMP\0" chunk is XMP read as such (task
+			// #333) and is dropped with them so only one XMP chunk remains.
 		default:
 			chunks = append(chunks, webpOriginalChunk{id: id, data: original[dataStart:dataEnd]})
 		}

@@ -562,12 +562,12 @@ func TestExtractBareJPEGAllNil(t *testing.T) {
 // --- Extended XMP write: TestInjectExtendedXMP ---
 
 // TestInjectExtendedXMP verifies that Inject correctly splits an XMP packet
-// larger than maxXMPPayload (65504 bytes) across a main APP1 and one or more
+// larger than maxXMPPayload (65502 bytes) across a main APP1 and one or more
 // extended APP1 segments (Adobe XMP Specification Part 3 §1.1.4), and that
 // the subsequent Extract call reassembles the full XMP content.
 func TestInjectExtendedXMP(t *testing.T) {
 	t.Parallel()
-	// Build a rawXMP that is larger than maxXMPPayload (65504 bytes).
+	// Build a rawXMP that is larger than maxXMPPayload (65502 bytes).
 	// We use a valid XMP envelope so that Extract's reassembleExtendedXMP can
 	// splice the extended content into it correctly.
 	const extraContentSize = 66000
@@ -776,7 +776,9 @@ func TestInjectNonJPEGReturnsError(t *testing.T) {
 
 // TestExtractExtendedXMPNoMatchingGUID verifies that when the main XMP has
 // HasExtendedXMP but the GUID does not match any extended chunk, the main XMP
-// is returned unchanged (graceful degradation).
+// is returned without HasExtendedXMP, which "must only be in the file" (XMP
+// Part 3 §1.1.3.1, p. 15; Toolkit JPEG_Handler.cpp ProcessXMP, task #332),
+// and otherwise unchanged (graceful degradation).
 func TestExtractExtendedXMPNoMatchingGUID(t *testing.T) {
 	t.Parallel()
 	const guid = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -799,9 +801,13 @@ func TestExtractExtendedXMPNoMatchingGUID(t *testing.T) {
 	if rawXMP == nil {
 		t.Fatal("rawXMP should not be nil when main XMP is present")
 	}
-	// The XMP should equal mainXMP (unchanged, no merge occurred).
-	if !bytes.Equal(rawXMP, mainXMP) {
-		t.Errorf("XMP was unexpectedly modified; got %q, want %q", rawXMP, mainXMP)
+	// No merge occurred, and the link to the extended XMP that was not found
+	// is gone.
+	if bytes.Contains(rawXMP, []byte("HasExtendedXMP")) {
+		t.Errorf("HasExtendedXMP kept although no extended chunk matches: %q", rawXMP)
+	}
+	if !bytes.Contains(rawXMP, []byte("<rdf:RDF")) {
+		t.Errorf("XMP lost: %q", rawXMP)
 	}
 }
 
@@ -1122,7 +1128,7 @@ func TestCopyNonMetadataSegmentsReadError(t *testing.T) {
 
 	scratch := make([]byte, 0, 4096)
 	var out bytes.Buffer
-	err := copyNonMetadataSegments(bytes.NewReader(buf.Bytes()), &out, &scratch, true)
+	err := copyNonMetadataSegments(bytes.NewReader(buf.Bytes()), &out, &scratch, true, nil, "")
 	// The truncated read should produce an error (non-EOF, unexpected EOF).
 	if err == nil {
 		t.Error("expected error for truncated segment, got nil")

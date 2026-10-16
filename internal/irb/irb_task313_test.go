@@ -78,7 +78,7 @@ func TestAppendSpliced_Duplicates(t *testing.T) {
 		block(ResourceIPTC, "nm", iimOld),
 		block(ResourceIPTC, "", iimOld),
 	}, nil)
-	out := AppendSpliced(nil, orig, iimNew)
+	out := AppendSpliced(nil, orig, iimNew, false)
 	want := bytes.Join([][]byte{thumb, AppendBlock(nil, ResourceIPTC, iimNew)}, nil)
 	if !bytes.Equal(out, want) {
 		t.Fatalf("AppendSpliced =\n%x\nwant\n%x", out, want)
@@ -86,7 +86,7 @@ func TestAppendSpliced_Duplicates(t *testing.T) {
 	if got := FindIPTC(out); !bytes.Equal(got, iimNew) {
 		t.Errorf("FindIPTC(out) = %x", got)
 	}
-	if removed := AppendSpliced(nil, orig, nil); !bytes.Equal(removed, thumb) {
+	if removed := AppendSpliced(nil, orig, nil, false); !bytes.Equal(removed, thumb) {
 		t.Errorf("AppendSpliced(nil IIM) = %x, want only the thumbnail resource", removed)
 	}
 }
@@ -98,15 +98,36 @@ func TestAppendSplicedDigest(t *testing.T) {
 	stale := bytes.Repeat([]byte{0xEE}, DigestSize)
 	orig := bytes.Join([][]byte{block(ResourceIPTCDigest, "", stale), block(ResourceIPTC, "", iimOld)}, nil)
 	d := Digest(iimNew, 4)
-	out := AppendSplicedDigest(nil, orig, iimNew, &d)
+	out := AppendSplicedDigest(nil, orig, iimNew, &d, false)
 	if got := FindDigest(out); !bytes.Equal(got, d[:]) {
 		t.Errorf("digest = %x, want %x", got, d)
 	}
 	if got := FindIPTC(out); !bytes.Equal(got, iimNew) {
 		t.Errorf("IIM = %x, want %x", got, iimNew)
 	}
-	keep := AppendSplicedDigest(nil, orig, iimNew, nil)
+	keep := AppendSplicedDigest(nil, orig, iimNew, nil, false)
 	if got := FindDigest(keep); !bytes.Equal(got, stale) {
 		t.Errorf("nil digest changed the 0x0425 resource: %x", got)
+	}
+}
+
+// TestAppendSplicedDigest_Create (task #323): create appends one 0x0425
+// resource only when a non-nil digest is given and the stream holds none.
+func TestAppendSplicedDigest_Create(t *testing.T) {
+	t.Parallel()
+	d := Digest(iimNew, 4)
+	orig := block(ResourceIPTC, "", iimOld)
+	out := AppendSplicedDigest(nil, orig, iimNew, &d, true)
+	if got := FindDigest(out); !bytes.Equal(got, d[:]) {
+		t.Errorf("created digest = %x, want %x", got, d)
+	}
+	if got := FindIPTC(out); !bytes.Equal(got, iimNew) {
+		t.Errorf("IIM = %x, want %x", got, iimNew)
+	}
+	if got := AppendSplicedDigest(nil, orig, iimNew, nil, true); FindDigest(got) != nil {
+		t.Error("a nil digest created a 0x0425 resource")
+	}
+	if got := AppendSplicedDigest(nil, orig, iimNew, &d, false); FindDigest(got) != nil {
+		t.Error("create=false created a 0x0425 resource")
 	}
 }

@@ -2,7 +2,6 @@ package gometadata
 
 import (
 	"bytes"
-	"encoding/binary"
 	"sync"
 	"time"
 
@@ -167,6 +166,37 @@ type Metadata struct {
 	// from the MD5 digest of the extended serialisation (task #295), so the
 	// same XMP always produces the same bytes.
 	rawXMPWire []byte
+
+	// keptExtGUID is the GUID of the extended XMP segments of a JPEG that the
+	// standard packet links to and that Read could not merge into the XMP
+	// model (an invalid chunk layout, or a document that cannot be merged; a
+	// ParseWarning wraps jpeg.ErrExtendedXMPTruncated). It is empty when the
+	// extended XMP was merged or there is none. When Write encodes m.XMP into a
+	// JPEG, it asks Inject to carry those segments over byte for byte and to
+	// link the standard packet to them, so that a setter write does not drop
+	// data the model cannot hold (task #357; XMP Part 3 §1.1.3.1, pp. 14-15).
+	// It is a pointer so that the common case (nil) keeps Metadata within its
+	// allocation size class: a string field moves it to the next one, which
+	// costs every Read 16 bytes.
+	keptExtGUID *string
+
+	// xmpOpaque is set by Read when the container carried an XMP packet that
+	// the caller cannot edit through the model, because it is not well-formed
+	// XML and so could not be parsed (the reason is in ParseWarnings; task
+	// #327) or because the caller opted out of parsing it with WithoutXMP
+	// (task #343). Write then carries rawXMP to the output byte for byte, and
+	// the setters create no XMP of their own, because encoding a fresh XMP
+	// from the setters' values would replace the packet and lose everything it
+	// held. A caller that wants to replace the packet assigns m.XMP
+	// explicitly.
+	xmpOpaque bool
+
+	// exifOpaque and iptcOpaque are the same guard for the EXIF and IPTC the
+	// caller opted out of parsing with WithoutEXIF and WithoutIPTC (task
+	// #343): the setters create no EXIF or IPTC of their own, which would
+	// replace the original and lose everything it held, and Write carries the
+	// original bytes.
+	exifOpaque, iptcOpaque bool
 
 	// iptcTrustElev caches the result of computeIPTCTrustElevated(rawIPTC,
 	// rawIPTCDigest), computed once by Read (see read.go) immediately after
@@ -810,17 +840,18 @@ func (m *Metadata) canCarryXMP() bool {
 
 // ensureEXIF constructs a minimal valid *exif.EXIF when m.EXIF is nil and the
 // detected format can carry EXIF. The constructed EXIF has a non-nil IFD0 and
-// ByteOrder = binary.LittleEndian so that m.Validate() and exif.Encode() succeed.
+// ByteOrder = binary.LittleEndian so that m.Validate() and exif.Encode() succeed,
+// and carries the mandatory tags of its IFDs (exif.New).
 //
 // EXIF validity invariant: m.EXIF != nil ⟹ m.EXIF.IFD0 != nil (Validate §).
 func (m *Metadata) ensureEXIF() {
-	if m.EXIF != nil || !m.canCarryEXIF() {
+	if m.EXIF != nil || m.exifOpaque || !m.canCarryEXIF() {
 		return
 	}
-	m.EXIF = &exif.EXIF{
-		ByteOrder: binary.LittleEndian,
-		IFD0:      &exif.IFD{},
-	}
+	// exif.New adds the tags that Exif 3.1 marks mandatory in the IFDs it
+	// creates (Tables 17-18, pp. 93-96); the column "Compressed" applies to a
+	// JPEG primary image (task #321).
+	m.EXIF = exif.New(format.FormatID(m.format) == format.FormatJPEG)
 }
 
 // ensureIPTC constructs a minimal valid *iptc.IPTC when m.IPTC is nil and the
@@ -828,7 +859,7 @@ func (m *Metadata) ensureEXIF() {
 // of IPTC (with its [10][]Dataset array) is ready for use by all write-path
 // helpers in the iptc package.
 func (m *Metadata) ensureIPTC() {
-	if m.IPTC != nil || !m.canCarryIPTC() {
+	if m.IPTC != nil || m.iptcOpaque || !m.canCarryIPTC() {
 		return
 	}
 	m.IPTC = new(iptc.IPTC)
@@ -837,8 +868,16 @@ func (m *Metadata) ensureIPTC() {
 // ensureXMP constructs a minimal valid *xmp.XMP when m.XMP is nil and the
 // detected format can carry XMP. The Properties map must be non-nil to satisfy
 // the Validate invariant (m.XMP != nil ⟹ m.XMP.Properties != nil).
+//
+// It constructs nothing when the image carried an XMP packet that is not
+// loaded (xmpOpaque): the packet is written back unchanged, and the XMP part
+// of a setter is skipped, so that no metadata is lost silently. The packet is
+// not loaded when it could not be parsed (task #327; XMP Part 1 §7.1 requires
+// a well-formed packet, and an ill-formed one cannot be edited faithfully;
+// Read reports it in ParseWarnings) or when the caller read with WithoutXMP
+// (task #343).
 func (m *Metadata) ensureXMP() {
-	if m.XMP != nil || !m.canCarryXMP() {
+	if m.XMP != nil || m.xmpOpaque || !m.canCarryXMP() {
 		return
 	}
 	m.XMP = &xmp.XMP{Properties: make(map[string]map[string]string)}

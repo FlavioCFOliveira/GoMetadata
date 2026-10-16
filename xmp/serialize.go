@@ -621,7 +621,7 @@ func (e *encoder) writeNodeID(l nodeList, q int32) {
 		return
 	}
 	e.buf.WriteString(" rdf:nodeID=\"")
-	writeXMLEscaped(e.buf, l[q].value)
+	writeXMLAttrEscaped(e.buf, l[q].value)
 	e.buf.WriteByte('"')
 }
 
@@ -646,13 +646,13 @@ func (e *encoder) writeBlankBlocks() {
 		e.buf.WriteString("  <rdf:")
 		e.buf.WriteString(elem)
 		e.buf.WriteString(" rdf:nodeID=\"")
-		writeXMLEscaped(e.buf, t[b].name)
+		writeXMLAttrEscaped(e.buf, t[b].name)
 		e.buf.WriteByte('"')
 		for _, u := range used {
 			e.buf.WriteString(" xmlns:")
 			e.buf.WriteString(e.pf.prefix(u))
 			e.buf.WriteString("=\"")
-			writeXMLEscaped(e.buf, u)
+			writeXMLAttrEscaped(e.buf, u)
 			e.buf.WriteByte('"')
 		}
 		e.buf.WriteString(">\n")
@@ -706,7 +706,7 @@ func (e *encoder) emitNode(l nodeList, i int32, indent int, asValue bool) { //no
 		case l.isAttrQual(q):
 			if !asValue {
 				e.buf.WriteString(" xml:lang=\"")
-				writeXMLEscaped(e.buf, l[q].value)
+				writeXMLAttrEscaped(e.buf, l[q].value)
 				e.buf.WriteByte('"')
 			}
 		default:
@@ -775,7 +775,7 @@ func (e *encoder) emitNode(l nodeList, i int32, indent int, asValue bool) { //no
 		e.writeIndent(indent)
 	case n.flags&nodeURI != 0:
 		e.buf.WriteString(" rdf:resource=\"")
-		writeXMLEscaped(e.buf, n.value)
+		writeXMLAttrEscaped(e.buf, n.value)
 		e.buf.WriteString("\"/>\n")
 		return
 	default:

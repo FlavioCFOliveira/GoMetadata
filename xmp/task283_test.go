@@ -6,6 +6,7 @@ package xmp
 // (xmlscan.go) grows both lists on demand.
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -95,8 +96,15 @@ func TestTask283NestedElementManyNamespaces(t *testing.T) {
 	for i := range 80 {
 		fmt.Fprintf(&b, `<f%d:F%d>v%d</f%d:F%d>`, i, i, i, i, i)
 	}
-	// f0 is out of scope here: this element has no namespace and is ignored.
-	b.WriteString(`</s:Struct><f0:Outside>x</f0:Outside></rdf:Description></rdf:RDF></x:xmpmeta>`)
+	b.WriteString(`</s:Struct>`)
+	const tail = `</rdf:Description></rdf:RDF></x:xmpmeta>`
+	// f0 is out of scope after the struct closes: an element that uses its
+	// prefix is not well-formed (Namespaces in XML 1.0 §5, Prefix Declared;
+	// task #345).
+	if _, err := Parse([]byte(b.String() + `<f0:Outside>x</f0:Outside>` + tail)); !errors.Is(err, ErrXMLNotWellFormed) {
+		t.Fatalf("Parse with an out-of-scope prefix = %v, want ErrXMLNotWellFormed", err)
+	}
+	b.WriteString(tail)
 	x := mustParse(t, []byte(b.String()))
 	for i := range 80 {
 		if got, want := x.Get("http://example.com/s/", fmt.Sprintf("Struct.F%d", i)), fmt.Sprintf("v%d", i); got != want {
@@ -104,7 +112,7 @@ func TestTask283NestedElementManyNamespaces(t *testing.T) {
 		}
 	}
 	if len(x.Properties) != 1 {
-		t.Fatalf("got %d namespaces, want 1 (f0:Outside must not resolve)", len(x.Properties))
+		t.Fatalf("got %d namespaces, want 1 (the declarations of f0..f79 must not leak)", len(x.Properties))
 	}
 	enc := mustEncode(t, x)
 	if a, b := modelDump(x), modelDump(mustParse(t, enc)); a != b {

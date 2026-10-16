@@ -6,10 +6,14 @@ package tiff
 // header/blocks split this file's writeRelocated consumes.
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
+	"sync"
 
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/trailer"
 )
 
 // resolveFileLen returns the true total length of the original source: when
@@ -71,11 +75,221 @@ func writePassThrough(r io.ReadSeeker, w io.Writer, prefix []byte, wholeFile boo
 //     pooled buffer (iobuf.StreamCopyN) — never buffering the whole file.
 //     r must be seekable and remain valid for the duration of this call.
 //
+// iptc is the IIM written to the IPTC tag, or nil.
+//
+// Bytes after the data the write moves are carried (task #360): the tail of
+// the source, from the first byte after every byte that an IFD addresses
+// (the image blocks, and the IFDs and out-of-line values of the metadata,
+// metadataEnd) to its end, is written after the last block unchanged. It holds
+// the trailers that some writers append after the TIFF data: AFCP and
+// FotoStation, whose IPTC copy is replaced by iptc and whose absolute offsets
+// are set for their new position (task #354, trailer.Plan), and every other
+// trailer or private data, which is copied byte for byte (CLAUDE.md §5).
+// Bytes between addressed regions (padding, and the IFDs and values that this
+// write replaces) are not carried: they are exactly what the write
+// regenerates, and carrying them would duplicate stale metadata.
+//
 // Every block is bounds-checked against the source's true total length
 // (resolveFileLen) before any Seek/Read is attempted, preserving the exact
 // ErrBlockOutOfBounds protection the pre-#291 single-buffer implementation
 // applied via `end > len(base)`.
-func writeRelocated(r io.ReadSeeker, w io.Writer, header []byte, blocks []*imageBlock, prefix []byte, wholeFile bool) error {
+func writeRelocated(r io.ReadSeeker, w io.Writer, header []byte, blocks []*imageBlock, prefix []byte, wholeFile bool, iptc []byte) error {
+	tail, err := planTail(r, prefix, wholeFile, blocks, iptc)
+	if err != nil {
+		return err
+	}
+	if tail.start >= tail.end {
+		return writeHeaderAndBlocks(r, w, header, blocks, prefix, wholeFile)
+	}
+	if len(tail.plan.Spans) == 0 {
+		if err := writeHeaderAndBlocks(r, w, header, blocks, prefix, wholeFile); err != nil {
+			return err
+		}
+		return tail.write(r, w, nil)
+	}
+	// A trailer with absolute offsets needs the position it takes in the output.
+	out := &trailer.OutWriter{W: w}
+	if err := writeHeaderAndBlocks(r, out, header, blocks, prefix, wholeFile); err != nil {
+		return err
+	}
+	return tail.write(r, out, out)
+}
+
+// tailPlan is the part of the source after the data that the write moves.
+type tailPlan struct {
+	// start and end are the source offsets of the tail; start >= end: none.
+	start, end uint64
+	// plan holds the tail bytes (plan.Region) and the trailers inside it that
+	// need rewriting; Region is nil when the tail is larger than
+	// trailer.MaxRegion and is streamed from the source instead.
+	plan trailer.Plan
+}
+
+// planTail finds the tail of the source (see writeRelocated). A trailer found
+// from the end of the file (trailer.FindTail) may start before the end of the
+// addressed data when the metadata structures it overlaps are mere pointers
+// into it; such a trailer extends the tail down to its start, provided it
+// starts after every image block (a candidate that overlaps one is image data
+// that merely looks like a trailer, and is ignored). iptc is the IIM written to
+// the IPTC tag (nil: leave the IPTC copies as they are).
+func planTail(r io.ReadSeeker, prefix []byte, wholeFile bool, blocks []*imageBlock, iptc []byte) (tailPlan, error) {
+	fileLen, err := resolveFileLen(r, prefix, wholeFile)
+	if err != nil {
+		return tailPlan{}, err
+	}
+	blocksEnd := endOfBlocks(blocks)
+	if blocksEnd >= fileLen {
+		return tailPlan{}, nil // the last image block ends the file: nothing follows it
+	}
+	start := min(max(blocksEnd, metadataEnd(prefix)), fileLen)
+
+	region, base, err := findTrailerRegion(r, prefix, wholeFile, fileLen)
+	if err != nil {
+		return tailPlan{}, err
+	}
+	if region != nil && base >= blocksEnd && base < start {
+		start = base
+	}
+	if start >= fileLen {
+		return tailPlan{}, nil
+	}
+	return loadTail(r, prefix, wholeFile, start, fileLen, region, base, iptc)
+}
+
+// loadTail returns the plan for the tail [start, end) of the source: its
+// bytes, with the trailers in it to rewrite. region (at offset base) is what
+// trailer.FindTail already loaded, or nil.
+func loadTail(r io.ReadSeeker, prefix []byte, wholeFile bool, start, end uint64, region []byte, base uint64, iptc []byte) (tailPlan, error) {
+	t := tailPlan{start: start, end: end}
+	if end-start > trailer.MaxRegion {
+		return t, nil // too large to look for trailers in: streamed as it is
+	}
+	if region == nil || base != start {
+		var err error
+		if region, err = loadRegion(r, prefix, wholeFile, start, end); err != nil {
+			return tailPlan{}, err
+		}
+	}
+	t.plan = trailer.PlanFromRegion(region, int64(start), iptc) //nolint:gosec // G115: start <= end <= maxFileSize
+	return t, nil
+}
+
+// endOfBlocks returns the offset one past the last byte of the image blocks.
+func endOfBlocks(blocks []*imageBlock) uint64 {
+	end := uint64(0)
+	for _, blk := range blocks {
+		end = max(end, saturatingAdd(blk.srcOffset, blk.size))
+	}
+	return end
+}
+
+// findTrailerRegion looks for an AFCP or FotoStation trailer at the end of the
+// source (trailer.FindTail) and returns the bytes from the start of the first
+// to the end of the file and its offset; region is nil when there is none.
+func findTrailerRegion(r io.ReadSeeker, prefix []byte, wholeFile bool, fileLen uint64) (region []byte, base uint64, err error) {
+	var b int64
+	if wholeFile {
+		region, b, err = trailer.FindTail(trailer.BytesSource(prefix), int64(fileLen)) //nolint:gosec // G115: fileLen is bounded by maxFileSize
+	} else {
+		region, b, err = trailer.FindTail(trailer.ReaderSource{R: r}, int64(fileLen)) //nolint:gosec // G115: fileLen is bounded by maxFileSize
+	}
+	if err != nil {
+		return nil, 0, fmt.Errorf("tiff: look for trailers: %w", err)
+	}
+	return region, uint64(b), nil //nolint:gosec // G115: b is a non-negative file offset
+}
+
+// loadRegion returns the source bytes [start, end): a slice of prefix when it
+// holds the whole file, otherwise read from r.
+func loadRegion(r io.ReadSeeker, prefix []byte, wholeFile bool, start, end uint64) ([]byte, error) {
+	if wholeFile {
+		return prefix[start:end:end], nil
+	}
+	region, err := (trailer.ReaderSource{R: r}).Range(int64(start), int64(end-start)) //nolint:gosec // G115: bounded by maxFileSize
+	if err != nil {
+		return nil, fmt.Errorf("tiff: read trailing bytes: %w", err)
+	}
+	return region, nil
+}
+
+// write appends the tail to w: from the plan's region when it was loaded
+// (rewriting the trailers that need it; out counts the bytes written so far),
+// otherwise streamed from r.
+func (t *tailPlan) write(r io.ReadSeeker, w io.Writer, out *trailer.OutWriter) error {
+	switch {
+	case len(t.plan.Spans) > 0:
+		if err := t.plan.WriteRegion(w, out); err != nil {
+			return fmt.Errorf("tiff: write trailer: %w", err)
+		}
+	case t.plan.Region != nil:
+		if _, err := w.Write(t.plan.Region); err != nil {
+			return fmt.Errorf("tiff: write trailing bytes: %w", err)
+		}
+	default:
+		if _, err := r.Seek(int64(t.start), io.SeekStart); err != nil { //nolint:gosec // G115: bounded by maxFileSize
+			return fmt.Errorf("tiff: seek to trailing bytes: %w", err)
+		}
+		if err := iobuf.StreamCopyN(r, w, int64(t.end-t.start)); err != nil { //nolint:gosec // G115: bounded by maxFileSize
+			return fmt.Errorf("tiff: stream trailing bytes: %w", err)
+		}
+	}
+	return nil
+}
+
+// saturatingAdd returns a+b, or math.MaxUint64 when the sum overflows.
+func saturatingAdd(a, b uint64) uint64 {
+	if s := a + b; s >= a {
+		return s
+	}
+	return math.MaxUint64
+}
+
+// bigTIFFMagic is the version field of a BigTIFF header (BigTIFF spec §2).
+const bigTIFFMagic = 0x002B
+
+// metadataEnd returns the offset one past the last byte that an IFD of the
+// classic or BigTIFF header at the start of prefix addresses as structure: the
+// IFDs of IFD0's chain, their sub-IFDs and every out-of-line value (the extent
+// scanner of Extract, extent.go). The strip, tile and thumbnail data that the
+// IFDs describe is not included: it is the image blocks. It returns 0 when
+// prefix does not start with a TIFF header. The non-standard magic of ORF and
+// RW2 is accepted: only the byte order and the IFD0 offset are read.
+func metadataEnd(prefix []byte) uint64 {
+	if len(prefix) < 8 {
+		return 0
+	}
+	var order binary.ByteOrder
+	switch {
+	case prefix[0] == 'I' && prefix[1] == 'I':
+		order = binary.LittleEndian
+	case prefix[0] == 'M' && prefix[1] == 'M':
+		order = binary.BigEndian
+	default:
+		return 0
+	}
+	ifd0, bigTIFF := uint64(order.Uint32(prefix[4:])), false
+	if order.Uint16(prefix[2:]) == bigTIFFMagic {
+		if len(prefix) < 16 {
+			return 0
+		}
+		ifd0, bigTIFF = order.Uint64(prefix[8:]), true
+	}
+	scan := extentScanPool.Get().(*extentScan) //nolint:forcetypeassert,revive // extentScanPool.New always stores *extentScan
+	end := scanExtentPass(scan, prefix, ifd0, order, bigTIFF)
+	scan.buf = nil // do not retain the caller's prefix in the pool
+	extentScanPool.Put(scan)
+	return end
+}
+
+// extentScanPool recycles the scanner (and its map of visited IFDs) of
+// metadataEnd, which every TIFF write runs.
+//
+//nolint:gochecknoglobals // sync.Pool: reuse avoids two allocations per write
+var extentScanPool = sync.Pool{New: func() any { return &extentScan{seenIFD: make(map[uint64]bool, 16)} }}
+
+// writeHeaderAndBlocks writes header and then every block's bytes to w (see
+// writeRelocated).
+func writeHeaderAndBlocks(r io.ReadSeeker, w io.Writer, header []byte, blocks []*imageBlock, prefix []byte, wholeFile bool) error {
 	if _, err := w.Write(header); err != nil {
 		return fmt.Errorf("tiff: write header: %w", err)
 	}

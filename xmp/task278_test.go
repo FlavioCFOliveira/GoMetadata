@@ -146,8 +146,11 @@ func TestParseExtended_Errors(t *testing.T) {
 		{"empty extended", std, nil, ErrEmptyInput},
 		{"extended without properties", std, []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"/>`), ErrNoExtendedProperties},
 		// A bare rdf:Description that relies on the namespace declarations of
-		// another document is not an XMP document of its own.
-		{"fragment", std, []byte(`<rdf:Description rdf:about=""><dc:title>t</dc:title></rdf:Description></rdf:RDF>`), ErrNoExtendedProperties},
+		// another document is not an XMP document of its own: its prefixes
+		// are not declared (Namespaces in XML 1.0 §5, task #345).
+		{"fragment", std, []byte(`<rdf:Description rdf:about=""><dc:title>t</dc:title></rdf:Description>`), ErrXMLNotWellFormed},
+		// An end tag without a start tag is not well-formed (XML 1.0 §3, task #327).
+		{"stray end tag", std, []byte(`<rdf:Description rdf:about=""/></rdf:RDF>`), ErrXMLNotWellFormed},
 		{"too deep", std, []byte(strings.Repeat("<a>", 200)), ErrXMLNestingDepth},
 		{"too large", std, bytes.Repeat([]byte(" "), maxXMPDocumentBytes+1), ErrDocumentTooLarge},
 	}

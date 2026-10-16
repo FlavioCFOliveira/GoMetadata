@@ -183,7 +183,7 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 		return writeTIFFRW2(r, w, m)
 	}
 
-	rawEXIF, rawIPTC, rawXMP, err := encodeMetadata(m, fmtID)
+	rawEXIF, rawIPTC, rawXMP, err := encodeLocked(r, m, fmtID)
 	if err != nil {
 		return err
 	}
@@ -720,6 +720,36 @@ func writeTIFFRW2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 	return nil
 }
 
+// encodeLocked completes and serialises the metadata of m with m.mu held, so
+// that the dimensions that fillPixelSize records cannot race with a setter or
+// with another Write that encodes the same Metadata.
+func encodeLocked(r io.ReadSeeker, m *Metadata, fmtID format.FormatID) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if fmtID == format.FormatJPEG {
+		fillPixelSize(r, m)
+	}
+	return encodeMetadata(m, fmtID)
+}
+
+// fillPixelSize records the pixel dimensions of the JPEG r in the EXIF of m
+// when the Exif IFD of m was created for it without them (task #321): Exif 3.1
+// §4.6.6.3.1-2, p. 48, and Table 18, p. 95, make PixelXDimension and
+// PixelYDimension mandatory for a compressed primary image, and only the frame
+// header of the image knows them. It does nothing when m needs no dimensions or
+// the frame header cannot be read: the tags are then left out, never guessed.
+// The position of r is restored to the start. The caller holds m.mu.
+func fillPixelSize(r io.ReadSeeker, m *Metadata) {
+	if m.EXIF == nil || !m.EXIF.NeedsImageSize() {
+		return
+	}
+	w, h, err := jpeg.ImageSize(r)
+	if _, serr := r.Seek(0, io.SeekStart); serr != nil || err != nil {
+		return
+	}
+	m.EXIF.SetImageSize(w, h)
+}
+
 // encodeMetadata serialises each modified metadata segment. If a segment was
 // not modified (m.EXIF/IPTC/XMP is nil) the original raw bytes are passed
 // through unchanged. Returns the first encoding error encountered.
@@ -744,7 +774,12 @@ func encodeMetadata(m *Metadata, fmtID format.FormatID) (rawEXIF, rawIPTC, rawXM
 // non-nil, or the original raw bytes when the caller did not modify EXIF.
 func encodeEXIF(m *Metadata) ([]byte, error) {
 	if m.EXIF != nil {
-		raw, err := exif.Encode(m.EXIF)
+		// The container holds this stream on its own, so the MakerNote it
+		// moves must stay valid there (tasks #317, #318): offsets that count
+		// from the TIFF header are set for the new position and the data the
+		// MakerNote addresses outside its declared bytes is carried from
+		// m.rawEXIF, the stream m.EXIF was parsed from.
+		raw, err := exif.EncodeRebased(m.EXIF, m.rawEXIF)
 		if err != nil {
 			return nil, fmt.Errorf("gometadata: encode EXIF: %w", err)
 		}
@@ -794,6 +829,11 @@ func encodeXMP(m *Metadata, fmtID format.FormatID) ([]byte, error) {
 		raw, err := xmppkg.Encode(m.XMP)
 		if err != nil {
 			return nil, fmt.Errorf("gometadata: encode XMP: %w", err)
+		}
+		// #357: the extended XMP that Read could not merge is carried over
+		// verbatim by the JPEG writer; the frame says which segments.
+		if m.keptExtGUID != nil && fmtID == format.FormatJPEG {
+			return jpeg.EncodeKeptExtended(raw, *m.keptExtGUID), nil
 		}
 		return raw, nil
 	}
@@ -898,6 +938,8 @@ func cloneEXIF(e *exif.EXIF) *exif.EXIF {
 		// when the clone (not the original) is passed to relocateTIFFFromParsed.
 		// BigTIFF spec §2; audit finding #107.
 		BigTIFF: e.BigTIFF,
+		// The IFDs the setters create follow the container (task #321).
+		CompressedPrimary: e.CompressedPrimary,
 	}
 	return out
 }
@@ -919,7 +961,32 @@ func cloneIFD(ifd *exif.IFD) *exif.IFD {
 		Entries:       entries,
 		Next:          cloneIFD(ifd.Next),
 		ThumbnailData: bytes.Clone(ifd.ThumbnailData),
+		Sub:           cloneSubIFDs(ifd.Sub),
 	}
+}
+
+// cloneStrips returns a deep copy of strips; nil stays nil.
+func cloneStrips(strips [][]byte) [][]byte {
+	if strips == nil {
+		return nil
+	}
+	out := make([][]byte, len(strips))
+	for i, s := range strips {
+		out[i] = bytes.Clone(s)
+	}
+	return out
+}
+
+// cloneSubIFDs returns a clone of the IFDs that an IFD of the chain after IFD0
+// addresses itself (exif.SubIFDs, task #319).
+func cloneSubIFDs(s *exif.SubIFDs) *exif.SubIFDs {
+	if s == nil {
+		return nil
+	}
+	// ThumbnailStrips is nil on every EXIF that reaches here (a TIFF-based file
+	// is parsed without CarryThumbnailStrips); copied anyway so that the clone
+	// stays equal to its source.
+	return &exif.SubIFDs{Exif: cloneIFD(s.Exif), GPS: cloneIFD(s.GPS), Interop: cloneIFD(s.Interop), ThumbnailStrips: cloneStrips(s.ThumbnailStrips)}
 }
 
 // writeTIFFNEF handles metadata injection for Nikon NEF files.

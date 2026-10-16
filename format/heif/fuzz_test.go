@@ -153,8 +153,8 @@ func FuzzHEIFExtract(f *testing.F) {
 // Both rawEXIF and rawXMP are fixed short payloads so the fuzzer focuses on
 // structural variation in the container bytes.
 func FuzzHEIFInject(f *testing.F) {
-	// Seed 1: minimal ftyp box only — no meta box; exercises the writePassThrough
-	// path (findMetaBoxAbs returns found=false).
+	// Seed 1: minimal ftyp box only — no meta box; exercises the
+	// ErrNoMetadataContainer path (findMetaBoxAbs returns found=false).
 	f.Add([]byte{
 		0x00, 0x00, 0x00, 0x14, // size = 20
 		'f', 't', 'y', 'p',
@@ -183,7 +183,7 @@ func FuzzHEIFInject(f *testing.F) {
 	})
 
 	// Seed 5: ftyp + minimal meta box with no iinf/iloc children — exercises
-	// buildInjectComponents returning ok=false (no matching items).
+	// planInject returning ErrUnreadableItemLocations (no iloc box).
 	// meta FullBox: size(4) + type(4) + version/flags(4) = 12 bytes minimum.
 	f.Add([]byte{
 		// ftyp box (20 bytes)
@@ -211,7 +211,7 @@ func FuzzHEIFInject(f *testing.F) {
 	}
 
 	// Seed 8: ftyp + 8-byte meta box (size=8 = header only; no FullBox version/flags).
-	// Exercises the #169 fix: meta box < 12 bytes must be treated as absent → pass-through.
+	// Exercises the #169 fix: meta box < 12 bytes must be treated as absent → ErrNoMetadataContainer.
 	// Before the fix, findMetaBoxAbs returned contentOff=12 > metaAbsEnd=8 causing
 	// buildInjectComponents to panic with "slice bounds out of range [12:8]".
 	// ISO 14496-12 §8.11.1: meta FullBox minimum size = 12 bytes.
@@ -273,6 +273,18 @@ func FuzzHEIFInject(f *testing.F) {
 	// heif_test.go for the full writeup.
 	f.Add(buildHEIFDuplicateIloc())
 
+	// Seeds (tasks #334, #335): a meta box with a 64-bit largesize header, and
+	// iloc boxes whose offset_size / length_size is 0.
+	f.Add(buildTask334File(task334Layout{metaLarge: true, offsetSize: 4, lengthSize: 4}))
+	f.Add(buildTask334File(task334Layout{inMoov: true, moovLarge: true, metaLarge: true, offsetSize: 4, lengthSize: 4}))
+	// Task #367: sources whose top-level boxes end in bytes that do not parse as
+	// a box, the first of which becomes a 'meta' header when a box follows it.
+	for _, tail := range task367Trailers() {
+		f.Add(append(buildTask334File(task334Layout{withItems: true, inMoov: true, offsetSize: 4, lengthSize: 4}), tail...))
+	}
+	f.Add(buildTask334File(task334Layout{offsetSize: 0, lengthSize: 4, baseOffsetSize: 4}))
+	f.Add(buildTask334File(task334Layout{offsetSize: 4, lengthSize: 0}))
+
 	// Seeds (task #309): real metadata-free AVIF and HEIC files, which make
 	// Inject create the Exif and XMP items, shift the image item's offset and
 	// insert an iref box.
@@ -298,18 +310,35 @@ func FuzzHEIFInject(f *testing.F) {
 			return
 		}
 		if bytes.Equal(out.Bytes(), data) {
-			// Pass-through: buildInjectComponents declined to rebuild the
-			// file at all (e.g. no matching item, or — as found while
-			// developing this very invariant — an iloc box whose
-			// offset_size is 0, which buildInjectComponents explicitly
-			// rejects because there is no field width to encode a new
-			// absolute offset into). Whatever the (possibly malformed)
-			// input's iloc box already declared, including for Exif/mime
-			// typed items, is not something Inject computed in this case —
-			// nothing to check.
-			return
+			// Task #335: a successful write of a non-nil payload never leaves
+			// the file unchanged. Inject either stores the payload or returns
+			// an error; the former silent pass-throughs (no meta box, an
+			// unreadable iloc, an iloc offset_size or length_size of 0) are
+			// gone. rawEXIF and rawXMP are always non-nil in this target.
+			t.Fatal("Inject returned nil but the output equals the input: the requested metadata was silently dropped")
 		}
 		assertHEIFExtentsWithinBounds(t, out.Bytes())
+
+		// Task #349: Extract and Inject select the same metadata container, so
+		// what Inject stored is what Extract reads back. Tasks #358 and #359:
+		// no exemption remains for an iinf box of version 1 (32-bit
+		// entry_count) or for a child of meta, iinf or iref with a size field
+		// of 0; Inject closes the open-ended child before appending. Task
+		// #367: none remains for a source whose top-level boxes end in bytes
+		// that do not parse as a box; the new 'mdat' box goes before them.
+		gotEXIF, _, gotXMP, err := Extract(bytes.NewReader(out.Bytes()))
+		if err != nil {
+			return
+		}
+		if gotEXIF != nil && !bytes.Equal(gotEXIF, rawEXIF) {
+			t.Fatalf("Extract after Inject read EXIF %x, want %x", gotEXIF, rawEXIF)
+		}
+		if gotXMP != nil && !bytes.Equal(gotXMP, rawXMP) {
+			t.Fatalf("Extract after Inject read XMP %q, want %q", gotXMP, rawXMP)
+		}
+		if gotEXIF == nil && gotXMP == nil {
+			t.Fatal("Inject stored EXIF and XMP but Extract of the output reads neither")
+		}
 	})
 }
 
@@ -341,11 +370,11 @@ func FuzzHEIFInject(f *testing.F) {
 // extents the (possibly malformed) input happened to declare.
 func assertHEIFExtentsWithinBounds(t *testing.T, output []byte) {
 	t.Helper()
-	metaAbsStart, metaAbsEnd, _, found := findMetaBoxAbs(output)
-	if !found || metaAbsEnd > len(output) || metaAbsStart+metaFullBoxMinSize > metaAbsEnd {
+	_, metaAbsEnd, metaContentOff, found := findMetaBoxAbs(output)
+	if !found || metaAbsEnd > len(output) || metaContentOff > metaAbsEnd {
 		return
 	}
-	metaContent := output[metaAbsStart+8+4 : metaAbsEnd]
+	metaContent := output[metaContentOff:metaAbsEnd]
 	itemTypes := parseIinf(metaContent)
 	ilocInfo, ok := parseIlocFull(metaContent)
 	if !ok {

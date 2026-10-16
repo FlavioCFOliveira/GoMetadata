@@ -2,6 +2,8 @@ package exif
 
 // Adapted from metadata-extractor Source/com/drew/imaging/tiff/TiffReader.java:TiffReader.processIfd, Copyright 2002-2019 Drew Noakes and contributors, SPDX-License-Identifier: Apache-2.0
 // Changes: only the byte-swapped entry-count heuristic is adapted, and it is applied to MakerNote IFDs only (mnView.ifdAt).
+// Adapted from metadata-extractor Source/com/drew/metadata/exif/ExifTiffHandler.java:ExifTiffHandler.processMakernote, Copyright 2002-2019 Drew Noakes and contributors, SPDX-License-Identifier: Apache-2.0
+// Changes: only the headerless Nikon branch (the IFD begins with the first MakerNote byte: Coolpix 775, E990, D1) is adapted, and the byte order of that IFD is taken from its entry count, with the heuristic above, instead of the guard on a big-endian count that metadata-extractor does not have (nikonType1, task #364).
 
 import (
 	"bytes"
@@ -22,7 +24,7 @@ import (
 // Supported formats:
 //   - Canon: plain IFD at offset 0, parent byte order (CIPA MakerNote §Canon)
 //   - Nikon Type 3: embedded TIFF header at offset 10 within "Nikon\0" prefix
-//   - Nikon Type 1: plain IFD at offset 0, big-endian (legacy Nikon cameras)
+//   - Nikon headerless: plain IFD at offset 0, either byte order (Coolpix 775, E990, D1)
 //   - Sony: plain IFD at offset 0, parent byte order
 //   - Fujifilm: "FUJIFILM" prefix, LE IFD at the offset stored at [8..11]
 //   - Olympus Type 2: "OLYMPUS\0" prefix, byte order at [8..9], IFD at 12
@@ -164,6 +166,15 @@ type MakerNoteLayout struct {
 	// Type 3, Olympus "OLYMPUS\0", Fujifilm, Pentax, Apple, ...), so the
 	// MakerNote can move unchanged.
 	TIFFRelative bool
+	// Base is the offset, from the first MakerNote byte, of the point that
+	// the value offsets of a layout with TIFFRelative false count from: 0,
+	// except for Nikon Type 3, whose offsets count from its embedded TIFF
+	// header (8 or 10 bytes into the MakerNote). It is 0 when TIFFRelative.
+	Base int
+
+	// layout is the detected layout, for the rules that depend on the vendor
+	// (see makernote_rebase.go).
+	layout mnLayout
 }
 
 // MakerNoteLayout reports the layout of e.MakerNote, detected as Parse
@@ -190,32 +201,52 @@ func (e *EXIF) MakerNoteLayout() (layout MakerNoteLayout, ok bool) {
 	if order == nil {
 		order = binary.LittleEndian
 	}
-	loc, base, ok := probeMakerNote(e.MakerNote, trimMake(makeValue), order)
+	return makerNoteLayoutOf(e.MakerNote, trimMake(makeValue), order)
+}
+
+// makerNoteLayoutOf is MakerNoteLayout for the MakerNote bytes mn of a camera
+// of Make mk (already trimmed) in a stream of byte order order.
+func makerNoteLayoutOf(mn, mk []byte, order binary.ByteOrder) (MakerNoteLayout, bool) {
+	loc, base, l, ok := probeMakerNote(mn, mk, order)
 	if !ok {
 		return MakerNoteLayout{}, false
 	}
-	return MakerNoteLayout{IFDOffset: loc.off, ByteOrder: loc.order, TIFFRelative: base == mnBaseTIFF}, true
+	lay := MakerNoteLayout{IFDOffset: loc.off, ByteOrder: loc.order, TIFFRelative: base == mnBaseTIFF, layout: l}
+	if !lay.TIFFRelative {
+		lay.Base = loc.base
+	}
+	return lay, true
 }
 
 // probeMakerNote parses mn on its own bytes as Parse would for a camera of
 // Make mk and returns where its IFD was found and its offset base; an
 // undetected MakerNote holding a plausible IFD at offset 0 is reported as
 // TIFF-relative (see MakerNoteLayout).
-func probeMakerNote(mn, mk []byte, order binary.ByteOrder) (loc mnLoc, base mnBase, ok bool) {
-	l := detectLayout(mn, mk)
+func probeMakerNote(mn, mk []byte, order binary.ByteOrder) (loc mnLoc, base mnBase, l mnLayout, ok bool) {
+	l = detectLayout(mn, mk)
 	f := mnLayouts[l]
 	v := blobView(mn)
 	v.loc = &loc
 	switch {
 	case l == mnNone:
-		if parsePlausibleIFD(v, 0, order) == nil {
-			return loc, 0, false
+		if parsePlausibleIFD(v, order) == nil {
+			return loc, 0, l, false
 		}
 		f.base = mnBaseTIFF
-	case f.parse == nil || f.base == mnBaseNone || f.parse(v, order) == nil:
-		return loc, 0, false
+	case f.parse == nil || f.base == mnBaseNone:
+		return loc, 0, l, false
+	case f.parse(v, order) == nil:
+		// A layout the Make selects for a plain IFD at offset 0 whose parser
+		// declines it is still an IFD of the TIFF byte order whose offsets
+		// count from the TIFF header, when it is a plausible one: the layout of
+		// an unidentified note. Only the repair of a moved MakerNote uses this;
+		// Parse still reports no MakerNote IFD for it.
+		if f.ifdOffset != 0 || parsePlausibleIFD(v, order) == nil {
+			return loc, 0, l, false
+		}
+		f.base = mnBaseTIFF
 	}
-	return loc, f.base, loc.order != nil
+	return loc, f.base, l, loc.order != nil
 }
 
 // mnView is the MakerNote handed to a layout parser: its bytes, and the
@@ -248,6 +279,7 @@ type mnView struct {
 type mnLoc struct {
 	off   int
 	order binary.ByteOrder
+	base  int // offset of the origin of the value offsets, when it is inside the MakerNote
 }
 
 // blobView returns the view of a MakerNote parsed on its own bytes: value
@@ -442,37 +474,55 @@ func nikonType3(v mnView) *IFD {
 		return nil
 	}
 	if v.loc != nil && uint64(ifdOffset) <= uint64(len(tiff)) {
-		*v.loc = mnLoc{off: tiffStart + int(ifdOffset), order: order}
+		*v.loc = mnLoc{off: tiffStart + int(ifdOffset), order: order, base: tiffStart}
 	}
 	return ifd
 }
 
-// parseNikonType1 parses a Nikon Type-1 MakerNote (legacy D1 / early Coolpix).
+// parseNikonType1 parses a headerless Nikon MakerNote (Coolpix 775, E990, E5000
+// and the D1): a plain IFD at offset 0 with no magic prefix, in either byte
+// order.
 //
-// Type-1 MakerNotes are plain IFDs at offset 0, big-endian, with no magic
-// prefix. A heuristic check (entry count > 0 and < 256) guards against
-// false positives on non-Nikon data (ExifTool Nikon.pm).
+// Task #364: the note was read as big-endian only, so the little-endian notes
+// of the Coolpix 775, E900-E5000 and most other headerless cameras ("most are
+// little-endian, but D1 is big", ExifTool MakerNotes.pm MakerNoteNikon3,
+// ByteOrder 'Unknown') had no entries. The order is taken from the entry
+// count, as metadata-extractor does for every IFD (TiffReader.processIfd,
+// lines 125-136, Apache-2.0, 6f037943: "The entire test image repository
+// doesn't contain a single IFD with more than 255 entries"; an IFD whose count
+// has a non-zero high byte and a zero low byte is byte-swapped), and
+// ExifTiffHandler.processMakernote (lines 474-501: "The IFD begins with the
+// first Makernote byte (no ASCII name). This occurs with CoolPix 775, E990 and
+// D1 models") sends the note through that routine. A count of 1 to 255 in
+// exactly one of the two orders is the test: it is unambiguous because the
+// count of an order is below 256 only when its high byte is 0, so both orders
+// qualify only for the count 0, which is refused.
 func parseNikonType1(b []byte, _ binary.ByteOrder) *IFD {
 	return nikonType1(blobView(b))
 }
 
 // nikonType1 is parseNikonType1 on a view.
 func nikonType1(v mnView) *IFD {
-	if len(v.bytes()) < 2 {
+	b := v.bytes()
+	if len(b) < 2 {
 		return nil
 	}
-	count := binary.BigEndian.Uint16(v.bytes())
+	var order binary.ByteOrder = binary.BigEndian
+	count := binary.BigEndian.Uint16(b)
 	if count == 0 || count >= 256 {
-		return nil
+		order, count = binary.LittleEndian, binary.LittleEndian.Uint16(b)
+		if count == 0 || count >= 256 {
+			return nil
+		}
 	}
-	return v.ifdAt(0, binary.BigEndian)
+	return v.ifdAt(0, order)
 }
 
 // parseNikonMakerNote parses a Nikon MakerNote.
 //
 // Nikon uses two distinct MakerNote formats (ExifTool Nikon.pm):
 //
-//   - Type 1 (old Nikon D1 / Coolpix): plain IFD at offset 0, big-endian.
+//   - Type 1 (old Nikon D1 / Coolpix): plain IFD at offset 0, either byte order.
 //     No magic prefix. Rare in practice.
 //
 //   - Type 3 (all modern Nikon DSLRs and Coolpix): embedded TIFF header.

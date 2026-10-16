@@ -37,7 +37,7 @@ func injectBytes(t *testing.T, src, rawEXIF, rawXMP []byte) []byte {
 // under test through parseIlocFull.
 func itemBytes(t *testing.T, file []byte, id uint16) []byte {
 	t.Helper()
-	metaContent, err := findBox(file, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(file)
 	if err != nil || metaContent == nil {
 		t.Fatalf("meta box not found: %v", err)
 	}
@@ -67,7 +67,7 @@ func itemBytes(t *testing.T, file []byte, id uint16) []byte {
 // referencing item and its targets.
 func cdscTargets(t *testing.T, file []byte) map[uint32][]uint32 {
 	t.Helper()
-	metaContent, _ := findBox(file, boxTypeMeta, 0)
+	metaContent, _ := findMetaContent(file)
 	iref := findInnerBox(metaContent, boxTypeIref)
 	refs := map[uint32][]uint32{}
 	if len(iref) < 4 {
@@ -100,9 +100,9 @@ func cdscTargets(t *testing.T, file []byte) map[uint32][]uint32 {
 // number of infe boxes it holds.
 func iinfEntryCount(t *testing.T, file []byte) (declared, actual int) {
 	t.Helper()
-	metaContent, _ := findBox(file, boxTypeMeta, 0)
+	metaContent, _ := findMetaContent(file)
 	iinf := findInnerBox(metaContent, boxTypeIinf)
-	count, pos, ok := parseIinfItemCount(iinf, iinf[0], 4)
+	count, pos, ok := parseIinfEntryCount(iinf, iinf[0], 4)
 	if !ok {
 		t.Fatal("iinf entry_count unreadable")
 	}
@@ -371,14 +371,23 @@ func TestTask309NoFreeItemID(t *testing.T) {
 // TestTask309TruncatedInfeIsNotRevived is the regression gate for a defect
 // FuzzHEIFInject found in the item creation code (corpus entry
 // testdata/fuzz/FuzzHEIFInject/73a9cfc5cb454843): the source iinf box ends
-// with a truncated infe box (declared size 48, 20 bytes present) that
-// parseIinf ignores. Appending the new infe boxes after those bytes let the
-// truncated box parse as a complete Exif item in the output, whose garbage
+// with a truncated infe box (declared size larger than the bytes present)
+// that parseIinf ignores. Appending the new infe boxes after those bytes let
+// the truncated box parse as a complete Exif item in the output, whose garbage
 // iloc extent pointed far outside the file. Only complete source children
 // are kept now, and entry_count counts the infe boxes actually written.
+//
+// The fuzz input also had a truncated iloc box, which Inject now refuses
+// (task #335), so this fixture pairs the truncated infe with a valid iloc.
 func TestTask309TruncatedInfeIsNotRevived(t *testing.T) {
 	t.Parallel()
-	in := []byte("\x00\x00\x00Xmeta0000\x00\x00\x00#iinf\x0000000\x00\x00\x000infe\x02000\x00\x0100Exif0\x00\x00\x00 iloc\x00000D\x00\x000\x00\x01000000000000000000000000000000000000000000")
+	infe := bmffInfeV2(1, "Exif")
+	binary.BigEndian.PutUint32(infe, uint32(len(infe)+28)) //nolint:gosec // G115: small test box; the declared size exceeds the bytes present
+	iinf := bmffFullBox("iinf", 0, 0, append([]byte{0, 1}, infe...))
+	metaBody := append([]byte{0, 0, 0, 0}, iinf...)
+	metaBody = append(metaBody, boxWithHeader("iloc", buildIlocBody(0, 4, 4, 0, 0, nil))...)
+	in := append(bmffFtyp("heic", 0, "mif1"), bmffBox("meta", metaBody)...)
+
 	out := injectBytes(t, in, []byte("EXIF"), []byte("XMP"))
 	assertHEIFExtentsWithinBounds(t, out)
 	if declared, actual := iinfEntryCount(t, out); declared != 2 || actual != 2 {

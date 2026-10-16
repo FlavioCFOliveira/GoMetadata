@@ -1,0 +1,23 @@
+---
+name: sprint46-e7-367-370
+description: Sprint 46 E7 (#367-#370) DONE 2026-10-16 (uncommitted at hand-off): design, verified facts, harness, perf, unfixed defects
+metadata:
+  type: project
+---
+
+Base HEAD 8866c6d. Scratch: scratchpad/e7 (wr2 = SetCaption/gps/all writer, kp_out.jpg, orf/).
+
+Done (code+tests green, go test -race ./... ok): 
+- #367 format/heif/inject.go: closeOpenEndedBox returns boxesEnd; trailer (non-box bytes) written AFTER new mdat; fuzz exemption hasTrailingUnboxedBytes removed; format/heif/task367_test.go.
+- #368 exif.CarryThumbnailStrips() option + IFD.ThumbnailStrips [][]byte (exif/thumbnail_strips.go, chain.go thumbnailEnd/patchChain/writeChainIFD, write.go thumbnailSpan/chainLen); root read.go adds the option only when !isTIFFBasedFormat (TIFF relocators enumerate IFD1 strips themselves = would double). Design ref: commons-imaging TiffOutputDirectory.getOutputItems 757-794 + TiffOutputSummary.updateOffsets 63-72 (Apache-2.0, design only). Cap 4096 strips / 1 MiB, else warning "thumbnail image data not carried".
+- #369 NO CODE CHANGE: root cause = source IFD0 out of tag order (Make 0x010F after ExifIFD); ExifTool MakerNoteSamsung2 needs Make read first (uc $$self{Make} eq 'SAMSUNG') -> source MN decodes as Unknown, output (sorted, TIFF 6.0 §2) as Samsung Type2; MN bytes identical, 7 entries both. Spec wins; AC literal "-MakerNotes:all identical" cannot hold.
+- #370: exif/externaloffsets.go rewritten (ExternalOffset gains MNStart/MNLen, Target(); (e *EXIF).ExternalOffsets; forms: 0x2020 IFD, 0x2020 value E-1, main 0x1036/0x1037 + 0x0088/0x0089; OLYMP TIFF-relative base 0); format/jpeg/externaloffsets.go newValue classes (inside MN / kept header segment (kept []keptSegment) / after SOS / unresolved); exif/private_ifd.go generalised (registry 0x014A,0x0190,0x8290,0x888A,0xFE00 LONG + any type IFD(13), count<=10 arrays; Exif/GPS/Interop excluded); format/tiff/relocate_olympus_external.go (planOlympusExternal/patch; kinds inMN/inBlock/ownBlock/inTail; hooked in relocate.go step 4.5 + short-circuit + step 9.5 and relocate_orf.go orfRelocateWithOLYMP).
+- Corpus facts: ORF previews live INSIDE the (1.4 MB) MakerNote so they already worked; E-1 JPEG = CameraSettings as UNDEFINED value, preview 26 bytes inside MN TIFF-relative; E-20 0x1036 points past the (truncated) file; corrupted.jpg preview after scan.
+- Tests: exif/thumbnail_strips_test.go (S-50), private_ifd_registry_test.go (R-32), externaloffsets_test.go X4 (R-31); format/jpeg/externaloffsets_task370_test.go (R-31,R-33); format/tiff/relocate_olympus_external_test.go (R-34); write_task367_370_test.go (S-50 Kodak, R-35 Samsung, R-31/R-34 corpus).
+
+Late changes: ThumbnailStrips moved from IFD to SubIFDs (IFD 64->88 B grew every Read alloc: +5% Read_JPEG; benchstat caught it); exif.(*EXIF).RebaseMakerNoteSubIFDs (R-36) fixes ORF OLYMP compacts SP350/SP500UZ/C8080 (embedded sub-IFD pointers of 0x2010-0x2050 UNDEFINED values were not rebased; the REAL "(4) ORF" defect; corpus ORF previews sit inside the 1.4 MB MN so they always worked); prefix test before MakerNoteLayout (probeMakerNote allocs).
+
+Validation (all done): gofmt/vet/build, go test -race ./..., golangci-lint 0, fuzz 60 s x all targets PASS (FuzzRewriteNikonMakerNoteIPTC fails at HEAD too: unfixed), sweep (scratchpad/e7: sw_base/sw_new, ew_in/ew_base/ew_new + ../e6/cmpt.py, ../e1/mncmp.py with BASE=out_base): warning files 118 -> 115 (3 Kodak dc210 fixed, 0 regressions), MN diffs 14 -> 8 files (6 ORF fixed; remaining Sony HX5V(2), Samsung Note 4, Olympus FE190 TIFF, NEF f505 TIFF), identical 590-line write/read error set. bench (scratchpad/e7/bench.sh, base = git archive HEAD with testdata/corpus symlink): all within +-2% except ExternalOffsets/Olympus +10% (3 extra forms), InjectOlympusPreview +5% (kept-segment slice), ImageSizeDNL B/op artefact.
+
+Unfixed defects found (report): FuzzRewriteNikonMakerNoteIPTC 284-byte input "no tag 0x0E01" (fails at HEAD; input saved scratchpad/e7/nikon_fuzz_fail_4e472a028c803fe0); Olympus FE190/X750 TIFF ce50e53...tif OLYMP note counts offsets from the MN (TIFF path rebase assumes TIFF-relative; exif walker decides by data via offsetsCountFromTIFF); NEF f505d8aa...tif Nikon PreviewIFD values differ; Sony ILCE-5000 JPEG "Error reading PreviewImage" (same class as Olympus preview offset, Sony MakerNote offset to data after image); Sony HX5V(2) IFD0 type-0 entry (E6); AFCP/FotoStation trailer starting inside metadata moves tail start (R-34 not detected).
+Traps: *testing.F satisfies testing.TB (olympusSource(tb)); gocyclo > 10 and thelper want name tb; benchstat showed IFD size class effects; never `git stash`.

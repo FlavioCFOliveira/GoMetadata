@@ -16,13 +16,6 @@ import (
 	"testing"
 )
 
-// TagExifVersion is the EXIF version tag (EXIF §4.6.5 Table 4, 0x9000).
-// Defined here for local use in conformance tests only.
-const TagExifVersion TagID = 0x9000
-
-// TagComponentsConfiguration (EXIF §4.6.5 Table 4, 0x9101).
-const TagComponentsConfiguration TagID = 0x9101
-
 // ---------------------------------------------------------------------------
 // V-01 — RATIONAL byte layout and zero-denominator guard
 // ---------------------------------------------------------------------------
@@ -357,7 +350,7 @@ func TestConformance_V06_gps_ref_strings(t *testing.T) {
 // V-07 — GPSVersionID type must be BYTE, not ASCII
 // ---------------------------------------------------------------------------
 
-// TestConformance_V07_gps_version_id verifies that GPSVersionID is BYTE[4] = {2,3,0,0}.
+// TestConformance_V07_gps_version_id verifies that GPSVersionID is BYTE[4] = {2,4,0,0}.
 // EXIF §4.6.6 Table 15: type MUST be BYTE not ASCII; count = 4.
 func TestConformance_V07_gps_version_id(t *testing.T) {
 	t.Parallel()
@@ -375,8 +368,8 @@ func TestConformance_V07_gps_version_id(t *testing.T) {
 	if vid.Count != 4 {
 		t.Errorf("V-07: GPSVersionID count = %d, want 4", vid.Count)
 	}
-	if len(vid.Value) < 4 || vid.Value[0] != 2 || vid.Value[1] != 3 {
-		t.Errorf("V-07: GPSVersionID value = %v, want {2,3,0,0}", vid.Value)
+	if len(vid.Value) < 4 || vid.Value[0] != 2 || vid.Value[1] != 4 {
+		t.Errorf("V-07: GPSVersionID value = %v, want {2,4,0,0}", vid.Value)
 	}
 }
 

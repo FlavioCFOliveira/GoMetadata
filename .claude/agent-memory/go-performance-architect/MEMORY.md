@@ -1,5 +1,12 @@
 # Memory Index
 
+- [Sprint 46 E6 (2026-10-16, done)](project_sprint46_e6_progress.md) — #358-#365: iinf count, bmff open-ended, Samsung rigid piece, Olympus MN-relative preview offset, KodakIFD, ExifVersion table, headerless Nikon, JPEG DNL
+- [Sprint 46 E1 (2026-10-16, done)](project_sprint46_e1_exif_mn_ifd1_type_mandatory_tail.md) — #317-#321,#360: EncodeRebased, IFD1 pointers, TypeUTF8=129, mandatory tags, TIFF tail; harness, perf, unfixed defects
+- [Sprint 46 E5b (2026-10-16)](project_sprint46_e5b_trailers_heif_cr3_nef_extxmp.md) — internal/trailer, heif meta selection, cr3 no-drop, NEF 0E0E, keep-ext-XMP frame; perf traps, unfixed defects
+- [Sprint 46 E5a (2026-10-15)](project_sprint46_e5a_digest_rework_xmp_xml_343_352.md) — MWG digest literal rule #323, opaque-segment guard #343, XML attr normalisation #344, unbound prefix #345, 65502 #351; perf +2%
+- [Sprint 46 E3 (2026-10-15)](project_sprint46_e3_digest_png_webp_extxmp_trailers.md) — digest policy #323, PNG profile drop #325, WebP #333, PackageForJPEG #332, AFCP/FotoStation/Nikon IPTC copies #322; verified clauses, perf, unfixed defects
+- [Sprint 46 E4 (2026-10-15)](project_sprint46_e4_heif_cr3_334_337.md) — HEIF largesize/iloc width 0/no-silent-drop; CR3 CMT2 read+write, CMT4 removal; ExifTool -G3:1 count trap
+- [Sprint 46 E2 (2026-10-14)](project_sprint46_e2_xmp_bugs.md) — XMP #326-#331: alias fold, strict scanner, unparsed-packet carry, verbatim text; Go slice-header eval-order trap
 - [Sprint 45 E5 (2026-10-14)](project_sprint45_e5_reconcile_tables.md) — internal/reconcile Toolkit tables + MWG EXIF>XMP>IIM read order (user-chosen); real MWG § numbers, perf cost accepted, corpus defects
 - [Sprint 45 E4b (2026-10-14)](project_sprint45_e4b_extxmp_aliasing.md) — xmp.ParseExtended one-tree merge, MD5 GUID, xmpNote URI, IFDEntry.Value caps; spec facts + measured costs
 - [Sprint 45 E4a (2026-10-14)](project_sprint45_e4a_xmp_tree.md) — XMP tree model (#303/#283/#277): Toolkit port, retained-subset design, perf traps, fuzz finds, unfixed defects
@@ -103,3 +110,5 @@
 - [Security-audit batch #244-247](project_security_audit_batch_244_247.md) — DETECT-SHORTREAD-01, EXIF-BO-001, PERF-201-LOW, XMPCONC-01
 - [Security-audit batch 2](project_security_audit_batch_2_20260706.md) — HEIF iloc zero-field DoS; ORF/RW2 double-write clone fix
 - [Lint after adding parser branches/tests](feedback_lint_iteration_after_new_code.md) — new nolint + gocyclo bumps common; run golangci-lint before done
+- [Sprint 46 E7 (2026-10-16, done)](project_sprint46_e7_progress.md) — #367-#370: HEIF trailer before-mdat, IFD1 strips (CarryThumbnailStrips), Samsung = ExifTool order dependence, Olympus offsets all forms
+- [Task #371 Nikon Capture overlap](project_task371_nikon_capture_overlap.md) — 0x0E01 data overlapping IFD erased its own entry; overlap check

@@ -82,6 +82,13 @@ func TestTask283Canon7DReadsEveryProperty(t *testing.T) {
 		}
 	}
 	for p := range want {
+		// A registered alias is folded into its base property on parse
+		// (task #329): it is read when the base property is.
+		if ns, local, ok := strings.Cut(p, " "); ok {
+			if base, isAlias := xmp.ResolveAlias(ns, local); isAlias {
+				p = base.NS + " " + base.Local
+			}
+		}
 		if !have[p] {
 			t.Errorf("property %s not read", p)
 		}

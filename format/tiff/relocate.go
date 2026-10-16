@@ -391,7 +391,7 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte, f
 	if len(rawIPTC) > 0 {
 		// Adobe XMP Spec / ExifTool convention: IPTC-NAA (0x83BB) as TypeLong.
 		// upsertIFD0Entry pads value to 4-byte boundary; Count = nLongs.
-		upsertIPTC(e.IFD0, rawIPTC)
+		upsertIPTC(e.IFD0, rawIPTC, rawXMP)
 	}
 	if len(rawXMP) > 0 {
 		// Adobe XMP Spec (TIFF Technical Note 3): XMP (0x02BC) as TypeByte.
@@ -450,6 +450,13 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte, f
 	subIFDs := subTree.all
 	blocks = append(blocks, subBlocks...)
 
+	// Step 4.5 (task #370): the Olympus MakerNote offsets of data outside the
+	// IFD structures (see relocate_olympus_external.go). Data outside every
+	// block is carried as a block of its own.
+	ext := planOlympusExternal(base, e, blocks, fileLen)
+	extBlocks := ext.blocksToAdd()
+	blocks = append(blocks, extBlocks...)
+
 	// Short-circuit when there are no image blocks to relocate and no SubIFDs.
 	if len(blocks) == 0 && len(subIFDs) == 0 && subTree.roots == nil {
 		out, encErr := exif.Encode(e)
@@ -461,6 +468,7 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte, f
 		// offset within the re-encoded IFD section.
 		// #127: MakerNote OOL offset rebasing incomplete on write.
 		rebaseGenericMakerNote(out, e, order)
+		ext.patch(out, order, uint64(len(out))) // no blocks: the tail follows the header
 		return out, nil, nil
 	}
 
@@ -471,6 +479,9 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte, f
 	// because those IFDs are NOT part of the exif.Encode model — mutating
 	// them has no effect on the output and only clutters the map.
 	mainBlocks := filterMainBlocks(blocks, subIFDs)
+	if len(extBlocks) > 0 {
+		mainBlocks = filterNonNilIFDBlocks(mainBlocks) // the blocks of ext belong to no IFD
+	}
 	removeImageOffsetEntries(mainBlocks)
 
 	// Step 6: re-insert placeholder entries for main-IFD blocks and encode
@@ -559,6 +570,7 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte, f
 	// #270: rebaseGenericMakerNote itself declines (documented fail-safe
 	// no-op) when e.BigTIFF is true — see that function's doc comment.
 	rebaseGenericMakerNote(finalTIFF, e, order)
+	ext.patch(finalTIFF, order, relocatedEnd(headerLen, blocks)) // task #370: after assignNewOffsets set the block positions
 
 	// Step 10: patch the 0x014A SubIFDs pointer array in finalTIFF.
 	// exif.Encode preserves 0x014A's original declared Type/Count/Value

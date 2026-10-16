@@ -38,6 +38,10 @@ func FuzzParseXMP(f *testing.F) {
 	f.Add([]byte(nestedXMP))
 	f.Add([]byte(representativeXMP))
 	f.Add(structListDoc("PropertyName", "f", 20))
+	// Attribute value normalisation (#344) and undeclared prefixes (#345).
+	f.Add(attrDoc("a\tb\nc\r\nd&#9;&#10;&#13;e", `"`))
+	f.Add(xmpDoc(`<rdf:Description rdf:about="urn:a&#9;b&#10;c" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Label="v"/>`))
+	f.Add(xmpDoc(`<rdf:Description rdf:about=""><zz:Foo>v</zz:Foo></rdf:Description>`))
 
 	f.Fuzz(func(t *testing.T, b []byte) {
 		x, err := Parse(b)

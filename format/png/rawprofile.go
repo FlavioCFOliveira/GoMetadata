@@ -40,6 +40,7 @@ const (
 	rawProfileIPTC
 	rawProfileAPP1
 	rawProfileEXIF
+	rawProfileXMP
 )
 
 // rawProfileKindOf maps the keyword suffix after rawProfilePrefix to a kind.
@@ -51,6 +52,8 @@ func rawProfileKindOf(suffix []byte) rawProfileKind {
 		return rawProfileAPP1
 	case bytes.EqualFold(suffix, []byte("exif")):
 		return rawProfileEXIF
+	case bytes.EqualFold(suffix, []byte("xmp")):
+		return rawProfileXMP
 	}
 	return rawProfileNone
 }
@@ -254,9 +257,19 @@ func profileIPTC(p []byte) []byte {
 // profileEXIF returns the TIFF stream of an "exif" or "APP1" raw profile: the
 // bytes after the "Exif\0\0" identifier, or the profile itself when it
 // already starts with a TIFF byte-order mark. An APP1 profile that carries an
-// XMP packet instead returns it as xmp.
+// XMP packet instead returns it as xmp, and an "xmp" profile is a bare XMP
+// packet (ExifTool PNG.pm, 'Raw profile type xmp'; task #325).
 func profileEXIF(kind rawProfileKind, p []byte) (tiff, xmp []byte) {
 	switch {
+	case kind == rawProfileXMP:
+		// A UTF-8 byte order mark may precede the packet (ImageMagick and
+		// .NET writers emit one); it is not part of the XMP text, and PNG
+		// iTXt text is plain UTF-8.
+		p = bytes.TrimPrefix(p, []byte("\xEF\xBB\xBF"))
+		if t := bytes.TrimLeft(p, " \t\r\n"); len(t) > 0 && t[0] == '<' {
+			return nil, p
+		}
+		return nil, nil
 	case bytes.HasPrefix(p, identExifJPEG):
 		return p[len(identExifJPEG):], nil
 	case kind == rawProfileAPP1 && bytes.HasPrefix(p, identXMPAPP1):
@@ -338,8 +351,12 @@ const rawProfileHexLine = 36
 // a text chunk of type chunkType, so that its IPTC raw profile holds newIIM;
 // ok is false when data must be kept as is: it is not an IPTC raw profile, it
 // cannot be decoded (a malformed chunk is preserved, never repaired), its
-// payload form is not one profileIPTC reads, or it already holds newIIM.
-func rewriteRawProfileIPTC(chunkType [4]byte, data, newIIM []byte) (payload []byte, ok bool, err error) {
+// payload form is not one profileIPTC reads, or it would not change. withXMP
+// is true when the PNG carries XMP as well: a profile in the Photoshop IRB form
+// then also gets the IPTC digest (resource 0x0425) of newIIM, created or
+// refreshed (irb.AppendSpliced; MWG Guidelines v2.0 §4.2.3.2, p. 29), even
+// when the IIM itself is unchanged.
+func rewriteRawProfileIPTC(chunkType [4]byte, data, newIIM []byte, withXMP bool) (payload []byte, ok bool, err error) {
 	kind, kwLen := isRawProfileKeyword(data)
 	if kind != rawProfileIPTC {
 		return nil, false, nil
@@ -350,16 +367,21 @@ func rewriteRawProfileIPTC(chunkType [4]byte, data, newIIM []byte) (payload []by
 	}
 	p := decodeRawProfile(text)
 	cur := profileIPTC(p)
-	if cur == nil || bytes.Equal(cur, newIIM) {
+	if cur == nil || (bytes.Equal(cur, newIIM) && !withXMP) {
 		return nil, false, nil
 	}
-	newText := appendRawProfileText(nil, text, splicedProfile(p, newIIM))
+	newProfile := splicedProfile(p, newIIM, withXMP)
+	if bytes.Equal(newProfile, p) {
+		return nil, false, nil
+	}
+	newText := appendRawProfileText(nil, text, newProfile)
 	return rawProfileChunk(chunkType, data, kwLen, newText)
 }
 
 // splicedProfile returns profile p (a form profileIPTC reads) with its IIM
-// replaced by newIIM.
-func splicedProfile(p, newIIM []byte) []byte {
+// replaced by newIIM and, in the Photoshop IRB form, its IPTC digest set as
+// irb.AppendSpliced does for withXMP.
+func splicedProfile(p, newIIM []byte, withXMP bool) []byte {
 	body := bytes.TrimPrefix(p, identPhotoshop)
 	if !bytes.HasPrefix(body, []byte("8BIM")) {
 		return newIIM // bare IIM stream
@@ -367,7 +389,7 @@ func splicedProfile(p, newIIM []byte) []byte {
 	ident := p[:len(p)-len(body)]
 	out := make([]byte, 0, len(p)+len(newIIM))
 	out = append(out, ident...)
-	return irb.AppendSpliced(out, body, newIIM)
+	return irb.AppendSpliced(out, body, newIIM, withXMP)
 }
 
 // appendRawProfileText appends to dst the raw profile text of profile, keeping
@@ -430,4 +452,42 @@ func rawProfileChunk(chunkType [4]byte, data []byte, kwLen int, newText []byte) 
 		return nil, false, fmt.Errorf("png: compress raw profile: %w", err)
 	}
 	return buf.Bytes(), true, nil
+}
+
+// Superseded raw profiles (task #325). Inject writes EXIF to the eXIf chunk
+// and XMP to the "XML:com.adobe.xmp" iTXt chunk. An EXIF, APP1 or XMP raw
+// profile that Extract read as the source of that content is a second copy of
+// it once the standard chunk is written, and would contradict it after an
+// edit: PNG 3rd Edition §11.3.4.5 allows only one eXIf chunk, and XMP
+// Specification Part 3 §1.1.5 (p. 16) asks for no more than one chunk
+// containing XMP. The copy is dropped instead of being rewritten in place
+// because the standard chunk is the authoritative carrier and a rewritten
+// copy would only keep two values to keep in step (ExifTool, PNG.pm, updates
+// the non-standard copies in place and writes the standard chunk as well; it
+// is a study reference only).
+
+// rawProfileSuperseded reports whether the text chunk data (type chunkType) is
+// an EXIF, APP1 or XMP raw profile whose content is replaced by a standard
+// chunk Inject writes: haveEXIF and haveXMP tell which standard chunks are
+// written. A profile that cannot be decoded, or whose payload form is not one
+// this package reads, is never dropped: its content has not been carried
+// over, so it is preserved byte-identical.
+func rawProfileSuperseded(chunkType [4]byte, data []byte, haveEXIF, haveXMP bool) bool {
+	if !haveEXIF && !haveXMP {
+		return false
+	}
+	kind, kwLen := isRawProfileKeyword(data)
+	if kind == rawProfileNone || kind == rawProfileIPTC {
+		return false
+	}
+	text, ok := rawProfileText(chunkType, data, kwLen)
+	if !ok {
+		return false
+	}
+	p := decodeRawProfile(text)
+	if p == nil {
+		return false
+	}
+	tiff, xmp := profileEXIF(kind, p)
+	return (tiff != nil && haveEXIF) || (xmp != nil && haveXMP)
 }

@@ -4,13 +4,13 @@ package jpeg
 //
 // See THIRD_PARTY_NOTICES.md for the licence note on this file.
 //
-// writeExtendedXMP follows the Toolkit in naming the extended XMP by the
-// uppercase hexadecimal MD5 digest of its serialisation, which it writes
-// without a packet wrapper. It keeps this package's partitioning, which
-// differs from the Toolkit's: the standard packet carries only
-// xmpNote:HasExtendedXMP and the extended serialisation carries the whole
-// document, instead of moving the largest top-level properties out of the
-// standard packet until it fits.
+// writeExtendedXMP is the fallback of the XMP writer (writePartitionedXMP
+// partitions the XMP as Part 3 §1.1.3.2 and the Toolkit's PackageForJPEG
+// describe): it stores a packet that cannot be parsed, or whose standard
+// portion cannot be made to fit, whole as extended XMP behind a standard
+// packet that carries only xmpNote:HasExtendedXMP. Like the Toolkit it names
+// the extended XMP by the uppercase hexadecimal MD5 digest of its
+// serialisation, which it writes without a packet wrapper.
 
 import (
 	"bytes"
@@ -196,9 +196,9 @@ func extendedXMPGUID(ext []byte) [guidLen]byte {
 	return g
 }
 
-// writeExtendedXMP writes rawXMP, which is too large for one APP1 segment,
-// as a standard XMP packet followed by extended XMP APP1 segments (Adobe XMP
-// Specification Part 3 §1.1.3.1):
+// writeExtendedXMP writes rawXMP, which is too large for one APP1 segment and
+// cannot be partitioned, as a standard XMP packet followed by extended XMP
+// APP1 segments (Adobe XMP Specification Part 3 §1.1.3.1):
 //
 //  1. The extended serialisation is rawXMP without its packet wrapper.
 //  2. Its GUID is the uppercase hexadecimal MD5 digest of that

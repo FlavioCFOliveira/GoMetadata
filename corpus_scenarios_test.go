@@ -270,17 +270,25 @@ func TestCorpusExtendedXMP(t *testing.T) {
 	if m.XMP == nil {
 		t.Fatal("XMP not parsed")
 	}
-	want := map[string]string{
-		"Author":       "PhilToo",
-		"CreationDate": "2008-10-20T19:54:15",
-		"Creator":      "Guess Who",
-		"ModDate":      "2008-10-20T19:54:15",
-		"Producer":     "Just ExifTool again",
-		"Title":        "PDF Title",
+	// The pdf: properties are registered aliases (Adobe XMP Specification
+	// Part 2 §1.1.1) and are folded into their base properties on parse
+	// (task #329): the base properties carry the extended values.
+	want := []struct{ ns, local, v string }{
+		{xmp.NSdc, "creator", "PhilToo"},
+		{xmp.NSxmp, "CreateDate", "2008-10-20T19:54:15"},
+		{xmp.NSxmp, "CreatorTool", "Guess Who"},
+		{xmp.NSxmp, "ModifyDate", "2008-10-20T19:54:15"},
+		{xmp.NSpdf, "Producer", "Just ExifTool again"},
+		{xmp.NSdc, "title", "PDF Title"},
 	}
-	for local, v := range want {
-		if got := m.XMP.Get(xmp.NSpdf, local); got != v {
-			t.Errorf("pdf:%s = %q, want %q (extended XMP not merged)", local, got, v)
+	for _, w := range want {
+		if got := m.XMP.Get(w.ns, w.local); got != w.v {
+			t.Errorf("%s %s = %q, want %q (extended XMP not merged)", w.ns, w.local, got, w.v)
+		}
+	}
+	for _, alias := range []string{"Author", "CreationDate", "Creator", "ModDate", "Title"} {
+		if got := m.XMP.Get(xmp.NSpdf, alias); got != "" {
+			t.Errorf("pdf:%s = %q, want it folded into its base property", alias, got)
 		}
 	}
 	// Adobe XMP Specification Part 3 §1.1.3.1: the reader removes

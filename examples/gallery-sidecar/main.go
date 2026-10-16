@@ -73,8 +73,7 @@ func main() {
 		// important when processing large batches of images.
 		m, err := gometadata.ReadFile(path, gometadata.WithoutMakerNote())
 		if err != nil {
-			var unsupported *gometadata.UnsupportedFormatError
-			if errors.As(err, &unsupported) {
+			if _, ok := errors.AsType[*gometadata.UnsupportedFormatError](err); ok {
 				fmt.Fprintf(os.Stderr, "gallery-sidecar: skip (unsupported format): %s\n", path)
 				continue
 			}

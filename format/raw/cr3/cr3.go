@@ -5,13 +5,16 @@
 // and whose XMP packet is a top-level uuid box.
 package cr3
 
-// Adapted from evanoberholster/imagemeta meta/isobmff/crx.go:readUUIDBox,readCrxMoovBox, Copyright (c) 2019-2023 Evan Oberholster, SPDX-License-Identifier: MIT
+// Adapted from evanoberholster/imagemeta meta/isobmff/crx.go:readUUIDBox,readCrxMoovBox,readCMTBox, Copyright (c) 2019-2023 Evan Oberholster, SPDX-License-Identifier: MIT
 //
 // Changes from imagemeta: the UUIDs of the Canon metadata box and of the XMP
 // packet box, and the mapping of CMT1-CMT4 to IFD0, Exif IFD, MakerNote IFD
 // and GPS IFD, are applied to byte slices instead of a streaming reader;
-// CMT3 and CMT4 are returned as raw TIFF streams (Segments) for the caller
-// to parse; and the same layout is written back by Inject.
+// CMT2, CMT3 and CMT4 are returned as raw TIFF streams (Segments) for the
+// caller to parse (CMT2 is a stand-alone TIFF stream whose first IFD is the
+// Exif IFD, as imagemeta's readCMTBox reads it with the ExifIFD type, not the
+// target of a pointer in CMT1); and the same layout is written back by Inject,
+// which also removes the CMT2 and CMT4 streams whose IFD the caller deleted.
 
 import (
 	"bytes"
@@ -22,6 +25,7 @@ import (
 	"slices"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/bmff"
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 )
 
@@ -279,6 +283,10 @@ type Segments struct {
 	// EXIF is the CMT1 TIFF stream (IFD0), with CMT2 appended when the
 	// ExifIFD pointer of IFD0 points beyond CMT1 (see mergeCMT).
 	EXIF []byte
+	// ExifIFD is the CMT2 TIFF stream: a stand-alone TIFF stream whose first
+	// IFD is the Exif IFD (lclevy canon_cr3; imagemeta readCrxMoovBox). nil
+	// when absent. Parse it with ParseExifStream.
+	ExifIFD []byte
 	// MakerNote is the CMT3 TIFF stream: its first IFD is the Canon
 	// MakerNote IFD. nil when absent.
 	MakerNote []byte
@@ -354,6 +362,7 @@ func ExtractSegments(r io.ReadSeeker) (Segments, error) {
 	if seg.XMP == nil {
 		seg.XMP = bytes.Clone(cb.xmp)
 	}
+	seg.ExifIFD = bytes.Clone(cb.cmt[1])
 	seg.MakerNote = bytes.Clone(cb.cmt[2])
 	seg.GPS = bytes.Clone(cb.cmt[3])
 	if cb.cmt[0] == nil {
@@ -417,6 +426,29 @@ func ParseSubIFD(b []byte) (*exif.IFD, binary.ByteOrder, error) {
 	return ifd, order, nil
 }
 
+// ParseExifStream parses the CMT2 TIFF stream (Segments.ExifIFD). Like every
+// CMT box, CMT2 is a stand-alone TIFF stream (TIFF 6.0 §2): its header points
+// at the Exif IFD directly, not through an ExifIFD pointer of an IFD0, and its
+// value offsets are relative to the start of the box. The stream's first IFD is
+// returned as exifIFD; the Interoperability IFD that its 0xA005 pointer
+// designates (EXIF 2.32, CIPA DC-X008, §4.6.3), if any, as interopIFD. The
+// entries' out-of-line values alias b.
+//
+// Source: lclevy canon_cr3 (CMT2 = Exif IFD TIFF stream) and imagemeta
+// meta/isobmff/crx.go readCrxMoovBox/readCMTBox.
+func ParseExifStream(b []byte) (exifIFD, interopIFD *exif.IFD, order binary.ByteOrder, err error) {
+	exifIFD, order, err = ParseSubIFD(b)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if p := exifIFD.Get(exif.TagInteropIFDPointer); p != nil && len(p.Value) >= 4 {
+		if ifd, _, ok := exif.ParseIFDAt(b, order.Uint32(p.Value), order); ok {
+			interopIFD = ifd
+		}
+	}
+	return exifIFD, interopIFD, order, nil
+}
+
 // tiffHeader decodes the 8-byte TIFF header of b (TIFF 6.0 §2).
 func tiffHeader(b []byte) (order binary.ByteOrder, ifdOff uint32, ok bool) {
 	if len(b) < 8 {
@@ -468,6 +500,11 @@ func getExifIFDOffset(cmt1 []byte) uint32 {
 //
 // If cmt2 is nil or the ExifIFD pointer lies within CMT1, cmt1 is returned
 // unchanged (zero copy).
+//
+// Canon cameras do not write that pointer: CMT1's IFD0 holds no ExifIFD entry
+// and CMT2 is a stand-alone TIFF stream (every file of the corpus; ExifTool
+// and imagemeta read it as such). Segments.ExifIFD carries CMT2 for that
+// layout (ParseExifStream); this merge only serves the pointer layout above.
 func mergeCMT(cmt1, cmt2 []byte) []byte {
 	if cmt2 == nil || len(cmt1) < 8 {
 		return cmt1
@@ -537,93 +574,217 @@ func findIFD0Tag(buf []byte, ifd0Off uint32, order binary.ByteOrder, want uint16
 	return 0, false
 }
 
-// tagGPSIFDPointer is the IFD0 tag that points to the GPS IFD
-// (CIPA DC-008 §4.6.3, Table 13).
-const tagGPSIFDPointer = 0x8825
+// cmtStreams holds the TIFF streams that a CR3 file stores the single EXIF
+// stream rawEXIF in: CMT1 (IFD0), CMT2 (Exif IFD) and CMT4 (GPS IFD). The zero
+// value means "no EXIF given": no CMT box is touched.
+type cmtStreams struct {
+	cmt1 []byte // IFD0 and anything that is not split off; nil when rawEXIF is nil
+	cmt2 []byte // the Exif IFD as the first IFD of its own stream; nil when rawEXIF has none
+	cmt4 []byte // the GPS IFD as the first IFD of its own stream; nil when rawEXIF has none
+	// order is the byte order of rawEXIF; nil when rawEXIF is nil or has no
+	// valid TIFF header. A source CMT2 or CMT4 stream is removed only when it
+	// uses this order (see removes).
+	order binary.ByteOrder
+	// exifIFD, interop and gps are the IFDs cmt2 and cmt4 encode; the source
+	// streams are compared against them to keep an unchanged box byte for byte.
+	exifIFD, interop, gps *exif.IFD
+}
 
-// splitEXIF separates the GPS IFD from rawEXIF, the single TIFF stream the
-// caller encodes, into the two TIFF streams a CR3 file stores them in: cmt1
-// (IFD0 and any Exif IFD, for CMT1) and cmt4 (the GPS IFD as the first IFD
-// of its own stream, for CMT4). imagemeta readCrxMoovBox: CMT1 = IFD0,
-// CMT4 = GPS IFD. Without this split, a GPS IFD read from CMT4 would be
-// written a second time inside CMT1, behind a GPS pointer the source never
-// had.
+// splitEXIF separates the Exif IFD and the GPS IFD from rawEXIF, the single
+// TIFF stream the caller encodes, into the TIFF streams a CR3 file stores
+// them in (lclevy canon_cr3; imagemeta readCrxMoovBox: CMT1 = IFD0, CMT2 =
+// Exif IFD, CMT3 = MakerNote IFD, CMT4 = GPS IFD): the Exif IFD becomes the
+// first IFD of the CMT2 stream, the GPS IFD the first IFD of the CMT4 stream,
+// and CMT1 keeps IFD0 without the ExifIFD and GPSIFD pointers. Without this
+// split an Exif IFD read from CMT2 would be written a second time inside CMT1,
+// behind a pointer the source never had, and ExifTool would report every Exif
+// tag twice (task #336); likewise for GPS and CMT4 (task #300).
 //
-// When rawEXIF has no GPS IFD, cmt1 is rawEXIF itself and cmt4 is nil.
-func splitEXIF(rawEXIF []byte) (cmt1, cmt4 []byte, err error) {
+// When rawEXIF has neither pointer, cmt1 is rawEXIF itself.
+func splitEXIF(rawEXIF []byte) (cmtStreams, error) {
 	order, ifdOff, ok := tiffHeader(rawEXIF)
-	if !ok || !hasIFD0Tag(rawEXIF, ifdOff, order, tagGPSIFDPointer) {
-		return rawEXIF, nil, nil
+	if !ok {
+		return cmtStreams{cmt1: rawEXIF}, nil
+	}
+	st := cmtStreams{cmt1: rawEXIF, order: order}
+	if !hasIFD0Tag(rawEXIF, ifdOff, order, uint16(exif.TagExifIFDPointer)) && !hasIFD0Tag(rawEXIF, ifdOff, order, uint16(exif.TagGPSIFDPointer)) {
+		return st, nil
 	}
 	e, err := exif.Parse(rawEXIF, exif.SkipMakerNote())
 	if err != nil {
-		return nil, nil, fmt.Errorf("cr3: split the GPS IFD from the EXIF stream: %w", err)
+		return cmtStreams{}, fmt.Errorf("cr3: split the Exif and GPS IFDs from the EXIF stream: %w", err)
 	}
-	if e.GPSIFD == nil {
-		return rawEXIF, nil, nil
+	exifIFD, interop, gps := e.ExifIFD, e.InteropIFD, e.GPSIFD
+	st.exifIFD, st.interop, st.gps = exifIFD, interop, gps
+	// exif.Encode emits no sub-IFD pointer without the sub-IFD, so clearing
+	// them leaves IFD0 alone. The raw MakerNote bytes live on in the Exif IFD's
+	// own 0x927C entry, which moves to CMT2 with it.
+	e.ExifIFD, e.InteropIFD, e.GPSIFD, e.MakerNote = nil, nil, nil, nil
+	if st.cmt1, err = exif.Encode(e); err != nil {
+		return cmtStreams{}, fmt.Errorf("cr3: encode CMT1: %w", err)
 	}
-	gps := e.GPSIFD
-	e.GPSIFD = nil // exif.Encode emits no GPS pointer without a GPS IFD
-	if cmt1, err = exif.Encode(e); err != nil {
-		return nil, nil, fmt.Errorf("cr3: encode CMT1: %w", err)
+	if exifIFD != nil {
+		if st.cmt2, err = encodeExifStream(e.ByteOrder, exifIFD, interop); err != nil {
+			return cmtStreams{}, fmt.Errorf("cr3: encode CMT2: %w", err)
+		}
 	}
-	if cmt4, err = exif.Encode(&exif.EXIF{ByteOrder: e.ByteOrder, IFD0: gps}); err != nil {
-		return nil, nil, fmt.Errorf("cr3: encode CMT4: %w", err)
+	if gps != nil {
+		if st.cmt4, err = exif.Encode(&exif.EXIF{ByteOrder: e.ByteOrder, IFD0: gps}); err != nil {
+			return cmtStreams{}, fmt.Errorf("cr3: encode CMT4: %w", err)
+		}
 	}
-	return cmt1, cmt4, nil
+	return st, nil
 }
 
-// sameFirstIFD reports whether the first IFDs of the TIFF streams a and b
-// hold the same entries: both are re-encoded with b's byte order by
-// exif.Encode, which sorts entries and lays out values canonically, and the
-// encodings are compared. It lets Inject keep an unchanged CMT4 box byte for
-// byte instead of replacing it with an equivalent re-encoding.
-func sameFirstIFD(a, b []byte) bool {
-	ia, _, errA := ParseSubIFD(a)
-	ib, order, errB := ParseSubIFD(b)
-	if errA != nil || errB != nil {
+// encodeExifStream encodes the CMT2 stream: a TIFF stream whose first IFD is
+// exifIFD. exif.Encode places an IFD0 first, so exifIFD is encoded as IFD0
+// (which also drops the pointer entries of IFD0, 0x8769, 0x8825, 0xA005); the
+// Interoperability IFD needs an Exif IFD in the model to be placed and
+// addressed, so when there is one the stream is encoded as an empty IFD0 plus
+// the Exif and Interoperability IFDs, and the first-IFD offset of the TIFF
+// header is pointed at the Exif IFD (TIFF 6.0 §2: the header locates the first
+// IFD; EXIF 2.32 §4.6.3: 0xA005 offsets count from the TIFF header). The
+// 18-byte stub IFD0 stays in the stream, unreferenced.
+func encodeExifStream(order binary.ByteOrder, exifIFD, interop *exif.IFD) ([]byte, error) {
+	if interop == nil {
+		stream, err := exif.Encode(&exif.EXIF{ByteOrder: order, IFD0: exifIFD})
+		if err != nil {
+			return nil, fmt.Errorf("cr3: encode the Exif IFD stream: %w", err)
+		}
+		return stream, nil
+	}
+	stream, err := exif.Encode(&exif.EXIF{ByteOrder: order, IFD0: &exif.IFD{}, ExifIFD: exifIFD, InteropIFD: interop})
+	if err != nil {
+		return nil, fmt.Errorf("cr3: encode the Exif IFD stream: %w", err)
+	}
+	// Stub IFD0 at offset 8: count(2) = 1, one 12-byte entry, next(4). The
+	// entry is the ExifIFD pointer, whose value is at entry offset 8.
+	const ptrValueOff = 8 + 2 + 8
+	if len(stream) < ptrValueOff+4 {
+		return nil, ErrBadCMTStream
+	}
+	ord := order
+	if ord == nil {
+		ord = binary.LittleEndian
+	}
+	ord.PutUint32(stream[4:], ord.Uint32(stream[ptrValueOff:]))
+	return stream, nil
+}
+
+// sameIFD reports whether the IFDs a and b hold the same entries, in the same
+// order (tag, type, count and value bytes): nil equals only nil. Encoded IFDs
+// are tag-sorted (TIFF 6.0 §2), so an IFD that is unsorted, or changed in any
+// entry, compares unequal and its box is rewritten, which is always safe. Only
+// the first IFD is compared: a chained IFD (Next) of a source stream is kept
+// with its box.
+func sameIFD(a, b *exif.IFD) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if len(a.Entries) != len(b.Entries) {
 		return false
 	}
-	ea, errA := exif.Encode(&exif.EXIF{ByteOrder: order, IFD0: ia})
-	eb, errB := exif.Encode(&exif.EXIF{ByteOrder: order, IFD0: ib})
-	return errA == nil && errB == nil && bytes.Equal(ea, eb)
+	for i := range a.Entries {
+		ea, eb := &a.Entries[i], &b.Entries[i]
+		if ea.Tag != eb.Tag || ea.Type != eb.Type || ea.Count != eb.Count || !bytes.Equal(ea.Value, eb.Value) {
+			return false
+		}
+	}
+	return true
+}
+
+// sameExifStream reports whether the source CMT2 payload src holds the Exif IFD
+// and Interoperability IFD that st.cmt2 encodes, in rawEXIF's byte order. It
+// lets Inject keep an unchanged CMT2 box byte for byte (Canon's padding and
+// value layout included) instead of replacing it with a re-encoding.
+func (st *cmtStreams) sameExifStream(src []byte) bool {
+	ifd, interop, order, err := ParseExifStream(src)
+	return err == nil && order == st.order && sameIFD(ifd, st.exifIFD) && sameIFD(interop, st.interop)
+}
+
+// sameGPSStream reports whether the source CMT4 payload src holds the GPS IFD
+// that st.cmt4 encodes, in rawEXIF's byte order; see sameExifStream.
+func (st *cmtStreams) sameGPSStream(src []byte) bool {
+	ifd, order, err := ParseSubIFD(src)
+	return err == nil && order == st.order && sameIFD(ifd, st.gps)
+}
+
+// removes reports whether the source CMT2 or CMT4 payload src must be removed
+// because rawEXIF no longer has the IFD it carries (own is nil): the caller
+// deleted the Exif or GPS IFD, as it can on a JPEG (CLAUDE.md §5: an explicit
+// modification is honoured; GPS removal is privacy-relevant, task #337). A
+// stream is removed only when the caller could have seen it, that is, when the
+// reader attaches it to the EXIF model: the source has a CMT1 (hasCMT1), and
+// the stream parses with the byte order of rawEXIF. Anything the reader does
+// not attach (no CMT1, an unreadable stream, a different byte order) is kept,
+// since the caller never had a chance to remove it.
+func (b *uuidRebuild) removes(own, src []byte) bool {
+	if own != nil || b.st.order == nil {
+		return false
+	}
+	_, order, err := ParseSubIFD(src)
+	return err == nil && order == b.st.order && hasChild(b.content, boxCMT1)
 }
 
 // rebuildUUIDContent iterates the sub-boxes of the Canon UUID box payload and
-// reconstructs it with CMT1 replaced by cmt1 (if non-nil), CMT4 replaced by
-// cmt4 (if non-nil and its GPS IFD differs from the existing one), and the
-// legacy "XMP " sub-box replaced by rawXMP (if both exist). Other sub-boxes,
-// including CMT2 and CMT3, are copied unchanged. hadXMP reports whether an
-// "XMP " sub-box was present.
+// reconstructs it with CMT1 replaced by st.cmt1 (if non-nil), CMT2 replaced by
+// st.cmt2 and CMT4 by st.cmt4 (if non-nil and their IFDs differ from the
+// existing ones), and the legacy "XMP " sub-box replaced by rawXMP (if both
+// exist). CMT2 and CMT4 are removed when uuidRebuild.removes says so. CMT3 and every
+// other sub-box are copied unchanged. hadXMP reports whether an "XMP "
+// sub-box was present.
 //
-// A missing CMT1 is appended when cmt1 is non-nil (audit #175: writing EXIF
+// A missing CMT1 is appended when st.cmt1 is non-nil (audit #175: writing EXIF
 // to a UUID box that only carries CMT2/CMT3/CMT4 must not discard it). A
-// missing CMT4 is inserted right after the last CMT box when cmt4 is non-nil.
-// A missing "XMP " sub-box is never created: CR3 stores XMP in the top-level
-// XMP uuid box (task #300), which Inject writes.
+// missing CMT2 is inserted right after CMT1 and a missing CMT4 right after
+// the last CMT box (Canon order CMT1, CMT2, CMT3, CMT4). A missing "XMP "
+// sub-box is never created: CR3 stores XMP in the top-level XMP uuid box
+// (task #300), which Inject writes.
 //
 // lclevy canon_cr3: CMT1 is the mandatory IFD0 TIFF stream inside the Canon UUID.
-func rebuildUUIDContent(uuidContent, cmt1, cmt4, rawXMP []byte) (newContent []byte, hadXMP bool) {
-	b := uuidRebuild{cmt1: cmt1, cmt4: cmt4, rawXMP: rawXMP, afterCMT: -1}
+func rebuildUUIDContent(uuidContent []byte, st cmtStreams, rawXMP []byte) (newContent []byte, hadXMP bool) {
+	b := uuidRebuild{st: st, rawXMP: rawXMP, content: uuidContent, afterCMT: -1, afterCMT1: -1}
 	pos := 0
 	for pos+8 <= len(uuidContent) {
 		size, typ, headerLen, ok := parseCR3BoxHeader(uuidContent, pos)
 		if !ok {
 			break
 		}
-		b.add(typ, uuidContent[pos:pos+int(size)], int(headerLen)) //nolint:gosec // G115: ISOBMFF box size bounded by file size; headerLen is 8 or 16
-		pos += int(size)                                           //nolint:gosec // G115: ISOBMFF box size bounded by file size
+		b.add(typ, bmff.Close(uuidContent[pos:pos+int(size)]), int(headerLen)) //nolint:gosec // G115: ISOBMFF box size bounded by file size; headerLen is 8 or 16
+		pos += int(size)                                                       //nolint:gosec // G115: ISOBMFF box size bounded by file size
 	}
 	return b.finish(), b.hadXMP
 }
 
 // uuidRebuild accumulates the output of rebuildUUIDContent.
 type uuidRebuild struct {
-	buf                bytes.Buffer
-	cmt1, cmt4, rawXMP []byte
-	hadCMT1, hadCMT4   bool
-	hadXMP             bool
-	afterCMT           int // buf length right after the last CMT box written
+	buf              bytes.Buffer
+	st               cmtStreams
+	rawXMP           []byte
+	hadCMT1, hadCMT2 bool
+	hadCMT4          bool
+	hadXMP           bool
+	afterCMT         int // buf length right after the last CMT box written
+	afterCMT1        int // buf length right after the CMT1 box
+	// content is the source Canon uuid payload; removes searches it for a CMT1
+	// box, only when a CMT2 or CMT4 box is a candidate for removal.
+	content []byte
+}
+
+// hasChild reports whether data, a sequence of boxes, has a box of type typ
+// at its top level.
+func hasChild(data []byte, typ [4]byte) bool {
+	for pos := 0; pos+8 <= len(data); {
+		size, t, _, ok := parseCR3BoxHeader(data, pos)
+		if !ok {
+			return false
+		}
+		if t == typ {
+			return true
+		}
+		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by slice length
+	}
+	return false
 }
 
 // add writes the output for one source sub-box of type typ whose header is
@@ -632,17 +793,16 @@ func (b *uuidRebuild) add(typ [4]byte, box []byte, headerLen int) {
 	switch typ {
 	case boxCMT1:
 		b.hadCMT1 = true
-		b.buf.Write(replacedBox("CMT1", b.cmt1, box))
+		b.buf.Write(replacedBox("CMT1", b.st.cmt1, box))
 		b.afterCMT = b.buf.Len()
+		b.afterCMT1 = b.afterCMT
+	case boxCMT2:
+		b.hadCMT2 = true
+		b.addIFDBox("CMT2", b.st.cmt2, box, headerLen)
 	case boxCMT4:
 		b.hadCMT4 = true
-		if b.cmt4 != nil && sameFirstIFD(box[headerLen:], b.cmt4) {
-			b.buf.Write(box) // unchanged GPS IFD: keep the source bytes
-		} else {
-			b.buf.Write(replacedBox("CMT4", b.cmt4, box))
-		}
-		b.afterCMT = b.buf.Len()
-	case boxCMT2, boxCMT3:
+		b.addIFDBox("CMT4", b.st.cmt4, box, headerLen)
+	case boxCMT3:
 		b.buf.Write(box)
 		b.afterCMT = b.buf.Len()
 	case boxXMP:
@@ -653,21 +813,68 @@ func (b *uuidRebuild) add(typ [4]byte, box []byte, headerLen int) {
 	}
 }
 
-// finish inserts a missing CMT4 after the last CMT box and appends a
-// missing CMT1, and returns the rebuilt content.
+// addIFDBox writes the output for a source CMT2 or CMT4 sub-box (name), whose
+// stream rawEXIF now encodes as own: nothing when rawEXIF no longer has the IFD
+// and the caller could see it (removes); a new box when the IFD changed; the
+// source box when it did not, or when rawEXIF has no such IFD that the caller
+// could have removed.
+func (b *uuidRebuild) addIFDBox(name string, own, box []byte, headerLen int) {
+	src := box[headerLen:]
+	switch {
+	case b.removes(own, src):
+		return
+	case own != nil && !b.sameStream(name, src):
+		b.buf.Write(buildBox(name, own))
+	default:
+		b.buf.Write(box)
+	}
+	b.afterCMT = b.buf.Len()
+}
+
+// sameStream reports whether the source CMT2 or CMT4 payload src holds the IFD
+// that the stream of box name encodes.
+func (b *uuidRebuild) sameStream(name string, src []byte) bool {
+	if name == "CMT2" {
+		return b.st.sameExifStream(src)
+	}
+	return b.st.sameGPSStream(src)
+}
+
+// insertMissingCMT2 inserts a CMT2 box right after CMT1 into out when
+// rawEXIF has an Exif IFD, the source has no CMT2 and the source has a CMT1
+// to follow, and returns out.
+func (b *uuidRebuild) insertMissingCMT2(out []byte) []byte {
+	if b.st.cmt2 == nil || b.hadCMT2 || b.afterCMT1 < 0 {
+		return out
+	}
+	box := buildBox("CMT2", b.st.cmt2)
+	out = slices.Insert(out, b.afterCMT1, box...)
+	if b.afterCMT >= b.afterCMT1 {
+		b.afterCMT += len(box)
+	}
+	b.hadCMT2 = true
+	return out
+}
+
+// finish inserts a missing CMT2 after CMT1 and a missing CMT4 after the last
+// CMT box, appends a missing CMT1 (followed by a missing CMT2 when the source
+// had no CMT1 to follow), and returns the rebuilt content.
 func (b *uuidRebuild) finish() []byte {
-	out := b.buf.Bytes()
-	if b.cmt4 != nil && !b.hadCMT4 {
+	out := b.insertMissingCMT2(b.buf.Bytes())
+	if b.st.cmt4 != nil && !b.hadCMT4 {
 		at := b.afterCMT
 		if at < 0 {
 			at = len(out)
 		}
-		out = slices.Insert(out, at, buildBox("CMT4", b.cmt4)...)
+		out = slices.Insert(out, at, buildBox("CMT4", b.st.cmt4)...)
 	}
 	// audit #175: insert a new CMT1 sub-box when cmt1 is provided but the
 	// original UUID content had no CMT1.
-	if b.cmt1 != nil && !b.hadCMT1 {
-		out = append(out, buildBox("CMT1", b.cmt1)...)
+	if b.st.cmt1 != nil && !b.hadCMT1 {
+		out = append(out, buildBox("CMT1", b.st.cmt1)...)
+	}
+	if b.st.cmt2 != nil && !b.hadCMT2 {
+		out = append(out, buildBox("CMT2", b.st.cmt2)...)
 	}
 	return out
 }
@@ -854,7 +1061,7 @@ func relocateCo64(content []byte, shift *chunkShift) error {
 // rebuildMoovContent replaces the Canon UUID box inside moovContent with a new
 // UUID box containing the rebuilt CMTx payloads. Returns the new moov content
 // slice. If no Canon UUID box is found, moovContent is returned unchanged.
-func rebuildMoovContent(moovContent, cmt1, cmt4, rawXMP []byte) []byte {
+func rebuildMoovContent(moovContent []byte, st cmtStreams, rawXMP []byte) []byte {
 	uuidStart, uuidEnd, hasUUID := flatUUIDBoxRange(moovContent, canonUUID)
 	if !hasUUID {
 		return moovContent
@@ -874,7 +1081,7 @@ func rebuildMoovContent(moovContent, cmt1, cmt4, rawXMP []byte) []byte {
 	// bytes) plus the mandatory 16-byte UUID field. flatUUIDBoxRange guarantees
 	// size >= headerLen+16, so this slice cannot underflow.
 	uuidData := moovContent[uuidStart+int(uuidHeaderLen)+16 : uuidEnd] //nolint:gosec // G115: uuidHeaderLen is 8 or 16; bounds guaranteed by flatUUIDBoxRange's size>=headerLen+16 check
-	newUUIDContent, _ := rebuildUUIDContent(uuidData, cmt1, cmt4, rawXMP)
+	newUUIDContent, _ := rebuildUUIDContent(uuidData, st, rawXMP)
 	newUUIDBox := buildUUIDBox(canonUUID, newUUIDContent)
 	// Rebuild moovContent: prefix + newUUIDBox + suffix.
 	capacity := len(moovContent) - (uuidEnd - uuidStart) + len(newUUIDBox)
@@ -897,11 +1104,14 @@ type boxEdit struct {
 // table entries to account for the boxes that changed size, and writes the
 // result to w.
 //
-//   - rawEXIF: IFD0 (and any Exif IFD) go to the CMT1 sub-box of the Canon
-//     uuid box; a GPS IFD goes to the CMT4 sub-box, which is kept byte for
-//     byte when its GPS IFD is unchanged (splitEXIF, sameFirstIFD). CMT2 and
-//     CMT3 are never rewritten. A source CMT4 is kept when rawEXIF has no
-//     GPS IFD.
+//   - rawEXIF: IFD0 goes to the CMT1 sub-box of the Canon uuid box, the Exif
+//     IFD to CMT2 and the GPS IFD to CMT4, each a stand-alone TIFF stream
+//     (splitEXIF). CMT2 and CMT4 are kept byte for byte when their IFDs are
+//     unchanged (sameExifStream, sameGPSStream) and created when missing. A
+//     source CMT2 or CMT4 that the reader exposes in the EXIF model, but that
+//     rawEXIF no longer has an IFD for, is removed, so deleting the GPS IFD
+//     removes the GPS data (tasks #336, #337; uuidRebuild.removes). CMT3 is
+//     never rewritten.
 //   - rawXMP: the packet goes to the top-level XMP uuid box (task #300),
 //     replacing the existing one or, when there is none, inserted right
 //     after moov; a legacy "XMP " sub-box of the Canon uuid box written by
@@ -924,8 +1134,10 @@ type boxEdit struct {
 // ErrPreserveUnknownSegmentsNotSupported because CR3 ISOBMFF boxes are
 // structurally mandatory and cannot be selectively stripped.
 //
-// If all payloads are nil, or no moov box is found, the source is streamed
-// through unchanged.
+// A write is never silently skipped: when rawEXIF or rawXMP is non-nil, Inject
+// either stores it or returns an error. ErrNoMetadataContainer reports a file
+// with no moov box, or (for rawEXIF) a moov box with no Canon uuid box. Only
+// when both payloads are nil is the source streamed through unchanged.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error { //nolint:gocyclo,cyclop // #292: sequential error-checked streaming steps (size cap, pass-through, box locate/rebuild, edit-list reassembly) are inherent in the streaming design; each branch is a distinct, independently-tested failure mode
 	if !preserveUnknownSegments {
 		return ErrPreserveUnknownSegmentsNotSupported
@@ -941,8 +1153,11 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 		return fmt.Errorf("cr3: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
 	}
 
-	// All payloads nil: no box changes size, so the file is streamed through.
-	if rawEXIF == nil && rawIPTC == nil && rawXMP == nil {
+	// Nothing storable requested (rawIPTC is never stored: CR3 has no IPTC
+	// carrier): no box changes size, so the file is streamed through. Every
+	// other branch below either writes the requested payloads or returns an
+	// error (task #347).
+	if rawEXIF == nil && rawXMP == nil {
 		return streamWholeFile(r, w, fileLen)
 	}
 
@@ -951,16 +1166,27 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 		return err
 	}
 	if lay.moov == nil {
-		// No moov box — file is corrupt/incomplete. Pass through unchanged.
-		return streamWholeFile(r, w, fileLen)
+		// No moov box: the file has no place to anchor the metadata boxes.
+		return fmt.Errorf("%w: %w", ErrNoMetadataContainer, ErrNoMoovBox)
+	}
+	// EXIF lives only in the CMT sub-boxes of the Canon uuid box in moov
+	// (lclevy canon_cr3). Creating that box is not attempted, so a request
+	// for EXIF on a file without it cannot be honoured: refuse it before any
+	// output is produced, never dropping it silently (task #347; ExifTool
+	// WriteQuickTime.pl likewise reports an error when it cannot write a tag
+	// group). XMP needs no Canon box: it goes to the top-level XMP uuid box.
+	if rawEXIF != nil {
+		if _, _, hasCanon := flatUUIDBoxRange(lay.moov, canonUUID); !hasCanon {
+			return fmt.Errorf("%w: moov has no Canon uuid box", ErrNoMetadataContainer)
+		}
 	}
 
-	cmt1, cmt4, err := splitEXIF(rawEXIF)
+	st, err := splitEXIF(rawEXIF)
 	if err != nil {
 		return err
 	}
 	var editBuf [2]boxEdit
-	edits, moovIdx := planEdits(editBuf[:0], &lay, buildBox("moov", rebuildMoovContent(lay.moov, cmt1, cmt4, rawXMP)), rawXMP)
+	edits, moovIdx := planEdits(editBuf[:0], &lay, buildBox("moov", rebuildMoovContent(lay.moov, st, rawXMP)), rawXMP)
 
 	var shift chunkShift
 	for _, e := range edits {

@@ -3,6 +3,7 @@ package heif
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"testing"
 )
 
@@ -347,15 +348,29 @@ func lastTopLevelBox(data []byte) int {
 // FuzzHEIFInject found (corpus entry
 // testdata/fuzz/FuzzHEIFInject/e070f83062e82dec): the size field of a last
 // box that extends to EOF (size 0) was made explicit before Inject decided
-// whether it could rebuild the file, so a pass-through (here: iloc
-// length_size 0, which cannot store a relocated length) was no longer
+// whether it could rebuild the file, so a pass-through was no longer
 // byte-identical to the input.
+//
+// Since task #335 a write that cannot be honoured returns an error instead of
+// passing the file through, so the two outcomes are checked separately: the
+// fuzz input (an iloc box that cannot be rewritten) is refused and nothing is
+// written; the only remaining pass-through (no payload requested) is verbatim
+// even when the last box is open-ended.
 func TestTask282PassThroughIsVerbatim(t *testing.T) {
 	t.Parallel()
 	in := []byte("\x00\x00\x00kmeta0000\x00\x00\x00#iinf\x0000000\x00\x00\x00\x15infe\x02000\x00\x0100Exif0\x00\x00\x000iloc\x00000\x80A\x000\x00\x01000000000000000000000000000000000000000000\x00\x00\x00\x000000")
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(in), &out, []byte("EXIF"), nil, []byte("XMP"), true); err != nil {
-		t.Fatalf("Inject: %v", err)
+	err := Inject(bytes.NewReader(in), &out, []byte("EXIF"), nil, []byte("XMP"), true)
+	if !errors.Is(err, ErrUnreadableItemLocations) {
+		t.Errorf("Inject error = %v, want ErrUnreadableItemLocations", err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("a refused write produced %d bytes of output", out.Len())
+	}
+
+	out.Reset()
+	if err := Inject(bytes.NewReader(in), &out, nil, nil, nil, true); err != nil {
+		t.Fatalf("Inject with no payload: %v", err)
 	}
 	if !bytes.Equal(out.Bytes(), in) {
 		t.Error("a pass-through write changed the file")

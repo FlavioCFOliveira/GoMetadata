@@ -18,7 +18,6 @@ package jpeg
 
 import (
 	"bytes"
-	"crypto/md5" //nolint:gosec // G501: MD5 is the MWG IPTC digest algorithm, not used for security
 	"encoding/binary"
 	"strings"
 	"testing"
@@ -582,8 +581,8 @@ func TestJPEGInjectMultiAPP13SiblingPreservation(t *testing.T) {
 		t.Errorf("0x0404 data after inject: got %q, want %q", gotIPTC, newIPTC)
 	}
 
-	// Verify 0x0425 is present and, since the IPTC changed, refreshed to the
-	// MD5 of the new IIM stream (#284, MWG Guidelines v2.0 §3.3.1).
+	// Verify 0x0425 is present and, since it does not match the old IIM (it is
+	// stale), left untouched (#284, #323, MWG Guidelines v2.0 §4.2.3.2).
 	outAPP13 := extractAPP13Payload(out.Bytes())
 	if outAPP13 == nil {
 		t.Fatal("output JPEG has no APP13 segment")
@@ -591,7 +590,7 @@ func TestJPEGInjectMultiAPP13SiblingPreservation(t *testing.T) {
 	got0425 := parseAPP13ResourceData(outAPP13, 0x0425)
 	if got0425 == nil {
 		t.Error("0x0425 (IPTC digest) missing from output; second APP13 payload must be merged into origIRB")
-	} else if want := md5.Sum(newIPTC); !bytes.Equal(got0425, want[:]) { //nolint:gosec // G401: MD5 is the MWG digest algorithm
-		t.Errorf("0x0425 data mismatch: got %x, want MD5(new IPTC) %x", got0425, want)
+	} else if !bytes.Equal(got0425, digestData) {
+		t.Errorf("0x0425 data mismatch: got %x, want the stale digest %x kept verbatim", got0425, digestData)
 	}
 }

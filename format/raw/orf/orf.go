@@ -209,11 +209,11 @@ func readInput(r io.ReadSeeker) ([]byte, error) {
 // extractTIFFTags scans IFD0 for the IPTC (0x83BB) and XMP (0x02BC) tags and
 // returns their raw byte values, using the shared tiffscan scanner.
 func extractTIFFTags(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawIPTC, rawXMP []byte) {
-	return tiffscan.ExtractTagValues(data, ifd0Off, order, false)
+	return tiffscan.ExtractTagValues(data, ifd0Off, order)
 }
 
 // typeSize returns the byte size of a single value for the given classic TIFF
 // type code, or 0 for an unrecognised type (shared tiffscan table).
 func typeSize(t uint16) uint32 {
-	return tiffscan.TypeSize(t, false)
+	return tiffscan.TypeSize(t)
 }

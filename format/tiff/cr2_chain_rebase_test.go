@@ -11,6 +11,7 @@ package tiff
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,11 @@ import (
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
 )
+
+// fixtureU32 converts a fixture offset or length, which is small by
+// construction, to uint32 with an explicit clamp, so that the conversion is
+// provably safe.
+func fixtureU32(n int) uint32 { return uint32(max(0, min(n, math.MaxUint32))) }
 
 // cr2Fixture builds a synthetic Canon CR2 following the lclevy CR2 layout:
 // 16-byte header (TIFF header, "CR\x02\x00", RAW IFD offset), IFD0 (main
@@ -47,19 +53,19 @@ func cr2Fixture() (data []byte, blocks [][]byte) {
 	o.PutUint16(data[2:], 42)
 	o.PutUint32(data[4:], ifd0Off)
 	copy(data[8:], []byte{'C', 'R', 2, 0})
-	o.PutUint32(data[12:], uint32(ifd3Off))
+	o.PutUint32(data[12:], fixtureU32(ifd3Off))
 	putFixtureIFD(data, ifd0Off, []fixtureEntry{
 		{0x0100, 4, 1, 8}, {0x0101, 4, 1, 8},
-		{0x0111, 4, 1, uint32(offs[0])}, {0x0117, 4, 1, uint32(len(blocks[0]))},
-	}, uint32(ifd1Off))
+		{0x0111, 4, 1, fixtureU32(offs[0])}, {0x0117, 4, 1, fixtureU32(len(blocks[0]))},
+	}, fixtureU32(ifd1Off))
 	putFixtureIFD(data, ifd1Off, []fixtureEntry{
-		{0x0201, 4, 1, uint32(offs[1])}, {0x0202, 4, 1, uint32(len(blocks[1]))},
-	}, uint32(ifd2Off))
+		{0x0201, 4, 1, fixtureU32(offs[1])}, {0x0202, 4, 1, fixtureU32(len(blocks[1]))},
+	}, fixtureU32(ifd2Off))
 	putFixtureIFD(data, ifd2Off, []fixtureEntry{
-		{0x0111, 4, 1, uint32(offs[2])}, {0x0117, 4, 1, uint32(len(blocks[2]))},
-	}, uint32(ifd3Off))
+		{0x0111, 4, 1, fixtureU32(offs[2])}, {0x0117, 4, 1, fixtureU32(len(blocks[2]))},
+	}, fixtureU32(ifd3Off))
 	putFixtureIFD(data, ifd3Off, []fixtureEntry{
-		{0x0111, 4, 1, uint32(offs[3])}, {0x0117, 4, 1, uint32(len(blocks[3]))},
+		{0x0111, 4, 1, fixtureU32(offs[3])}, {0x0117, 4, 1, fixtureU32(len(blocks[3]))},
 	}, 0)
 	for i, b := range blocks {
 		copy(data[offs[i]:], b)
@@ -157,7 +163,7 @@ func TestCR2RawIFDPointerHelpers(t *testing.T) {
 		"zero pointer":      func(b []byte) { o.PutUint32(b[12:], 0) },
 		"pointer off chain": func(b []byte) { o.PutUint32(b[12:], 17) },
 		"bad byte order":    func(b []byte) { b[0], b[1] = 'X', 'X' },
-		"ifd0 outside":      func(b []byte) { o.PutUint32(b[4:], uint32(len(b))) },
+		"ifd0 outside":      func(b []byte) { o.PutUint32(b[4:], fixtureU32(len(b))) },
 	} {
 		b := bytes.Clone(data)
 		mutate(b)

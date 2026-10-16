@@ -61,7 +61,7 @@ func TestExtractTagValues_PSIRFallback(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			buf := buildIFD0(tc.entries)
-			iptc, _ := ExtractTagValues(buf, fixtureIFD0Off, binary.LittleEndian, true)
+			iptc, _ := ExtractTagValues(buf, fixtureIFD0Off, binary.LittleEndian)
 			if !bytes.Equal(iptc, tc.want) {
 				t.Errorf("rawIPTC = %x, want %x", iptc, tc.want)
 			}
@@ -163,7 +163,7 @@ func FuzzIPTCDigest(f *testing.F) {
 			t.Fatalf("digest of %d bytes", len(d))
 		}
 		if len(data) >= 8 {
-			_, _ = ExtractTagValues(data, binary.LittleEndian.Uint32(data[4:]), binary.LittleEndian, true)
+			_, _ = ExtractTagValues(data, binary.LittleEndian.Uint32(data[4:]), binary.LittleEndian)
 		}
 	})
 }

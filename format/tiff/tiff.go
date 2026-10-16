@@ -349,7 +349,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ boo
 	if err != nil {
 		return err
 	}
-	if err := writeRelocated(r, w, header, blocks, base, true); err != nil {
+	if err := writeRelocated(r, w, header, blocks, base, true, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -447,7 +447,7 @@ func InjectWithEXIFStream(r io.ReadSeeker, prefix []byte, wholeFile bool, modifi
 	if err != nil {
 		return err
 	}
-	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -538,7 +538,7 @@ func InjectWithEXIFCR2Stream(r io.ReadSeeker, prefix []byte, wholeFile bool, mod
 		return insertErr
 	}
 
-	if err := writeRelocated(r, w, newHeader, blocks, prefix, wholeFile); err != nil {
+	if err := writeRelocated(r, w, newHeader, blocks, prefix, wholeFile, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -976,7 +976,7 @@ func InjectWithEXIFNEFStream(r io.ReadSeeker, prefix []byte, wholeFile bool, mod
 	if err != nil {
 		return err
 	}
-	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -1029,7 +1029,7 @@ func InjectWithEXIFARWStream(r io.ReadSeeker, prefix []byte, wholeFile bool, mod
 	if err != nil {
 		return err
 	}
-	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -1088,7 +1088,7 @@ func InjectWithEXIFORFStream(r io.ReadSeeker, prefix []byte, wholeFile bool, mod
 	if err != nil {
 		return err
 	}
-	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -1146,7 +1146,7 @@ func InjectWithEXIFRW2Stream(r io.ReadSeeker, prefix []byte, wholeFile bool, mod
 	if err != nil {
 		return err
 	}
-	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -1231,42 +1231,67 @@ const tagPhotoshopIRB = exif.TagID(tiffscan.PSIRTag)
 // 0x83BB and the digest for TIFF; it is not followed here because a stale
 // copy would contradict the IPTC just written.
 //
-// Digest (task #284). MWG Guidelines v2.0 §3.3.1: the digest is the MD5 of
-// the IPTC-IIM block, so a writer that changes the IIM must update it. The new
-// digest covers the stored value of tag 0x83BB including its LONG zero
-// padding, the bytes Photoshop and ExifTool hash (irb.Digest with align 4).
-// Policy, shared with the JPEG writer (irb.AppendSpliced):
-//   - no digest resource: none is created;
-//   - the IIM changed: the digest is refreshed;
-//   - the IIM is unchanged: a current digest is rewritten in the padded form
-//     (same meaning, now also current for ExifTool), and a stale digest is
-//     left stale, because a stale digest is the MWG signal that the IIM was
-//     edited without updating XMP, and rewriting identical IIM is no edit.
-func upsertIPTC(ifd *exif.IFD, rawIPTC []byte) {
-	oldIPTC := currentIPTC(ifd)
+// Digest (tasks #284, #323). MWG Guidelines v2.0 §4.2.3.2: the digest is the
+// MD5 of the IPTC-IIM block (p. 26), and "If IPTC-IIM and XMP are both
+// present, whether changed or not, a Changer MUST create or update the
+// checksum value" (p. 29). The digest covers the stored value of tag 0x83BB
+// including its LONG zero padding, the bytes Photoshop and ExifTool hash
+// (irb.Digest with align 4). Policy, shared with the JPEG writer
+// (irb.AppendSpliced):
+//   - XMP is written or present (rawXMP non-empty or tag 0x02BC in the IFD):
+//     the digest is set to that of the IIM written: created when the block
+//     holds none (in a new resource block, tag 0x8649, when the IFD has none),
+//     otherwise rewritten, a stale digest included and also when the IIM is
+//     unchanged (which also rewrites an unpadded digest in the padded form
+//     that is current for ExifTool as well);
+//   - no XMP in the IFD or written: the digest is left as it is and none is
+//     created, because the IIM and XMP are not both present.
+func upsertIPTC(ifd *exif.IFD, rawIPTC, rawXMP []byte) {
 	upsertIFD0Entry(ifd, exif.TagIPTC, exif.TypeLong, rawIPTC)
+	withXMP := len(rawXMP) > 0 || ifd.Get(exif.TagXMP) != nil
 
 	psir := ifd.Get(tagPhotoshopIRB) // after the upsert: it may move entries
 	if psir == nil {
+		if withXMP {
+			d := irb.Digest(rawIPTC, 4)
+			upsertIFD0Entry(ifd, tagPhotoshopIRB, exif.TypeByte, irb.AppendBlock(nil, irb.ResourceIPTCDigest, d[:]))
+		}
 		return
 	}
-	digest, refresh := iptcDigestUpdate(psir.Value, oldIPTC, rawIPTC)
 	// The resource block is a byte stream (Adobe Photoshop File Formats
 	// Specification, TIFF tag 34377: BYTE or UNDEFINED); any other declared
 	// type is left alone, as its Count would not be a byte count.
 	byteTyped := psir.Type == exif.TypeByte || psir.Type == exif.TypeUndefined
+	digest, plan := iptcDigestUpdate(psir.Value, rawIPTC, withXMP && byteTyped)
+	updatePSIR(psir, rawIPTC, byteTyped, digest, plan)
+}
+
+// updatePSIR applies the outcome of iptcDigestUpdate to the resource block
+// entry psir: the 0x0404 copy of the IIM is replaced when it differs from
+// rawIPTC, and the digest is created or refreshed as plan says. The value is
+// always a fresh slice, because psir.Value may alias the caller's input.
+func updatePSIR(psir *exif.IFDEntry, rawIPTC []byte, byteTyped bool, digest [irb.DigestSize]byte, plan irb.DigestPlan) {
 	copy0404 := irb.FindIPTC(psir.Value)
 	copyIIM := byteTyped && copy0404 != nil && !bytes.Equal(copy0404, rawIPTC)
 	switch {
 	case copyIIM:
 		var d *[irb.DigestSize]byte
-		if refresh {
+		if plan != irb.DigestKeep {
 			d = &digest
 		}
-		// A fresh slice: psir.Value may alias the caller's input.
-		psir.Value = irb.AppendSplicedDigest(make([]byte, 0, len(psir.Value)+len(rawIPTC)+16), psir.Value, rawIPTC, d)
+		psir.Value = irb.AppendSplicedDigest(make([]byte, 0, len(psir.Value)+len(rawIPTC)+28), psir.Value, rawIPTC, d, plan == irb.DigestCreate)
 		psir.Count = uint32(len(psir.Value)) //nolint:gosec // G115: bounded by the TIFF value size
-	case refresh:
+	case byteTyped && plan == irb.DigestCreate:
+		// The block holds no 0x0404 to replace (or one that already equals
+		// rawIPTC): append only the new digest resource, never an IIM copy.
+		v := make([]byte, 0, len(psir.Value)+1+12+irb.DigestSize)
+		v = append(v, psir.Value...)
+		if len(v)%2 != 0 {
+			v = append(v, 0) // resources start on even offsets
+		}
+		psir.Value = irb.AppendBlock(v, irb.ResourceIPTCDigest, digest[:])
+		psir.Count = uint32(len(psir.Value)) //nolint:gosec // G115: bounded by the TIFF value size
+	case plan == irb.DigestRefresh:
 		// RefreshDigest copies: psir.Value may alias the caller's input.
 		if v := irb.RefreshDigest(psir.Value, digest); v != nil {
 			psir.Value = v
@@ -1275,38 +1300,23 @@ func upsertIPTC(ifd *exif.IFD, rawIPTC []byte) {
 }
 
 // iptcDigestUpdate applies the digest policy of upsertIPTC to the resource
-// block psir when the IIM goes from oldIPTC to rawIPTC: it returns the digest
-// to store and true when the 0x0425 resource must be rewritten.
-func iptcDigestUpdate(psir, oldIPTC, rawIPTC []byte) (digest [irb.DigestSize]byte, refresh bool) {
-	stored := irb.FindDigest(psir)
-	if stored == nil {
-		return digest, false
-	}
-	if bytes.Equal(oldIPTC, tiffscan.TrimIPTCLongPadding(rawIPTC)) && !irb.DigestCurrent(oldIPTC, stored, 4) {
-		return digest, false // unchanged IIM, stale digest: keep the MWG signal
+// block psir when the IIM written is rawIPTC: it returns the digest to store
+// and what to do with it (irb.DigestCreate when the block holds no digest,
+// irb.DigestRefresh when it holds one that differs from the digest of rawIPTC,
+// irb.DigestKeep when it already holds that digest or withXMP is false).
+func iptcDigestUpdate(psir, rawIPTC []byte, withXMP bool) (digest [irb.DigestSize]byte, plan irb.DigestPlan) {
+	if !withXMP {
+		return digest, irb.DigestKeep
 	}
 	digest = irb.Digest(rawIPTC, 4)
-	return digest, !bytes.Equal(stored, digest[:])
-}
-
-// currentIPTC returns the IIM stream ifd holds before an IPTC write: the
-// value of tag 0x83BB without its LONG padding, or, when that tag is absent
-// or empty, the 0x0404 resource of tag 0x8649 (the read precedence of
-// tiffscan.WithPSIRFallback).
-func currentIPTC(ifd *exif.IFD) []byte {
-	if e := ifd.Get(exif.TagIPTC); e != nil {
-		v := e.Value
-		if e.Type == exif.TypeLong {
-			v = tiffscan.TrimIPTCLongPadding(v)
-		}
-		if len(v) > 0 {
-			return v
-		}
+	stored := irb.FindDigest(psir)
+	switch {
+	case stored == nil:
+		return digest, irb.DigestCreate
+	case bytes.Equal(stored, digest[:]):
+		return digest, irb.DigestKeep
 	}
-	if p := ifd.Get(tagPhotoshopIRB); p != nil {
-		return irb.FindIPTC(p.Value)
-	}
-	return nil
+	return digest, irb.DigestRefresh
 }
 
 // byteOrder determines the TIFF byte order from the first 2 bytes.
@@ -1322,50 +1332,26 @@ func byteOrder(b []byte) (binary.ByteOrder, error) {
 
 // extractTagValues scans IFD0 for the IPTC (0x83BB) and XMP (0x02BC) tags
 // and returns their raw byte values, using the shared tiffscan scanner with
-// this package's type table (type 13 is the 4-byte TIFF Extensions IFD type).
+// the same type table as exif (type 13 is the 4-byte IFD type, 129 UTF-8).
 func extractTagValues(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawIPTC, rawXMP []byte) {
-	return tiffscan.ExtractTagValues(data, ifd0Off, order, true)
+	return tiffscan.ExtractTagValues(data, ifd0Off, order)
 }
 
 // typeSize returns the byte size of a single value for the given TIFF type.
 //
-// Type 13 ("IFD") intentionally diverges from exif/type.go's DataType table
-// (task #270, format/tiff-only fix — does NOT touch the exif package).
-//
-// CIPA DC-008-2023 §4.6.3 (EXIF 3.0) assigns type code 13 to TypeUTF8, a NEW
-// 1-byte-per-element EXIF-registry string type. Adobe TIFF 6.0 Extensions
-// ("Adding New Fields", also codified in libtiff's tif_dir.h as TIFF_IFD)
-// assigns the SAME numeric code 13 to IFD — a 4-byte pointer to a child IFD —
-// predating EXIF 3.0 by decades. This is a genuine type-code collision between
-// the two specifications' independent numbering spaces.
-//
-// exif/type.go correctly follows CIPA DC-008-2023 for its OWN EXIF-registry
-// tag table (IFD0/ExifIFD/GPSIFD tags never legitimately used type 13 before
-// EXIF 3.0, so the EXIF-3.0 interpretation is safe there). But tag 0x014A
-// (SubIFDs) is a TIFF-Extension tag, not an EXIF-registry tag (TIFF Extension
-// §F; Adobe DNG Spec §4), and real-world files legitimately declare it as
-// type 13 meaning IFD — see the conformance fixture
-// testdata/corpus/tiff/metadata-extractor/BigTIFFSubIFD4.tif, purpose-built to
-// exercise exactly this. format/tiff's own generic raw-IFD scanners (which
-// walk 0x014A arrays and SubIFD entries independently of exif.Parse) must
-// interpret type 13 as IFD (4 bytes) for that tag family, matching the
-// TIFF-Extension meaning, not the EXIF-3.0 one.
-//
-// #270 regression: exif.Parse (which correctly follows CIPA DC-008-2023 for
-// type 13 in its own struct-based IFD model) mis-sizes a 0x014A/type=13
-// entry's inline value to 1 byte instead of 4, silently truncating the SubIFD
-// pointer. format/tiff's write-path relocator never relies on exif's parsed
-// Value for 0x014A; it re-reads the raw bytes directly using this table (see
-// findEntryInIFD / enumerateSubIFDs in relocate_bigtiff.go).
+// Type 13 is the TIFF IFD type, a 4-byte pointer to a child IFD (Adobe
+// PageMaker 6.0 TIFF Technical Notes, TIFF Tech Note 1; libtiff TIFF_IFD).
+// Type 129 is the 1-byte UTF-8 string that Exif 3.0 and 3.1 added (CIPA
+// DC-008-2026 §4.6.2, p. 28). Up to task #320 exif/type.go gave type 13 to
+// UTF-8 by mistake, so this table and the exif table disagreed; since then
+// they agree. Returns 0 for an unknown type.
 func typeSize(t uint16) uint32 {
 	switch t {
-	case 1, 2, 6, 7: // BYTE, ASCII, SBYTE, UNDEFINED
+	case 1, 2, 6, 7, 129: // BYTE, ASCII, SBYTE, UNDEFINED, UTF-8
 		return 1
 	case 3, 8: // SHORT, SSHORT
 		return 2
-	case 4, 9, 11: // LONG, SLONG, FLOAT
-		return 4
-	case 13: // IFD — TIFF 6.0 Extensions / libtiff TIFF_IFD; see doc comment above.
+	case 4, 9, 11, 13: // LONG, SLONG, FLOAT, IFD
 		return 4
 	case 5, 10, 12: // RATIONAL, SRATIONAL, DOUBLE
 		return 8
@@ -1384,19 +1370,14 @@ func typeSize(t uint16) uint32 {
 // must reject them.  Returns 0 for any unknown type code (same sentinel as
 // typeSize) to allow the caller to skip unrecognised entries gracefully.
 //
-// Type 13 ("IFD", 4 bytes) is handled identically to typeSize — see that
-// function's doc comment for the EXIF-3.0-vs-TIFF-Extension type-code
-// collision this deliberately resolves in favour of the TIFF-Extension
-// meaning for format/tiff's own generic raw-IFD scanners.
+// Types 13 (IFD, 4 bytes) and 129 (UTF-8, 1 byte) are handled as in typeSize.
 func typeSizeBigTIFF(t uint16) uint64 {
 	switch t {
-	case 1, 2, 6, 7: // BYTE, ASCII, SBYTE, UNDEFINED
+	case 1, 2, 6, 7, 129: // BYTE, ASCII, SBYTE, UNDEFINED, UTF-8
 		return 1
 	case 3, 8: // SHORT, SSHORT
 		return 2
-	case 4, 9, 11: // LONG, SLONG, FLOAT
-		return 4
-	case 13: // IFD — TIFF 6.0 Extensions / libtiff TIFF_IFD; see typeSize doc comment.
+	case 4, 9, 11, 13: // LONG, SLONG, FLOAT, IFD (see typeSize)
 		return 4
 	case 5, 10, 12: // RATIONAL, SRATIONAL, DOUBLE
 		return 8

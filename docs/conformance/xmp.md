@@ -2,7 +2,7 @@
 
 Normative-requirements checklist for the GoMetadata conformance test battery. Rule IDs
 (`PW-*`, `RDF-*`, `NS-*`, `VT-*`, `JPEG-*`, `TIFF-*`, `PNG-*`, `HEIF-*`, `MWG-*`, `ROB-*`)
-are used verbatim as Go sub-test names. 69 rules total.
+are used verbatim as Go sub-test names. 74 rules total.
 
 > Note for implementers: a few byte-length constants below (e.g. the JPEG XMP namespace
 > identifier length) must be reconciled against the actual codebase during implementation —
@@ -27,8 +27,9 @@ are used verbatim as Go sub-test names. 69 rules total.
 - **PW-02** `id` MUST be exactly `W5M0MpCehiHzreSzNTczkc9d`.
 - **PW-03** Packet ends with `<?xpacket end="r"?>` or `end="w"`; missing end → error/partial+diagnostic.
 - **PW-04** For in-place writeable packets, whitespace padding fills space before the end PI.
-- **PW-05** BOM encodes byte order (UTF-8 / UTF-16 LE / UTF-16 BE); empty/absent ⇒ assume UTF-8.
+- **PW-05** BOM encodes byte order (UTF-8 / UTF-16 LE / UTF-16 BE); empty/absent ⇒ assume UTF-8 unless the NUL-byte pattern of the first character says otherwise (PW-08).
 - **PW-06** Scanning locates begin PI by searching `3C 3F 78` (`<?x`) then matching `xpacket`+`begin`; no fixed offset.
+- **PW-08** A UTF-16 or UTF-32 packet without a BOM is recognised from the first bytes (`00 nn` UTF-16BE, `nn 00` UTF-16LE, `00 00 00 nn` UTF-32BE, `nn 00 00 00` UTF-32LE; XMP Part 1 §7.1 p. 9, §7.3.2; XML 1.0 App. F.1; Toolkit `DetermineInputEncoding`) and decoded to the same properties as the UTF-8 form. A first byte of 0x80 or more that is not a BOM is UTF-8 (divergence from the Toolkit).
 - **PW-07** Wrapper optional when the container delimits XMP (APP1, TIFF tag 700, PNG iTXt, HEIF item) — handle both.
 
 ### 2.2 RDF/XML Serialization — XMP Part 1 §7.2–§7.4
@@ -39,6 +40,11 @@ are used verbatim as Go sub-test names. 69 rules total.
 - **RDF-05** Arrays: `rdf:Seq` (ordered), `rdf:Bag` (unordered), `rdf:Alt` (lang alt); preserve semantics on round-trip.
 - **RDF-06** `rdf:Alt` MUST contain an `rdf:li xml:lang="x-default"`; return x-default when no lang match.
 - **RDF-07** Qualifiers (other than xml:lang) via `rdf:value` + qualifier elements; MUST preserve on write.
+- **RDF-09** Element text of a literal property is verbatim: leading, trailing and inner white space is kept, as in the attribute form (XML 1.0 §2.10; XMP Part 1 §7.5; Toolkit `LiteralPropertyElement`); CRLF and CR read as LF (XML 1.0 §2.11). White space between child elements is not content.
+- **RDF-13** Attribute values are normalised as XML 1.0 §3.3.3 requires, before entity and character references are expanded: each literal TAB, LF and CR (a CR LF pair counts once, XML 1.0 §2.11) becomes one space; `&#9;` `&#10;` `&#13;` stay the character. All attributes of a packet are of type CDATA (no DTD), so nothing else is normalised. Expat (the Toolkit's parser) does this; Go `encoding/xml` does not, and the specification is followed. `Encode` writes TAB, LF and CR of an attribute value as character references, so a value survives the round trip. `TestTask344AttributeValueNormalisation`, `TestTask344EncodeEscapesAttributeWhitespace`.
+- **RDF-10** Registered aliases (35, Adobe XMP Part 2 §1.1.1; Toolkit `RegisterStandardAliases`) are folded into the base property on parse by the rules of `MoveExplicitAliases`: base absent ⇒ the alias is transplanted (a text or array-item alias becomes the x-default or first item of a new array); base present ⇒ the alias is deleted (base wins); readers find the value at the base property and writers write the base form only.
+- **RDF-11** Setting the default text of a language alternative (`SetCaption`, `SetCopyright`) updates the x-default item and the items that repeated its old text, keeps the other languages, and inserts x-default first when absent (XMP Part 1 §8.2.2.4; Toolkit `SetLocalizedText`).
+- **RDF-12** `CameraModel` is `tiff:Model` only; `xmp:CreatorTool` names the software and is never a fallback (XMP Part 1 §8.4 p. 27).
 - **RDF-08** Structures = nested `rdf:Description`; recurse to extract fields.
   - Since task #303 the parser builds the XMP data model tree (ISO 16684-1:2019 §6), so
     structures and arrays nest to any depth (an array inside a struct field, a struct inside an
@@ -66,15 +72,23 @@ are used verbatim as Go sub-test names. 69 rules total.
 
 ### 3.1 JPEG — XMP Part 3 §1.1
 - **JPEG-01** Standard XMP in APP1 (`FF E1`); payload begins with `http://ns.adobe.com/xap/1.0/\0` then the packet.
-- **JPEG-02** APP1 ≤ 65535; max standard XMP data = 65535 − 2 − 29 = 65504 bytes.
+- **JPEG-02** The XMP packet of a single standard APP1 segment is at most 65502 bytes (S3 §1.1.3.1, p. 14: "If the XMP packet is not split across multiple APP1 sections, the size of the XMP packet can be at most 65502 bytes"), 2 bytes below what the segment can hold (65535 − 2 − 29 = 65504). The writer follows the 65502 of the specification; the reader accepts any size, so files written with up to 65504 bytes still read. `TestTask351_StandardPacketLimit` (boundary 65502 one segment, 65503 partitioned).
 - **JPEG-03** Exactly one standard XMP APP1; reader uses first, writer ensures one.
-- **JPEG-04** Excess > 65504 → ExtendedXMP APP1(s) with id `http://ns.adobe.com/xmp/extension/\0`.
+- **JPEG-04** Excess > 65502 → ExtendedXMP APP1(s) with id `http://ns.adobe.com/xmp/extension/\0`.
 - **JPEG-05** ExtendedXMP header after id = 32 ASCII hex GUID + uint32 BE fullLength + uint32 BE offset.
 - **JPEG-06** GUID = MD5 of full extended XMP = value of `xmpNote:HasExtendedXMP` in standard packet; validate before reassembly.
 - **JPEG-07** Reassembly validates: same GUID, same fullLength, Σ chunk lengths = fullLength, no dup/overlap offsets; incomplete → error.
 - **JPEG-08** Merge extended `rdf:Description` into primary model without duplicating props; a top-level property present in both portions takes the extended value as a whole (Adobe XMP Toolkit `XMPUtils::MergeFromJPEG`).
 - **JPEG-09** ExtendedXMP serialized without a packet wrapper; GUID written as 32 hex digits with capital A–F (S3 §1.1.3.1).
 - **JPEG-10** Reader recomposes StandardXMP and ExtendedXMP into one data model tree and removes `xmpNote:HasExtendedXMP`; the xmpNote namespace URI is `http://ns.adobe.com/xmp/note/` (S3 §1.1.3.1).
+- **JPEG-11** Writer avoids partitioning (S3 §1.1.3.2 p. 15, task #332): a packet whose compact serialisation fits one APP1 segment (65502 bytes, S3 §1.1.3.1 p. 14) is written whole, without its padding; the packet padding alone never causes a split. `TestTask332_CompactNotSplit`, `TestTask332_PaddedPacketThatFitsUnpadded`.
+- **JPEG-12** Writer partitions as S3 §1.1.3.2 (p. 15) recommends: StandardXMP at most 65000 bytes, compact, carrying `xmpNote:HasExtendedXMP` (added with a 32-byte dummy before the size is measured, S3 §1.1.3.1 p. 15); properties move to ExtendedXMP in order xmp:Thumbnails, the Camera Raw namespace, photoshop:History, then top-level properties by estimated size, largest first, until it fits; the two portions recompose into the original XMP. Divergence from the Toolkit (`XMPUtils::PackageForJPEG`), documented: xmp:Thumbnails moves instead of being deleted. `TestPackageForJPEG_*` (xmp), `TestTask332_PartitionKeepsStandardScalars`.
+- **JPEG-13** The extended serialisation has no packet wrapper and its GUID is the uppercase MD5 of its bytes (JPEG-09, JPEG-06); an XMP that cannot be parsed, or whose standard portion cannot fit, is stored whole as extended XMP behind a stub (fallback). `TestTask332_FallbackExtendedWrite`, `TestTask295_ExtendedXMPWriteDeterministic`.
+- **JPEG-14** Reader removes `xmpNote:HasExtendedXMP` from the StandardXMP also when extended chunks exist but none matches its GUID, or the matching chunks do not recompose, as the Toolkit does (`JPEG_Handler.cpp:ProcessXMP`); a write of that XMP does not bring it back, except for the extended XMP that is kept verbatim (XMP-EXT-KEEP-01). The same holds when the chunks match the GUID but the extended document cannot be merged (not well-formed, not an XMP document): the standard packet is returned without the link and a `ParseWarning` (`ErrExtendedXMPTruncated`) reports that the extended content was not merged; the wire frame keeps it for an unmodified write (task #350; the Toolkit deletes the property before it merges and ignores a failed `MergeFromJPEG`). `TestTask332_UnmatchedLinkRemoved`, `TestStripExtendedLink`, `TestTask350_UnmergedExtendedLinkRemoved`, `TestTask350UnmergedExtendedXMPWarns` (root, ParseWarning).
+- **XMP-EXT-KEEP-01** (task #357) Extended XMP that the standard packet links to but that `Read` could not merge (an invalid chunk layout, or an assembled document that cannot be merged; `Read` adds a `ParseWarning` wrapping `ErrExtendedXMPTruncated`) is kept by a write that re-encodes the standard packet (any setter): `Inject` copies the source's extended APP1 segments of that GUID byte for byte, in their place, and the packet written links to them with `xmpNote:HasExtendedXMP` (S3 §1.1.3.1, pp. 14-15: a reader incorporates only the extended segments whose GUID matches the property). Original policy: the Adobe XMP Toolkit drops such segments and ExifTool reports an error; dropping them silently loses data the model cannot hold. The output reads the same way again, so a second write keeps them too. `TestTask357SetterWriteKeepsUnmergedExtendedXMP`, `FuzzJPEGInject`. Corpus: `jpeg/metadata-extractor/malformed_extended_xmp.jpg` (and `_2`) keep their extended segment after a caption write; `exiftool -validate -warning` reports the same `Incomplete extended XMP` warning as for the input.
+- **XMP-EXT-KEEP-02** The link is added only when the file being written has an extended segment of that GUID (the metadata may be written into another file than the one it was read from); otherwise the packet is written without it. `TestTask357NoDanglingLink`.
+- **XMP-EXT-KEEP-03** Extended XMP that `Read` merged is part of the model and is re-encoded, not kept (unchanged behaviour). `TestTask357MergedExtendedXMPIsNotKept`.
+- **XMP-EXT-KEEP-04** A file carries one ExtendedXMP, whose GUID the standard packet holds (S3 §1.1.3.1, p. 14). When the XMP to write is itself too large for one segment, so that it needs extended XMP of its own, it cannot be written next to the segments that are kept: `Write` returns `jpeg.ErrExtendedXMPConflict` and writes nothing, so nothing is dropped silently. Reducing the XMP so that it fits one segment resolves it. `TestTask357OversizedPacketIsRefused`.
 
 ### 3.2 TIFF — XMP Part 3 §1.3
 - **TIFF-01** XMP in tag 700 (`0x02BC`); type BYTE(1) or UNDEFINED(7); accept both, write BYTE.
@@ -87,6 +101,7 @@ are used verbatim as Go sub-test names. 69 rules total.
 - **PNG-03** Packet end attribute = `r` for PNG embedding.
 - **PNG-04** Exactly one XMP iTXt; reader uses first.
 - **PNG-05** Language tag + translated keyword empty (two NULs); accept any on read.
+- **PNG-06** No more than one chunk containing XMP (S3 §1.1.5 p. 16, task #325): an XMP packet read from a `Raw profile type xmp` text chunk (or an `APP1` profile that carries a packet) is the fallback when no native iTXt exists; a write that emits the XMP iTXt chunk drops that profile, so one current copy remains. A profile that cannot be decoded is kept, and a nil XMP payload leaves it. `TestInject_RawProfileXMPDropped`, `TestExtract_RawProfileXMP`, `TestCorpus_PNGRawProfiles`.
 
 ### 3.4 HEIF / ISO BMFF — XMP Part 3 §1.8
 - **HEIF-01** XMP item: `item_type='mime'`, `content_type='application/rdf+xml'`; identify by these, not item ID.
@@ -106,7 +121,8 @@ are used verbatim as Go sub-test names. 69 rules total.
 
 ## Section 5: Robustness Cases (MUST NOT crash)
 - **ROB-01** Missing end PI → partial content + diagnostic, no crash.
-- **ROB-02** Malformed RDF (not well-formed) → descriptive error, no silent partial.
+- **ROB-02** Malformed RDF (not well-formed) → descriptive error, no silent partial. The scanner checks Element Type Match (every end tag names the innermost open start tag), stray end tags, malformed start tags and unclosed elements (XML 1.0 §3; error wraps `ErrXMLNotWellFormed` and names the element). `Write` carries an unparseable packet unchanged and the setters create no XMP over it.
+- **ROB-13** An element or attribute whose namespace prefix no declaration in scope binds is not well-formed (Namespaces in XML 1.0 §5, Namespace Constraint "Prefix Declared"; XMP Part 1 §7.1): `Parse` returns an error that wraps `ErrXMLNotWellFormed` and names the prefix. The `xml` prefix is bound by definition (§3); a declaration is in scope on its own element and its descendants. `TestTask345UnboundPrefix`.
 - **ROB-03** XXE / billion-laughs: disable external entities, cap entity expansion; reject/cap `<!DOCTYPE>` internal entities.
 - **ROB-04** Unknown-namespace properties preserved on read, re-serialized on write losslessly.
 - **ROB-05** Duplicate property → last-value + diagnostic; continue parsing.

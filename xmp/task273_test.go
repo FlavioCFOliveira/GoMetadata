@@ -51,7 +51,9 @@ func TestTask273RoundTripPreservesSourceContainerType(t *testing.T) {
 			` xmlns:exif="` + NSexif + `"` +
 			` xmlns:xmpRights="` + NSxmpRights + `"` +
 			` xmlns:cust="` + customNS + `">` +
-			`<tiff:ImageDescription><rdf:Alt><rdf:li xml:lang="x-default">A single caption</rdf:li></rdf:Alt></tiff:ImageDescription>` +
+			// exif:UserComment, not tiff:ImageDescription: the latter is an
+			// alias of dc:description and is folded on parse (task #329).
+			`<exif:UserComment><rdf:Alt><rdf:li xml:lang="x-default">A single caption</rdf:li></rdf:Alt></exif:UserComment>` +
 			`<exif:ISOSpeedRatings><rdf:Seq><rdf:li>400</rdf:li></rdf:Seq></exif:ISOSpeedRatings>` +
 			`<xmpRights:UsageTerms><rdf:Alt><rdf:li xml:lang="x-default">All rights reserved</rdf:li></rdf:Alt></xmpRights:UsageTerms>` +
 			`<cust:Tags><rdf:Bag><rdf:li>onlyitem</rdf:li></rdf:Bag></cust:Tags>` +
@@ -62,8 +64,8 @@ func TestTask273RoundTripPreservesSourceContainerType(t *testing.T) {
 
 	// Sanity: values are readable via the flat Properties map before any
 	// round trip, exactly as they would be for a normal Get() call.
-	if got := x.Get(NStiff, "ImageDescription"); got != "A single caption" {
-		t.Fatalf("pre-encode Get(tiff:ImageDescription) = %q", got)
+	if got := x.Get(NSexif, "UserComment"); got != "A single caption" {
+		t.Fatalf("pre-encode Get(exif:UserComment) = %q", got)
 	}
 
 	encoded := mustEncode(t, x)
@@ -76,10 +78,10 @@ func TestTask273RoundTripPreservesSourceContainerType(t *testing.T) {
 		wantElement string // must appear: local element open tag immediately followed by its container
 	}{
 		{
-			name:        "tiff:ImageDescription (Alt, in spec table)",
+			name:        "exif:UserComment (Alt, in spec table)",
 			ctype:       "Alt",
-			bareScalar:  "<tiff:ImageDescription>A single caption</tiff:ImageDescription>",
-			wantElement: "<tiff:ImageDescription>\n    <rdf:Alt>",
+			bareScalar:  "<exif:UserComment>A single caption</exif:UserComment>",
+			wantElement: "<exif:UserComment>\n    <rdf:Alt>",
 		},
 		{
 			name:        "exif:ISOSpeedRatings (Seq, in spec table)",
@@ -119,8 +121,8 @@ func TestTask273RoundTripPreservesSourceContainerType(t *testing.T) {
 	// Re-parse the encoded output and confirm values and containers are
 	// stable under a SECOND round trip (Parse → Encode → Parse → Encode).
 	x2 := mustParse(t, encoded)
-	if got := x2.Get(NStiff, "ImageDescription"); got != "A single caption" {
-		t.Errorf("round-trip Get(tiff:ImageDescription) = %q", got)
+	if got := x2.Get(NSexif, "UserComment"); got != "A single caption" {
+		t.Errorf("round-trip Get(exif:UserComment) = %q", got)
 	}
 	if got := x2.Get(NSexif, "ISOSpeedRatings"); got != "400" {
 		t.Errorf("round-trip Get(exif:ISOSpeedRatings) = %q", got)
@@ -162,10 +164,6 @@ func TestTask273LangAltNoInternalSeparatorLeak(t *testing.T) {
 		lang   string
 		value  string
 	}{
-		{
-			name: "tiff:ImageDescription single fr item", ns: NStiff, local: "ImageDescription",
-			prefix: "tiff", lang: "fr", value: "Bonjour",
-		},
 		{
 			name: "exif:UserComment single de item", ns: NSexif, local: "UserComment",
 			prefix: "exif", lang: "de", value: "Hallo Welt",

@@ -6,7 +6,7 @@ import (
 )
 
 // TestDigest verifies that Digest computes the correct MD5 of rawIIM bytes.
-// MWG Guidelines v2.0 §3.3.1: digest = MD5(raw 0x0404 IIM stream).
+// MWG Guidelines v2.0 §4.2.3.2, p. 26: digest = MD5(raw 0x0404 IIM stream).
 func TestDigest(t *testing.T) {
 	t.Parallel()
 
@@ -53,7 +53,8 @@ func TestDigest(t *testing.T) {
 }
 
 // TestDigestIsZero verifies the all-zero sentinel detection.
-// MWG §3.3.1: all-zero digest means "unknown" — treat as mismatch (elevate IPTC).
+// All-zero digest means "unknown" (a convention of this library, not of MWG
+// §4.2.3.2) — treat as mismatch (elevate IPTC).
 func TestDigestIsZero(t *testing.T) {
 	t.Parallel()
 
@@ -94,7 +95,7 @@ func TestDigestIsZero(t *testing.T) {
 	}
 }
 
-// TestDigestMatch verifies the three-state logic required by MWG §3.3.1:
+// TestDigestMatch verifies the three-state logic of MWG §4.2.3.2, pp. 27-28, and the library's sentinel:
 //   - match=true, unknown=false  → stored equals computed; XMP keeps priority
 //   - match=false, unknown=false → mismatch; elevate IPTC trust
 //   - match=false, unknown=true  → all-zero sentinel; elevate IPTC trust
@@ -113,7 +114,7 @@ func TestDigestMatch(t *testing.T) {
 		wantUnknown bool
 	}{
 		{
-			// MWG §3.3.1: matching digest → XMP priority kept (default).
+			// MWG §4.2.3.2, p. 27: matching digest → XMP priority kept (default).
 			name:        "match — XMP priority",
 			rawIIM:      rawIIM,
 			stored:      correct,
@@ -121,7 +122,7 @@ func TestDigestMatch(t *testing.T) {
 			wantUnknown: false,
 		},
 		{
-			// MWG §3.3.1: mismatch → elevate IPTC trust.
+			// MWG §4.2.3.2, p. 28: mismatch → elevate IPTC trust.
 			name:        "mismatch — IPTC elevated",
 			rawIIM:      rawIIM,
 			stored:      wrong,
@@ -129,7 +130,7 @@ func TestDigestMatch(t *testing.T) {
 			wantUnknown: false,
 		},
 		{
-			// MWG §3.3.1: all-zero sentinel → unknown; elevate IPTC trust.
+			// Library sentinel (not MWG): all-zero → unknown; elevate IPTC trust.
 			name:        "all-zero sentinel — IPTC elevated",
 			rawIIM:      rawIIM,
 			stored:      [16]byte{},

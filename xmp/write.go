@@ -40,6 +40,48 @@ var localListPool = sync.Pool{New: func() any { s := make([]string, 0, 16); retu
 // entries follow, written from their keys alone (classifyProps). serialise
 // never modifies x: merges are applied to a pooled scratch copy.
 func serialise(x *XMP) ([]byte, error) {
+	return serialiseMode(x, serialiseDefault)
+}
+
+// serialiseOpts selects the form of a serialised packet.
+type serialiseOpts uint8
+
+const (
+	// serialiseDefault is the form Encode writes: <?xpacket?> wrapper, 2 KB
+	// of padding, one formatting line per element.
+	serialiseDefault serialiseOpts = 0
+	// serialiseCompact removes the formatting white space between elements
+	// (see compactMarkup) and the padding. XMP Specification Part 3 §1.1.3.2
+	// (p. 15): the StandardXMP of a JPEG should be as small as possible,
+	// "eliminating all formatting whitespace" and padding.
+	serialiseCompact serialiseOpts = 1 << iota
+	// serialiseNoWrapper omits the <?xpacket?> processing instructions:
+	// Part 3 §1.1.3.1 (p. 14) requires the ExtendedXMP of a JPEG to be
+	// "serialized without a packet wrapper".
+	serialiseNoWrapper
+)
+
+// serialiseMode is serialise with the form chosen by mode; see serialiseOpts.
+// A compact or unwrapped packet carries no padding.
+func serialiseMode(x *XMP, mode serialiseOpts) ([]byte, error) {
+	buf, err := serialiseBuf(x, mode)
+	if err != nil {
+		return nil, err
+	}
+	// Copy the result before returning the buffer to the pool so callers own
+	// their slice independently of the pooled backing array.
+	result := bytes.Clone(buf.Bytes())
+	encBufPool.Put(buf)
+	return result, nil
+}
+
+// serialiseBuf is serialiseMode without the final copy: it returns the pooled
+// buffer that holds the packet, which the caller must hand back to encBufPool
+// once it has read it. It lets a caller that only needs the size of a packet
+// (PackageForJPEG) skip the copy.
+func serialiseBuf(x *XMP, mode serialiseOpts) (*bytes.Buffer, error) {
+	compact := mode&serialiseCompact != 0
+	wrapper := mode&serialiseNoWrapper == 0
 	buf := encBufPool.Get().(*bytes.Buffer) //nolint:forcetypeassert,revive // encBufPool.New always stores *bytes.Buffer; pool invariant
 	buf.Reset()
 
@@ -50,18 +92,7 @@ func serialise(x *XMP) ([]byte, error) {
 	}
 	buf.Grow(256 + 2048 + nProps*100)
 
-	// Opening packet wrapper with UTF-8 BOM marker (XMP §7.1).
-	buf.WriteString("<?xpacket begin=\"\xef\xbb\xbf\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n")
-	buf.WriteString("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"")
-	if x.toolkit != "" {
-		// XMP Part 1 §7.3.3: x:xmptk names the toolkit that wrote the packet;
-		// a parsed value is kept so that a round trip does not lose it.
-		buf.WriteString(" x:xmptk=\"")
-		writeXMLEscaped(buf, x.toolkit)
-		buf.WriteByte('"')
-	}
-	buf.WriteString(">\n")
-	buf.WriteString(" <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n")
+	writePacketHead(buf, x, wrapper)
 
 	// Sort namespace URIs for deterministic output (ISO 16684-1 §7.4).
 	nsListPtr := nsListPool.Get().(*[]string) //nolint:forcetypeassert,revive // nsListPool.New always stores *[]string; pool invariant
@@ -132,16 +163,48 @@ func serialise(x *XMP) ([]byte, error) {
 	enc.writeBlankBlocks()
 	buf.WriteString(" </rdf:RDF>\n</x:xmpmeta>\n")
 
-	// 2 KB padding of spaces / newlines for in-place editing (XMP §7.3).
-	// Uses the pre-computed package-level array to avoid a per-call allocation.
-	buf.Write(xmpPadding[:])
-	buf.WriteString("\n<?xpacket end=\"w\"?>")
+	writePacketTail(buf, wrapper, compact)
+	if compact {
+		out := buf.Bytes()
+		buf.Truncate(len(compactMarkup(out)))
+	}
+	return buf, nil
+}
 
-	// Copy the result before returning the buffer to the pool so callers own
-	// their slice independently of the pooled backing array.
-	result := bytes.Clone(buf.Bytes())
-	encBufPool.Put(buf)
-	return result, nil
+// writePacketHead writes the start of a packet: the <?xpacket?> processing
+// instruction when wrapper is true, the x:xmpmeta element and the rdf:RDF
+// element.
+func writePacketHead(buf *bytes.Buffer, x *XMP, wrapper bool) {
+	// Opening packet wrapper with UTF-8 BOM marker (XMP §7.1).
+	if wrapper {
+		buf.WriteString("<?xpacket begin=\"\xef\xbb\xbf\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n")
+	}
+	buf.WriteString("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"")
+	if x.toolkit != "" {
+		// XMP Part 1 §7.3.3: x:xmptk names the toolkit that wrote the packet;
+		// a parsed value is kept so that a round trip does not lose it.
+		buf.WriteString(" x:xmptk=\"")
+		writeXMLAttrEscaped(buf, x.toolkit)
+		buf.WriteByte('"')
+	}
+	buf.WriteString(">\n")
+	buf.WriteString(" <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n")
+}
+
+// writePacketTail writes the end of a packet that writePacketHead started,
+// after the rdf:RDF element: the padding (unless compact) and the closing
+// processing instruction when wrapper is true.
+func writePacketTail(buf *bytes.Buffer, wrapper, compact bool) {
+	if !wrapper {
+		return
+	}
+	if !compact {
+		// 2 KB padding of spaces / newlines for in-place editing (XMP §7.3).
+		// Uses the pre-computed package-level array to avoid a per-call allocation.
+		buf.Write(xmpPadding[:])
+		buf.WriteString("\n")
+	}
+	buf.WriteString("<?xpacket end=\"w\"?>")
 }
 
 // reserveNestedPrefixes adds to used the canonical prefix of every
@@ -226,7 +289,7 @@ func releaseEncScratch(sc *encScratch) {
 func (e *encoder) startDescription(ns, prefix string, extra []string) {
 	buf := e.buf
 	buf.WriteString("  <rdf:Description rdf:about=\"")
-	writeXMLEscaped(buf, e.x.about)
+	writeXMLAttrEscaped(buf, e.x.about)
 	buf.WriteString("\" xmlns:")
 	buf.WriteString(prefix)
 	buf.WriteString("=\"")
@@ -236,7 +299,7 @@ func (e *encoder) startDescription(ns, prefix string, extra []string) {
 	// untrusted XMP), which would break the attribute boundary and inject
 	// arbitrary XML.  writeXMLEscaped handles all five XML entities plus C0
 	// control chars, making the value safe for attribute context.
-	writeXMLEscaped(buf, ns)
+	writeXMLAttrEscaped(buf, ns)
 	buf.WriteByte('"')
 	for _, u := range extra {
 		if u == ns {
@@ -245,7 +308,7 @@ func (e *encoder) startDescription(ns, prefix string, extra []string) {
 		buf.WriteString(" xmlns:")
 		buf.WriteString(e.pf.prefix(u))
 		buf.WriteString("=\"")
-		writeXMLEscaped(buf, u)
+		writeXMLAttrEscaped(buf, u)
 		buf.WriteByte('"')
 	}
 	buf.WriteString(">\n")
@@ -453,7 +516,7 @@ func writeMultiValuedProperty(buf *bytes.Buffer, prefix, local, val, ctype strin
 			lang, altVal, hasLang := strings.Cut(v, "|")
 			if hasLang {
 				buf.WriteString("     <rdf:li xml:lang=\"")
-				writeXMLEscaped(buf, lang)
+				writeXMLAttrEscaped(buf, lang)
 				buf.WriteString("\">")
 				writeXMLEscaped(buf, altVal)
 			} else {
@@ -816,4 +879,80 @@ func writeXMLEscaped(buf *bytes.Buffer, s string) { //nolint:cyclop,gocyclo // X
 		last = i + 1
 	}
 	buf.WriteString(s[last:])
+}
+
+// writeXMLAttrEscaped is writeXMLEscaped for the value of an attribute. XML
+// 1.0 §3.3.3 makes a parser turn a literal TAB, LF or CR in an attribute value
+// into a space, so those characters are written as character references,
+// which a parser expands to the characters themselves; the value then
+// survives a parse unchanged. writeXMLEscaped already writes CR as &#xD;, so
+// only TAB (&#9;) and LF (&#10;) are handled here. A value without them, the
+// usual case, goes straight to writeXMLEscaped.
+func writeXMLAttrEscaped(buf *bytes.Buffer, s string) {
+	if strings.IndexByte(s, '\t') < 0 && strings.IndexByte(s, '\n') < 0 {
+		writeXMLEscaped(buf, s)
+		return
+	}
+	last := 0
+	for i := range len(s) {
+		var ref string
+		switch s[i] {
+		case '\t':
+			ref = "&#9;"
+		case '\n':
+			ref = "&#10;"
+		default:
+			continue
+		}
+		writeXMLEscaped(buf, s[last:i])
+		buf.WriteString(ref)
+		last = i + 1
+	}
+	writeXMLEscaped(buf, s[last:])
+}
+
+// compactMarkup removes, in place, the formatting white space that serialise
+// writes between elements: a line feed and its indentation that follow a '>'
+// and precede a '<'. It returns the shortened slice.
+//
+// Text values never contain a raw '<' or '>' (writeXMLEscaped writes them as
+// entities), so every '>' ends a tag and the white space after it that runs
+// into a '<' is either formatting or a value that consists of white space
+// only. A value always sits between the start tag of its element and the end
+// tag, so the one pattern that is kept is a start tag followed by white space
+// and an end tag: it covers a white-space value, and costs a few bytes for
+// an empty container.
+func compactMarkup(b []byte) []byte { //nolint:gocyclo // a small state machine over the tag boundaries; splitting it would obscure the one rule it implements
+	const (
+		tagOther = iota // end tag, empty-element tag, processing instruction
+		tagStart        // start tag
+	)
+	w, kind := 0, tagOther
+	for r := 0; r < len(b); {
+		c := b[r]
+		b[w] = c
+		w++
+		r++
+		switch c {
+		case '<':
+			kind = tagStart
+			if r < len(b) && (b[r] == '/' || b[r] == '?' || b[r] == '!') {
+				kind = tagOther
+			}
+		case '>':
+			if kind == tagStart && w >= 2 && b[w-2] == '/' {
+				kind = tagOther // an empty-element tag
+			}
+			if r < len(b) && b[r] == '\n' {
+				j := r + 1
+				for j < len(b) && b[j] == ' ' {
+					j++
+				}
+				if j < len(b) && b[j] == '<' && (kind != tagStart || j+1 >= len(b) || b[j+1] != '/') {
+					r = j
+				}
+			}
+		}
+	}
+	return b[:w]
 }

@@ -528,7 +528,7 @@ func TestRebuildUUIDContent(t *testing.T) {
 
 		newExif := append(origExif, 0xFF) // different bytes
 		newXMP := []byte("new-xmp-data")
-		result, hadXMP := rebuildUUIDContent(content, newExif, nil, newXMP)
+		result, hadXMP := rebuildUUIDContent(content, cmtStreams{cmt1: newExif}, newXMP)
 		if !hadXMP {
 			t.Error("expected hadXMP=true")
 		}
@@ -543,7 +543,7 @@ func TestRebuildUUIDContent(t *testing.T) {
 		origExif := minimalTIFF()
 		content := buildBox("CMT1", origExif)
 
-		_, hadXMP := rebuildUUIDContent(content, nil, nil, nil)
+		_, hadXMP := rebuildUUIDContent(content, cmtStreams{}, nil)
 		if hadXMP {
 			t.Error("expected hadXMP=false when no XMP  box present")
 		}
@@ -554,7 +554,7 @@ func TestRebuildUUIDContent(t *testing.T) {
 		origExif := minimalTIFF()
 		content := buildBox("CMT1", origExif)
 
-		result, _ := rebuildUUIDContent(content, nil, nil, nil)
+		result, _ := rebuildUUIDContent(content, cmtStreams{}, nil)
 		// The result should contain the original CMT1 box (unchanged).
 		if !bytes.Contains(result, origExif) {
 			t.Error("original CMT1 not preserved when rawEXIF is nil")
@@ -567,7 +567,7 @@ func TestRebuildUUIDContent(t *testing.T) {
 		origXMP := []byte("keep-this-xmp")
 		content := append(buildBox("CMT1", origExif), buildBox("XMP ", origXMP)...)
 
-		result, hadXMP := rebuildUUIDContent(content, nil, nil, nil)
+		result, hadXMP := rebuildUUIDContent(content, cmtStreams{}, nil)
 		if !hadXMP {
 			t.Error("expected hadXMP=true")
 		}

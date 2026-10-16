@@ -590,14 +590,15 @@ func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64
 	}
 
 	// iTXt is always inspected (it may be the XMP chunk being replaced);
-	// tEXt and zTXt only when an IPTC write may have to rewrite a "Raw profile
-	// type iptc" chunk (task #314), so a write without IPTC still streams them.
-	if chunkType == chunkITXt || (rawIPTC != nil && (chunkType == chunkTEXt || chunkType == chunkZTXt)) {
+	// tEXt and zTXt only when the write may have to rewrite or drop a "Raw
+	// profile type ..." chunk (tasks #314, #325), so a write without any
+	// metadata payload still streams them.
+	if chunkType == chunkITXt || ((rawIPTC != nil || rawEXIF != nil || rawXMP != nil) && (chunkType == chunkTEXt || chunkType == chunkZTXt)) {
 		data, crcB, release, err := readChunkBody(r, length)
 		if err != nil {
 			return pos, fmt.Errorf("png: chunk %q: %w", chunkTypeStr(chunkType), err)
 		}
-		werr := writeTextChunk(w, hdr, chunkType, data, crcB, rawIPTC)
+		werr := writeTextChunk(w, hdr, chunkType, data, crcB, rawEXIF, rawIPTC, rawXMP)
 		release()
 		if werr != nil {
 			return pos, werr
@@ -621,15 +622,17 @@ func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64
 
 // writeTextChunk writes the text chunk data (type chunkType, original CRC
 // crcB) read by injectOneChunk: an XMP iTXt chunk is dropped (Inject writes
-// its own), an IPTC raw profile chunk is rewritten with rawIPTC when it holds
-// another IIM (rewriteRawProfileIPTC; a fresh CRC is computed), and any other
-// chunk is copied through byte-identical, original CRC included.
-func writeTextChunk(w io.Writer, hdr *[8]byte, chunkType [4]byte, data []byte, crcB [4]byte, rawIPTC []byte) error {
-	if shouldDropChunk(chunkType, data) {
+// its own); an EXIF, APP1 or XMP raw profile chunk is dropped when Inject
+// writes the standard chunk that replaces its content (rawProfileSuperseded,
+// task #325); an IPTC raw profile chunk is rewritten with rawIPTC when it
+// holds another IIM (rewriteRawProfileIPTC; a fresh CRC is computed); and any
+// other chunk is copied through byte-identical, original CRC included.
+func writeTextChunk(w io.Writer, hdr *[8]byte, chunkType [4]byte, data []byte, crcB [4]byte, rawEXIF, rawIPTC, rawXMP []byte) error {
+	if shouldDropChunk(chunkType, data) || rawProfileSuperseded(chunkType, data, rawEXIF != nil, rawXMP != nil) {
 		return nil
 	}
 	if rawIPTC != nil {
-		payload, ok, err := rewriteRawProfileIPTC(chunkType, data, rawIPTC)
+		payload, ok, err := rewriteRawProfileIPTC(chunkType, data, rawIPTC, rawXMP != nil)
 		if err != nil {
 			return err
 		}
@@ -650,6 +653,14 @@ func writeTextChunk(w io.Writer, hdr *[8]byte, chunkType [4]byte, data []byte, c
 // convention ExifTool also writes), that chunk is rewritten to hold rawIPTC,
 // so it never contradicts the IPTC just written (task #314). A nil rawIPTC
 // leaves such a chunk unchanged.
+//
+// EXIF and XMP are always written to their standard chunks (eXIf and the
+// "XML:com.adobe.xmp" iTXt). A "Raw profile type exif", "APP1" or "xmp" text
+// chunk whose content that standard chunk replaces is dropped, so exactly one
+// current copy remains (task #325; PNG 3rd Edition §11.3.4.5: only one eXIf
+// chunk; XMP Specification Part 3 §1.1.5, p. 16: no more than one chunk
+// containing XMP). A nil rawEXIF or rawXMP leaves the matching raw profile
+// chunk unchanged, as a nil rawIPTC does.
 //
 // preserveUnknownSegments must be true. PNG chunk semantics differ
 // fundamentally from JPEG APPn segments: chunks such as tEXt, gAMA, cHRM, and

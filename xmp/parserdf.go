@@ -506,7 +506,7 @@ func (p *rdfParser) resourcePropertyElement(parent, c int32, top bool) { //nolin
 		}
 		// rdf:ID is ignored; any other attribute is invalid here.
 	}
-	if p.d.text(c) != "" {
+	if p.d.hasText(c) {
 		return // "Children of resource property element must be XML elements"
 	}
 	child := &p.d.elems[el.firstChild]
@@ -591,7 +591,7 @@ func (p *rdfParser) parseTypeResourcePropertyElement(parent, c int32, top bool) 
 // Port of RDF_Parser::EmptyPropertyElement.
 func (p *rdfParser) emptyPropertyElement(parent, c int32, top bool) { //nolint:cyclop,gocyclo // one branch per RDF attribute kind, transcribed from the Toolkit
 	el := &p.d.elems[c]
-	if el.firstChild != noNode || p.d.text(c) != "" {
+	if el.firstChild != noNode || p.d.hasText(c) {
 		return // "Nested content not allowed with rdf:resource or property attributes"
 	}
 	var hasPropertyAttrs, hasResource, hasNodeID, hasValue bool

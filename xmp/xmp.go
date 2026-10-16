@@ -19,6 +19,11 @@
 // and qualifiers — is kept internally and written back unchanged.
 package xmp
 
+// Adapted from Adobe XMP-Toolkit-SDK XMPCore/source/XMPMeta-GetSet.cpp:XMPMeta::SetLocalizedText,ChooseLocalizedText,AppendLangItem, Copyright 2003 Adobe, SPDX-License-Identifier: BSD-3-Clause
+//
+// See THIRD_PARTY_NOTICES.md for the licence note on this file. Only the
+// x-default case of setDefaultText is adapted.
+
 import (
 	"fmt"
 	"math"
@@ -151,8 +156,25 @@ const maxXMPDocumentBytes = 16 << 20 // 16 MiB
 // b may include the <?xpacket …?> wrapper; if absent, the bytes are
 // treated as the xmpmeta/RDF body directly.
 //
-// XMP Part 1 §7.2: if b begins with a UTF-16 or UTF-32 BOM, it is
-// automatically transcoded to UTF-8 before parsing.
+// XMP Part 1 §7.1 p. 9 and §7.2: a UTF-16 or UTF-32 packet is transcoded to
+// UTF-8 before parsing; the encoding is recognised from the byte-order mark,
+// or from the first bytes when there is none (for example 00 3C 00 3F is
+// UTF-16BE).
+//
+// Parse returns an error that wraps ErrXMLNotWellFormed, and names the
+// element or the namespace prefix, when the packet is not well-formed XML: a
+// mismatched or stray end tag, a malformed start tag, an element that is never
+// closed, or an element or attribute whose namespace prefix is not declared
+// (Namespaces in XML 1.0 §5). It never returns a tree built from part of such
+// a packet.
+//
+// The values of literal property elements are verbatim, white space
+// included (XML 1.0 §2.10). The values of attributes are normalised as XML
+// 1.0 §3.3.3 requires: each literal TAB, LF and CR becomes a space, while a
+// character reference to one of them (&#9;) stays the character. A property that is one of the 35 registered
+// aliases (see ResolveAlias) is folded into its base property, as the Adobe
+// XMP Toolkit does (Adobe XMP Specification Part 2 §1.1.1): after Parse a
+// document holds one value for it, at the base property.
 //
 // Parse rejects inputs larger than maxXMPDocumentBytes (16 MiB) after
 // UTF-8 normalisation to prevent O(n) parsing of pathological documents.
@@ -220,16 +242,15 @@ func Encode(x *XMP) ([]byte, error) {
 	return serialise(x)
 }
 
-// CameraModel returns the tiff:Model or xmp:CreatorTool property.
-// tiff:Model is the canonical XMP property for the camera model (XMP §8.4).
+// CameraModel returns the tiff:Model property (XMP Part 1 §8.4, p. 27), or ""
+// when the document has none. xmp:CreatorTool is not a fallback: it names the
+// software that created the file (the alias target of tiff:Software), not the
+// camera.
 func (x *XMP) CameraModel() string {
 	if x == nil {
 		return ""
 	}
-	if v := x.getProp(NStiff, "Model"); v != "" {
-		return v
-	}
-	return x.getProp(NSxmp, "CreatorTool")
+	return x.getProp(NStiff, "Model")
 }
 
 // GPS returns GPS coordinates from available XMP namespaces, checked in order:
@@ -391,11 +412,104 @@ func (x *XMP) Get(ns, local string) string {
 	return x.getProp(ns, local)
 }
 
-// SetCaption sets dc:description to s (XMP §8.3).
-func (x *XMP) SetCaption(s string) { x.putProp(NSdc, "description", s) }
+// SetCaption sets the default (x-default) text of dc:description to s
+// (XMP §8.3). The other language alternatives of the property are kept, as
+// described at setDefaultText.
+func (x *XMP) SetCaption(s string) { x.setDefaultText(NSdc, "description", s) }
 
-// SetCopyright sets dc:rights to s (XMP §8.3).
-func (x *XMP) SetCopyright(s string) { x.putProp(NSdc, "rights", s) }
+// SetCopyright sets the default (x-default) text of dc:rights to s
+// (XMP §8.3). The other language alternatives of the property are kept, as
+// described at setDefaultText.
+func (x *XMP) SetCopyright(s string) { x.setDefaultText(NSdc, "rights", s) }
+
+// setDefaultText sets the x-default item of the language alternative (ns,
+// local) to value and leaves its other items alone, following the x-default
+// case of XMPMeta::SetLocalizedText (Adobe XMP Toolkit, XMPCore/source/
+// XMPMeta-GetSet.cpp, line 889) and XMP Part 1 §8.2.2.4 (language
+// alternatives; x-default is the item that applications use when they have no
+// better match):
+//
+//   - no item: the property becomes the single x-default item;
+//   - an x-default item exists: the Toolkit first swaps it with the first item
+//     (ChooseLocalizedText finds it by an exact match), then gives the new
+//     value to every other item that holds the old x-default text — a
+//     translation that merely repeated it — and to x-default itself;
+//   - no x-default item (every item has a language): the new x-default item
+//     is inserted first (AppendLangItem) and the others stay as they are.
+//
+// The flat form of the property is the one of Properties: items joined with
+// U+001E, the x-default item bare and every other item as "lang|value". An
+// item written "x-default|value" is read as x-default too.
+func (x *XMP) setDefaultText(ns, local, value string) {
+	old := x.getProp(ns, local)
+	if old == "" {
+		x.putProp(ns, local, value)
+		return
+	}
+	items := strings.Split(old, "\x1e")
+
+	xd, oldDefault := findDefaultItem(items)
+	if xd < 0 {
+		// No x-default item: it is inserted first and the items stay.
+		x.putProp(ns, local, value+"\x1e"+old)
+		return
+	}
+
+	// ChooseLocalizedText finds the x-default item by an exact match and
+	// SetLocalizedText swaps it with the first item. Every other item that
+	// holds the old x-default text gets the new text, then x-default does.
+	items[0], items[xd] = items[xd], items[0]
+	for i := 1; i < len(items); i++ {
+		if lang, val, tagged := cutAltItem(items[i]); tagged && val == oldDefault {
+			items[i] = lang + "|" + value
+		} else if !tagged && items[i] == oldDefault {
+			items[i] = value
+		}
+	}
+	items[0] = value
+	x.putProp(ns, local, strings.Join(items, "\x1e"))
+}
+
+// findDefaultItem returns the index of the x-default item of items (the first
+// bare item, or the first "x-default|…") and its text, or -1.
+func findDefaultItem(items []string) (index int, text string) {
+	for i, item := range items {
+		lang, val, tagged := cutAltItem(item)
+		if !tagged {
+			return i, item
+		}
+		if lang == "x-default" {
+			return i, val
+		}
+	}
+	return -1, ""
+}
+
+// cutAltItem splits the flat form of a language alternative item, "lang|value",
+// into its language and value. An item whose text before the first '|' is not
+// a language tag (RFC 5646: ASCII letters, digits and '-') is a bare item that
+// merely contains a '|', such as the x-default text "a | b", and is not split.
+func cutAltItem(item string) (lang, val string, tagged bool) {
+	lang, val, tagged = strings.Cut(item, "|")
+	if !tagged || !isLangTag(lang) {
+		return "", item, false
+	}
+	return lang, val, true
+}
+
+// isLangTag reports whether s is non-empty and made of ASCII letters, digits
+// and '-' only, the characters of a language tag (RFC 5646).
+func isLangTag(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range []byte(s) {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '-' {
+			return false
+		}
+	}
+	return true
+}
 
 // SetCreator sets dc:creator to s (XMP §8.3).
 func (x *XMP) SetCreator(s string) { x.putProp(NSdc, "creator", s) }
