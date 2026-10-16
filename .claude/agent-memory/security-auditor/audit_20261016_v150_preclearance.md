@@ -30,3 +30,13 @@ NEW BLOCKER (HIGH): format/tiff/relocate_stream.go checkBlocks (~L303-318), F-07
 
 Residuals judged: F-05 attr shape (23x, 322 MiB) ACCEPT: absolute ceiling independent of doc size (~170 MiB live/~450 MiB total alloc worst valid shape, measured), 16 MiB packet cap bounds input; optional: lowering caps would risk valid-file rejection. Gm.Read XMP error->warning ACCEPT: m.XMP nil so raw XMP is passed through unchanged on Write (no loss). Minor LOW: png 32 MiB profile budget could reject a legit PNG with ~16 MiB XMP profile + others.
 Lesson: ALWAYS run a differential corpus Read->Write against the previous commit after "reject if" hardening; unit tests with synthetic files missed this.
+
+## Final re-audit — 68357f7 (branch dfcee93) — 2026-10-16 — verdict CLEARED
+
+BLOCKING-1 (checkBlocks rejecting strip+tile/JPEG overlap) is fixed by coalescing (format/tiff/relocate_blocks.go planBlocks/disjointAscending; assignNewOffsets rebases each block at srcOffset-range.start inside its copied range). Verified:
+- Corpus differential (3365 files, Read->Write plain + SetCaption) vs 3d74da6: 0 new errors, 0 panics; vs 3cd3831: only 26 entries changed (13 unique: 8 former failures now write incl. Sony A7M4 ARW, 5 coalesced/smaller).
+- Validity of those 13 outputs: mini TIFF walker compares bytes at every strip/tile/JPEGIF (offset,count) orig vs output, ARW 144 blocks + all TIFFs: 0 content mismatches, all in range.
+- Structure-aware generator (40k random strip/tile/JPEG block sets, overlap/dup/nested/near-2^32 offsets): 4896 writes OK, 0 panic, 0 corrupt; output <= input + ~6 KB (no amplification); OOB blocks still rejected by checkBlocks (ErrBlockOutOfBounds).
+- F-07a PoC: N=2000 strips over one range, 1 MiB in -> 1 MiB out (0.5 ms). F-07b PoC: ErrTooManyImageBlocks, 18 MiB. Plan arithmetic uses saturatingAdd, rg.end-rg.start cannot underflow (sorted sweep), dst+offset <= MaxUint32 by the saturation guard; assign/relocatedEnd/write all derive the same plan from the same slice (ORF allBlocks incl. thumbBlock returned and written).
+- go vet clean, tiff/raw tests + root corpus tests pass, tiff -race pass.
+Note: files with chain-IFD JPEG thumbnails still write ~2x input (e.g. 2b27 10 MB -> 19.6 MB): header carries Encode's thumbnails (bounded by F-06a len(b) budget) plus the union once. Bounded, pre-existing, not a blocker. Lesson: differential corpus + pointer-content walker is the right check for any write-path offset rebasing.
