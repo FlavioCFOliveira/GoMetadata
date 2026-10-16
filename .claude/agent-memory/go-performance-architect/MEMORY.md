@@ -110,3 +110,4 @@
 - [Security-audit batch #244-247](project_security_audit_batch_244_247.md) — DETECT-SHORTREAD-01, EXIF-BO-001, PERF-201-LOW, XMPCONC-01
 - [Security-audit batch 2](project_security_audit_batch_2_20260706.md) — HEIF iloc zero-field DoS; ORF/RW2 double-write clone fix
 - [Lint after adding parser branches/tests](feedback_lint_iteration_after_new_code.md) — new nolint + gocyclo bumps common; run golangci-lint before done
+- [Sprint 46 E7 (2026-10-16, done)](project_sprint46_e7_progress.md) — #367-#370: HEIF trailer before-mdat, IFD1 strips (CarryThumbnailStrips), Samsung = ExifTool order dependence, Olympus offsets all forms
