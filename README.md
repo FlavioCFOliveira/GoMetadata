@@ -8,7 +8,7 @@
 
 </div>
 
-A pure Go library for reading and writing EXIF, IPTC, and XMP metadata from any image format. `GoMetadata` provides a single, unified API over all three metadata standards — EXIF 3.0 (CIPA DC-008 / TIFF 6.0), IPTC IIM 4.2, and XMP (ISO 16684-1) — across 13 container formats including JPEG, TIFF, PNG, WebP, HEIF/AVIF, and the major RAW formats (CR2, CR3, NEF, ARW, DNG, ORF, RW2).
+A pure Go library for reading and writing EXIF, IPTC, and XMP metadata from any image format. `GoMetadata` provides a single, unified API over all three metadata standards — EXIF 3.1 (CIPA DC-008-2026, reads 3.0 and 2.x / TIFF 6.0), IPTC IIM 4.2, and XMP (ISO 16684-1) — across 13 container formats including JPEG, TIFF, PNG, WebP, HEIF/AVIF, and the major RAW formats (CR2, CR3, NEF, ARW, DNG, ORF, RW2).
 
 Developers searching for a Go EXIF library, a Go IPTC parser, or a way to read and write XMP metadata in Go will find that `GoMetadata` handles all three in a single import. Format detection is by magic bytes, not file extension. All parsers are fuzz-tested and race-clean.
 
@@ -264,7 +264,7 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 
 | Feature | Details |
 |---|---|
-| Metadata standards | EXIF 3.0 (CIPA DC-008 / TIFF 6.0), IPTC IIM 4.2, XMP (ISO 16684-1) |
+| Metadata standards | EXIF 3.1 (CIPA DC-008-2026, reads 3.0 and 2.x / TIFF 6.0), IPTC IIM 4.2, XMP (ISO 16684-1) |
 | Read | Whichever of EXIF / IPTC / XMP the container carries, across all 13 formats (IPTC is carried by JPEG, the TIFF-based formats, and PNG "Raw profile type iptc" text chunks) |
 | Write | All three standards across all 13 container formats, including BigTIFF (magic `0x002B`); preserves unmodified metadata byte-for-byte. All TIFF-based formats (TIFF, DNG, CR2, NEF, ARW, ORF, RW2) use a copy-and-relocate serializer that preserves image-data blocks (strips/tiles/MakerNote blobs) at corrected offsets; BigTIFF uses a native 64-bit encoder and a container-width-aware relocator. |
 | Atomic writes | `WriteFile` uses temp file + rename — no partial writes |

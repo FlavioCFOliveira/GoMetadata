@@ -67,7 +67,7 @@ func TestExtractTagValues_IPTCTypeLongTrimsPadding(t *testing.T) {
 		value    []byte
 	}{{0x83BB, 4, payload}})
 
-	rawIPTC, rawXMP := ExtractTagValues(data, 8, binary.LittleEndian, false)
+	rawIPTC, rawXMP := ExtractTagValues(data, 8, binary.LittleEndian)
 	if rawXMP != nil {
 		t.Errorf("rawXMP = %v, want nil", rawXMP)
 	}
@@ -86,7 +86,7 @@ func TestExtractTagValues_IPTCTypeUndefinedNoTrim(t *testing.T) {
 		value    []byte
 	}{{0x83BB, 7, payload}})
 
-	rawIPTC, _ := ExtractTagValues(data, 8, binary.LittleEndian, false)
+	rawIPTC, _ := ExtractTagValues(data, 8, binary.LittleEndian)
 	if !bytes.Equal(rawIPTC, payload) {
 		t.Errorf("rawIPTC = %v, want %v (no trim for TypeUndefined)", rawIPTC, payload)
 	}
@@ -100,7 +100,7 @@ func TestExtractTagValues_XMP(t *testing.T) {
 		value    []byte
 	}{{0x02BC, 1, xmpPacket}})
 
-	rawIPTC, rawXMP := ExtractTagValues(data, 8, binary.LittleEndian, false)
+	rawIPTC, rawXMP := ExtractTagValues(data, 8, binary.LittleEndian)
 	if rawIPTC != nil {
 		t.Errorf("rawIPTC = %v, want nil", rawIPTC)
 	}
@@ -121,7 +121,7 @@ func TestExtractTagValues_BothTags(t *testing.T) {
 		{0x83BB, 7, iptc},
 	})
 
-	rawIPTC, rawXMP := ExtractTagValues(data, 8, binary.LittleEndian, false)
+	rawIPTC, rawXMP := ExtractTagValues(data, 8, binary.LittleEndian)
 	if !bytes.Equal(rawIPTC, iptc) {
 		t.Errorf("rawIPTC = %v, want %v", rawIPTC, iptc)
 	}
@@ -137,7 +137,7 @@ func TestExtractTagValues_NoTags(t *testing.T) {
 		value    []byte
 	}{{0x0100, 4, []byte{1, 0, 0, 0}}}) // ImageWidth, unrelated tag
 
-	rawIPTC, rawXMP := ExtractTagValues(data, 8, binary.LittleEndian, false)
+	rawIPTC, rawXMP := ExtractTagValues(data, 8, binary.LittleEndian)
 	if rawIPTC != nil || rawXMP != nil {
 		t.Errorf("rawIPTC=%v rawXMP=%v, want both nil", rawIPTC, rawXMP)
 	}
@@ -145,23 +145,23 @@ func TestExtractTagValues_NoTags(t *testing.T) {
 
 func TestExtractTagValues_UnknownTypeSkipped(t *testing.T) {
 	t.Parallel()
-	// With type13IsIFD == false, an IPTC tag declared with type 13 is
-	// skipped, not extracted.
+	// An IPTC tag declared with a type this package does not know (here 200,
+	// which no specification defines) is skipped, not extracted.
 	data := buildIFD0([]struct {
 		tag, typ uint16
 		value    []byte
-	}{{0x83BB, 13, []byte{1, 2, 3, 4}}})
+	}{{0x83BB, 200, []byte{1, 2, 3, 4}}})
 
-	rawIPTC, _ := ExtractTagValues(data, 8, binary.LittleEndian, false)
+	rawIPTC, _ := ExtractTagValues(data, 8, binary.LittleEndian)
 	if rawIPTC != nil {
-		t.Errorf("rawIPTC = %v, want nil (type 13 unrecognised)", rawIPTC)
+		t.Errorf("rawIPTC = %v, want nil (type 200 unrecognised)", rawIPTC)
 	}
 }
 
 func TestExtractTagValues_TruncatedIFD0Header(t *testing.T) {
 	t.Parallel()
 	// ifd0Off+2 > len(data): cannot even read the entry count.
-	rawIPTC, rawXMP := ExtractTagValues([]byte{0x00}, 4, binary.LittleEndian, false)
+	rawIPTC, rawXMP := ExtractTagValues([]byte{0x00}, 4, binary.LittleEndian)
 	if rawIPTC != nil || rawXMP != nil {
 		t.Errorf("rawIPTC=%v rawXMP=%v, want both nil for truncated header", rawIPTC, rawXMP)
 	}
@@ -173,7 +173,7 @@ func TestExtractTagValues_TruncatedEntry(t *testing.T) {
 	// plus a partial first entry.
 	buf := make([]byte, 8+2+6)
 	binary.LittleEndian.PutUint16(buf[8:], 2)
-	rawIPTC, rawXMP := ExtractTagValues(buf, 8, binary.LittleEndian, false)
+	rawIPTC, rawXMP := ExtractTagValues(buf, 8, binary.LittleEndian)
 	if rawIPTC != nil || rawXMP != nil {
 		t.Errorf("rawIPTC=%v rawXMP=%v, want both nil for truncated entry table", rawIPTC, rawXMP)
 	}
@@ -188,7 +188,7 @@ func TestExtractTagValues_OutOfLineOffsetOutOfBounds(t *testing.T) {
 	// Corrupt the out-of-line offset to point past the buffer.
 	binary.LittleEndian.PutUint32(data[8+2+8:], uint32(len(data)+1000)) //nolint:gosec // test fixture: small length
 
-	rawIPTC, rawXMP := ExtractTagValues(data, 8, binary.LittleEndian, false)
+	rawIPTC, rawXMP := ExtractTagValues(data, 8, binary.LittleEndian)
 	if rawIPTC != nil || rawXMP != nil {
 		t.Errorf("rawIPTC=%v rawXMP=%v, want both nil for out-of-bounds offset", rawIPTC, rawXMP)
 	}
@@ -211,7 +211,7 @@ func TestExtractTagValues_BigEndian(t *testing.T) {
 	buf = append(buf, xmp...)
 	order.PutUint32(buf[pos+8:], uint32(off)) //nolint:gosec // test helper
 
-	_, rawXMP := ExtractTagValues(buf, ifd0Off, order, false)
+	_, rawXMP := ExtractTagValues(buf, ifd0Off, order)
 	if !bytes.Equal(rawXMP, xmp) {
 		t.Errorf("rawXMP = %q, want %q", rawXMP, xmp)
 	}
@@ -219,15 +219,14 @@ func TestExtractTagValues_BigEndian(t *testing.T) {
 
 func TestExtractTagValues_Type13IsIFD(t *testing.T) {
 	t.Parallel()
-	// With type13IsIFD == true, type 13 is a 4-byte element (TIFF 6.0
-	// Extensions IFD type), matching format/tiff's type table.
+	// Type 13 is a 4-byte element (the IFD type of TIFF Tech Note 1).
 	payload := []byte{1, 2, 3, 4}
 	data := buildIFD0([]struct {
 		tag, typ uint16
 		value    []byte
 	}{{0x83BB, 13, payload}})
 
-	rawIPTC, _ := ExtractTagValues(data, 8, binary.LittleEndian, true)
+	rawIPTC, _ := ExtractTagValues(data, 8, binary.LittleEndian)
 	if !bytes.Equal(rawIPTC, payload) {
 		t.Errorf("rawIPTC = %v, want %v (type 13 as IFD)", rawIPTC, payload)
 	}

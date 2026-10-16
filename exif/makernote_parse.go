@@ -164,6 +164,15 @@ type MakerNoteLayout struct {
 	// Type 3, Olympus "OLYMPUS\0", Fujifilm, Pentax, Apple, ...), so the
 	// MakerNote can move unchanged.
 	TIFFRelative bool
+	// Base is the offset, from the first MakerNote byte, of the point that
+	// the value offsets of a layout with TIFFRelative false count from: 0,
+	// except for Nikon Type 3, whose offsets count from its embedded TIFF
+	// header (8 or 10 bytes into the MakerNote). It is 0 when TIFFRelative.
+	Base int
+
+	// layout is the detected layout, for the rules that depend on the vendor
+	// (see makernote_rebase.go).
+	layout mnLayout
 }
 
 // MakerNoteLayout reports the layout of e.MakerNote, detected as Parse
@@ -190,32 +199,54 @@ func (e *EXIF) MakerNoteLayout() (layout MakerNoteLayout, ok bool) {
 	if order == nil {
 		order = binary.LittleEndian
 	}
-	loc, base, ok := probeMakerNote(e.MakerNote, trimMake(makeValue), order)
+	return makerNoteLayoutOf(e.MakerNote, trimMake(makeValue), order)
+}
+
+// makerNoteLayoutOf is MakerNoteLayout for the MakerNote bytes mn of a camera
+// of Make mk (already trimmed) in a stream of byte order order.
+func makerNoteLayoutOf(mn, mk []byte, order binary.ByteOrder) (MakerNoteLayout, bool) {
+	loc, base, l, ok := probeMakerNote(mn, mk, order)
 	if !ok {
 		return MakerNoteLayout{}, false
 	}
-	return MakerNoteLayout{IFDOffset: loc.off, ByteOrder: loc.order, TIFFRelative: base == mnBaseTIFF}, true
+	lay := MakerNoteLayout{IFDOffset: loc.off, ByteOrder: loc.order, TIFFRelative: base == mnBaseTIFF, layout: l}
+	if !lay.TIFFRelative {
+		lay.Base = loc.base
+	}
+	return lay, true
 }
 
 // probeMakerNote parses mn on its own bytes as Parse would for a camera of
 // Make mk and returns where its IFD was found and its offset base; an
 // undetected MakerNote holding a plausible IFD at offset 0 is reported as
 // TIFF-relative (see MakerNoteLayout).
-func probeMakerNote(mn, mk []byte, order binary.ByteOrder) (loc mnLoc, base mnBase, ok bool) {
-	l := detectLayout(mn, mk)
+func probeMakerNote(mn, mk []byte, order binary.ByteOrder) (loc mnLoc, base mnBase, l mnLayout, ok bool) {
+	l = detectLayout(mn, mk)
 	f := mnLayouts[l]
 	v := blobView(mn)
 	v.loc = &loc
 	switch {
 	case l == mnNone:
-		if parsePlausibleIFD(v, 0, order) == nil {
-			return loc, 0, false
+		if parsePlausibleIFD(v, order) == nil {
+			return loc, 0, l, false
 		}
 		f.base = mnBaseTIFF
-	case f.parse == nil || f.base == mnBaseNone || f.parse(v, order) == nil:
-		return loc, 0, false
+	case f.parse == nil || f.base == mnBaseNone:
+		return loc, 0, l, false
+	case f.parse(v, order) == nil:
+		// A layout the Make selects for a plain IFD at offset 0 whose parser
+		// declines it (the headerless Nikon notes of the E-series read their
+		// count in the TIFF byte order, which the Nikon Type 1 parser, big
+		// endian, does not) is still an IFD of the TIFF byte order whose
+		// offsets count from the TIFF header: the layout of an unidentified
+		// note. Only the repair of a moved MakerNote uses this; Parse still
+		// reports no MakerNote IFD for it.
+		if f.ifdOffset != 0 || parsePlausibleIFD(v, order) == nil {
+			return loc, 0, l, false
+		}
+		f.base = mnBaseTIFF
 	}
-	return loc, f.base, loc.order != nil
+	return loc, f.base, l, loc.order != nil
 }
 
 // mnView is the MakerNote handed to a layout parser: its bytes, and the
@@ -248,6 +279,7 @@ type mnView struct {
 type mnLoc struct {
 	off   int
 	order binary.ByteOrder
+	base  int // offset of the origin of the value offsets, when it is inside the MakerNote
 }
 
 // blobView returns the view of a MakerNote parsed on its own bytes: value
@@ -442,7 +474,7 @@ func nikonType3(v mnView) *IFD {
 		return nil
 	}
 	if v.loc != nil && uint64(ifdOffset) <= uint64(len(tiff)) {
-		*v.loc = mnLoc{off: tiffStart + int(ifdOffset), order: order}
+		*v.loc = mnLoc{off: tiffStart + int(ifdOffset), order: order, base: tiffStart}
 	}
 	return ifd
 }

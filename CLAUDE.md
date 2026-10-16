@@ -74,7 +74,7 @@ sub-test name, so a failing test points directly at the violated specification c
 
 | Format | Official specification(s) |
 |---|---|
-| EXIF | CIPA DC-008 (Exif 3.0, 2023/2024) / DC-X008 (Exif 2.32, 2019) / JEITA CP-3451 |
+| EXIF | CIPA DC-008-2026 (Exif 3.1, JEITA CP-3451H) is the target; CIPA DC-008-2024 (Exif 3.0), DC-X008-2019 (Exif 2.32) and JEITA CP-3451 are compatibility references (2.x and 3.0 files stay readable) |
 | TIFF | Adobe TIFF Revision 6.0 (1992); BigTIFF (Aware Systems / libtiff) |
 | IPTC IIM | IPTC-NAA Information Interchange Model 4.2 (2014) |
 | IPTC Core/Ext | IPTC Photo Metadata Standard 2025.1 (Core 1.5 / Extension 1.9) |

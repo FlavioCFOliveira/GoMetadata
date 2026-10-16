@@ -155,8 +155,9 @@ var extendedTags = [...]extendedTag{ //nolint:gochecknoglobals // read-only spec
 	{0xA462, tagInfo{"SourceExposureTimesOfCompositeImage", TypeUndefined, 0}},
 	{0xA500, tagInfo{"Gamma", TypeRational, 1}},
 
-	// EXIF 3.0 tags (CIPA DC-008-2023 §4.6.5): UTF-8 text fields (type 13).
-	// IDs and names cross-checked against the Exiv2 tag reference.
+	// Exif 3.0 tags (CIPA DC-008-2024 §4.6.6, Table 9, p. 45): UTF-8 text
+	// fields (type 129; each may also be written as ASCII). IDs and names
+	// cross-checked against the Exiv2 tag reference.
 	{0xA436, tagInfo{"ImageTitle", TypeUTF8, 0}},
 	{0xA437, tagInfo{"Photographer", TypeUTF8, 0}},
 	{0xA438, tagInfo{"ImageEditor", TypeUTF8, 0}},
@@ -164,6 +165,22 @@ var extendedTags = [...]extendedTag{ //nolint:gochecknoglobals // read-only spec
 	{0xA43A, tagInfo{"RAWDevelopingSoftware", TypeUTF8, 0}},
 	{0xA43B, tagInfo{"ImageEditingSoftware", TypeUTF8, 0}},
 	{0xA43C, tagInfo{"MetadataEditingSoftware", TypeUTF8, 0}},
+
+	// Exif 3.1 tags (CIPA DC-008-2026, January 2026; the tags new in 3.1, all
+	// optional at every support level, Table 18, pp. 94-96):
+	// LearningOptOutIn §4.6.6.4.3, pp. 49-51 (UNDEFINED, any count);
+	// DevelopmentType §4.6.6.7.47, pp. 72-73 (SHORT 1);
+	// DevelopmentTypeDescription §4.6.6.7.48, pp. 73-74 (UTF-8 only: the
+	// only tag of Exif 3.1 that may not be ASCII); DistortionCorrection,
+	// ChromaticAberrationCorrection, ShadingCorrection and NoiseReduction
+	// §4.6.6.7.49-52, p. 74 (SHORT 1).
+	{0x9287, tagInfo{"LearningOptOutIn", TypeUndefined, 0}},
+	{0xA40D, tagInfo{"DevelopmentType", TypeShort, 1}},
+	{0xA40E, tagInfo{"DevelopmentTypeDescription", TypeUTF8, 0}},
+	{0xA40F, tagInfo{"DistortionCorrection", TypeShort, 1}},
+	{0xA410, tagInfo{"ChromaticAberrationCorrection", TypeShort, 1}},
+	{0xA411, tagInfo{"ShadingCorrection", TypeShort, 1}},
+	{0xA412, tagInfo{"NoiseReduction", TypeShort, 1}},
 
 	// DNG tags. Adobe DNG Specification 1.7.1.0 (2023), "DNG Tag Reference" (tag,
 	// type, count); names and primary types cross-checked against libtiff

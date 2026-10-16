@@ -1,8 +1,10 @@
 // Package exif implements an EXIF/TIFF parser and writer.
 //
-// Compliance: CIPA DC-008-2023 / JEITA CP-3451 (EXIF 3.0) and TIFF 6.0.
-// Spec citations in comments reference the CIPA document as "EXIF §<section>"
-// and the TIFF 6.0 spec as "TIFF §<section>".
+// Compliance target: CIPA DC-008-2026 / JEITA CP-3451H (Exif 3.1), which keeps
+// the structure of Exif 3.0 (CIPA DC-008-2024) and 2.x readable, and Adobe
+// TIFF Revision 6.0. Spec citations in comments reference the CIPA document
+// as "Exif 3.1 §<section>, p. <printed page>" (a citation to an older edition
+// names it) and the TIFF 6.0 spec as "TIFF §<section>".
 package exif
 
 import (
@@ -75,6 +77,23 @@ type EXIF struct {
 	// truncate all 64-bit offsets to 32 bits.
 	// BigTIFF spec §2 (Aware Systems / libtiff); audit finding #107; task #264.
 	BigTIFF bool
+
+	// CompressedPrimary reports that the primary image of the container is
+	// JPEG-compressed data, the case of an Exif-JPEG file. It selects the
+	// "Compressed" column of the tag support levels of Exif 3.1 §4.6.9,
+	// Tables 17-18 (pp. 93-96) for the IFDs this package creates on its own
+	// (see New and the Set* methods): the tags ComponentsConfiguration,
+	// PixelXDimension and PixelYDimension are mandatory there and not
+	// allowed for uncompressed data, and the same holds for YCbCrPositioning
+	// in IFD0. gometadata.Read sets it for a JPEG source; the zero value
+	// means "not known to be compressed", which creates no such tag.
+	CompressedPrimary bool
+
+	// sizePending is set when this package created an ExifIFD for a
+	// compressed primary image without PixelXDimension and PixelYDimension,
+	// which are mandatory there (Exif 3.1 Table 18, p. 95) and which only the
+	// container knows. NeedsImageSize reports it; SetImageSize clears it.
+	sizePending bool
 
 	// Warnings is a slice of diagnostic messages produced during parsing.
 	// A non-nil Warnings slice does not indicate a parse failure; the EXIF
@@ -496,6 +515,13 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 		// test fixtures) and avoids the overhead of calling parseExifSubIFDs and
 		// parseGPSSubIFD when we already know they would return nil.
 
+		// Task #319: the Exif and GPS IFDs that an IFD of the chain after IFD0
+		// (the thumbnail IFD) addresses itself are carried (Exif 3.1 Table 21,
+		// p. 99). One nil check on the common file.
+		if ifd0.Next != nil {
+			attachChainSubIFDs(b, ifd0, order, &budget, cfg.aliasThumbnail, false)
+		}
+
 		// task #200: materialise all deferred warn records into []string ONCE here.
 		// On clean files warnRecs is nil so this is a nil-check + return nil (zero cost).
 		e.Warnings = materializeWarnings(warnRecs)
@@ -543,6 +569,11 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 		e.GPSIFD, gpsWarnRecs = parseGPSSubIFDBigTIFF(b, ifd0, order, &budget, cfg.aliasThumbnail)
 		warnRecs = append(warnRecs, gpsWarnRecs...)
 
+		// Task #319: see the classic-TIFF branch.
+		if ifd0.Next != nil {
+			attachChainSubIFDs(b, ifd0, order, &budget, cfg.aliasThumbnail, true)
+		}
+
 		// task #200: materialise all deferred warn records into []string ONCE here.
 		e.Warnings = materializeWarnings(warnRecs)
 		return e, nil
@@ -582,7 +613,7 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 // unknown type codes must re-inject that data into the stream after calling Encode.
 // Task #84 pins this behaviour; any change to it is a conscious, tested decision.
 func Encode(e *EXIF) ([]byte, error) {
-	out, _, err := serialise(nil, e, false)
+	out, _, err := serialise(nil, e, false, nil)
 	return out, err
 }
 
@@ -595,7 +626,7 @@ func Encode(e *EXIF) ([]byte, error) {
 // cases. A caller that appends more data after the encoded stream can size
 // dst for the whole output up front and avoid any regrowth.
 func EncodeInto(dst []byte, e *EXIF) ([]byte, error) {
-	out, _, err := serialise(dst, e, false)
+	out, _, err := serialise(dst, e, false, nil)
 	return out, err
 }
 
@@ -609,7 +640,7 @@ var errEncodedSizeOverflow = errors.New("exif: encoded size exceeds the addressa
 // The size is computed by the same layout arithmetic Encode uses to place
 // every IFD, so it is exact, and it costs a fraction of an encode.
 func EncodedSize(e *EXIF) (int, error) {
-	_, total, err := serialise(nil, e, true)
+	_, total, err := serialise(nil, e, true, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -968,40 +999,36 @@ func (e *EXIF) ifd0BigEndian() bool {
 	return e.ifd0ByteOrder() == binary.BigEndian
 }
 
-// SetCameraModel sets IFD0 tag 0x0110 (Model, EXIF §4.6.4 Table 3).
+// SetCameraModel sets IFD0 tag 0x0110 (Model, Exif 3.1 Table 6, pp. 31-32); see setText for the type chosen).
 func (e *EXIF) SetCameraModel(s string) {
 	if e == nil || e.IFD0 == nil {
 		return
 	}
-	v := asciiValue(s)
-	e.IFD0.set(TagModel, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
+	e.setText(e.IFD0, TagModel, s)
 }
 
-// SetCaption sets IFD0 tag 0x010E (ImageDescription, EXIF §4.6.4 Table 3).
+// SetCaption sets IFD0 tag 0x010E (ImageDescription, Exif 3.1 Table 6, pp. 31-32); see setText for the type chosen).
 func (e *EXIF) SetCaption(s string) {
 	if e == nil || e.IFD0 == nil {
 		return
 	}
-	v := asciiValue(s)
-	e.IFD0.set(TagImageDescription, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
+	e.setText(e.IFD0, TagImageDescription, s)
 }
 
-// SetCopyright sets IFD0 tag 0x8298 (Copyright, EXIF §4.6.4 Table 3).
+// SetCopyright sets IFD0 tag 0x8298 (Copyright, Exif 3.1 Table 6, pp. 31-32); see setText for the type chosen).
 func (e *EXIF) SetCopyright(s string) {
 	if e == nil || e.IFD0 == nil {
 		return
 	}
-	v := asciiValue(s)
-	e.IFD0.set(TagCopyright, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
+	e.setText(e.IFD0, TagCopyright, s)
 }
 
-// SetCreator sets IFD0 tag 0x013B (Artist, EXIF §4.6.4 Table 3).
+// SetCreator sets IFD0 tag 0x013B (Artist, Exif 3.1 Table 6, pp. 31-32); see setText for the type chosen).
 func (e *EXIF) SetCreator(s string) {
 	if e == nil || e.IFD0 == nil {
 		return
 	}
-	v := asciiValue(s)
-	e.IFD0.set(TagArtist, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
+	e.setText(e.IFD0, TagArtist, s)
 }
 
 // SetOrientation sets IFD0 tag 0x0112 (Orientation, EXIF §4.6.4 Table 3).
@@ -1021,11 +1048,15 @@ func (e *EXIF) SetOrientation(v uint16) {
 // ensureExifIFD creates ExifIFD if nil and ensures IFD0 carries a placeholder
 // TagExifIFDPointer entry so that Encode() will wire the real offset.
 // It is called by all setters that target the ExifIFD.
+//
+// A created ExifIFD carries the tags that Exif 3.1 marks mandatory (see
+// addExifIFDDefaults); an ExifIFD that already exists is never touched.
 func (e *EXIF) ensureExifIFD() {
 	if e.ExifIFD != nil {
 		return
 	}
 	e.ExifIFD = &IFD{}
+	e.addExifIFDDefaults()
 	if e.IFD0 != nil && e.IFD0.Get(TagExifIFDPointer) == nil {
 		// Value 0 is a placeholder; encode() (write.go) overwrites it with the
 		// correct absolute offset once the ExifIFD is serialised.
@@ -1034,13 +1065,12 @@ func (e *EXIF) ensureExifIFD() {
 	}
 }
 
-// SetMake sets IFD0 tag 0x010F (Make, EXIF §4.6.4 Table 3).
+// SetMake sets IFD0 tag 0x010F (Make, Exif 3.1 Table 6, pp. 31-32); see setText for the type chosen).
 func (e *EXIF) SetMake(s string) {
 	if e == nil || e.IFD0 == nil {
 		return
 	}
-	v := asciiValue(s)
-	e.IFD0.set(TagMake, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
+	e.setText(e.IFD0, TagMake, s)
 }
 
 // SetDateTimeOriginal sets ExifIFD tag 0x9003 (DateTimeOriginal, EXIF §4.6.5)
@@ -1132,14 +1162,14 @@ func (e *EXIF) SetFocalLength(mm float64) {
 	e.ExifIFD.set(TagFocalLength, TypeRational, 1, b, order == binary.BigEndian)
 }
 
-// SetLensModel sets ExifIFD tag 0xA434 (LensModel, EXIF §4.6.5).
+// SetLensModel sets ExifIFD tag 0xA434 (LensModel, Exif 3.1 Table 9, p. 45;
+// see setText for the type chosen).
 func (e *EXIF) SetLensModel(s string) {
 	if e == nil || e.IFD0 == nil {
 		return
 	}
 	e.ensureExifIFD()
-	v := asciiValue(s)
-	e.ExifIFD.set(TagLensModel, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
+	e.setText(e.ExifIFD, TagLensModel, s)
 }
 
 // SetImageSize sets ExifIFD tags 0xA002 and 0xA003 (PixelXDimension /
@@ -1156,6 +1186,7 @@ func (e *EXIF) SetImageSize(width, height uint32) {
 	isBig := order == binary.BigEndian
 	e.ExifIFD.set(TagPixelXDimension, TypeLong, 1, bw[:], isBig)
 	e.ExifIFD.set(TagPixelYDimension, TypeLong, 1, bh[:], isBig)
+	e.sizePending = false
 }
 
 // validWGS84Coords reports whether lat and lon are finite, non-NaN values
@@ -1254,11 +1285,13 @@ func (e *EXIF) SetGPS(lat, lon float64) {
 	latDMS := decimalToDMSBytes(lat, order)
 	lonDMS := decimalToDMSBytes(lon, order)
 
-	// Write GPSVersionID (0x0000, BYTE, count=4) = {2,3,0,0} only when not already
-	// present. EXIF §4.6.6 Table 15: GPSVersionID indicates the GPS IFD version;
-	// {2,3,0,0} corresponds to EXIF 2.3/3.0 GPS attribute information revision.
+	// GPSVersionID (0x0000, BYTE, count 4) is mandatory when any GPS tag is
+	// recorded and is 2.4.0.0 in Exif 3.1 (§4.6.7.1.1, p. 83: "The version is
+	// given as 2.4.0.0. This tag is mandatory when at least one tag related to
+	// the GPS is present"; Exif 3.0 §4.6.7.1.1 says the same, 2.3 said 2.3.0.0).
+	// Only written when absent, so the version of an existing GPS IFD stays.
 	if gps.Get(TagGPSVersionID) == nil {
-		gps.set(TagGPSVersionID, TypeByte, 4, []byte{2, 3, 0, 0}, isBig)
+		gps.set(TagGPSVersionID, TypeByte, 4, []byte{2, 4, 0, 0}, isBig)
 	}
 	gps.set(TagGPSLatitudeRef, TypeASCII, 2, []byte(latRef), isBig)
 	gps.set(TagGPSLatitude, TypeRational, 3, latDMS[:], isBig)

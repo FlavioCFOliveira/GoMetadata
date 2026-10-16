@@ -2949,7 +2949,7 @@ func TestThumbnailRoundTripBothOrders(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// #21 — TypeUTF8 (CIPA DC-008-2023 §4.6.3, type code 13)
+// #21 — TypeUTF8 (Exif 3.1 §4.6.2, p. 28, type code 129)
 // ---------------------------------------------------------------------------
 
 // TestTypeUTF8RoundTrip verifies that an IFDEntry with TypeUTF8 survives a
@@ -3058,10 +3058,10 @@ func TestUTF8ValueHelper(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// #22 — SetGPS writes GPSVersionID {2,3,0,0} (EXIF §4.6.6 Table 15)
+// #22 — SetGPS writes GPSVersionID {2,4,0,0} (Exif 3.1 §4.6.7.1.1, p. 83: 2.4.0.0)
 // ---------------------------------------------------------------------------
 
-// TestSetGPSWritesVersionID verifies that SetGPS inserts GPSVersionID = {2,3,0,0}
+// TestSetGPSWritesVersionID verifies that SetGPS inserts GPSVersionID = {2,4,0,0}
 // into the GPS IFD when called on a fresh EXIF struct.
 func TestSetGPSWritesVersionID(t *testing.T) {
 	t.Parallel()
@@ -3081,7 +3081,7 @@ func TestSetGPSWritesVersionID(t *testing.T) {
 	if entry.Count != 4 {
 		t.Errorf("GPSVersionID Count = %d, want 4", entry.Count)
 	}
-	want := []byte{2, 3, 0, 0}
+	want := []byte{2, 4, 0, 0}
 	if !bytes.Equal(entry.Value, want) {
 		t.Errorf("GPSVersionID value = %v, want %v", entry.Value, want)
 	}
@@ -3129,7 +3129,7 @@ func TestSetGPSVersionIDRoundTrip(t *testing.T) {
 	if entry == nil {
 		t.Fatal("GPSVersionID missing after round-trip")
 	}
-	want := []byte{2, 3, 0, 0}
+	want := []byte{2, 4, 0, 0}
 	if !bytes.Equal(entry.Value, want) {
 		t.Errorf("GPSVersionID after round-trip = %v, want %v", entry.Value, want)
 	}

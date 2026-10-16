@@ -262,6 +262,27 @@ moov/uuid; BigTIFF RAW (8-byte offsets, 20-byte entries, u64 counts).
   copy of `Nikon.nef` whose values are made consistent follows the structures (`exiftool -NikonCaptureOffsets`
   shows the new offsets). `TestTask355CorpusNEF`.
 
+**Rule IDs (TIFF-family write: bytes after the data; sub-test names).**
+- **TIFF-TAIL-01** (task #360) A TIFF-family write carries the tail of the source: the bytes after the last byte that
+  any IFD addresses (the image blocks, and the IFDs, sub-IFDs and out-of-line values of the metadata, found by the
+  extent scanner of `Extract`) are written after the last block, unchanged. It covers a trailer that nothing
+  addresses (unknown or private data appended by another writer) through the whole-file and the streaming path.
+  ExifTool `ExifTool.pm` (trailer handling, study) and Apache Commons Imaging `TiffImageWriterLossless` (keeps
+  unknown bytes; Apache-2.0, study) do the same in spirit. `TestTask360UnknownTrailerIsCarried`.
+- **TIFF-TAIL-02** An AFCP trailer that another trailer follows is found (the tail is scanned forward, not only
+  from the end of the file) and rewritten as in TIFF-AFCP-01; the bytes after it are carried unchanged. A malformed
+  trailer is carried byte for byte, never rewritten. `TestTask360AFCPFollowedByAnotherTrailer`,
+  `TestTask354TIFFTrailerEdgeCases`.
+- **TIFF-TAIL-03** Bytes between addressed regions, and the IFDs and values of the source that the write
+  regenerates (a source whose IFD follows the image data, as libtiff writes it), are not carried: they are exactly
+  what the write replaces, and carrying them would keep stale metadata. A tail larger than 16 MiB is carried
+  without the trailer rewrite. `TestTask360StaleStructuresAreNotCarried`.
+- **TIFF-TAIL-04** A file that ends with its image data, or with its structures, is written as before: nothing is
+  appended, and the scan is skipped when the last image block ends the file. `TestTask360NoTailIsNoChange`.
+- **JPEG-SIZE-01** (task #321) `jpeg.ImageSize` returns the dimensions of the first frame header (SOF0-SOF15 but not
+  DHT/JPG/DAC; ITU-T T.81 §B.2.2), skipping each segment by its length, and `ErrNoFrameHeader` at SOS/EOI, at the end
+  of the stream, for a zero height, or for a damaged stream. `TestImageSize`, `FuzzImageSize`.
+
 ## Cross-cutting: EXIF payload-prefix matrix (high-value test)
 | Container | EXIF location | Prefix before TIFF header |
 |---|---|---|

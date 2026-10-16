@@ -102,6 +102,8 @@ type tagInfo struct {
 
 // Standard EXIF IFD tags (EXIF §4.6.5 Table 4).
 const (
+	TagExifVersion               TagID = 0x9000 // Undefined 4 ("0300"; Exif 3.1 §4.6.6.1.1, p. 47)
+	TagComponentsConfiguration   TagID = 0x9101 // Undefined 4 (Exif 3.1 §4.6.6.3.3, pp. 48-49)
 	TagExposureTime              TagID = 0x829A // Rational (seconds)
 	TagFNumber                   TagID = 0x829D // Rational (f/N)
 	TagExposureProgram           TagID = 0x8822 // Short

@@ -1,9 +1,12 @@
 package exif
 
 import (
+	"bytes"
 	"encoding/binary"
 	"os"
 	"testing"
+
+	"github.com/FlavioCFOliveira/GoMetadata/internal/testutil"
 )
 
 // FuzzParseEXIF exercises the EXIF parser against arbitrary byte inputs.
@@ -167,6 +170,29 @@ func FuzzParseEXIF(f *testing.F) {
 		f.Add(data)
 	}
 
+	// Seeds with a MakerNote (tasks #317, #318): the TIFF-relative layouts, the
+	// Nikon PreviewIFD that runs past the declared end of the note, and a
+	// value stored outside the note (testutil.MakerNoteTIFF).
+	for _, spec := range []testutil.MNSpec{
+		{Make: "Canon", Order: binary.LittleEndian, TIFFRelative: true, Footer: true, PadBefore: 6, Entries: mnEntries()},
+		{Make: "OLYMPUS OPTICAL CO.,LTD", Order: binary.LittleEndian, Prefix: []byte("OLYMP\x00\x01\x00"), TIFFRelative: true, PadBefore: 6,
+			Entries: append(mnEntries(), testutil.MNEntry{Tag: 0x0004, Type: 4, Count: 3, Value: mnTriple(), Outside: true})},
+		nikon3Spec([]byte{0xFF, 0xD8, 1, 2, 3, 4, 0xFF, 0xD9}),
+	} {
+		tiff, _ := testutil.MakerNoteTIFF(spec)
+		f.Add(tiff)
+	}
+	// Seed: an IFD1 whose pointer tags address IFDs of their own (task #319).
+	{
+		e := chainEXIF(1, 1, &SubIFDs{
+			Exif: &IFD{Entries: []IFDEntry{chainEnt(TagExposureTime, TypeRational, 1, []byte{1, 0, 0, 0, 100, 0, 0, 0})}},
+			GPS:  &IFD{Entries: []IFDEntry{chainEnt(TagGPSVersionID, TypeByte, 4, []byte{2, 4, 0, 0})}},
+		}, false)
+		if out, err := Encode(e); err == nil {
+			f.Add(out)
+		}
+	}
+
 	f.Fuzz(func(t *testing.T, b []byte) {
 		// Must not panic on any input.
 		e, err := Parse(b)
@@ -205,6 +231,23 @@ func FuzzParseEXIF(f *testing.F) {
 				if reErr == nil && e2 != nil && e.BigTIFF != e2.BigTIFF {
 					t.Errorf("Encode round-trip changed BigTIFF provenance: before=%v after=%v", e.BigTIFF, e2.BigTIFF)
 				}
+				// EncodedSize replays Encode's layout, including the IFDs
+				// attached to the chain (task #319).
+				if n, sizeErr := EncodedSize(e); sizeErr != nil || n != len(encoded) {
+					t.Errorf("EncodedSize = %d, %v; len(Encode) = %d", n, sizeErr, len(encoded))
+				}
+			}
+			// Tasks #317, #318: the MakerNote repair must not panic, must not
+			// modify its inputs, and its output must parse.
+			before := append([]byte(nil), b...)
+			rebased, rbErr := EncodeRebased(e, b)
+			if rbErr == nil {
+				if _, reErr := Parse(rebased); reErr != nil && encErr == nil {
+					t.Errorf("EncodeRebased output does not parse although Encode's does: %v", reErr)
+				}
+			}
+			if !bytes.Equal(before, b) {
+				t.Error("EncodeRebased modified the source stream")
 			}
 		}
 	})

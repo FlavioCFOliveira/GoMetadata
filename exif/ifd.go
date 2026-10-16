@@ -577,10 +577,36 @@ gpsSection:
 // and 0x0202 JPEGInterchangeFormatLength).  It is populated by parseSingleIFD
 // so that Encode can re-append the bytes at the correct new offset and patch
 // tag 0x0201 accordingly.  Nil means no JPEG thumbnail is attached.
+//
+// Sub holds the sub-IFDs addressed by the pointer tags of an IFD of the chain
+// that follows IFD0 (a thumbnail IFD, "1st IFD"): see SubIFDs. It is nil for
+// IFD0 (whose sub-IFDs are the ExifIFD, GPSIFD and InteropIFD fields of EXIF)
+// and for every chained IFD that has none of its own.
 type IFD struct {
 	Entries       []IFDEntry
-	Next          *IFD   // linked IFDs (e.g. IFD1 for thumbnail)
-	ThumbnailData []byte // raw JPEG thumbnail bytes; non-nil when present
+	Next          *IFD     // linked IFDs (e.g. IFD1 for thumbnail)
+	ThumbnailData []byte   // raw JPEG thumbnail bytes; non-nil when present
+	Sub           *SubIFDs // sub-IFDs of a chained IFD (see SubIFDs); nil when none
+}
+
+// SubIFDs holds the sub-IFDs that an IFD of the chain after IFD0 addresses
+// through its own pointer tags. Exif 3.1 §4.6.9.2, Table 21, p. 99, lists the
+// Exif IFD pointer (0x8769) and the GPS Info IFD pointer (0x8825) among the
+// optional tags of the 1st IFD, so a thumbnail IFD may carry an Exif IFD and a
+// GPS IFD of its own (the Olympus μ Digital 800 of the corpus does: a copy of
+// the primary image's tags). Exif is the IFD that 0x8769 addresses, GPS the
+// one of 0x8825, Interop the one that the Interoperability pointer (0xA005)
+// of Exif addresses.
+//
+// Parse fills a field only for an IFD that differs from the one IFD0 itself
+// addresses with the same tag and that it can parse. A pointer that addresses
+// the IFD of IFD0 is rewritten by Encode to the block it writes for it; a
+// pointer that addresses an IFD that cannot be parsed is dropped (see
+// chainEntries).
+type SubIFDs struct {
+	Exif    *IFD
+	GPS     *IFD
+	Interop *IFD
 }
 
 // IFDEntry represents a single TIFF directory entry (TIFF §2, 12 bytes each).
@@ -686,9 +712,9 @@ func parseIFDEntry(b []byte, e int, order binary.ByteOrder) (IFDEntry, bool) {
 	typ := DataType(order.Uint16(b[e+2:]))
 	cnt := order.Uint32(b[e+4:])
 
-	// entryTypeSize, not typeSize: type 13 on an IFD-pointer tag is the
-	// 4-byte TIFF IFD type, not a 1-byte string (task #311).
-	sz := entryTypeSize(tag, typ)
+	// Type 13 is the 4-byte TIFF IFD type (TypeIFD; TIFF Tech Note 1) and type
+	// 129 the 1-byte Exif UTF-8 string (TypeUTF8; Exif 3.1 §4.6.2, p. 28).
+	sz := typeSize(typ)
 	totalSize := uint64(sz) * uint64(cnt)
 
 	// Every Value aliases b (zero-copy) and is capped at its own length with
@@ -1677,7 +1703,7 @@ func parseIFDEntryBigTIFF(b []byte, e int, order binary.ByteOrder) (IFDEntry, bo
 		return IFDEntry{}, false
 	}
 
-	sz := entryTypeSizeBigTIFF(tag, typ) // type 13 on an IFD-pointer tag is 4 bytes (task #311)
+	sz := typeSizeBigTIFF(typ) // type 13 (TypeIFD) is 4 bytes, type 129 (TypeUTF8) 1 byte
 	// Every Value is capped at its own length (full slice expression), as in
 	// parseIFDEntry (task #296).
 	if sz == 0 {
@@ -1996,10 +2022,9 @@ func readBigTIFFSubIFDOffset(e *IFDEntry) (uint64, bool) {
 			return 0, false
 		}
 		return uint64(e.order().Uint16(e.Value)), true
-	case TypeLong, TypeUTF8:
+	case TypeLong, TypeIFD:
 		// TypeLong (4 bytes): used by tiffcp / libtiff even in BigTIFF containers.
-		// Type 13 is the 4-byte TIFF IFD type on these pointer tags (see
-		// entryTypeSize; task #311).
+		// Type 13 is the 4-byte TIFF IFD type (TypeIFD; TIFF Tech Note 1).
 		if len(e.Value) < 4 {
 			return 0, false
 		}
@@ -2030,8 +2055,8 @@ func (ifd *IFD) Get(tag TagID) *IFDEntry {
 }
 
 // String decodes the entry value as a NUL-terminated string.
-// Handles TypeASCII (TIFF §2, US-ASCII) and TypeUTF8 (CIPA DC-008-2023 §4.6.3,
-// UTF-8 encoded Unicode). Both types use element size 1 and NUL termination.
+// Handles TypeASCII (TIFF §2, US-ASCII) and TypeUTF8 (type 129, Exif 3.1 §4.6.2,
+// p. 28: UTF-8 encoded Unicode). Both types use element size 1 and NUL termination.
 func (e *IFDEntry) String() string {
 	if (e.Type != TypeASCII && e.Type != TypeUTF8) || len(e.Value) == 0 {
 		return ""
@@ -2255,8 +2280,8 @@ func asciiValue(s string) []byte {
 }
 
 // utf8Value encodes s as a NUL-terminated UTF-8 byte slice suitable for
-// IFDEntry.Value (TypeUTF8 = 13, CIPA DC-008-2023 §4.6.3). Analogous to
-// asciiValue but for the EXIF 3.0 UTF-8 string type.
+// IFDEntry.Value (TypeUTF8 = 129, Exif 3.1 §4.6.2, p. 28). Analogous to
+// asciiValue but for the Exif 3.0 UTF-8 string type.
 func utf8Value(s string) []byte {
 	v := make([]byte, len(s)+1)
 	copy(v, s)
@@ -2399,7 +2424,7 @@ func ifdTotalSize(entries []IFDEntry) uint32 {
 	valueParity := uint64(0)
 
 	for _, e := range entries {
-		ts := entryTypeSize(e.Tag, e.Type)
+		ts := typeSize(e.Type)
 		if ts == 0 {
 			continue
 		}
@@ -2504,7 +2529,7 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 		order.PutUint16(entryBuf[p+2:], uint16(e.Type))
 		order.PutUint32(entryBuf[p+4:], e.Count)
 
-		ts := entryTypeSize(e.Tag, e.Type)
+		ts := typeSize(e.Type)
 		total := uint64(ts) * uint64(e.Count)
 
 		if ts == 0 || total <= 4 {
@@ -2544,7 +2569,7 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 	out = slices.Grow(out, int(valueAreaLen)) // valueAreaLen bounded by ifdTotalSize's own MaxUint32-saturating cap, itself far below every caller's 256 MiB aggregate input cap — fits int on every supported platform
 	curOff := valueOff
 	for _, e := range entries {
-		ts := entryTypeSize(e.Tag, e.Type)
+		ts := typeSize(e.Type)
 		total := uint64(ts) * uint64(e.Count)
 		if ts == 0 || total <= 4 {
 			continue // inline value: already written into entryBuf by pass 1
@@ -2581,7 +2606,7 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 // before each out-of-line value whose running offset is odd, the full
 // len(Value) bytes (zero-filled up to Count × type size), and a trailing pad
 // when the block ends at an odd output length. thumbPatched mirrors
-// patchThumbnailEntries: the JPEGInterchangeFormat and
+// chainEntries: the JPEGInterchangeFormat and
 // JPEGInterchangeFormatLength values are 4 bytes long.
 func ifdWrittenLen(entries []IFDEntry, startOff uint64, bigTIFF, thumbPatched bool) uint64 { //nolint:gocyclo // mirrors writeIFD/writeIFDBigTIFF layout rules branch for branch
 	fixed, threshold := uint64(2+len(entries)*12+4), uint64(4)
@@ -2596,9 +2621,9 @@ func ifdWrittenLen(entries []IFDEntry, startOff uint64, bigTIFF, thumbPatched bo
 		e := &entries[i]
 		var ts uint64
 		if bigTIFF {
-			ts = entryTypeSizeBigTIFF(e.Tag, e.Type)
+			ts = typeSizeBigTIFF(e.Type)
 		} else {
-			ts = uint64(entryTypeSize(e.Tag, e.Type))
+			ts = uint64(typeSize(e.Type))
 		}
 		total := ts * uint64(e.Count)
 		if ts == 0 || total <= threshold {
@@ -2682,7 +2707,7 @@ func ifdTotalSizeBigTIFF(entries []IFDEntry) uint64 {
 
 	valueParity := uint64(0)
 	for _, e := range entries {
-		ts := entryTypeSizeBigTIFF(e.Tag, e.Type) // #1 correctness rule: never typeSize here.
+		ts := typeSizeBigTIFF(e.Type) // #1 correctness rule: never typeSize here.
 		if ts == 0 {
 			continue
 		}
@@ -2747,7 +2772,7 @@ func writeIFDBigTIFF(out []byte, entries []IFDEntry, order binary.ByteOrder, sta
 		// #1 correctness rule: typeSizeBigTIFF, never typeSize (see the
 		// section comment above ifdTotalSizeBigTIFF). Conflating the two
 		// would silently truncate every LONG8/SLONG8/IFD8 (16/17/18) value.
-		ts := entryTypeSizeBigTIFF(e.Tag, e.Type)
+		ts := typeSizeBigTIFF(e.Type)
 		total := ts * uint64(e.Count)
 
 		if ts == 0 || total <= 8 {
@@ -2787,7 +2812,7 @@ func writeIFDBigTIFF(out []byte, entries []IFDEntry, order binary.ByteOrder, sta
 	out = slices.Grow(out, int(valueAreaLen)) // valueAreaLen bounded by ifdTotalSizeBigTIFF's own MaxUint32-saturating cap, itself far below every caller's 256 MiB aggregate input cap — fits int on every supported platform
 	curOff := valueOff
 	for _, e := range entries {
-		ts := entryTypeSizeBigTIFF(e.Tag, e.Type)
+		ts := typeSizeBigTIFF(e.Type)
 		total := ts * uint64(e.Count)
 		if ts == 0 || total <= 8 {
 			continue // inline value: already written into entryBuf by pass 1

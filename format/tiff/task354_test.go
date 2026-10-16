@@ -260,15 +260,18 @@ func TestTask354TIFFTrailerEdgeCases(t *testing.T) {
 		}
 	})
 
-	t.Run("TIFF-AFCP-03/malformed trailer is not invented", func(t *testing.T) {
+	t.Run("TIFF-AFCP-03/malformed trailer is carried, not rewritten", func(t *testing.T) {
 		t.Parallel()
 		good := t354AFCP(binary.BigEndian, "AXS!", int64(len(plain)), entries)
 		binary.BigEndian.PutUint32(good[len(good)-8:], 3) // the EOF record points elsewhere
 		src := append(bytes.Clone(plain), good...)
 		out := t354Write(t, src, true, t354NewIIM)
 		base := t354Write(t, plain, true, t354NewIIM)
-		if !bytes.Equal(out, base) {
-			t.Error("an inconsistent trailer changed the output")
+		// Task #360: the bytes after the data the write moves are carried
+		// unchanged, so an inconsistent trailer is not rewritten (its IPTC copy
+		// keeps the old IIM and its offsets stay) and is not lost either.
+		if !bytes.Equal(out, append(bytes.Clone(base), good...)) {
+			t.Error("an inconsistent trailer was not carried byte for byte after the unchanged output")
 		}
 	})
 }

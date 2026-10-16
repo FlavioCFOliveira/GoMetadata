@@ -2,7 +2,6 @@ package gometadata
 
 import (
 	"bytes"
-	"encoding/binary"
 	"sync"
 	"time"
 
@@ -841,17 +840,18 @@ func (m *Metadata) canCarryXMP() bool {
 
 // ensureEXIF constructs a minimal valid *exif.EXIF when m.EXIF is nil and the
 // detected format can carry EXIF. The constructed EXIF has a non-nil IFD0 and
-// ByteOrder = binary.LittleEndian so that m.Validate() and exif.Encode() succeed.
+// ByteOrder = binary.LittleEndian so that m.Validate() and exif.Encode() succeed,
+// and carries the mandatory tags of its IFDs (exif.New).
 //
 // EXIF validity invariant: m.EXIF != nil ⟹ m.EXIF.IFD0 != nil (Validate §).
 func (m *Metadata) ensureEXIF() {
 	if m.EXIF != nil || m.exifOpaque || !m.canCarryEXIF() {
 		return
 	}
-	m.EXIF = &exif.EXIF{
-		ByteOrder: binary.LittleEndian,
-		IFD0:      &exif.IFD{},
-	}
+	// exif.New adds the tags that Exif 3.1 marks mandatory in the IFDs it
+	// creates (Tables 17-18, pp. 93-96); the column "Compressed" applies to a
+	// JPEG primary image (task #321).
+	m.EXIF = exif.New(format.FormatID(m.format) == format.FormatJPEG)
 }
 
 // ensureIPTC constructs a minimal valid *iptc.IPTC when m.IPTC is nil and the

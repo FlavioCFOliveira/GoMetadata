@@ -37,15 +37,10 @@ const (
 // never read, so a TIFF-based RAW file (ORF, RW2) may be passed with its
 // original, non-standard magic. ifd0Off is the absolute offset of IFD0.
 //
-// type13IsIFD selects the element size for type code 13. When true, type 13
-// is the TIFF Extensions IFD type (4 bytes per element); when false, entries
-// declaring type 13 are skipped as unrecognised. format/tiff passes true to
-// match its own type table; format/raw/orf and format/raw/rw2 pass false.
-//
 // TIFF 6.0 §2: classic IFD entries are 12 bytes (tag, type, count,
 // value-or-offset); a value is stored inline when its total byte size is
 // ≤ 4 bytes, otherwise value-or-offset holds an absolute offset to the value.
-func ExtractTagValues(data []byte, ifd0Off uint32, order binary.ByteOrder, type13IsIFD bool) (rawIPTC, rawXMP []byte) { //nolint:gocyclo // IPTC trimming branch is inherent to TypeLong-vs-TypeUndefined handling; extracting a helper would reduce clarity
+func ExtractTagValues(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawIPTC, rawXMP []byte) { //nolint:gocyclo // IPTC trimming branch is inherent to TypeLong-vs-TypeUndefined handling; extracting a helper would reduce clarity
 	// CWE-681/190: compare in uint64 before converting ifd0Off to int. On a
 	// 32-bit platform int(ifd0Off) for ifd0Off >= 2^31 is negative and would
 	// pass an int-typed bound check, then panic on data[ifd0Off:].
@@ -70,7 +65,7 @@ func ExtractTagValues(data []byte, ifd0Off uint32, order binary.ByteOrder, type1
 		typ := order.Uint16(data[e+2:])
 		cnt := order.Uint32(data[e+4:])
 
-		sz := TypeSize(typ, type13IsIFD)
+		sz := TypeSize(typ)
 		if sz == 0 {
 			continue
 		}
@@ -127,23 +122,19 @@ func TrimIPTCLongPadding(v []byte) []byte {
 }
 
 // TypeSize returns the byte size of a single value for the given classic TIFF
-// type code, or 0 for an unrecognised type.
-// Type 13 is recognised as a 4-byte IFD pointer only when type13IsIFD is true
-// (TIFF 6.0 Extensions / libtiff TIFF_IFD).
-func TypeSize(t uint16, type13IsIFD bool) uint32 {
+// type code, or 0 for an unrecognised type. Type 13 is the 4-byte IFD type
+// (TIFF Tech Note 1, libtiff TIFF_IFD) and type 129 the 1-byte Exif UTF-8
+// string (Exif 3.1 §4.6.2, p. 28).
+func TypeSize(t uint16) uint32 {
 	switch t {
-	case 1, 2, 6, 7: // BYTE, ASCII, SBYTE, UNDEFINED
+	case 1, 2, 6, 7, 129: // BYTE, ASCII, SBYTE, UNDEFINED, UTF-8
 		return 1
 	case 3, 8: // SHORT, SSHORT
 		return 2
-	case 4, 9, 11: // LONG, SLONG, FLOAT
+	case 4, 9, 11, 13: // LONG, SLONG, FLOAT, IFD
 		return 4
 	case 5, 10, 12: // RATIONAL, SRATIONAL, DOUBLE
 		return 8
-	case 13: // IFD (TIFF 6.0 Extensions)
-		if type13IsIFD {
-			return 4
-		}
 	}
 	return 0
 }
@@ -221,7 +212,7 @@ func psirClassic(data []byte, order binary.ByteOrder) []byte {
 		if order.Uint16(data[e:]) != tagPSIR {
 			continue
 		}
-		sz := TypeSize(order.Uint16(data[e+2:]), true)
+		sz := TypeSize(order.Uint16(data[e+2:]))
 		total := uint64(sz) * uint64(order.Uint32(data[e+4:]))
 		switch {
 		case sz == 0:
@@ -242,7 +233,7 @@ func psirClassic(data []byte, order binary.ByteOrder) []byte {
 // spec §2), 0 for an unknown type.
 func bigTIFFTypeSize(t uint16) uint64 {
 	switch t {
-	case 1, 2, 6, 7:
+	case 1, 2, 6, 7, 129:
 		return 1
 	case 3, 8:
 		return 2

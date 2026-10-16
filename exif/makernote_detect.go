@@ -114,6 +114,7 @@ const (
 	mnLeicaMake
 	mnSamsung
 	mnDJI
+	mnJVC
 )
 
 // mnLayouts describes every layout. Index mnNone is the zero format (no
@@ -154,6 +155,7 @@ var mnLayouts = [...]makerNoteFormat{
 	mnLeicaMake:    {"leica", 0, mnBaseTIFF, parseLeicaMN},
 	mnSamsung:      {"samsung", 0, mnBaseTIFF, parseSamsungMN},
 	mnDJI:          {"dji", 0, mnBaseTIFF, parseDJIMN},
+	mnJVC:          {"jvc", 4, mnBaseTIFF, parseJVCMN},
 }
 
 // asciiUpper folds an ASCII letter to upper case.
@@ -200,21 +202,21 @@ func parseAtOffset(v mnView, off int, order binary.ByteOrder) *IFD {
 	return v.ifdAt(off, order)
 }
 
-// parsePlausibleIFD is parseAtOffset for layouts that have no signature to
+// parsePlausibleIFD is parseAtOffset at offset 0 for layouts that have no signature to
 // vouch for them (Make-only detection of Minolta and signature-less Pentax):
 // the IFD is accepted only when its entry count is non-zero and every entry
 // fits inside the MakerNote, so an arbitrary blob is not reinterpreted as an
 // IFD.
-func parsePlausibleIFD(v mnView, off int, order binary.ByteOrder) *IFD {
+func parsePlausibleIFD(v mnView, order binary.ByteOrder) *IFD {
 	b := v.bytes()
-	if len(b) < off+2 {
+	if len(b) < 2 {
 		return nil
 	}
-	n := int(order.Uint16(b[off:]))
-	if n == 0 || off+2+n*12 > len(b) {
+	n := int(order.Uint16(b))
+	if n == 0 || 2+n*12 > len(b) {
 		return nil
 	}
-	return parseAtOffset(v, off, order)
+	return parseAtOffset(v, 0, order)
 }
 
 // Layouts whose IFD sits at a fixed offset behind a signature. The offsets
@@ -226,9 +228,10 @@ func parseNikonType1HeaderMN(v mnView, parent binary.ByteOrder) *IFD {
 }
 func parseSonyCamMN(v mnView, parent binary.ByteOrder) *IFD { return parseAtOffset(v, 12, parent) }
 func parseKyoceraMN(v mnView, parent binary.ByteOrder) *IFD { return parseAtOffset(v, 22, parent) }
+func parseJVCMN(v mnView, parent binary.ByteOrder) *IFD     { return parseAtOffset(v, 4, parent) }
 func parseSanyoMN(v mnView, parent binary.ByteOrder) *IFD   { return parseAtOffset(v, 8, parent) }
 func parsePlainIFDMN(v mnView, parent binary.ByteOrder) *IFD {
-	return parsePlausibleIFD(v, 0, parent)
+	return parsePlausibleIFD(v, parent)
 }
 
 // parseSemcMN: Sony Ericsson "SEMC MS\0\0\0\0\0" header, big-endian IFD at 20.
@@ -277,7 +280,7 @@ func parsePentaxOrPlain(v mnView, parent binary.ByteOrder) *IFD {
 	if bytes.HasPrefix(v.bytes(), []byte("AOC\x00")) || bytes.HasPrefix(v.bytes(), []byte("PENTAX \x00")) {
 		return nil // signed but unparsable: do not reinterpret as a plain IFD
 	}
-	return parsePlausibleIFD(v, 0, parent)
+	return parsePlausibleIFD(v, parent)
 }
 
 // detectBySignature identifies a MakerNote from its leading bytes. The order
@@ -292,7 +295,7 @@ func detectBySignature(mn []byte) mnLayout {
 		return mnNone
 	}
 	switch mn[0] {
-	case 'A', 'E', 'F', 'K', 'L', 'N', 'O', 'P', 'Q', 'R', 'S', 'r':
+	case 'A', 'E', 'F', 'J', 'K', 'L', 'N', 'O', 'P', 'Q', 'R', 'S', 'r':
 	default:
 		return mnNone
 	}
@@ -314,7 +317,9 @@ func detectBySignature(mn []byte) mnLayout {
 			return mnNikon1
 		}
 		return mnNikon3
-	case has("SONY CAM") || has("SONY DSC"):
+	case has("SONY CAM") || has("SONY DSC") || has("SONY MOBILE"):
+		// "SONY MOBILE" (Xperia): ExifTool MakerNotes.pm, MakerNoteSony,
+		// condition /^SONY (DSC|CAM|MOBILE)/, Start => $valuePtr + 12.
 		return mnSonyCam
 	case has("SEMC MS\x00\x00\x00\x00\x00"):
 		return mnSonyEricsson
@@ -342,8 +347,14 @@ func detectBySignature(mn []byte) mnLayout {
 		return mnPentaxAOC
 	case has("PENTAX \x00"):
 		return mnPentax
-	case has("SANYO\x00\x01\x00"):
+	case has("SANYO\x00"):
+		// Every version: ExifTool MakerNotes.pm, MakerNoteSanyo, Validate
+		// /^SANYO/, Start => $valuePtr + 8 (metadata-extractor tests version
+		// 1.0 only; the corpus holds 2.1).
 		return mnSanyo
+	case has("JVC "):
+		// ExifTool MakerNotes.pm, MakerNoteJVC: Start => $valuePtr + 4.
+		return mnJVC
 	case len(mn) >= 5 && eqFold(mn[:5], "RICOH"):
 		return mnRicoh
 	case has("Apple iOS\x00"):

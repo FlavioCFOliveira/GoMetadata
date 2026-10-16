@@ -462,6 +462,9 @@ func parseEXIF(m *Metadata, raw []byte, cfg *readConfig) *ParseSegmentError {
 	if err != nil {
 		return &ParseSegmentError{Segment: "EXIF", Err: err}
 	}
+	// The IFDs the setters create need the support levels of a JPEG primary
+	// image (Exif 3.1 Tables 17-18; exif.EXIF.CompressedPrimary).
+	e.CompressedPrimary = format.FormatID(m.format) == format.FormatJPEG
 	m.EXIF = e
 	// Surface EXIF parser warnings as ParseWarnings at the top-level Metadata
 	// API. Each warning string is wrapped in a *ParseSegmentError so it is

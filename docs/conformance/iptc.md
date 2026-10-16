@@ -219,7 +219,8 @@ Namespaces: `Iptc4xmpCore` = `http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/`,
   position it takes in the output (ExifTool `ExifTool.pm` `IdentifyTrailer`/`ProcessTrailers`, study). The trailer
   must start after every image block that is copied: a candidate inside image data is image data. The shared logic
   lives in `internal/trailer`, used by `format/jpeg` and `format/tiff` (`writeRelocated`, so every TIFF-based
-  write path). Bytes of a source that no IFD addresses are otherwise not carried over by a TIFF write.
+  write path). Since #360 the bytes after the data a write moves are carried too (TIFF-TAIL-01 to 03 in
+  `containers.md`), so the trailer is found also when another trailer follows it.
   `TestTask354TIFFAFCPTrailerRewritten` (both byte orders, whole file and streamed).
 - **TIFF-AFCP-02** FotoStation records at the end of a TIFF, before and after an AFCP trailer, have their IPTC record
   replaced. `TestTask354TIFFFotoStationTrailer`.

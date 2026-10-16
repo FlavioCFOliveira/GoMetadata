@@ -20,7 +20,7 @@ compliance"). The battery proves correctness against the spec, not merely code c
 
 | File | Scope | Primary specifications |
 |---|---|---|
-| [`exif-tiff.md`](exif-tiff.md) | EXIF, TIFF 6.0, BigTIFF | CIPA DC-008 (Exif 3.0) / DC-X008 (Exif 2.32) / JEITA CP-3451; Adobe TIFF 6.0; BigTIFF |
+| [`exif-tiff.md`](exif-tiff.md) | EXIF, TIFF 6.0, BigTIFF | CIPA DC-008-2026 (Exif 3.1, target) with DC-008-2024 (Exif 3.0) / DC-X008-2019 (Exif 2.32) / JEITA CP-3451 as compatibility references; Adobe TIFF 6.0; BigTIFF |
 | [`iptc.md`](iptc.md) | IPTC IIM, IPTC Core/Extension, APP13/8BIM IRB | IPTC-NAA IIM 4.2; IPTC Photo Metadata 2025.1; Adobe Photoshop File Formats |
 | [`xmp.md`](xmp.md) | XMP data model, serialization, embedding, MWG reconciliation | ISO 16684-1:2019 / 16684-2:2014; Adobe XMP Parts 1–3; MWG v2.0 |
 | [`containers.md`](containers.md) | JPEG, PNG, WebP, ISO BMFF, HEIF, AVIF, DNG, TIFF/EP, proprietary RAW | ITU-T T.81/T.871; W3C PNG 3rd ed.; RFC 9649; ISO/IEC 14496-12, 23008-12; AOM AVIF; Adobe DNG 1.7.1.0; ISO 12234-2 |
