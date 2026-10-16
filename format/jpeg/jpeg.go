@@ -1545,29 +1545,40 @@ func resolveOrigIRB(r io.ReadSeeker, scratch *[]byte, rawIPTC []byte) ([]byte, e
 // there are none. A keep frame in rawXMP (#357) is resolved against the source
 // first: xmp is the standard packet to write and keepGUID the GUID of the
 // extended XMP segments to keep (see resolveKeptExtended).
-func prepareInject(cr io.ReadSeeker, w io.Writer, scratch *[]byte, rawIPTC, rawXMP []byte) (origIRB []byte, plan *trailer.Plan, out io.Writer, xmp []byte, keepGUID string, err error) {
+func prepareInject(cr io.ReadSeeker, w io.Writer, scratch *[]byte, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) (origIRB []byte, plan *trailer.Plan, out io.Writer, exifOut, xmp []byte, keepGUID string, err error) {
 	// #357: a keep frame in rawXMP asks to carry over the extended XMP segments
 	// of the source that were not merged; it starts with 0x00, which no XMP
 	// packet does, so any other payload skips the call. Resolved against this
 	// source before another pass moves the reader.
 	if len(rawXMP) > 0 && rawXMP[0] == 0 {
 		if rawXMP, keepGUID, err = resolveKeptExtended(cr, scratch, rawXMP); err != nil {
-			return nil, nil, w, nil, "", err
+			return nil, nil, w, nil, nil, "", err
 		}
 	}
 	origIRB, err = resolveOrigIRB(cr, scratch, rawIPTC)
 	if err != nil {
-		return nil, nil, w, nil, "", err
+		return nil, nil, w, nil, nil, "", err
 	}
 	plan, out, err = startTrailerPlan(cr, w, scratch, rawIPTC)
 	if err != nil {
-		return nil, nil, w, nil, "", err
+		return nil, nil, w, nil, nil, "", err
+	}
+	// #362: a MakerNote offset to data outside the EXIF stream follows the data
+	// it addresses. Only an Olympus MakerNote holds one, and its signature
+	// starts with 'O': the single-byte search keeps the common stream from
+	// paying for more (a call with this many arguments from Inject itself cost
+	// 5% on the 300 ns Inject benchmark; here the arguments are at hand).
+	exifOut = rawEXIF
+	if bytes.IndexByte(rawEXIF, 'O') >= 0 {
+		if exifOut, err = shiftExternalOffsets(cr, scratch, rawEXIF, rawIPTC, rawXMP, origIRB, preserveUnknownSegments, keepGUID, plan); err != nil {
+			return nil, nil, w, nil, nil, "", err
+		}
 	}
 	// Seek back to the start for the main copy pass.
 	if _, err := cr.Seek(0, io.SeekStart); err != nil {
-		return nil, nil, w, nil, "", fmt.Errorf("jpeg: seek: %w", err)
+		return nil, nil, w, nil, nil, "", fmt.Errorf("jpeg: seek: %w", err)
 	}
-	return origIRB, plan, out, rawXMP, keepGUID, nil
+	return origIRB, plan, out, exifOut, rawXMP, keepGUID, nil
 }
 
 // Inject reads the JPEG marker stream from r, replaces the relevant APP
@@ -1635,7 +1646,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	// #357: a keep frame in rawXMP asks to carry over the extended XMP segments
 	// of the source that were not merged; resolve it against this source before
 	// any pass moves the reader.
-	origIRB, plan, w, rawXMP, keepGUID, err := prepareInject(cr, w, scratch, rawIPTC, rawXMP)
+	origIRB, plan, w, rawEXIF, rawXMP, keepGUID, err := prepareInject(cr, w, scratch, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments)
 	if err != nil {
 		return err
 	}

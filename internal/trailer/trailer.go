@@ -49,6 +49,20 @@
 //	             file end (4), both ABSOLUTE offsets from the start of the
 //	             file; the block is followed by the 2 bytes "BS"
 //
+// The Samsung audio file, the blocks after it and the QDIO block form one rigid
+// piece: the two audio offsets are shifted by the movement of the QDIO block,
+// which names the same audio bytes only when everything from the start of the
+// audio file to the QDIO block is copied unchanged and in one piece. An AFCP or
+// FotoStation trailer that intersects that piece is therefore part of the audio
+// file as far as the Samsung trailer is concerned and is copied unchanged
+// (task #361). Such a layout is not written by any producer known to the
+// formats (ExifTool Samsung.pm ProcessSamsung derives the audio position from
+// the directory of blocks, which the audio file always precedes), so the rule
+// only has to keep the audio addressable, never to rewrite a trailer inside it.
+// An AFCP or FotoStation trailer before the piece or after it is rewritten as
+// usual and the offsets stay valid: the movement of the QDIO block includes
+// the size change of the trailers before it.
+//
 // The data set "IPTC" (FotoStation: tag 1) holds the IIM stream as is. The
 // reserved fields are written as zero, as ExifTool does: the specification
 // leaves them for a validation checksum that it does not define.
@@ -143,15 +157,24 @@ func PlanFromRegion(region []byte, base int64, newIPTC []byte) Plan {
 			plan.Spans = append(plan.Spans, fotoSpan(recs, start, end, newIPTC))
 		}
 	}
-	// The audio file lies after every other span: the bytes between its
-	// offsets are shifted as one piece, which holds only when no span that
-	// changes size sits among them.
-	floor := base
-	for _, sp := range plan.Spans {
-		floor = max(floor, sp.End)
-	}
-	if sp, ok := findSamsungQDIO(region, base, floor); ok {
-		plan.Spans = append(plan.Spans, sp)
+	// Task #361: the audio file, the blocks after it and the QDIO block move
+	// as one rigid piece, so that the two offsets name the same audio bytes
+	// when they are shifted by the movement of the QDIO block. Every other
+	// span that intersects that piece (an AFCP or FotoStation trailer found
+	// among the audio bytes or the directory) belongs to the audio file as far
+	// as the Samsung trailer is concerned: it is copied unchanged, not
+	// rewritten, because rewriting it could change the size of the piece. A
+	// span before the piece or after it does not matter: the movement of the
+	// QDIO block already includes the size change of the spans before it, and
+	// the spans after it move nothing the offsets name.
+	if sp, rigidStart, ok := findSamsungQDIO(region, base); ok {
+		kept := plan.Spans[:0]
+		for _, other := range plan.Spans {
+			if other.End <= rigidStart || other.Start >= sp.End {
+				kept = append(kept, other)
+			}
+		}
+		plan.Spans = append(kept, sp)
 	}
 	plan.Spans = disjoint(sortSpans(plan.Spans))
 	return plan
@@ -494,44 +517,43 @@ var (
 )
 
 // findSamsungQDIO returns the span of the two absolute audio offsets of the
-// Samsung trailer in region (the bytes of the file from base to its end), or
-// false when there is none. The QDIO block is found by its end, "QDIO" + "BS",
-// and accepted only when it has the layout of the package comment and follows
-// a directory block ("SEFT" whose data starts with "SEFH"); the last such block
-// of the region is used. The audio file offsets are rewritten only when they
-// lie at or after floor (the end of the other trailers that are rewritten) and
-// before the QDIO block, as they do in a file written by the camera: anything
-// else is not understood and is left alone.
-func findSamsungQDIO(region []byte, base, floor int64) (Span, bool) {
-	var found Span
-	ok := false
+// Samsung trailer in region (the bytes of the file from base to its end), the
+// absolute offset of the start of the audio file, or false when there is no
+// such trailer. The QDIO block is found by its end, "QDIO" + "BS", and
+// accepted only when it has the layout of the package comment and follows a
+// directory block ("SEFT" whose data starts with "SEFH"); the last such block
+// of the region is used. The audio file offsets are rewritten only when the
+// audio file lies in the region (at or after base, before the QDIO block), as
+// it does in a file written by the camera: anything else is not understood and
+// is left alone.
+func findSamsungQDIO(region []byte, base int64) (sp Span, audioStart int64, ok bool) {
 	for from := 0; ; {
 		i := bytes.Index(region[from:], samsungQDIOSig)
 		if i < 0 {
-			return found, ok
+			return sp, audioStart, ok
 		}
 		q := from + i // index of the QDIO block type
 		from = q + 1
-		if sp, valid := samsungSpanAt(region, base, floor, q); valid {
-			found, ok = sp, true
+		if cand, start, valid := samsungSpanAt(region, base, q); valid {
+			sp, audioStart, ok = cand, start, true
 		}
 	}
 }
 
 // samsungSpanAt validates the QDIO block whose type field starts at region[q]
-// and returns the span of its audio offsets.
-func samsungSpanAt(region []byte, base, floor int64, q int) (Span, bool) {
+// and returns the span of its audio offsets and the start of the audio file.
+func samsungSpanAt(region []byte, base int64, q int) (sp Span, audioStart int64, ok bool) {
 	blockStart := q - samsungQDIOBlockLen + 4 // start of the QDIO data
 	if blockStart < 12 || q+len(samsungQDIOSig) > len(region) || !samsungBlocksValid(region, blockStart, q) {
-		return Span{}, false
+		return Span{}, 0, false
 	}
 	le := binary.LittleEndian
 	data := region[blockStart : blockStart+samsungQDIODataLen]
 	start := int64(le.Uint32(data[samsungOffsetsAt:]))
 	end := int64(le.Uint32(data[samsungOffsetsAt+4:]))
 	qdioAbs := base + int64(blockStart)
-	if start < floor || end < start || end > qdioAbs {
-		return Span{}, false
+	if start < base || end < start || end > qdioAbs {
+		return Span{}, 0, false
 	}
 	spanStart := qdioAbs + samsungOffsetsAt
 	return Span{Start: spanStart, End: spanStart + 8, Build: func(outPos int64) ([]byte, bool, error) {
@@ -547,7 +569,7 @@ func samsungSpanAt(region []byte, base, floor int64, q int) (Span, bool) {
 		le.PutUint32(b[:], uint32(ns))  //nolint:gosec // G115: bounded by the check above
 		le.PutUint32(b[4:], uint32(ne)) //nolint:gosec // G115: bounded by the check above
 		return b[:], true, nil
-	}}, true
+	}}, start, true
 }
 
 // samsungBlocksValid reports whether the QDIO block with its data at

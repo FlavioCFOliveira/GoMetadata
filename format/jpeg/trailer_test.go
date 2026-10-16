@@ -323,6 +323,12 @@ func FuzzTrailers(f *testing.F) {
 	f.Add(samsungOf(int64(len(probe)), samsungAudio))
 	seedAFCP := afcpOf(binary.BigEndian, "AXS!", int64(len(probe)), [][2]string{{"IPTC", string(oldIIM)}})
 	f.Add(append(seedAFCP, samsungOf(int64(len(probe)+len(seedAFCP)), samsungAudio)...))
+	// Task #361: AFCP after the Samsung trailer, and an AFCP trailer that is
+	// the audio file itself.
+	seedSam := samsungOf(int64(len(probe)), samsungAudio)
+	f.Add(append(bytes.Clone(seedSam), afcpOf(binary.BigEndian, "AXS!", int64(len(probe)+len(seedSam)), [][2]string{{"IPTC", string(oldIIM)}})...))
+	seedAudioAFCP := afcpOf(binary.BigEndian, "AXS!", int64(len(probe)), [][2]string{{"IPTC", string(oldIIM)}})
+	f.Add(append(bytes.Clone(seedAudioAFCP), samsungOf(int64(len(probe)), seedAudioAFCP)[len(seedAudioAFCP):]...))
 	f.Fuzz(func(t *testing.T, tail []byte) {
 		src := jpegWithTail(tail)
 		var out bytes.Buffer
@@ -340,13 +346,14 @@ func FuzzTrailers(f *testing.F) {
 				t.Fatal("inconsistent AFCP trailer in the output")
 			}
 		}
-		// A Samsung trailer that still names bytes after the write names the
-		// same bytes (task #353). A trailer the package does not understand
-		// (its offsets lie among the other trailers, say) is left as it is, and
-		// then need not name anything valid in the output.
+		// A Samsung trailer whose audio file lies in the region after the image
+		// names the same bytes after the write (tasks #353 and #361): the
+		// offsets are shifted by the movement of the QDIO block, and a trailer
+		// that intersects the audio range is copied unchanged.
 		if before, ok := qdioAudio(src, int64(len(jpegWithTail(nil)))); ok {
-			if after, ok := qdioAudio(data, base); ok && !bytes.Equal(before, after) {
-				t.Fatalf("the Samsung audio offsets name %q after the write, want %q", after, before)
+			after, ok := qdioAudio(data, base)
+			if !ok || !bytes.Equal(before, after) {
+				t.Fatalf("the Samsung audio offsets name %q (valid: %v) after the write, want %q", after, ok, before)
 			}
 		}
 	})

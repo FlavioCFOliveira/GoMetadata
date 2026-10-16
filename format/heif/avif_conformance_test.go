@@ -370,17 +370,13 @@ func TestAVIFMetaBoxIinfItemCount(t *testing.T) {
 	}
 	version := iinfData[0]
 	pos := 4
-	declaredCount, _, ok := parseIinfItemCount(iinfData, version, pos)
+	declaredCount, scanPos, ok := parseIinfEntryCount(iinfData, version, pos)
 	if !ok {
 		t.Fatal("AVIF-meta-iinf-item-count: could not parse entry_count")
 	}
 
 	// Count actual infe boxes.
 	actualCount := 0
-	scanPos := pos + 2 // past entry_count
-	if version >= 2 {
-		scanPos = pos + 4
-	}
 	for scanPos < len(iinfData) {
 		sz, typ, _, ok2 := parseHEIFBoxHeader(iinfData, scanPos)
 		if !ok2 {

@@ -37,9 +37,10 @@ for cross-checking only).
 - Source files: `Source/com/drew/metadata/exif/ExifDirectoryBase.java` (`TAG_*` constants);
   `Source/com/drew/metadata/exif/ExifTiffHandler.java` (`processMakernote`);
   `Source/com/drew/imaging/tiff/TiffReader.java` (`processIfd`, byte-swapped entry count);
-  `Source/com/drew/metadata/webp/WebpRiffHandler.java` (`processChunk`, the "Exif\0\0" identifier of an EXIF chunk)
+  `Source/com/drew/metadata/webp/WebpRiffHandler.java` (`processChunk`, the "Exif\0\0" identifier of an EXIF chunk);
+  `Source/com/drew/metadata/jpeg/JpegDnlReader.java` (`extract`)
 - Destination files: `exif/tag_extended.go`, `exif/tag_extended_test.go`; `exif/makernote_detect.go`;
-  `exif/makernote_parse.go`; `format/webp/webp.go`
+  `exif/makernote_parse.go`; `format/webp/webp.go`; `format/jpeg/size.go`
 - Adapted: yes (tag IDs and names of the tags that libtiff does not list; the rest of the table is used for cross-checking.
   MakerNote detection: the order of the signature and Make tests, the signatures, and the IFD offset and offset base of
   each layout, re-implemented as allocation-free Go; the offset base is applied when a MakerNote is read, and the
@@ -47,7 +48,10 @@ for cross-checking only).
   byte-swapped entry-count heuristic of `processIfd`, applied to MakerNote IFDs only. MakerNote tag tables are not
   copied. WebP: an EXIF chunk that starts with the "Exif\0\0" identifier is read as the TIFF stream after it, as
   `processChunk` does, re-implemented in Go; the reader here also takes the FourCC "XMP\0" as XMP, and the writer drops
-  the identifier and that FourCC)
+  the identifier and that FourCC. Headerless Nikon MakerNote: the IFD begins with the first MakerNote byte
+  (`processMakernote`, Coolpix 775, E990, D1) and its byte order comes from the entry count with the heuristic of
+  `processIfd`. JPEG height: the number of lines of a frame whose header declares none is the first unsigned 16-bit
+  value of the DNL segment (`JpegDnlReader.extract`); the search for the segment in the entropy-coded data is original)
 - Notes: the repository has no `NOTICE` file. The changes made are stated in the
   header of each destination file. No descriptor marked as converted from ExifTool is used.
 
@@ -172,8 +176,8 @@ for cross-checking only).
 - Source files: `src/read.c` (`avifParseItemLocationBox`, `avifDecoderItemRead`, `avifParseItemInfoBox`, `avifParse`); `src/write.c`
   (`avifEncoderDataCreateExifItem`, `avifEncoderDataCreateXMPItem`, `avifEncoderFinish`,
   `avifEncoderWriteTrackMetaBox`); `src/stream.c` (`avifROStreamReadBoxHeaderPartial`, consulted for the 64-bit
-  largesize box header)
-- Destination files: `format/heif/heif.go`, `format/heif/iloc.go`, `format/heif/inject.go`
+  largesize box header; `avifRWStreamFinishBox`)
+- Destination files: `format/heif/heif.go`, `format/heif/iloc.go`, `format/heif/inject.go`, `internal/bmff/openended.go`
 - Adapted: yes (the content of an `infe` box starts after its real header length, 8 or 16 bytes, as
   `avifParseItemInfoBox` reads it through the box header; the metadata container is the file-level `meta` box, as
   `avifParse` takes it, with a fallback to a `meta` box that is a direct child of `moov`; the item location box field order, including the 16-bit `data_reference_index` of every version, the
@@ -181,7 +185,11 @@ for cross-checking only).
   allocation-free Go; the layout of a new Exif or XMP item — infe version 2, item name, XMP content type, iref `cdsc`
   reference to the primary item, iloc entry with construction method 0 — re-implemented to edit an existing file; the
   4-byte `offset_size` and `length_size` of the written iloc box, applied by widening the zero field widths of an
-  existing iloc box)
+  existing iloc box; the `entry_count` of an `iinf` box is 16 bits for version 0 and 32 bits otherwise, as
+  `avifParseItemInfoBox` reads it; the size of a box is written back once its payload is complete, as
+  `avifRWStreamFinishBox` does, here to give an open-ended box an explicit size before boxes are appended; the `entry_count` of an `iinf` box is 16 bits for version 0 and 32 bits otherwise, as
+  `avifParseItemInfoBox` reads it; the size of a box is written back once its payload is complete, as
+  `avifRWStreamFinishBox` does, here to give an open-ended box an explicit size before boxes are appended)
 - Notes: the changes made are stated in the header of each destination file.
 
 ## libwebp

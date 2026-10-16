@@ -40,7 +40,8 @@ import (
 // version "0300" of Exif 3.0 (it has no "0310"): its changes are optional
 // tags. Divergence from ExifTool, which writes "0232": the target standard of
 // this library is 3.1, and a file that holds the type UTF-8 or a 2.31 tag such
-// as OffsetTimeOriginal needs at least "0300" (see requireExifVersion30).
+// as OffsetTimeOriginal needs at least the version that defines it (see
+// version.go).
 const exifVersionDefault = "0300"
 
 // colorSpaceUncalibrated is the ColorSpace written when the colour space of
@@ -125,7 +126,7 @@ func isASCII(s string) bool {
 // 2-byte or larger code is necessary, UTF-8 shall be set as Type. The count is
 // the value including NULL terminations." So any other s is stored as
 // TypeUTF8 (129), and the ExifVersion is raised to "0300" when it is lower
-// (requireExifVersion30): the type 129 exists only since Exif 3.0, and
+// (requireExifVersion): the type 129 exists only since Exif 3.0, and
 // §4.2, p. 14, makes the upper part of the version change "when there is a
 // possibility that a data reader implementing the old standard may operate
 // incorrectly due to the new specifications".
@@ -138,31 +139,5 @@ func (e *EXIF) setText(ifd *IFD, tag TagID, s string) {
 	}
 	v := utf8Value(s)
 	ifd.set(tag, TypeUTF8, uint32(len(v)), v, big) //nolint:gosec // G115: string length bounded by input
-	e.requireExifVersion30()
-}
-
-// requireExifVersion30 makes the ExifVersion at least "0300" (Exif 3.1
-// §4.6.6.1.1, p. 47), creating the ExifIFD when it is absent. An ExifVersion
-// of 3.0 or later is left as it is; a lower one, or one that is not four ASCII
-// digits and so cannot be compared, is replaced.
-func (e *EXIF) requireExifVersion30() {
-	e.ensureExifIFD()
-	if v := e.ExifIFD.Get(TagExifVersion); v != nil && !versionBefore30(v.Value) {
-		return
-	}
-	e.ExifIFD.set(TagExifVersion, TypeUndefined, 4, []byte(exifVersionDefault), e.ifd0BigEndian())
-}
-
-// versionBefore30 reports whether v is a four-digit ExifVersion lower than
-// "0300", or is not four ASCII digits at all.
-func versionBefore30(v []byte) bool {
-	if len(v) != 4 {
-		return true
-	}
-	for _, c := range v {
-		if c < '0' || c > '9' {
-			return true
-		}
-	}
-	return string(v) < exifVersionDefault
+	e.requireExifVersion(exifVersionDefault)
 }

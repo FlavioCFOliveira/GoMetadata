@@ -160,7 +160,7 @@ func parseIlocHeader(ilocData []byte) (h ilocHeader, ok bool) {
 		!validIlocFieldSize(h.baseOffsetSize) || !validIlocFieldSize(h.indexSize) {
 		return h, false
 	}
-	count, pos, countOK := parseIinfItemCount(ilocData, h.version, ilocFixedHeaderSize)
+	count, pos, countOK := parseIlocItemCount(ilocData, h.version, ilocFixedHeaderSize)
 	// Security audit FIX 1 (HEIF-ILOC-EXTENT-AMPLIFICATION): reject an iloc box
 	// whose declared item_count exceeds a sane ceiling before doing any
 	// per-item work. iloc version 2 encodes item_count as a 4-byte field (up to

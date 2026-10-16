@@ -25,6 +25,7 @@ import (
 	"slices"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/bmff"
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 )
 
@@ -749,27 +750,10 @@ func rebuildUUIDContent(uuidContent []byte, st cmtStreams, rawXMP []byte) (newCo
 		if !ok {
 			break
 		}
-		b.add(typ, closeOpenEnded(uuidContent[pos:pos+int(size)]), int(headerLen)) //nolint:gosec // G115: ISOBMFF box size bounded by file size; headerLen is 8 or 16
-		pos += int(size)                                                           //nolint:gosec // G115: ISOBMFF box size bounded by file size
+		b.add(typ, bmff.Close(uuidContent[pos:pos+int(size)]), int(headerLen)) //nolint:gosec // G115: ISOBMFF box size bounded by file size; headerLen is 8 or 16
+		pos += int(size)                                                       //nolint:gosec // G115: ISOBMFF box size bounded by file size
 	}
 	return b.finish(), b.hadXMP
-}
-
-// closeOpenEnded returns box with an explicit size when its 32-bit size field
-// is 0. ISO/IEC 14496-12 §4.2: size 0 means "this box extends to the end of
-// its container", which stops being true when rebuildUUIDContent appends a
-// box after it (a new CMT1, CMT2 or CMT4): a reader would read the appended
-// box as part of the open-ended one and the written EXIF would be lost (found
-// by FuzzCR3Inject, task #347). The box is copied, never edited in place: it
-// aliases the caller's moov buffer. A box whose length does not fit 32 bits
-// is returned as is.
-func closeOpenEnded(box []byte) []byte {
-	if binary.BigEndian.Uint32(box) != 0 || uint64(len(box)) > math.MaxUint32 {
-		return box
-	}
-	out := bytes.Clone(box)
-	binary.BigEndian.PutUint32(out, uint32(len(out))) //nolint:gosec // G115: len(out) <= MaxUint32 checked above
-	return out
 }
 
 // uuidRebuild accumulates the output of rebuildUUIDContent.

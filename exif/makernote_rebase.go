@@ -59,10 +59,19 @@ import (
 // Encode itself copies the MakerNote verbatim, which is what the TIFF-family
 // writers of this library need: they place the MakerNote and then fix it for
 // the position they chose.
+//
+// The stream also carries the private IFD that IFD0 tag 0x8290 (KodakIFD)
+// points to, with the values it addresses, after the end of the stream
+// (private_ifd.go, task #362). A MakerNote offset that addresses data outside
+// the stream (Olympus PreviewImageStart) is copied as it is: ExternalOffsets
+// finds it for the writer of the container, which knows where the data lands.
 func EncodeRebased(e *EXIF, src []byte) ([]byte, error) {
 	plan := planMakerNote(e, src)
 	out, _, err := serialise(nil, e, false, plan)
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	return appendPrivateIFD(out, e, src), nil // the private IFD of IFD0, if any (private_ifd.go)
 }
 
 // mnFix is one pointer of a TIFF-relative MakerNote IFD: the 4-byte field at

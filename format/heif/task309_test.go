@@ -102,7 +102,7 @@ func iinfEntryCount(t *testing.T, file []byte) (declared, actual int) {
 	t.Helper()
 	metaContent, _ := findMetaContent(file)
 	iinf := findInnerBox(metaContent, boxTypeIinf)
-	count, pos, ok := parseIinfItemCount(iinf, iinf[0], 4)
+	count, pos, ok := parseIinfEntryCount(iinf, iinf[0], 4)
 	if !ok {
 		t.Fatal("iinf entry_count unreadable")
 	}

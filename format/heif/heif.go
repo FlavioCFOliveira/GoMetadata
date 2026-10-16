@@ -323,18 +323,48 @@ func parsePitm(metaContent []byte) uint16 {
 	return uint16(id)
 }
 
-// parseIinfItemCount decodes the item_count field from iinfData (or ilocData)
-// at pos, using version to determine whether it is a 2-byte or 4-byte field.
-// Returns count, updated pos, and success.
+// parseIinfEntryCount decodes the entry_count field of an 'iinf' box body at
+// pos, using the FullBox version to pick the width. Returns count, updated pos,
+// and success.
 //
-// ISO 14496-12 §8.11.3 / §8.11.6: version < 2 uses uint16, version 2 uses uint32.
-func parseIinfItemCount(data []byte, version byte, pos int) (count, newPos int, ok bool) {
+// ISO/IEC 14496-12 §8.11.6 (ItemInfoBox; the text of the standard is not
+// available locally, so the sub-clause is not cited): entry_count is
+// unsigned int(16) when version == 0 and unsigned int(32) otherwise. Reference
+// implementations that read it identically: libavif src/read.c avifParseItemInfoBox (BSD-2,
+// ab37e294; reads 32 bits for version 1 and rejects later versions), heic-rs
+// src/meta/iinf.rs (MIT/Apache-2.0, 999470f5). The 'iloc' item_count has a
+// different rule (16 bits below version 2), see parseIlocItemCount.
+//
+// Task #358: the width was previously "16 bits below version 2", which read
+// the high half of a 32-bit entry_count of a version 1 box and left pos two
+// bytes short, so the first infe box was parsed from the wrong offset.
+func parseIinfEntryCount(data []byte, version byte, pos int) (count, newPos int, ok bool) {
+	if version == 0 {
+		if pos+2 > len(data) {
+			return 0, pos, false
+		}
+		return int(binary.BigEndian.Uint16(data[pos:])), pos + 2, true
+	}
+	return readCount32(data, pos)
+}
+
+// parseIlocItemCount decodes the item_count field of an 'iloc' box body at
+// pos, using the FullBox version to pick the width. Returns count, updated pos,
+// and success.
+//
+// ISO 14496-12 §8.11.3.2: version < 2 uses uint16, version 2 uses uint32.
+func parseIlocItemCount(data []byte, version byte, pos int) (count, newPos int, ok bool) {
 	if version < 2 {
 		if pos+2 > len(data) {
 			return 0, pos, false
 		}
 		return int(binary.BigEndian.Uint16(data[pos:])), pos + 2, true
 	}
+	return readCount32(data, pos)
+}
+
+// readCount32 decodes a 32-bit item or entry count at pos.
+func readCount32(data []byte, pos int) (count, newPos int, ok bool) {
 	if pos+4 > len(data) {
 		return 0, pos, false
 	}
@@ -370,7 +400,7 @@ func parseIinf(metaData []byte) map[uint16][4]byte {
 	version := iinfData[0]
 	pos := 4 // skip version + flags
 
-	itemCount, pos, ok := parseIinfItemCount(iinfData, version, pos)
+	itemCount, pos, ok := parseIinfEntryCount(iinfData, version, pos)
 	if !ok {
 		return result
 	}

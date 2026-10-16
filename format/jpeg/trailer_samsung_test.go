@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/FlavioCFOliveira/GoMetadata/internal/trailer"
 )
 
 var samsungAudio = []byte("RIFF-fake-audio-file-bytes") //nolint:gochecknoglobals // immutable test fixture
@@ -96,6 +98,63 @@ func TestTrailers_SamsungQDIO(t *testing.T) {
 			clear(blockOut[20+12 : 20+20])
 			if !bytes.Equal(blockSrc, blockOut) {
 				t.Error("the Samsung trailer was altered beyond its audio offsets")
+			}
+		})
+	}
+}
+
+// TestTrailers_SamsungWithOtherSpans (task #361): the audio offsets name the
+// audio file after a write whatever AFCP and FotoStation trailers sit before or
+// after the Samsung trailer, and a trailer that lies inside the audio range is
+// copied unchanged (documented rule: it belongs to the audio file).
+func TestTrailers_SamsungWithOtherSpans(t *testing.T) {
+	t.Parallel()
+	exif := []byte("II*\x00\x08\x00\x00\x00\x00\x00\x00\x00")
+	probe := int64(len(jpegWithTail(nil)))
+	foto := fotoOf(trailer.FotoRecord{Tag: 1, Data: oldIIM})
+	afcpAt := func(at int64) []byte {
+		return afcpOf(binary.BigEndian, "AXS!", at, [][2]string{{"IPTC", string(oldIIM)}})
+	}
+	for _, tc := range []struct {
+		name string
+		tail func() []byte
+		// kept is the trailer that must be copied unchanged ("" none).
+		kept func() []byte
+	}{
+		{"AFCP after the Samsung trailer", func() []byte {
+			sam := samsungOf(probe, samsungAudio)
+			return append(sam, afcpAt(probe+int64(len(sam)))...)
+		}, nil},
+		{"FotoStation then Samsung then AFCP", func() []byte {
+			sam := samsungOf(probe+int64(len(foto)), samsungAudio)
+			tail := append(append([]byte{}, foto...), sam...)
+			return append(tail, afcpAt(probe+int64(len(tail)))...)
+		}, nil},
+		{"AFCP trailer is the audio file", func() []byte {
+			afcp := afcpAt(probe)
+			return append(append([]byte{}, afcp...), samsungOf(probe, afcp)[len(afcp):]...)
+		}, func() []byte { return afcpAt(probe) }},
+		{"FotoStation record is the audio file", func() []byte {
+			return samsungOf(probe, foto)
+		}, func() []byte { return foto }},
+	} {
+		t.Run("TRAILER-SAMSUNG-04/"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			src := jpegWithTail(tc.tail())
+			s0, e0 := samsungAudioOffsets(t, src)
+			audio := bytes.Clone(src[s0:e0])
+			out := injectTail(t, src, exif, newIIM)
+			s, e := samsungAudioOffsets(t, out)
+			if s == s0 {
+				t.Fatal("the trailer did not move: the test proves nothing")
+			}
+			if !bytes.Equal(out[s:e], audio) {
+				t.Errorf("QDIO offsets %d-%d name %q, want %q", s, e, out[s:e], audio)
+			}
+			// The trailer that is the audio file is copied unchanged: the audio
+			// bytes of the output are the source's, with the old IPTC copy.
+			if tc.kept != nil && !bytes.Equal(out[s:e], tc.kept()) {
+				t.Error("the trailer inside the audio file was not copied unchanged")
 			}
 		})
 	}

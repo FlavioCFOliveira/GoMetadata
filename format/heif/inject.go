@@ -24,6 +24,7 @@ import (
 	"math"
 	"slices"
 
+	"github.com/FlavioCFOliveira/GoMetadata/internal/bmff"
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 )
 
@@ -437,7 +438,7 @@ func maxItemID(metaContent []byte, items []ilocFullItem) uint16 {
 	if len(iinfData) < 4 {
 		return maxID
 	}
-	_, pos, ok := parseIinfItemCount(iinfData, iinfData[0], 4)
+	_, pos, ok := parseIinfEntryCount(iinfData, iinfData[0], 4)
 	if !ok {
 		return maxID
 	}
@@ -567,9 +568,12 @@ func buildIinfBox(metaContent []byte, newItems []newMetadataItem) ([]byte, error
 
 // completeChildren returns the prefix of data made of complete child boxes
 // (stopping at the first header that does not parse) and the number of
-// those children of type typ.
+// those children of type typ. A last child that is open-ended (size 0, ISO
+// 14496-12 §4.2) is closed in the returned prefix, which is then a copy: the
+// caller appends boxes after the prefix, and a reader would otherwise take
+// them as part of that child (task #359).
 func completeChildren(data []byte, typ [4]byte) (prefix []byte, n int) {
-	pos := 0
+	pos, last := 0, 0
 	for pos < len(data) {
 		size, t, _, ok := parseHEIFBoxHeader(data, pos)
 		if !ok {
@@ -578,7 +582,13 @@ func completeChildren(data []byte, typ [4]byte) (prefix []byte, n int) {
 		if t == typ {
 			n++
 		}
+		last = pos
 		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by slice length
+	}
+	if pos > 0 && bmff.OpenEnded(data[last:pos]) {
+		closed := bmff.Close(data[last:pos])
+		prefix = make([]byte, 0, last+len(closed))
+		return append(append(prefix, data[:last]...), closed...), n
 	}
 	return data[:pos], n
 }
@@ -672,8 +682,8 @@ func planMetaParts(metaContent, iinfBox, irefBox []byte) (parts [][]byte, ilocId
 		if !ok {
 			break
 		}
-		p.add(typ, metaContent[pos:pos+int(size)]) //nolint:gosec // G115: ISOBMFF box size bounded by slice length
-		pos += int(size)                           //nolint:gosec // G115: ISOBMFF box size bounded by slice length
+		p.add(typ, bmff.Close(metaContent[pos:pos+int(size)])) //nolint:gosec // G115: ISOBMFF box size bounded by slice length
+		pos += int(size)                                       //nolint:gosec // G115: ISOBMFF box size bounded by slice length
 	}
 	p.finish()
 	return p.parts, p.ilocIdx
@@ -1183,8 +1193,8 @@ func closeOpenEndedBox(data []byte) {
 		if !ok {
 			return
 		}
-		if binary.BigEndian.Uint32(data[pos:]) == 0 && size <= math.MaxUint32 {
-			binary.BigEndian.PutUint32(data[pos:], uint32(size))
+		if bmff.OpenEnded(data[pos:]) {
+			bmff.CloseInPlace(data[pos : pos+int(size)]) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 			return
 		}
 		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size

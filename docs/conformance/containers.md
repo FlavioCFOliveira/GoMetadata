@@ -48,9 +48,35 @@ length/padding; fill bytes (`FF FF…`).
   stream; a file that does not end with one has none. `TestFindTail` (internal/trailer), `FuzzTrailerTail`.
 - **TRAILER-PLAN-01** A plan writes its region with the IPTC copies replaced and the offsets set for the position it
   is written at; the bytes between and after the trailers are copied. `TestPlanWriteRegion`.
+- **TRAILER-SAMSUNG-04** (task #361) The Samsung audio file, the blocks after it and the QDIO block move as one rigid
+  piece, so the two offsets are shifted by the movement of the QDIO block and name the same audio bytes: an AFCP or
+  FotoStation trailer after the Samsung trailer (a file edited by software that appends AFCP) no longer stops the
+  rewrite, as it did when the offsets had to lie after every other trailer. An AFCP or FotoStation trailer that
+  intersects the piece (found among the audio bytes, between the audio and the QDIO block) is part of the audio file as
+  far as the Samsung trailer is concerned: it is copied unchanged, not rewritten, because rewriting it could change the
+  size of the piece; no producer known to the format notes (ExifTool `Samsung.pm` `ProcessSamsung`, which derives the
+  audio position from the directory of blocks, study only) writes such a layout, and a write has no warning channel
+  (`ParseWarnings` is read-only). An audio start before the region after the image is not understood and the QDIO block is
+  left alone. `TestTrailers_SamsungWithOtherSpans`, `FuzzTrailers` (a Samsung trailer valid in the source is valid and
+  names the same bytes in the output).
 - Trailers that need no rewrite (checked against the ExifTool sources, study only): CanonVRD (header and footer hold
   the length of the data), PhotoMechanic (the footer holds the trailer length), Vivo and OnePlus (offsets counted back
   from the end of the trailer), MIE (relative lengths). They are copied byte for byte.
+
+**Rule IDs (JPEG frame size).**
+- **JPEG-DNL-01** (task #365) A frame header with Y = 0 defers the number of lines to the DNL segment (marker `FF DC`)
+  that follows the first scan. ITU-T T.81 §B.2.2, p. 36 (Y: "Value 0 indicates that the number of lines shall be defined
+  by the DNL marker and parameters at the end of the first scan"); §B.2.5, p. 45 (the segment is mandatory when Y is 0;
+  Ld, NL; Table B.10: Ld 4-65535, NL 1-65535); §B.2.1, p. 35 (it "shall immediately follow the first scan"). The text
+  was read in the W3C copy of the Recommendation (itu-t81.pdf). `jpeg.ImageSize` reads the segments to the first SOS,
+  skips the scan header, and searches the entropy-coded data of the first scan for the next marker that is not a stuffed
+  zero, a restart marker or a fill byte (§B.1.1.5), reading at most 64 MiB; the marker must be DNL with Ld >= 4 and
+  NL >= 1, else the height is unknown (`ErrNoFrameHeader`). Nothing is decoded. libjpeg-turbo (`jdmarker.c` `get_sof`)
+  rejects Y = 0 ("DNL not supported") and has no search to adapt; metadata-extractor `JpegDnlReader` takes NL as the
+  first unsigned 16-bit value of the segment and applies it only when the frame header's height is 0. Corpus
+  `beach.jpg` (SOF1, Y 0, X 200, NL 200): a caption write creates PixelXDimension and PixelYDimension 200 x 200.
+  `TestImageSizeDNL`, `TestScanForDNLLimit`, `TestImageSizeDNLCorpus`, `TestWrite_Task365_JPEGHeightFromDNL`,
+  `FuzzImageSize`.
 
 ## 2. PNG
 **(a)** W3C "PNG Specification (Third Edition)", W3C Recommendation 24 Jun 2025; ISO/IEC
@@ -109,6 +135,15 @@ content changes; patch iloc/stco/co64 offsets when boxes move; 4cc exactly 4 byt
 **(f)** size 2–7; size past EOF; largesize overflow; deep nesting (recursion guard); child larger
 than parent; box-vs-FullBox confusion; duplicate ftyp.
 
+**Rule IDs (ISO BMFF boxes).**
+- **BMFF-OPENENDED-01** (task #359) A box whose 32-bit size field is 0 extends to the end of its container (ISO/IEC
+  14496-12 §4.2); a box appended after it would be read as part of it. `internal/bmff` is the one helper of the HEIF/AVIF
+  and CR3 writers: `OpenEnded` (size 0, or a 64-bit form with largesize 0, which the readers of this module also take
+  as extending to the end), `Close` (a copy with the explicit size, 32-bit or, above 4 GiB, the 64-bit header) and
+  `CloseInPlace`. Reference: libavif `src/stream.c` `avifRWStreamFinishBox` writes the size once the payload is complete
+  and refuses a box above UINT32_MAX (BSD-2; the logic here is original). `TestOpenEndedAndClose`,
+  `TestCloseAbove32Bits`.
+
 ## 5. HEIF / HEIC
 **(a)** ISO/IEC 23008-12 (on ISO/IEC 14496-12). Reference: libheif, ExifTool QuickTime.
 **(b)** ftyp major_brand ∈ {heic, heix, heim, heis, hevc, mif1, msf1} (or in compatible_brands).
@@ -165,6 +200,20 @@ truncated meta (CRITICAL HEIF panic — fuzz the meta/iloc/iinf walk).
   writes it or returns `ErrNoMetadataContainer` (no valid `meta` box) or `ErrUnreadableItemLocations`
   (`iloc` missing, unsupported version or field size, truncated, or too large to rewrite without dropping
   items). Only a request with no payload copies the file through unchanged.
+- **HEIF-IINF-COUNT-01** (task #358) The `entry_count` of an `iinf` box is 16 bits for FullBox version 0 and 32 bits for
+  any other version (ISO/IEC 14496-12 §8.11.6, the ItemInfoBox; the sub-clause is not cited because the text of the
+  standard is not available locally). Reference: libavif `src/read.c` `avifParseItemInfoBox` (version 0: 16 bits;
+  version 1: 32 bits; others rejected) and heic-rs `src/meta/iinf.rs`. `parseIinf` read 16 bits for every version below 2,
+  so it could not read what `buildIinfBox` writes for a version 1 box. The `iloc` `item_count` keeps its own rule (16 bits
+  below version 2, §8.11.3.2) in `parseIlocItemCount`. `TestTask358IinfEntryCountWidth`,
+  `TestTask358ParseIinfItemCountTable`, `TestTask358IlocItemCountWidth`, `TestTask358RoundTripIinfVersion1`.
+- **HEIF-BOX-OPENENDED-01** (task #359) `Inject` closes a child of `meta`, `iinf` or `iref` whose size field is 0 (or a
+  largesize of 0) before it appends boxes after it, in the 32-bit and the 64-bit forms, through
+  `bmff.Close` (BMFF-OPENENDED-01): the appended `iinf`, `iref`, `iloc` and `infe` boxes are read as boxes of their own
+  and every item re-reads. `FuzzHEIFInject` no longer exempts such sources or `iinf` version 1; the one exemption left is
+  a source whose top-level boxes end in bytes that do not parse as a box (the appended `mdat` can then complete a bogus
+  file-level `meta` header; reported separately). `TestTask359InjectClosesOpenEndedChild`,
+  `TestTask359OpenEndedChildContentKept`, `FuzzHEIFInject`.
 
 ## 6. AVIF
 **(a)** AOM "AV1 Image File Format (AVIF)" v1.2.0 (on HEIF + MIAF ISO/IEC 23000-22). Ref: libavif.

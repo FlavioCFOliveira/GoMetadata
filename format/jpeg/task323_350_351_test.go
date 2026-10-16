@@ -22,8 +22,8 @@ import (
 // without XMP the digest is left as it is.
 func TestInject_IPTCDigestPolicy(t *testing.T) {
 	t.Parallel()
-	oldIIM := []byte{0x1C, 0x02, 0x78, 0x00, 0x03, 'o', 'l', 'd'}
-	newIIM := []byte{0x1C, 0x02, 0x78, 0x00, 0x03, 'n', 'e', 'w'}
+	oldIPTCData := []byte{0x1C, 0x02, 0x78, 0x00, 0x03, 'o', 'l', 'd'}
+	newIPTCData := []byte{0x1C, 0x02, 0x78, 0x00, 0x03, 'n', 'e', 'w'}
 	sum := func(b []byte) []byte { s := md5.Sum(b); return s[:] } //nolint:gosec // G401: MWG digest
 	stale := bytes.Repeat([]byte{0x5A}, 16)
 	xmpPacket := []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"/>`)
@@ -32,7 +32,7 @@ func TestInject_IPTCDigestPolicy(t *testing.T) {
 		if digest != nil {
 			b = irbpkg.AppendBlock(b, irbpkg.ResourceIPTCDigest, digest)
 		}
-		return irbpkg.AppendBlock(b, irbpkg.ResourceIPTC, oldIIM)
+		return irbpkg.AppendBlock(b, irbpkg.ResourceIPTC, oldIPTCData)
 	}
 	cases := []struct {
 		name       string
@@ -41,13 +41,13 @@ func TestInject_IPTCDigestPolicy(t *testing.T) {
 		xmp        []byte // XMP written; nil: none
 		wantDigest []byte // nil: no digest in the output
 	}{
-		{"RECONCILE-06 absent digest is created", nil, newIIM, xmpPacket, sum(newIIM)},
-		{"RECONCILE-06 matching digest is refreshed", sum(oldIIM), newIIM, xmpPacket, sum(newIIM)},
-		{"RECONCILE-06 stale digest is refreshed", stale, newIIM, xmpPacket, sum(newIIM)},
-		{"RECONCILE-06 stale digest of an unchanged IIM is refreshed", stale, oldIIM, xmpPacket, sum(oldIIM)},
-		{"RECONCILE-06 current digest of an unchanged IIM stays", sum(oldIIM), oldIIM, xmpPacket, sum(oldIIM)},
-		{"RECONCILE-06 no XMP: no digest created", nil, newIIM, nil, nil},
-		{"RECONCILE-06 no XMP: stale digest kept as it is", stale, newIIM, nil, stale},
+		{"RECONCILE-06 absent digest is created", nil, newIPTCData, xmpPacket, sum(newIPTCData)},
+		{"RECONCILE-06 matching digest is refreshed", sum(oldIPTCData), newIPTCData, xmpPacket, sum(newIPTCData)},
+		{"RECONCILE-06 stale digest is refreshed", stale, newIPTCData, xmpPacket, sum(newIPTCData)},
+		{"RECONCILE-06 stale digest of an unchanged IIM is refreshed", stale, oldIPTCData, xmpPacket, sum(oldIPTCData)},
+		{"RECONCILE-06 current digest of an unchanged IIM stays", sum(oldIPTCData), oldIPTCData, xmpPacket, sum(oldIPTCData)},
+		{"RECONCILE-06 no XMP: no digest created", nil, newIPTCData, nil, nil},
+		{"RECONCILE-06 no XMP: stale digest kept as it is", stale, newIPTCData, nil, stale},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

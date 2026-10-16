@@ -225,10 +225,9 @@ func isCorpusCopy(p string) bool {
 // MakerNote to a class, and returns "" for any other warning. Variants of one
 // problem share a class, as ExifTool words it differently with the context
 // ("Bad NikonScanIFD directory" and "Bad NikonScanIFD SubDirectory start").
-// The file-absolute preview offsets of Olympus MakerNotes
-// ("PreviewImageStart+PreviewImageLength runs past end of file") are not
-// included: they point into the file, which a write resizes (reported as a
-// known limit, see CHANGELOG).
+// The MakerNote offset of the Olympus preview image after the end of the JPEG
+// ("PreviewImageStart+PreviewImageLength runs past end of file") is a class
+// since task #362, which makes the writer follow the preview.
 func makerNoteWarningClass(msg string) string {
 	for _, c := range []struct{ contains, class string }{
 		{"Possibly incorrect maker notes offsets", "offsets"},
@@ -240,6 +239,8 @@ func makerNoteWarningClass(msg string) string {
 		{"offset for PreviewIFD", "PreviewIFD"},
 		{"Bad NikonScanIFD", "NikonScanIFD"},
 		{"Invalid Canon", "Canon data"},
+		{"PreviewImageStart+PreviewImageLength runs past end of file", "preview offset"},
+		{"KodakIFD pointer references previous", "KodakIFD"},
 	} {
 		if strings.Contains(msg, c.contains) {
 			return c.class

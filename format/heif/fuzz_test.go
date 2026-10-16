@@ -315,12 +315,18 @@ func FuzzHEIFInject(f *testing.F) {
 		assertHEIFExtentsWithinBounds(t, out.Bytes())
 
 		// Task #349: Extract and Inject select the same metadata container, so
-		// what Inject stored is what Extract reads back. Two defects outside
-		// task #349, reported separately, are left out of this check: a child
-		// of meta, iinf or iref with a size field of 0, which a reader takes
-		// to include the boxes Inject appends after it, and an iinf box of
-		// version 1, whose 32-bit entry_count parseIinf reads as 16 bits.
-		if hasOpenEndedMetaChild(data) || hasIinfVersion1(data) {
+		// what Inject stored is what Extract reads back. Tasks #358 and #359:
+		// no exemption remains for an iinf box of version 1 (32-bit
+		// entry_count) or for a child of meta, iinf or iref with a size field
+		// of 0; Inject closes the open-ended child before appending.
+		//
+		// One input class stays out of the check: a source whose top-level
+		// boxes end in bytes that do not parse as a box. Inject appends the
+		// new 'mdat' box after those bytes, where a reader can take them as the
+		// header of a file-level 'meta' box that reaches into the new 'mdat'
+		// and prefer it to the 'moov' one the writer used (reported
+		// separately, not part of tasks #358 and #359).
+		if hasTrailingUnboxedBytes(data) {
 			return
 		}
 		gotEXIF, _, gotXMP, err := Extract(bytes.NewReader(out.Bytes()))
@@ -339,58 +345,13 @@ func FuzzHEIFInject(f *testing.F) {
 	})
 }
 
-// hasOpenEndedMetaChild reports whether the selected meta box of file, or its
-// iinf or iref box (the boxes Inject appends children to), has a child box whose
-// 32-bit size field is 0 (ISO/IEC 14496-12 §4.2: the box extends to the end of
-// its container).
-func hasOpenEndedMetaChild(file []byte) bool {
-	_, end, off, ok := findMetaBoxAbs(file)
-	if !ok {
-		return false
-	}
-	content := file[off:end]
-	if openEndedChild(content, 0) {
-		return true
-	}
-	for _, typ := range [][4]byte{boxTypeIinf, boxTypeIref} {
-		if body := findInnerBox(content, typ); len(body) >= 4 {
-			// iinf has an entry count after version/flags (2 bytes in version 0,
-			// 4 otherwise); iref has none.
-			skip := 4
-			if typ == boxTypeIinf {
-				skip += 2
-				if body[0] != 0 {
-					skip += 2
-				}
-			}
-			if skip <= len(body) && openEndedChild(body[skip:], 0) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// hasIinfVersion1 reports whether the selected meta box of file has an iinf box
-// whose version is not 0.
-func hasIinfVersion1(file []byte) bool {
-	_, end, off, ok := findMetaBoxAbs(file)
-	if !ok {
-		return false
-	}
-	body := findInnerBox(file[off:end], boxTypeIinf)
-	return len(body) > 0 && body[0] != 0
-}
-
-// openEndedChild reports whether a child box of data (a sequence of boxes,
-// starting at from) has a size field of 0.
-func openEndedChild(data []byte, from int) bool {
-	for pos := from; pos+8 <= len(data); {
-		size, _, _, valid := parseHEIFBoxHeader(data, pos)
-		if !valid {
-			return false
-		}
-		if binary.BigEndian.Uint32(data[pos:]) == 0 {
+// hasTrailingUnboxedBytes reports whether the top-level boxes of file stop
+// before its end because the next header does not parse as a box.
+func hasTrailingUnboxedBytes(file []byte) bool {
+	pos := 0
+	for pos < len(file) {
+		size, _, _, ok := parseHEIFBoxHeader(file, pos)
+		if !ok {
 			return true
 		}
 		pos += int(size) //nolint:gosec // G115: bounded by the slice length

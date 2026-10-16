@@ -832,17 +832,17 @@ func TestParsePitm(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// parseIinfItemCount
+// parseIinfEntryCount
 // ---------------------------------------------------------------------------
 
-// TestParseIinfItemCount tests version < 2 (uint16) and version 2 (uint32) paths.
+// TestParseIinfItemCount tests the version 0 (uint16) and version 2 (uint32) paths.
 func TestParseIinfItemCount(t *testing.T) {
 	t.Parallel()
 
 	t.Run("version 0 uint16", func(t *testing.T) {
 		t.Parallel()
 		data := []byte{0x00, 0x05}
-		count, newPos, ok := parseIinfItemCount(data, 0, 0)
+		count, newPos, ok := parseIinfEntryCount(data, 0, 0)
 		if !ok || count != 5 || newPos != 2 {
 			t.Errorf("v0: count=%d newPos=%d ok=%v, want 5 2 true", count, newPos, ok)
 		}
@@ -852,7 +852,7 @@ func TestParseIinfItemCount(t *testing.T) {
 		t.Parallel()
 		data := make([]byte, 4)
 		binary.BigEndian.PutUint32(data, 12)
-		count, newPos, ok := parseIinfItemCount(data, 0, 2)
+		count, newPos, ok := parseIinfEntryCount(data, 0, 2)
 		if !ok || count != 12 || newPos != 4 {
 			t.Errorf("v2: count=%d newPos=%d ok=%v, want 12 4 true", count, newPos, ok)
 		}
@@ -860,7 +860,7 @@ func TestParseIinfItemCount(t *testing.T) {
 
 	t.Run("version 2 too short", func(t *testing.T) {
 		t.Parallel()
-		_, _, ok := parseIinfItemCount([]byte{0x00}, 0, 2)
+		_, _, ok := parseIinfEntryCount([]byte{0x00}, 0, 2)
 		if ok {
 			t.Error("expected ok=false for too-short v2")
 		}

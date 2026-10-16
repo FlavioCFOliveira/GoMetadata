@@ -182,6 +182,22 @@ func FuzzParseEXIF(f *testing.F) {
 		tiff, _ := testutil.MakerNoteTIFF(spec)
 		f.Add(tiff)
 	}
+	// Seeds (task #362): a Kodak private IFD behind IFD0 tag 0x8290 and
+	// Interoperability pointers that loop to IFD0 and to the Exif IFD; Olympus
+	// notes with a CameraSettings preview offset; headerless Nikon notes of
+	// both byte orders (task #364).
+	for _, interop := range []func(ifd0, exifIFD uint32) uint32{noInterop, func(ifd0, _ uint32) uint32 { return ifd0 }, func(_, exifIFD uint32) uint32 { return exifIFD }} {
+		kodak, _ := kodakStream(interop, 2)
+		f.Add(kodak)
+	}
+	f.Add(olympusStream("OLYMPUS IMAGING CORP.", "OLYMPUS\x00II\x03\x00", []testutil.MNEntry{
+		{Tag: 0x0101, Type: 4, Count: 1, Value: long(5000)}, {Tag: 0x0102, Type: 4, Count: 1, Value: long(321)}}))
+	f.Add(olympusStream("OM Digital Solutions", "OM SYSTEM\x00\x00\x00II", []testutil.MNEntry{
+		{Tag: 0x0101, Type: 4, Count: 1, Value: long(1)}, {Tag: 0x0102, Type: 4, Count: 1, Value: long(2)}}))
+	for _, order := range []testOrder{binary.LittleEndian, binary.BigEndian} {
+		tiff, _ := testutil.MakerNoteTIFF(testutil.MNSpec{Make: "NIKON", Order: order, TIFFRelative: true, PadBefore: 6, Entries: mnEntries()})
+		f.Add(tiff)
+	}
 	// Seed: an IFD1 whose pointer tags address IFDs of their own (task #319).
 	{
 		e := chainEXIF(1, 1, &SubIFDs{
@@ -248,6 +264,16 @@ func FuzzParseEXIF(f *testing.F) {
 			}
 			if !bytes.Equal(before, b) {
 				t.Error("EncodeRebased modified the source stream")
+			}
+			// Task #362: the data of the MakerNote that lies outside the EXIF
+			// stream is found without panicking, on the stream and on what the
+			// writer made of it, and leaves the stream as it was.
+			_ = ExternalOffsets(b)
+			if rbErr == nil {
+				_ = ExternalOffsets(rebased)
+			}
+			if !bytes.Equal(before, b) {
+				t.Error("ExternalOffsets modified its argument")
 			}
 		}
 	})

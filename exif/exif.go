@@ -264,13 +264,38 @@ func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseCon
 	}
 
 	// Interoperability IFD pointer (EXIF §4.6.3, tag 0xA005).
-	if iptr := sub.Get(TagInteropIFDPointer); iptr != nil && len(iptr.Value) >= 4 {
-		if isub, isubWarnings, ierr := traverseWithArena(b, order.Uint32(iptr.Value), order, arena, budget, cfg.aliasThumbnail); ierr == nil {
-			interopIFD = isub
-			warnings = append(warnings, isubWarnings...)
-		}
-	}
+	interopIFD, interopWarnings := parseInteropIFD(b, order, sub, order.Uint32(ptr.Value), arena, budget, cfg.aliasThumbnail)
+	warnings = append(warnings, interopWarnings...)
 	return exifIFD, makerNote, makerNoteOffset, makerNoteOffset64, makerNoteIFD, interopIFD, warnings
+}
+
+// parseInteropIFD parses the Interoperability IFD that tag 0xA005 of the Exif
+// IFD sub points to (EXIF §4.6.3), or returns nil when there is no pointer or it
+// does not address an IFD of its own. exifOff is the offset of the Exif IFD.
+//
+// A pointer that addresses IFD0 or the Exif IFD itself is a loop, not an IFD
+// (the Kodak ProBack of the corpus points it at IFD0, offset 8): ExifTool
+// ignores it ("InteropIFD pointer references previous IFD0 directory"), and so
+// must a writer, which would otherwise write a second copy of that IFD as the
+// Interoperability IFD (task #362).
+func parseInteropIFD(b []byte, order binary.ByteOrder, sub *IFD, exifOff uint32, arena *parseArena, budget *traverseBudget, aliasThumbnail bool) (*IFD, []parseWarn) {
+	iptr := sub.Get(TagInteropIFDPointer)
+	if iptr == nil || len(iptr.Value) < 4 || pointsAtEarlierIFD(b, order, order.Uint32(iptr.Value), exifOff) {
+		return nil, nil
+	}
+	isub, warnings, err := traverseWithArena(b, order.Uint32(iptr.Value), order, arena, budget, aliasThumbnail)
+	if err != nil {
+		return nil, nil
+	}
+	return isub, warnings
+}
+
+// pointsAtEarlierIFD reports whether off is the offset of IFD0 (the offset in
+// the TIFF header of b) or exifOff, the offset of the Exif IFD: an IFD that is
+// read already. The traversal budget bounds the cost of a loop, but the copy
+// would be written as a second IFD.
+func pointsAtEarlierIFD(b []byte, order binary.ByteOrder, off, exifOff uint32) bool {
+	return len(b) >= 8 && (off == order.Uint32(b[4:]) || off == exifOff)
 }
 
 // parseGPSSubIFD traverses the GPS IFD rooted at the TagGPSIFDPointer entry
@@ -1099,6 +1124,9 @@ func (e *EXIF) SetDateTimeOriginal(t time.Time) {
 	off := append(t.AppendFormat(make([]byte, 0, 7), "-07:00"), 0)
 	e.ExifIFD.set(TagOffsetTimeOriginal, TypeASCII, uint32(len(off)), off, big) //nolint:gosec // G115: 7 bytes
 	e.ExifIFD.remove(TagSubSecTimeOriginal)
+	// OffsetTimeOriginal exists since Exif 2.31: the ExifVersion must not claim
+	// an older standard (task #363).
+	e.requireExifTag(TagOffsetTimeOriginal)
 }
 
 // SetExposureTime sets ExifIFD tag 0x829A (ExposureTime, EXIF §4.6.5).
@@ -1170,6 +1198,7 @@ func (e *EXIF) SetLensModel(s string) {
 	}
 	e.ensureExifIFD()
 	e.setText(e.ExifIFD, TagLensModel, s)
+	e.requireExifTag(TagLensModel) // defined by Exif 2.3 (task #363)
 }
 
 // SetImageSize sets ExifIFD tags 0xA002 and 0xA003 (PixelXDimension /
