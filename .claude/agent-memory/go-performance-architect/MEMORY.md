@@ -113,3 +113,4 @@
 - [Lint after adding parser branches/tests](feedback_lint_iteration_after_new_code.md) — new nolint + gocyclo bumps common; run golangci-lint before done
 - [Sprint 46 E7 (2026-10-16, done)](project_sprint46_e7_progress.md) — #367-#370: HEIF trailer before-mdat, IFD1 strips (CarryThumbnailStrips), Samsung = ExifTool order dependence, Olympus offsets all forms
 - [Task #371 Nikon Capture overlap](project_task371_nikon_capture_overlap.md) — 0x0E01 data overlapping IFD erased its own entry; overlap check
+- [Task #379 F-07a coalesce (2026-10-16)](project_task379_f07a_coalesce.md) — planBlocks union copy replaces overlap rejection; corpus rejects list; png F-08 timing flake
