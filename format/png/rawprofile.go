@@ -5,6 +5,7 @@ package png
 import (
 	"bytes"
 	"compress/zlib"
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -73,43 +74,99 @@ func isRawProfileKeyword(data []byte) (kind rawProfileKind, keywordLen int) {
 	return rawProfileKindOf(data[len(rawProfilePrefix):null]), null
 }
 
+// maxRawProfileBudget bounds the text that all the "Raw profile type ..."
+// chunks of one PNG may inflate to, in one Extract or one Inject. A profile is
+// the hex text of an IPTC, Exif or XMP block: a few kilobytes, and 2 bytes of
+// text per byte of an XMP packet of at most 16 MiB (the xmp package's own
+// limit), so 32 MiB is far above any real file. Without the bound every such
+// chunk is inflated up to 64 MiB on its own (security audit F-08: 40 chunks
+// cost 2.1 s of Read), and each chunk of the same kind after the first would be
+// inflated for nothing. Reference: Exiv2 pngimage.cpp inflates a chunk only
+// when its keyword is one it reads, and stops at the first of each kind.
+const maxRawProfileBudget int64 = 32 << 20
+
+// profileBudget counts the text inflated so far in one Extract or Inject; the
+// zero value is a full budget of maxRawProfileBudget.
+type profileBudget struct{ used int64 }
+
+// newProfileBudget returns a full budget.
+func newProfileBudget() profileBudget { return profileBudget{} }
+
+// limit returns the output cap for the next inflate: what is left of the
+// budget, or the per-chunk cap for a nil budget.
+func (b *profileBudget) limit() int64 {
+	if b == nil {
+		return maxZlibDecompressSize
+	}
+	return maxRawProfileBudget - b.used
+}
+
+// spend charges n inflated bytes to the budget.
+func (b *profileBudget) spend(n int) {
+	if b != nil {
+		b.used += int64(n)
+	}
+}
+
+// inflate decompresses data within the budget. A stream that is not valid zlib
+// is (nil, nil): the chunk is malformed and ignored, as it always was; only the
+// budget running out is an error.
+func (b *profileBudget) inflate(data []byte) ([]byte, error) {
+	dec, err := zlibDecompressLimit(data, b.limit())
+	if err != nil {
+		if errors.Is(err, ErrRawProfileBudget) {
+			return nil, err
+		}
+		return nil, nil
+	}
+	b.spend(len(dec))
+	return dec, nil
+}
+
 // rawProfileText returns the text of a text chunk whose keyword occupies
 // data[:keywordLen] (PNG §11.3.4: tEXt, zTXt, iTXt layouts), decompressing it
 // when the chunk is compressed. ok is false for a malformed chunk.
 func rawProfileText(chunkType [4]byte, data []byte, keywordLen int) (text []byte, ok bool) {
+	text, ok, _ = rawProfileTextB(chunkType, data, keywordLen, nil)
+	return text, ok
+}
+
+// rawProfileTextB is rawProfileText with the inflate charged to budget; err is
+// ErrRawProfileBudget when it runs out.
+func rawProfileTextB(chunkType [4]byte, data []byte, keywordLen int, budget *profileBudget) (text []byte, ok bool, err error) {
 	pos := keywordLen + 1 // past the keyword NUL
 	switch chunkType {
 	case chunkTEXt:
-		return data[pos:], true
+		return data[pos:], true, nil
 	case chunkZTXt:
 		// compression method byte, then the zlib stream.
 		if pos >= len(data) || data[pos] != 0 {
-			return nil, false
+			return nil, false, nil
 		}
-		dec, err := zlibDecompress(data[pos+1:])
-		return dec, err == nil
+		dec, err := budget.inflate(data[pos+1:])
+		return dec, dec != nil, err
 	case chunkITXt:
-		return iTXtText(data, pos)
+		return iTXtTextB(data, pos, budget)
 	}
-	return nil, false
+	return nil, false, nil
 }
 
-// iTXtText returns the text of an iTXt chunk whose compression flag starts at
+// iTXtTextB returns the text of an iTXt chunk whose compression flag starts at
 // data[pos] (PNG §11.3.4.5: compression flag, compression method, language
-// tag NUL, translated keyword NUL, text).
-func iTXtText(data []byte, pos int) (text []byte, ok bool) {
+// tag NUL, translated keyword NUL, text), inflating it within budget.
+func iTXtTextB(data []byte, pos int, budget *profileBudget) (text []byte, ok bool, err error) {
 	compFlag, compMethod, pos, ok := iTXtTextStart(data, pos)
 	if !ok {
-		return nil, false
+		return nil, false, nil
 	}
 	if compFlag == 0 {
-		return data[pos:], true
+		return data[pos:], true, nil
 	}
 	if compMethod != 0 {
-		return nil, false
+		return nil, false, nil
 	}
-	dec, err := zlibDecompress(data[pos:])
-	return dec, err == nil
+	dec, err := budget.inflate(data[pos:])
+	return dec, dec != nil, err
 }
 
 // iTXtTextStart returns the compression flag and method of an iTXt chunk
@@ -287,23 +344,55 @@ type extractState struct {
 	// (eXIf chunk, XMP iTXt) is absent: PNG 3rd Edition defines eXIf and the
 	// XMP iTXt as the authoritative carriers.
 	profEXIF, profXMP []byte
+	// budget bounds the text that the raw profile chunks inflate to.
+	budget profileBudget
+}
+
+// wants reports whether a raw profile of the given kind can still add
+// anything to st: the first profile of each kind wins, so once its slot is
+// filled the later chunks of that kind are not inflated at all (the invariant
+// of at most one decompression per kind that v1.4.0 had; security audit F-08).
+// An APP1 profile holds Exif or XMP, so it is wanted while either is missing.
+func (st *extractState) wants(kind rawProfileKind) bool {
+	switch kind {
+	case rawProfileIPTC:
+		return st.iptc == nil
+	case rawProfileEXIF:
+		return st.profEXIF == nil
+	case rawProfileXMP:
+		return st.profXMP == nil
+	case rawProfileAPP1:
+		return st.profEXIF == nil || st.profXMP == nil
+	case rawProfileNone:
+	}
+	return false
 }
 
 // addRawProfile decodes a raw profile text chunk and records its content. A
-// malformed profile is ignored.
-func (st *extractState) addRawProfile(chunkType [4]byte, data []byte) {
+// malformed profile is ignored, and so is a profile of a kind that an earlier
+// chunk already supplied. The error is ErrRawProfileBudget when the chunks
+// together inflate to more than maxRawProfileBudget.
+func (st *extractState) addRawProfile(chunkType [4]byte, data []byte) error {
 	kind, kwLen := isRawProfileKeyword(data)
-	if kind == rawProfileNone {
-		return
+	if kind == rawProfileNone || !st.wants(kind) {
+		return nil
 	}
-	text, ok := rawProfileText(chunkType, data, kwLen)
+	text, ok, err := rawProfileTextB(chunkType, data, kwLen, &st.budget)
+	if err != nil {
+		return err
+	}
 	if !ok {
-		return
+		return nil
 	}
-	p := decodeRawProfile(text)
-	if p == nil {
-		return
+	if p := decodeRawProfile(text); p != nil {
+		st.record(kind, p)
 	}
+	return nil
+}
+
+// record stores the decoded profile p of the given kind in the first free slot
+// of its kind.
+func (st *extractState) record(kind rawProfileKind, p []byte) {
 	if kind == rawProfileIPTC {
 		if st.iptc == nil {
 			st.iptc = profileIPTC(p) // p is a fresh buffer: it may be retained
@@ -357,11 +446,20 @@ const rawProfileHexLine = 36
 // refreshed (irb.AppendSpliced; MWG Guidelines v2.0 §4.2.3.2, p. 29), even
 // when the IIM itself is unchanged.
 func rewriteRawProfileIPTC(chunkType [4]byte, data, newIIM []byte, withXMP bool) (payload []byte, ok bool, err error) {
+	return rewriteRawProfileIPTCB(chunkType, data, newIIM, withXMP, nil)
+}
+
+// rewriteRawProfileIPTCB is rewriteRawProfileIPTC with the inflate charged to
+// budget; err is ErrRawProfileBudget when it runs out.
+func rewriteRawProfileIPTCB(chunkType [4]byte, data, newIIM []byte, withXMP bool, budget *profileBudget) (payload []byte, ok bool, err error) {
 	kind, kwLen := isRawProfileKeyword(data)
 	if kind != rawProfileIPTC {
 		return nil, false, nil
 	}
-	text, tok := rawProfileText(chunkType, data, kwLen)
+	text, tok, terr := rawProfileTextB(chunkType, data, kwLen, budget)
+	if terr != nil {
+		return nil, false, terr
+	}
 	if !tok {
 		return nil, false, nil
 	}
@@ -473,21 +571,35 @@ func rawProfileChunk(chunkType [4]byte, data []byte, kwLen int, newText []byte) 
 // this package reads, is never dropped: its content has not been carried
 // over, so it is preserved byte-identical.
 func rawProfileSuperseded(chunkType [4]byte, data []byte, haveEXIF, haveXMP bool) bool {
+	superseded, _ := rawProfileSupersededB(chunkType, data, haveEXIF, haveXMP, nil)
+	return superseded
+}
+
+// rawProfileSupersededB is rawProfileSuperseded with the inflate charged to
+// budget; err is ErrRawProfileBudget when it runs out.
+func rawProfileSupersededB(chunkType [4]byte, data []byte, haveEXIF, haveXMP bool, budget *profileBudget) (bool, error) {
 	if !haveEXIF && !haveXMP {
-		return false
+		return false, nil
 	}
 	kind, kwLen := isRawProfileKeyword(data)
 	if kind == rawProfileNone || kind == rawProfileIPTC {
-		return false
+		return false, nil
 	}
-	text, ok := rawProfileText(chunkType, data, kwLen)
-	if !ok {
-		return false
-	}
-	p := decodeRawProfile(text)
-	if p == nil {
-		return false
+	p, err := decodedProfile(chunkType, data, kwLen, budget)
+	if p == nil || err != nil {
+		return false, err
 	}
 	tiff, xmp := profileEXIF(kind, p)
-	return (tiff != nil && haveEXIF) || (xmp != nil && haveXMP)
+	return (tiff != nil && haveEXIF) || (xmp != nil && haveXMP), nil
+}
+
+// decodedProfile returns the profile bytes of the raw profile chunk data, or
+// nil when the chunk is malformed; err is ErrRawProfileBudget when the inflate
+// runs out of budget.
+func decodedProfile(chunkType [4]byte, data []byte, kwLen int, budget *profileBudget) ([]byte, error) {
+	text, ok, err := rawProfileTextB(chunkType, data, kwLen, budget)
+	if err != nil || !ok {
+		return nil, err
+	}
+	return decodeRawProfile(text), nil
 }

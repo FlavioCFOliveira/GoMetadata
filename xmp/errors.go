@@ -8,6 +8,12 @@ var ErrEmptyInput = errors.New("xmp: empty input")
 // ErrXMLNestingDepth is returned when XML parsing exceeds 100 levels of nesting.
 var ErrXMLNestingDepth = errors.New("xmp: XML nesting depth exceeded 100 levels")
 
+// ErrXMLTooComplex is returned when an XMP packet holds more elements or
+// attributes than the parser accepts (524288 elements, 1048576 attributes).
+// ISO 16684-1 imposes no limit; this is a local security policy that keeps the
+// memory needed to parse a packet proportional to its size.
+var ErrXMLTooComplex = errors.New("xmp: XML document has too many elements or attributes")
+
 // ErrGPSValueTooShort is returned when an XMP GPS coordinate string is too short to parse.
 var ErrGPSValueTooShort = errors.New("xmp: GPS value too short")
 

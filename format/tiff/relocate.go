@@ -352,7 +352,8 @@ func relocateTIFF(base []byte, rawIPTC, rawXMP []byte) (header []byte, blocks []
 //     always small (bounded by metadata size), regardless of source file size.
 //   - blocks: every image-data block (strips, tiles, JPEG-in-TIFF), each
 //     already carrying its final newOffset (assigned by assignNewOffsets).
-//     blocks[i].newOffset == len(header) + sum(blocks[j].size for j < i): the
+//     blocks[i].newOffset == len(header) + sum(blocks[j].size for j < i) when the
+//     blocks are disjoint (overlapping blocks share one copy, see assignNewOffsets): the
 //     blocks, concatenated in slice order and appended immediately after
 //     header, reproduce EXACTLY the single-buffer result this function used
 //     to return directly (task #291).
@@ -1009,7 +1010,17 @@ func bytecountTagFor(offsetTag exif.TagID) exif.TagID {
 }
 
 // assignNewOffsets assigns a new absolute file offset to each image block,
-// placing them contiguously starting at imageStart.
+// placing the copied bytes contiguously starting at imageStart.
+//
+// Disjoint blocks (the usual case) are placed one after the other in slice
+// order. When blocks overlap, each source byte is copied once: the blocks are
+// coalesced into a union of source ranges (planBlocks), each range is placed at
+// the position of its first block, and every block is rebased into its range at
+// the same distance from the range start that it has in the source, so a tile
+// over a strip points inside the copy of the strip. This is the relocation that
+// libtiff's TIFFRewriteDirectory/_TIFFRewriteField and Exiv2's TiffImage
+// perform when they keep the strips as they are: the addressed data is written
+// once and each offset entry is updated to where it lands.
 //
 // TIFF 6.0 §2: all offsets are measured from byte 0 of the TIFF stream.
 //
@@ -1021,13 +1032,41 @@ func bytecountTagFor(offsetTag exif.TagID) exif.TagID {
 // at the ifdEnd/subIFDsSize overflow check for the full rationale.
 func assignNewOffsets(blocks []*imageBlock, imageStart uint64) {
 	cur := imageStart
-	for _, blk := range blocks {
-		blk.newOffset = cur
-		if blk.size > math.MaxUint32-cur {
-			// Saturate to prevent overflow; caller will detect the invalid offset.
+	if disjointAscending(blocks) {
+		for _, blk := range blocks {
+			blk.newOffset = cur
+			if blk.size > math.MaxUint32-cur {
+				// Saturate to prevent overflow; caller will detect the invalid offset.
+				blk.newOffset = math.MaxUint32
+			} else {
+				cur += blk.size
+			}
+		}
+		return
+	}
+	plan := planBlocks(blocks)
+	dst := make([]uint64, len(plan.ranges))
+	placed := 0
+	for i, blk := range blocks {
+		p := plan.of[i]
+		if p < 0 { // empty block: no bytes, at the position it has in the order
+			blk.newOffset = cur
+			continue
+		}
+		rg := plan.ranges[p]
+		if int(p) == placed { // first block of its range: place the range
+			placed++
+			if size := rg.end - rg.start; size > math.MaxUint32-cur {
+				dst[p] = math.MaxUint32 // saturate, as above
+			} else {
+				dst[p] = cur
+				cur += size
+			}
+		}
+		if dst[p] == math.MaxUint32 {
 			blk.newOffset = math.MaxUint32
 		} else {
-			cur += blk.size
+			blk.newOffset = dst[p] + (blk.srcOffset - rg.start)
 		}
 	}
 }
@@ -1332,6 +1371,11 @@ func budgetValue(b *imageBlockBudget) imageBlockBudget {
 	return *b
 }
 
+// subIFDBudgetCost is the number of imageBlockBudget units one SubIFD visited
+// costs (see subIFDWalker.visit): at most maxAggregateImageBlocks/4 = 65536 of
+// them are built per write.
+const subIFDBudgetCost = 4
+
 // maxSubIFDChain bounds the main-chain IFDs whose SubIFDs enumerateSubIFDs
 // visits. exif.Parse follows at most 512 chained IFDs (maxTraverseChainIFDs);
 // real files chain a handful (a CR2 chains four).
@@ -1461,6 +1505,16 @@ func (w *subIFDWalker) visit(off uint64, depth int) (si *subIFDInfo, ok bool, er
 	}
 	if found := w.lookup(off); found != nil {
 		return found, true, nil
+	}
+	// Every SubIFD built costs subIFDBudgetCost units of the aggregate budget, whether it is
+	// named by a 0x014A array or only linked by a next-IFD pointer (security
+	// audit F-07b: array charges the pointers it reads, but the SubIFDs that
+	// chain follows from them were free, so 1024 heads x 512 links built 524288
+	// SubIFDs from a 3 MiB file). Each one allocates a parsed IFD and a raw
+	// copy, about 280 bytes against the 64 of an image block, hence the weight;
+	// a real file has a handful (DNG: one to four, plus a chain of previews).
+	if !w.budget.spend(subIFDBudgetCost) {
+		return nil, false, fmt.Errorf("tiff: SubIFD at offset %d: %w", off, ErrTooManyImageBlocks)
 	}
 	raw := rawSubIFD(w.base, off, w.bigTIFF, w.order)
 	if raw == nil {

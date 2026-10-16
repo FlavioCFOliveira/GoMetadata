@@ -147,6 +147,7 @@ func FuzzTrailerTail(f *testing.F) {
 	f.Add(append(bytes.Repeat([]byte{7}, 20), afcpOf(binary.BigEndian, "AXS!", 20, [][2]string{{"IPTC", string(oldIIM)}})...))
 	f.Add(fotoOf(FotoRecord{Tag: 1, Data: oldIIM}))
 	f.Add([]byte("AXS!\x00\x00\x00\x00AXS!\x00\x00\x00\x00"))
+	f.Add(afcpBomb(4096)) // security audit F-03: repeated signature units
 	f.Fuzz(func(t *testing.T, file []byte) {
 		region, base, err := FindTail(BytesSource(file), int64(len(file)))
 		if err != nil {
@@ -172,4 +173,97 @@ func FuzzTrailerTail(f *testing.F) {
 			t.Fatalf("output %d bytes, want %d", buf.Len(), len(file))
 		}
 	})
+}
+
+// afcpBomb returns n bytes of the repeated 12-byte unit "AXS!" + 8 zero bytes
+// (security audit F-03): every unit is a candidate header whose directory is
+// empty, and every unit is also a candidate EOF record for every earlier one.
+func afcpBomb(n int) []byte {
+	unit := append([]byte("AXS!"), make([]byte, 8)...)
+	return bytes.Repeat(unit, n/12)
+}
+
+// TestSecurityAuditV150 holds the regression tests of the 2026-10-16
+// pre-release security audit; the sub-test names are the finding IDs.
+func TestSecurityAuditV150(t *testing.T) {
+	t.Parallel()
+
+	// F-03: FindAFCP was quadratic (candidate x EOF-record scan): 0.23 s at
+	// 64 KiB, 15 s at 512 KiB. The work is bounded structurally now, which is
+	// what this test proves instead of a load-sensitive wall-clock limit: a
+	// region with more than maxAFCPSignatures signatures yields no candidate list
+	// at all (collectAFCPSigs returns nil), so no candidate is parsed and no EOF
+	// record is searched, however large the region; and a region with exactly
+	// maxAFCPSignatures is the worst case that is still examined, which is
+	// bounded by the constant, not by the region size.
+	t.Run("F-03", func(t *testing.T) {
+		t.Parallel()
+		region := afcpBomb(512 << 10)
+		var buf [maxAFCPSignatures]int
+		if sigs := collectAFCPSigs(buf[:0], region); sigs != nil {
+			t.Errorf("collectAFCPSigs kept %d signatures of a %d-signature region, want nil (over the cap)", len(sigs), len(region)/12)
+		}
+		if a := FindAFCP(region, 100); a != nil {
+			t.Errorf("FindAFCP accepted a repeated-signature region: %+v", a)
+		}
+		plan := PlanFromRegion(region, 100, newIIM)
+		if len(plan.Spans) != 0 {
+			t.Errorf("PlanFromRegion planned %d spans for a repeated-signature region", len(plan.Spans))
+		}
+		atCap := afcpBomb(maxAFCPSignatures * 12)
+		if sigs := collectAFCPSigs(buf[:0], atCap); len(sigs) != maxAFCPSignatures {
+			t.Errorf("collectAFCPSigs kept %d signatures of a region with exactly %d, want all", len(sigs), maxAFCPSignatures)
+		}
+		if a := FindAFCP(atCap, 100); a != nil {
+			t.Errorf("FindAFCP accepted a repeated-signature region at the cap: %+v", a)
+		}
+	})
+
+	// F-03: a region with few signatures keeps the old behaviour, including
+	// the gap between the data and the EOF record and chance signatures
+	// before the real trailer.
+	t.Run("F-03-valid", func(t *testing.T) {
+		t.Parallel()
+		prefix := append(bytes.Repeat([]byte{9}, 4), "AXS!junkAXS*"...)
+		real := afcpOf(binary.BigEndian, "AXS!", 100+int64(len(prefix)), [][2]string{{"IPTC", string(oldIIM)}})
+		region := append(bytes.Clone(prefix), real...)
+		region = append(region, "tail"...)
+		a := FindAFCP(region, 100)
+		if a == nil {
+			t.Fatal("AFCP trailer behind chance signatures not found")
+		}
+		if a.Start != 100+int64(len(prefix)) || a.End != 100+int64(len(region)-4) {
+			t.Errorf("Start/End = %d/%d", a.Start, a.End)
+		}
+		if len(a.Entries) != 1 || !bytes.Equal(a.Entries[0].Data, oldIIM) {
+			t.Errorf("entries: %+v", a.Entries)
+		}
+		// Little-endian, with a gap between the data and the EOF record.
+		le := afcpOf(binary.LittleEndian, "AXS*", 7, [][2]string{{"TEXT", "caption"}})
+		gap := append(bytes.Clone(le[:len(le)-12]), "gap"...)
+		gap = append(gap, le[len(le)-12:]...)
+		if a := FindAFCP(gap, 7); a == nil || a.End != 7+int64(len(gap)) {
+			t.Errorf("gap before the EOF record: %+v", a)
+		}
+	})
+}
+
+// BenchmarkFindAFCP measures the worst case of the audit (F-03) and the common
+// case of a valid trailer.
+func BenchmarkFindAFCP(b *testing.B) {
+	bomb := afcpBomb(512 << 10)
+	valid := append(bytes.Repeat([]byte{7}, 1<<20), afcpOf(binary.BigEndian, "AXS!", 1<<20, [][2]string{{"IPTC", string(oldIIM)}})...)
+	none := bytes.Repeat([]byte{7}, 1<<20)
+	for _, tc := range []struct {
+		name   string
+		region []byte
+	}{{"repeated-512KiB", bomb}, {"valid-1MiB", valid}, {"none-1MiB", none}} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.SetBytes(int64(len(tc.region)))
+			b.ReportAllocs()
+			for range b.N {
+				_ = FindAFCP(tc.region, 100)
+			}
+		})
+	}
 }

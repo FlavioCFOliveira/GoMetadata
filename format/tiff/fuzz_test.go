@@ -222,6 +222,12 @@ func FuzzTIFFInject(f *testing.F) {
 	f.Add(append(bytes.Clone(minLE), t354AFCP(binary.BigEndian, "AXS!", int64(len(minLE)), [][2]string{{"IPTC", string(t354OldIIM)}})...))
 	f.Add(append(bytes.Clone(minLE), t354Foto(trailer.FotoRecord{Tag: 1, Data: t354OldIIM})...))
 
+	// Seeds (security audit 2026-10-16): F-03 repeated AFCP signature units as
+	// the trailer, F-07a StripOffsets repeating one range, F-07b SubIFD chains.
+	f.Add(append(bytes.Clone(minLE), bytes.Repeat(append([]byte("AXS!"), make([]byte, 8)...), 64)...))
+	f.Add(auditDuplicateStrips(64, 4096))
+	f.Add(auditSubIFDChains(16, 32))
+
 	// Seed 2: minimal BE TIFF — exercises big-endian parsing in exif.Parse.
 	minBE := buildMinimalTIFF(binary.BigEndian,
 		[]byte("fuzz-iptc-be"),

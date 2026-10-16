@@ -180,10 +180,17 @@ func (p *olympusExternalPlan) blocksToAdd() []*imageBlock {
 }
 
 // relocatedEnd returns the position in the output of the end of the last image
-// block, where the tail begins: the header length plus the size of every block.
+// block, where the tail begins: the header length plus the bytes copied for the
+// blocks (each source byte once, see assignNewOffsets).
 func relocatedEnd(headerLen uint64, blocks []*imageBlock) uint64 {
-	for _, b := range blocks {
-		headerLen = saturatingAdd(headerLen, b.size)
+	if disjointAscending(blocks) {
+		for _, b := range blocks {
+			headerLen = saturatingAdd(headerLen, b.size)
+		}
+		return headerLen
+	}
+	for _, rg := range planBlocks(blocks).ranges {
+		headerLen = saturatingAdd(headerLen, rg.end-rg.start)
 	}
 	return headerLen
 }

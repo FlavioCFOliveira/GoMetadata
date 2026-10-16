@@ -525,7 +525,7 @@ func TestPatchAncestorSize(t *testing.T) {
 
 		// metaAbsStart=8 is inside the outer box (0..40), so the outer box size
 		// should be patched.
-		patchAncestorSize(data, 8, 4) // delta = +4
+		_ = patchAncestorSize(data, 8, 4) // delta = +4
 		newSize := binary.BigEndian.Uint32(data[0:])
 		if newSize != 44 {
 			t.Errorf("patched outer box size = %d, want 44", newSize)
@@ -537,7 +537,7 @@ func TestPatchAncestorSize(t *testing.T) {
 		binary.BigEndian.PutUint32(data[0:], 1) // sentinel: extended size
 		copy(data[4:8], "moov")
 		binary.BigEndian.PutUint64(data[8:], 24) // 64-bit size
-		patchAncestorSize(data, 8, 4)            // should not modify anything
+		_ = patchAncestorSize(data, 8, 4)        // should not modify anything
 		// The first 4 bytes should still be 1 (unchanged).
 		if binary.BigEndian.Uint32(data[0:]) != 1 {
 			t.Error("extended-size box was unexpectedly patched")
@@ -549,7 +549,7 @@ func TestPatchAncestorSize(t *testing.T) {
 		binary.BigEndian.PutUint32(data[0:], 16)
 		copy(data[4:8], "ftyp")
 		// metaAbsStart=20 is beyond the end of this box (0..16), so no patch.
-		patchAncestorSize(data, 20, 4)
+		_ = patchAncestorSize(data, 20, 4)
 		if binary.BigEndian.Uint32(data[0:]) != 16 {
 			t.Errorf("size was unexpectedly patched")
 		}
@@ -561,7 +561,7 @@ func TestPatchAncestorSize(t *testing.T) {
 		copy(data[4:8], "mdat")
 		// This should try to patch because offset 0 to len(data)=16 contains
 		// metaAbsStart=8.
-		patchAncestorSize(data, 8, 4)
+		_ = patchAncestorSize(data, 8, 4)
 		// size==0 path sets size=uint64(len(data)-pos)=16, boxEnd=16 > 8, so it patches.
 		if binary.BigEndian.Uint32(data[0:]) == 0 {
 			t.Logf("note: zero-size box may not be patched (expected behavior)")
@@ -2377,7 +2377,7 @@ func TestHEIFInjectPatchAncestorSizeOverflow(t *testing.T) {
 		binary.BigEndian.PutUint32(data[8:], 16) // inner box size
 		copy(data[12:16], "meta")
 
-		patchAncestorSize(data, 8, 4) // delta = +4
+		_ = patchAncestorSize(data, 8, 4) // delta = +4
 		got := binary.BigEndian.Uint32(data[0:])
 		want := moovSize + 4 // 36
 		if got != want {
@@ -2395,7 +2395,7 @@ func TestHEIFInjectPatchAncestorSizeOverflow(t *testing.T) {
 		binary.BigEndian.PutUint32(data[8:], 16) // inner box
 		copy(data[12:16], "meta")
 
-		patchAncestorSize(data, 8, 1) // delta=+1 causes overflow
+		_ = patchAncestorSize(data, 8, 1) // delta=+1 causes overflow
 		got := binary.BigEndian.Uint32(data[0:])
 		// Must NOT be 0 (uint32(0x100000000) == 0 truncation), and must NOT be
 		// MaxUint32+1 (impossible). Acceptable: MaxUint32 (unchanged).
@@ -2422,7 +2422,7 @@ func TestHEIFInjectPatchAncestorSizeOverflow(t *testing.T) {
 		copy(data[20:], "meta")
 
 		// metaAbsStart=16 is inside the 64-bit moov box. delta=4.
-		patchAncestorSize(data, 16, 4)
+		_ = patchAncestorSize(data, 16, 4)
 		gotLargeSize := binary.BigEndian.Uint64(data[8:])
 		wantLargeSize := largeSize + 4
 		if gotLargeSize != wantLargeSize {

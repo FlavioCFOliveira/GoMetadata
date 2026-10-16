@@ -101,6 +101,7 @@ var (
 	errItemPayloadTooLarge  = errors.New("heif: item payload exceeds size limit")
 	errItemOffsetOverflow   = errors.New("heif: item location offset overflows int64")
 	errIdatExtentOutOfRange = errors.New("heif: item extent lies outside the idat box")
+	errItemExtentOutOfFile  = errors.New("heif: metadata item data lies beyond the end of the file")
 )
 
 // ilocHeader is the decoded fixed header of an iloc box body (the bytes after
@@ -325,7 +326,7 @@ func readIlocItem(src itemSource, ilocData []byte, h *ilocHeader, it ilocItemHea
 	if !ok || it.extentCount == 0 || it.extentCount > maxIlocExtentsPerItem {
 		return nil, nil
 	}
-	total, err := itemLength(ilocData, h, it, extPos)
+	total, err := checkedItemLength(src, idat, ilocData, h, it, extPos)
 	if err != nil || total == 0 {
 		return nil, err
 	}
@@ -337,12 +338,34 @@ func readIlocItem(src itemSource, ilocData []byte, h *ilocHeader, it ilocItemHea
 		if ext.length == 0 {
 			continue
 		}
+		// itemLength proved filled+ext.length <= total == len(payload); the
+		// explicit check keeps a future change from turning a mismatch into a
+		// slice-bounds panic (security audit F-01).
+		if ext.length > total-filled {
+			return nil, errItemPayloadTooLarge
+		}
 		if err := readExtent(src.r, idat, it.baseOffset+ext.offset, payload[filled:filled+ext.length]); err != nil {
 			return nil, err
 		}
 		filled += ext.length
 	}
 	return payload, nil
+}
+
+// checkedItemLength returns the total length of the extents of item it after
+// validating every one of them against the bytes that actually exist (the file
+// length, or the idat payload). It runs BEFORE the payload is allocated, so a
+// 168-byte file cannot make Extract allocate 256 MiB (security audit F-09).
+func checkedItemLength(src itemSource, idat, ilocData []byte, h *ilocHeader, it ilocItemHeader, extPos int) (uint64, error) {
+	limit, err := itemSourceLen(src, idat)
+	if err != nil {
+		return 0, err
+	}
+	total, err := itemLength(ilocData, h, it, extPos, limit)
+	if err != nil && idat != nil && errors.Is(err, errItemExtentOutOfFile) {
+		err = errIdatExtentOutOfRange
+	}
+	return total, err
 }
 
 // itemStorage resolves where the extents of item it are stored: the file
@@ -364,9 +387,33 @@ func itemStorage(src itemSource, it ilocItemHeader) (idat []byte, ok bool) {
 	}
 }
 
-// itemLength validates every extent of item it and returns their total
-// length, capped at maxItemPayloadSize.
-func itemLength(ilocData []byte, h *ilocHeader, it ilocItemHeader, extPos int) (uint64, error) {
+// itemSourceLen returns the number of bytes an item's extents may address:
+// len(idat) for construction_method 1, the length of the whole file otherwise.
+func itemSourceLen(src itemSource, idat []byte) (uint64, error) {
+	if idat != nil {
+		return uint64(len(idat)), nil
+	}
+	end, err := src.r.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, fmt.Errorf("heif: seek to end: %w", err)
+	}
+	if end < 0 {
+		return 0, errItemExtentOutOfFile
+	}
+	return uint64(end), nil
+}
+
+// itemLength validates every extent of item it against the limit bytes its
+// source holds and returns their total length, capped at maxItemPayloadSize.
+//
+// The running total is checked BEFORE each addition (ext.length is a
+// caller-controlled uint64 of up to 2^64-1, so an unchecked += wraps and
+// defeats the cap: security audit F-01). An extent must also lie wholly inside
+// the source: ISO/IEC 14496-12 §8.11.3.3 resolves base_offset+extent_offset
+// to a position in the file (or idat) and extent_length bytes must follow it;
+// libheif HeifFile::append_data_from_iloc rejects a range past the stream end
+// the same way.
+func itemLength(ilocData []byte, h *ilocHeader, it ilocItemHeader, extPos int, limit uint64) (uint64, error) {
 	extSize := h.extentSize()
 	var total uint64
 	for i := range it.extentCount {
@@ -374,10 +421,17 @@ func itemLength(ilocData []byte, h *ilocHeader, it ilocItemHeader, extPos int) (
 		if ext.offset > math.MaxUint64-it.baseOffset {
 			return 0, errItemOffsetOverflow
 		}
-		total += ext.length
-		if total > maxItemPayloadSize {
+		if ext.length == 0 {
+			continue // contributes no bytes; readIlocItem skips it as well
+		}
+		if ext.length > maxItemPayloadSize-total {
 			return 0, errItemPayloadTooLarge
 		}
+		abs := it.baseOffset + ext.offset
+		if abs > limit || ext.length > limit-abs {
+			return 0, errItemExtentOutOfFile
+		}
+		total += ext.length
 	}
 	return total, nil
 }
