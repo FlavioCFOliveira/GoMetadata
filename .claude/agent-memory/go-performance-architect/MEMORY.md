@@ -1,5 +1,6 @@
 # Memory Index
 
+- [Sprint 46 E5b (2026-10-16)](project_sprint46_e5b_trailers_heif_cr3_nef_extxmp.md) — internal/trailer, heif meta selection, cr3 no-drop, NEF 0E0E, keep-ext-XMP frame; perf traps, unfixed defects
 - [Sprint 46 E5a (2026-10-15)](project_sprint46_e5a_digest_rework_xmp_xml_343_352.md) — MWG digest literal rule #323, opaque-segment guard #343, XML attr normalisation #344, unbound prefix #345, 65502 #351; perf +2%
 - [Sprint 46 E3 (2026-10-15)](project_sprint46_e3_digest_png_webp_extxmp_trailers.md) — digest policy #323, PNG profile drop #325, WebP #333, PackageForJPEG #332, AFCP/FotoStation/Nikon IPTC copies #322; verified clauses, perf, unfixed defects
 - [Sprint 46 E4 (2026-10-15)](project_sprint46_e4_heif_cr3_334_337.md) — HEIF largesize/iloc width 0/no-silent-drop; CR3 CMT2 read+write, CMT4 removal; ExifTool -G3:1 count trap
