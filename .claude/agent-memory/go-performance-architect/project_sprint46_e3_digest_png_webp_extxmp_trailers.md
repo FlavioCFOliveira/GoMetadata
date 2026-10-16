@@ -8,7 +8,7 @@ metadata:
 Effort E3 of rmp sprint 46 (2026-10-15): IPTC digest policy, PNG raw-profile drop, WebP Exif preamble + `XMP\0`, JPEG XMP PackageForJPEG, IPTC copies in AFCP/FotoStation/Nikon Capture.
 
 **Spec clauses verified from local/official sources (cite these, not the task text):**
-- MWG v2.0 digest rules are §4.2.3.2 pp. 26-29 (not "§3.3.1", which many older comments/tests still cite: read.go, metadata_conformance_test.go, tiffscan.go — unfixed). p. 29: Changer MUST create/update the checksum "whether changed or not"; we keep a stale digest stale (user/task policy) — documented deviation RECONCILE-06.
+- MWG v2.0 digest rules are §4.2.3.2 pp. 26-29 (not "§3.3.1", which many older comments/tests still cite: read.go, metadata_conformance_test.go, tiffscan.go — unfixed). p. 29: Changer MUST create/update the checksum "whether changed or not"; the stale-stays-stale policy and RECONCILE-06 deviation were REVERSED in E5a (digest now always refreshed when IIM+XMP both written) - see sprint46-e5a note.
 - PNG 3rd Ed eXIf is §11.3.4.5 (task text said §11.3.3 = textual info). XMP Part 3 §1.1.5 p. 16 (one XMP chunk), §1.1.3.1 pp. 14-15, §1.1.3.2 p. 15 (partitioning). RFC 9649 §2.7.1.5 (WebP metadata, at most one chunk of each type).
 - MWG PDF saved to docs/specs (gitignored) from web.archive.org 2012 copy of metadataworkinggroup.org/pdf/mwg_guidance.pdf; original offline.
 
