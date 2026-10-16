@@ -54,3 +54,10 @@ var ErrPreserveUnknownSegmentsNotSupported = errors.New("png: PreserveUnknownSeg
 // length field that overflows this range would silently corrupt the chunk header.
 // Inject returns this error instead of emitting a corrupt chunk.
 var ErrXMPTooLarge = errors.New("png: XMP payload too large for a single PNG chunk (limit 2^31-1 bytes)")
+
+// ErrRawProfileBudget is returned when the "Raw profile type ..." text chunks
+// of one PNG expand, together, to more than the 32 MiB that a file's profiles
+// may need (a real profile is a few kilobytes of hex text). Every profile chunk
+// has to be inflated to be read, and a file that repeats a 64 MiB zlib bomb in
+// many chunks would otherwise cost seconds of CPU per Read or Write (CWE-409).
+var ErrRawProfileBudget = errors.New("png: the embedded metadata profiles expand to more data than the limit")

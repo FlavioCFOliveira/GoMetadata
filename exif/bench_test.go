@@ -71,7 +71,7 @@ func BenchmarkIFDSet(b *testing.B) {
 	for i := range tags {
 		tags[i] = TagID(0x0100 + i)
 	}
-	rand.Shuffle(len(tags), func(i, j int) { tags[i], tags[j] = tags[j], tags[i] })
+	rand.Shuffle(len(tags), func(i, j int) { tags[i], tags[j] = tags[j], tags[i] }) //nolint:gosec // G404: shuffles benchmark input only; the permutation needs no cryptographic randomness
 
 	b.ResetTimer()
 	for range b.N {

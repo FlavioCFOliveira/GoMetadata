@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/trailer"
 )
 
 func FuzzTIFFExtract(f *testing.F) {
@@ -216,6 +217,17 @@ func FuzzTIFFInject(f *testing.F) {
 	)
 	f.Add(minLE)
 
+	// Seeds (task #354): the same TIFF followed by an AFCP trailer and by a
+	// FotoStation trailer, which Inject rewrites after the image data.
+	f.Add(append(bytes.Clone(minLE), t354AFCP(binary.BigEndian, "AXS!", int64(len(minLE)), [][2]string{{"IPTC", string(t354OldIIM)}})...))
+	f.Add(append(bytes.Clone(minLE), t354Foto(trailer.FotoRecord{Tag: 1, Data: t354OldIIM})...))
+
+	// Seeds (security audit 2026-10-16): F-03 repeated AFCP signature units as
+	// the trailer, F-07a StripOffsets repeating one range, F-07b SubIFD chains.
+	f.Add(append(bytes.Clone(minLE), bytes.Repeat(append([]byte("AXS!"), make([]byte, 8)...), 64)...))
+	f.Add(auditDuplicateStrips(64, 4096))
+	f.Add(auditSubIFDChains(16, 32))
+
 	// Seed 2: minimal BE TIFF — exercises big-endian parsing in exif.Parse.
 	minBE := buildMinimalTIFF(binary.BigEndian,
 		[]byte("fuzz-iptc-be"),
@@ -264,6 +276,15 @@ func FuzzTIFFInject(f *testing.F) {
 	f.Add(buildSyntheticBigTIFF(binary.LittleEndian, uint16(exif.TypeLong8), 0))
 	f.Add(buildSyntheticBigTIFF(binary.BigEndian, uint16(exif.TypeLong), 13)) // 0x014A as IFD (EXIF-3.0/TIFF-Extension type-13 collision case)
 	f.Add(buildSyntheticBigTIFF(binary.LittleEndian, uint16(exif.TypeLong), uint16(exif.TypeIFD8)))
+
+	// Seeds (task #370): Olympus MakerNotes whose preview offset addresses data
+	// inside the note and after the metadata, in both layouts.
+	for _, layout := range []string{"olympus", "olymp"} {
+		for _, place := range []string{"mn", "tail"} {
+			file, _, _ := olympusSource(f, layout, place)
+			f.Add(file)
+		}
+	}
 
 	// Seed 8: TIFF with max-value count entry — exercises overflow guards in
 	// exif.Parse field-width arithmetic.

@@ -8,7 +8,21 @@
 // and including the <?xpacket …?> processing instructions). Locating that
 // packet within a container (e.g., JPEG APP1) is the responsibility of the
 // container layer (format/jpeg).
+//
+// Parse exposes the properties of a packet in XMP.Properties under flat
+// keys: "name" for a simple value or an array of simple items, "parent.field"
+// for a struct field, and "parent[N].field" for a field of a struct array
+// item (see XMP.Properties). The composed keys ("parent.field",
+// "parent[N].field") are limited to 4 × the document size + 4 KiB in total;
+// keys past that limit are omitted from Properties, and Encode still writes
+// their properties back. Everything that has no flat key — deeper structures
+// and qualifiers — is kept internally and written back unchanged.
 package xmp
+
+// Adapted from Adobe XMP-Toolkit-SDK XMPCore/source/XMPMeta-GetSet.cpp:XMPMeta::SetLocalizedText,ChooseLocalizedText,AppendLangItem, Copyright 2003 Adobe, SPDX-License-Identifier: BSD-3-Clause
+//
+// See THIRD_PARTY_NOTICES.md for the licence note on this file. Only the
+// x-default case of setDefaultText is adapted.
 
 import (
 	"fmt"
@@ -31,69 +45,73 @@ import (
 // concurrent mutation must provide their own synchronisation (see
 // gometadata.Metadata, whose Set* methods serialise on an internal mutex).
 type XMP struct {
-	// Properties maps namespace URI → property local-name → value string.
-	// Multi-valued properties (rdf:Alt, rdf:Seq, rdf:Bag) are joined with
-	// the Unicode "record separator" U+001E so callers can split them.
+	// Properties maps namespace URI → property key → value string.
+	//
+	// Key conventions (unchanged since the first release):
+	//   - a simple property is stored under its local name ("Model");
+	//   - an array of simple items (rdf:Alt, rdf:Seq, rdf:Bag) is stored under
+	//     its local name with the items joined by the Unicode record
+	//     separator U+001E; an rdf:Alt item whose xml:lang is not x-default
+	//     is written "lang|value";
+	//   - a simple field of a struct is stored under "parent.field";
+	//   - a simple field of a struct item of an array is stored under
+	//     "parent[N].field", N counting items from 0.
+	//
+	// Struct fields are stored in the namespace of the top-level property.
+	// A qualified value written with rdf:value (ISO 16684-1:2019 §7.9.2.5)
+	// is a simple value with qualifiers, not a struct: it is stored as
+	// "name" = value, and its qualifiers have no key. Deeper structures (a
+	// struct inside a struct field, an array inside a struct) and qualifiers
+	// other than xml:lang have no key either; Parse keeps them in an internal
+	// tree and Encode writes them back unchanged, together with every
+	// property whose keys were not modified.
+	//
+	// The composed keys ("parent.field", "parent[N].field") repeat the
+	// property name, so their total size is limited to 4 × the document size
+	// + 4 KiB. Keys past that limit are omitted from this map; Encode still
+	// writes their properties back. Real documents stay far below the limit.
 	Properties map[string]map[string]string
 
-	// containerTypes records, for a property parsed from a source document,
-	// the RDF collection kind ("Seq", "Bag", or "Alt") that the source
-	// actually used for it. Keyed the same way as Properties — namespace URI
-	// → local property name — using the top-level (parent) local name even
-	// for struct-in-list properties (e.g. "History", not "History[0].action").
+	// nodes is the retained part of the parsed XMP data model tree
+	// (ISO 16684-1:2019 §6): nodes[0] is the root, its children are schema
+	// nodes, and their children are the top-level properties that the flat
+	// Properties view cannot reproduce exactly — properties with qualifiers,
+	// nested structures, URI values, empty items, a container other than the
+	// one Encode would choose, or keys that exceed the budget above (tasks
+	// #303, #277). Every other property lives only in Properties. nodes is nil
+	// when the whole document is representable by Properties, and for every
+	// XMP value built by a caller rather than by Parse.
 	//
-	// Task #273 / ISO 16684-1 §7.5 / CLAUDE.md "existing metadata not
-	// explicitly modified is preserved exactly": Properties alone cannot
-	// distinguish "this array happens to hold one item" from "this was never
-	// an array" — a flat map has no per-property container-type tag. Without
-	// this field, Encode had exactly one source of truth for every
-	// property's container (the spec-sourced collectionType/
-	// isCollectionProperty table in namespace.go), so any array-typed
-	// property outside that table's namespace/name allowlist — including
-	// every property in every unknown/custom namespace, which the table can
-	// never enumerate — was silently downgraded to a bare scalar element on
-	// a plain Parse → (unrelated field write) → Encode round trip, with no
-	// Set() call on the affected property required to trigger it.
-	//
-	// recordContainerType (rdf.go) populates this map the moment an
-	// rdf:Alt/Seq/Bag element opens during parsing — before its rdf:li
-	// children are read — so the container is captured even for a
-	// collection that turns out to hold exactly one item. effectiveContainerType
-	// (namespace.go) consults it first on Encode, falling back to the
-	// spec-sourced table only for properties with no parse-time record
-	// (typically properties newly created via Set()/the named setters,
-	// which have no source document to preserve).
-	//
-	// Deliberately unexported: this is derived read-path provenance, not
-	// part of the public data model, so a caller cannot desynchronise it
-	// from Properties by editing one but not the other. Left nil — and
-	// never allocated — for any XMP value with no rdf:Alt/Seq/Bag
-	// collection at all (the common case for shorthand-attribute-only or
-	// EXIF-flavoured XMP, and for every XMP value constructed directly by a
-	// caller rather than via Parse), so the zero/low-alloc parse fast path
-	// is unaffected when a document has no collections to preserve.
-	containerTypes map[string]map[string]string
+	// Encode compares each retained property with its Properties entries:
+	// an unmodified property is written from the tree, a modified one is
+	// merged with the new entries, and a property whose entries were all
+	// deleted is omitted. Deliberately unexported, like the rest of the
+	// read-path provenance below: a caller edits Properties, never the tree.
+	nodes nodeList
+
+	// about is the rdf:about value of the top-level rdf:Description elements
+	// ("" when absent), toolkit the x:xmptk attribute of x:xmpmeta, and
+	// prefixes the namespace prefixes that the source document bound to
+	// namespaces without a well-known prefix (nil when there are none).
+	// Encode writes all three back so that a round trip keeps them.
+	about    string
+	toolkit  string
+	prefixes map[string]string
 
 	// arena is a compact, append-only, result-owned byte buffer holding a
-	// copy of every property value and property/struct/attribute-name key
-	// that Parse actually decided to keep in Properties or containerTypes —
-	// and NOTHING else. Every such string is an unsafe.String view into a
-	// region of arena, produced by the intern method.
+	// copy of every string that Parse keeps — Properties keys and values,
+	// retained node names and values, namespace URIs and prefixes — and
+	// NOTHING else. Every such string is an unsafe.String view into a region
+	// of arena, produced by intern or written directly (joined array values
+	// and composed keys, see project.go).
 	//
-	// arena receives a copy of a value/key ONLY at the moment it is decided
-	// to be stored (storeProperty, recordContainerType — see intern), never
-	// eagerly for every value computed while scanning. Comments, whitespace,
-	// tag/attribute syntax, namespace declaration URIs that are never
-	// referenced as a stored namespace, and attribute values on attributes
-	// that turn out to be dropped (e.g. rdf:about, x:xmptk) never touch arena
-	// at all — they are read directly from the transient input/normalised
-	// buffer during the synchronous Parse call (see transientAliasString's
-	// doc for the read-only, synchronous-only contract that makes this safe)
-	// and become unreachable garbage the moment that call returns. arena's
-	// worst-case retention is therefore bounded by roughly 2x the total bytes
-	// of content actually kept (see intern's doc for why append-only growth
-	// bounds the multiplier to ~2x, not more), not by document size — except
-	// for struct-in-list keys, tracked in #277.
+	// A string is copied into arena only at the moment Parse decides to keep
+	// it, never eagerly while scanning: comments, whitespace, markup, unused
+	// namespace declarations and ignored attributes never reach arena. A
+	// namespace URI is copied once per Parse call however many nodes use it
+	// (XMPARENA-NS-REINTERN-01), and composed keys are bounded by the budget
+	// described on Properties (task #277), so arena stays proportional to the
+	// input size.
 	//
 	// Safety invariants — ALL must hold for the lifetime of the returned *XMP:
 	//  1. arena is never handed to a sync.Pool or any other buffer reuse
@@ -107,7 +125,8 @@ type XMP struct {
 	//     growth/reallocation — see intern's doc.
 	//  3. arena strictly outlives every string derived from it, via Go's
 	//     normal GC interior-pointer keep-alive rules.
-	//  4. intern is the ONLY function that ever appends to arena.
+	//  4. Only intern and the projection helpers in project.go append to
+	//     arena, and only during Parse.
 	arena []byte
 }
 
@@ -133,30 +152,57 @@ type XMP struct {
 // complementary: they bound individual allocations; this cap bounds total input.
 const maxXMPDocumentBytes = 16 << 20 // 16 MiB
 
-// maxInitialArenaCap bounds the initial pre-sizing guess for XMP.arena.
-//
-// Parse pre-sizes arena to min(len(body), maxInitialArenaCap) bytes: a small
-// document gets a right-sized guess (never more than its own body length,
-// which is itself an upper bound on how much content it could possibly have
-// stored), while a large — or adversarially padded, up to
-// maxXMPDocumentBytes — document is capped at this constant regardless of
-// its raw size, so the INITIAL allocation never scales with document size.
-// 256 bytes comfortably covers the representative packet's stored-content
-// total (xmp/bench_test.go) with only one or two amortised regrowths for
-// larger real-world documents; over-hinting further would reintroduce a
-// document-size-proportional initial allocation, defeating the fix.
-const maxInitialArenaCap = 256
-
 // Parse parses a raw XMP packet.
 // b may include the <?xpacket …?> wrapper; if absent, the bytes are
 // treated as the xmpmeta/RDF body directly.
 //
-// XMP Part 1 §7.2: if b begins with a UTF-16 or UTF-32 BOM, it is
-// automatically transcoded to UTF-8 before parsing.
+// XMP Part 1 §7.1 p. 9 and §7.2: a UTF-16 or UTF-32 packet is transcoded to
+// UTF-8 before parsing; the encoding is recognised from the byte-order mark,
+// or from the first bytes when there is none (for example 00 3C 00 3F is
+// UTF-16BE).
+//
+// Parse returns an error that wraps ErrXMLNotWellFormed, and names the
+// element or the namespace prefix, when the packet is not well-formed XML: a
+// mismatched or stray end tag, a malformed start tag, an element that is never
+// closed, or an element or attribute whose namespace prefix is not declared
+// (Namespaces in XML 1.0 §5). It never returns a tree built from part of such
+// a packet.
+//
+// The values of literal property elements are verbatim, white space
+// included (XML 1.0 §2.10). The values of attributes are normalised as XML
+// 1.0 §3.3.3 requires: each literal TAB, LF and CR becomes a space, while a
+// character reference to one of them (&#9;) stays the character. A property that is one of the 35 registered
+// aliases (see ResolveAlias) is folded into its base property, as the Adobe
+// XMP Toolkit does (Adobe XMP Specification Part 2 §1.1.1): after Parse a
+// document holds one value for it, at the base property.
 //
 // Parse rejects inputs larger than maxXMPDocumentBytes (16 MiB) after
 // UTF-8 normalisation to prevent O(n) parsing of pathological documents.
 func Parse(b []byte) (*XMP, error) {
+	body, err := documentBody(b)
+	if err != nil {
+		return nil, err
+	}
+
+	x := &XMP{Properties: make(map[string]map[string]string, 8)}
+
+	// body is read directly (transient, read-only, synchronous-only; see
+	// transientAliasString's doc) and is NEVER retained by x. parseRDF sizes
+	// x.arena once, from the content it decides to keep (see finish in
+	// project.go), so the arena does not scale with comments, padding or
+	// other content that is scanned but not stored.
+	if err := parseRDF(body, x); err != nil {
+		return nil, err
+	}
+
+	return x, nil
+}
+
+// documentBody returns the part of b that Parse reads: b normalised to
+// UTF-8 (XMP Part 1 §7.2), limited to maxXMPDocumentBytes, and reduced to
+// the XMP packet when b carries a <?xpacket?> wrapper (XMP Part 1 §7.3);
+// without a wrapper the whole input is the document body.
+func documentBody(b []byte) ([]byte, error) {
 	if len(b) == 0 {
 		return nil, ErrEmptyInput
 	}
@@ -175,49 +221,36 @@ func Parse(b []byte) (*XMP, error) {
 		return nil, ErrDocumentTooLarge
 	}
 
-	x := &XMP{Properties: make(map[string]map[string]string, 8)}
-
-	// Locate the XMP packet; if no wrapper is found, treat the whole input
-	// as the RDF body (XMP §7.3).
-	body := Scan(normalised)
-	if body == nil {
-		body = normalised
+	if body := Scan(normalised); body != nil {
+		return body, nil
 	}
-
-	// x.arena starts small and grows ONLY as parseRDF's intern() calls
-	// actually keep content — body itself is read directly (transient,
-	// read-only, synchronous-only; see transientAliasString's doc) and is
-	// NEVER retained by x. Pre-size arena to a small fraction of body's
-	// length, capped at maxInitialArenaCap, so a legitimately small document
-	// gets a right-sized initial allocation while a large (or adversarially
-	// padded, up to maxXMPDocumentBytes) document never forces a large
-	// upfront allocation regardless of how little of it is actually stored.
-	x.arena = make([]byte, 0, min(len(body), maxInitialArenaCap))
-
-	if err := parseRDF(body, x); err != nil {
-		return nil, err
-	}
-
-	return x, nil
+	return normalised, nil
 }
 
 // Encode serialises x to a padded XMP packet ready for embedding in a
 // container segment. The packet is UTF-8 encoded with a read/write
 // <?xpacket?> wrapper per XMP §7.
+//
+// For an x returned by Parse, every property whose Properties entries were
+// not modified is written exactly as parsed — nested structures,
+// qualifiers, URI values, empty arrays and the source's array containers
+// included — together with rdf:about, x:xmptk and the prefixes of
+// namespaces without a well-known prefix. A modified entry changes only the
+// value it names; deleting every entry of a property removes it. Encode does
+// not modify x and is safe to call concurrently with other readers of x.
 func Encode(x *XMP) ([]byte, error) {
 	return serialise(x)
 }
 
-// CameraModel returns the tiff:Model or xmp:CreatorTool property.
-// tiff:Model is the canonical XMP property for the camera model (XMP §8.4).
+// CameraModel returns the tiff:Model property (XMP Part 1 §8.4, p. 27), or ""
+// when the document has none. xmp:CreatorTool is not a fallback: it names the
+// software that created the file (the alias target of tiff:Software), not the
+// camera.
 func (x *XMP) CameraModel() string {
 	if x == nil {
 		return ""
 	}
-	if v := x.getProp(NStiff, "Model"); v != "" {
-		return v
-	}
-	return x.getProp(NSxmp, "CreatorTool")
+	return x.getProp(NStiff, "Model")
 }
 
 // GPS returns GPS coordinates from available XMP namespaces, checked in order:
@@ -379,11 +412,104 @@ func (x *XMP) Get(ns, local string) string {
 	return x.getProp(ns, local)
 }
 
-// SetCaption sets dc:description to s (XMP §8.3).
-func (x *XMP) SetCaption(s string) { x.putProp(NSdc, "description", s) }
+// SetCaption sets the default (x-default) text of dc:description to s
+// (XMP §8.3). The other language alternatives of the property are kept, as
+// described at setDefaultText.
+func (x *XMP) SetCaption(s string) { x.setDefaultText(NSdc, "description", s) }
 
-// SetCopyright sets dc:rights to s (XMP §8.3).
-func (x *XMP) SetCopyright(s string) { x.putProp(NSdc, "rights", s) }
+// SetCopyright sets the default (x-default) text of dc:rights to s
+// (XMP §8.3). The other language alternatives of the property are kept, as
+// described at setDefaultText.
+func (x *XMP) SetCopyright(s string) { x.setDefaultText(NSdc, "rights", s) }
+
+// setDefaultText sets the x-default item of the language alternative (ns,
+// local) to value and leaves its other items alone, following the x-default
+// case of XMPMeta::SetLocalizedText (Adobe XMP Toolkit, XMPCore/source/
+// XMPMeta-GetSet.cpp, line 889) and XMP Part 1 §8.2.2.4 (language
+// alternatives; x-default is the item that applications use when they have no
+// better match):
+//
+//   - no item: the property becomes the single x-default item;
+//   - an x-default item exists: the Toolkit first swaps it with the first item
+//     (ChooseLocalizedText finds it by an exact match), then gives the new
+//     value to every other item that holds the old x-default text — a
+//     translation that merely repeated it — and to x-default itself;
+//   - no x-default item (every item has a language): the new x-default item
+//     is inserted first (AppendLangItem) and the others stay as they are.
+//
+// The flat form of the property is the one of Properties: items joined with
+// U+001E, the x-default item bare and every other item as "lang|value". An
+// item written "x-default|value" is read as x-default too.
+func (x *XMP) setDefaultText(ns, local, value string) {
+	old := x.getProp(ns, local)
+	if old == "" {
+		x.putProp(ns, local, value)
+		return
+	}
+	items := strings.Split(old, "\x1e")
+
+	xd, oldDefault := findDefaultItem(items)
+	if xd < 0 {
+		// No x-default item: it is inserted first and the items stay.
+		x.putProp(ns, local, value+"\x1e"+old)
+		return
+	}
+
+	// ChooseLocalizedText finds the x-default item by an exact match and
+	// SetLocalizedText swaps it with the first item. Every other item that
+	// holds the old x-default text gets the new text, then x-default does.
+	items[0], items[xd] = items[xd], items[0]
+	for i := 1; i < len(items); i++ {
+		if lang, val, tagged := cutAltItem(items[i]); tagged && val == oldDefault {
+			items[i] = lang + "|" + value
+		} else if !tagged && items[i] == oldDefault {
+			items[i] = value
+		}
+	}
+	items[0] = value
+	x.putProp(ns, local, strings.Join(items, "\x1e"))
+}
+
+// findDefaultItem returns the index of the x-default item of items (the first
+// bare item, or the first "x-default|…") and its text, or -1.
+func findDefaultItem(items []string) (index int, text string) {
+	for i, item := range items {
+		lang, val, tagged := cutAltItem(item)
+		if !tagged {
+			return i, item
+		}
+		if lang == "x-default" {
+			return i, val
+		}
+	}
+	return -1, ""
+}
+
+// cutAltItem splits the flat form of a language alternative item, "lang|value",
+// into its language and value. An item whose text before the first '|' is not
+// a language tag (RFC 5646: ASCII letters, digits and '-') is a bare item that
+// merely contains a '|', such as the x-default text "a | b", and is not split.
+func cutAltItem(item string) (lang, val string, tagged bool) {
+	lang, val, tagged = strings.Cut(item, "|")
+	if !tagged || !isLangTag(lang) {
+		return "", item, false
+	}
+	return lang, val, true
+}
+
+// isLangTag reports whether s is non-empty and made of ASCII letters, digits
+// and '-' only, the characters of a language tag (RFC 5646).
+func isLangTag(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range []byte(s) {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '-' {
+			return false
+		}
+	}
+	return true
+}
 
 // SetCreator sets dc:creator to s (XMP §8.3).
 func (x *XMP) SetCreator(s string) { x.putProp(NSdc, "creator", s) }
@@ -564,7 +690,7 @@ func (x *XMP) getProp(ns, local string) string {
 // Adobe Lightroom frequently place x-default last in document order, so
 // "return the first item" is not spec-compliant.
 //
-// Storage convention (established by onCharDataListItem in rdf.go):
+// Storage convention (established by joinItems in project.go):
 //   - A bare item (x-default or unlabelled) is stored without a prefix: "value"
 //   - A language-tagged item is stored as "lang|value": "en|value"
 //
@@ -589,7 +715,7 @@ func xDefaultValue(v string) string {
 	}
 
 	// Multiple items: scan for the first bare item (no '|').
-	// A bare item is x-default or unlabelled per onCharDataListItem convention.
+	// A bare item is x-default or unlabelled per the joinItems convention.
 	// firstItem is the first item in document order; keep it as the fallback.
 	if strings.IndexByte(firstItem, '|') < 0 {
 		// First item is already bare — return it immediately.

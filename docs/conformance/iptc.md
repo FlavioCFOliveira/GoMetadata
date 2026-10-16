@@ -129,16 +129,23 @@ Namespaces: `Iptc4xmpCore` = `http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/`,
   lossy constraints (sub-second truncation, single-string flattening of a
   repeatable field, 8859-1 vs UTF-8 transcoding). — IPTC Photo Metadata 2025.1
   Mapping Guidelines; MWG §2 ("Synchronization").
-- **RECONCILE-02** Read priority: default is XMP > IIM (MWG §2, "MWG-01").
-  Exception (MWG §3.3.1, "MWG-02"): when Photoshop IRB resource `0x0425`
+- **RECONCILE-02** Read priority (MWG §4.2.3.3, "MWG-01"): EXIF > XMP > IIM
+  for {Caption/Abstract, CopyrightNotice, By-line, DateCreated+TimeCreated};
+  XMP > IIM for Keywords, which EXIF does not carry (MWG §5.1). Exception
+  (MWG §4.2.3.2, scenario 4, "MWG-02"): when Photoshop IRB resource `0x0425`
   ("IPTC Digest") is present, compare `MD5(raw 0x0404 IIM stream)` to the
-  stored 16-byte value. All-zero stored digest ("unknown" sentinel) OR a
-  computed/stored mismatch ⇒ elevate IIM priority (IIM > XMP > EXIF) for the
-  conflict-prone field set {Caption/Abstract, CopyrightNotice, By-line,
-  Keywords}. Digest match, or resource absent, ⇒ default MWG-01 applies
-  unchanged. Digest is not consulted for any field outside the set above
-  (in particular, not for DateCreated/DateTimeOriginal in this codebase).
-  Proven by `TestConformance_MWG02` (metadata_conformance_test.go).
+  stored 16-byte value. All-zero stored digest (an "unknown" sentinel of this
+  library; MWG §4.2.3.2, pp. 26-29, defines none) OR a computed/stored mismatch ⇒ the IIM value wins over EXIF and XMP unless it
+  equals the IIM value predicted from the XMP value (the XMP value truncated
+  to the DataSet length limit; for dates, the IIM export of the XMP date).
+  Digest match, or resource absent, ⇒ MWG-01 applies unchanged. A value of
+  only spaces or NULs is absent (MWG §4.2.3.3). The write side of the digest
+  (creation and refresh) is RECONCILE-06. Proven by
+  `TestConformance_MWG02` (metadata_conformance_test.go),
+  `TestPrecedence_ExplicitPolicyComment` (root_task50_test.go) and
+  `TestTask308_ReadPolicy_Text`, `TestTask308_ReadPolicy_Keywords`,
+  `TestTask308_DateTimeOriginalSources`,
+  `TestTask308_DateTimeOriginalEditedIIMWinsOverEXIF` (reconcile_task308_test.go).
 - **RECONCILE-03** Date bridging (write path): a single capture timestamp is
   split into IIM 2:55 `CCYYMMDD` + 2:60 `HHMMSS±HHMM` (IIM §2.2.23), EXIF
   ExifIFD 0x9003 DateTimeOriginal (EXIF §4.6.5), and XMP `photoshop:DateCreated`
@@ -152,7 +159,9 @@ Namespaces: `Iptc4xmpCore` = `http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/`,
   The convenience setter also flattens the ordered list into EXIF IFD0 0x013B
   Artist (EXIF §4.6.4 Table 3) as a single string joined with `"; "`
   (semicolon-space), the MWG list-handling convention for single-string EXIF
-  fields that mirror a multi-valued XMP/IIM property.
+  fields that mirror a multi-valued XMP/IIM property (MWG §5.7): an item that
+  contains `"; "` or begins with a quote is enclosed in quotes and its quotes
+  are doubled, and on read the Artist string is split back into items.
 - **RECONCILE-05** Lang Alt ↔ IIM plain-string reconciliation: an IIM Record 2
   text dataset (2:05 ObjectName, 2:116 CopyrightNotice, 2:120 Caption/Abstract)
   round-trips through XMP as an `rdf:Alt` collection whose `x-default`
@@ -160,6 +169,70 @@ Namespaces: `Iptc4xmpCore` = `http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/`,
   non-default `xml:lang` alternative present in the XMP `rdf:Alt` is preserved
   on the XMP side but has no IIM representation (IIM carries one un-tagged
   string) and MUST be dropped, not concatenated, when the value flows into IIM.
+
+- **RECONCILE-06** IPTC digest on write (MWG Guidelines v2.0 §4.2.3.2, pp.
+  26-29; task #323). The digest is the MD5 of the entire IIM block, stored as a
+  16-byte binary value in Photoshop resource 1061 (`0x0425`; p. 26 and the
+  "IPTC-IIM checksum" paragraph, p. 29). The rule is the one of p. 29: "If
+  IPTC-IIM and XMP are both present, whether changed or not, a Changer MUST
+  create or update the checksum value" (a Creator that writes both MUST create
+  it, p. 28). So, on every write that stores the IIM and has XMP in the output
+  (written now or present in the file; JPEG: an XMP packet is written; TIFF:
+  XMP written or tag `0x02BC` present; PNG: XMP written, for a raw profile in
+  the Photoshop IRB form), the digest is set to the MD5 of the IIM written
+  (TIFF: of the stored tag `0x83BB` value including its LONG zero padding): it
+  is **created** when the Photoshop block holds none (in a new `0x8649` block
+  holding only it, for TIFF) and **rewritten** when it holds one, a stale
+  digest and an unchanged IIM included. When the output has no XMP, or the IIM
+  is removed, the two conditions of the MUST are not both met and MWG gives no
+  rule for an IIM-only file (its Changer guidance, p. 28, is to write IIM and
+  XMP together): every digest is then left as it is and none is created. The
+  read side is unchanged: a stale digest found in a source file still elevates
+  the IIM value on read (RECONCILE-02), but a write that stores IIM and XMP
+  together has reconciled both and so refreshes it. Where reference
+  implementations diverge, the specification wins: ExifTool `MWG.pm` updates
+  only an absent or matching digest, and the Adobe XMP Toolkit
+  (`ReconcileIPTC.cpp:SetIPTCDigest`) writes it unconditionally, also for an
+  IIM-only write. Proven by `TestAppendSpliced_DigestPolicy` (internal/irb),
+  `TestInject_IPTCDigestPolicy` (format/jpeg), `TestUpsertIPTC_DigestPolicy`
+  (format/tiff), `TestInject_RawProfileIPTCDigest` (format/png),
+  `TestWrite_JPEGIPTCDigestCreated`, `TestWrite_JPEGStaleIPTCDigestRefreshed`
+  (iptc_photoshop_irb_test.go) and `TestCorpus_IPTCDigest`.
+- **IIM-COPY-01** IPTC copy in a JPEG trailer (task #322): an AFCP trailer
+  (AXS File Concatenation Protocol, 1992) whose directory has an `IPTC` data
+  set, and a FotoStation trailer whose tag 1 record holds the IIM, are
+  rewritten with the IIM written to APP13 when a write replaces it; a nil IIM
+  leaves them. A trailer is found only right after EOI (FotoStation also right
+  after the AFCP trailer) and only when consistent; otherwise it is copied
+  unchanged. `TestTrailers_AFCPRewrite`, `TestTrailers_FollowedByOtherData`,
+  `TestTrailers_FotoStationOnly`, `TestTrailers_Malformed`,
+  `TestTrailers_Corpus`.
+- **IIM-COPY-02** AFCP offsets (task #322; AFCP specification): the directory
+  offsets and the EOF record are absolute file offsets. When the trailer moves
+  they are rewritten for its position in the output, entries keep their order
+  and data, reserved fields are zero; a write that moves nothing and changes no
+  IPTC copy keeps the trailer byte for byte (CLAUDE.md §5). `TestTrailers_*`
+  (`checkAFCPConsistent`), `TestTrailers_UnchangedIsByteIdentical`.
+- **TIFF-AFCP-01** AFCP trailer of a TIFF (task #354, the policy of #322: update the copies): a TIFF write
+  writes the AFCP trailer found at the end of the source after the last image block, with its `IPTC` data set
+  equal to the IIM written to tag `0x83BB` (or kept when there is none) and its offsets and EOF record set for the
+  position it takes in the output (ExifTool `ExifTool.pm` `IdentifyTrailer`/`ProcessTrailers`, study). The trailer
+  must start after every image block that is copied: a candidate inside image data is image data. The shared logic
+  lives in `internal/trailer`, used by `format/jpeg` and `format/tiff` (`writeRelocated`, so every TIFF-based
+  write path). Since #360 the bytes after the data a write moves are carried too (TIFF-TAIL-01 to 03 in
+  `containers.md`), so the trailer is found also when another trailer follows it.
+  `TestTask354TIFFAFCPTrailerRewritten` (both byte orders, whole file and streamed).
+- **TIFF-AFCP-02** FotoStation records at the end of a TIFF, before and after an AFCP trailer, have their IPTC record
+  replaced. `TestTask354TIFFFotoStationTrailer`.
+- **TIFF-AFCP-03** A nil IIM keeps the IPTC copy but still moves the offsets; a look-alike inside image data and an
+  inconsistent trailer are not rewritten; a file without a trailer is written as before.
+  `TestTask354TIFFTrailerEdgeCases`.
+- **IIM-COPY-03** IPTC copy in the Nikon Capture data (task #322): the IPTC
+  entry (`0x9EF5F6E0`) of MakerNote tag `0x0E01` of a NEF is rewritten with the
+  IIM written to tag `0x83BB`: in place with zero padding when it fits its
+  capacity (no size or offset changes), otherwise rebuilt and moved to the end
+  of the MakerNote with the count and offset of `0x0E01` updated, the old bytes
+  cleared. `TestRewriteNikonMakerNoteIPTC`, `TestNEF_NikonCaptureCorpus`.
 
 ## Section 5: Robustness Cases (MUST NOT crash)
 - **ROBUST-01** Oversized standard length, value truncated by EOF → Truncated, rescan.

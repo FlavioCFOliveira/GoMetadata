@@ -74,7 +74,7 @@ sub-test name, so a failing test points directly at the violated specification c
 
 | Format | Official specification(s) |
 |---|---|
-| EXIF | CIPA DC-008 (Exif 3.0, 2023/2024) / DC-X008 (Exif 2.32, 2019) / JEITA CP-3451 |
+| EXIF | CIPA DC-008-2026 (Exif 3.1, JEITA CP-3451H) is the target; CIPA DC-008-2024 (Exif 3.0), DC-X008-2019 (Exif 2.32) and JEITA CP-3451 are compatibility references (2.x and 3.0 files stay readable) |
 | TIFF | Adobe TIFF Revision 6.0 (1992); BigTIFF (Aware Systems / libtiff) |
 | IPTC IIM | IPTC-NAA Information Interchange Model 4.2 (2014) |
 | IPTC Core/Ext | IPTC Photo Metadata Standard 2025.1 (Core 1.5 / Extension 1.9) |
@@ -173,8 +173,9 @@ Motto: **"Maximise the return on effort: deliver the most with the least work."*
 
 This is the default way of working on this project. The user MUST NOT need to ask for it, and it MUST NOT be modelled as an `rmp` task.
 
-- **Merge related tasks.** Whenever tasks — in `rmp` or requested ad hoc by the user — show verifiable functional or technical proximity, merge them into a single development effort.
-- **Batch work within and across tasks.** Write all the code for the merged tasks in one pass, then test all the changes in one pass. Do not write small fragments and test each one in isolation.
+- **Group related tasks into one effort.** Whenever tasks — in `rmp` or requested ad hoc by the user — show verifiable functional or technical proximity, execute them as a single development effort that benefits all of them together.
+- **Tasks stay separate.** When tasks are identified and recorded, each task remains a separate, individually defined task. Only the work effort — development and testing — is joined.
+- **Batch work within and across tasks.** Write all the code for the grouped tasks in one pass, then test all the changes in one pass. Do not write small fragments and test each one in isolation.
 - **Batch documentation.** Write all the documentation in one pass. When the scope is too large, split it into a few coherent blocks and handle each block in one pass.
 - **Apply the principle to all work**, not only to code and documentation.
 - **Minimise tasks and iterations.** Reach each objective with the smallest possible number of tasks and iterations.
@@ -183,7 +184,7 @@ This is the default way of working on this project. The user MUST NOT need to as
 
 ## Work Convergence Policy
 
-- **Always look for convergence** between the individual objectives of each task, and turn that convergence into synergy. Tasks with complementary objectives, functional proximity, or technical proximity MUST always be grouped so that the effort is optimised and the synergies are maximised.
+- **Always look for convergence** between the individual objectives of each task, and turn that convergence into synergy. Tasks with complementary objectives, functional proximity, or technical proximity MUST always have their work effort grouped (the tasks themselves stay separate) so that the effort is optimised and the synergies are maximised.
 - **Group work of the same type**: write all the code at once, write all the documentation at once, and run the tests for all changed code at once.
 - **Quality is not negotiable.** Grouping MUST deliver work that is faster and cheaper than task-by-task development and at least equal in quality. If grouping would reduce quality, do not group.
 - **Maximise internal resources** (skills, subagents, the Knowledge Graph, existing tooling) so that deliveries are faster and cost the user less.
@@ -210,7 +211,7 @@ All writing and all interpretation of instructions on this project MUST be:
 
 ### Documentation Language
 
-**All documentation** — from the main README to the specifications, including code documentation (comments and doc comments) — MUST be written in flawless English, in a professional tone, with no spelling, grammatical, or syntax errors. It MUST be accurate and faithful to the code, aimed at human readers, and follow the four rules above (explicit, objective, closed, concise).
+**All documentation** — from the main README and this `CLAUDE.md` to the specifications, including code documentation (comments and doc comments) — MUST be written in flawless English, in a professional tone, with no spelling, grammatical, or syntax errors. It MUST be accurate and faithful to the code, aimed at human readers, and follow the four rules above (explicit, objective, closed, concise).
 
 ---
 
@@ -223,6 +224,53 @@ Act strictly towards the objective of the current work. You are FORBIDDEN from v
 ## Completeness
 
 You are FORBIDDEN from executing any task or piece of work only partially. Every piece of work that is started MUST be executed in full. **DO NOT LEAVE TASKS HALF-DONE OR PARTIALLY DONE.**
+
+---
+
+## Open Source Policy
+
+At every stage of analysis, exploration, and development, determine whether a reference open-source project already implements or solves what is required. Use such projects to copy from, in full or in part, where possible, or otherwise to study as examples. Use **only reference projects** that are useful and trustworthy for the intended contribution.
+
+---
+
+## Do Not Reinvent
+
+When analysing existing problems, new features, or refactorings of existing features, do not invent a solution entirely from scratch. Base the solution primarily on existing knowledge of the subject and, wherever possible, on the knowledge, engineering, architecture, and approach of an open-source project that already solves the problem in whole or in part. Copying and studying projects that already implement what is needed is authorised. These projects are only the starting point: never stay bound to the source code — the current project must benefit from the code of other projects, in full or in part, and adapt it to its own requirements.
+
+---
+
+## Reference Open-Source Projects
+
+This table maps each area of GoMetadata to the open-source projects to use as references, per the Open Source and Do Not Reinvent policies.
+
+GoMetadata is MIT-licensed, so only permissively licensed code (MIT, BSD, Apache-2.0, libpng, libtiff) may be copied or adapted, and every copyright and NOTICE requirement must be retained; GPL, LGPL, and Artistic-licensed projects may be used only for study and as differential-test oracles, never as a source of copied code.
+
+The projects listed below may be cloned locally so that their code can be used directly for whatever the work requires: reading, studying, copying, adapting, building, and running them as test oracles. Copying code from them remains subject to the licensing rule above, so only code from permissively licensed projects may be copied into GoMetadata. Local clones are working references only and must never be committed to this repository.
+
+| Area | Copy / adapt | Study / oracle |
+|---|---|---|
+| EXIF tag registry | [metadata-extractor], [libtiff] | [ExifTool], [Exiv2] |
+| MakerNote decoding | [evanoberholster/imagemeta], [metadata-extractor] | [ExifTool] |
+| MakerNote writing | — | [Exiv2], [ExifTool] |
+| IPTC in PNG / RAW | [Adobe XMP Toolkit SDK] | [Exiv2], [ExifTool] |
+| XMP and MWG reconciliation | [Adobe XMP Toolkit SDK] | [ExifTool] |
+| HEIF / AVIF writing | [libavif] | [libheif], [ExifTool] |
+| CR3 | [evanoberholster/imagemeta] | [lclevy canon_cr3], [ExifTool] |
+| WebP | [libwebp] | [Exiv2] |
+| PNG | [libpng] | [Exiv2] |
+| TIFF | [libtiff] | [Exiv2] |
+
+[metadata-extractor]: https://github.com/drewnoakes/metadata-extractor
+[libtiff]: https://gitlab.com/libtiff/libtiff
+[ExifTool]: https://github.com/exiftool/exiftool
+[Exiv2]: https://github.com/Exiv2/exiv2
+[evanoberholster/imagemeta]: https://github.com/evanoberholster/imagemeta
+[Adobe XMP Toolkit SDK]: https://github.com/adobe/XMP-Toolkit-SDK
+[libavif]: https://github.com/AOMediaCodec/libavif
+[libheif]: https://github.com/strukturag/libheif
+[lclevy canon_cr3]: https://github.com/lclevy/canon_cr3
+[libwebp]: https://chromium.googlesource.com/webm/libwebp
+[libpng]: https://github.com/pnggroup/libpng
 
 ---
 
@@ -242,7 +290,7 @@ Every development cycle must follow these steps in order:
 
 **Specify → Implement → Test → Document**
 
-Apply the Work Synergy and Work Convergence policies to each step: when a cycle covers several merged tasks, specify them together, implement them together, test them together, and document them together.
+Apply the Work Synergy and Work Convergence policies to each step: when a cycle covers several grouped tasks, specify them together, implement them together, test them together, and document them together.
 
 ---
 
@@ -270,7 +318,7 @@ Use the **Knowledge Graph**, queried through the `knowledge-authority` skill, to
 
 ### Planning
 
-Assess the proposed work and determine whether multiple development phases (sprints) are needed, each delivering a solid, well-defined deliverable. Apply the Work Synergy and Work Convergence policies: plan the smallest possible number of sprints and tasks, and merge tasks with functional or technical proximity.
+Assess the proposed work and determine whether multiple development phases (sprints) are needed, each delivering a solid, well-defined deliverable. Apply the Work Synergy and Work Convergence policies: plan the smallest possible number of sprints and tasks, and group tasks with functional or technical proximity into shared development efforts, keeping each task as a separate record.
 
 Every task must have a clear, objective definition of: goals, functional requirements, technical requirements, and acceptance criteria that confirm the task is complete. When a task is closed, include a brief summary of what was done.
 
@@ -285,9 +333,9 @@ Subdivide a task only when its scope is too large for a single development cycle
 Task execution is the natural continuation of planning. Always, through the `roadmap-manager` skill, use `rmp` to:
 
 1. Check whether any open task is already in progress and resume it if so.
-2. Identify the next task, together with every other open task that can be merged with it under the Work Synergy and Work Convergence policies.
+2. Identify the next task, together with every other open task whose work can be grouped with it under the Work Synergy and Work Convergence policies.
 3. Understand the objective of each selected task from its description, functional requirements, and technical requirements.
-4. Determine the most appropriate specialist subagent and delegate the execution to it, per the Subagent Policy (one subagent at a time, in series). Go code is always delegated to `go-performance-architect`, per the mandatory Code Authorship Rule above.
+4. Determine the most appropriate specialist subagent and delegate the execution to it, per the Subagent Policy (one subagent at a time, in series). Go code is always delegated to `go-performance-architect`, per the mandatory Code Authorship Rule above. Record the work in the `rmp` comment log as it happens, per the [Work Log](#work-log-rmp-comments) section.
 5. Validate the acceptance criteria before closing each task.
 6. Close each task with a brief summary of what was done.
 7. Create the git commit(s) describing what was done, through the `gitflow` skill.
@@ -295,7 +343,46 @@ Task execution is the natural continuation of planning. Always, through the `roa
 
 Whenever possible, adapt the model and its reasoning-effort level to the requirements of each task's individual operations.
 
-Sprints must always be executed sequentially. Tasks within a sprint may be merged into a single effort under the Work Synergy and Work Convergence policies; subagents always run in series, per the Subagent Policy.
+Sprints must always be executed sequentially. The work of tasks within a sprint may be grouped into a single effort, with the tasks kept separate, under the Work Synergy and Work Convergence policies; subagents always run in series, per the Subagent Policy.
+
+---
+
+## Work Log (rmp Comments)
+
+Use the `rmp` comment log, through the `roadmap-manager` skill, on every task and every sprint to track the progression of the work. Write each entry when the event happens; never reconstruct the log at closing time.
+
+### Sprint comments
+
+Sprint comments record high-level sprint management only.
+
+| Type | Use it for |
+|---|---|
+| `DECISION` | Scope, grouping of tasks into efforts, execution order, and exclusions, with the rejected options. |
+| `PROGRESS` | An effort or milestone delivered, and what remains. |
+| `FINDING` | An impediment, risk, or discovery that affects the sprint as a whole. |
+| `UPDATE` | A change to the sprint definition, and why. |
+
+`HYPOTHESIS`, `TEST`, and `NOTE` are not valid on sprints.
+
+### Task comments
+
+Task comments record the work of that task only.
+
+| Type | Must state |
+|---|---|
+| `HYPOTHESIS` | The proposition to verify, written before testing, and what would confirm or refute it. |
+| `TEST` | The exact command or procedure, and its result. |
+| `FINDING` | What was discovered: root cause, measurement, refuted hypothesis, or pre-existing defect. |
+| `DECISION` | The choice, its reasoning, the rejected options, and the open-source reference used. |
+| `PROGRESS` | A part delivered, and what remains. |
+| `UPDATE` | Why the task definition changed. Always paired with an edit of the task. |
+| `NOTE` | Useful context that fits no other type. |
+
+### Rules
+
+- Choose the type whose meaning matches the entry. Never default to `NOTE` when a typed entry applies.
+- For investigative work, follow the chain `HYPOTHESIS` → `TEST` → `FINDING` → `DECISION`.
+- Close a task only when its log holds a `DECISION` for each non-obvious choice, a `TEST` proving the acceptance criteria, a `FINDING` for each discovery, and an `UPDATE` for each definition change.
 
 ---
 

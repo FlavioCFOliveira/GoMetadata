@@ -1224,22 +1224,38 @@ func TestWriteXMLEscapedAllChars(t *testing.T) {
 
 // ---- Group D: xmp.go accessor nil / fallback paths -------------------------
 
-// TestCameraModelFallbackToCreatorTool covers the fallback branch in CameraModel
-// when tiff:Model is absent but xmp:CreatorTool is present.
-func TestCameraModelFallbackToCreatorTool(t *testing.T) {
+// TestCameraModelNoCreatorToolFallback pins task #331: CameraModel is
+// tiff:Model only. xmp:CreatorTool names the creating software (XMP Part 1
+// §8.4), so it is never returned as a camera model.
+func TestCameraModelNoCreatorToolFallback(t *testing.T) {
 	t.Parallel()
-	raw := `<?xpacket begin="" uid="abc"?>` +
-		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
+	const head = `<?xpacket begin="" uid="abc"?><x:xmpmeta xmlns:x="adobe:ns:meta/">` +
 		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
-		`<rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/"` +
-		` xmp:CreatorTool="Adobe Lightroom 5"/>` +
-		`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`
-	x, err := Parse([]byte(raw))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
+		`<rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:tiff="http://ns.adobe.com/tiff/1.0/"`
+	const tail = `/></rdf:RDF></x:xmpmeta><?xpacket end="w"?>`
+	tests := []struct {
+		name, attrs, want string
+	}{
+		{"CreatorTool only", ` xmp:CreatorTool="Adobe Lightroom 5"`, ""},
+		{"tiff:Model", ` tiff:Model="EOS 5D"`, "EOS 5D"},
+		{"both", ` xmp:CreatorTool="Adobe Lightroom 5" tiff:Model="EOS 5D"`, "EOS 5D"},
+		{"neither", ``, ""},
 	}
-	if got := x.CameraModel(); got != "Adobe Lightroom 5" {
-		t.Errorf("CameraModel fallback = %q, want %q", got, "Adobe Lightroom 5")
+	for _, tc := range tests {
+		t.Run("RDF-12/"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			x, err := Parse([]byte(head + tc.attrs + tail))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			if got := x.CameraModel(); got != tc.want {
+				t.Errorf("CameraModel = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	var nilXMP *XMP
+	if got := nilXMP.CameraModel(); got != "" {
+		t.Errorf("nil: CameraModel = %q, want empty", got)
 	}
 }
 
@@ -1790,15 +1806,15 @@ func TestCDATAInPropertyValue(t *testing.T) {
 	raw := `<?xpacket begin="" uid="abc"?>` +
 		`<x:xmpmeta xmlns:x="adobe:ns:meta/">` +
 		`<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
-		`<rdf:Description rdf:about="" xmlns:tiff="http://ns.adobe.com/tiff/1.0/">` +
-		`<tiff:ImageDescription><![CDATA[A description with <special> & "chars"]]></tiff:ImageDescription>` +
+		`<rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">` +
+		`<xmp:Label><![CDATA[A description with <special> & "chars"]]></xmp:Label>` +
 		`</rdf:Description>` +
 		`</rdf:RDF></x:xmpmeta><?xpacket end="w"?>`
 	x, err := Parse([]byte(raw))
 	if err != nil {
 		t.Fatalf("Parse CDATA: %v", err)
 	}
-	got := x.Get(NStiff, "ImageDescription")
+	got := x.Get(NSxmp, "Label")
 	// Content must be verbatim — no entity expansion inside CDATA.
 	want := `A description with <special> & "chars"`
 	if got != want {

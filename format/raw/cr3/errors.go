@@ -27,6 +27,15 @@ var ErrFileTooLarge = errors.New("cr3: input exceeds maximum file size (256 MiB)
 // ErrNoMoovBox is returned when the CR3 container does not contain a moov box.
 var ErrNoMoovBox = errors.New("cr3: no moov box found")
 
+// ErrNoMetadataContainer is returned by Inject when it is asked to store EXIF
+// or XMP data in a file that has no box to hold it: a file without a moov
+// box, or, for EXIF, a moov box without the Canon uuid box that carries the
+// CMT1-CMT4 sub-boxes. Inject does not create those boxes, so the request
+// cannot be honoured; the output is never silently left without the requested
+// metadata, and nothing is written. When the moov box is missing, the error
+// also matches ErrNoMoovBox.
+var ErrNoMetadataContainer = errors.New("cr3: the file has no metadata container for the requested data (moov box or Canon uuid box missing)")
+
 // ErrNoCMT1Box is returned by Extract when the moov/UUID structure is present
 // but no CMT1 sub-box is found — neither inside the Canon UUID box nor via the
 // flat fallback search. This distinguishes "no EXIF metadata" from a structurally
@@ -73,3 +82,8 @@ var ErrStcoOverflow = errors.New("cr3: stco chunk offset would overflow uint32 a
 //
 // Use PreserveUnknownSegments(true) (the default) when writing to CR3.
 var ErrPreserveUnknownSegmentsNotSupported = errors.New("cr3: PreserveUnknownSegments(false) is not supported for CR3; ISOBMFF boxes are structurally mandatory")
+
+// ErrBadCMTStream is returned by ParseSubIFD when a CMT sub-box does not hold
+// a TIFF stream with a readable first IFD (TIFF 6.0 §2: byte order, magic
+// 42, IFD offset, then the IFD).
+var ErrBadCMTStream = errors.New("cr3: a camera metadata block is not readable EXIF data")

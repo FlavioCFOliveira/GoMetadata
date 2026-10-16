@@ -391,14 +391,14 @@ func TestConformance_R08_nikon_type3_makernote(t *testing.T) {
 func TestConformance_R09_fujifilm_makernote(t *testing.T) {
 	t.Parallel()
 	order := binary.LittleEndian
-	// Layout: [0..7] "FUJIFILM"; [8..11] version "0100"; [12..15] LE IFD offset (relative to b[0]).
-	// IFD at offset 16 within the MakerNote blob.
+	// Layout: [0..7] "FUJIFILM"; [8..11] LE IFD offset (relative to b[0]);
+	// IFD at offset 16 within the MakerNote blob (bytes 12..15 are filler).
 	const ifdOff = 16
 	ifdSize := 2 + 12 + 4
 	mnBuf := make([]byte, ifdOff+ifdSize)
 	copy(mnBuf[0:], "FUJIFILM")
-	copy(mnBuf[8:], "0100")             // version
-	order.PutUint32(mnBuf[12:], ifdOff) // LE IFD offset
+	order.PutUint32(mnBuf[8:], ifdOff) // LE IFD offset
+	copy(mnBuf[12:], "0100")           // filler before the IFD
 	// IFD at offset 16: 1 entry, ImageWidth=100.
 	order.PutUint16(mnBuf[ifdOff:], 1)
 	p := ifdOff + 2

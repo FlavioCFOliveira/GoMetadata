@@ -84,6 +84,13 @@ func rtMinimalTIFF() []byte {
 	return buf
 }
 
+// rtExifImageDescription is the ImageDescription that the EXIF reader finds
+// in rtMinimalTIFF. The fixture declares a 3-byte value ("ok\x00") but stores
+// an offset in the value field; TIFF 6.0 §2 puts a value of 4 bytes or fewer
+// in the field itself, so the value is the first byte of the offset (26,
+// "\x1a") up to its NUL terminator.
+const rtExifImageDescription = "\x1a"
+
 // rtPNGWriteChunk appends a PNG chunk with correct CRC to buf.
 func rtPNGWriteChunk(buf *bytes.Buffer, chunkType string, data []byte) {
 	var hdr [4]byte
@@ -232,8 +239,17 @@ func TestRoundTripIPTC_JPEG(t *testing.T) {
 	}
 
 	// Step 6: assert values survived.
-	if got := m2.Caption(); got != wantCaption {
-		t.Errorf("Caption: got %q, want %q", got, wantCaption)
+	if m2.IPTC == nil {
+		t.Fatal("IPTC missing after Write")
+	}
+	if got := m2.IPTC.Caption(); got != wantCaption {
+		t.Errorf("IPTC Caption: got %q, want %q", got, wantCaption)
+	}
+	// MWG v2.0 §4.2.3.3: Caption prefers the EXIF ImageDescription. The
+	// fixture's tag holds "\x1a" (see rtExifImageDescription), which is not
+	// blank: MWG counts only spaces and NULs as blank.
+	if got := m2.Caption(); got != rtExifImageDescription {
+		t.Errorf("Caption: got %q, want the EXIF value %q", got, rtExifImageDescription)
 	}
 	if got := m2.Copyright(); got != wantCopyright {
 		t.Errorf("Copyright: got %q, want %q", got, wantCopyright)
@@ -285,8 +301,16 @@ func TestRoundTripXMP_JPEG(t *testing.T) {
 		t.Fatalf("Read after Write: %v", err)
 	}
 
-	if got := m2.Caption(); got != wantCaption {
-		t.Errorf("Caption: got %q, want %q", got, wantCaption)
+	if m2.XMP == nil {
+		t.Fatal("XMP missing after Write")
+	}
+	if got := m2.XMP.Caption(); got != wantCaption {
+		t.Errorf("XMP Caption: got %q, want %q", got, wantCaption)
+	}
+	// MWG v2.0 §4.2.3.3: Caption prefers the EXIF ImageDescription (see the
+	// IPTC round trip above).
+	if got := m2.Caption(); got != rtExifImageDescription {
+		t.Errorf("Caption: got %q, want the EXIF value %q", got, rtExifImageDescription)
 	}
 	if got := m2.Copyright(); got != wantCopyright {
 		t.Errorf("Copyright: got %q, want %q", got, wantCopyright)

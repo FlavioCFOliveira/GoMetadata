@@ -14,6 +14,7 @@ import (
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/irb"
 	"github.com/FlavioCFOliveira/GoMetadata/internal/tiffscan"
 )
 
@@ -348,7 +349,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ boo
 	if err != nil {
 		return err
 	}
-	if err := writeRelocated(r, w, header, blocks, base, true); err != nil {
+	if err := writeRelocated(r, w, header, blocks, base, true, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -446,7 +447,7 @@ func InjectWithEXIFStream(r io.ReadSeeker, prefix []byte, wholeFile bool, modifi
 	if err != nil {
 		return err
 	}
-	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -530,14 +531,14 @@ func InjectWithEXIFCR2Stream(r io.ReadSeeker, prefix []byte, wholeFile bool, mod
 	// headerSize = 8). After inserting 8 bytes at position 8, IFD0 moves to
 	// offset 16, which is the canonical CR2 IFD0 position.
 	//
-	// Canon CR2 spec §3.1: TIFF header (8 bytes) + CR marker (4 bytes) + zero-pad
-	// (4 bytes) = 16-byte total header; IFD0 immediately follows at offset 16.
-	newHeader, insertErr := insertCR2MarkerAndShiftOffsets(header, prefix)
+	// Canon CR2 spec §3.1: TIFF header (8 bytes) + CR marker (4 bytes) + RAW IFD
+	// offset (4 bytes) = 16-byte total header; IFD0 immediately follows at offset 16.
+	newHeader, insertErr := insertCR2MarkerAndShiftOffsets(header, prefix, cr2MakerNoteOf(modifiedEXIF, prefix))
 	if insertErr != nil {
 		return insertErr
 	}
 
-	if err := writeRelocated(r, w, newHeader, blocks, prefix, wholeFile); err != nil {
+	if err := writeRelocated(r, w, newHeader, blocks, prefix, wholeFile, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -545,19 +546,22 @@ func InjectWithEXIFCR2Stream(r io.ReadSeeker, prefix []byte, wholeFile bool, mod
 
 // cr2MarkerLen is the length of the Canon CR2 proprietary header extension
 // inserted at byte position 8 of the TIFF stream.
-// Canon CR2 spec §3.1: 4-byte marker ('C','R',0x02,0x00) + 4-byte zero-pad = 8 bytes.
+// lclevy CR2 header: 4-byte marker ('C','R',0x02,0x00) + 4-byte RAW IFD offset = 8 bytes.
 const cr2MarkerLen = 8
 
 // cr2IFD0Offset is the canonical IFD0 offset in a well-formed CR2 file.
 // Canon CR2 spec §3.1: standard 8-byte TIFF header + 8-byte CR2 marker = 16.
 const cr2IFD0Offset = 16
 
-// insertCR2MarkerAndShiftOffsets inserts the 8-byte CR2 marker at byte
-// position 8 of finalTIFF, updates the IFD0 offset in the TIFF header from
-// 8 to 16, and rebases all IFD absolute offsets by +8.
+// insertCR2MarkerAndShiftOffsets inserts the 8-byte CR2 header extension at
+// byte position 8 of finalTIFF, updates the IFD0 offset in the TIFF header
+// from 8 to 16, and rebases all IFD absolute offsets by +8.
 //
-// The CR2 marker bytes are read from originalBytes[8:12] (the original file's
-// CR2 marker: 0x43,0x52,0x02,0x00); bytes [12:16] are zeroed.
+// CR2 header layout (lclevy, "Canon CR2 specifications", CR2 header):
+// bytes [8:10] "CR", [10] major version 2, [11] minor version 0, [12:16] the
+// offset of the RAW IFD (IFD3). The signature and version are copied from
+// originalBytes[8:12]; the RAW IFD offset is recomputed for the output (step
+// 4) because the IFDs move when the metadata is rewritten.
 //
 // The original TIFF header at [0:4] (byte-order + magic) is preserved.
 //
@@ -565,14 +569,20 @@ const cr2IFD0Offset = 16
 //
 //  1. Build output: hdr[0:8] + marker[0:8] + finalTIFF[8:].
 //  2. Update header bytes [4:8] → 16 (new IFD0 offset).
-//  3. Walk IFD0 (at offset 16) and all sub-IFDs, shifting every OOL val_or_off
-//     and every inline sub-IFD pointer by +cr2MarkerLen (+8).
+//  3. Walk IFD0 (at offset 16) and every IFD reachable from it, shifting all
+//     offsets by +cr2MarkerLen (+8); see rebaseAllIFDsAfterCR2Marker. The
+//     out-of-line offsets inside a TIFF-relative MakerNote (the Canon
+//     MakerNote of every CR2) are shifted too when mn locates its IFD (task
+//     #310).
+//  4. Write the output offset of the RAW IFD into bytes [12:16]: the IFD at
+//     the same position of the IFD0 chain as the one the original header
+//     pointed to (task #281).
 //
 // This mirrors insertRW2GUIDAndShiftOffsets (delta=16 for RW2 GUID) but uses
 // delta=8 for the 8-byte CR2 marker extension.
 //
 // Canon CR2 spec §3.1 / TIFF 6.0 §2 / containers.md §8(e).
-func insertCR2MarkerAndShiftOffsets(finalTIFF, originalBytes []byte) ([]byte, error) {
+func insertCR2MarkerAndShiftOffsets(finalTIFF, originalBytes []byte, mn cr2MakerNote) ([]byte, error) {
 	if len(finalTIFF) < 8 {
 		return nil, fmt.Errorf("%w (%d bytes)", ErrCR2OutputTooShort, len(finalTIFF))
 	}
@@ -582,12 +592,12 @@ func insertCR2MarkerAndShiftOffsets(finalTIFF, originalBytes []byte) ([]byte, er
 		return nil, fmt.Errorf("tiff: CR2 insert marker: %w", orderErr)
 	}
 
-	// Build 8-byte CR2 marker: bytes [8:12] from original + 4 zero bytes [12:16].
-	// Canon CR2 spec §3.1: 0x43 'C', 0x52 'R', 0x02 version, 0x00 version minor.
+	// Build the 8-byte CR2 marker: bytes [8:12] from the original; bytes
+	// [12:16] (the RAW IFD offset) are filled in by step 4.
+	// lclevy CR2 header: 0x43 'C', 0x52 'R', 0x02 major, 0x00 minor version.
 	var marker [cr2MarkerLen]byte
 	if len(originalBytes) >= 12 {
 		copy(marker[0:4], originalBytes[8:12]) // CR2 signature + version
-		// marker[4:8] remain zero (reserved, per Canon CR2 spec §3.1)
 	} else {
 		// Fallback: synthesise canonical marker when original is too short.
 		marker[0] = 0x43 // 'C'
@@ -637,108 +647,288 @@ func insertCR2MarkerAndShiftOffsets(finalTIFF, originalBytes []byte) ([]byte, er
 	if ifd0Start+2 > len(out) {
 		return nil, fmt.Errorf("%w (offset=%d, len=%d)", ErrCR2IFD0OutOfBounds, ifd0Start, len(out))
 	}
-	rebaseAllIFDsAfterCR2Marker(out, ifd0Start, order, 0)
+	r := cr2Rebaser{out: out, order: order, budget: cr2MaxIFDs, mn: mn}
+	r.chain(ifd0Start, 0)
+
+	// Step 4 (task #281): restore the RAW IFD pointer of the CR2 header. The
+	// original header names the RAW IFD by offset; its position in the IFD0
+	// chain (IFD3 in every CR2 the lclevy reference describes) is the same in
+	// the output, whose IFDs have moved. When the original pointer cannot be
+	// resolved to a chained IFD the field stays 0, as in a header that has
+	// none.
+	if idx, ok := cr2RawIFDIndex(originalBytes); ok {
+		if off, ok := nthCR2IFD(out, idx, order); ok {
+			order.PutUint32(out[12:], off)
+		}
+	}
 
 	return out, nil
 }
 
-// rebaseAllIFDsAfterCR2Marker walks the IFD at ifdStart in out and shifts all
-// TIFF-absolute file offsets by +cr2MarkerLen (+8) to account for the 8-byte
-// CR2 marker inserted at file position 8.
+// cr2MaxChain bounds the IFD0 chain walks of cr2RawIFDIndex and nthCR2IFD
+// so a cyclic chain cannot loop forever. A CR2 chains four IFDs.
+const cr2MaxChain = 64
+
+// cr2RawIFDIndex returns the position in the IFD0 chain (0 = IFD0) of the
+// IFD that the CR2 header of orig names as the RAW IFD (bytes [12:16],
+// lclevy CR2 header), and false when orig has no such pointer or it does not
+// address a chained IFD.
+func cr2RawIFDIndex(orig []byte) (int, bool) {
+	if len(orig) < cr2IFD0Offset {
+		return 0, false
+	}
+	order, err := byteOrder(orig)
+	if err != nil {
+		return 0, false
+	}
+	raw := order.Uint32(orig[12:])
+	if raw == 0 {
+		return 0, false
+	}
+	off := order.Uint32(orig[4:])
+	for i := range cr2MaxChain {
+		if off == raw {
+			return i, true
+		}
+		next, ok := nextIFDOffset(orig, off, order)
+		if !ok || next == 0 {
+			return 0, false
+		}
+		off = next
+	}
+	return 0, false
+}
+
+// nthCR2IFD returns the offset of the IFD at position n of the IFD0 chain of
+// the CR2 stream b (IFD0 at cr2IFD0Offset), and false when the chain is
+// shorter or leaves b.
+func nthCR2IFD(b []byte, n int, order binary.ByteOrder) (uint32, bool) {
+	off := uint32(cr2IFD0Offset)
+	for range min(n, cr2MaxChain) {
+		next, ok := nextIFDOffset(b, off, order)
+		if !ok || next == 0 {
+			return 0, false
+		}
+		off = next
+	}
+	if n > cr2MaxChain || uint64(off)+2 > uint64(len(b)) {
+		return 0, false
+	}
+	return off, true
+}
+
+// nextIFDOffset returns the next-IFD pointer of the classic IFD at off
+// (TIFF 6.0 §2: 2-byte count, count 12-byte entries, 4-byte pointer), and
+// false when the IFD does not fit in b.
+func nextIFDOffset(b []byte, off uint32, order binary.ByteOrder) (uint32, bool) {
+	if uint64(off)+2 > uint64(len(b)) {
+		return 0, false
+	}
+	at := uint64(off) + 2 + uint64(order.Uint16(b[off:]))*12
+	if at+4 > uint64(len(b)) {
+		return 0, false
+	}
+	return order.Uint32(b[at:]), true
+}
+
+// cr2MaxIFDs bounds the number of IFDs one rebase pass visits. A Canon CR2
+// holds four chained IFDs plus their Exif/GPS/Interop/MakerNote children
+// (lclevy "Canon CR2 specifications", poster layout: IFD0 main JPEG preview,
+// IFD1 thumbnail, IFD2 uncompressed RGB preview, IFD3 lossless-JPEG raw), so
+// 4096 is far above any real file and still bounds the work on hostile input.
+const cr2MaxIFDs = 4096
+
+// cr2Rebaser shifts the TIFF-absolute offsets of every IFD reachable from
+// IFD0 by cr2MarkerLen. seen holds each IFD start (in output coordinates)
+// already shifted, so an offset reachable through two paths is shifted once.
+// mn, when set, locates the IFD of a TIFF-relative MakerNote, whose
+// out-of-line offsets move with everything else.
+type cr2Rebaser struct {
+	out    []byte
+	order  binary.ByteOrder
+	seen   map[int]struct{}
+	budget int
+	mn     cr2MakerNote
+}
+
+// cr2MakerNote locates the IFD of a MakerNote whose value offsets count from
+// the TIFF header (exif.MakerNoteLayout): ifdOffset from the first MakerNote
+// byte, read in order. The zero value (ok false) means no such MakerNote.
+type cr2MakerNote struct {
+	ok        bool
+	ifdOffset int
+	order     binary.ByteOrder
+}
+
+// cr2MakerNoteOf returns the cr2MakerNote of the MakerNote that the CR2
+// writer copies: the one of e, or, when e is nil (the writer then re-parses
+// the original bytes), the one parsed from prefix. Canon MakerNotes are plain
+// IFDs whose value offsets count from the TIFF header (metadata-extractor
+// ExifTiffHandler.processMakernote), so the 8-byte CR2 marker insertion moves
+// the values they address (task #310).
+func cr2MakerNoteOf(e *exif.EXIF, prefix []byte) cr2MakerNote {
+	if e == nil {
+		parsed, err := exif.Parse(prefix)
+		if err != nil {
+			return cr2MakerNote{}
+		}
+		e = parsed
+	}
+	l, ok := e.MakerNoteLayout()
+	if !ok || !l.TIFFRelative || e.BigTIFF {
+		return cr2MakerNote{}
+	}
+	return cr2MakerNote{ok: true, ifdOffset: l.IFDOffset, order: l.ByteOrder}
+}
+
+// shiftOffset returns v + cr2MarkerLen, and false when v lies before the
+// insertion point (8) or the sum would wrap past 4 GiB. #176: an offset
+// near MaxUint32 would wrap to ~0 and point into the header.
+func shiftOffset(v uint32) (uint32, bool) {
+	const insertionPoint = 8
+	if v < insertionPoint || v > math.MaxUint32-uint32(cr2MarkerLen) {
+		return v, false
+	}
+	return v + uint32(cr2MarkerLen), true
+}
+
+// rebaseAllIFDsAfterCR2Marker shifts every TIFF-absolute offset reachable from
+// the IFD at ifdStart in out by +cr2MarkerLen (+8), to account for the 8-byte
+// CR2 marker inserted at file position 8. Everything that follows the marker
+// moved by +8, including the image data, so every offset that addresses a
+// byte at or after position 8 must move too.
 //
-// For each IFD entry:
-//   - OOL entries (type×count > 4): shift val_or_off by +cr2MarkerLen.
-//   - Inline sub-IFD pointer tags (0x8769 ExifIFD, 0x8825 GPS, 0xA005 Interop):
-//     shift the inline value by +cr2MarkerLen AND recursively rebase the sub-IFD.
+// Per IFD (TIFF 6.0 §2: 12-byte entries tag(2) type(2) count(4) val_or_off(4)):
+//   - the next-IFD pointer is shifted and the chained IFD is rebased in turn
+//     (CR2 chains IFD0 -> IFD1 -> IFD2 -> IFD3);
+//   - sub-IFD pointer tags (0x8769 ExifIFD, 0x8825 GPS, 0xA005 Interop) and
+//     the SubIFDs array (0x014A) are shifted and each target IFD is rebased;
+//   - image-data offset arrays StripOffsets (0x0111), TileOffsets (0x0144) and
+//     JPEGInterchangeFormat (0x0201) are LONG offsets into the file: each
+//     element is shifted, whether stored inline (count 1) or out of line;
+//   - every other out-of-line entry (type x count > 4) has its val_or_off
+//     pointer shifted.
 //
 // Guards:
-//   - depth limits recursion to maxSubIFDDepth (8) levels so a crafted CR2 that
-//     chains sub-IFD pointers in a deep cycle cannot cause a stack overflow.
-//     #172: unbounded recursive IFD walker depth guard.
-//   - OOL offsets near math.MaxUint32 are left unchanged when adding cr2MarkerLen
-//     would wrap to zero, preventing pointer corruption.
-//     #176: uint32 overflow guard for OOL pointer rebasing.
-//   - Only offsets ≥ 8 (the insertion point) are shifted, which covers all
-//     offsets produced by exif.Encode (which starts placing values at offset 8+).
+//   - depth limits recursion to maxSubIFDDepth (8) levels, and cr2MaxIFDs
+//     bounds the IFDs visited, so a crafted file cannot exhaust the stack or
+//     the CPU. #172.
+//   - an offset that would wrap past 4 GiB is left unchanged. #176.
+//   - an IFD reachable twice is shifted once (cycle and double-shift guard).
 //
-// TIFF 6.0 §2: IFD entries are 12 bytes: tag(2)+type(2)+count(4)+val_or_off(4).
-// EXIF §4.6.3: sub-IFD pointer tags are TypeLong, Count=1, total=4 ≤ 4 → inline.
-//
-//nolint:cyclop,gocyclo // recursive IFD walk with OOL/inline/pointer dispatch mirrors rebaseAllIFDsAfterGUID; inherent TIFF §2 complexity
-func rebaseAllIFDsAfterCR2Marker(out []byte, ifdStart int, order binary.ByteOrder, depth int) {
-	// #172: depth guard — mirrors the maxSubIFDDepth cap used by enumerateSubIFDsAt.
-	// A crafted CR2 chaining sub-IFD pointers more than 8 levels deep would drive
-	// the recursion to ~bufferSize/cr2MarkerLen calls, causing a runtime stack overflow.
-	// TIFF Extension §F: SubIFD nesting depth is bounded in practice; 8 is generous.
-	if depth >= maxSubIFDDepth {
-		return
-	}
-	if ifdStart+2 > len(out) {
-		return
-	}
-	ifdCount := int(order.Uint16(out[ifdStart:]))
-	ifdPos := ifdStart + 2
+// Layout reference: lclevy, "Canon CR2 specifications" (IFD0-IFD3 chain, strip
+// offsets in IFD0/IFD3, JPEG offsets in IFD0/IFD1/IFD2).
+func rebaseAllIFDsAfterCR2Marker(out []byte, ifdStart int, order binary.ByteOrder) {
+	r := cr2Rebaser{out: out, order: order, budget: cr2MaxIFDs}
+	r.chain(ifdStart, 0)
+}
 
-	for i := range ifdCount {
-		e := ifdPos + i*12
-		if e+12 > len(out) {
-			break
+// chain rebases the IFD at start and every IFD linked from it by next-IFD
+// pointers. start is in output coordinates (already shifted).
+func (r *cr2Rebaser) chain(start, depth int) {
+	for start > 0 && depth < maxSubIFDDepth && r.budget > 0 {
+		if start+2 > len(r.out) {
+			return
 		}
-		entryTag := exif.TagID(order.Uint16(out[e:]))
-		entryType := order.Uint16(out[e+2:])
-		entryCount := order.Uint32(out[e+4:])
+		if _, dup := r.seen[start]; dup {
+			return
+		}
+		if r.seen == nil {
+			r.seen = make(map[int]struct{}, 8)
+		}
+		r.seen[start] = struct{}{}
+		r.budget--
 
-		elemSz := typeSize(entryType)
-		if elemSz == 0 || entryCount == 0 {
+		count := int(r.order.Uint16(r.out[start:]))
+		r.ifd(start, count, depth)
+
+		nextAt := start + 2 + count*12
+		if nextAt+4 > len(r.out) {
+			return
+		}
+		next := r.order.Uint32(r.out[nextAt:])
+		if next == 0 {
+			return
+		}
+		shifted, ok := shiftOffset(next)
+		if !ok {
+			return
+		}
+		r.order.PutUint32(r.out[nextAt:], shifted)
+		start = int(shifted)
+	}
+}
+
+// ifd rebases the entries of one IFD (count entries at start+2).
+//
+//nolint:cyclop,gocyclo // per-tag dispatch (pointer, offset array, out-of-line) mirrors TIFF 6.0 §2 entry semantics
+func (r *cr2Rebaser) ifd(start, count, depth int) {
+	for i := range count {
+		e := start + 2 + i*12
+		if e+12 > len(r.out) {
+			return
+		}
+		tag := exif.TagID(r.order.Uint16(r.out[e:]))
+		typ := r.order.Uint16(r.out[e+2:])
+		n := r.order.Uint32(r.out[e+4:])
+		elemSz := typeSize(typ)
+		if elemSz == 0 || n == 0 {
 			continue
 		}
-		total := uint64(elemSz) * uint64(entryCount)
+		total := uint64(elemSz) * uint64(n)
 
+		isPtr := tag == exif.TagExifIFDPointer || tag == exif.TagGPSIFDPointer ||
+			tag == exif.TagInteropIFDPointer || tag == exif.TagSubIFDs
+		isOffsets := tag == exif.TagStripOffsets || tag == exif.TagTileOffsets ||
+			tag == exif.TagJPEGInterchangeFormat
+
+		// Offset-bearing tags are arrays of 32-bit offsets (LONG, or IFD for
+		// the pointer tags, TIFF Extension §F); anything else is opaque.
+		if (isPtr || isOffsets) && elemSz == 4 {
+			r.offsetArray(e, n, total, isPtr, depth)
+			continue
+		}
 		if total > 4 {
-			// OOL entry: val_or_off is a TIFF-absolute pointer to the value area.
-			// After CR2 marker insertion every such offset shifts by +cr2MarkerLen.
-			// TIFF 6.0 §2: all offsets are measured from byte 0 of the TIFF stream.
-			oldVOO := order.Uint32(out[e+8:])
-			// Only rebase offsets at or beyond the insertion point (8).
-			// exif.Encode never places values at offsets < 8.
-			const insertionPoint = 8
-			if oldVOO >= insertionPoint {
-				// #176: guard against uint32 overflow: an OOL pointer near 4 GiB would
-				// wrap to ~0 (pointing at the TIFF header) if added to cr2MarkerLen.
-				// Skip such entries — they already point outside the valid region.
-				if oldVOO <= math.MaxUint32-uint32(cr2MarkerLen) {
-					order.PutUint32(out[e+8:], oldVOO+uint32(cr2MarkerLen))
+			// Out-of-line value: val_or_off is a TIFF-absolute pointer.
+			if v, ok := shiftOffset(r.order.Uint32(r.out[e+8:])); ok {
+				r.order.PutUint32(r.out[e+8:], v)
+				if tag == exif.TagMakerNote && r.mn.ok {
+					// Task #310: the offsets inside a TIFF-relative MakerNote
+					// moved by the same 8 bytes (shiftOffset semantics:
+					// offsets at or after the insertion point).
+					rebaseMakerNoteIFD(r.out, int(v)+r.mn.ifdOffset, r.mn.order, cr2MarkerLen, 8)
+					fixMakerNoteFooter(r.out, int(v), int(n), r.mn.order, uint64(v)-cr2MarkerLen, uint64(v))
 				}
 			}
+		}
+	}
+}
+
+// offsetArray shifts the n 32-bit file offsets of the entry at e, stored inline
+// (total <= 4, n == 1) or out of line behind the val_or_off pointer. When
+// descend is set every shifted element is an IFD that is rebased in turn.
+func (r *cr2Rebaser) offsetArray(e int, n uint32, total uint64, descend bool, depth int) {
+	base := e + 8 // inline: the elements start at the val_or_off field
+	if total > 4 {
+		ptr, ok := shiftOffset(r.order.Uint32(r.out[e+8:]))
+		if !ok {
+			return
+		}
+		r.order.PutUint32(r.out[e+8:], ptr)
+		if uint64(ptr)+total > uint64(len(r.out)) {
+			return
+		}
+		base = int(ptr)
+	}
+	for k := range int(n) {
+		at := base + k*4
+		v, ok := shiftOffset(r.order.Uint32(r.out[at:]))
+		if !ok {
 			continue
 		}
-
-		// Inline entry (total ≤ 4): only sub-IFD pointer tags carry absolute file
-		// offsets that need rebasing.
-		//
-		// EXIF §4.6.3: 0x8769 (ExifIFD), 0x8825 (GPS IFD), 0xA005 (InteropIFD)
-		// are TypeLong, Count=1, total=4 ≤ 4 → stored inline. Their val_or_off
-		// VALUE is an absolute file offset to the sub-IFD structure.
-		switch entryTag {
-		case exif.TagExifIFDPointer, exif.TagGPSIFDPointer, exif.TagInteropIFDPointer:
-			// Rebase sub-IFD pointer and recursively rebase the sub-IFD.
-			oldVal := order.Uint32(out[e+8:])
-			const insertionPoint = 8
-			if oldVal < insertionPoint {
-				continue // guard: implausibly small offset (shouldn't happen)
-			}
-			// #176: guard against uint32 overflow for inline sub-IFD pointers.
-			if oldVal > math.MaxUint32-uint32(cr2MarkerLen) {
-				continue // would wrap: pointer already outside valid address space
-			}
-			newVal := oldVal + uint32(cr2MarkerLen)
-			order.PutUint32(out[e+8:], newVal)
-			// Recurse into the sub-IFD at its new position in out.
-			// #172: pass depth+1 to enforce the recursion depth cap.
-			subIFDStart := int(newVal)
-			if subIFDStart+2 <= len(out) {
-				rebaseAllIFDsAfterCR2Marker(out, subIFDStart, order, depth+1)
-			}
+		r.order.PutUint32(r.out[at:], v)
+		if descend && int(v)+2 <= len(r.out) {
+			r.chain(int(v), depth+1)
 		}
 	}
 }
@@ -786,7 +976,7 @@ func InjectWithEXIFNEFStream(r io.ReadSeeker, prefix []byte, wholeFile bool, mod
 	if err != nil {
 		return err
 	}
-	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -798,7 +988,7 @@ func InjectWithEXIFNEFStream(r io.ReadSeeker, prefix []byte, wholeFile bool, mod
 // MakerNote info) before the standard TIFF copy-and-relocate algorithm, and
 // patches the following in the output after encoding:
 //   - Sony MakerNote (0x927C) OOL offsets are rebased (Sony uses TIFF-absolute
-//     offsets, unlike Canon which uses blob-relative).
+//     offsets).
 //   - SR2Private (0xC634) inline 4-byte value is updated to point to the new SR2
 //     block position; SR2 internal pointers are rebased.
 //
@@ -839,7 +1029,7 @@ func InjectWithEXIFARWStream(r io.ReadSeeker, prefix []byte, wholeFile bool, mod
 	if err != nil {
 		return err
 	}
-	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -898,7 +1088,7 @@ func InjectWithEXIFORFStream(r io.ReadSeeker, prefix []byte, wholeFile bool, mod
 	if err != nil {
 		return err
 	}
-	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -956,7 +1146,7 @@ func InjectWithEXIFRW2Stream(r io.ReadSeeker, prefix []byte, wholeFile bool, mod
 	if err != nil {
 		return err
 	}
-	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -1023,6 +1213,112 @@ func upsertIFD0Entry(ifd *exif.IFD, tag exif.TagID, typ exif.DataType, value []b
 	ifd.Entries = slices.Insert(ifd.Entries, i, entry)
 }
 
+// tagPhotoshopIRB is the TIFF tag of the Photoshop image resource block
+// (Adobe Photoshop File Formats Specification, "TIFF tags": 34377).
+const tagPhotoshopIRB = exif.TagID(tiffscan.PSIRTag)
+
+// upsertIPTC stores rawIPTC in tag 0x83BB of ifd (TypeLong, see
+// upsertIFD0Entry) and keeps the Photoshop image resource block (tag 0x8649)
+// consistent with it: its copy of the IIM (resource 0x0404) and its IPTC
+// digest (resource 0x0425).
+//
+// IIM copy (task #314): when the resource block already holds a 0x0404
+// resource, it is replaced by rawIPTC (irb.AppendSplicedDigest; duplicates are
+// resolved as irb documents), so no reader sees a stale second copy of the
+// IPTC (ExifTool lists it as group IPTC2 and updates both copies when it
+// writes). A 0x0404 resource is never added to a block that has none. The
+// Adobe XMP Toolkit (ReconcileLegacy.cpp:ExportPhotoData) updates only tag
+// 0x83BB and the digest for TIFF; it is not followed here because a stale
+// copy would contradict the IPTC just written.
+//
+// Digest (tasks #284, #323). MWG Guidelines v2.0 §4.2.3.2: the digest is the
+// MD5 of the IPTC-IIM block (p. 26), and "If IPTC-IIM and XMP are both
+// present, whether changed or not, a Changer MUST create or update the
+// checksum value" (p. 29). The digest covers the stored value of tag 0x83BB
+// including its LONG zero padding, the bytes Photoshop and ExifTool hash
+// (irb.Digest with align 4). Policy, shared with the JPEG writer
+// (irb.AppendSpliced):
+//   - XMP is written or present (rawXMP non-empty or tag 0x02BC in the IFD):
+//     the digest is set to that of the IIM written: created when the block
+//     holds none (in a new resource block, tag 0x8649, when the IFD has none),
+//     otherwise rewritten, a stale digest included and also when the IIM is
+//     unchanged (which also rewrites an unpadded digest in the padded form
+//     that is current for ExifTool as well);
+//   - no XMP in the IFD or written: the digest is left as it is and none is
+//     created, because the IIM and XMP are not both present.
+func upsertIPTC(ifd *exif.IFD, rawIPTC, rawXMP []byte) {
+	upsertIFD0Entry(ifd, exif.TagIPTC, exif.TypeLong, rawIPTC)
+	withXMP := len(rawXMP) > 0 || ifd.Get(exif.TagXMP) != nil
+
+	psir := ifd.Get(tagPhotoshopIRB) // after the upsert: it may move entries
+	if psir == nil {
+		if withXMP {
+			d := irb.Digest(rawIPTC, 4)
+			upsertIFD0Entry(ifd, tagPhotoshopIRB, exif.TypeByte, irb.AppendBlock(nil, irb.ResourceIPTCDigest, d[:]))
+		}
+		return
+	}
+	// The resource block is a byte stream (Adobe Photoshop File Formats
+	// Specification, TIFF tag 34377: BYTE or UNDEFINED); any other declared
+	// type is left alone, as its Count would not be a byte count.
+	byteTyped := psir.Type == exif.TypeByte || psir.Type == exif.TypeUndefined
+	digest, plan := iptcDigestUpdate(psir.Value, rawIPTC, withXMP && byteTyped)
+	updatePSIR(psir, rawIPTC, byteTyped, digest, plan)
+}
+
+// updatePSIR applies the outcome of iptcDigestUpdate to the resource block
+// entry psir: the 0x0404 copy of the IIM is replaced when it differs from
+// rawIPTC, and the digest is created or refreshed as plan says. The value is
+// always a fresh slice, because psir.Value may alias the caller's input.
+func updatePSIR(psir *exif.IFDEntry, rawIPTC []byte, byteTyped bool, digest [irb.DigestSize]byte, plan irb.DigestPlan) {
+	copy0404 := irb.FindIPTC(psir.Value)
+	copyIIM := byteTyped && copy0404 != nil && !bytes.Equal(copy0404, rawIPTC)
+	switch {
+	case copyIIM:
+		var d *[irb.DigestSize]byte
+		if plan != irb.DigestKeep {
+			d = &digest
+		}
+		psir.Value = irb.AppendSplicedDigest(make([]byte, 0, len(psir.Value)+len(rawIPTC)+28), psir.Value, rawIPTC, d, plan == irb.DigestCreate)
+		psir.Count = uint32(len(psir.Value)) //nolint:gosec // G115: bounded by the TIFF value size
+	case byteTyped && plan == irb.DigestCreate:
+		// The block holds no 0x0404 to replace (or one that already equals
+		// rawIPTC): append only the new digest resource, never an IIM copy.
+		v := make([]byte, 0, len(psir.Value)+1+12+irb.DigestSize)
+		v = append(v, psir.Value...)
+		if len(v)%2 != 0 {
+			v = append(v, 0) // resources start on even offsets
+		}
+		psir.Value = irb.AppendBlock(v, irb.ResourceIPTCDigest, digest[:])
+		psir.Count = uint32(len(psir.Value)) //nolint:gosec // G115: bounded by the TIFF value size
+	case plan == irb.DigestRefresh:
+		// RefreshDigest copies: psir.Value may alias the caller's input.
+		if v := irb.RefreshDigest(psir.Value, digest); v != nil {
+			psir.Value = v
+		}
+	}
+}
+
+// iptcDigestUpdate applies the digest policy of upsertIPTC to the resource
+// block psir when the IIM written is rawIPTC: it returns the digest to store
+// and what to do with it (irb.DigestCreate when the block holds no digest,
+// irb.DigestRefresh when it holds one that differs from the digest of rawIPTC,
+// irb.DigestKeep when it already holds that digest or withXMP is false).
+func iptcDigestUpdate(psir, rawIPTC []byte, withXMP bool) (digest [irb.DigestSize]byte, plan irb.DigestPlan) {
+	if !withXMP {
+		return digest, irb.DigestKeep
+	}
+	digest = irb.Digest(rawIPTC, 4)
+	stored := irb.FindDigest(psir)
+	switch {
+	case stored == nil:
+		return digest, irb.DigestCreate
+	case bytes.Equal(stored, digest[:]):
+		return digest, irb.DigestKeep
+	}
+	return digest, irb.DigestRefresh
+}
+
 // byteOrder determines the TIFF byte order from the first 2 bytes.
 func byteOrder(b []byte) (binary.ByteOrder, error) {
 	switch {
@@ -1036,50 +1332,26 @@ func byteOrder(b []byte) (binary.ByteOrder, error) {
 
 // extractTagValues scans IFD0 for the IPTC (0x83BB) and XMP (0x02BC) tags
 // and returns their raw byte values, using the shared tiffscan scanner with
-// this package's type table (type 13 is the 4-byte TIFF Extensions IFD type).
+// the same type table as exif (type 13 is the 4-byte IFD type, 129 UTF-8).
 func extractTagValues(data []byte, ifd0Off uint32, order binary.ByteOrder) (rawIPTC, rawXMP []byte) {
-	return tiffscan.ExtractTagValues(data, ifd0Off, order, true)
+	return tiffscan.ExtractTagValues(data, ifd0Off, order)
 }
 
 // typeSize returns the byte size of a single value for the given TIFF type.
 //
-// Type 13 ("IFD") intentionally diverges from exif/type.go's DataType table
-// (task #270, format/tiff-only fix — does NOT touch the exif package).
-//
-// CIPA DC-008-2023 §4.6.3 (EXIF 3.0) assigns type code 13 to TypeUTF8, a NEW
-// 1-byte-per-element EXIF-registry string type. Adobe TIFF 6.0 Extensions
-// ("Adding New Fields", also codified in libtiff's tif_dir.h as TIFF_IFD)
-// assigns the SAME numeric code 13 to IFD — a 4-byte pointer to a child IFD —
-// predating EXIF 3.0 by decades. This is a genuine type-code collision between
-// the two specifications' independent numbering spaces.
-//
-// exif/type.go correctly follows CIPA DC-008-2023 for its OWN EXIF-registry
-// tag table (IFD0/ExifIFD/GPSIFD tags never legitimately used type 13 before
-// EXIF 3.0, so the EXIF-3.0 interpretation is safe there). But tag 0x014A
-// (SubIFDs) is a TIFF-Extension tag, not an EXIF-registry tag (TIFF Extension
-// §F; Adobe DNG Spec §4), and real-world files legitimately declare it as
-// type 13 meaning IFD — see the conformance fixture
-// testdata/corpus/tiff/metadata-extractor/BigTIFFSubIFD4.tif, purpose-built to
-// exercise exactly this. format/tiff's own generic raw-IFD scanners (which
-// walk 0x014A arrays and SubIFD entries independently of exif.Parse) must
-// interpret type 13 as IFD (4 bytes) for that tag family, matching the
-// TIFF-Extension meaning, not the EXIF-3.0 one.
-//
-// #270 regression: exif.Parse (which correctly follows CIPA DC-008-2023 for
-// type 13 in its own struct-based IFD model) mis-sizes a 0x014A/type=13
-// entry's inline value to 1 byte instead of 4, silently truncating the SubIFD
-// pointer. format/tiff's write-path relocator never relies on exif's parsed
-// Value for 0x014A; it re-reads the raw bytes directly using this table (see
-// findEntryInIFD / enumerateSubIFDs in relocate_bigtiff.go).
+// Type 13 is the TIFF IFD type, a 4-byte pointer to a child IFD (Adobe
+// PageMaker 6.0 TIFF Technical Notes, TIFF Tech Note 1; libtiff TIFF_IFD).
+// Type 129 is the 1-byte UTF-8 string that Exif 3.0 and 3.1 added (CIPA
+// DC-008-2026 §4.6.2, p. 28). Up to task #320 exif/type.go gave type 13 to
+// UTF-8 by mistake, so this table and the exif table disagreed; since then
+// they agree. Returns 0 for an unknown type.
 func typeSize(t uint16) uint32 {
 	switch t {
-	case 1, 2, 6, 7: // BYTE, ASCII, SBYTE, UNDEFINED
+	case 1, 2, 6, 7, 129: // BYTE, ASCII, SBYTE, UNDEFINED, UTF-8
 		return 1
 	case 3, 8: // SHORT, SSHORT
 		return 2
-	case 4, 9, 11: // LONG, SLONG, FLOAT
-		return 4
-	case 13: // IFD — TIFF 6.0 Extensions / libtiff TIFF_IFD; see doc comment above.
+	case 4, 9, 11, 13: // LONG, SLONG, FLOAT, IFD
 		return 4
 	case 5, 10, 12: // RATIONAL, SRATIONAL, DOUBLE
 		return 8
@@ -1098,19 +1370,14 @@ func typeSize(t uint16) uint32 {
 // must reject them.  Returns 0 for any unknown type code (same sentinel as
 // typeSize) to allow the caller to skip unrecognised entries gracefully.
 //
-// Type 13 ("IFD", 4 bytes) is handled identically to typeSize — see that
-// function's doc comment for the EXIF-3.0-vs-TIFF-Extension type-code
-// collision this deliberately resolves in favour of the TIFF-Extension
-// meaning for format/tiff's own generic raw-IFD scanners.
+// Types 13 (IFD, 4 bytes) and 129 (UTF-8, 1 byte) are handled as in typeSize.
 func typeSizeBigTIFF(t uint16) uint64 {
 	switch t {
-	case 1, 2, 6, 7: // BYTE, ASCII, SBYTE, UNDEFINED
+	case 1, 2, 6, 7, 129: // BYTE, ASCII, SBYTE, UNDEFINED, UTF-8
 		return 1
 	case 3, 8: // SHORT, SSHORT
 		return 2
-	case 4, 9, 11: // LONG, SLONG, FLOAT
-		return 4
-	case 13: // IFD — TIFF 6.0 Extensions / libtiff TIFF_IFD; see typeSize doc comment.
+	case 4, 9, 11, 13: // LONG, SLONG, FLOAT, IFD (see typeSize)
 		return 4
 	case 5, 10, 12: // RATIONAL, SRATIONAL, DOUBLE
 		return 8
@@ -1219,6 +1486,7 @@ func extractTagValuesBigTIFF(data []byte, ifd0Off uint64, order binary.ByteOrder
 	}
 
 	pos := ifd0Off + 8 // first entry starts after the 8-byte count field
+	var psir []byte
 
 	for i := uint64(0); i < count; i++ { //nolint:intrange // BigTIFF parser: loop variable is a byte-slice offset multiplier
 		e := pos + i*bigTIFFEntrySize
@@ -1262,6 +1530,8 @@ func extractTagValuesBigTIFF(data []byte, ifd0Off uint64, order binary.ByteOrder
 		}
 
 		switch tag {
+		case tiffscan.PSIRTag: // Photoshop IRB; its 0x0404 resource is the IPTC fallback (task #301)
+			psir = v
 		case 0x83BB: // IPTC-NAA
 			// ROBUST-16 (iptc.md §5): type-aware trimming — only TypeLong (4)
 			// gets structural-padding trimmed; TypeByte/Undefined are returned
@@ -1280,5 +1550,5 @@ func extractTagValuesBigTIFF(data []byte, ifd0Off uint64, order binary.ByteOrder
 			rawXMP = v
 		}
 	}
-	return rawIPTC, rawXMP
+	return tiffscan.WithPSIRFallback(rawIPTC, psir), rawXMP
 }

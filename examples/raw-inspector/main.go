@@ -36,8 +36,7 @@ func main() {
 	// standard tags are needed.
 	m, err := gometadata.ReadFile(path, gometadata.WithoutMakerNote())
 	if err != nil {
-		var unsupported *gometadata.UnsupportedFormatError
-		if errors.As(err, &unsupported) {
+		if unsupported, ok := errors.AsType[*gometadata.UnsupportedFormatError](err); ok {
 			fmt.Fprintf(os.Stderr, "raw-inspector: unsupported format (magic: %x)\n", unsupported.Magic[:])
 			os.Exit(1)
 		}

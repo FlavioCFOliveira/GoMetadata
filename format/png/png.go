@@ -110,6 +110,15 @@ func putBytesReader(br *bytes.Reader) {
 // on every return path rather than defer, so the function stays simple to
 // reason about at every exit point.
 func zlibDecompress(data []byte) ([]byte, error) {
+	return zlibDecompressLimit(data, maxZlibDecompressSize)
+}
+
+// zlibDecompressLimit is zlibDecompress with the output capped at limit bytes
+// (at most maxZlibDecompressSize): a larger output is errDecompressBomb when
+// limit is the per-chunk cap, and ErrRawProfileBudget when it is a smaller
+// budget, in which case the inflate stops one byte past the limit.
+func zlibDecompressLimit(data []byte, limit int64) ([]byte, error) {
+	limit = min(limit, maxZlibDecompressSize)
 	br := bytesReaderPool.Get().(*bytes.Reader) //nolint:forcetypeassert,revive // bytesReaderPool.New always stores *bytes.Reader; pool invariant
 	br.Reset(data)
 
@@ -131,7 +140,7 @@ func zlibDecompress(data []byte) ([]byte, error) {
 	// Cap decompressed output to prevent decompression bombs: a crafted zlib
 	// stream with a tiny compressed payload can expand to gigabytes of output.
 	// Reading one byte beyond the limit lets us detect overflow without reading it all.
-	out, err := io.ReadAll(io.LimitReader(zr, maxZlibDecompressSize+1))
+	out, err := io.ReadAll(io.LimitReader(zr, limit+1))
 	// Return both pooled values now that reading has fully completed; zr is
 	// returned without closing so it can be Reset on next use.
 	zlibPool.Put(zr)
@@ -139,32 +148,39 @@ func zlibDecompress(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("png: zlib decompress: %w", err)
 	}
-	if int64(len(out)) > maxZlibDecompressSize {
+	if int64(len(out)) > limit {
+		if limit < maxZlibDecompressSize {
+			return nil, ErrRawProfileBudget
+		}
 		return nil, errDecompressBomb
 	}
 	return out, nil
 }
 
 // processExtractChunk dispatches a single PNG chunk during Extract, updating
-// rawEXIF and rawXMP as appropriate. It returns (rawEXIF, rawXMP, done, err)
-// where done is true when IEND signals the end of the chunk stream.
-// data is backed by a pooled buffer; any slice that must outlive this call is
-// cloned here or in its callees before being returned as rawEXIF/rawXMP.
-func processExtractChunk(chunkType [4]byte, data, rawEXIF, rawXMP []byte) ([]byte, []byte, bool, error) {
+// st as appropriate. It returns done = true when IEND signals the end of the
+// chunk stream. data is backed by a pooled buffer; any slice that must outlive
+// this call is cloned here or in its callees before being stored in st.
+func processExtractChunk(chunkType [4]byte, data []byte, st *extractState) (done bool, err error) {
 	switch chunkType {
 	case chunkEXIf:
 		// Clone: data is pooled and will be returned to the pool after this call.
-		return bytes.Clone(data), rawXMP, false, nil
+		st.exif = bytes.Clone(data)
 	case chunkITXt, chunkTEXt, chunkZTXt:
-		xmp, err := handleXMPChunk(chunkType, data, rawXMP)
+		xmp, err := handleXMPChunk(chunkType, data, st.xmp)
 		if err != nil {
-			return rawEXIF, rawXMP, false, err
+			return false, err
 		}
-		return rawEXIF, xmp, false, nil
+		st.xmp = xmp
+		// "Raw profile type ..." chunks: decodeRawProfile always returns a fresh
+		// buffer, so nothing aliases the pooled data.
+		if err := st.addRawProfile(chunkType, data); err != nil {
+			return false, err
+		}
 	case chunkIEND:
-		return rawEXIF, rawXMP, true, nil
+		return true, nil
 	}
-	return rawEXIF, rawXMP, false, nil
+	return false, nil
 }
 
 // extractIgnores reports whether Extract's chunk-scanning loop can skip a
@@ -273,13 +289,14 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	// #288: hdr is hoisted out of the loop and reused for every chunk header
 	// instead of being declared fresh per call.
 	var hdr [8]byte
+	var st extractState
 	pos := int64(len(pngSig))
 	var done bool
 	for !done {
 		var n int64
 		n, err = readOrSkipChunk(r, &hdr, pos, total, func(chunkType [4]byte, data []byte) error {
 			var perr error
-			rawEXIF, rawXMP, done, perr = processExtractChunk(chunkType, data, rawEXIF, rawXMP)
+			done, perr = processExtractChunk(chunkType, data, &st)
 			return perr
 		})
 		pos = n
@@ -296,7 +313,8 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 			return nil, nil, nil, err
 		}
 	}
-	return rawEXIF, nil, rawXMP, nil
+	rawEXIF, rawIPTC, rawXMP = st.result()
+	return rawEXIF, rawIPTC, rawXMP, nil
 }
 
 // readOrSkipChunk reads one PNG chunk header at the reader's current
@@ -554,7 +572,7 @@ func writeVerbatimChunk(w io.Writer, hdr *[8]byte, data []byte, crcB [4]byte) er
 // rejected here rather than silently accepted.
 //
 //nolint:cyclop,gocyclo // straight-line chunk-type dispatch; splitting would obscure the shared bounds check every branch needs
-func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64, rawEXIF, rawXMP []byte) (int64, error) {
+func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64, rawEXIF, rawIPTC, rawXMP []byte, budget *profileBudget) (int64, error) {
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return pos, fmt.Errorf("png: read chunk header: %w", err)
 	}
@@ -585,15 +603,16 @@ func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64
 		return pos + length + 4, nil
 	}
 
-	if chunkType == chunkITXt {
+	// iTXt is always inspected (it may be the XMP chunk being replaced);
+	// tEXt and zTXt only when the write may have to rewrite or drop a "Raw
+	// profile type ..." chunk (tasks #314, #325), so a write without any
+	// metadata payload still streams them.
+	if chunkType == chunkITXt || ((rawIPTC != nil || rawEXIF != nil || rawXMP != nil) && (chunkType == chunkTEXt || chunkType == chunkZTXt)) {
 		data, crcB, release, err := readChunkBody(r, length)
 		if err != nil {
 			return pos, fmt.Errorf("png: chunk %q: %w", chunkTypeStr(chunkType), err)
 		}
-		var werr error
-		if !shouldDropChunk(chunkType, data) {
-			werr = writeVerbatimChunk(w, hdr, data, crcB)
-		}
+		werr := writeTextChunk(w, hdr, chunkType, data, crcB, rawEXIF, rawIPTC, rawXMP, budget)
 		release()
 		if werr != nil {
 			return pos, werr
@@ -615,9 +634,57 @@ func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64
 	return pos + length + 4, nil
 }
 
+// writeTextChunk writes the text chunk data (type chunkType, original CRC
+// crcB) read by injectOneChunk: an XMP iTXt chunk is dropped (Inject writes
+// its own); an EXIF, APP1 or XMP raw profile chunk is dropped when Inject
+// writes the standard chunk that replaces its content (rawProfileSuperseded,
+// task #325); an IPTC raw profile chunk is rewritten with rawIPTC when it
+// holds another IIM (rewriteRawProfileIPTC; a fresh CRC is computed); and any
+// other chunk is copied through byte-identical, original CRC included.
+//
+// budget bounds the text that all the raw profile chunks of the file inflate
+// to (security audit F-08); ErrRawProfileBudget is returned when it runs out.
+func writeTextChunk(w io.Writer, hdr *[8]byte, chunkType [4]byte, data []byte, crcB [4]byte, rawEXIF, rawIPTC, rawXMP []byte, budget *profileBudget) error {
+	if shouldDropChunk(chunkType, data) {
+		return nil
+	}
+	superseded, serr := rawProfileSupersededB(chunkType, data, rawEXIF != nil, rawXMP != nil, budget)
+	if serr != nil {
+		return serr
+	}
+	if superseded {
+		return nil
+	}
+	if rawIPTC != nil {
+		payload, ok, err := rewriteRawProfileIPTCB(chunkType, data, rawIPTC, rawXMP != nil, budget)
+		if err != nil {
+			return err
+		}
+		if ok {
+			if len(payload) > maxPNGChunkSize {
+				return fmt.Errorf("png: raw profile chunk length %d exceeds limit: %w", len(payload), ErrChunkTooLarge)
+			}
+			return writeChunk(w, chunkType, payload)
+		}
+	}
+	return writeVerbatimChunk(w, hdr, data, crcB)
+}
+
 // Inject reads the PNG chunk stream from r, replaces or inserts the eXIf and
-// iTXt(XMP) chunks, and writes the result to w. IPTC is not natively
-// supported in PNG; rawIPTC is ignored.
+// iTXt(XMP) chunks, and writes the result to w. PNG has no native IPTC
+// chunk, so rawIPTC is not added to a file that has none; when the file
+// already carries IPTC in a "Raw profile type iptc" text chunk (the ImageMagick
+// convention ExifTool also writes), that chunk is rewritten to hold rawIPTC,
+// so it never contradicts the IPTC just written (task #314). A nil rawIPTC
+// leaves such a chunk unchanged.
+//
+// EXIF and XMP are always written to their standard chunks (eXIf and the
+// "XML:com.adobe.xmp" iTXt). A "Raw profile type exif", "APP1" or "xmp" text
+// chunk whose content that standard chunk replaces is dropped, so exactly one
+// current copy remains (task #325; PNG 3rd Edition §11.3.4.5: only one eXIf
+// chunk; XMP Specification Part 3 §1.1.5, p. 16: no more than one chunk
+// containing XMP). A nil rawEXIF or rawXMP leaves the matching raw profile
+// chunk unchanged, as a nil rawIPTC does.
 //
 // preserveUnknownSegments must be true. PNG chunk semantics differ
 // fundamentally from JPEG APPn segments: chunks such as tEXt, gAMA, cHRM, and
@@ -673,9 +740,10 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 
 	var hdr [8]byte
 	pos := int64(len(pngSig))
+	budget := newProfileBudget()
 	for {
 		var err error
-		pos, err = injectOneChunk(r, w, &hdr, pos, total, rawEXIF, rawXMP)
+		pos, err = injectOneChunk(r, w, &hdr, pos, total, rawEXIF, rawIPTC, rawXMP, &budget)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break

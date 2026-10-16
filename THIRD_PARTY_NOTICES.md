@@ -1,0 +1,239 @@
+# Third-Party Notices
+
+GoMetadata is licensed under the MIT License (see [`LICENSE`](LICENSE)). Some
+source files adapt data or code from the permissively licensed open-source
+projects listed below. Each adapted file carries a header comment that names
+its source (see [`docs/THIRD_PARTY.md`](docs/THIRD_PARTY.md)), and each project
+has one entry here. The full licence texts are in [`LICENSES/`](LICENSES/),
+named by SPDX identifier.
+
+`go test` fails when a `.go` file contains an `Adapted from` header that has no
+matching entry in this file (see `third_party_notices_test.go`).
+
+Entry fields: project, URL, source commit, licence, copyright notice, source
+files, destination files, adapted (yes: content copied or transcribed; no: used
+for cross-checking only).
+
+---
+
+## libtiff
+
+- URL: https://gitlab.com/libtiff/libtiff
+- Source commit: `d23249978a7a99ea2e0752a476611914501577de`
+- Licence: libtiff (see `LICENSES/libtiff.txt`), SPDX-License-Identifier: `libtiff`
+- Copyright: Copyright (c) 1988-1997 Sam Leffler; Copyright (c) 1991-1997 Silicon Graphics, Inc.
+- Source files: `libtiff/tif_dirinfo.c` (`tiffFields[]`, `exifFields[]`, `gpsFields[]`)
+- Destination files: `exif/tag_extended.go`, `exif/tag_extended_test.go`
+- Adapted: yes (tag IDs, names, types and counts, transcribed and renamed to Go types)
+- Notes: the tag names of the TIFF/EP entries keep libtiff's `EP` prefix. The libtiff
+  pseudo-tag `PerSample` (0x1001B) is not transcribed because it is outside the 16-bit tag space.
+
+## metadata-extractor
+
+- URL: https://github.com/drewnoakes/metadata-extractor
+- Source commit: `6f037943c0811799a59b0ea19896cb2b07da17be`
+- Licence: Apache-2.0 (see `LICENSES/Apache-2.0.txt`), SPDX-License-Identifier: `Apache-2.0`
+- Copyright: Copyright 2002-2019 Drew Noakes and contributors
+- Source files: `Source/com/drew/metadata/exif/ExifDirectoryBase.java` (`TAG_*` constants);
+  `Source/com/drew/metadata/exif/ExifTiffHandler.java` (`processMakernote`);
+  `Source/com/drew/imaging/tiff/TiffReader.java` (`processIfd`, byte-swapped entry count);
+  `Source/com/drew/metadata/webp/WebpRiffHandler.java` (`processChunk`, the "Exif\0\0" identifier of an EXIF chunk);
+  `Source/com/drew/metadata/jpeg/JpegDnlReader.java` (`extract`);
+  `Source/com/drew/metadata/exif/makernotes/OlympusMakernoteDirectory.java` (`TAG_PREVIEW_IMAGE_START`, `TAG_PREVIEW_IMAGE_LENGTH`,
+  consulted for task #370: cross-check of the tag IDs `0x1036` and `0x1037`, no content copied)
+- Destination files: `exif/tag_extended.go`, `exif/tag_extended_test.go`; `exif/makernote_detect.go`;
+  `exif/makernote_parse.go`; `format/webp/webp.go`; `format/jpeg/size.go`
+- Adapted: yes (tag IDs and names of the tags that libtiff does not list; the rest of the table is used for cross-checking.
+  MakerNote detection: the order of the signature and Make tests, the signatures, and the IFD offset and offset base of
+  each layout, re-implemented as allocation-free Go; the offset base is applied when a MakerNote is read, and the
+  Fujifilm IFD offset is read from the 4 bytes after "FUJIFILM", as `processMakernote` does. MakerNote byte order: the
+  byte-swapped entry-count heuristic of `processIfd`, applied to MakerNote IFDs only. MakerNote tag tables are not
+  copied. WebP: an EXIF chunk that starts with the "Exif\0\0" identifier is read as the TIFF stream after it, as
+  `processChunk` does, re-implemented in Go; the reader here also takes the FourCC "XMP\0" as XMP, and the writer drops
+  the identifier and that FourCC. Headerless Nikon MakerNote: the IFD begins with the first MakerNote byte
+  (`processMakernote`, Coolpix 775, E990, D1) and its byte order comes from the entry count with the heuristic of
+  `processIfd`. JPEG height: the number of lines of a frame whose header declares none is the first unsigned 16-bit
+  value of the DNL segment (`JpegDnlReader.extract`); the search for the segment in the entropy-coded data is original)
+- Notes: the repository has no `NOTICE` file. The changes made are stated in the
+  header of each destination file. No descriptor marked as converted from ExifTool is used.
+
+## bep/imagemeta
+
+- URL: https://github.com/bep/imagemeta
+- Source commit: `fbefe9cdc214365d79ba42fff69549ee7058db51`
+- Licence: MIT (see `LICENSES/MIT.txt`), SPDX-License-Identifier: `MIT`
+- Copyright: Copyright (c) 2022 Bjørn Erik Pedersen
+- Source files: `metadecoder_iptc_fields.json` (dataset list and repeatable flags); `imagedecoder_png.go`
+  (`decodePNG` "Raw profile type iptc" branch, `decompressZTXt`)
+- Destination files: `iptc/dataset_table.go` (cross-check only), `iptc/dataset_table_test.go` (reference list of 116 datasets);
+  `format/png/rawprofile.go`
+- Adapted: yes for the test reference list and for the raw profile chunk decoding (keyword match, header skip, hex
+  decode), which was extended to tEXt and iTXt chunks, the "exif", "APP1" and "xmp" keywords, and declared-length
+  validation; the reference only reads, so the rewrite of the IPTC profile and the removal of a profile that a standard
+  chunk replaces are original;
+  no for the production dataset table
+- Notes: the production table is transcribed from the IPTC-NAA Information Interchange
+  Model 4.2. The upstream JSON file is itself generated from ExifTool documentation, so no
+  name or note text from it is copied.
+
+## Adobe XMP Toolkit SDK
+
+- URL: https://github.com/adobe/XMP-Toolkit-SDK
+- Source commit: `7093513bd3caaad29da01db0f275d88a39d6bcc2`
+- Licence: BSD-3-Clause (see `LICENSES/BSD-3-Clause.txt`), SPDX-License-Identifier: `BSD-3-Clause`
+- Copyright: Copyright (c) 2020, Adobe (repository `LICENSE`); Copyright 2002-2009 Adobe (source file headers)
+- Source files: `public/include/XMP_Const.h` (`kXMP_NS_*`), `XMPCore/source/XMPMeta.cpp` (`XMPMeta::Initialize`, `RegisterStandardAliases`);
+  `XMPCore/source/ParseRDF.cpp` (`RDF_Parser`: `GetRDFTermKind`, `AddChildNode`, `AddQualifierNode`, `FixupQualifiedNode`,
+  `NodeElement`, `NodeElementAttrs`, `PropertyElement`, `ResourcePropertyElement`, `LiteralPropertyElement`,
+  `ParseTypeResourcePropertyElement`, `EmptyPropertyElement`), `XMPCore/source/XMPCore_Impl.hpp` (`XMP_Node`),
+  `XMPCore/source/XMPMeta-Serialize.cpp` (`SerializeCanonicalRDFProperty`), `XMPCore/source/ExpatAdapter.cpp` (`SetQualName`),
+  `XMPCore/source/XMPMeta-Parse.cpp` (`DetermineInputEncoding`, `MoveExplicitAliases`, `TransplantNamedAlias`,
+  `TransplantArrayItemAlias`), `XMPCore/source/XMPMeta-GetSet.cpp` (`XMPMeta::SetLocalizedText`, `ChooseLocalizedText`,
+  `AppendLangItem`), `source/XML_Node.cpp` (`XML_Node::IsWhitespaceNode`);
+  `XMPFiles/source/FormatSupport/PSIR_MemoryReader.cpp` (`PSIR_MemoryReader::ParseMemoryResources`),
+  `XMPFiles/source/FormatSupport/PSIR_FileWriter.cpp` (`PSIR_FileWriter::ParseMemoryResources`, duplicate-resource
+  policy), `XMPFiles/source/FormatSupport/ReconcileIPTC.cpp` (`ComputeIPTCDigest`, `SetIPTCDigest`),
+  `XMPFiles/source/FileHandlers/TIFF_Handler.cpp` (`TIFF_MetaHandler::ProcessXMP`);
+  `XMPFiles/source/FileHandlers/JPEG_Handler.cpp` (`JPEG_MetaHandler::ProcessXMP`), `XMPCore/source/XMPUtils.cpp`
+  (`XMPUtils::MergeFromJPEG`, `XMPUtils::PackageForJPEG`, `EstimateSizeForJPEG`, `CreateEstimatedSizeMap`,
+  `MoveLargestProperty`);
+  `XMPFiles/source/FormatSupport/ReconcileTIFF.cpp` (`TIFF_MappingToXMP`, `kExport_*`, `sPrimaryIFDMappings`,
+  `sExifIFDMappings`, `sGPSInfoIFDMappings`, `ImportSingleTIFF_*`, `PhotoDataUtils::Import3WayItems`),
+  `XMPFiles/source/FormatSupport/IPTC_Support.hpp` (`DataSetCharacteristics`, `kIPTC_Map*`),
+  `XMPFiles/source/FormatSupport/IPTC_Support.cpp` (`kKnownDataSets`),
+  `XMPFiles/source/FormatSupport/ReconcileIPTC.cpp` (`PhotoDataUtils::Import2WayIPTC`,
+  `PhotoDataUtils::ImportIPTC_Date`, `ExportIPTC_Date`)
+- Destination files: `xmp/namespace_toolkit.go`, `xmp/namespace_toolkit_test.go`; `xmp/parserdf.go`, `xmp/tree.go`,
+  `xmp/serialize.go`, `xmp/xmlscan.go`, `xmp/alias.go`, `xmp/encoding.go`, `xmp/xmp.go`; `internal/irb/irb.go`, `internal/tiffscan/tiffscan.go`; `xmp/extended.go`,
+  `format/jpeg/extxmp.go`, `format/jpeg/jpeg.go`, `xmp/jpegpackage.go`; `internal/reconcile/tables.go`, `internal/reconcile/reconcile.go`,
+  `internal/reconcile/policy.go`, `reconcile.go`
+- Adapted: yes (namespace URIs, prefixes and alias definitions, transcribed to Go tables; the Photoshop image resource
+  walk, the MD5 IPTC digest computation and check, and the TIFF IPTC source precedence of tag 0x83BB over tag 0x8649,
+  re-implemented in Go; the duplicate-resource policy — first resource of an ID wins, a later non-empty one replaces
+  an empty first one, one resource per ID on write — applied to every reader and to the splice of `internal/irb`;
+  the XMP data model tree and its RDF parser and serialiser — the recursive descent over the RDF/XML grammar with every
+  property element form, the duplicate and placement checks, the qualifier ordering, the rdf:value fix-up, and the
+  verbose (rdf:parseType="Resource") form of each node — re-implemented in Go over an index-linked node list; the
+  compatibility mapping of an unqualified about/ID attribute of rdf:Description; the recomposition of the standard and
+  extended XMP of a JPEG file into one tree without xmpNote:HasExtendedXMP, and the extended XMP GUID computed as the
+  uppercase hexadecimal MD5 digest of the extended serialisation written without a packet wrapper; the partition of
+  the XMP of a JPEG file into a standard packet of at most 65000 bytes and an extended serialisation, moving
+  xmp:Thumbnails, the Camera Raw namespace, photoshop:History and then the top-level properties by estimated size,
+  largest first, and the removal of xmpNote:HasExtendedXMP when no extended chunk matches; the TIFF-to-XMP
+  mapping tables of the primary, Exif and GPS directories with their export modes, and the IIM DataSet table with its
+  mapping forms and length limits, transcribed row by row into Go tables; the XMP text of a SHORT, LONG, RATIONAL,
+  SRATIONAL and ASCII tag; the read order of the three-way fields (EXIF, then XMP, then IIM, per MWG v2.0 §4.2.3) and of
+  the two-way IIM fields (XMP, then IIM), with the IIM value preferred over all others when the IPTC digest does not
+  match and the IIM differs from the value predicted from the XMP; the tolerant parse and the export form of the IIM date and time; the
+  detection of the encoding of a packet without a byte-order mark, the folding of the registered aliases into their base
+  properties after parsing, and the update of the x-default item of a language alternative that keeps the other
+  languages — each re-implemented in Go over the flat Properties view or the node list)
+- Notes: the source files carry the header "Adobe permits you to use, modify, and distribute
+  this file in accordance with the terms of the Adobe license agreement accompanying it",
+  while the repository root `LICENSE` is the BSD 3-Clause licence. The accompanying licence
+  is the root BSD 3-Clause licence, which is the one recorded here. For the namespace
+  tables only facts (URIs, prefixes, alias pairs) are transcribed. The image resource
+  and IPTC digest logic is re-implemented from the Toolkit's algorithm, with these
+  changes: bounds checks in uint64, resources returned as sub-slices instead of copies,
+  a digest created or rewritten only when the caller also writes XMP, where the Toolkit
+  also writes it for an IIM-only write
+  (see the header of `internal/irb/irb.go`). The RDF parser and
+  serialiser differ from the Toolkit in these points: recoverable errors are skipped
+  silently instead of being reported; the element tree is built by an original
+  allocation-free scanner instead of Expat; rdf:parseType="Literal" without markup and
+  non-RDF attributes on a text element are read (as text and as qualifiers) instead of
+  rejected; rdf:nodeID references and their blank-node descriptions are kept verbatim
+  instead of being ignored; and alternative-text arrays are written in document order
+  instead of moving x-default first (see the headers of `xmp/parserdf.go` and
+  `xmp/serialize.go`). The extended XMP of a JPEG file differs from the Toolkit in these points: the two
+  portions are parsed into one tree, the extended serialisation first, so that a property present in both takes the
+  extended value as `XMPUtils::MergeFromJPEG` gives it, but the extended properties precede the standard ones in their
+  schema; the writer partitions the XMP as `PackageForJPEG` does, except that xmp:Thumbnails moves to the extended
+  portion instead of being deleted, the compact form omits formatting white space but does not use attribute shorthand,
+  the HasExtendedXMP dummy is added before the first measurement, and a property that refers to a blank node block stays
+  in the standard packet; the unparseable packet is stored whole as extended XMP, behind a standard packet that carries
+  only xmpNote:HasExtendedXMP (see the headers of `xmp/extended.go`, `xmp/jpegpackage.go`, `format/jpeg/extxmp.go` and
+  `format/jpeg/jpeg.go`). The reconciliation
+  differs from the Toolkit in these points: the import policy is applied when a convenience getter reads a value instead
+  of being merged into the XMP; an XMP copy of an EXIF camera setting is refreshed only when it already exists, instead
+  of the tiff: and exif: namespaces being rewritten from the native tags; the predicted IIM value is the value the iptc
+  package writes (no CR/LF conversion); and out-of-range IIM date fields are rejected instead of clamped (see the
+  headers of `internal/reconcile/policy.go` and `reconcile.go`). The encoding detection differs from
+  `DetermineInputEncoding` in that a first byte of 0x80 or more other than a byte-order mark is UTF-8, not UTF-16LE or
+  UTF-32LE (XML 1.0 Appendix F.1). The alias folding differs from `MoveExplicitAliases` in that an alias that the Toolkit
+  would report as a fatal error or would transplant into an invalid tree is left as written (an alias to an array item
+  that is not a simple value, an alias with an xml:lang other than x-default, an alias whose base is a struct), and in that
+  a language alternative that is an alias of dc:description (tiff:ImageDescription as written by Exiv2) is merged into the
+  base alternative language by language instead of being rejected (see the header of `xmp/alias.go`). The XML scanner
+  differs from Expat in that it reports the first well-formedness violation that it detects (a mismatched or stray end
+  tag, a malformed start tag, an unclosed element) but does not validate names, attribute values or character data
+  (see the header of `xmp/xmlscan.go`).
+
+## libavif
+
+- URL: https://github.com/AOMediaCodec/libavif
+- Source commit: `ab37e2946dfb6d2cc52886f39cb0fbf701db98e1`
+- Licence: BSD-2-Clause (see `LICENSES/BSD-2-Clause.txt`), SPDX-License-Identifier: `BSD-2-Clause`
+- Copyright: Copyright 2019 Joe Drago. All rights reserved.
+- Source files: `src/read.c` (`avifParseItemLocationBox`, `avifDecoderItemRead`, `avifParseItemInfoBox`, `avifParse`); `src/write.c`
+  (`avifEncoderDataCreateExifItem`, `avifEncoderDataCreateXMPItem`, `avifEncoderFinish`,
+  `avifEncoderWriteTrackMetaBox`); `src/stream.c` (`avifROStreamReadBoxHeaderPartial`, consulted for the 64-bit
+  largesize box header; `avifRWStreamFinishBox`)
+- Destination files: `format/heif/heif.go`, `format/heif/iloc.go`, `format/heif/inject.go`, `internal/bmff/openended.go`
+- Adapted: yes (the content of an `infe` box starts after its real header length, 8 or 16 bytes, as
+  `avifParseItemInfoBox` reads it through the box header; the metadata container is the file-level `meta` box, as
+  `avifParse` takes it, with a fallback to a `meta` box that is a direct child of `moov`; the item location box field order, including the 16-bit `data_reference_index` of every version, the
+  field-width validation, the concatenation of an item's extents and the idat construction method, re-implemented as
+  allocation-free Go; the layout of a new Exif or XMP item — infe version 2, item name, XMP content type, iref `cdsc`
+  reference to the primary item, iloc entry with construction method 0 — re-implemented to edit an existing file; the
+  4-byte `offset_size` and `length_size` of the written iloc box, applied by widening the zero field widths of an
+  existing iloc box; the `entry_count` of an `iinf` box is 16 bits for version 0 and 32 bits otherwise, as
+  `avifParseItemInfoBox` reads it; the size of a box is written back once its payload is complete, as
+  `avifRWStreamFinishBox` does, here to give an open-ended box an explicit size before boxes are appended; the `entry_count` of an `iinf` box is 16 bits for version 0 and 32 bits otherwise, as
+  `avifParseItemInfoBox` reads it; the size of a box is written back once its payload is complete, as
+  `avifRWStreamFinishBox` does, here to give an open-ended box an explicit size before boxes are appended)
+- Notes: the changes made are stated in the header of each destination file.
+
+## libwebp
+
+- URL: https://chromium.googlesource.com/webm/libwebp
+- Source commit: `0c7ffd17e9b89eb6ec4219a976886867880b0f25`
+- Licence: BSD-3-Clause (see `LICENSES/BSD-3-Clause.txt`), SPDX-License-Identifier: `BSD-3-Clause`
+- Copyright: Copyright (c) 2010, Google Inc. All rights reserved. (repository `COPYING`); Copyright 2010, 2011 and 2012
+  Google Inc. (source file headers)
+- Source files: `src/dec/vp8_dec.c` (`VP8GetInfo`), `src/dec/vp8l_dec.c` (`VP8LGetInfo`, `ReadImageInfo`),
+  `src/mux/muxedit.c` (`CreateVP8XChunk`)
+- Destination files: `format/webp/vp8x.go`
+- Adapted: yes (the VP8 key frame and VP8L header checks that yield the image width, height and alpha hint, and the
+  VP8X feature flags and 24-bit canvas fields of a still image, re-implemented in Go)
+- Notes: libwebp also ships an additional patent grant (`PATENTS`); no codec code is copied. The changes made are
+  stated in the header of the destination file.
+
+## evanoberholster/imagemeta
+
+- URL: https://github.com/evanoberholster/imagemeta
+- Source commit: `96e0dc74b3f3cea41c97a6029fb439f7f2f159c5`
+- Licence: MIT (see `LICENSES/MIT.txt`), SPDX-License-Identifier: `MIT`
+- Copyright: Copyright (c) 2019-2023 Evan Oberholster
+- Source files: `meta/isobmff/crx.go` (`cr3MetaBoxUUID`, `cr3XPacketUUID`, `readUUIDBox`, `readCrxMoovBox`,
+  `readCMTBox`)
+- Destination files: `format/raw/cr3/cr3.go`
+- Adapted: yes (the UUID of the CR3 XMP packet box, and the mapping of the Canon uuid sub-boxes CMT1, CMT2, CMT3 and
+  CMT4 to IFD0, the Exif IFD, the MakerNote IFD and the GPS IFD, applied to the in-memory reader and to the writer;
+  CMT2 parsed and written as a stand-alone TIFF stream whose first IFD is the Exif IFD)
+- Notes: the changes made are stated in the header of the destination file.
+
+## Apache Commons Imaging
+
+- URL: https://github.com/apache/commons-imaging
+- Source commit: `439b7722a5a2b52adb5c3ff0754705873648defb`
+- Licence: Apache-2.0 (see `LICENSES/Apache-2.0.txt`), SPDX-License-Identifier: `Apache-2.0`
+- Copyright: Copyright 2007-2026 The Apache Software Foundation (NOTICE.txt)
+- Source files: `src/main/java/org/apache/commons/imaging/formats/tiff/write/TiffOutputDirectory.java` (`getOutputItems`,
+  lines 757-794); `src/main/java/org/apache/commons/imaging/formats/tiff/write/TiffOutputSummary.java` (`updateOffsets`,
+  lines 63-72)
+- Destination files: `exif/thumbnail_strips.go`
+- Adapted: no (design consulted for task #368: the strips of an image directory are written as output items after it and
+  StripOffsets is rewritten as a LONG array of their final positions; the code of this repository is original)
+- Notes: the project has a `NOTICE.txt` file; its requirements do not apply to a
+  design that is not copied.

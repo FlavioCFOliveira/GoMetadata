@@ -3,6 +3,7 @@ package heif
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"math"
 	"testing"
@@ -37,13 +38,19 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 	// --- Build infe boxes ---
 	// infe v2: version(1)+flags(3)+item_id(2)+item_protection_index(2)+item_type(4)+item_name(1, "")
 	makeInfe := func(id uint16, itemType string) []byte {
-		body := make([]byte, 4+2+2+4+1)
+		// ISO 23008-12 Annex A.3: the XMP item is the 'mime' item whose
+		// content_type is "application/rdf+xml" (NUL-terminated).
+		contentType := ""
+		if itemType == "mime" {
+			contentType = "application/rdf+xml\x00"
+		}
+		body := make([]byte, 4+2+2+4+1+len(contentType))
 		body[0] = 2 // version 2
 		binary.BigEndian.PutUint16(body[4:], id)
 		// item_protection_index = 0
 		copy(body[8:], itemType)
-		// item_name = "" (single NUL)
-		body[12] = 0
+		// item_name = "" (single NUL) at body[12], then the content type.
+		copy(body[13:], contentType)
 		size := uint32(8 + len(body)) //nolint:gosec // G115: test helper, intentional type cast
 		hdr := make([]byte, 0, 8+len(body))
 		hdr = append(hdr, 0, 0, 0, 0, 'i', 'n', 'f', 'e')
@@ -70,10 +77,11 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 
 	// --- Build iloc box ---
 	// iloc: version(1)+flags(3)+offset_size(4bit)+length_size(4bit)+
-	//       base_offset_size(4bit)+reserved(4bit)+item_count(2)+items
+	//       base_offset_size(4bit)+reserved(4bit)+item_count(2)+items, each
+	//       item_ID(2)+data_reference_index(2)+extent_count(2)+extents
 	// We use offset_size=4, length_size=4.
 	makeIloc := func(items []ilocTestItem) []byte {
-		ilocBody := make([]byte, 0, 6+2+len(items)*(2+2+4+4)) // version+flags+sizes+item_count + items
+		ilocBody := make([]byte, 0, 6+2+len(items)*(2+2+2+4+4)) // version+flags+sizes+item_count + items
 		ilocBody = append(ilocBody,
 			0x00, 0x00, 0x00, 0x00, // version + flags
 			0x44, // offset_size=4, length_size=4
@@ -86,6 +94,7 @@ func buildHEIF(exifData, xmpData []byte) []byte {
 			id := make([]byte, 2)
 			binary.BigEndian.PutUint16(id, item.id)
 			ilocBody = append(ilocBody, id...)
+			ilocBody = append(ilocBody, 0x00, 0x00) // data_reference_index = 0 (this file), ISO 14496-12 §8.11.3.2
 			ec := make([]byte, 2)
 			binary.BigEndian.PutUint16(ec, 1) // 1 extent
 			ilocBody = append(ilocBody, ec...)
@@ -501,38 +510,6 @@ func TestParseInfeV0V1(t *testing.T) {
 	})
 }
 
-// TestExtractItemSlice exercises extractItemSlice (0% coverage).
-func TestExtractItemSlice(t *testing.T) {
-	t.Parallel()
-	data := []byte{0, 1, 2, 3, 4, 5, 6, 7}
-
-	t.Run("valid slice", func(t *testing.T) {
-		t.Parallel()
-		loc := itemLoc{offset: 2, length: 3}
-		got := extractItemSlice(data, loc)
-		want := data[2:5]
-		if !bytes.Equal(got, want) {
-			t.Errorf("extractItemSlice = %v, want %v", got, want)
-		}
-	})
-	t.Run("out of bounds", func(t *testing.T) {
-		t.Parallel()
-		loc := itemLoc{offset: 6, length: 10} // 6+10=16 > 8
-		got := extractItemSlice(data, loc)
-		if got != nil {
-			t.Errorf("extractItemSlice OOB = %v, want nil", got)
-		}
-	})
-	t.Run("zero length", func(t *testing.T) {
-		t.Parallel()
-		loc := itemLoc{offset: 3, length: 0}
-		got := extractItemSlice(data, loc)
-		if !bytes.Equal(got, data[3:3]) {
-			t.Errorf("extractItemSlice zero len = %v, want empty", got)
-		}
-	})
-}
-
 // TestPatchAncestorSize exercises patchAncestorSize (0% coverage).
 func TestPatchAncestorSize(t *testing.T) {
 	t.Parallel()
@@ -548,7 +525,7 @@ func TestPatchAncestorSize(t *testing.T) {
 
 		// metaAbsStart=8 is inside the outer box (0..40), so the outer box size
 		// should be patched.
-		patchAncestorSize(data, 8, 4) // delta = +4
+		_ = patchAncestorSize(data, 8, 4) // delta = +4
 		newSize := binary.BigEndian.Uint32(data[0:])
 		if newSize != 44 {
 			t.Errorf("patched outer box size = %d, want 44", newSize)
@@ -560,7 +537,7 @@ func TestPatchAncestorSize(t *testing.T) {
 		binary.BigEndian.PutUint32(data[0:], 1) // sentinel: extended size
 		copy(data[4:8], "moov")
 		binary.BigEndian.PutUint64(data[8:], 24) // 64-bit size
-		patchAncestorSize(data, 8, 4)            // should not modify anything
+		_ = patchAncestorSize(data, 8, 4)        // should not modify anything
 		// The first 4 bytes should still be 1 (unchanged).
 		if binary.BigEndian.Uint32(data[0:]) != 1 {
 			t.Error("extended-size box was unexpectedly patched")
@@ -572,7 +549,7 @@ func TestPatchAncestorSize(t *testing.T) {
 		binary.BigEndian.PutUint32(data[0:], 16)
 		copy(data[4:8], "ftyp")
 		// metaAbsStart=20 is beyond the end of this box (0..16), so no patch.
-		patchAncestorSize(data, 20, 4)
+		_ = patchAncestorSize(data, 20, 4)
 		if binary.BigEndian.Uint32(data[0:]) != 16 {
 			t.Errorf("size was unexpectedly patched")
 		}
@@ -584,7 +561,7 @@ func TestPatchAncestorSize(t *testing.T) {
 		copy(data[4:8], "mdat")
 		// This should try to patch because offset 0 to len(data)=16 contains
 		// metaAbsStart=8.
-		patchAncestorSize(data, 8, 4)
+		_ = patchAncestorSize(data, 8, 4)
 		// size==0 path sets size=uint64(len(data)-pos)=16, boxEnd=16 > 8, so it patches.
 		if binary.BigEndian.Uint32(data[0:]) == 0 {
 			t.Logf("note: zero-size box may not be patched (expected behavior)")
@@ -747,10 +724,12 @@ func TestParseInfeV2V3(t *testing.T) {
 
 	t.Run("version 3 valid", func(t *testing.T) {
 		t.Parallel()
-		data := make([]byte, 10)
+		const ct = "\x00application/rdf+xml\x00" // item_name "", content_type
+		data := make([]byte, 10+len(ct))
 		binary.BigEndian.PutUint32(data[0:], 5) // uint32 ID = 5
 		// protection index = 0 at [4:6]
 		copy(data[6:], "mime")
+		copy(data[10:], ct)
 		id, typ, ok := parseInfeV2V3(data, 0, 3)
 		if id != 5 {
 			t.Errorf("id = %d, want 5", id)
@@ -853,17 +832,17 @@ func TestParsePitm(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// parseIinfItemCount
+// parseIinfEntryCount
 // ---------------------------------------------------------------------------
 
-// TestParseIinfItemCount tests version < 2 (uint16) and version 2 (uint32) paths.
+// TestParseIinfItemCount tests the version 0 (uint16) and version 2 (uint32) paths.
 func TestParseIinfItemCount(t *testing.T) {
 	t.Parallel()
 
 	t.Run("version 0 uint16", func(t *testing.T) {
 		t.Parallel()
 		data := []byte{0x00, 0x05}
-		count, newPos, ok := parseIinfItemCount(data, 0, 0)
+		count, newPos, ok := parseIinfEntryCount(data, 0, 0)
 		if !ok || count != 5 || newPos != 2 {
 			t.Errorf("v0: count=%d newPos=%d ok=%v, want 5 2 true", count, newPos, ok)
 		}
@@ -873,7 +852,7 @@ func TestParseIinfItemCount(t *testing.T) {
 		t.Parallel()
 		data := make([]byte, 4)
 		binary.BigEndian.PutUint32(data, 12)
-		count, newPos, ok := parseIinfItemCount(data, 0, 2)
+		count, newPos, ok := parseIinfEntryCount(data, 0, 2)
 		if !ok || count != 12 || newPos != 4 {
 			t.Errorf("v2: count=%d newPos=%d ok=%v, want 12 4 true", count, newPos, ok)
 		}
@@ -881,7 +860,7 @@ func TestParseIinfItemCount(t *testing.T) {
 
 	t.Run("version 2 too short", func(t *testing.T) {
 		t.Parallel()
-		_, _, ok := parseIinfItemCount([]byte{0x00}, 0, 2)
+		_, _, ok := parseIinfEntryCount([]byte{0x00}, 0, 2)
 		if ok {
 			t.Error("expected ok=false for too-short v2")
 		}
@@ -1214,11 +1193,13 @@ func buildHEIFV1Iloc(xmpPayload []byte) []byte {
 
 	// --- infe v2 for XMP item ---
 	// infe v2: version(1)+flags(3)+item_id(2)+item_protection_index(2)+item_type(4)+item_name(NUL)
-	infeBody := make([]byte, 4+2+2+4+1)
+	const contentType = "application/rdf+xml\x00" // content_type of the XMP item
+	infeBody := make([]byte, 4+2+2+4+1+len(contentType))
 	infeBody[0] = 2 // version 2
 	binary.BigEndian.PutUint16(infeBody[4:], xmpItemID)
 	copy(infeBody[8:], "mime")
-	infeBody[12] = 0 // NUL-terminated item name
+	// infeBody[12] = 0: NUL-terminated (empty) item name.
+	copy(infeBody[13:], contentType)
 	infeHdr := make([]byte, 0, 8+len(infeBody))
 	infeHdr = append(infeHdr, 0, 0, 0, 0, 'i', 'n', 'f', 'e')
 	binary.BigEndian.PutUint32(infeHdr, uint32(8+len(infeBody))) //nolint:gosec // G115: test helper, bounded size
@@ -1242,6 +1223,7 @@ func buildHEIFV1Iloc(xmpPayload []byte) []byte {
 	//   for each item:
 	//     item_ID(2)
 	//     construction_method(2)   [v1/v2 only]
+	//     data_reference_index(2)
 	//     base_offset (0 bytes, base_offset_size=0)
 	//     extent_count(2) = 1
 	//     extent_offset(4)
@@ -1252,8 +1234,9 @@ func buildHEIFV1Iloc(xmpPayload []byte) []byte {
 	// the final meta box size.
 	makeIlocV1 := func(extentOffset uint32) []byte {
 		// Fixed body: version+flags(4)+sizes(2)+item_count(2)+item_ID(2)+
-		//             construction_method(2)+extent_count(2)+offset(4)+length(4) = 22 bytes.
-		body := make([]byte, 0, 22)
+		//             construction_method(2)+data_reference_index(2)+
+		//             extent_count(2)+offset(4)+length(4) = 24 bytes.
+		body := make([]byte, 0, 24)
 		body = append(body,
 			0x01, 0x00, 0x00, 0x00, // version=1, flags=0
 			0x44,       // offset_size=4, length_size=4
@@ -1261,6 +1244,7 @@ func buildHEIFV1Iloc(xmpPayload []byte) []byte {
 			0x00, 0x01, // item_count = 1
 			0x00, byte(xmpItemID), // item_ID = 1 //nolint:gosec // G115: constant 1
 			0x00, 0x01, // construction_method = 1 (idat-relative)
+			0x00, 0x00, // data_reference_index = 0 (this file)
 			// base_offset: omitted (base_offset_size=0)
 			0x00, 0x01, // extent_count = 1
 		)
@@ -1339,7 +1323,7 @@ func TestInjectNormalizesConstructionMethod(t *testing.T) {
 	// Verify that the input really does encode construction_method=1.
 	// findBox returns meta box content with version+flags stripped (per its contract).
 	{
-		metaContent, err := findBox(input, boxTypeMeta, 0)
+		metaContent, err := findMetaContent(input)
 		if err != nil || len(metaContent) == 0 {
 			t.Fatalf("setup: meta box not found in synthetic input (err=%v)", err)
 		}
@@ -1362,7 +1346,7 @@ func TestInjectNormalizesConstructionMethod(t *testing.T) {
 	// Parse the output iloc and assert:
 	// 1. construction_method of the XMP item is 0 (file offset).
 	// 2. The extent_offset points at the appended XMP payload.
-	outMetaContent, err := findBox(output, boxTypeMeta, 0)
+	outMetaContent, err := findMetaContent(output)
 	if err != nil || len(outMetaContent) == 0 {
 		t.Fatalf("output: meta box not found (err=%v)", err)
 	}
@@ -1435,7 +1419,7 @@ func buildHEIFTwoExtentEXIF(exifPart1, exifPart2 []byte) []byte {
 	// iloc v0, offset_size=4, length_size=4, base_offset_size=0, item_count=1,
 	// with the single item carrying extent_count=2.
 	makeIloc := func(off1, len1, off2, len2 uint32) []byte {
-		body := make([]byte, 0, 6+2+2+2+4+4+4+4)
+		body := make([]byte, 0, 6+2+2+2+2+4+4+4+4)
 		body = append(body,
 			0x00, 0x00, 0x00, 0x00, // version=0, flags=0
 			0x44, // offset_size=4, length_size=4
@@ -1443,6 +1427,7 @@ func buildHEIFTwoExtentEXIF(exifPart1, exifPart2 []byte) []byte {
 		)
 		body = binary.BigEndian.AppendUint16(body, 1) // item_count = 1
 		body = binary.BigEndian.AppendUint16(body, exifItemID)
+		body = binary.BigEndian.AppendUint16(body, 0) // data_reference_index = 0 (this file)
 		body = binary.BigEndian.AppendUint16(body, 2) // extent_count = 2
 		body = binary.BigEndian.AppendUint32(body, off1)
 		body = binary.BigEndian.AppendUint32(body, len1)
@@ -1507,7 +1492,7 @@ func TestInjectMultiExtentItemCollapsesToOne(t *testing.T) {
 	data := buildHEIFTwoExtentEXIF(part1, part2)
 
 	// Sanity: the input really does carry 2 extents for the Exif item.
-	metaContent, err := findBox(data, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(data)
 	if err != nil || metaContent == nil {
 		t.Fatalf("setup: meta box not found (err=%v)", err)
 	}
@@ -1523,7 +1508,7 @@ func TestInjectMultiExtentItemCollapsesToOne(t *testing.T) {
 	}
 	output := out.Bytes()
 
-	outMetaContent, err := findBox(output, boxTypeMeta, 0)
+	outMetaContent, err := findMetaContent(output)
 	if err != nil || outMetaContent == nil {
 		t.Fatalf("output: meta box not found (err=%v)", err)
 	}
@@ -1599,7 +1584,7 @@ func buildHEIFDuplicateIloc() []byte {
 	// iloc v0, offset_size=4, length_size=4, base_offset_size=0, one item,
 	// one extent — a plain, well-formed iloc box, instantiated TWICE below.
 	makeIloc := func(off, ln uint32) []byte {
-		body := make([]byte, 0, 6+2+2+2+4+4)
+		body := make([]byte, 0, 6+2+2+2+2+4+4)
 		body = append(body,
 			0x00, 0x00, 0x00, 0x00, // version=0, flags=0
 			0x44, // offset_size=4, length_size=4
@@ -1607,6 +1592,7 @@ func buildHEIFDuplicateIloc() []byte {
 		)
 		body = binary.BigEndian.AppendUint16(body, 1) // item_count = 1
 		body = binary.BigEndian.AppendUint16(body, exifItemID)
+		body = binary.BigEndian.AppendUint16(body, 0) // data_reference_index = 0 (this file)
 		body = binary.BigEndian.AppendUint16(body, 1) // extent_count = 1
 		body = binary.BigEndian.AppendUint32(body, off)
 		body = binary.BigEndian.AppendUint32(body, ln)
@@ -1673,7 +1659,7 @@ func TestInjectDuplicateIlocBoxesOffsetInBounds(t *testing.T) {
 	}
 	output := out.Bytes()
 
-	metaContent, err := findBox(output, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(output)
 	if err != nil || metaContent == nil {
 		t.Fatalf("output: meta box not found (err=%v)", err)
 	}
@@ -1743,7 +1729,7 @@ func buildHEIFMetaTrailingGarbage() []byte {
 	iinfBox := append(iinfHdr, iinfBody...)
 
 	makeIloc := func(off, ln uint32) []byte {
-		body := make([]byte, 0, 6+2+2+2+4+4)
+		body := make([]byte, 0, 6+2+2+2+2+4+4)
 		body = append(body,
 			0x00, 0x00, 0x00, 0x00, // version=0, flags=0
 			0x44, // offset_size=4, length_size=4
@@ -1751,6 +1737,7 @@ func buildHEIFMetaTrailingGarbage() []byte {
 		)
 		body = binary.BigEndian.AppendUint16(body, 1) // item_count = 1
 		body = binary.BigEndian.AppendUint16(body, exifItemID)
+		body = binary.BigEndian.AppendUint16(body, 0) // data_reference_index = 0 (this file)
 		body = binary.BigEndian.AppendUint16(body, 1) // extent_count = 1
 		body = binary.BigEndian.AppendUint32(body, off)
 		body = binary.BigEndian.AppendUint32(body, ln)
@@ -1812,7 +1799,7 @@ func TestInjectMetaWithTrailingUnparseableBytesOffsetInBounds(t *testing.T) {
 	}
 	output := out.Bytes()
 
-	metaContent, err := findBox(output, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(output)
 	if err != nil || metaContent == nil {
 		t.Fatalf("output: meta box not found (err=%v)", err)
 	}
@@ -1919,13 +1906,13 @@ func TestHEIFSlowPathMemory(t *testing.T) {
 
 	// Verify the file is large enough that meta is beyond 64 KB.
 	const headerWindow = 65536
-	metaData, err := findBox(fileData, boxTypeMeta, 0)
+	metaData, err := findMetaContent(fileData)
 	if err != nil || metaData == nil {
 		t.Fatalf("setup: meta box not found in slow-path synthetic HEIF")
 	}
 	// Confirm the meta box starts after headerWindow by checking that a quick
 	// scan of the first headerWindow bytes does NOT find the meta box.
-	quickMeta, _ := findBox(fileData[:headerWindow], boxTypeMeta, 0)
+	quickMeta, _ := findMetaContent(fileData[:headerWindow])
 	if quickMeta != nil {
 		t.Fatalf("setup: meta box found within first %d bytes — slow path will not be triggered", headerWindow)
 	}
@@ -1977,10 +1964,12 @@ func buildIlocWithLargeExtentCount(xmpPayload []byte, extentCount uint16) []byte
 	const xmpItemID uint16 = 1
 
 	// infe v2 for the XMP item.
-	infeBody := make([]byte, 4+2+2+4+1)
+	const contentType = "application/rdf+xml\x00" // content_type of the XMP item
+	infeBody := make([]byte, 4+2+2+4+1+len(contentType))
 	infeBody[0] = 2
 	binary.BigEndian.PutUint16(infeBody[4:], xmpItemID)
 	copy(infeBody[8:], "mime")
+	copy(infeBody[13:], contentType)
 	infeHdr := make([]byte, 0, 8+len(infeBody))
 	infeHdr = append(infeHdr, 0, 0, 0, 0, 'i', 'n', 'f', 'e')
 	binary.BigEndian.PutUint32(infeHdr, uint32(8+len(infeBody))) //nolint:gosec // G115: test helper
@@ -2000,8 +1989,9 @@ func buildIlocWithLargeExtentCount(xmpPayload []byte, extentCount uint16) []byte
 	// bounds checks and stop reading after the first real extent.
 	makeIlocV1Large := func(xmpOffset uint32) []byte {
 		// version+flags(4) + sizes(2) + item_count(2) +
-		// item: id(2)+construct(2)+extent_count(2)+offset(4)+length(4) = 14 bytes per item
-		body := make([]byte, 0, 26)
+		// item: id(2)+construct(2)+data_reference_index(2)+extent_count(2)+
+		// offset(4)+length(4) = 16 bytes per item
+		body := make([]byte, 0, 28)
 		body = append(body,
 			0x01, 0x00, 0x00, 0x00, // version=1, flags=0
 			0x44,       // offset_size=4, length_size=4
@@ -2009,6 +1999,7 @@ func buildIlocWithLargeExtentCount(xmpPayload []byte, extentCount uint16) []byte
 			0x00, 0x01, // item_count = 1
 			0x00, byte(xmpItemID), // item_ID //nolint:gosec // G115: constant
 			0x00, 0x00, // construction_method = 0
+			0x00, 0x00, // data_reference_index = 0 (this file)
 		)
 		// extent_count = extentCount (the attacker-controlled large value).
 		ecBytes := [2]byte{}
@@ -2082,7 +2073,7 @@ func TestHEIFInjectLargeExtentCountBounded(t *testing.T) {
 		t.Parallel()
 		// Build a minimal ilocData with offsetSize=4, lengthSize=4, indexSize=0.
 		// Provide only one real extent (8 bytes) but declare extentCount=65535.
-		info := ilocBoxInfo{
+		h := ilocHeader{
 			version:    1,
 			offsetSize: 4,
 			lengthSize: 4,
@@ -2092,8 +2083,11 @@ func TestHEIFInjectLargeExtentCountBounded(t *testing.T) {
 			0x00, 0x00, 0x00, 0x10, // offset = 16
 			0x00, 0x00, 0x00, 0x08, // length = 8
 		}
-		extents, _ := readIlocFullExtents(ilocData, 0, largeExtentCount, info)
-		// The pre-allocated capacity must be capped.
+		extents, _, ok := readIlocFullExtents(ilocData, 0, largeExtentCount, &h)
+		// An extent_count above the cap is refused before any allocation.
+		if ok {
+			t.Error("readIlocFullExtents accepted extent_count 65535, want ok=false (task #335: surplus extents are refused, not silently dropped)")
+		}
 		if cap(extents) > maxIlocExtentsPerItem {
 			t.Errorf("readIlocFullExtents allocated cap=%d, want <= %d (maxIlocExtentsPerItem)",
 				cap(extents), maxIlocExtentsPerItem)
@@ -2106,10 +2100,16 @@ func TestHEIFInjectLargeExtentCountBounded(t *testing.T) {
 		data := buildIlocWithLargeExtentCount(xmpPayload, largeExtentCount)
 		newXMP := []byte(`<?xpacket begin="" id="x"?><x:xmpmeta><new/></x:xmpmeta><?xpacket end="r"?>`)
 		var out bytes.Buffer
-		// Must not panic, OOM, or hang.
-		_ = Inject(bytes.NewReader(data), &out, nil, nil, newXMP, true)
-		// We do not assert a specific return value — the crafted truncated iloc
-		// may cause graceful early-termination. The key invariant is: no crash.
+		// Must not panic, OOM, or hang, and — since an item with this many
+		// extents cannot be rewritten without dropping extents — must refuse
+		// the write with an explicit error (task #335).
+		err := Inject(bytes.NewReader(data), &out, nil, nil, newXMP, true)
+		if !errors.Is(err, ErrUnreadableItemLocations) {
+			t.Errorf("Inject error = %v, want ErrUnreadableItemLocations", err)
+		}
+		if out.Len() != 0 {
+			t.Errorf("Inject wrote %d bytes before refusing", out.Len())
+		}
 	})
 }
 
@@ -2142,7 +2142,7 @@ func buildIlocZeroFieldAmplification(itemCount int, extentCount uint16, ilocVers
 	iinfBody := []byte{0, 0, 0, 0, 0, 0} // version=0, flags=0, item_count=0
 	iinfBox := boxWithHeader("iinf", iinfBody)
 
-	ilocBody := make([]byte, 0, 8+itemCount*6)
+	ilocBody := make([]byte, 0, 8+itemCount*8)
 	// version + flags, then offset|length=0, base_offset|index=0.
 	ilocBody = append(ilocBody, ilocVersion, 0, 0, 0, 0x00, 0x00)
 
@@ -2163,6 +2163,7 @@ func buildIlocZeroFieldAmplification(itemCount int, extentCount uint16, ilocVers
 		if ilocVersion == 1 || ilocVersion == 2 {
 			ilocBody = append(ilocBody, 0x00, 0x00) // construction_method = 0
 		}
+		ilocBody = append(ilocBody, 0x00, 0x00) // data_reference_index = 0 (this file)
 		// base_offset: 0 bytes (base_offset_size = 0).
 		var ec [2]byte
 		binary.BigEndian.PutUint16(ec[:], extentCount)
@@ -2221,10 +2222,13 @@ func TestHEIFIlocZeroFieldSizeAmplificationBounded(t *testing.T) {
 	// --- White-box: readIlocFullExtents (Inject/write path) ---
 	t.Run("readIlocFullExtents zero field size is bounded", func(t *testing.T) {
 		t.Parallel()
-		info := ilocBoxInfo{version: 1} // offsetSize=lengthSize=indexSize=0 (zero value)
+		h := ilocHeader{version: 1} // offsetSize=lengthSize=indexSize=0 (zero value)
 		start := time.Now()
-		extents, pos := readIlocFullExtents(nil, 0, extentCount, info)
+		extents, pos, ok := readIlocFullExtents(nil, 0, extentCount, &h)
 		elapsed := time.Since(start)
+		if ok {
+			t.Error("readIlocFullExtents accepted extent_count 65535, want ok=false")
+		}
 		if len(extents) > maxIlocExtentsPerItem {
 			t.Errorf("readIlocFullExtents returned %d extents, want <= %d (maxIlocExtentsPerItem)",
 				len(extents), maxIlocExtentsPerItem)
@@ -2241,20 +2245,27 @@ func TestHEIFIlocZeroFieldSizeAmplificationBounded(t *testing.T) {
 		}
 	})
 
-	// --- White-box: readIlocSimpleExtents (Extract/read path) ---
-	t.Run("readIlocSimpleExtents zero field size is bounded", func(t *testing.T) {
+	// --- White-box: findIlocItem (Extract/read path) ---
+	// The read path skips the extent list of every non-matching item by
+	// arithmetic (extent_count × extent size), so a zero extent size costs
+	// O(1) per item regardless of extent_count (task #282).
+	t.Run("findIlocItem zero field size is bounded", func(t *testing.T) {
 		t.Parallel()
-		start := time.Now()
-		_, _, pos, ok := readIlocSimpleExtents(nil, 0, extentCount, 0, 0, 0, 0)
-		elapsed := time.Since(start)
+		const ftypAndMetaHeaderLen = 20 + 8 + 4
+		data := buildIlocZeroFieldAmplification(itemCount, extentCount, 0)
+		ilocData := findInnerBox(data[ftypAndMetaHeaderLen:], boxTypeIloc)
+		h, ok := parseIlocHeader(ilocData)
 		if !ok {
-			t.Fatal("readIlocSimpleExtents returned ok=false for a well-formed (zero-width) extent loop")
+			t.Fatal("parseIlocHeader rejected a well-formed zero-field-size iloc box")
 		}
-		if pos != 0 {
-			t.Errorf("readIlocSimpleExtents advanced pos to %d, want 0 (zero field size consumes no bytes)", pos)
+		start := time.Now()
+		_, _, found := findIlocItem(ilocData, &h, itemCount) // the last item
+		elapsed := time.Since(start)
+		if !found {
+			t.Fatal("findIlocItem did not find the last item")
 		}
 		if elapsed > time.Second {
-			t.Errorf("readIlocSimpleExtents took %v, want well under 1s (amplification not bounded)", elapsed)
+			t.Errorf("findIlocItem took %v, want well under 1s (amplification not bounded)", elapsed)
 		}
 	})
 
@@ -2285,7 +2296,9 @@ func TestHEIFIlocZeroFieldSizeAmplificationBounded(t *testing.T) {
 			t.Errorf("Inject took %v on a %d-byte crafted file, want well under 2s (amplification not bounded)",
 				elapsed, len(data))
 		}
-		_ = err // no specific error expected; absence of a hang/OOM is the invariant under test
+		if !errors.Is(err, ErrUnreadableItemLocations) {
+			t.Errorf("Inject error = %v, want ErrUnreadableItemLocations", err)
+		}
 	})
 
 	// --- White-box: parseIlocFull rejects an oversized item_count outright ---
@@ -2316,8 +2329,8 @@ func TestHEIFIlocZeroFieldSizeAmplificationBounded(t *testing.T) {
 		}
 	})
 
-	// --- White-box: parseIloc rejects an oversized item_count outright ---
-	t.Run("parseIloc rejects item_count above maxIlocItems", func(t *testing.T) {
+	// --- White-box: parseIlocHeader (read path) rejects an oversized item_count outright ---
+	t.Run("parseIlocHeader rejects item_count above maxIlocItems", func(t *testing.T) {
 		t.Parallel()
 		const ftypAndMetaHeaderLen = 20 + 8 + 4
 		data := buildIlocZeroFieldAmplification(4, 1, 0) // version 0 -> 2-byte item_count field
@@ -2330,8 +2343,8 @@ func TestHEIFIlocZeroFieldSizeAmplificationBounded(t *testing.T) {
 		// (65535) exceeds maxIlocItems (4096) while still fitting the 2-byte
 		// field width that version < 2 mandates.
 		binary.BigEndian.PutUint16(ilocData[6:], math.MaxUint16)
-		if result := parseIloc(metaContent); len(result) != 0 {
-			t.Errorf("parseIloc accepted item_count > maxIlocItems, want empty result, got %d items", len(result))
+		if _, ok := parseIlocHeader(ilocData); ok {
+			t.Error("parseIlocHeader accepted item_count > maxIlocItems, want ok=false")
 		}
 	})
 }
@@ -2364,7 +2377,7 @@ func TestHEIFInjectPatchAncestorSizeOverflow(t *testing.T) {
 		binary.BigEndian.PutUint32(data[8:], 16) // inner box size
 		copy(data[12:16], "meta")
 
-		patchAncestorSize(data, 8, 4) // delta = +4
+		_ = patchAncestorSize(data, 8, 4) // delta = +4
 		got := binary.BigEndian.Uint32(data[0:])
 		want := moovSize + 4 // 36
 		if got != want {
@@ -2382,7 +2395,7 @@ func TestHEIFInjectPatchAncestorSizeOverflow(t *testing.T) {
 		binary.BigEndian.PutUint32(data[8:], 16) // inner box
 		copy(data[12:16], "meta")
 
-		patchAncestorSize(data, 8, 1) // delta=+1 causes overflow
+		_ = patchAncestorSize(data, 8, 1) // delta=+1 causes overflow
 		got := binary.BigEndian.Uint32(data[0:])
 		// Must NOT be 0 (uint32(0x100000000) == 0 truncation), and must NOT be
 		// MaxUint32+1 (impossible). Acceptable: MaxUint32 (unchanged).
@@ -2409,7 +2422,7 @@ func TestHEIFInjectPatchAncestorSizeOverflow(t *testing.T) {
 		copy(data[20:], "meta")
 
 		// metaAbsStart=16 is inside the 64-bit moov box. delta=4.
-		patchAncestorSize(data, 16, 4)
+		_ = patchAncestorSize(data, 16, 4)
 		gotLargeSize := binary.BigEndian.Uint64(data[8:])
 		wantLargeSize := largeSize + 4
 		if gotLargeSize != wantLargeSize {

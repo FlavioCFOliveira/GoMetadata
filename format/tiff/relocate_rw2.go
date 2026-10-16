@@ -200,7 +200,7 @@ func relocateTIFFFromParsedRW2(base []byte, fileLen uint64, e *exif.EXIF, rawIPT
 
 	// ── Step 2: upsert metadata tags in IFD0 ─────────────────────────────────
 	if rawIPTC != nil {
-		upsertIFD0Entry(e.IFD0, exif.TagIPTC, exif.TypeLong, rawIPTC)
+		upsertIPTC(e.IFD0, rawIPTC, rawXMP)
 	}
 	if rawXMP != nil {
 		upsertIFD0Entry(e.IFD0, exif.TagXMP, exif.TypeByte, rawXMP)
@@ -239,7 +239,8 @@ func relocateTIFFFromParsedRW2(base []byte, fileLen uint64, e *exif.EXIF, rawIPT
 	}
 
 	// ── Step 4: enumerate SubIFDs ────────────────────────────────────────────
-	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget, fileLen)
+	subTree, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget, fileLen)
+	subIFDs := subTree.all
 	if subErr != nil {
 		return nil, nil, fmt.Errorf("rw2: enumerate SubIFDs: %w", subErr)
 	}
@@ -263,7 +264,7 @@ func relocateTIFFFromParsedRW2(base []byte, fileLen uint64, e *exif.EXIF, rawIPT
 	ifdEnd := uint64(ifdEndInt) //nolint:gosec // G115: EncodedSize never returns a negative length
 
 	// ── Step 7: assign new absolute offsets ──────────────────────────────────
-	subIFDsSize := computeSubIFDsSize(subIFDs)
+	subIFDsSize := computeSubIFDsSize(ifdEnd, subIFDs)
 	imageStart := ifdEnd + subIFDsSize
 	assignNewOffsets(allBlocks, imageStart)
 	assignSubIFDOffsets(subIFDs, ifdEnd)
@@ -313,8 +314,8 @@ func relocateTIFFFromParsedRW2(base []byte, fileLen uint64, e *exif.EXIF, rawIPT
 	}
 
 	// ── Step 10: patch the 0x014A SubIFDs pointer array ──────────────────────
-	if len(subIFDs) > 0 {
-		if pErr := patchSubIFDPointers(finalTIFF, subIFDs, false, order); pErr != nil {
+	if subTree.roots != nil {
+		if pErr := patchSubIFDPointers(finalTIFF, subTree, false, order); pErr != nil {
 			return nil, nil, fmt.Errorf("rw2: patch SubIFD pointers: %w", pErr)
 		}
 	}

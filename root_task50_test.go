@@ -1042,37 +1042,69 @@ func TestPrecedence_ExplicitPolicyComment(t *testing.T) {
 		t.Errorf("Make() = %q, want EXIF value ExifMake", got)
 	}
 
-	// --- Descriptive/rights data: XMP wins over IPTC over EXIF ---
-	if got := m.Caption(); got != "XMPCaption" {
-		t.Errorf("Caption() = %q, want XMP value XMPCaption", got)
+	// --- Descriptive/rights data (MWG v2.0 §4.2.3.3): EXIF wins over XMP
+	// over IPTC; Keywords has no EXIF form (MWG §5.1), so XMP wins over IPTC.
+	m.EXIF.SetCaption("ExifCaption")
+	if got := m.Caption(); got != "ExifCaption" {
+		t.Errorf("Caption() = %q, want EXIF value ExifCaption", got)
 	}
-	if got := m.Copyright(); got != "XMPCopyright" {
-		t.Errorf("Copyright() = %q, want XMP value XMPCopyright", got)
+	if got := m.Copyright(); got != "ExifCopyright" {
+		t.Errorf("Copyright() = %q, want EXIF value ExifCopyright", got)
 	}
-	if got := m.Creator(); got != "XMPCreator" {
-		t.Errorf("Creator() = %q, want XMP value XMPCreator", got)
+	if got := m.Creator(); got != "ExifCreator" {
+		t.Errorf("Creator() = %q, want EXIF value ExifCreator", got)
 	}
 	if kws := m.Keywords(); len(kws) != 1 || kws[0] != "xmp-kw" {
 		t.Errorf("Keywords() = %v, want XMP value [xmp-kw]", kws)
 	}
 
-	// With XMP emptied, IPTC must win.
-	m.XMP = &xmp.XMP{Properties: make(map[string]map[string]string)}
+	// A stale IPTC digest (MWG §4.2.3.2 scenario 4, §4.2.3.3): the edited
+	// IPTC values win over EXIF and XMP.
+	m.iptcTrustElev = true
 	if got := m.Caption(); got != "IPTCCaption" {
-		t.Errorf("Caption() (no XMP) = %q, want IPTC value IPTCCaption", got)
+		t.Errorf("Caption() (stale digest) = %q, want IPTC value IPTCCaption", got)
 	}
 	if got := m.Copyright(); got != "IPTCCopyright" {
-		t.Errorf("Copyright() (no XMP) = %q, want IPTC value IPTCCopyright", got)
+		t.Errorf("Copyright() (stale digest) = %q, want IPTC value IPTCCopyright", got)
 	}
 	if got := m.Creator(); got != "IPTCCreator" {
-		t.Errorf("Creator() (no XMP) = %q, want IPTC value IPTCCreator", got)
+		t.Errorf("Creator() (stale digest) = %q, want IPTC value IPTCCreator", got)
+	}
+	if kws := m.Keywords(); len(kws) != 1 || kws[0] != "iptc-kw" {
+		t.Errorf("Keywords() (stale digest) = %v, want IPTC value [iptc-kw]", kws)
+	}
+	m.iptcTrustElev = false
+
+	// Without EXIF, XMP must win over IPTC.
+	exifSaved := m.EXIF
+	m.EXIF = nil
+	if got := m.Caption(); got != "XMPCaption" {
+		t.Errorf("Caption() (no EXIF) = %q, want XMP value XMPCaption", got)
+	}
+	if got := m.Copyright(); got != "XMPCopyright" {
+		t.Errorf("Copyright() (no EXIF) = %q, want XMP value XMPCopyright", got)
+	}
+	if got := m.Creator(); got != "XMPCreator" {
+		t.Errorf("Creator() (no EXIF) = %q, want XMP value XMPCreator", got)
+	}
+
+	// Without EXIF and XMP, IPTC must win.
+	m.XMP = &xmp.XMP{Properties: make(map[string]map[string]string)}
+	if got := m.Caption(); got != "IPTCCaption" {
+		t.Errorf("Caption() (no EXIF, no XMP) = %q, want IPTC value IPTCCaption", got)
+	}
+	if got := m.Copyright(); got != "IPTCCopyright" {
+		t.Errorf("Copyright() (no EXIF, no XMP) = %q, want IPTC value IPTCCopyright", got)
+	}
+	if got := m.Creator(); got != "IPTCCreator" {
+		t.Errorf("Creator() (no EXIF, no XMP) = %q, want IPTC value IPTCCreator", got)
 	}
 	if kws := m.Keywords(); len(kws) != 1 || kws[0] != "iptc-kw" {
 		t.Errorf("Keywords() (no XMP) = %v, want IPTC value [iptc-kw]", kws)
 	}
 
-	// With both XMP and IPTC empty, EXIF must win for Copyright/Creator.
-	m.XMP = &xmp.XMP{Properties: make(map[string]map[string]string)}
+	// With EXIF back and XMP and IPTC empty, EXIF still wins.
+	m.EXIF = exifSaved
 	m.IPTC = new(iptc.IPTC) // empty IPTC
 	if got := m.Copyright(); got != "ExifCopyright" {
 		t.Errorf("Copyright() (no XMP, no IPTC) = %q, want EXIF value ExifCopyright", got)

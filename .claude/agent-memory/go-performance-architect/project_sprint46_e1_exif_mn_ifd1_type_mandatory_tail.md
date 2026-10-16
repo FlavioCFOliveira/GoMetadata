@@ -1,0 +1,14 @@
+---
+name: sprint46-e1-exif-mn-ifd1-type-mandatory-tail
+description: Sprint 46 E1 (#317-#321,#360) DONE 2026-10-16 (uncommitted at hand-off): design, verified facts, harness, perf, unfixed defects
+metadata:
+  type: project
+---
+
+Base HEAD 8640284. All code+tests+docs done; gofmt/vet/build/race/golangci-lint(0)/fuzz 60 s x9 green. Harness in scratchpad/e1: sw_base/sw_new (`sweepw` corpus write sweep), oracle.sh + mncmp.py (MakerNote values via exiftool -G1 -a -MakerNotes:all), cmpt.py (warnings from TEXT output; `exiftool -j` keeps only ONE Warning), bench_e1.sh/bench_tiff.sh (interleaved vs scratchpad/base_e1 = git archive HEAD), spec/ (pdftotext of Exif 3.0/3.1 + pg.py printed-page mapper).
+
+Design (all in repo): exif/chain.go (IFD.Sub *SubIFDs; chained-IFD pointer rule: own IFD carried / same offset as IFD0 -> relocated / else dropped); exif/makernote_rebase.go + makernote_walk.go (EncodeRebased(e, src); TIFF-relative fixups after encode; per-region carry beyond declared MN; sub-IFDs Nikon 0x0011/0x0E10, Olympus 0x2010-0x2050/0x3000, Ricoh 0x2001(+20)); exif/mandatory.go (New, defaults, setText, version rule); format/jpeg/size.go ImageSize; format/tiff/relocate_stream.go planTail/metadataEnd; root encodeEXIF -> EncodeRebased, encodeLocked fills PixelX/Y under m.mu. TIFF-family writers still use Encode + own rebase (unchanged).
+
+Verified facts: Exif 3.1 p.28 type 129=UTF-8, 13=IFD (TIFF TN1); ExifVersion stays "0300"; GPSVersionID 2.4.0.0 (p.83); Table 17-21 pp.93-99 (Compressed column: IFD0 YCbCrPositioning M; Exif IFD ExifVersion/ComponentsConfiguration/ColorSpace/PixelX/Y M; XRes/YRes/ResUnit/FlashpixVersion O since 3.0); Table 21 allows 0x8769/0x8825 in IFD1. ExifTool TIFF validator still wants FlashpixVersion (spec: optional). Corpus: *_2/_3 files are byte-identical copies; "Issue 247-*.nef" are JPEGs; metadata-extractor tables are wrong for Sanyo/Samsung NX/Ricoh files (data decides: valuesInside counts); Canon footer origin by ExifTool end-of-values test; a TIFF-relative note with a value straddling its end is inconsistent -> no carry, same shift for all pointers.
+Perf vs 8640284: parse/encode benches equal; Write_TIFF +7.7% (tail scan), RelocateMakerNote +16% (0.69->0.81us fixed scan), Task308_SetAndWrite +4% (+2 allocs, mandatory tags); EncodeRebased Canon-like +0.3us.
+Unfixed defects found: Olympus MN PreviewImageStart is FILE-absolute (10 corpus JPEGs); Kodak ProBack binary MN; Sony HX5V(2) IFD0 type-0 entry makes ExifTool read no MN after write; headerless LE Nikon MN unparsed by Parse (nikonType1 BE-only); ORF corpus (OLYMP via TIFF path) 3 files differ; JPEG with zero-height SOF (DNL) gets no PixelX/Y; SetDateTimeOriginal adds a 2.31 tag without raising ExifVersion < 0231; exiftool zsh/macOS: use perl -pi / sed -i '' ; exiftool -j loses duplicate Warnings.

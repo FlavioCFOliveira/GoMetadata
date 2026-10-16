@@ -49,6 +49,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
 )
@@ -584,7 +585,7 @@ func orfRelocateWithOLYMP(
 	}
 	if rawIPTC != nil {
 		// Adobe XMP Spec / ExifTool convention: IPTC-NAA (0x83BB) as TypeLong.
-		upsertIFD0Entry(e.IFD0, exif.TagIPTC, exif.TypeLong, rawIPTC)
+		upsertIPTC(e.IFD0, rawIPTC, rawXMP)
 	}
 	if rawXMP != nil {
 		// Adobe XMP Spec (TIFF Technical Note 3): XMP (0x02BC) as TypeByte.
@@ -635,11 +636,22 @@ func orfRelocateWithOLYMP(
 	}
 
 	// Step 4: enumerate SubIFDs (tag 0x014A).
-	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget, fileLen)
+	subTree, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget, fileLen)
+	subIFDs := subTree.all
 	if subErr != nil {
 		return nil, nil, fmt.Errorf("enumerate SubIFDs: %w", subErr)
 	}
 	blocks = append(blocks, subBlocks...)
+
+	// Step 4.5 (task #370): the Olympus MakerNote offsets of data outside the
+	// IFD structures (relocate_olympus_external.go); the thumbnail block of the
+	// MakerNote is one of the blocks they may fall in.
+	known := blocks
+	if thumbBlock != nil {
+		known = append(slices.Clip(blocks), thumbBlock)
+	}
+	ext := planOlympusExternal(base, e, known, fileLen)
+	blocks = append(blocks, ext.blocksToAdd()...)
 
 	// Step 5: remove stale image-data offset entries from main IFDs only.
 	mainBlocks := filterMainBlocks(blocks, subIFDs)
@@ -661,7 +673,7 @@ func orfRelocateWithOLYMP(
 	ifdEnd := uint64(ifdEndInt) //nolint:gosec // G115: EncodedSize never returns a negative length
 
 	// Step 7: assign new absolute offsets.
-	subIFDsSize := computeSubIFDsSize(subIFDs)
+	subIFDsSize := computeSubIFDsSize(ifdEnd, subIFDs)
 	imageStart := ifdEnd + subIFDsSize
 	// Include the thumbBlock in the allBlocks slice for assignNewOffsets.
 	allBlocks := blocks
@@ -700,10 +712,16 @@ func orfRelocateWithOLYMP(
 	//   "[minor] Possibly incorrect maker notes offsets (fix by N?)"
 	//   "[minor] Suspicious MakerNotes offset for ThumbnailImage"
 	rebaseOlympMakerNote(finalTIFF, mnInfo, thumbBlock, order)
+	// Task #370: the offsets of the sub-IFDs of the note (CameraSettings and the
+	// others), and the pointers inside them, follow the MakerNote too.
+	if newMN, found := encodedMakerNoteAbs(finalTIFF, order); found {
+		e.RebaseMakerNoteSubIFDs(finalTIFF, newMN)
+	}
+	ext.patch(finalTIFF, order, relocatedEnd(headerLen, allBlocks)) // task #370
 
 	// Step 10: patch the 0x014A SubIFDs pointer array in finalTIFF.
-	if len(subIFDs) > 0 {
-		if pErr := patchSubIFDPointers(finalTIFF, subIFDs, false, order); pErr != nil {
+	if subTree.roots != nil {
+		if pErr := patchSubIFDPointers(finalTIFF, subTree, false, order); pErr != nil {
 			return nil, nil, fmt.Errorf("patch SubIFD pointers: %w", pErr)
 		}
 	}

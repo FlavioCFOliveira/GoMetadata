@@ -562,12 +562,12 @@ func TestExtractBareJPEGAllNil(t *testing.T) {
 // --- Extended XMP write: TestInjectExtendedXMP ---
 
 // TestInjectExtendedXMP verifies that Inject correctly splits an XMP packet
-// larger than maxXMPPayload (65504 bytes) across a main APP1 and one or more
+// larger than maxXMPPayload (65502 bytes) across a main APP1 and one or more
 // extended APP1 segments (Adobe XMP Specification Part 3 §1.1.4), and that
 // the subsequent Extract call reassembles the full XMP content.
 func TestInjectExtendedXMP(t *testing.T) {
 	t.Parallel()
-	// Build a rawXMP that is larger than maxXMPPayload (65504 bytes).
+	// Build a rawXMP that is larger than maxXMPPayload (65502 bytes).
 	// We use a valid XMP envelope so that Extract's reassembleExtendedXMP can
 	// splice the extended content into it correctly.
 	const extraContentSize = 66000
@@ -776,7 +776,9 @@ func TestInjectNonJPEGReturnsError(t *testing.T) {
 
 // TestExtractExtendedXMPNoMatchingGUID verifies that when the main XMP has
 // HasExtendedXMP but the GUID does not match any extended chunk, the main XMP
-// is returned unchanged (graceful degradation).
+// is returned without HasExtendedXMP, which "must only be in the file" (XMP
+// Part 3 §1.1.3.1, p. 15; Toolkit JPEG_Handler.cpp ProcessXMP, task #332),
+// and otherwise unchanged (graceful degradation).
 func TestExtractExtendedXMPNoMatchingGUID(t *testing.T) {
 	t.Parallel()
 	const guid = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -799,9 +801,13 @@ func TestExtractExtendedXMPNoMatchingGUID(t *testing.T) {
 	if rawXMP == nil {
 		t.Fatal("rawXMP should not be nil when main XMP is present")
 	}
-	// The XMP should equal mainXMP (unchanged, no merge occurred).
-	if !bytes.Equal(rawXMP, mainXMP) {
-		t.Errorf("XMP was unexpectedly modified; got %q, want %q", rawXMP, mainXMP)
+	// No merge occurred, and the link to the extended XMP that was not found
+	// is gone.
+	if bytes.Contains(rawXMP, []byte("HasExtendedXMP")) {
+		t.Errorf("HasExtendedXMP kept although no extended chunk matches: %q", rawXMP)
+	}
+	if !bytes.Contains(rawXMP, []byte("<rdf:RDF")) {
+		t.Errorf("XMP lost: %q", rawXMP)
 	}
 }
 
@@ -1056,34 +1062,8 @@ func TestReadSegmentInvalidLength(t *testing.T) {
 	}
 }
 
-// TestSkipPascalStringEdgeCases exercises skipPascalString when the pos is at
-// or beyond the buffer end, and when nameLen requires padding.
-func TestSkipPascalStringEdgeCases(t *testing.T) {
-	t.Parallel()
-
-	t.Run("pos at end returns pos+1, false", func(t *testing.T) {
-		t.Parallel()
-		buf := []byte{0x05}
-		newPos, ok := skipPascalString(buf, 1) // pos == len(buf)
-		if ok {
-			t.Error("expected ok=false")
-		}
-		if newPos != 2 {
-			t.Errorf("newPos = %d, want 2", newPos)
-		}
-	})
-
-	t.Run("even-length name (no padding byte)", func(t *testing.T) {
-		t.Parallel()
-		// nameLen=2 → total = 1(len) + 2(name) = 3 (odd) → padded: total = 4
-		buf := []byte{0x02, 'A', 'B', 0x00} // length + 2 chars + pad
-		newPos, ok := skipPascalString(buf, 0)
-		if !ok {
-			t.Errorf("expected ok=true, got false")
-		}
-		_ = newPos
-	})
-}
+// TestSkipPascalStringEdgeCases moved to internal/irb (TestSkipPascalString_EdgeCases)
+// together with the parser it exercises.
 
 // errorWriter is a test helper that always returns an error on Write.
 type errorWriter struct{}
@@ -1148,7 +1128,7 @@ func TestCopyNonMetadataSegmentsReadError(t *testing.T) {
 
 	scratch := make([]byte, 0, 4096)
 	var out bytes.Buffer
-	err := copyNonMetadataSegments(bytes.NewReader(buf.Bytes()), &out, &scratch, true)
+	err := copyNonMetadataSegments(bytes.NewReader(buf.Bytes()), &out, &scratch, true, nil, "")
 	// The truncated read should produce an error (non-EOF, unexpected EOF).
 	if err == nil {
 		t.Error("expected error for truncated segment, got nil")

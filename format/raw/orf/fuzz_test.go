@@ -2,8 +2,11 @@ package orf
 
 import (
 	"bytes"
+	"encoding/binary"
 	"io"
 	"testing"
+
+	"github.com/FlavioCFOliveira/GoMetadata/internal/testutil"
 )
 
 func FuzzORFExtract(f *testing.F) {
@@ -69,6 +72,35 @@ func FuzzORFInject(f *testing.F) {
 		[]byte("fuzz-orf-iptc-seed"),
 		[]byte("<xmpmeta orf='1'/>"),
 	))
+
+	// Seeds (task #370): Olympus MakerNotes whose preview offset addresses data
+	// after the MakerNote ("OLYMPUS\0" layout) and an E-1 CameraSettings stored
+	// as a value ("OLYMP\0" layout), in an ORF container.
+	le := binary.LittleEndian
+	preview := append([]byte{0xFF, 0xD8}, bytes.Repeat([]byte("preview"), 8)...)
+	layout2, _ := testutil.MakerNoteTIFF(testutil.MNSpec{
+		Make: "OLYMPUS IMAGING CORP.", Order: le, Prefix: []byte("OLYMPUS\x00II\x03\x00"), PadBefore: 6,
+		Entries: []testutil.MNEntry{{Tag: 0x2020, Sub: &testutil.MNSub{Entries: []testutil.MNEntry{
+			{Tag: 0x0101, Type: 4, Count: 1, PtrOutside: preview},
+			{Tag: 0x0102, Type: 4, Count: 1, Value: le.AppendUint32(nil, uint32(len(preview)))}, //nolint:gosec // G115: tiny test sizes
+		}}}},
+	})
+	e1 := le.AppendUint16(nil, 2)
+	for _, ent := range [...][2]uint32{{0x0101, 100}, {0x0102, 56}} {
+		e1 = le.AppendUint16(e1, uint16(ent[0])) //nolint:gosec // G115: tiny test values
+		e1 = le.AppendUint16(e1, 4)
+		e1 = le.AppendUint32(e1, 1)
+		e1 = le.AppendUint32(e1, ent[1])
+	}
+	layout1, _ := testutil.MakerNoteTIFF(testutil.MNSpec{
+		Make: "OLYMPUS OPTICAL CO.,LTD", Order: le, Prefix: []byte("OLYMP\x00\x01\x00"), TIFFRelative: true, PadBefore: 6,
+		Entries: []testutil.MNEntry{{Tag: 0x2020, Type: 7, Count: uint32(len(e1)), Value: e1}}, //nolint:gosec // G115: tiny test sizes
+	})
+	for _, seed := range [][]byte{layout2, layout1} {
+		seed = bytes.Clone(seed)
+		copy(seed[0:4], orfMagic) // "IIRO"
+		f.Add(seed)
+	}
 
 	// Fixed metadata payloads for rawIPTC/rawXMP: short and constant so that
 	// Inject reaches relocateTIFF on every iteration once the magic and

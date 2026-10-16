@@ -2,6 +2,7 @@ package jpeg
 
 import (
 	"bytes"
+	"encoding/binary"
 	"io"
 	"testing"
 )
@@ -38,6 +39,23 @@ func FuzzJPEGExtract(f *testing.F) {
 		iptc := []byte{0x1C, 0x02, 0x78, 0x00, 0x03, 'k', 'w', '1'}
 		seed := buildJPEG(nil, iptc, nil)
 		f.Add(seed)
+	}
+
+	// Seeds: extended XMP whose standard packet writes HasExtendedXMP as a
+	// property element and as a property attribute (task #278).
+	{
+		ext := []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+			`<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:format>image/jpeg</dc:format>` +
+			`</rdf:Description></rdf:RDF></x:xmpmeta>`)
+		const guid = "04B9E48040A30A6308713BD1E4223B41"
+		for _, prop := range []string{
+			`><xmpNote:HasExtendedXMP>` + guid + `</xmpNote:HasExtendedXMP></rdf:Description>`,
+			` xmpNote:HasExtendedXMP="` + guid + `"/>`,
+		} {
+			main := []byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+				`<rdf:Description rdf:about="" xmlns:xmpNote="http://ns.adobe.com/xmp/note/"` + prop + `</rdf:RDF></x:xmpmeta>`)
+			f.Add(buildExtendedXMPJPEG(main, guid, ext))
+		}
 	}
 
 	f.Fuzz(func(t *testing.T, data []byte) {
@@ -161,10 +179,70 @@ func FuzzJPEGInject(f *testing.F) {
 	rawIPTC := []byte{0x1C, 0x02, 0x78, 0x00, 0x03, 'f', 'z', '1'}
 	rawXMP := []byte(`<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?><x:xmpmeta xmlns:x='adobe:ns:meta/'></x:xmpmeta><?xpacket end='r'?>`)
 
+	// Seeds (task #357): a source with extended XMP segments of the GUID the
+	// keep frame below names, one chunk and two chunks.
+	const keepGUID = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	extSeg := func(guid string, off uint32, chunk string) []byte {
+		p := []byte("http://ns.adobe.com/xmp/extension/\x00" + guid)
+		p = binary.BigEndian.AppendUint32(p, 10)
+		p = binary.BigEndian.AppendUint32(p, off)
+		p = append(p, chunk...)
+		size := uint16(len(p) + 2) //nolint:gosec // G115: test sizes are small
+		return append([]byte{0xFF, 0xE1, byte(size >> 8), byte(size)}, p...)
+	}
+	withExt := func(segs ...[]byte) []byte {
+		b := []byte{0xFF, 0xD8}
+		for _, s := range segs {
+			b = append(b, s...)
+		}
+		return append(b, 0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9)
+	}
+	f.Add(withExt(extSeg(keepGUID, 0, "0123456789")))
+	f.Add(withExt(extSeg(keepGUID, 0, "01234"), extSeg(keepGUID, 5, "56789")))
+	f.Add(withExt(extSeg("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", 0, "0123456789")))
+
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic regardless of input. Inject must return an error or
 		// write valid output — a panic is always a bug in the write path.
 		err := Inject(bytes.NewReader(data), io.Discard, rawEXIF, rawIPTC, rawXMP, true)
 		_ = err
+
+		// #357: with a keep frame, the extended segments of the GUID are all
+		// carried over, and the packet links to them only when there are some.
+		var out bytes.Buffer
+		if err := Inject(bytes.NewReader(data), &out, rawEXIF, rawIPTC, EncodeKeptExtended(rawXMP, keepGUID), true); err != nil {
+			return
+		}
+		before, after := countExtended(data, keepGUID), countExtended(out.Bytes(), keepGUID)
+		if before != after {
+			t.Fatalf("%d extended segments of the GUID before the write, %d after", before, after)
+		}
+		if before == 0 && bytes.Contains(out.Bytes(), []byte("HasExtendedXMP")) {
+			t.Fatal("the output links to extended XMP that is not in it")
+		}
+		if before > 0 && !bytes.Contains(out.Bytes(), []byte("HasExtendedXMP")) {
+			t.Fatal("the output keeps extended XMP that the standard packet does not link to")
+		}
 	})
+}
+
+// countExtended returns the number of extended XMP segments of guid before
+// the first SOS of the JPEG in data, read with the package's own segment
+// reader (so that fill bytes and truncation are handled as Inject handles them).
+func countExtended(data []byte, guid string) int {
+	if len(data) < 2 {
+		return 0
+	}
+	r := bytes.NewReader(data[2:])
+	scratch := make([]byte, 4096)
+	n := 0
+	for {
+		marker, seg, err := readSegment(r, &scratch)
+		if err != nil || marker == markerSOS || marker == markerEOI {
+			return n
+		}
+		if isExtendedSegmentOf(marker, seg, guid) {
+			n++
+		}
+	}
 }

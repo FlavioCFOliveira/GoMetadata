@@ -1,14 +1,23 @@
 package exif
 
 import (
+	"bytes"
 	"encoding/binary"
 	"os"
 	"testing"
+
+	"github.com/FlavioCFOliveira/GoMetadata/internal/testutil"
 )
 
 // FuzzParseEXIF exercises the EXIF parser against arbitrary byte inputs.
 // Run with: go test -fuzz=FuzzParseEXIF -fuzztime=60s ./exif/...
 func FuzzParseEXIF(f *testing.F) {
+	// Security audit 2026-10-16: F-06a (IFDs of a chain addressing one
+	// thumbnail range) and F-06b (IFD0 entries addressing private IFDs whose
+	// data cannot all be carried), scaled down.
+	f.Add(auditThumbChain(40, 4096, func(int) int { return 0 }, 4096))
+	f.Add(auditPrivateIFDs(8, func(int) (int, int) { return 0, 4000 }, 4096))
+	f.Add(auditPrivateIFDs(3, func(i int) (int, int) { return i * 100, 100 }, 400))
 	// Seed corpus: minimal valid little-endian TIFF header.
 	f.Add([]byte("II\x2A\x00\x08\x00\x00\x00"))
 	// Seed corpus: minimal valid big-endian TIFF header.
@@ -167,6 +176,58 @@ func FuzzParseEXIF(f *testing.F) {
 		f.Add(data)
 	}
 
+	// Seeds with a MakerNote (tasks #317, #318): the TIFF-relative layouts, the
+	// Nikon PreviewIFD that runs past the declared end of the note, and a
+	// value stored outside the note (testutil.MakerNoteTIFF).
+	for _, spec := range []testutil.MNSpec{
+		{Make: "Canon", Order: binary.LittleEndian, TIFFRelative: true, Footer: true, PadBefore: 6, Entries: mnEntries()},
+		{Make: "OLYMPUS OPTICAL CO.,LTD", Order: binary.LittleEndian, Prefix: []byte("OLYMP\x00\x01\x00"), TIFFRelative: true, PadBefore: 6,
+			Entries: append(mnEntries(), testutil.MNEntry{Tag: 0x0004, Type: 4, Count: 3, Value: mnTriple(), Outside: true})},
+		nikon3Spec([]byte{0xFF, 0xD8, 1, 2, 3, 4, 0xFF, 0xD9}),
+	} {
+		tiff, _ := testutil.MakerNoteTIFF(spec)
+		f.Add(tiff)
+	}
+	// Seeds (task #362): a Kodak private IFD behind IFD0 tag 0x8290 and
+	// Interoperability pointers that loop to IFD0 and to the Exif IFD; Olympus
+	// notes with a CameraSettings preview offset; headerless Nikon notes of
+	// both byte orders (task #364).
+	for _, interop := range []func(ifd0, exifIFD uint32) uint32{noInterop, func(ifd0, _ uint32) uint32 { return ifd0 }, func(_, exifIFD uint32) uint32 { return exifIFD }} {
+		kodak, _ := kodakStream(interop, 2)
+		f.Add(kodak)
+	}
+	f.Add(olympusStream("OLYMPUS IMAGING CORP.", "OLYMPUS\x00II\x03\x00", []testutil.MNEntry{
+		{Tag: 0x0101, Type: 4, Count: 1, Value: long(5000)}, {Tag: 0x0102, Type: 4, Count: 1, Value: long(321)}}))
+	f.Add(olympusStream("OM Digital Solutions", "OM SYSTEM\x00\x00\x00II", []testutil.MNEntry{
+		{Tag: 0x0101, Type: 4, Count: 1, Value: long(1)}, {Tag: 0x0102, Type: 4, Count: 1, Value: long(2)}}))
+	for _, order := range []testOrder{binary.LittleEndian, binary.BigEndian} {
+		tiff, _ := testutil.MakerNoteTIFF(testutil.MNSpec{Make: "NIKON", Order: order, TIFFRelative: true, PadBefore: 6, Entries: mnEntries()})
+		f.Add(tiff)
+	}
+	// Seed: an IFD1 whose pointer tags address IFDs of their own (task #319).
+	{
+		e := chainEXIF(1, 1, &SubIFDs{
+			Exif: &IFD{Entries: []IFDEntry{chainEnt(TagExposureTime, TypeRational, 1, []byte{1, 0, 0, 0, 100, 0, 0, 0})}},
+			GPS:  &IFD{Entries: []IFDEntry{chainEnt(TagGPSVersionID, TypeByte, 4, []byte{2, 4, 0, 0})}},
+		}, false)
+		if out, err := Encode(e); err == nil {
+			f.Add(out)
+		}
+	}
+
+	// Seeds (task #368, #370): the strips of an uncompressed thumbnail, private
+	// IFD0 pointers, and the other forms of the Olympus preview offset.
+	for _, order := range []binary.ByteOrder{binary.LittleEndian, binary.BigEndian} {
+		strips, _ := rawStripStream(order, TypeLong, TypeLong, []int{50, 51, 0, 7}, []int{0, 3, 1}, false)
+		f.Add(strips)
+	}
+	shortStrips, _ := rawStripStream(binary.LittleEndian, TypeShort, TypeShort, []int{33, 34}, []int{0}, true)
+	f.Add(shortStrips)
+	privStream, _ := privateStream(ptrSpec{0x014A, 4, 3}, ptrSpec{0x0190, 4, 1}, ptrSpec{0xC000, 13, 1})
+	f.Add(privStream)
+	f.Add(olympStream([]testutil.MNEntry{{Tag: 0x2020, Type: 7, Count: 42, Value: previewIFDValue(5000, 321)}}))
+	f.Add(olympStream([]testutil.MNEntry{{Tag: 0x1036, Type: 4, Count: 1, Value: long(5000)}, {Tag: 0x1037, Type: 4, Count: 1, Value: long(321)}}))
+
 	f.Fuzz(func(t *testing.T, b []byte) {
 		// Must not panic on any input.
 		e, err := Parse(b)
@@ -205,7 +266,79 @@ func FuzzParseEXIF(f *testing.F) {
 				if reErr == nil && e2 != nil && e.BigTIFF != e2.BigTIFF {
 					t.Errorf("Encode round-trip changed BigTIFF provenance: before=%v after=%v", e.BigTIFF, e2.BigTIFF)
 				}
+				// EncodedSize replays Encode's layout, including the IFDs
+				// attached to the chain (task #319).
+				if n, sizeErr := EncodedSize(e); sizeErr != nil || n != len(encoded) {
+					t.Errorf("EncodedSize = %d, %v; len(Encode) = %d", n, sizeErr, len(encoded))
+				}
 			}
+			// Tasks #317, #318: the MakerNote repair must not panic, must not
+			// modify its inputs, and its output must parse.
+			before := append([]byte(nil), b...)
+			rebased, rbErr := EncodeRebased(e, b)
+			if rbErr == nil {
+				if _, reErr := Parse(rebased); reErr != nil && encErr == nil {
+					t.Errorf("EncodeRebased output does not parse although Encode's does: %v", reErr)
+				}
+			}
+			if !bytes.Equal(before, b) {
+				t.Error("EncodeRebased modified the source stream")
+			}
+			// Task #362: the data of the MakerNote that lies outside the EXIF
+			// stream is found without panicking, on the stream and on what the
+			// writer made of it, and leaves the stream as it was.
+			for _, o := range ExternalOffsets(b) {
+				// Task #370: the field is inside the MakerNote, inside the stream.
+				if o.Field < o.MNStart || o.Field+4 > o.MNStart+o.MNLen || o.MNStart+o.MNLen > len(b) {
+					t.Errorf("ExternalOffsets: field %d outside the MakerNote [%d,+%d) of the %d-byte stream", o.Field, o.MNStart, o.MNLen, len(b))
+				}
+			}
+			if rbErr == nil {
+				_ = ExternalOffsets(rebased)
+			}
+			if !bytes.Equal(before, b) {
+				t.Error("ExternalOffsets modified its argument")
+			}
+			fuzzThumbnailStrips(t, b)
 		}
 	})
+}
+
+// fuzzThumbnailStrips checks the strips of the thumbnail (task #368): Parse with
+// CarryThumbnailStrips never panics; when it carries strips, Encode writes
+// them, EncodedSize agrees with the length, and a second parse of the output
+// reads the same strip bytes.
+func fuzzThumbnailStrips(t *testing.T, b []byte) {
+	t.Helper()
+	e, err := Parse(b, CarryThumbnailStrips())
+	if err != nil || e.IFD0 == nil {
+		return
+	}
+	var want [][]byte
+	for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
+		for _, s := range ifd.thumbnailStrips() {
+			want = append(want, bytes.Clone(s))
+		}
+	}
+	out, err := Encode(e)
+	if err != nil {
+		return
+	}
+	if n, sizeErr := EncodedSize(e); sizeErr != nil || n != len(out) {
+		t.Errorf("EncodedSize = %d, %v; len(Encode) = %d (with strips)", n, sizeErr, len(out))
+	}
+	if len(want) == 0 {
+		return
+	}
+	e2, err := Parse(out, CarryThumbnailStrips())
+	if err != nil {
+		t.Fatalf("Parse of an output with strips: %v", err)
+	}
+	var got [][]byte
+	for ifd := e2.IFD0.Next; ifd != nil; ifd = ifd.Next {
+		got = append(got, ifd.thumbnailStrips()...)
+	}
+	if !equalStrips(got, want) {
+		t.Errorf("the strips differ after Encode: %d before, %d after", len(want), len(got))
+	}
 }

@@ -26,6 +26,58 @@ EXIF write must not exceed 65533 (cannot span) — fail rather than truncate.
 `Exif\0\0` (use first); ExtendedXMP missing/dup/overlapping chunks, GUID mismatch; malformed IRB
 length/padding; fill bytes (`FF FF…`).
 
+**Rule IDs (JPEG trailers; sub-test names).**
+- **TRAILER-SAMSUNG-01** (task #353) The Samsung "Sound & Shot" trailer ends with a QDIO block (`QDIO`,
+  101, 1, the absolute offsets of the start and the end of its audio file, all little-endian, then the block
+  length 20, `QDIO` and `BS`) that follows a `SEFH`/`SEFT` directory block. When a write moves the trailer, the
+  two offsets are rewritten for its position in the output, so they name the audio file again; the directory's
+  offsets are relative to it and need no rewrite. Whatever precedes or follows the trailer (an AFCP trailer, a
+  Vivo trailer, unknown bytes) is found in the region after EOI and does not matter. Layout from the format notes
+  of ExifTool `Samsung.pm` `ProcessSamsung` (study only; written independently).
+  `TestTrailers_SamsungQDIO`, `FuzzTrailers`.
+- **TRAILER-SAMSUNG-02** A write that does not move the trailer keeps the file byte for byte; a QDIO block that is
+  not understood (offsets outside the region after the other trailers and before the block, no directory block) is
+  never touched. `TestTrailers_SamsungUnchanged`.
+- **TRAILER-SAMSUNG-03** `testdata/corpus/jpeg/exiftool/ExifTool.jpg` (trailer chain: AFCP, FotoStation x2, CanonVRD,
+  PhotoMechanic, MIE, Samsung, Vivo): after a caption write the two audio offsets name the audio file again
+  (`exiftool -a -G1 -Samsung:all` identical before and after), exactly 4 bytes of the file differ from a write
+  that does not rewrite them, and every trailer after the AFCP and FotoStation trailers is carried unchanged.
+  `TestTrailers_CorpusSamsung`.
+- **TRAILER-TAIL-01** (task #354) `FindTail` finds AFCP and FotoStation trailers from the end of a file (a
+  FotoStation record by its footer, an AFCP trailer by its EOF record), in either order, from a buffer or a
+  stream; a file that does not end with one has none. `TestFindTail` (internal/trailer), `FuzzTrailerTail`.
+- **TRAILER-PLAN-01** A plan writes its region with the IPTC copies replaced and the offsets set for the position it
+  is written at; the bytes between and after the trailers are copied. `TestPlanWriteRegion`.
+- **TRAILER-SAMSUNG-04** (task #361) The Samsung audio file, the blocks after it and the QDIO block move as one rigid
+  piece, so the two offsets are shifted by the movement of the QDIO block and name the same audio bytes: an AFCP or
+  FotoStation trailer after the Samsung trailer (a file edited by software that appends AFCP) no longer stops the
+  rewrite, as it did when the offsets had to lie after every other trailer. An AFCP or FotoStation trailer that
+  intersects the piece (found among the audio bytes, between the audio and the QDIO block) is part of the audio file as
+  far as the Samsung trailer is concerned: it is copied unchanged, not rewritten, because rewriting it could change the
+  size of the piece; no producer known to the format notes (ExifTool `Samsung.pm` `ProcessSamsung`, which derives the
+  audio position from the directory of blocks, study only) writes such a layout, and a write has no warning channel
+  (`ParseWarnings` is read-only). An audio start before the region after the image is not understood and the QDIO block is
+  left alone. `TestTrailers_SamsungWithOtherSpans`, `FuzzTrailers` (a Samsung trailer valid in the source is valid and
+  names the same bytes in the output).
+- Trailers that need no rewrite (checked against the ExifTool sources, study only): CanonVRD (header and footer hold
+  the length of the data), PhotoMechanic (the footer holds the trailer length), Vivo and OnePlus (offsets counted back
+  from the end of the trailer), MIE (relative lengths). They are copied byte for byte.
+
+**Rule IDs (JPEG frame size).**
+- **JPEG-DNL-01** (task #365) A frame header with Y = 0 defers the number of lines to the DNL segment (marker `FF DC`)
+  that follows the first scan. ITU-T T.81 §B.2.2, p. 36 (Y: "Value 0 indicates that the number of lines shall be defined
+  by the DNL marker and parameters at the end of the first scan"); §B.2.5, p. 45 (the segment is mandatory when Y is 0;
+  Ld, NL; Table B.10: Ld 4-65535, NL 1-65535); §B.2.1, p. 35 (it "shall immediately follow the first scan"). The text
+  was read in the W3C copy of the Recommendation (itu-t81.pdf). `jpeg.ImageSize` reads the segments to the first SOS,
+  skips the scan header, and searches the entropy-coded data of the first scan for the next marker that is not a stuffed
+  zero, a restart marker or a fill byte (§B.1.1.5), reading at most 64 MiB; the marker must be DNL with Ld >= 4 and
+  NL >= 1, else the height is unknown (`ErrNoFrameHeader`). Nothing is decoded. libjpeg-turbo (`jdmarker.c` `get_sof`)
+  rejects Y = 0 ("DNL not supported") and has no search to adapt; metadata-extractor `JpegDnlReader` takes NL as the
+  first unsigned 16-bit value of the segment and applies it only when the frame header's height is 0. Corpus
+  `beach.jpg` (SOF1, Y 0, X 200, NL 200): a caption write creates PixelXDimension and PixelYDimension 200 x 200.
+  `TestImageSizeDNL`, `TestScanForDNLLimit`, `TestImageSizeDNLCorpus`, `TestWrite_Task365_JPEGHeightFromDNL`,
+  `FuzzImageSize`.
+
 ## 2. PNG
 **(a)** W3C "PNG Specification (Third Edition)", W3C Recommendation 24 Jun 2025; ISO/IEC
 15948:2004; historical RFC 2083. XMP via XMP Part 3 §1.1.5.
@@ -35,11 +87,12 @@ length/padding; fill bytes (`FF FF…`).
 (ancillary/private/reserved/safe-to-copy) (§5.4). IHDR first, IEND last; IDATs consecutive;
 PLTE before first IDAT (§5.6, §11). CRC-32 poly `0xEDB88320` reflected, init `0xFFFFFFFF`, final
 ones-complement, over Type+Data (not Length) (§5.5).
-**(d)** EXIF → `eXIf` chunk; raw TIFF stream **with no `Exif\0\0` prefix** (PNG-3 §11.3.4.4).
+**(d)** EXIF → `eXIf` chunk; raw TIFF stream **with no `Exif\0\0` prefix** (PNG-3 §11.3.4.5, eXIf: "Only one eXIf chunk is allowed").
 XMP → `iTXt` keyword `XML:com.adobe.xmp`, compression 0, empty lang/translated keyword. Text →
 `tEXt`/`zTXt`. IPTC → via XMP (no native chunk).
 **(e)** Length = data length; recompute CRC over Type+Data; insert ancillary chunks between
 IHDR and IEND (eXIf/text before IDAT recommended); preserve unknown safe-to-copy chunks.
+**PNG-EXIF-01** (task #325) A write that emits the eXIf chunk drops a `Raw profile type exif` or `APP1` text chunk (tEXt, zTXt or iTXt) whose decoded profile is the EXIF it replaces (PNG-3 §11.3.4.5: one eXIf chunk), so one current copy remains; an undecodable profile, a profile of another kind and a nil EXIF payload leave the chunk byte-identical. `TestInject_RawProfileEXIFDropped`, `TestInject_RawProfileKeptWhenNotSuperseded`, `TestInject_RawProfilesAllKinds`. (`Raw profile type iptc` is rewritten in place: task #314.)
 **(f)** Bad signature; truncated chunk; Length past EOF; CRC mismatch (detect, no crash);
 Length > 2³¹−1; zero-length data (legal); duplicate IHDR/IEND; chunks after IEND; bad iTXt
 zlib/separators; non-UTF-8 XMP; bad eXIf TIFF header.
@@ -58,6 +111,12 @@ chunk (`58 4D 50 20`, 4th byte is space `0x20`), raw packet. IPTC → via XMP. M
 VP8X (extended) format.
 **(e)** Adding EXIF/XMP requires VP8X + set flag; Chunk-Size = exact payload; pad byte iff odd;
 update RIFF File-Size; reserved bits 0; ICCP before image data; do not reorder reconstruction chunks.
+A VP8X added to a simple-format file takes its canvas (u24 LE width−1, height−1) from the VP8/VP8L
+bitstream header and sets Alpha when the image has alpha (VP8L `alpha_is_used`, or an `ALPH` chunk);
+libwebp rejects a canvas that differs from the image size (`VP8_STATUS_BITSTREAM_ERROR`).
+**WEBP-01** (task #333) An `EXIF` chunk that starts with `Exif\0\0` is read as the TIFF stream after the identifier (metadata-extractor `WebpRiffHandler`); a write emits the TIFF stream without the identifier, as checklist item (d) of this section requires. `TestExtract_ExifPreambleAndXMPNul`.
+**WEBP-02** A chunk with the non-standard FourCC `XMP\0` is read as XMP; the standard `XMP ` chunk wins when both exist. `TestExtract_ExifPreambleAndXMPNul`.
+**WEBP-03** A write emits exactly one `EXIF` and one `XMP ` chunk (RFC 9649 §2.7.1.5: at most one of each) and no `XMP\0` chunk, with the VP8X flags to match; a nil XMP payload removes the `XMP\0` chunk too. `TestInject_OneStandardChunkEach`, `TestCorpus_WebPExifPreambleXMPNul`.
 **(f)** File-Size mismatch; Chunk-Size past EOF; odd size missing/non-zero pad; chunk present but
 flag unset (read lenient, write correct); truncated VP8X; `XMP` without trailing space; duplicate
 metadata chunks; metadata before image data.
@@ -76,12 +135,22 @@ content changes; patch iloc/stco/co64 offsets when boxes move; 4cc exactly 4 byt
 **(f)** size 2–7; size past EOF; largesize overflow; deep nesting (recursion guard); child larger
 than parent; box-vs-FullBox confusion; duplicate ftyp.
 
+**Rule IDs (ISO BMFF boxes).**
+- **BMFF-OPENENDED-01** (task #359) A box whose 32-bit size field is 0 extends to the end of its container (ISO/IEC
+  14496-12 §4.2); a box appended after it would be read as part of it. `internal/bmff` is the one helper of the HEIF/AVIF
+  and CR3 writers: `OpenEnded` (size 0, or a 64-bit form with largesize 0, which the readers of this module also take
+  as extending to the end), `Close` (a copy with the explicit size, 32-bit or, above 4 GiB, the 64-bit header) and
+  `CloseInPlace`. Reference: libavif `src/stream.c` `avifRWStreamFinishBox` writes the size once the payload is complete
+  and refuses a box above UINT32_MAX (BSD-2; the logic here is original). `TestOpenEndedAndClose`,
+  `TestCloseAbove32Bits`.
+
 ## 5. HEIF / HEIC
 **(a)** ISO/IEC 23008-12 (on ISO/IEC 14496-12). Reference: libheif, ExifTool QuickTime.
 **(b)** ftyp major_brand ∈ {heic, heix, heim, heis, hevc, mif1, msf1} (or in compatible_brands).
 **(c)** Inside `meta`: `hdlr` handler `pict`; `pitm` primary item ID; `iinf` entry_count + `infe`
 per item (item_ID, type e.g. hvc1/Exif/mime/grid, name; FullBox v≥2); `iloc` item byte locations
-(construction_method, base_offset, extents: extent_offset/extent_length); `iref` typed refs
+(construction_method, data_reference_index — present in every iloc version, ISO/IEC 14496-12
+§8.11.3.2 — base_offset, extents: extent_offset/extent_length); `iref` typed refs
 (dimg/thmb/cdsc); `iprp`/`ipco`/`ipma` item properties (ispe/colr/hvcC/pixi/irot).
 **(d)** EXIF item: `infe` item_type `Exif`; payload via iloc is an ExifDataBlock = **4-byte u32 BE
 `exif_tiff_header_offset`** then EXIF (`Exif\0\0`+TIFF or directly TIFF). XMP item: `infe`
@@ -93,6 +162,70 @@ corruption risk); content_type exactly `application/rdf+xml\0`.
 **(f)** iloc extent past EOF; construction_method variants; zero extents; EXIF item missing
 4-byte prefix or bad offset; iinf entry_count mismatch; missing cdsc; multiple EXIF items;
 truncated meta (CRITICAL HEIF panic — fuzz the meta/iloc/iinf walk).
+
+**Rule IDs (HEIF / AVIF write path; sub-test names).**
+- **HEIF-BOX-LARGESIZE-01** The `meta` box, and the `moov` box that may wrap it, may use the 64-bit
+  largesize header (size field 1, then the type, then a 64-bit size: 16 bytes). The meta content starts
+  after the header plus the 4 FullBox bytes; a rewrite keeps the header form of the source and patches
+  the size of an enclosing box in its own form. A meta box smaller than its header + 4 is not a FullBox.
+  ISO/IEC 14496-12 §4.2 (box header), §8.11.1 (`meta` FullBox).
+- **HEIF-BOX-LARGESIZE-02** (task #348) Every box content offset in the HEIF reader and writer comes from the box
+  header length, 8 or 16 bytes, never from a constant: the `infe` boxes of an `iinf` box may use the 64-bit
+  largesize header too, and are read identically to their 8-byte form. Reference: libavif `src/read.c`
+  `avifParseItemInfoBox` (each `infe` is read through its box header), `src/stream.c`
+  `avifROStreamReadBoxHeaderPartial`; ISO/IEC 14496-12 §4.2. `TestTask348ParseIinfInfeHeaderForms`,
+  `TestTask348ExtractAndInjectLargesizeInfe`, and the audit gate `TestTask348NoHardCodedBoxHeaderLength`, which
+  fails on any `pos+8` content offset in the package outside the box header parser.
+- **HEIF-META-SELECT-01** (task #349) `Extract` and `Inject` use one rule to select the metadata container, in
+  `findMetaBoxAbs`: the first file-level `meta` box in file order; only when the file has no file-level `meta` box,
+  the first `meta` box that is a direct child of the first `moov` box. A file-level `meta` box that is present but too
+  small to be a FullBox is the selected one and is not skipped in favour of a nested one, so both paths always agree
+  (`Extract` finds nothing and `Inject` returns `ErrNoMetadataContainer`). A `meta` box nested deeper (`trak`,
+  `udta`), which `Extract` used to find by a depth-first search while `Inject` never wrote to it, is not selected.
+  Rationale: libavif (`src/read.c` `avifParse`: the file-level `meta` box is the item container, `moov` is parsed for
+  tracks), libheif (`libheif/file.cc` `HeifFile::parse_heif_file`: `m_meta_box` is the file-level box) and heic-rs
+  (`src/meta/mod.rs`) read only the file-level box; ISO/IEC 14496-12 §8.11.1 also allows a `meta` box in `moov`, which
+  is kept as the fallback so that a movie-level-only file reads and writes as before. Corpus: all 41 HEIF/AVIF files have
+  a file-level `meta` box and none has one in `moov`, so no corpus result changes. Clause status: §4.2 and §8.11.1 of
+  ISO/IEC 14496-12 are cited as in the existing checklist; the ISO/IEC 23008-12 clause that requires the file-level
+  `MetaBox` for image items is NOT verified (the ISO texts are not available locally).
+  `TestTask349ExtractInjectSelectSameMeta` (both placements in both orders, and beyond the 64 KB `Extract` window),
+  `TestTask349MalformedTopLevelMetaIsNotSkipped`, `TestTask349NestedDeeperThanMoovIsNotSelected`,
+  `TestTask349CorpusSelectsTopLevel`.
+- **HEIF-ILOC-WIDTH0-01** An `iloc` `offset_size` or `length_size` of 0 is legal (the sizes are taken from
+  {0, 4, 8}; the absent field reads as 0). A write widens a zero width to 4 bytes, keeping every existing
+  extent value, and stores the new item locations. ISO/IEC 14496-12 §8.11.3.3. Reference: libavif
+  `src/write.c` writes both sizes as 4.
+- **HEIF-WRITE-NODROP-01** `Inject` never returns nil without storing a requested EXIF or XMP payload: it
+  writes it or returns `ErrNoMetadataContainer` (no valid `meta` box) or `ErrUnreadableItemLocations`
+  (`iloc` missing, unsupported version or field size, truncated, or too large to rewrite without dropping
+  items). Only a request with no payload copies the file through unchanged.
+- **HEIF-IINF-COUNT-01** (task #358) The `entry_count` of an `iinf` box is 16 bits for FullBox version 0 and 32 bits for
+  any other version (ISO/IEC 14496-12 §8.11.6, the ItemInfoBox; the sub-clause is not cited because the text of the
+  standard is not available locally). Reference: libavif `src/read.c` `avifParseItemInfoBox` (version 0: 16 bits;
+  version 1: 32 bits; others rejected) and heic-rs `src/meta/iinf.rs`. `parseIinf` read 16 bits for every version below 2,
+  so it could not read what `buildIinfBox` writes for a version 1 box. The `iloc` `item_count` keeps its own rule (16 bits
+  below version 2, §8.11.3.2) in `parseIlocItemCount`. `TestTask358IinfEntryCountWidth`,
+  `TestTask358ParseIinfItemCountTable`, `TestTask358IlocItemCountWidth`, `TestTask358RoundTripIinfVersion1`.
+- **HEIF-BOX-OPENENDED-01** (task #359) `Inject` closes a child of `meta`, `iinf` or `iref` whose size field is 0 (or a
+  largesize of 0) before it appends boxes after it, in the 32-bit and the 64-bit forms, through
+  `bmff.Close` (BMFF-OPENENDED-01): the appended `iinf`, `iref`, `iloc` and `infe` boxes are read as boxes of their own
+  and every item re-reads. `FuzzHEIFInject` no longer exempts such sources, `iinf` version 1, or (task #367) a source whose
+  top-level boxes end in bytes that do not parse as a box. `TestTask359InjectClosesOpenEndedChild`,
+  `TestTask359OpenEndedChildContentKept`, `FuzzHEIFInject`.
+- **HEIF-TRAILING-BYTES-01** (task #367) Bytes after the last top-level box that do not parse as a box (a header whose size
+  exceeds what follows or is below its own length, a 64-bit size that does not fit, fewer than 8 bytes) are kept byte for
+  byte at the very end of the file, and `Inject` writes the new `mdat` box where the last real box ends, before them
+  (ISO/IEC 14496-12 §4.2: a file is a sequence of boxes, so a new box starts on a box boundary). Appended after them, the
+  new box header completed a bogus file-level `meta` header (for example a trailing `00 00 00 20 'meta'`) that reached
+  into the new box and hid the `meta` box inside `moov`: `Extract` read nothing. An item extent that points into the
+  trailing bytes lies outside every box and is not shifted. `Extract` keeps its tolerance: it stops at the first bytes that
+  are not a box and uses what it found. Other readers: libavif `src/read.c` `avifParse` (line 4912: a top-level header that
+  does not parse is `AVIF_RESULT_BMFF_PARSE_FAILED`, after the earlier boxes were handled), libheif `libheif/file_layout.cc`
+  (lines 105-125: once `meta`, `mini` or `moov` was found, a short tail is accepted; a header that does not parse is an
+  error) and heic-rs `src/boxes.rs` `BoxIter` (yields the earlier boxes, then an error); all three are stricter, none
+  reads a `meta` box out of the trailing bytes. `TestTask367TrailingBytesKept`, `TestTask367NoTrailingBytesUnchanged`,
+  `FuzzHEIFInject`.
 
 ## 6. AVIF
 **(a)** AOM "AV1 Image File Format (AVIF)" v1.2.0 (on HEIF + MIAF ISO/IEC 23000-22). Ref: libavif.
@@ -139,7 +272,8 @@ Proprietary deviations to tolerate: Nikon Type-3 TIFF-in-TIFF (`Nikon\0`+header)
 encrypted/obfuscated tags, ORF/RW2 non-standard magic (patch to `2A 00` for the walk, restore on write).
 **(d)** EXIF via 0x8769; GPS via 0x8825; MakerNote 0x927C. XMP via tag `0x02BC` (700). IPTC via
 tag `0x83BB` and/or XMP. CR3 (BMFF): Canon `CMT1`=IFD0, `CMT2`=EXIF IFD, `CMT3`=MakerNote,
-`CMT4`=GPS; not the TIFF item model.
+`CMT4`=GPS, each a complete TIFF stream; XMP in the top-level `uuid` box
+`be7acfcb-97a9-42e8-9c71-999491e3afac`; not the TIFF item model.
 **(e)** Byte order fixed by header (no mixing); patch all dependent offsets when moving
 (StripOffsets 0x0111, TileOffsets 0x0144, SubIFDs, ExifIFD, MakerNote internal). Absolute-offset
 MakerNotes break if relocated — preserve in place or fix up. ORF/RW2: restore original magic on
@@ -148,6 +282,67 @@ write. CR2: preserve `CR 02 00` at offset 8. Even-byte alignment; tag-sorted IFD
 relative-vs-absolute; encrypted Sony tags; truncated MakerNote; ORF magic not in {IIRO,IIRS}
 → degrade to generic TIFF; RW2 0x0055 misread; CR3 missing/extra CMT* boxes, malformed
 moov/uuid; BigTIFF RAW (8-byte offsets, 20-byte entries, u64 counts).
+
+**Rule IDs (CR3; sub-test names).**
+- **CR3-CMT2-READ-01** CMT2 is a stand-alone TIFF stream whose first IFD is the Exif IFD (with the
+  Interoperability IFD behind its `0xA005` pointer); it is parsed into the EXIF model's Exif IFD, in the
+  byte order of CMT1. CMT1 holds no `ExifIFD` pointer. Reference: lclevy canon_cr3 (CMT2 = Exif IFD);
+  imagemeta `readCrxMoovBox`; ExifTool (`ExifIFD directory with N entries` read from CMT2).
+- **CR3-CMT2-WRITE-01** A write stores the Exif IFD in CMT2 (replaced when changed, kept byte for byte
+  when unchanged, created after CMT1 when missing) and never as a second Exif IFD inside CMT1.
+- **CR3-CMT4-DELETE-01** Deleting the GPS IFD removes the CMT4 box (as ExifTool's `-GPS:all=` does; Canon
+  firmware writes a CMT4 holding only `GPSVersionID` when there is no fix, so an empty IFD would still read
+  as GPS present). An unchanged GPS IFD keeps CMT4 byte for byte. A CMT4 that the reader does not expose
+  (no CMT1, unreadable, other byte order) is kept. The same rule removes CMT2 when the Exif IFD is deleted.
+
+- **CR3-WRITE-NODROP-01** (task #347) `Inject` never returns nil without storing a requested EXIF or XMP payload:
+  it writes it or returns `ErrNoMetadataContainer` (no `moov` box, which also matches `ErrNoMoovBox`; or, for EXIF, no
+  Canon uuid box in `moov`, the only carrier of CMT1-CMT4) and writes nothing. XMP needs no Canon box: it goes to the
+  top-level XMP uuid box. Only a request with no EXIF and no XMP copies the file through (IPTC is never stored in a
+  CR3). Creating the Canon uuid box is not attempted. ExifTool `WriteQuickTime.pl` also reports an error in these
+  cases (study). A Canon uuid box whose last child has a size field of 0 ("to the end of the container", ISO/IEC
+  14496-12 §4.2) gets an explicit size before a CMT box is appended, so the appended box is not read as part of it
+  (found by `FuzzCR3Inject`). `TestTask347InjectNeverReturnsNilWithoutWriting`,
+  `TestTask347NothingRequestedIsVerbatim`, `TestTask347OpenEndedChildKeepsAppendedCMT1`, `TestCR3RobustNoMoovRefused`,
+  `TestTask347CR3WriteWithoutCanonBoxIsRefused` (root, corpus file without its Canon uuid box), `FuzzCR3Inject`.
+
+**Rule IDs (NEF; sub-test names).**
+- **NEF-CAPTURE-OFFSETS-01** (task #355) MakerNote tag `0x0E0E` ("NikonCaptureOffsets", written by Nikon Capture) holds
+  `"0100"`, an entry count (2) and 12-byte entries (identifier (4), offset (4), 4 bytes of unknown meaning) in the
+  byte order of the MakerNote. Identifiers 1, 2 and 3 are copies of the offsets of IFD0, the Nikon PreviewIFD and the
+  first SubIFD. A NEF write moves them, so each is rewritten to the new position of the structure it names, when its
+  value equals the structure's position in the source; unknown identifiers and the 4 unknown bytes are carried
+  unchanged. The PreviewIFD moves with the MakerNote value (it lies inside the extended value the writer builds).
+  ExifTool does not update these offsets (`Nikon.pm`, study); this is original policy.
+  `TestTask355PatchNikonCaptureOffsets` (all four byte-order combinations).
+- **NEF-CAPTURE-OFFSETS-02** A value that does not start with `0100`, is truncated, names no structure of the source,
+  or sits in a MakerNote that is not Nikon Type 3 is carried unchanged. `TestTask355PatchLeavesWhatItDoesNotUnderstand`.
+- **NEF-CAPTURE-OFFSETS-03** Corpus finding: in all 9 NEF corpus files that carry the tag
+  (`raw/exiftool/Nikon.nef`, `raw/metadata-extractor/Issue 247-*.nef`) the values name no structure of their own
+  file (the files are pruned, or were edited after Nikon Capture wrote them), so a write carries them unchanged; a
+  copy of `Nikon.nef` whose values are made consistent follows the structures (`exiftool -NikonCaptureOffsets`
+  shows the new offsets). `TestTask355CorpusNEF`.
+
+**Rule IDs (TIFF-family write: bytes after the data; sub-test names).**
+- **TIFF-TAIL-01** (task #360) A TIFF-family write carries the tail of the source: the bytes after the last byte that
+  any IFD addresses (the image blocks, and the IFDs, sub-IFDs and out-of-line values of the metadata, found by the
+  extent scanner of `Extract`) are written after the last block, unchanged. It covers a trailer that nothing
+  addresses (unknown or private data appended by another writer) through the whole-file and the streaming path.
+  ExifTool `ExifTool.pm` (trailer handling, study) and Apache Commons Imaging `TiffImageWriterLossless` (keeps
+  unknown bytes; Apache-2.0, study) do the same in spirit. `TestTask360UnknownTrailerIsCarried`.
+- **TIFF-TAIL-02** An AFCP trailer that another trailer follows is found (the tail is scanned forward, not only
+  from the end of the file) and rewritten as in TIFF-AFCP-01; the bytes after it are carried unchanged. A malformed
+  trailer is carried byte for byte, never rewritten. `TestTask360AFCPFollowedByAnotherTrailer`,
+  `TestTask354TIFFTrailerEdgeCases`.
+- **TIFF-TAIL-03** Bytes between addressed regions, and the IFDs and values of the source that the write
+  regenerates (a source whose IFD follows the image data, as libtiff writes it), are not carried: they are exactly
+  what the write replaces, and carrying them would keep stale metadata. A tail larger than 16 MiB is carried
+  without the trailer rewrite. `TestTask360StaleStructuresAreNotCarried`.
+- **TIFF-TAIL-04** A file that ends with its image data, or with its structures, is written as before: nothing is
+  appended, and the scan is skipped when the last image block ends the file. `TestTask360NoTailIsNoChange`.
+- **JPEG-SIZE-01** (task #321) `jpeg.ImageSize` returns the dimensions of the first frame header (SOF0-SOF15 but not
+  DHT/JPG/DAC; ITU-T T.81 §B.2.2), skipping each segment by its length, and `ErrNoFrameHeader` at SOS/EOI, at the end
+  of the stream, for a zero height, or for a damaged stream. `TestImageSize`, `FuzzImageSize`.
 
 ## Cross-cutting: EXIF payload-prefix matrix (high-value test)
 | Container | EXIF location | Prefix before TIFF header |

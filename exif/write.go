@@ -134,7 +134,7 @@ var maxBigTIFFEncodeSize uint64 = 4 << 30 //nolint:gochecknoglobals // test-over
 // encoded length is returned, after the same validation Encode performs.
 // Otherwise the stream is written into dst's backing array from index 0 when
 // cap(dst) suffices, or into a newly allocated buffer of the exact size.
-func serialise(dst []byte, e *EXIF, sizeOnly bool) ([]byte, uint64, error) {
+func serialise(dst []byte, e *EXIF, sizeOnly bool, mn *mnPlan) ([]byte, uint64, error) {
 	if e == nil {
 		return nil, 0, ErrNilEXIF
 	}
@@ -169,6 +169,7 @@ func serialise(dst []byte, e *EXIF, sizeOnly bool) ([]byte, uint64, error) {
 	// (task #264).
 	ifd0Entries := buildIFD0Entries(e, order, &exifPtrBuf, &gpsPtrBuf, ifd0Ptr)
 	exifIFDEntries := buildExifIFDEntries(e, order, &interopPtrBuf, exifPtr)
+	mn.install(exifIFDEntries) // the MakerNote blob to write (makernote_rebase.go); no-op for a nil plan
 
 	// BigTIFF spec §2 (Aware Systems / libtiff); task #264: Encode natively
 	// supports BigTIFF sources rather than downgrading them to classic TIFF
@@ -207,7 +208,11 @@ func serialise(dst []byte, e *EXIF, sizeOnly bool) ([]byte, uint64, error) {
 	}
 	out = writeIFD(out, ifd0Entries, order, uint32(len(out)), ifd0NextPtr) //nolint:gosec // G115: output offset bounded by buffer size
 
-	out = writeSubIFDs(out, e, exifIFDEntries, order)
+	out, err := writeSubIFDs(out, e, exifIFDEntries, order, exifStart, gpsStart)
+	if err != nil {
+		return nil, 0, err
+	}
+	mn.finish(out, order) // the TIFF-relative MakerNote pointers, now that it has a position; no-op for a nil plan
 
 	return out, uint64(len(out)), nil
 }
@@ -278,7 +283,7 @@ func serialiseBigTIFF(dst []byte, e *EXIF, order binary.ByteOrder, ifd0Entries, 
 	}
 	out = writeIFDBigTIFF(out, ifd0Entries, order, uint64(len(out)), ifd0NextPtr)
 
-	out, err = writeSubIFDsBigTIFF(out, e, exifIFDEntries, order)
+	out, err = writeSubIFDsBigTIFF(out, e, exifIFDEntries, order, exifStart, gpsStart)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -286,26 +291,55 @@ func serialiseBigTIFF(dst []byte, e *EXIF, order binary.ByteOrder, ifd0Entries, 
 	return out, uint64(len(out)), nil
 }
 
-// checkBigTIFFThumbnails applies writeSubIFDsBigTIFF's R-16 thumbnail-pointer
-// range check without writing: it walks the IFD1 chain from ifd1Start using
-// the same layout arithmetic and returns ErrBigTIFFPointerOverflow when a
-// JPEGInterchangeFormat offset or length would not fit in 32 bits.
+// checkBigTIFFThumbnails applies writeSubIFDsBigTIFF's R-16 pointer range
+// check without writing: it walks the IFD1 chain from ifd1Start using the same
+// layout arithmetic and returns ErrBigTIFFPointerOverflow when a
+// JPEGInterchangeFormat offset or length, or the offset of a sub-IFD of the
+// chain, would not fit in 32 bits.
 func checkBigTIFFThumbnails(e *EXIF, ifd1Start uint64) error {
 	if e.IFD0 == nil {
 		return nil
 	}
 	pos := ifd1Start
 	for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
-		// patchThumbnailEntries never changes the entry count, types, or
-		// counts, so the unpatched entries have the same encoded size.
-		thumbOff := pos + ifdTotalSizeBigTIFF(ifd.Entries)
+		l := chainLen(e, ifd, pos, true)
 		thumbLen := uint64(len(ifd.ThumbnailData))
-		if ifd.ThumbnailData != nil && (thumbOff > math.MaxUint32 || thumbLen > math.MaxUint32) {
-			return fmt.Errorf("%w: JPEGInterchangeFormat offset %d / length %d", ErrBigTIFFPointerOverflow, thumbOff, thumbLen)
+		if ifd.ThumbnailData != nil && (l.thumb > math.MaxUint32 || thumbLen > math.MaxUint32) {
+			return fmt.Errorf("%w: JPEGInterchangeFormat offset %d / length %d", ErrBigTIFFPointerOverflow, l.thumb, thumbLen)
 		}
-		pos = thumbOff + thumbLen
+		if l.end > math.MaxUint32 && ifd.Sub != nil {
+			return fmt.Errorf("%w: IFD1 sub-IFD pointer target offset %d", ErrBigTIFFPointerOverflow, l.end)
+		}
+		pos = l.end
 	}
 	return nil
+}
+
+// chainLen returns the layout of the chained IFD ifd at output offset pos
+// (see planChain) without writing it. An IFD without pointer tags or attached
+// IFDs is measured on its own entries, which allocates nothing.
+func chainLen(e *EXIF, ifd *IFD, pos uint64, bigTIFF bool) chainLayout {
+	if !chainHasPointers(ifd) && ifd.thumbnailStrips() == nil {
+		blockEnd := pos + ifdWrittenLen(ifd.Entries, pos, bigTIFF, ifd.ThumbnailData != nil)
+		return chainLayout{thumb: blockEnd, end: blockEnd + thumbnailSpan(ifd)}
+	}
+	cb := chainEntries(e, ifd)
+	return planChain(&cb, ifd, pos, bigTIFF)
+}
+
+// chainHasPointers reports whether ifd, an IFD of the chain after IFD0, has an
+// Exif, GPS or Interoperability pointer entry or attached sub-IFDs, which
+// Encode rewrites (see chain.go).
+func chainHasPointers(ifd *IFD) bool {
+	if ifd.Sub != nil {
+		return true
+	}
+	for _, t := range chainPointerTags {
+		if hasEntry(ifd.Entries, t) {
+			return true
+		}
+	}
+	return false
 }
 
 // appendUint16Order appends the 2-byte encoding of v (per order) to out and
@@ -455,14 +489,17 @@ func writeTIFFHeaderBigTIFF(dst []byte, order binary.ByteOrder, total uint64) ([
 
 // writeSubIFDs appends the ExifIFD, GPS IFD, InteropIFD, and IFD1 chain blocks
 // to out in the order mandated by the TIFF layout (TIFF §2 / EXIF §4.5.4).
-// Returns the extended slice.
+// Returns the extended slice. exifStart and gpsStart are the offsets of the
+// ExifIFD and GPS IFD blocks, which a chained IFD may address too.
 //
 // For IFDs in the IFD1 chain that carry a JPEG thumbnail (ThumbnailData != nil),
 // the thumbnail bytes are appended immediately after the IFD block and the
 // JPEGInterchangeFormat (0x0201) entry value is patched to the new offset.
 // This fixes stale offset corruption that occurs when the TIFF is re-serialised
-// to a different position in the byte stream (EXIF §4.5.5, TIFF §2).
-func writeSubIFDs(out []byte, e *EXIF, exifIFDEntries []IFDEntry, order binary.ByteOrder) []byte {
+// to a different position in the byte stream (EXIF §4.5.5, TIFF §2). The
+// pointer entries of an IFD of the chain are relocated or dropped, and its own
+// Exif and GPS IFDs are written after its thumbnail (chain.go, task #319).
+func writeSubIFDs(out []byte, e *EXIF, exifIFDEntries []IFDEntry, order binary.ByteOrder, exifStart, gpsStart uint32) ([]byte, error) {
 	if e.ExifIFD != nil {
 		out = writeIFD(out, exifIFDEntries, order, uint32(len(out)), 0) //nolint:gosec // G115: output offset bounded by buffer size
 	}
@@ -478,53 +515,61 @@ func writeSubIFDs(out []byte, e *EXIF, exifIFDEntries []IFDEntry, order binary.B
 	// e.IFD0 is nil when the caller sets only ExifIFD/GPSIFD without IFD0; the
 	// IFD1 chain is unreachable in that case so skipping it is correct.
 	if e.IFD0 == nil {
-		return out
+		return out, nil
 	}
 	for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
-		// For IFDs with JPEG thumbnail data: the thumbnail bytes are placed
-		// immediately after the IFD block.  Compute the thumbnail offset now,
-		// patch the entries, then append the data.
-		//
 		// EXIF §4.5.5: JPEGInterchangeFormat (0x0201, TypeLong, Count=1) holds
 		// the absolute byte offset within the TIFF stream to the JPEG thumbnail.
 		// JPEGInterchangeFormatLength (0x0202, TypeLong, Count=1) holds its byte
 		// length.  Both are inline (4-byte) values in the IFD entry (TIFF §2:
 		// value stored inline when total size ≤ 4 bytes).
-		entries := ifd.Entries
-		if ifd.ThumbnailData != nil {
-			entries = patchThumbnailEntries(ifd.Entries, order,
-				uint32(len(out))+ifdTotalSize(ifd.Entries), //nolint:gosec // G115: output offset bounded by buffer size
-				uint32(len(ifd.ThumbnailData)),             //nolint:gosec // G115: thumbnail length bounded by parse-time validation
-			)
-		}
-
-		nextPtr := uint32(0)
-		if ifd.Next != nil {
-			// nextPtr must skip past both the IFD block and any thumbnail data
-			// that follows it before the next IFD begins.
-			nextPtr = uint32(len(out)) + ifdTotalSize(entries) + uint32(len(ifd.ThumbnailData)) //nolint:gosec // G115: output offset bounded by buffer size
-		}
-		out = writeIFD(out, entries, order, uint32(len(out)), nextPtr) //nolint:gosec // G115: output offset bounded by buffer size
-
-		// Append thumbnail bytes after the IFD block.
-		if ifd.ThumbnailData != nil {
-			out = append(out, ifd.ThumbnailData...)
+		//
+		// Task #279: every position is derived from the actual running output
+		// length through ifdWrittenLen, the same replay encodedLen uses, so the
+		// pointers written here and the sizes reported by EncodedSize cannot
+		// drift apart. ifdTotalSize is not used: it assumes an even start offset
+		// and a Value no longer than Count x type size.
+		var err error
+		out, err = writeChainIFD(out, e, ifd, order, false, uint64(exifStart), uint64(gpsStart))
+		if err != nil {
+			return nil, err
 		}
 	}
-	return out
+	return out, nil
+}
+
+// thumbnailSpan returns the number of bytes the IFD's thumbnail occupies
+// after its IFD block: the data itself plus one pad byte when the data has
+// odd length and another IFD follows. TIFF 6.0 §2 (p. 13): an IFD offset must
+// be even ("The Image File Directory ... must begin on a word boundary"), so
+// the IFD that follows an odd-length thumbnail is placed after a pad byte.
+// BigTIFF uses the same rule (libtiff tif_dirwrite.c word-aligns every offset).
+//
+// It is exact for an IFD without thumbnail strips (chainLen then uses it); for
+// one with strips it is an upper bound (every strip may need a pad byte), used
+// only to size the buffer of classicCapacityHint.
+func thumbnailSpan(ifd *IFD) uint64 {
+	n := uint64(len(ifd.ThumbnailData))
+	for _, s := range ifd.thumbnailStrips() {
+		n += uint64(len(s)) + 1
+	}
+	if ifd.Next != nil && n&1 == 1 {
+		n++
+	}
+	return n
 }
 
 // writeSubIFDsBigTIFF is the BigTIFF counterpart of writeSubIFDs; see its doc
 // comment for the overall layout rationale. All offsets are uint64
 // (BigTIFF spec §2).
 //
-// JPEGInterchangeFormat (0x0201) and JPEGInterchangeFormatLength (0x0202)
-// remain fixed EXIF LONG (4-byte) fields even in BigTIFF (task #264 §4); the
-// existing patchThumbnailEntries helper (unchanged) is reused directly once
-// the computed uint64 offset/length have been range-checked against
-// math.MaxUint32 — see ErrBigTIFFPointerOverflow's doc comment. Returns a
-// non-nil error instead of truncating when the check fails.
-func writeSubIFDsBigTIFF(out []byte, e *EXIF, exifIFDEntries []IFDEntry, order binary.ByteOrder) ([]byte, error) { //nolint:gocyclo,cyclop // mirrors classic writeSubIFDs' dispatch chain plus the R-16 thumbnail-pointer overflow guard; branches are inherent
+// JPEGInterchangeFormat (0x0201) and JPEGInterchangeFormatLength (0x0202), and
+// the Exif and GPS pointers of a chained IFD, remain fixed EXIF LONG (4-byte)
+// fields even in BigTIFF (task #264 §4); writeChainIFD range-checks the
+// computed uint64 offsets against math.MaxUint32 — see
+// ErrBigTIFFPointerOverflow's doc comment. Returns a non-nil error instead of
+// truncating when the check fails.
+func writeSubIFDsBigTIFF(out []byte, e *EXIF, exifIFDEntries []IFDEntry, order binary.ByteOrder, exifStart, gpsStart uint64) ([]byte, error) {
 	if e.ExifIFD != nil {
 		out = writeIFDBigTIFF(out, exifIFDEntries, order, uint64(len(out)), 0)
 	}
@@ -542,68 +587,13 @@ func writeSubIFDsBigTIFF(out []byte, e *EXIF, exifIFDEntries []IFDEntry, order b
 		return out, nil
 	}
 	for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
-		entries := ifd.Entries
-		if ifd.ThumbnailData != nil {
-			// EXIF §4.5.5: JPEGInterchangeFormat holds the absolute stream
-			// offset to the JPEG thumbnail; JPEGInterchangeFormatLength holds
-			// its byte length. Both stay TypeLong (32-bit) fields (task #264
-			// §4) — range-check before truncating (R-16).
-			thumbOff := uint64(len(out)) + ifdTotalSizeBigTIFF(ifd.Entries)
-			thumbLen := uint64(len(ifd.ThumbnailData))
-			if thumbOff > math.MaxUint32 || thumbLen > math.MaxUint32 {
-				return nil, fmt.Errorf("%w: JPEGInterchangeFormat offset %d / length %d", ErrBigTIFFPointerOverflow, thumbOff, thumbLen)
-			}
-			entries = patchThumbnailEntries(ifd.Entries, order, uint32(thumbOff), uint32(thumbLen))
-		}
-
-		nextPtr := uint64(0)
-		if ifd.Next != nil {
-			// nextPtr must skip past both the IFD block and any thumbnail data
-			// that follows it before the next IFD begins.
-			nextPtr = uint64(len(out)) + ifdTotalSizeBigTIFF(entries) + uint64(len(ifd.ThumbnailData))
-		}
-		out = writeIFDBigTIFF(out, entries, order, uint64(len(out)), nextPtr)
-
-		// Append thumbnail bytes after the IFD block.
-		if ifd.ThumbnailData != nil {
-			out = append(out, ifd.ThumbnailData...)
+		var err error
+		out, err = writeChainIFD(out, e, ifd, order, true, exifStart, gpsStart)
+		if err != nil {
+			return nil, err
 		}
 	}
 	return out, nil
-}
-
-// patchThumbnailEntries returns a shallow copy of entries with
-// TagJPEGInterchangeFormat (0x0201) and TagJPEGInterchangeFormatLength (0x0202)
-// patched to the provided newOffset and newLength values.
-//
-// Both tags are TypeLong / Count=1 (total size = 4 bytes, stored inline in the
-// IFD entry field per TIFF §2).  The [4]byte backing arrays are stack-allocated
-// in the caller's frame; the returned slice aliases them so no heap allocation
-// is needed.
-//
-// EXIF §4.5.5: JPEGInterchangeFormat is the absolute TIFF-stream offset to the
-// JPEG thumbnail; JPEGInterchangeFormatLength is its byte length.
-func patchThumbnailEntries(entries []IFDEntry, order binary.ByteOrder, newOffset, newLength uint32) []IFDEntry {
-	// Shallow-copy the slice so we don't mutate the IFD's original entries.
-	patched := make([]IFDEntry, len(entries))
-	copy(patched, entries)
-
-	for i := range patched {
-		switch patched[i].Tag {
-		case TagJPEGInterchangeFormat:
-			// Replace the stale offset with the new one.  Allocate a fresh
-			// [4]byte value so the original IFDEntry.Value slice is not modified.
-			v := make([]byte, 4)
-			order.PutUint32(v, newOffset)
-			patched[i].Value = v
-		case TagJPEGInterchangeFormatLength:
-			// Update length in case ThumbnailData was trimmed or replaced.
-			v := make([]byte, 4)
-			order.PutUint32(v, newLength)
-			patched[i].Value = v
-		}
-	}
-	return patched
 }
 
 // buildIFD0Entries assembles the IFD0 entry slice for encoding.
@@ -643,30 +633,21 @@ func buildIFD0Entries(e *EXIF, order binary.ByteOrder, exifPtrBuf, gpsPtrBuf *[4
 // and returns a sorted slice. Placeholder values are patched later by patchPointers.
 //
 // MakerNote bytes are preserved verbatim by exif.Encode. Offset correctness
-// after relocation depends on the maker's offset convention:
+// after relocation depends on the layout's offset base (EXIF.MakerNoteLayout,
+// from metadata-extractor ExifTiffHandler.processMakernote):
 //
-//   - Blob-relative (safe, no rebasing needed): Canon (plain IFD at offset 0),
-//     Panasonic ("Panasonic\0\0\0" prefix, IFD at offset 12, all val_or_off
-//     relative to blob start), Nikon Type-3 (embedded TIFF header inside the
-//     blob; all internal offsets relative to the embedded TIFF base which moves
-//     with the blob), Olympus "OLYMPUS\0" format (IFD at offset 12, blob-relative
-//     val_or_off), Pentax AOC / PENTAX.
+//   - Relative to a point inside the MakerNote (move-safe, no rebasing
+//     needed): Nikon Type 3 (embedded TIFF header), Olympus "OLYMPUS\0" and
+//     "OM SYSTEM", Fujifilm, Pentax AOC / PENTAX, Apple, Ricoh, Sanyo.
 //
-//   - TIFF-absolute (offsets relative to the outer TIFF base — become stale when
-//     the blob moves): Sony plain-IFD MakerNotes (DSLR-A series, ILCE, SLT —
-//     plain IFD at offset 0, all OOL val_or_off are outer-TIFF-absolute), and
-//     Olympus "OLYMP\0" MakerNotes (older compacts such as C5050Z — "OLYMP\0"
-//     prefix, IFD at offset 8, all OOL val_or_off are outer-TIFF-absolute).
-//     Nikon Type-1 (legacy D1, plain IFD at offset 0, big-endian, OOL offsets
-//     are outer-TIFF-absolute) is a documented limitation: rebasing is not
-//     implemented because Type-1 cameras are extremely rare and empirically
-//     produce no OOL MakerNote entries in practice (ExifTool Nikon.pm confirms
-//     Type-1 has no known OOL sub-structures; see relocate_makernote.go).
+//   - Relative to the TIFF header (stale when the MakerNote moves): Canon,
+//     Sony, Panasonic, Casio, Samsung, DJI, Kyocera, Sigma, Minolta, Nikon
+//     Type 2, Olympus "OLYMP\0", and unrecognised plain-IFD MakerNotes.
 //
-// Rebasing for Sony and Olympus OLYMP-type is performed by the TIFF relocators
-// in format/tiff/relocate_makernote.go after exif.Encode places the blob.
-// EXIF.MakerNoteOffset records the original TIFF offset so relocators can
-// compute the movement delta.
+// The TIFF-family writers rebase the second group after exif.Encode places
+// the blob (format/tiff/relocate_makernote.go, tasks #127, #310).
+// EXIF.MakerNoteOffset records the original TIFF offset so they can compute
+// the movement delta. Other containers (JPEG, PNG, WebP, HEIF) do not rebase.
 //
 // Reference: EXIF §4.6.5 tag 0x927C; ExifTool Sony.pm, Olympus.pm, Panasonic.pm,
 // Nikon.pm; empirical analysis per #127.
@@ -776,7 +757,14 @@ func classicCapacityHint(e *EXIF, ifd1Start uint32) uint64 {
 	total := uint64(ifd1Start)
 	if e.IFD0 != nil {
 		for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
-			total += uint64(ifdTotalSize(ifd.Entries)) + uint64(len(ifd.ThumbnailData))
+			total += uint64(ifdTotalSize(ifd.Entries)) + thumbnailSpan(ifd)
+			if sub := ifd.Sub; sub != nil { // chain.go: the attached IFDs follow the thumbnail
+				for _, x := range [...]*IFD{sub.Exif, sub.GPS, sub.Interop} {
+					if x != nil {
+						total += uint64(ifdTotalSize(x.Entries)) + 6
+					}
+				}
+			}
 		}
 	}
 	return total
@@ -811,10 +799,10 @@ func encodedLen(e *EXIF, ifd0Entries, exifIFDEntries []IFDEntry) uint64 {
 		return pos
 	}
 	for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
-		// writeSubIFDs replaces the JPEGInterchangeFormat/Length values with
-		// 4-byte values (patchThumbnailEntries) when ThumbnailData is set.
-		pos += ifdWrittenLen(ifd.Entries, pos, e.BigTIFF, ifd.ThumbnailData != nil)
-		pos += uint64(len(ifd.ThumbnailData))
+		// writeChainIFD replaces the JPEGInterchangeFormat/Length values with
+		// 4-byte values when ThumbnailData is set, and writes the sub-IFDs and
+		// pointers of the IFD as chain.go says; chainLen replays that layout.
+		pos = chainLen(e, ifd, pos, e.BigTIFF).end
 	}
 	return pos
 }

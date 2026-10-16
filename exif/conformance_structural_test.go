@@ -643,9 +643,9 @@ func TestConformance_S17_bigtiff_huge_count(t *testing.T) {
 // Section 2.4 — Field Type Codes (S-18..S-22)
 // ---------------------------------------------------------------------------
 
-// TestConformance_S18_field_type_sizes verifies that all 12 classic + UTF8 + BigTIFF
-// type codes map to the correct element byte sizes.
-// TIFF 6.0 §2 Table 1 and EXIF 2.32/3.0 §4.6.3.
+// TestConformance_S18_field_type_sizes verifies that all 12 classic + IFD (13) +
+// UTF-8 (129) + BigTIFF type codes map to the correct element byte sizes.
+// TIFF 6.0 §2 Table 1; TIFF Tech Note 1 (IFD); Exif 3.1 §4.6.2, p. 28 (UTF-8 = 129).
 func TestConformance_S18_field_type_sizes(t *testing.T) {
 	t.Parallel()
 	// Classic TIFF types (TIFF 6.0 §2 Table 1).
@@ -665,7 +665,8 @@ func TestConformance_S18_field_type_sizes(t *testing.T) {
 		{TypeSRational, 8},
 		{TypeFloat, 4},
 		{TypeDouble, 8},
-		{TypeUTF8, 1}, // EXIF 3.0 §4.6.3
+		{TypeIFD, 4},  // TIFF Tech Note 1: IFD = 13
+		{TypeUTF8, 1}, // Exif 3.1 §4.6.2, p. 28: UTF-8 = 129
 	}
 	for _, tc := range classicTests {
 		if got := typeSize(tc.typ); got != tc.wantSize {
@@ -696,6 +697,10 @@ func TestConformance_S18_field_type_sizes(t *testing.T) {
 	}
 	if got := typeSizeBigTIFF(DataType(99)); got != 0 {
 		t.Errorf("S-18: typeSizeBigTIFF(99) = %d, want 0", got)
+	}
+	// IFD and UTF-8 have the same size in BigTIFF.
+	if typeSizeBigTIFF(TypeIFD) != 4 || typeSizeBigTIFF(TypeUTF8) != 1 {
+		t.Errorf("S-18: typeSizeBigTIFF(IFD) = %d, typeSizeBigTIFF(UTF8) = %d, want 4, 1", typeSizeBigTIFF(TypeIFD), typeSizeBigTIFF(TypeUTF8))
 	}
 }
 
@@ -783,11 +788,12 @@ func TestConformance_S20_ascii_nul_terminated(t *testing.T) {
 	}
 }
 
-// TestConformance_S21_utf8_type13 verifies that TypeUTF8 (13) strings are decoded
-// correctly by EXIF 3.0-aware parsers, and that EXIF 2.x-era code (typeSize path)
-// treats type 13 as having element size 1 (not unknown), so no crash.
-// CIPA DC-008-2023 §4.6.3: TypeUTF8 = 13, element size 1, NUL-terminated UTF-8.
-func TestConformance_S21_utf8_type13(t *testing.T) {
+// TestConformance_S21_utf8_type129 verifies that TypeUTF8 (129) strings are decoded
+// correctly by Exif 3.x-aware parsers. Exif 3.1 §4.6.2, p. 28: "129 = UTF-8 ... The
+// final byte is terminated with NULL. BOM shall not be used"; element size 1.
+// (Task #320: the code was 13 before, which is the TIFF IFD type; see
+// utf8_type_test.go for 13.)
+func TestConformance_S21_utf8_type129(t *testing.T) {
 	t.Parallel()
 	order := binary.LittleEndian
 	payload := []byte("Ångström\x00")                                                         // UTF-8 with multi-byte chars
@@ -1191,7 +1197,7 @@ func TestConformance_S32_gps_mandatory_tags(t *testing.T) {
 	if e.GPSIFD == nil {
 		t.Fatal("S-32: GPSIFD nil after SetGPS")
 	}
-	// GPSVersionID must be TypeByte[4] = {2,3,0,0}.
+	// GPSVersionID must be TypeByte[4] = {2,4,0,0}.
 	vid := e.GPSIFD.Get(TagGPSVersionID)
 	if vid == nil {
 		t.Fatal("S-32: GPSVersionID missing")
@@ -1199,8 +1205,8 @@ func TestConformance_S32_gps_mandatory_tags(t *testing.T) {
 	if vid.Type != TypeByte || vid.Count != 4 {
 		t.Errorf("S-32: GPSVersionID type=%d count=%d, want Byte/4", vid.Type, vid.Count)
 	}
-	if len(vid.Value) < 4 || vid.Value[0] != 2 || vid.Value[1] != 3 {
-		t.Errorf("S-32: GPSVersionID value = %v, want {2,3,0,0}", vid.Value[:4])
+	if len(vid.Value) < 4 || vid.Value[0] != 2 || vid.Value[1] != 4 {
+		t.Errorf("S-32: GPSVersionID value = %v, want {2,4,0,0}", vid.Value[:4])
 	}
 	// GPSLatitudeRef must be "S\x00" for lat < 0.
 	latRef := e.GPSIFD.Get(TagGPSLatitudeRef)

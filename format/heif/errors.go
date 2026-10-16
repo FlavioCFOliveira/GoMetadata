@@ -29,7 +29,11 @@ var maxFileSize int64 = 256 << 20 //nolint:gochecknoglobals // test-overridable 
 // allocation. Callers can detect this specific condition with errors.Is.
 var ErrFileTooLarge = errors.New("heif: input exceeds maximum file size (256 MiB)")
 
-// ErrMaxNestingDepth is returned when findBox exceeds the maximum recursive nesting depth.
+// ErrMaxNestingDepth is no longer returned: the metadata container is selected
+// by a bounded, non-recursive scan (task #349). It is kept so that code
+// comparing against it keeps compiling.
+//
+// Deprecated: never returned.
 var ErrMaxNestingDepth = errors.New("heif: findBox: exceeded maximum nesting depth")
 
 // ErrCorruptXMP is returned when the rawXMP bytes passed to Inject are not a
@@ -46,3 +50,18 @@ var ErrCorruptXMP = errors.New("heif: corrupt or invalid XMP data")
 //
 // Use PreserveUnknownSegments(true) (the default) when writing to HEIF/AVIF.
 var ErrPreserveUnknownSegmentsNotSupported = errors.New("heif: PreserveUnknownSegments(false) is not supported for HEIF/AVIF; ISOBMFF boxes are structurally mandatory")
+
+// ErrNoMetadataContainer is returned by Inject when it is asked to store EXIF
+// or XMP data in a file that has no metadata container box, or whose
+// container box is too small to be valid. Without that box the file has no
+// item table to hold the metadata, so the request cannot be honoured; the
+// output is never silently left without the requested metadata.
+var ErrNoMetadataContainer = errors.New("heif: the file has no valid metadata container, so EXIF and XMP cannot be stored in it")
+
+// ErrUnreadableItemLocations is returned by Inject when it is asked to store
+// EXIF or XMP data in a file whose item location table is missing, uses an
+// unsupported version or field size, or is truncated or too large to be
+// rewritten safely. Rewriting such a table would drop items of the file, and
+// leaving it untouched would drop the requested metadata, so the request is
+// refused instead.
+var ErrUnreadableItemLocations = errors.New("heif: the item location table is missing or cannot be read, so metadata cannot be stored in the file")

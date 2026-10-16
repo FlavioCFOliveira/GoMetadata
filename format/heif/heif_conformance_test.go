@@ -60,7 +60,7 @@ func bmffLargesizeBox(typ string, body []byte) []byte {
 // bmffFullBox wraps a body with a FullBox version+flags header (4 bytes).
 // ISO 14496-12 §4.2: FullBox = Box + version(1) + flags(3).
 // flags is a 3-byte value; version occupies the leading byte.
-func bmffFullBox(typ string, version byte, flags uint32, body []byte) []byte { //nolint:unparam // flags always 0 by design in conformance tests; version varies
+func bmffFullBox(typ string, version byte, flags uint32, body []byte) []byte {
 	vf := make([]byte, 0, 4+len(body))
 	// Encode version+flags as a 4-byte big-endian value with version in the high byte.
 	combined := (uint32(version) << 24) | (flags & 0x00FFFFFF)
@@ -82,7 +82,7 @@ func bmffFtyp(majorBrand string, minorVersion uint32, compatBrands ...string) []
 
 // bmffInfeV2 assembles an infe (item info entry) FullBox version 2.
 // ISO 14496-12 §8.11.6: version(1)+flags(3)+item_ID(2)+item_protection_index(2)+item_type(4)+item_name(NUL).
-func bmffInfeV2(itemID uint16, itemType string) []byte { //nolint:unparam // itemType always "Exif" in most call sites; parameter kept for multi-type tests
+func bmffInfeV2(itemID uint16, itemType string) []byte {
 	body := make([]byte, 0, 2+2+4+1)
 	body = binary.BigEndian.AppendUint16(body, itemID)
 	// item_protection_index(2) + item_type(4) + item_name NUL(1)
@@ -92,7 +92,7 @@ func bmffInfeV2(itemID uint16, itemType string) []byte { //nolint:unparam // ite
 
 // bmffInfeV2WithContentType assembles an infe v2 for mime items (XMP).
 // ISO 14496-12 §8.11.6 + ISO 23008-12 §6.2: content_type NUL-terminated after item_type.
-func bmffInfeV2WithContentType(itemID uint16, itemType, contentType string) []byte {
+func bmffInfeV2WithContentType(itemID uint16, itemType, contentType string) []byte { //nolint:unparam // itemType is always "mime" today; kept explicit so the item type of every fixture reads at the call site
 	body := make([]byte, 0, 2+2+4+1+len(contentType)+1)
 	body = binary.BigEndian.AppendUint16(body, itemID)
 	// item_protection_index(2) + item_type(4) + item_name NUL(1)
@@ -123,8 +123,9 @@ type bmffIlocItem struct {
 // ISO 14496-12 §8.11.3: item location box.
 func bmffIloc(items []bmffIlocItem) []byte {
 	// body: sizes(2)+item_count(2)+items[]
-	// Each item: item_ID(2)+extent_count(2)+extent_offset(4)+extent_length(4) = 12 bytes
-	body := make([]byte, 0, 4+len(items)*12)
+	// Each item: item_ID(2)+data_reference_index(2)+extent_count(2)+
+	// extent_offset(4)+extent_length(4) = 14 bytes
+	body := make([]byte, 0, 4+len(items)*14)
 	body = append(body,
 		0x44, // offset_size=4, length_size=4
 		0x00, // base_offset_size=0, reserved=0
@@ -132,7 +133,10 @@ func bmffIloc(items []bmffIlocItem) []byte {
 	body = binary.BigEndian.AppendUint16(body, uint16(len(items))) //nolint:gosec // G115: test helper, bounded
 	for _, it := range items {
 		body = binary.BigEndian.AppendUint16(body, it.id)
-		body = append(body, 0x00, 0x01) // extent_count=1
+		body = append(body,
+			0x00, 0x00, // data_reference_index=0 (this file), ISO 14496-12 §8.11.3.2
+			0x00, 0x01, // extent_count=1
+		)
 		body = binary.BigEndian.AppendUint32(body, it.offset)
 		body = binary.BigEndian.AppendUint32(body, it.length)
 	}
@@ -601,7 +605,7 @@ func TestHEIFExifItemIlocOffset(t *testing.T) {
 	data := buildConformanceHEIF("heic", exif, nil)
 
 	// Parse meta to find iloc and verify the offset.
-	metaContent, err := findBox(data, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(data)
 	if err != nil || metaContent == nil {
 		t.Fatalf("HEIF-Exif-item-iloc-offset: meta box not found (err=%v)", err)
 	}
@@ -656,7 +660,7 @@ func TestHEIFMimeXMPContentTypeExact(t *testing.T) {
 	data := buildConformanceHEIF("heic", nil, xmp)
 
 	// Parse the infe box to verify the content_type bytes.
-	metaContent, err := findBox(data, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(data)
 	if err != nil || metaContent == nil {
 		t.Fatalf("HEIF-mime-xmp-content-type-exact: meta box not found (err=%v)", err)
 	}
@@ -777,7 +781,7 @@ func TestHEIFWriteEXIFPrefixOnInject(t *testing.T) {
 
 	// The EXIF item payload in the output file must begin with 4 zero bytes (the prefix).
 	outData := out.Bytes()
-	metaContent, err := findBox(outData, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(outData)
 	if err != nil || metaContent == nil {
 		t.Fatalf("HEIF-write-exif-prefix-on-inject: meta box not found in output (err=%v)", err)
 	}
@@ -820,7 +824,7 @@ func TestHEIFWriteIlocOffsetsPatched(t *testing.T) {
 	}
 	outData := out.Bytes()
 
-	metaContent, err := findBox(outData, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(outData)
 	if err != nil || metaContent == nil {
 		t.Fatalf("HEIF-write-iloc-offsets-patched: meta box not found (err=%v)", err)
 	}
@@ -882,7 +886,7 @@ func TestHEIFWriteXMPContentTypePreserved(t *testing.T) {
 		t.Fatalf("HEIF-write-xmp-content-type-preserved: Inject failed: %v", err)
 	}
 
-	metaContent, err := findBox(out.Bytes(), boxTypeMeta, 0)
+	metaContent, err := findMetaContent(out.Bytes())
 	if err != nil || metaContent == nil {
 		t.Fatalf("HEIF-write-xmp-content-type-preserved: meta box not found (err=%v)", err)
 	}
@@ -1100,23 +1104,22 @@ func TestHEIFRobustTruncatedMeta(t *testing.T) {
 }
 
 // TestHEIFRobustDeepNesting verifies that deeply nested container boxes do not
-// cause a stack overflow (findBox has a depth limit of 32).
+// cause a stack overflow or a false meta box (the selection scan is
+// non-recursive).
 // ISO 14496-12 §4.2: arbitrary nesting is not guaranteed valid.
 func TestHEIFRobustDeepNesting(t *testing.T) {
-	// HEIF-robust-deep-nesting: §5(f) — depth > 32 returns ErrMaxNestingDepth.
+	// HEIF-robust-deep-nesting: §5(f) — deep nesting is neither followed nor a panic.
 	t.Parallel()
 
-	// Build 35 levels of "moov" nesting (findBox limit is 32).
+	// Build 35 levels of "moov" nesting (the scan never recurses).
 	innerData := bmffFtyp("heic", 0)
 	for range 35 {
 		innerData = bmffBox("moov", innerData)
 	}
 
-	_, err := findBox(innerData, boxTypeMeta, 0)
-	if err == nil {
-		t.Log("HEIF-robust-deep-nesting: findBox returned nil error on >32 nesting (may have gracefully stopped)")
-	} else if !strings.Contains(err.Error(), "nesting") {
-		t.Logf("HEIF-robust-deep-nesting: got error %v (may be depth limit)", err)
+	_, _, _, found := findMetaBoxAbs(innerData)
+	if found {
+		t.Fatal("HEIF-robust-deep-nesting: a meta box was found in a ftyp nested in moov boxes")
 	}
 }
 
@@ -1264,7 +1267,7 @@ func TestHEIFRobustIlocV2ItemID(t *testing.T) {
 	t.Parallel()
 
 	// Build a minimal iloc v2 with one item whose ID = 0x00020000 (> math.MaxUint16).
-	// body: version+flags(4) + sizes(2) + item_count(4) + item_ID(4)+construct(2)+extcnt(2)
+	// body: version+flags(4) + sizes(2) + item_count(4) + item_ID(4)+construct(2)+dri(2)+extcnt(2)
 	ilocBody := []byte{
 		0x02, 0x00, 0x00, 0x00, // version=2, flags=0
 		0x44,                   // offset_size=4, length_size=4
@@ -1272,6 +1275,7 @@ func TestHEIFRobustIlocV2ItemID(t *testing.T) {
 		0x00, 0x00, 0x00, 0x01, // item_count=1 (v2=4 bytes)
 		0x00, 0x02, 0x00, 0x00, // item_ID = 0x00020000 > 0xFFFF → rejected
 		0x00, 0x00, // construction_method=0
+		0x00, 0x00, // data_reference_index=0
 		0x00, 0x01, // extent_count=1
 		0x00, 0x00, 0x00, 0x00, // extent_offset=0
 		0x00, 0x00, 0x00, 0x04, // extent_length=4
@@ -1442,16 +1446,18 @@ func TestHEIFRobustIlocConstructionMethod1(t *testing.T) {
 	//
 	// iloc v1 body layout:
 	//   version(1)+flags(3)+sizes(2)+item_count(2)+
-	//   item_ID(2)+construction_method(2)+base_offset(0)+extent_count(2)+offset(4)+length(4)
+	//   item_ID(2)+construction_method(2)+data_reference_index(2)+base_offset(4)+
+	//   extent_count(2)+offset(4)+length(4)
 	ilocBody := []byte{
 		0x01, 0x00, 0x00, 0x00, // version=1, flags=0
 		0x44,       // offset_size=4, length_size=4
-		0x10,       // base_offset_size=1, index_size=0
+		0x40,       // base_offset_size=4, index_size=0
 		0x00, 0x01, // item_count=1
 		// Item entry:
 		0x00, 0x01, // item_ID=1
-		0x00, 0x01, // construction_method=1 (idat-relative — cannot resolve)
-		0x10,       // base_offset (1 byte, value=16)
+		0x00, 0x01, // construction_method=1 (idat-relative — no idat box in this file)
+		0x00, 0x00, // data_reference_index=0
+		0x00, 0x00, 0x00, 0x10, // base_offset=16
 		0x00, 0x01, // extent_count=1
 		0x00, 0x00, 0x00, 0x10, // extent_offset=16
 		0x00, 0x00, 0x00, 0x08, // extent_length=8
@@ -1500,22 +1506,23 @@ func TestReadIlocSimpleExtentsTruncatedIndex(t *testing.T) {
 	// HEIF-robust-audit-133: §5(f) LOW — truncated iloc extent_index must not produce zero-offset item.
 	t.Parallel()
 
-	// Build iloc v1 with index_size=2 (i.e. extent_index is 2 bytes per extent)
-	// but the extent data is truncated after the item_ID and construction_method —
-	// there is no room for even the extent_index field.
+	// Build iloc v1 with index_size=4 (i.e. extent_index is 4 bytes per extent)
+	// but the extent data is truncated after the item header — there is no
+	// room for even the extent_index field.
 	//
 	// iloc v1 body: version(1)+flags(3)+sizes(2)+item_count(2)+
-	//   item_ID(2)+const_method(2)+extent_count(2)+extent_index(2)[truncated]
+	//   item_ID(2)+const_method(2)+data_reference_index(2)+extent_count(2)+extent_index(4)[truncated]
 	ilocBody := []byte{
 		0x01, 0x00, 0x00, 0x00, // version=1, flags=0
 		0x44,       // offset_size=4, length_size=4
-		0x02,       // base_offset_size=0, index_size=2  ← index present
+		0x04,       // base_offset_size=0, index_size=4  ← index present
 		0x00, 0x01, // item_count=1
 		// Item entry (truncated after extent_count):
 		0x00, 0x01, // item_ID=1
 		0x00, 0x00, // construction_method=0
+		0x00, 0x00, // data_reference_index=0
 		0x00, 0x01, // extent_count=1
-		// extent_index (2 bytes) is missing — truncated here
+		// extent_index (4 bytes) is missing — truncated here
 	}
 	rawIloc := make([]byte, 8+len(ilocBody))
 	binary.BigEndian.PutUint32(rawIloc, uint32(len(rawIloc))) //nolint:gosec // G115: test helper, bounded

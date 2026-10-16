@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("< xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"<rdf:Description xmlns:dc=\"0\"<dc: /0<dc:\".0000<rdf:<rdf:")

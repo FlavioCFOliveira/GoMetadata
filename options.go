@@ -18,12 +18,17 @@ type readConfig struct {
 }
 
 // WithoutXMP skips XMP parsing, reducing allocations when XMP is not needed.
+// The XMP packet is not lost: a Write of the Metadata carries it unchanged,
+// also after a setter ran (the setters then update EXIF and IPTC only). To
+// replace it, assign Metadata.XMP.
 func WithoutXMP() ReadOption { return func(c *readConfig) { c.lazyXMP = true } }
 
-// WithoutIPTC skips IPTC parsing.
+// WithoutIPTC skips IPTC parsing. The IPTC is carried unchanged by Write, also
+// after a setter ran; to replace it, assign Metadata.IPTC.
 func WithoutIPTC() ReadOption { return func(c *readConfig) { c.lazyIPTC = true } }
 
-// WithoutEXIF skips EXIF parsing.
+// WithoutEXIF skips EXIF parsing. The EXIF is carried unchanged by Write, also
+// after a setter ran; to replace it, assign Metadata.EXIF.
 func WithoutEXIF() ReadOption { return func(c *readConfig) { c.lazyEXIF = true } }
 
 // WithoutMakerNote skips manufacturer-specific MakerNote IFD parsing.

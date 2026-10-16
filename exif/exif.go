@@ -1,8 +1,10 @@
 // Package exif implements an EXIF/TIFF parser and writer.
 //
-// Compliance: CIPA DC-008-2023 / JEITA CP-3451 (EXIF 3.0) and TIFF 6.0.
-// Spec citations in comments reference the CIPA document as "EXIF §<section>"
-// and the TIFF 6.0 spec as "TIFF §<section>".
+// Compliance target: CIPA DC-008-2026 / JEITA CP-3451H (Exif 3.1), which keeps
+// the structure of Exif 3.0 (CIPA DC-008-2024) and 2.x readable, and Adobe
+// TIFF Revision 6.0. Spec citations in comments reference the CIPA document
+// as "Exif 3.1 §<section>, p. <printed page>" (a citation to an older edition
+// names it) and the TIFF 6.0 spec as "TIFF §<section>".
 package exif
 
 import (
@@ -33,10 +35,10 @@ import (
 // 32-bit file offsets) may safely continue using MakerNoteOffset.
 //
 // These fields are informational: callers can use them to detect whether Encode
-// has moved the MakerNote to a different position.  Manufacturers that store
-// MakerNote-internal offsets relative to the parent TIFF start (e.g. certain
-// Nikon bodies) will produce stale internal offsets if the MakerNote moves;
-// full offset rebasing is not yet implemented.  EXIF §4.6.5, tag 0x927C.
+// has moved the MakerNote to a different position.  Encode copies the
+// MakerNote verbatim; when its layout counts value offsets from the TIFF
+// header (EXIF.MakerNoteLayout), a writer that moves it must rebase them, as
+// the TIFF-family writers of format/tiff do.  EXIF §4.6.5, tag 0x927C.
 // BigTIFF spec §2 (Aware Systems / libtiff); fix for audit finding #142.
 //
 // BigTIFF is true when the EXIF was parsed from a BigTIFF source (magic 0x002B,
@@ -76,6 +78,23 @@ type EXIF struct {
 	// BigTIFF spec §2 (Aware Systems / libtiff); audit finding #107; task #264.
 	BigTIFF bool
 
+	// CompressedPrimary reports that the primary image of the container is
+	// JPEG-compressed data, the case of an Exif-JPEG file. It selects the
+	// "Compressed" column of the tag support levels of Exif 3.1 §4.6.9,
+	// Tables 17-18 (pp. 93-96) for the IFDs this package creates on its own
+	// (see New and the Set* methods): the tags ComponentsConfiguration,
+	// PixelXDimension and PixelYDimension are mandatory there and not
+	// allowed for uncompressed data, and the same holds for YCbCrPositioning
+	// in IFD0. gometadata.Read sets it for a JPEG source; the zero value
+	// means "not known to be compressed", which creates no such tag.
+	CompressedPrimary bool
+
+	// sizePending is set when this package created an ExifIFD for a
+	// compressed primary image without PixelXDimension and PixelYDimension,
+	// which are mandatory there (Exif 3.1 Table 18, p. 95) and which only the
+	// container knows. NeedsImageSize reports it; SetImageSize clears it.
+	sizePending bool
+
 	// Warnings is a slice of diagnostic messages produced during parsing.
 	// A non-nil Warnings slice does not indicate a parse failure; the EXIF
 	// data is still usable. Each entry describes a recoverable anomaly such
@@ -96,6 +115,7 @@ type parseConfig struct {
 	skipMakerNote  bool
 	extraMagic     uint16
 	aliasThumbnail bool
+	thumbStrips    bool
 }
 
 // SkipMakerNote skips parsing the manufacturer-specific MakerNote IFD.
@@ -144,13 +164,13 @@ func AcceptRAWMagic(magic uint16) ParseOption {
 //  2. b is never mutated in place.
 //
 // Without this option (the default), every ThumbnailData is an independent
-// copy and b may be freely discarded, reused, or pooled the instant Parse
-// returns — Parse's long-standing default contract. This option is for
-// gometadata.Read's own internal use, where the buffer passed to Parse is
-// always Metadata.rawEXIF, a field retained unmodified for the *Metadata's
-// entire lifetime (see Metadata.RawEXIF's defensive bytes.Clone for external
-// callers, which exists precisely because the internal field is never
-// copied-on-read). Passing this option with a transient or mutable buffer
+// copy. Entry values and MakerNote alias b in either case (see Parse), so b
+// must not be modified, reused, or pooled while the result is in use. This
+// option is for gometadata.Read's own internal use, where the buffer passed
+// to Parse is always Metadata.rawEXIF, a field retained unmodified for the
+// *Metadata's entire lifetime (see Metadata.RawEXIF's defensive bytes.Clone
+// for external callers, which exists precisely because the internal field is
+// never copied-on-read). Passing this option with a transient or mutable buffer
 // will corrupt or invalidate the returned ThumbnailData once that buffer is
 // released or modified.
 //
@@ -158,6 +178,25 @@ func AcceptRAWMagic(magic uint16) ParseOption {
 func AliasThumbnail() ParseOption {
 	return func(c *parseConfig) { c.aliasThumbnail = true }
 }
+
+// CarryThumbnailStrips configures Parse to read the strips of an uncompressed
+// thumbnail (Exif 3.1 §4.5.8, pp. 25-26) into IFD.Sub.ThumbnailStrips for every IFD
+// of the chain after IFD0, so that Encode writes them again with valid
+// StripOffsets. Without this option the strip data is not read and Encode
+// writes the StripOffsets and StripByteCounts entries as they were parsed.
+//
+// Use it for a stream that is encoded again on its own (a JPEG APP1 segment, a
+// PNG eXIf chunk, a WebP or HEIF Exif item). Do not use it for a TIFF-based file
+// whose image data is relocated by format/tiff: that path carries the strips of
+// every IFD itself and would write them twice.
+//
+// The strips are carried when every strip lies inside the parsed bytes and the
+// total is at most 1 MiB in at most 4096 strips; otherwise Parse adds a warning
+// and leaves the IFD unchanged. With AliasThumbnail the strips alias the parsed
+// bytes (same contract).
+//
+//go:noinline
+func CarryThumbnailStrips() ParseOption { return func(c *parseConfig) { c.thumbStrips = true } }
 
 // parseByteOrder reads the two-byte byte-order marker at b[0:2] and returns
 // the corresponding binary.ByteOrder. Returns a CorruptMetadataError for any
@@ -228,25 +267,55 @@ func parseExifSubIFDs(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *parseCon
 		makerNoteOffset64 = mn.rawOffset
 		makerNoteOffset = uint32(mn.rawOffset) //nolint:gosec // G115: classic TIFF offsets always fit uint32
 		if !cfg.skipMakerNote {
+			// task #202: zero-alloc dispatch — pass raw IFDEntry.Value bytes to
+			// makerNoteDispatch so the NUL+whitespace trim and detection operate
+			// on []byte with no heap string allocation.
+			// Task #304: detection is by MakerNote signature first, so a missing
+			// Make no longer skips dispatch (Apple, Epson, ... write signed notes).
+			// EXIF §4.6.4 tag 0x010F (Make); EXIF §4.6.5 tag 0x927C (MakerNote).
+			var makeValue []byte
 			if makeEntry := ifd0.Get(TagMake); makeEntry != nil {
-				// task #202: zero-alloc dispatch — pass raw IFDEntry.Value bytes to
-				// makerNoteDispatch so the NUL+whitespace trim and map lookup operate
-				// on []byte with no heap string allocation. The Go compiler elides the
-				// string([]byte) heap copy when it appears directly as a map key.
-				// EXIF §4.6.4 tag 0x010F (Make); EXIF §4.6.5 tag 0x927C (MakerNote).
-				makerNoteIFD = makerNoteDispatch(makeEntry.Value, order, mn.Value)
+				makeValue = makeEntry.Value
 			}
+			// Task #312: b is passed so that a layout whose value offsets
+			// count from the TIFF header resolves them against b.
+			makerNoteIFD = makerNoteDispatchAt(makeValue, order, mn.Value, b, mn.rawOffset)
 		}
 	}
 
 	// Interoperability IFD pointer (EXIF §4.6.3, tag 0xA005).
-	if iptr := sub.Get(TagInteropIFDPointer); iptr != nil && len(iptr.Value) >= 4 {
-		if isub, isubWarnings, ierr := traverseWithArena(b, order.Uint32(iptr.Value), order, arena, budget, cfg.aliasThumbnail); ierr == nil {
-			interopIFD = isub
-			warnings = append(warnings, isubWarnings...)
-		}
-	}
+	interopIFD, interopWarnings := parseInteropIFD(b, order, sub, order.Uint32(ptr.Value), arena, budget, cfg.aliasThumbnail)
+	warnings = append(warnings, interopWarnings...)
 	return exifIFD, makerNote, makerNoteOffset, makerNoteOffset64, makerNoteIFD, interopIFD, warnings
+}
+
+// parseInteropIFD parses the Interoperability IFD that tag 0xA005 of the Exif
+// IFD sub points to (EXIF §4.6.3), or returns nil when there is no pointer or it
+// does not address an IFD of its own. exifOff is the offset of the Exif IFD.
+//
+// A pointer that addresses IFD0 or the Exif IFD itself is a loop, not an IFD
+// (the Kodak ProBack of the corpus points it at IFD0, offset 8): ExifTool
+// ignores it ("InteropIFD pointer references previous IFD0 directory"), and so
+// must a writer, which would otherwise write a second copy of that IFD as the
+// Interoperability IFD (task #362).
+func parseInteropIFD(b []byte, order binary.ByteOrder, sub *IFD, exifOff uint32, arena *parseArena, budget *traverseBudget, aliasThumbnail bool) (*IFD, []parseWarn) {
+	iptr := sub.Get(TagInteropIFDPointer)
+	if iptr == nil || len(iptr.Value) < 4 || pointsAtEarlierIFD(b, order, order.Uint32(iptr.Value), exifOff) {
+		return nil, nil
+	}
+	isub, warnings, err := traverseWithArena(b, order.Uint32(iptr.Value), order, arena, budget, aliasThumbnail)
+	if err != nil {
+		return nil, nil
+	}
+	return isub, warnings
+}
+
+// pointsAtEarlierIFD reports whether off is the offset of IFD0 (the offset in
+// the TIFF header of b) or exifOff, the offset of the Exif IFD: an IFD that is
+// read already. The traversal budget bounds the cost of a loop, but the copy
+// would be written as a second IFD.
+func pointsAtEarlierIFD(b []byte, order binary.ByteOrder, off, exifOff uint32) bool {
+	return len(b) >= 8 && (off == order.Uint32(b[4:]) || off == exifOff)
 }
 
 // parseGPSSubIFD traverses the GPS IFD rooted at the TagGPSIFDPointer entry
@@ -314,18 +383,19 @@ func parseExifSubIFDsBigTIFF(b []byte, ifd0 *IFD, order binary.ByteOrder, cfg *p
 		makerNoteOffset64 = mn.rawOffset
 		makerNoteOffset = uint32(mn.rawOffset & 0xFFFF_FFFF) // backward compat: lower 32 bits only; callers needing full offset use MakerNoteOffset64
 		if !cfg.skipMakerNote {
+			// task #202: zero-alloc dispatch — same pattern as the classic TIFF path.
+			// makerNoteDispatch trims NULs+whitespace from the raw Make bytes and
+			// detects the layout (signature first, task #304) without allocating.
+			// parseMakerNoteIFD uses the classic-TIFF traversal internally; for
+			// BigTIFF containers the MakerNote blob is still a classic-TIFF
+			// fragment so this is correct IF the MakerNote itself is a plain IFD.
+			// On failure (e.g. Nikon encrypted notes) the result is nil — safe.
+			// EXIF §4.6.4 tag 0x010F (Make); BigTIFF spec §2; task #202.
+			var makeValue []byte
 			if makeEntry := ifd0.Get(TagMake); makeEntry != nil {
-				// task #202: zero-alloc dispatch — same pattern as the classic TIFF path.
-				// makerNoteDispatch trims NULs+whitespace from the raw Make bytes and
-				// performs a string([]byte)-keyed map lookup that the Go compiler
-				// special-cases to avoid heap allocation (cmd/compile mapaccess2_faststr).
-				// parseMakerNoteIFD uses the classic-TIFF traversal internally; for
-				// BigTIFF containers the MakerNote blob is still a classic-TIFF
-				// fragment so this is correct IF the MakerNote itself is a plain IFD.
-				// On failure (e.g. Nikon encrypted notes) the result is nil — safe.
-				// EXIF §4.6.4 tag 0x010F (Make); BigTIFF spec §2; task #202.
-				makerNoteIFD = makerNoteDispatch(makeEntry.Value, order, mn.Value)
+				makeValue = makeEntry.Value
 			}
+			makerNoteIFD = makerNoteDispatch(makeValue, order, mn.Value)
 		}
 	}
 
@@ -381,6 +451,10 @@ const bigTIFFMinHeader = 16
 // profile.  The BigTIFF path uses separate traversal functions
 // (traverseBigTIFF, parseSingleIFDBigTIFF, parseIFDEntryBigTIFF) that share
 // the same IFD/IFDEntry types with the classic path.
+//
+// Parse does not copy value bytes: every IFDEntry.Value and EXIF.MakerNote
+// of the result is a view of b (task #296). b must stay unmodified while the
+// result is in use, and the views are read-only — see IFDEntry.Value.
 func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cyclop,funlen // multi-format TIFF/BigTIFF dispatch; branches are inherent in format detection
 	var cfg parseConfig
 	for _, o := range opts {
@@ -486,9 +560,19 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 		// test fixtures) and avoids the overhead of calling parseExifSubIFDs and
 		// parseGPSSubIFD when we already know they would return nil.
 
+		// Task #319: the Exif and GPS IFDs that an IFD of the chain after IFD0
+		// (the thumbnail IFD) addresses itself are carried (Exif 3.1 Table 21,
+		// p. 99). One nil check on the common file.
+		if ifd0.Next != nil {
+			attachChainSubIFDs(b, ifd0, order, &budget, cfg.aliasThumbnail, false)
+		}
+
 		// task #200: materialise all deferred warn records into []string ONCE here.
 		// On clean files warnRecs is nil so this is a nil-check + return nil (zero cost).
 		e.Warnings = materializeWarnings(warnRecs)
+		if cfg.thumbStrips && ifd0.Next != nil {
+			attachThumbnailStrips(b, e, cfg.aliasThumbnail)
+		}
 		return e, nil
 
 	case magic == 0x002B:
@@ -533,8 +617,16 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 		e.GPSIFD, gpsWarnRecs = parseGPSSubIFDBigTIFF(b, ifd0, order, &budget, cfg.aliasThumbnail)
 		warnRecs = append(warnRecs, gpsWarnRecs...)
 
+		// Task #319: see the classic-TIFF branch.
+		if ifd0.Next != nil {
+			attachChainSubIFDs(b, ifd0, order, &budget, cfg.aliasThumbnail, true)
+		}
+
 		// task #200: materialise all deferred warn records into []string ONCE here.
 		e.Warnings = materializeWarnings(warnRecs)
+		if cfg.thumbStrips && ifd0.Next != nil {
+			attachThumbnailStrips(b, e, cfg.aliasThumbnail)
+		}
 		return e, nil
 
 	default:
@@ -557,6 +649,12 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 // offset for one of these tags does not fit in 32 bits, Encode returns
 // ErrBigTIFFPointerOverflow rather than truncating it.
 //
+// The strips of an uncompressed thumbnail of an IFD after IFD0 (IFD.Sub.ThumbnailStrips,
+// read by Parse with CarryThumbnailStrips) are written after the IFD and
+// StripOffsets is set to their new positions (Exif 3.1 §4.5.8, task #368). Without
+// that option the entries StripOffsets and StripByteCounts are written as parsed,
+// and the strip data is not part of the stream.
+//
 // Round-trip fidelity guarantee:
 //   - Known-type inline entries (total value size ≤ 4 bytes) are perfectly preserved.
 //   - Known-type out-of-line entries (total value size > 4 bytes) are re-serialised
@@ -572,7 +670,7 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 // unknown type codes must re-inject that data into the stream after calling Encode.
 // Task #84 pins this behaviour; any change to it is a conscious, tested decision.
 func Encode(e *EXIF) ([]byte, error) {
-	out, _, err := serialise(nil, e, false)
+	out, _, err := serialise(nil, e, false, nil)
 	return out, err
 }
 
@@ -585,7 +683,7 @@ func Encode(e *EXIF) ([]byte, error) {
 // cases. A caller that appends more data after the encoded stream can size
 // dst for the whole output up front and avoid any regrowth.
 func EncodeInto(dst []byte, e *EXIF) ([]byte, error) {
-	out, _, err := serialise(dst, e, false)
+	out, _, err := serialise(dst, e, false, nil)
 	return out, err
 }
 
@@ -599,7 +697,7 @@ var errEncodedSizeOverflow = errors.New("exif: encoded size exceeds the addressa
 // The size is computed by the same layout arithmetic Encode uses to place
 // every IFD, so it is exact, and it costs a fraction of an encode.
 func EncodedSize(e *EXIF) (int, error) {
-	_, total, err := serialise(nil, e, true)
+	_, total, err := serialise(nil, e, true, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -958,40 +1056,36 @@ func (e *EXIF) ifd0BigEndian() bool {
 	return e.ifd0ByteOrder() == binary.BigEndian
 }
 
-// SetCameraModel sets IFD0 tag 0x0110 (Model, EXIF §4.6.4 Table 3).
+// SetCameraModel sets IFD0 tag 0x0110 (Model, Exif 3.1 Table 6, pp. 31-32); see setText for the type chosen).
 func (e *EXIF) SetCameraModel(s string) {
 	if e == nil || e.IFD0 == nil {
 		return
 	}
-	v := asciiValue(s)
-	e.IFD0.set(TagModel, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
+	e.setText(e.IFD0, TagModel, s)
 }
 
-// SetCaption sets IFD0 tag 0x010E (ImageDescription, EXIF §4.6.4 Table 3).
+// SetCaption sets IFD0 tag 0x010E (ImageDescription, Exif 3.1 Table 6, pp. 31-32); see setText for the type chosen).
 func (e *EXIF) SetCaption(s string) {
 	if e == nil || e.IFD0 == nil {
 		return
 	}
-	v := asciiValue(s)
-	e.IFD0.set(TagImageDescription, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
+	e.setText(e.IFD0, TagImageDescription, s)
 }
 
-// SetCopyright sets IFD0 tag 0x8298 (Copyright, EXIF §4.6.4 Table 3).
+// SetCopyright sets IFD0 tag 0x8298 (Copyright, Exif 3.1 Table 6, pp. 31-32); see setText for the type chosen).
 func (e *EXIF) SetCopyright(s string) {
 	if e == nil || e.IFD0 == nil {
 		return
 	}
-	v := asciiValue(s)
-	e.IFD0.set(TagCopyright, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
+	e.setText(e.IFD0, TagCopyright, s)
 }
 
-// SetCreator sets IFD0 tag 0x013B (Artist, EXIF §4.6.4 Table 3).
+// SetCreator sets IFD0 tag 0x013B (Artist, Exif 3.1 Table 6, pp. 31-32); see setText for the type chosen).
 func (e *EXIF) SetCreator(s string) {
 	if e == nil || e.IFD0 == nil {
 		return
 	}
-	v := asciiValue(s)
-	e.IFD0.set(TagArtist, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
+	e.setText(e.IFD0, TagArtist, s)
 }
 
 // SetOrientation sets IFD0 tag 0x0112 (Orientation, EXIF §4.6.4 Table 3).
@@ -1011,11 +1105,15 @@ func (e *EXIF) SetOrientation(v uint16) {
 // ensureExifIFD creates ExifIFD if nil and ensures IFD0 carries a placeholder
 // TagExifIFDPointer entry so that Encode() will wire the real offset.
 // It is called by all setters that target the ExifIFD.
+//
+// A created ExifIFD carries the tags that Exif 3.1 marks mandatory (see
+// addExifIFDDefaults); an ExifIFD that already exists is never touched.
 func (e *EXIF) ensureExifIFD() {
 	if e.ExifIFD != nil {
 		return
 	}
 	e.ExifIFD = &IFD{}
+	e.addExifIFDDefaults()
 	if e.IFD0 != nil && e.IFD0.Get(TagExifIFDPointer) == nil {
 		// Value 0 is a placeholder; encode() (write.go) overwrites it with the
 		// correct absolute offset once the ExifIFD is serialised.
@@ -1024,26 +1122,43 @@ func (e *EXIF) ensureExifIFD() {
 	}
 }
 
-// SetMake sets IFD0 tag 0x010F (Make, EXIF §4.6.4 Table 3).
+// SetMake sets IFD0 tag 0x010F (Make, Exif 3.1 Table 6, pp. 31-32); see setText for the type chosen).
 func (e *EXIF) SetMake(s string) {
 	if e == nil || e.IFD0 == nil {
 		return
 	}
-	v := asciiValue(s)
-	e.IFD0.set(TagMake, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
+	e.setText(e.IFD0, TagMake, s)
 }
 
 // SetDateTimeOriginal sets ExifIFD tag 0x9003 (DateTimeOriginal, EXIF §4.6.5)
-// from t, using the EXIF datetime format "YYYY:MM:DD HH:MM:SS\x00" (20 bytes).
+// from t, using the EXIF datetime format "YYYY:MM:DD HH:MM:SS\x00" (20 bytes),
+// and keeps the two tags that qualify it consistent with t:
+//
+//   - 0x9011 OffsetTimeOriginal is set to the UTC offset of t, "±HH:MM" (EXIF
+//     2.31+, CIPA DC-008-2023 §4.6.5: ASCII, count 7, the offset of
+//     DateTimeOriginal from UTC). A UTC time is written "+00:00".
+//   - 0x9291 SubSecTimeOriginal is removed: it records the fraction of the
+//     second of DateTimeOriginal, which the datetime format above does not
+//     carry, so a fraction left from an earlier value would be wrong.
+//
+// DateTimeOriginal then reads back the same instant as t, to the second.
 func (e *EXIF) SetDateTimeOriginal(t time.Time) {
 	if e == nil || e.IFD0 == nil {
 		return
 	}
 	e.ensureExifIFD()
+	big := e.ifd0BigEndian()
 	// EXIF §4.6.5: DateTimeOriginal is a 20-byte ASCII field including the NUL.
 	formatted := t.Format("2006:01:02 15:04:05") + "\x00"
 	v := []byte(formatted)
-	e.ExifIFD.set(TagDateTimeOriginal, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
+	e.ExifIFD.set(TagDateTimeOriginal, TypeASCII, uint32(len(v)), v, big) //nolint:gosec // G115: string length bounded by input
+	// "-07:00" renders "+00:00" for UTC; the NUL makes the count 7.
+	off := append(t.AppendFormat(make([]byte, 0, 7), "-07:00"), 0)
+	e.ExifIFD.set(TagOffsetTimeOriginal, TypeASCII, uint32(len(off)), off, big) //nolint:gosec // G115: 7 bytes
+	e.ExifIFD.remove(TagSubSecTimeOriginal)
+	// OffsetTimeOriginal exists since Exif 2.31: the ExifVersion must not claim
+	// an older standard (task #363).
+	e.requireExifTag(TagOffsetTimeOriginal)
 }
 
 // SetExposureTime sets ExifIFD tag 0x829A (ExposureTime, EXIF §4.6.5).
@@ -1107,14 +1222,15 @@ func (e *EXIF) SetFocalLength(mm float64) {
 	e.ExifIFD.set(TagFocalLength, TypeRational, 1, b, order == binary.BigEndian)
 }
 
-// SetLensModel sets ExifIFD tag 0xA434 (LensModel, EXIF §4.6.5).
+// SetLensModel sets ExifIFD tag 0xA434 (LensModel, Exif 3.1 Table 9, p. 45;
+// see setText for the type chosen).
 func (e *EXIF) SetLensModel(s string) {
 	if e == nil || e.IFD0 == nil {
 		return
 	}
 	e.ensureExifIFD()
-	v := asciiValue(s)
-	e.ExifIFD.set(TagLensModel, TypeASCII, uint32(len(v)), v, e.ifd0BigEndian()) //nolint:gosec // G115: string length bounded by input
+	e.setText(e.ExifIFD, TagLensModel, s)
+	e.requireExifTag(TagLensModel) // defined by Exif 2.3 (task #363)
 }
 
 // SetImageSize sets ExifIFD tags 0xA002 and 0xA003 (PixelXDimension /
@@ -1131,6 +1247,7 @@ func (e *EXIF) SetImageSize(width, height uint32) {
 	isBig := order == binary.BigEndian
 	e.ExifIFD.set(TagPixelXDimension, TypeLong, 1, bw[:], isBig)
 	e.ExifIFD.set(TagPixelYDimension, TypeLong, 1, bh[:], isBig)
+	e.sizePending = false
 }
 
 // validWGS84Coords reports whether lat and lon are finite, non-NaN values
@@ -1229,11 +1346,13 @@ func (e *EXIF) SetGPS(lat, lon float64) {
 	latDMS := decimalToDMSBytes(lat, order)
 	lonDMS := decimalToDMSBytes(lon, order)
 
-	// Write GPSVersionID (0x0000, BYTE, count=4) = {2,3,0,0} only when not already
-	// present. EXIF §4.6.6 Table 15: GPSVersionID indicates the GPS IFD version;
-	// {2,3,0,0} corresponds to EXIF 2.3/3.0 GPS attribute information revision.
+	// GPSVersionID (0x0000, BYTE, count 4) is mandatory when any GPS tag is
+	// recorded and is 2.4.0.0 in Exif 3.1 (§4.6.7.1.1, p. 83: "The version is
+	// given as 2.4.0.0. This tag is mandatory when at least one tag related to
+	// the GPS is present"; Exif 3.0 §4.6.7.1.1 says the same, 2.3 said 2.3.0.0).
+	// Only written when absent, so the version of an existing GPS IFD stays.
 	if gps.Get(TagGPSVersionID) == nil {
-		gps.set(TagGPSVersionID, TypeByte, 4, []byte{2, 3, 0, 0}, isBig)
+		gps.set(TagGPSVersionID, TypeByte, 4, []byte{2, 4, 0, 0}, isBig)
 	}
 	gps.set(TagGPSLatitudeRef, TypeASCII, 2, []byte(latRef), isBig)
 	gps.set(TagGPSLatitude, TypeRational, 3, latDMS[:], isBig)

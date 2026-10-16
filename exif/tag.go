@@ -102,6 +102,8 @@ type tagInfo struct {
 
 // Standard EXIF IFD tags (EXIF §4.6.5 Table 4).
 const (
+	TagExifVersion               TagID = 0x9000 // Undefined 4 ("0300"; Exif 3.1 §4.6.6.1.1, p. 47)
+	TagComponentsConfiguration   TagID = 0x9101 // Undefined 4 (Exif 3.1 §4.6.6.3.3, pp. 48-49)
 	TagExposureTime              TagID = 0x829A // Rational (seconds)
 	TagFNumber                   TagID = 0x829D // Rational (f/N)
 	TagExposureProgram           TagID = 0x8822 // Short
@@ -334,6 +336,15 @@ func init() { //nolint:funlen // justified: tag registry must enumerate all ~140
 		// Additional EXIF 2.3+ tags (CIPA DC-008-2023 §4.6.5).
 		TagStandardOutputSensitivity: {"StandardOutputSensitivity", TypeLong, 1},
 		TagDeviceSettingDescription:  {"DeviceSettingDescription", TypeUndefined, 0},
+	}
+	// Merge the extended TIFF/EXIF/DNG tags (tag_extended.go). The map grows
+	// once here, at init time, so TagName stays a single allocation-free map
+	// lookup. An ID already registered above is never overridden.
+	for i := range extendedTags {
+		e := &extendedTags[i]
+		if _, dup := tagRegistry[e.id]; !dup {
+			tagRegistry[e.id] = e.info
+		}
 	}
 }
 

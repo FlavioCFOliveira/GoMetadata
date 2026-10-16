@@ -20,6 +20,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/FlavioCFOliveira/GoMetadata/xmp"
 )
 
 // requireCorpusFile returns the absolute path to a corpus file relative to
@@ -253,14 +255,46 @@ func TestCorpusGPSCoordinates(t *testing.T) {
 
 // TestCorpusExtendedXMP verifies that a JPEG carrying multi-packet extended
 // XMP (GUIDed continuation segments) is reassembled and parsed correctly.
-// Source: exiftool test suite (ExtendedXMP.jpg).
+// Source: exiftool test suite (ExtendedXMP.jpg). Its standard packet writes
+// xmpNote:HasExtendedXMP as a property element, and its extended chunks
+// precede the standard packet and are out of order (task #278): every pdf:
+// property below exists only in the extended XMP (values per exiftool -X).
 func TestCorpusExtendedXMP(t *testing.T) {
 	t.Parallel()
 	path := requireCorpusFile(t, "jpeg/exiftool/ExtendedXMP.jpg")
 	m := openAndRead(t, path)
 
 	if m.RawXMP() == nil {
-		t.Error("RawXMP() = nil; ExtendedXMP.jpg should produce reassembled XMP")
+		t.Fatal("RawXMP() = nil; ExtendedXMP.jpg should produce reassembled XMP")
+	}
+	if m.XMP == nil {
+		t.Fatal("XMP not parsed")
+	}
+	// The pdf: properties are registered aliases (Adobe XMP Specification
+	// Part 2 §1.1.1) and are folded into their base properties on parse
+	// (task #329): the base properties carry the extended values.
+	want := []struct{ ns, local, v string }{
+		{xmp.NSdc, "creator", "PhilToo"},
+		{xmp.NSxmp, "CreateDate", "2008-10-20T19:54:15"},
+		{xmp.NSxmp, "CreatorTool", "Guess Who"},
+		{xmp.NSxmp, "ModifyDate", "2008-10-20T19:54:15"},
+		{xmp.NSpdf, "Producer", "Just ExifTool again"},
+		{xmp.NSdc, "title", "PDF Title"},
+	}
+	for _, w := range want {
+		if got := m.XMP.Get(w.ns, w.local); got != w.v {
+			t.Errorf("%s %s = %q, want %q (extended XMP not merged)", w.ns, w.local, got, w.v)
+		}
+	}
+	for _, alias := range []string{"Author", "CreationDate", "Creator", "ModDate", "Title"} {
+		if got := m.XMP.Get(xmp.NSpdf, alias); got != "" {
+			t.Errorf("pdf:%s = %q, want it folded into its base property", alias, got)
+		}
+	}
+	// Adobe XMP Specification Part 3 §1.1.3.1: the reader removes
+	// xmpNote:HasExtendedXMP after recomposing the two portions.
+	if got := m.XMP.Get(xmp.NSxmpNote, "HasExtendedXMP"); got != "" {
+		t.Errorf("xmpNote:HasExtendedXMP = %q, want it removed", got)
 	}
 }
 

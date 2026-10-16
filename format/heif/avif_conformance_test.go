@@ -158,7 +158,7 @@ func TestAVIFExifItemInfeType(t *testing.T) {
 	exif := conformanceMinimalTIFF()
 	data := buildConformanceAVIF("avif", exif, nil)
 
-	metaContent, err := findBox(data, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(data)
 	if err != nil || metaContent == nil {
 		t.Fatalf("AVIF-Exif-item-infe-type: meta box not found (err=%v)", err)
 	}
@@ -214,7 +214,7 @@ func TestAVIFExifItemPrefixIsWrittenOnInject(t *testing.T) {
 	}
 
 	outData := out.Bytes()
-	metaContent, err := findBox(outData, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(outData)
 	if err != nil || metaContent == nil {
 		t.Fatalf("AVIF-Exif-item-prefix-written-on-inject: meta box not found (err=%v)", err)
 	}
@@ -325,7 +325,7 @@ func TestAVIFMetaBoxIlocOffsets(t *testing.T) {
 	xmp := conformanceXMPPacket()
 	data := buildConformanceAVIF("avif", exif, xmp)
 
-	metaContent, err := findBox(data, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(data)
 	if err != nil || metaContent == nil {
 		t.Fatalf("AVIF-meta-iloc-offsets: meta box not found (err=%v)", err)
 	}
@@ -355,7 +355,7 @@ func TestAVIFMetaBoxIinfItemCount(t *testing.T) {
 	xmp := conformanceXMPPacket()
 	data := buildConformanceAVIF("avif", exif, xmp)
 
-	metaContent, err := findBox(data, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(data)
 	if err != nil || metaContent == nil {
 		t.Fatalf("AVIF-meta-iinf-item-count: meta box not found (err=%v)", err)
 	}
@@ -370,17 +370,13 @@ func TestAVIFMetaBoxIinfItemCount(t *testing.T) {
 	}
 	version := iinfData[0]
 	pos := 4
-	declaredCount, _, ok := parseIinfItemCount(iinfData, version, pos)
+	declaredCount, scanPos, ok := parseIinfEntryCount(iinfData, version, pos)
 	if !ok {
 		t.Fatal("AVIF-meta-iinf-item-count: could not parse entry_count")
 	}
 
 	// Count actual infe boxes.
 	actualCount := 0
-	scanPos := pos + 2 // past entry_count
-	if version >= 2 {
-		scanPos = pos + 4
-	}
 	for scanPos < len(iinfData) {
 		sz, typ, _, ok2 := parseHEIFBoxHeader(iinfData, scanPos)
 		if !ok2 {
@@ -417,7 +413,7 @@ func TestAVIFWriteIlocOffsetCorrect(t *testing.T) {
 	}
 
 	outData := out.Bytes()
-	metaContent, err := findBox(outData, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(outData)
 	if err != nil || metaContent == nil {
 		t.Fatalf("AVIF-write-iloc-offset-correct: meta box not found in output (err=%v)", err)
 	}
@@ -566,6 +562,7 @@ func TestAVIFRobustMalformedIloc(t *testing.T) {
 		0x00,       // baseOffsetSize=0
 		0x00, 0x01, // item_count=1
 		0x00, 0x01, // item_ID=1
+		0x00, 0x00, // data_reference_index=0
 		0x00, 0x01, // extent_count=1
 		0xDE, 0xAD, 0xBE, // 3-byte offset (non-standard)
 	}

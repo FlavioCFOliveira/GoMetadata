@@ -750,13 +750,28 @@ func relocateTIFFFromParsedNEF(base []byte, r io.ReadSeeker, fileLen uint64, e *
 		return nil, nil, fmt.Errorf("nef: extract Nikon preview info: %w", err)
 	}
 
+	// #322: the Nikon Capture data of the MakerNote holds a copy of the IPTC;
+	// keep it in step with the IIM written to tag 0x83BB. After the extension
+	// above, so that data appended to the blob follows the structures that
+	// the extension covers.
+	rewriteNikonCaptureIPTC(e, rawIPTC)
+
+	// #355: the Nikon Capture offsets (MakerNote tag 0x0E0E) copy the positions
+	// of IFD0, the PreviewIFD and the first SubIFD; note where they are in the
+	// source, before the relocation moves the structures they name.
+	captureSrc, hasCapture := locateNikonCapture(base, false)
+
 	if info == nil {
 		// No Nikon-specific preprocessing needed; use the standard path.
-		return relocateTIFFFromParsed(base, e, rawIPTC, rawXMP, fileLen)
+		header, blocks, err = relocateTIFFFromParsed(base, e, rawIPTC, rawXMP, fileLen)
+	} else {
+		// Step C (and the rest of the main algorithm) is handled here.
+		header, blocks, err = nefRelocateWithPreview(base, e, rawIPTC, rawXMP, info, order, fileLen)
 	}
-
-	// Step C (and the rest of the main algorithm) is handled here.
-	return nefRelocateWithPreview(base, e, rawIPTC, rawXMP, info, order, fileLen)
+	if err == nil && hasCapture {
+		patchNikonCaptureOffsets(header, captureSrc)
+	}
+	return header, blocks, err
 }
 
 // nefRelocateWithPreview runs the TIFF copy-and-relocate algorithm with the
@@ -782,7 +797,7 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	if rawIPTC != nil {
 		// Adobe XMP Spec / ExifTool convention: IPTC-NAA (0x83BB) as TypeLong.
 		// upsertIFD0Entry pads value to 4-byte boundary; Count = nLongs.
-		upsertIFD0Entry(e.IFD0, exif.TagIPTC, exif.TypeLong, rawIPTC)
+		upsertIPTC(e.IFD0, rawIPTC, rawXMP)
 	}
 	if rawXMP != nil {
 		// Adobe XMP Spec (TIFF Technical Note 3): XMP (0x02BC) as TypeByte.
@@ -817,7 +832,8 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	allBlocks := append(mainIFDBlocks, info.previewBlock)
 
 	// Step 4: parse SubIFDs (tag 0x014A).
-	subIFDs, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget, fileLen)
+	subTree, subBlocks, subErr := enumerateSubIFDs(base, e, order, budget, fileLen)
+	subIFDs := subTree.all
 	if subErr != nil {
 		return nil, nil, fmt.Errorf("nef: enumerate SubIFDs: %w", subErr)
 	}
@@ -846,7 +862,7 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	ifdEnd := uint64(ifdEndInt) //nolint:gosec // G115: EncodedSize never returns a negative length
 
 	// Step 7: assign new absolute offsets.
-	subIFDsSize := computeSubIFDsSize(subIFDs)
+	subIFDsSize := computeSubIFDsSize(ifdEnd, subIFDs)
 	imageStart := ifdEnd + subIFDsSize
 	assignNewOffsets(allBlocks, imageStart)
 	assignSubIFDOffsets(subIFDs, ifdEnd)
@@ -880,8 +896,8 @@ func nefRelocateWithPreview( //nolint:cyclop,gocyclo,funlen // mirrors relocateT
 	}
 
 	// Step 10: patch 0x014A SubIFDs pointer array.
-	if len(subIFDs) > 0 {
-		if pErr := patchSubIFDPointers(finalTIFF, subIFDs, false, order); pErr != nil {
+	if subTree.roots != nil {
+		if pErr := patchSubIFDPointers(finalTIFF, subTree, false, order); pErr != nil {
 			return nil, nil, fmt.Errorf("nef: patch SubIFD pointers: %w", pErr)
 		}
 	}

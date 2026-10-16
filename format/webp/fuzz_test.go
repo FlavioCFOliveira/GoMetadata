@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"os"
 	"testing"
 )
 
@@ -26,6 +27,11 @@ func FuzzWebPExtract(f *testing.F) {
 		0x30, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x01, 0x00, 0x01, 0x00,
 	}
 	f.Add(withVP8)
+
+	// Seeds (task #333): an EXIF chunk with the "Exif\0\0" identifier and a
+	// chunk with the non-standard FourCC "XMP\0".
+	f.Add(webpOf(rawChunk{"VP8X", vp8xPayloadFlags(0x08)}, rawChunk{"VP8 ", vp8Payload},
+		rawChunk{"EXIF", append([]byte("Exif\x00\x00"), tiffStream...)}, rawChunk{"XMP\x00", xmpPacket}))
 
 	// Seed: empty input.
 	f.Add([]byte{})
@@ -144,6 +150,14 @@ func FuzzWebPInject(f *testing.F) {
 		0x00, 0x00, 0x00, 0x00, // next-IFD = 0
 	}
 	rawXMP := []byte(`<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?><x:xmpmeta xmlns:x='adobe:ns:meta/'></x:xmpmeta><?xpacket end='r'?>`)
+
+	// Seeds (task #299): simple-format VP8 and VP8L files, for which Inject
+	// builds the VP8X chunk from the bitstream header.
+	for _, name := range []string{"testdata/simple_lossy.webp", "testdata/simple_lossless_alpha.webp"} {
+		if seed, err := os.ReadFile(name); err == nil {
+			f.Add(seed)
+		}
+	}
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic regardless of input. Inject must return an error or

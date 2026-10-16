@@ -16,8 +16,9 @@
 //   - AVIF (read + write)
 //   - WebP (read + write)
 //   - CR2 — Canon RAW v2, TIFF-based (read + write; uses the same copy-and-relocate
-//     path as TIFF/DNG; Canon MakerNote blobs copied verbatim — blob-relative offsets
-//     are move-safe; validated against real Canon EOS 350D corpus file)
+//     path as TIFF/DNG; the Canon MakerNote is copied verbatim and its
+//     TIFF-relative offsets and footer are rebased; validated against the
+//     corpus CR2 files)
 //   - CR3 — Canon RAW v3, ISOBMFF-based (read + write; cr3.Inject relocates stco/co64 chunk-offset tables after moov rebuild)
 //   - NEF — Nikon RAW, TIFF-based (read + write; Nikon MakerNote blob extended
 //     to cover PreviewIFD and NikonScanIFD; validated against real Nikon D70 NEF)
@@ -60,4 +61,20 @@
 //	}
 //	fmt.Println(m.CameraModel())
 //	lat, lon, ok := m.GPS()
+//
+// # Concurrency
+//
+// The Set* methods of [Metadata] are serialised by an internal mutex, and
+// its getters may run concurrently with each other. The parsed components
+// Metadata.EXIF, Metadata.IPTC and Metadata.XMP are not safe for concurrent
+// use: mutating them directly from several goroutines, bypassing the Set*
+// methods of Metadata, needs the caller's own synchronisation (see the
+// concurrency contract of [Metadata]).
+//
+// # Parsed EXIF values
+//
+// Read does not copy EXIF values: every exif.IFDEntry.Value is a read-only
+// view of the raw EXIF bytes that Write later copies the file from. Change a
+// value through a Set* method or by assigning a new slice, never by writing
+// into an existing Value.
 package gometadata

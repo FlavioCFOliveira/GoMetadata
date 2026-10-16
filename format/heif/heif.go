@@ -6,6 +6,18 @@
 // "application/rdf+xml". Item locations are resolved via the 'iloc' box.
 package heif
 
+// Adapted from libavif src/read.c:avifParseItemInfoBox,avifParse, Copyright 2019 Joe Drago, SPDX-License-Identifier: BSD-2-Clause
+//
+// Changes from libavif: libavif reads each infe box through
+// avifROStreamReadBoxHeader, so that the box content starts after the real
+// header length (8 bytes, or 16 for a 64-bit largesize box); parseIinf does the
+// same through parseHEIFBoxHeader (task #348), and every other box content
+// offset of this package comes from that header length. libavif parses only
+// the file-level meta box as the item container (and moov for its tracks);
+// findMetaBoxAbs follows it and adds a fallback to a meta box that is a direct
+// child of moov when the file has no file-level one, which Extract and Inject
+// share (task #349). See THIRD_PARTY_NOTICES.md.
+
 import (
 	"bytes"
 	"encoding/binary"
@@ -37,11 +49,13 @@ var (
 	boxTypeMeta = [4]byte{'m', 'e', 't', 'a'} //nolint:gochecknoglobals // package-level constant box type; never mutated
 	boxTypeMoov = [4]byte{'m', 'o', 'o', 'v'} //nolint:gochecknoglobals // package-level constant box type; never mutated
 	boxTypeTrak = [4]byte{'t', 'r', 'a', 'k'} //nolint:gochecknoglobals // package-level constant box type; never mutated
-	boxTypeUdta = [4]byte{'u', 'd', 't', 'a'} //nolint:gochecknoglobals // package-level constant box type; never mutated
 	boxTypeIinf = [4]byte{'i', 'i', 'n', 'f'} //nolint:gochecknoglobals // package-level constant box type; never mutated
 	boxTypeIloc = [4]byte{'i', 'l', 'o', 'c'} //nolint:gochecknoglobals // package-level constant box type; never mutated
 	boxTypePitm = [4]byte{'p', 'i', 't', 'm'} //nolint:gochecknoglobals // package-level constant box type; never mutated
 	boxTypeInfe = [4]byte{'i', 'n', 'f', 'e'} //nolint:gochecknoglobals // package-level constant box type; never mutated
+	boxTypeDinf = [4]byte{'d', 'i', 'n', 'f'} //nolint:gochecknoglobals // package-level constant box type; never mutated
+	boxTypeDref = [4]byte{'d', 'r', 'e', 'f'} //nolint:gochecknoglobals // package-level constant box type; never mutated
+	boxTypeIdat = [4]byte{'i', 'd', 'a', 't'} //nolint:gochecknoglobals // package-level constant box type; never mutated
 )
 
 // itemTypeExif and itemTypeMime identify a HEIF item by its 4-byte ISOBMFF
@@ -54,6 +68,12 @@ var (
 	itemTypeExif = [4]byte{'E', 'x', 'i', 'f'} //nolint:gochecknoglobals // package-level constant item type; never mutated
 	itemTypeMime = [4]byte{'m', 'i', 'm', 'e'} //nolint:gochecknoglobals // package-level constant item type; never mutated
 )
+
+// xmpContentType is the content_type of an XMP item (ISO 23008-12 Annex A.3;
+// libavif AVIF_CONTENT_TYPE_XMP). A 'mime' item is the XMP item only when its
+// content_type equals this string: 'mime' items also carry other MIME
+// payloads, which must never be read or overwritten as XMP.
+const xmpContentType = "application/rdf+xml"
 
 // Extract navigates the ISOBMFF box hierarchy of r and extracts raw payloads.
 // rawEXIF has the 4-byte TIFF-header offset prefix stripped before return.
@@ -83,9 +103,13 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, fmt.Errorf("heif: read: %w", rerr)
 	}
 	hdr = hdr[:n]
+	// The window holds the whole file when the read ended short of it
+	// (io.ErrUnexpectedEOF): only then can the absence of a file-level meta box
+	// in the window be trusted (see findMetaBoxAbs, task #349).
+	complete := rerr != nil
 
-	// Find the meta box within the header window.
-	metaData, _ := findBox(hdr, boxTypeMeta, 0)
+	// Select the metadata container with the same rule Inject applies.
+	metaData := metaContentInWindow(hdr, complete)
 	if metaData != nil {
 		// Fast path: meta box fully within header window.
 		// Read item payloads by seeking rather than slicing a full in-memory copy.
@@ -97,9 +121,9 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		iobuf.Put(hdrPtr)
 		return rawEXIF, nil, rawXMP, err
 	}
-
-	// Slow path fallback: meta box not found in first 64 KB (extremely rare —
-	// HEIF spec places meta at the file head). Read the full file.
+	// Slow path fallback: no file-level meta box in the first 64 KB (extremely
+	// rare — HEIF places meta at the file head — or a file whose only meta box
+	// is nested in moov). Read the full file.
 	iobuf.Put(hdrPtr)
 	if _, err = r.Seek(0, io.SeekStart); err != nil {
 		return nil, nil, nil, fmt.Errorf("heif: seek: %w", err)
@@ -119,49 +143,16 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	return rawEXIF, nil, rawXMP, err
 }
 
-// maxItemPayloadSize is the upper bound on a single HEIF item payload that this
-// library will allocate. Real EXIF and XMP payloads are orders of magnitude
-// smaller; a value exceeding this indicates a malformed or adversarial file.
-// ISO 23008-12 §6.6: item payloads are compact metadata structures, not media.
-const maxItemPayloadSize = 256 << 20 // 256 MB
-
-var (
-	errItemPayloadTooLarge = errors.New("heif: item payload exceeds size limit")
-	errItemOffsetOverflow  = errors.New("heif: item location offset overflows int64")
-)
-
-// readItemPayload seeks r to loc.offset and reads loc.length bytes.
-// The returned slice is owned by the caller; r is left at an unspecified position.
-func readItemPayload(r io.ReadSeeker, loc itemLoc) ([]byte, error) {
-	if loc.length == 0 {
-		return nil, nil
-	}
-	if loc.length > maxItemPayloadSize {
-		return nil, errItemPayloadTooLarge
-	}
-	// Validate that offset fits int64 to prevent sign-wrapping on conversion.
-	// math.MaxInt64 = 9223372036854775807; any realistic file offset is far below this.
-	if loc.offset > math.MaxInt64 {
-		return nil, errItemOffsetOverflow
-	}
-	if _, err := r.Seek(int64(loc.offset), io.SeekStart); err != nil {
-		return nil, fmt.Errorf("heif: seek to item: %w", err)
-	}
-	payload := make([]byte, loc.length)
-	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, fmt.Errorf("heif: read item payload: %w", err)
-	}
-	return payload, nil
-}
-
 // extractFromMetaData parses the meta box content and seeks r to read EXIF/XMP
 // item payloads directly, avoiding a full file read.
 // metaData must be the content of the meta box with the 4-byte FullBox
 // version+flags already stripped (as returned by findBox).
 // ISO 23008-12 §6.2 (primary item), §6.6.1 (EXIF item layout).
+//
+// Only the iloc entries of the two selected items are resolved
+// (findIlocItem); the iloc box is never materialised into a per-item map.
 func extractFromMetaData(r io.ReadSeeker, metaData []byte) (rawEXIF, rawXMP []byte, err error) {
 	itemTypes := parseIinf(metaData)
-	itemLocs := parseIloc(metaData)
 	primaryID := parsePitm(metaData)
 
 	bestEXIFID, exifFound := selectBestItem(itemTypes, primaryID, itemTypeExif)
@@ -171,193 +162,48 @@ func extractFromMetaData(r io.ReadSeeker, metaData []byte) (rawEXIF, rawXMP []by
 	// was unreachable dead code even before the [4]byte conversion (task
 	// #228) and is intentionally not carried forward.
 	bestXMPID, xmpFound := selectBestItem(itemTypes, primaryID, itemTypeMime)
+	if !exifFound && !xmpFound {
+		return nil, nil, nil
+	}
+
+	ilocData := findInnerBox(metaData, boxTypeIloc)
+	h, ok := parseIlocHeader(ilocData)
+	if !ok {
+		return nil, nil, nil
+	}
+	src := itemSource{r: r, metaContent: metaData}
 
 	if exifFound {
-		if loc, ok := itemLocs[bestEXIFID]; ok && loc.length > 0 {
-			payload, e := readItemPayload(r, loc)
+		if it, extPos, found := findIlocItem(ilocData, &h, bestEXIFID); found {
+			payload, e := readIlocItem(src, ilocData, &h, it, extPos)
 			if e == nil {
 				rawEXIF = extractExifFromData(payload)
 			}
 		}
 	}
 	if xmpFound {
-		if loc, ok := itemLocs[bestXMPID]; ok && loc.length > 0 {
-			rawXMP, err = readItemPayload(r, loc)
+		if it, extPos, found := findIlocItem(ilocData, &h, bestXMPID); found {
+			rawXMP, err = readIlocItem(src, ilocData, &h, it, extPos)
 		}
 	}
 	return rawEXIF, rawXMP, err
 }
 
-// writePassThrough copies data to w verbatim, wrapping any error.
-func writePassThrough(w io.Writer, data []byte) error {
-	if _, err := w.Write(data); err != nil {
-		return fmt.Errorf("heif: write: %w", err)
-	}
-	return nil
-}
-
-// injectComponents holds the output sections produced by buildInjectComponents.
-type injectComponents struct {
-	outputPrefix []byte
-	finalMetaBox []byte
-	suffix       []byte
-	updatedItems []ilocFullItem
-	pendingByID  map[uint16][]byte
-}
-
-// buildInjectComponents parses the existing meta box, maps pending items, computes
-// the final output prefix (with patched ancestor sizes), and builds the final
-// meta box with correct iloc offsets. Returns false if injection cannot proceed
-// (e.g. no matching items, unreadable iloc) — caller should pass through unchanged.
+// parseHEIFMetadata parses the box hierarchy of a fully buffered file to find
+// EXIF and XMP items (the Extract slow path). When multiple items of the same
+// type exist, the primary item (per 'pitm' box) is preferred; otherwise the
+// item with the lowest ID is selected.
+// ISO 23008-12 §6.2 (primary item), §6.6.1 (EXIF item layout).
 //
-// Single-pass design (task #229): the iloc/meta boxes are serialised exactly
-// ONCE, not twice. This is possible because every iloc field (item_ID width,
-// construction_method, base_offset, extent_count, and each extent's
-// index/offset/length) has a FIXED byte width once the box's field-size
-// nibbles and item/extent counts are known (ISO 14496-12 §8.11.3) — the iloc
-// (and therefore meta) box's total LENGTH never depends on the actual offset
-// or length VALUES stored in it, only on its structure. updateIlocItemsInPlace
-// fixes that structure upfront (every updated item collapses to exactly one
-// placeholder extent), so newMetaBoxLen can compute the exact byte length the
-// rebuilt meta box will have using pure arithmetic (nonIlocBoxesLen +
-// ilocBoxSize), with no bytes written at all. That length is enough to patch
-// ancestor container sizes and compute the final item base offset BEFORE the
-// real offset/length values are known; assignItemOffsets then fills those
-// values into the already correctly-shaped ilocInfo.items, and
-// buildIlocBox/buildMetaBox each run once, already carrying the final values.
-func buildInjectComponents(data []byte, metaAbsStart, metaAbsEnd, metaContentOff int, rawEXIF, rawXMP []byte) (injectComponents, bool) {
-	metaContent := data[metaContentOff:metaAbsEnd]
-
-	itemTypes := parseIinf(metaContent)
-	ilocInfo, ilocOK := parseIlocFull(metaContent)
-	if !ilocOK || ilocInfo.offsetSize == 0 {
-		return injectComponents{}, false
+// Item payloads are read through extractFromMetaData into freshly allocated,
+// exactly-sized slices, so the returned rawEXIF/rawXMP never retain data.
+func parseHEIFMetadata(data []byte) (rawEXIF, rawXMP []byte, err error) {
+	// The same selection rule Inject applies (findMetaBoxAbs, task #349).
+	metaData := metaContentInWindow(data, true)
+	if metaData == nil {
+		return nil, nil, nil
 	}
-
-	pendingByID := mapPendingItems(itemTypes, rawEXIF, rawXMP)
-	if len(pendingByID) == 0 {
-		return injectComponents{}, false
-	}
-
-	// Mutates ilocInfo.items in place: parseIlocFull produced this slice fresh
-	// for this call, so no other reference shares its backing array (task #229;
-	// avoids the extra full-slice copy the former updateIlocItems allocated).
-	updateIlocItemsInPlace(ilocInfo.items, pendingByID)
-
-	versionFlags := data[metaAbsStart+8 : metaContentOff] // 4 bytes: version + flags
-	newMetaLen := newMetaBoxLen(metaContent, ilocInfo)
-	metaDelta := newMetaLen - (metaAbsEnd - metaAbsStart)
-
-	suffix := data[metaAbsEnd:]
-	outputPrefix := make([]byte, metaAbsStart)
-	copy(outputPrefix, data[:metaAbsStart])
-	if metaDelta != 0 {
-		patchAncestorSize(outputPrefix, metaAbsStart, metaDelta)
-	}
-
-	newItemBaseOffset := uint64(len(outputPrefix)) + uint64(newMetaLen) + uint64(len(suffix)) //nolint:gosec // G115: newMetaLen is a box length bounded by file size
-	assignItemOffsets(ilocInfo.items, pendingByID, newItemBaseOffset)
-
-	finalIlocBytes := buildIlocBox(ilocInfo, ilocInfo.items)
-	finalMetaBox := buildMetaBox(versionFlags, metaContent, finalIlocBytes)
-
-	return injectComponents{
-		outputPrefix: outputPrefix,
-		finalMetaBox: finalMetaBox,
-		suffix:       suffix,
-		updatedItems: ilocInfo.items,
-		pendingByID:  pendingByID,
-	}, true
-}
-
-// Inject writes a modified HEIF stream to w with updated metadata items.
-//
-// The iloc box is fully rebuilt with updated entries for modified items,
-// preserving all other items unchanged. Any enclosing container box sizes
-// (e.g. moov) are patched if the meta box size changes. New item payloads
-// are appended at the end of the output file.
-//
-// preserveUnknownSegments must be true. HEIF/AVIF ISOBMFF boxes (ftyp, moov,
-// mdat, etc.) are structurally mandatory; there is no concept of an "unknown
-// optional segment" analogous to JPEG's APPn. Passing false returns
-// ErrPreserveUnknownSegmentsNotSupported.
-func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error { //nolint:cyclop,gocyclo // preserveUnknownSegments guard adds one branch; function already contained maximum allowed complexity pre-#85
-	// Reject PreserveUnknownSegments(false) for HEIF/AVIF: ISOBMFF boxes are
-	// structurally mandatory. There is no concept of "unknown optional segment"
-	// in ISOBMFF analogous to JPEG's APPn segments.
-	if !preserveUnknownSegments {
-		return ErrPreserveUnknownSegmentsNotSupported
-	}
-
-	// Defense in depth: reject a JPEG extended-XMP wire-frame that was not
-	// filtered out by the encodeXMP format check in write.go. The wire-frame
-	// begins with 0x00XMPEXT\x00 — an invalid start for any XMP packet — and
-	// can only be decoded by jpeg.Inject. Writing it verbatim to a HEIF XMP
-	// item would produce a corrupt, non-XMP blob. (Bug #70.)
-	if len(rawXMP) >= len(xmpWireFrameMagic) && [8]byte(rawXMP[:8]) == xmpWireFrameMagic {
-		return fmt.Errorf("heif: rawXMP contains an internal JPEG wire-frame encoding that cannot be stored in a HEIF/AVIF container: %w", ErrCorruptXMP)
-	}
-	if _, err := r.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("heif: seek: %w", err)
-	}
-	// #140 fix, #230 refinement: cap the full-file read to maxFileSize bytes so
-	// that an oversized or infinite streaming reader cannot trigger unbounded
-	// heap allocation. iobuf.ReadAll allocates exactly one buffer sized to the
-	// input's Seek-reported length (filled with a single io.ReadFull) instead
-	// of io.ReadAll's geometric-growth strategy, and rejects an oversized input
-	// via ErrTooLarge before allocating anything at all.
-	data, err := iobuf.ReadAll(r, maxFileSize)
-	if err != nil {
-		if errors.Is(err, iobuf.ErrTooLarge) {
-			return fmt.Errorf("heif: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
-		}
-		return fmt.Errorf("heif: read: %w", err)
-	}
-
-	if rawEXIF == nil && rawXMP == nil {
-		return writePassThrough(w, data)
-	}
-
-	metaAbsStart, metaAbsEnd, metaContentOff, found := findMetaBoxAbs(data)
-	if !found || metaAbsEnd > len(data) {
-		return writePassThrough(w, data)
-	}
-
-	comp, ok := buildInjectComponents(data, metaAbsStart, metaAbsEnd, metaContentOff, rawEXIF, rawXMP)
-	if !ok {
-		return writePassThrough(w, data)
-	}
-
-	return writeHEIFOutput(w, comp.outputPrefix, comp.finalMetaBox, comp.suffix, comp.updatedItems, comp.pendingByID)
-}
-
-// ---------------------------------------------------------------------------
-// iloc full-structure types (used by Inject only)
-// ---------------------------------------------------------------------------
-
-// ilocBoxInfo holds the fully-parsed structure of an 'iloc' FullBox.
-type ilocBoxInfo struct {
-	version        uint8
-	offsetSize     int // 0, 4, or 8  (ISO 14496-12 §8.11.3)
-	lengthSize     int // 0, 4, or 8
-	baseOffsetSize int // 0, 4, or 8
-	indexSize      int // 0, 4, or 8 (only for iloc v1/v2)
-	items          []ilocFullItem
-}
-
-// ilocFullItem is one entry in the iloc item list, including all extents.
-type ilocFullItem struct {
-	id              uint16
-	constructMethod uint16 // construction_method (iloc v1/v2 only)
-	baseOffset      uint64
-	extents         []ilocExtent
-}
-
-// ilocExtent is one extent within an iloc item.
-type ilocExtent struct {
-	index  uint64 // extent_index (only if indexSize > 0)
-	offset uint64
-	length uint64
+	return extractFromMetaData(bytes.NewReader(data), metaData)
 }
 
 // parseHEIFBoxHeader reads an ISOBMFF box header starting at pos in data.
@@ -398,575 +244,6 @@ func parseHEIFBoxHeader(data []byte, pos int) (size uint64, typ [4]byte, headerL
 		return 0, [4]byte{}, 0, false
 	}
 	return size, typ, headerLen, true
-}
-
-// parseIlocFull parses the 'iloc' FullBox found within metaContent and returns
-// its complete structure including all per-item extents.
-func parseIlocFull(metaContent []byte) (ilocBoxInfo, bool) {
-	var info ilocBoxInfo
-	ilocData := findInnerBox(metaContent, boxTypeIloc)
-	// HEIF-ILOC-OFFBYONE-01 fix (task #243): same fixed-header layout as
-	// parseIloc below — offset_size|length_size at index 4 and
-	// base_offset_size|index_size at index 5 — both reads require
-	// len(ilocData) >= 6. See the parseIloc guard comment for the full
-	// rationale; this is the write-path (Inject) counterpart of the same bug.
-	if len(ilocData) < 6 {
-		return info, false
-	}
-
-	info.version = ilocData[0]
-	pos := 4 // skip version + flags
-
-	info.offsetSize = int(ilocData[pos] >> 4)
-	info.lengthSize = int(ilocData[pos] & 0x0F)
-	pos++
-	info.baseOffsetSize = int(ilocData[pos] >> 4)
-	if info.version == 1 || info.version == 2 {
-		info.indexSize = int(ilocData[pos] & 0x0F)
-	}
-	pos++
-
-	itemCount, newPos, ok := parseIinfItemCount(ilocData, info.version, pos)
-	if !ok {
-		return info, false
-	}
-	// Security audit FIX 1 (HEIF-ILOC-EXTENT-AMPLIFICATION): reject an iloc box
-	// whose declared item_count exceeds a sane ceiling before doing any
-	// per-item work. iloc version 2 encodes item_count as a 4-byte field (up to
-	// 2^32-1); without this guard a crafted box could drive a very large
-	// number of outer-loop iterations. See maxIlocItems for the rationale.
-	if itemCount > maxIlocItems {
-		return info, false
-	}
-	pos = newPos
-
-	for range itemCount {
-		item, updatedPos, itemOK := parseIlocFullItem(ilocData, pos, info)
-		if !itemOK {
-			break
-		}
-		pos = updatedPos
-		info.items = append(info.items, item)
-	}
-	return info, true
-}
-
-// readIlocItemID reads the version-dependent item_ID field from ilocData at pos.
-// version < 2 uses a 2-byte field; version 2 uses a 4-byte field capped to uint16.
-// ISO 14496-12 §8.11.3.
-func readIlocItemID(ilocData []byte, pos int, version uint8) (id uint16, newPos int, ok bool) {
-	if version < 2 {
-		if pos+2 > len(ilocData) {
-			return 0, pos, false
-		}
-		return binary.BigEndian.Uint16(ilocData[pos:]), pos + 2, true
-	}
-	if pos+4 > len(ilocData) {
-		return 0, pos, false
-	}
-	rawID := binary.BigEndian.Uint32(ilocData[pos:])
-	if rawID > math.MaxUint16 {
-		return 0, pos, false // item ID exceeds uint16 range; malformed iloc box
-	}
-	return uint16(rawID), pos + 4, true
-}
-
-// maxIlocExtentsPerItem is the upper bound on the number of extents we will
-// allocate for a single iloc item. The HEIF specification does not impose a
-// hard limit, but real files have 1-3 extents per item. 1024 is a generous
-// ceiling; it keeps the per-item allocation at most 1024×24 = 24 KB regardless
-// of what an untrusted file claims for extent_count (max uint16 = 65535).
-//
-// Without this cap, a crafted file with extentCount=65535 per item causes
-// ~1.5 MB of slice-header allocation per item — a denial-of-service via
-// memory amplification.
-const maxIlocExtentsPerItem = 1024
-
-// maxIlocItems caps the number of items processed from a single iloc box.
-// Real-world HEIF/AVIF files carry from one to a few hundred items (image
-// variants, thumbnails, alpha planes, EXIF/XMP metadata items). 4096 is a
-// generous ceiling that mirrors the sanity cap format/detect.go's
-// parseBigTIFFIFD0 applies to BigTIFF IFD entry counts: it defends against an
-// attacker-controlled item_count field (up to 2^32-1 for iloc version 2)
-// driving unbounded outer-loop work, without affecting any legitimate file.
-// ISO 14496-12 §8.11.3.
-const maxIlocItems = 4096
-
-// readIlocFullExtents reads extentCount extents from ilocData at pos using the
-// field sizes in info. Returns the populated extents and updated position.
-// If the data is truncated before all extents are read, parsing stops early
-// and only the extents read so far are returned.
-//
-// Security (CWE-770/834): extents beyond maxIlocExtentsPerItem are dropped —
-// NOT merely capped at the pre-allocation stage — by guarding the append with
-// a length check; the position is still advanced for every extent that
-// genuinely consumes input bytes, so the caller correctly lands at the next
-// item. Additionally, when every per-extent field width is zero
-// (indexSize == offsetSize == lengthSize == 0), no iteration consumes any
-// input byte at all, so an attacker-controlled extent_count of up to 65535
-// would otherwise force 65535 no-op iterations per item at zero cost to the
-// attacker; the loop bound itself is capped at maxIlocExtentsPerItem in that
-// degenerate case (task: security audit FIX 1, HEIF-ILOC-EXTENT-AMPLIFICATION).
-// ISO 14496-12 §8.11.3.
-func readIlocFullExtents(ilocData []byte, pos, extentCount int, info ilocBoxInfo) (extents []ilocExtent, newPos int) { //nolint:gocyclo // binary parser: each branch is a mandatory spec-derived bounds check (indexSize/offsetSize/lengthSize) plus the FIX-1 zero-field-size DoS guard; splitting would reduce clarity without reducing branch count
-	extents = make([]ilocExtent, 0, min(extentCount, maxIlocExtentsPerItem))
-
-	extentFieldSize := info.indexSize + info.offsetSize + info.lengthSize
-	loopCount := extentCount
-	if extentFieldSize == 0 && loopCount > maxIlocExtentsPerItem {
-		loopCount = maxIlocExtentsPerItem
-	}
-
-	for range loopCount {
-		var ext ilocExtent
-		if info.indexSize > 0 {
-			if pos+info.indexSize > len(ilocData) {
-				return extents, pos
-			}
-			ext.index = readUintN(ilocData[pos:], info.indexSize)
-			pos += info.indexSize
-		}
-		if info.offsetSize > 0 {
-			if pos+info.offsetSize > len(ilocData) {
-				return extents, pos
-			}
-			ext.offset = readUintN(ilocData[pos:], info.offsetSize)
-			pos += info.offsetSize
-		}
-		if info.lengthSize > 0 {
-			if pos+info.lengthSize > len(ilocData) {
-				return extents, pos
-			}
-			ext.length = readUintN(ilocData[pos:], info.lengthSize)
-			pos += info.lengthSize
-		}
-		if len(extents) < maxIlocExtentsPerItem {
-			extents = append(extents, ext)
-		}
-	}
-	return extents, pos
-}
-
-// parseIlocFullItem reads one item entry from ilocData at pos given the box
-// metadata in info. Returns the parsed item, updated position, and success.
-//
-// ISO 14496-12 §8.11.3: item_ID width is 2 bytes for version < 2, 4 bytes for
-// version 2. construction_method present only for version 1 or 2.
-func parseIlocFullItem(ilocData []byte, pos int, info ilocBoxInfo) (ilocFullItem, int, bool) {
-	var item ilocFullItem
-
-	// Read item ID (version-specific width).
-	id, pos, ok := readIlocItemID(ilocData, pos, info.version)
-	if !ok {
-		return item, pos, false
-	}
-	item.id = id
-
-	// Read construction_method (version 1 and 2 only).
-	if info.version == 1 || info.version == 2 {
-		if pos+2 > len(ilocData) {
-			return item, pos, false
-		}
-		item.constructMethod = binary.BigEndian.Uint16(ilocData[pos:])
-		pos += 2
-	}
-
-	// Read base_offset.
-	if info.baseOffsetSize > 0 {
-		if pos+info.baseOffsetSize > len(ilocData) {
-			return item, pos, false
-		}
-		item.baseOffset = readUintN(ilocData[pos:], info.baseOffsetSize)
-		pos += info.baseOffsetSize
-	}
-
-	// Read extent_count then loop over extents.
-	if pos+2 > len(ilocData) {
-		return item, pos, false
-	}
-	extentCount := int(binary.BigEndian.Uint16(ilocData[pos:]))
-	pos += 2
-
-	item.extents, pos = readIlocFullExtents(ilocData, pos, extentCount, info)
-	return item, pos, true
-}
-
-// ilocFixedHeaderSize is the byte length of the iloc FullBox's fixed header,
-// after the 8-byte box header: version(1)+flags(3)+offset/length-size
-// nibbles(1)+base_offset/index-size nibbles(1) = 6 bytes (ISO 14496-12 §8.11.3).
-const ilocFixedHeaderSize = 6
-
-// ilocBoxSize returns the exact total byte length (including the 8-byte box
-// header) that buildIlocBox would produce for items under info. It depends
-// only on field widths and per-item extent counts — never on the actual
-// offset/length VALUES stored — so it can be computed with no bytes written
-// at all (task #229; used by newMetaBoxLen to size the meta box before the
-// final iloc bytes exist).
-func ilocBoxSize(info ilocBoxInfo, items []ilocFullItem) int {
-	itemCountWidth := 2
-	if info.version >= 2 {
-		itemCountWidth = 4
-	}
-	total := 8 + ilocFixedHeaderSize + itemCountWidth
-	for _, item := range items {
-		total += ilocItemSize(item, info)
-	}
-	return total
-}
-
-// nonIlocBoxesLen sums the sizes of every child box in metaContent that is
-// NOT of type boxTypeIloc, by walking metaContent box-by-box and stopping
-// the instant parseHEIFBoxHeader fails to parse the next header — the EXACT
-// same traversal buildMetaBox itself performs for both of its own passes
-// (the size pre-computation pass and the copy pass). Any trailing bytes
-// that traversal cannot parse as a box header are silently dropped by
-// buildMetaBox's real output, so they must also be excluded here.
-//
-// This single shared helper is what makes newMetaBoxLen provably match what
-// buildMetaBox will actually produce for ANY metaContent — well-formed or
-// not — instead of relying on two independently-written loops (one for
-// measuring, one for building) to stay in lockstep by convention. Security
-// audit finding HEIF-ILOC-DUPBOX-01 (2026-09-25) was exactly that class of
-// drift: an earlier, hand-written size-measuring loop stopped at the FIRST
-// 'iloc'-typed child instead of summing every one buildMetaBox's copy loop
-// actually drops (`if typ != boxTypeIloc { append }` — no early exit), and a
-// closely related second drift (found via the fuzz invariant added for this
-// same finding) affected metaContent with trailing bytes that fail to parse
-// as a box header at all: buildMetaBox's copy loop stops there and drops
-// them, but a naive "declared meta box length minus removed iloc size"
-// computation does not know to exclude them. Extracting the traversal into
-// one function used by both call sites closes both variants at once, and
-// any future one sharing the same root cause. Regression gates:
-// TestInjectDuplicateIlocBoxesOffsetInBounds,
-// TestInjectMetaWithTrailingUnparseableBytesOffsetInBounds.
-func nonIlocBoxesLen(metaContent []byte) int {
-	total := 0
-	pos := 0
-	for pos < len(metaContent) {
-		size, typ, _, ok := parseHEIFBoxHeader(metaContent, pos)
-		if !ok {
-			break
-		}
-		if typ != boxTypeIloc {
-			total += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
-		}
-		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
-	}
-	return total
-}
-
-// newMetaBoxLen returns the exact total byte length (including the 8-byte
-// box header) that buildMetaBox(versionFlags, metaContent, newIloc) would
-// produce for an iloc box built from info/info.items, without serialising
-// either box. It is arithmetic-only (task #229) but, unlike computing a
-// "delta" from the OLD meta box's own declared length, it is built entirely
-// from the same nonIlocBoxesLen traversal buildMetaBox itself uses — see
-// nonIlocBoxesLen's doc comment for why that equivalence matters.
-func newMetaBoxLen(metaContent []byte, info ilocBoxInfo) int {
-	return 8 + 4 + nonIlocBoxesLen(metaContent) + ilocBoxSize(info, info.items)
-}
-
-// buildIlocBox serialises the iloc FullBox from info (field sizes) and the
-// given items (which may differ from info.items — e.g. with updated extents)
-// into a single pre-sized buffer: the 8-byte box header is written directly
-// into the buffer (with the size field patched in once the exact total is
-// known), and the body is appended in place — one allocation instead of the
-// former separate body+hdr buffers (task #229).
-func buildIlocBox(info ilocBoxInfo, items []ilocFullItem) []byte {
-	total := ilocBoxSize(info, items)
-	buf := make([]byte, 8, total)
-	buf[4], buf[5], buf[6], buf[7] = 'i', 'l', 'o', 'c'
-
-	// FullBox: version(1) + flags(3), then field-size nibble-pair bytes.
-	// G115: nibble-packed fields; values are 0–8 so byte cast is safe.
-	buf = append(buf,
-		info.version, 0, 0, 0,
-		byte(info.offsetSize<<4|info.lengthSize),    //nolint:gosec // G115: nibble-packed field, values are 0–8
-		byte(info.baseOffsetSize<<4|info.indexSize), //nolint:gosec // G115: nibble-packed field, values are 0–8
-	)
-
-	if info.version < 2 {
-		buf = appendUintN(buf, 2, uint64(len(items)))
-	} else {
-		buf = appendUintN(buf, 4, uint64(len(items)))
-	}
-
-	for _, item := range items {
-		buf = appendIlocItem(buf, item, info)
-	}
-
-	binary.BigEndian.PutUint32(buf[0:4], uint32(len(buf))) //nolint:gosec // G115: ISOBMFF box size bounded by body length
-	return buf
-}
-
-// ilocItemSize returns the exact byte length that appendIlocItem would write
-// for item given the encoding parameters in info. Used to pre-size the output
-// buffer in buildIlocBox, eliminating reallocation churn on the write path.
-//
-// ISO 14496-12 §8.11.3: mirrors the conditional field layout in appendIlocItem.
-func ilocItemSize(item ilocFullItem, info ilocBoxInfo) int {
-	size := 0
-	if info.version < 2 {
-		size += 2 // item_ID (16-bit)
-	} else {
-		size += 4 // item_ID (32-bit)
-	}
-	if info.version == 1 || info.version == 2 {
-		size += 2 // construction_method
-	}
-	if info.baseOffsetSize > 0 {
-		size += info.baseOffsetSize // base_offset
-	}
-	size += 2 // extent_count (always 16-bit)
-	for range item.extents {
-		if info.indexSize > 0 {
-			size += info.indexSize
-		}
-		if info.offsetSize > 0 {
-			size += info.offsetSize
-		}
-		if info.lengthSize > 0 {
-			size += info.lengthSize
-		}
-	}
-	return size
-}
-
-// appendIlocItem serialises one iloc item entry (version-specific ID width,
-// optional construction method, base offset, and extent list) onto body and
-// returns the extended slice.
-//
-// ISO 14496-12 §8.11.3: item serialization mirrors the parse layout exactly.
-func appendIlocItem(body []byte, item ilocFullItem, info ilocBoxInfo) []byte {
-	if info.version < 2 {
-		body = appendUintN(body, 2, uint64(item.id))
-	} else {
-		body = appendUintN(body, 4, uint64(item.id))
-	}
-	if info.version == 1 || info.version == 2 {
-		body = appendUintN(body, 2, uint64(item.constructMethod))
-	}
-	if info.baseOffsetSize > 0 {
-		body = appendUintN(body, info.baseOffsetSize, item.baseOffset)
-	}
-	body = appendUintN(body, 2, uint64(len(item.extents)))
-	for _, ext := range item.extents {
-		if info.indexSize > 0 {
-			body = appendUintN(body, info.indexSize, ext.index)
-		}
-		if info.offsetSize > 0 {
-			body = appendUintN(body, info.offsetSize, ext.offset)
-		}
-		if info.lengthSize > 0 {
-			body = appendUintN(body, info.lengthSize, ext.length)
-		}
-	}
-	return body
-}
-
-// buildMetaBox constructs a meta FullBox by copying all child boxes from
-// metaContent except iloc, then appending newIloc, into a single pre-sized
-// buffer (box header + body together — one allocation instead of the former
-// separate body+hdr buffers, task #229).
-// versionFlags is the 4-byte FullBox version+flags field.
-func buildMetaBox(versionFlags, metaContent, newIloc []byte) []byte {
-	// Pre-compute body size to avoid realloc churn, via the same traversal
-	// the copy pass below performs (see nonIlocBoxesLen's doc comment for
-	// why sharing this exact walk with newMetaBoxLen matters).
-	totalBody := 4 + nonIlocBoxesLen(metaContent) // version+flags + non-iloc children
-	totalBody += len(newIloc)
-
-	buf := make([]byte, 8, 8+totalBody)
-	buf[4], buf[5], buf[6], buf[7] = 'm', 'e', 't', 'a'
-	buf = append(buf, versionFlags...)
-
-	pos := 0
-	for pos < len(metaContent) {
-		size, typ, _, ok := parseHEIFBoxHeader(metaContent, pos)
-		if !ok {
-			break
-		}
-		if typ != boxTypeIloc {
-			buf = append(buf, metaContent[pos:pos+int(size)]...) //nolint:gosec // G115: ISOBMFF box size bounded by file size
-		}
-		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
-	}
-	buf = append(buf, newIloc...)
-
-	binary.BigEndian.PutUint32(buf[0:4], uint32(len(buf))) //nolint:gosec // G115: ISOBMFF box size bounded by body length
-	return buf
-}
-
-// patchAncestorSize adds delta to the size field of any top-level container
-// box in data whose byte range contains metaAbsStart (i.e. wraps the meta
-// box). This is needed when meta is nested inside moov and meta changes size.
-//
-// Both 32-bit and 64-bit extended-size (size==1) boxes are handled:
-//   - 32-bit: if the updated size would exceed 0xFFFFFFFF the patch is skipped
-//     (the file was already near the 4 GB ISOBMFF single-box limit; corrupting
-//     the size field would be worse than leaving it stale).
-//   - 64-bit (size field == 1): the 8-byte largesize at bytes [pos+8:pos+16] is
-//     read, incremented by delta, and written back.
-func patchAncestorSize(data []byte, metaAbsStart, delta int) {
-	pos := 0
-	for pos+8 <= len(data) {
-		rawSize32 := binary.BigEndian.Uint32(data[pos:])
-		if rawSize32 == 1 {
-			advanced, done := patchAncestorSizeExtended(data, pos, metaAbsStart, delta)
-			if done {
-				return
-			}
-			pos = advanced
-			continue
-		}
-		advanced, done := patchAncestorSize32(data, pos, metaAbsStart, delta)
-		if done {
-			return
-		}
-		pos = advanced
-	}
-}
-
-// patchAncestorSizeExtended handles the extended 64-bit size (size==1) branch
-// of patchAncestorSize. Returns (newPos, true) when scanning must stop (box
-// wraps metaAbsStart or data is truncated); returns (newPos, false) to advance.
-// ISO 14496-12 §4.2: if size==1, the 64-bit largesize follows the 4-byte type.
-func patchAncestorSizeExtended(data []byte, pos, metaAbsStart, delta int) (newPos int, done bool) {
-	if pos+16 > len(data) {
-		return pos, true
-	}
-	size64 := binary.BigEndian.Uint64(data[pos+8:])
-	if uint64(pos)+size64 > uint64(len(data)) { //nolint:gosec // G115: pos is non-negative (loop guard)
-		return pos, true
-	}
-	boxEnd := pos + int(size64) //nolint:gosec // G115: ISOBMFF box size bounded by file size
-	if pos < metaAbsStart && metaAbsStart < boxEnd {
-		newSize64 := int64(size64) + int64(delta) //nolint:gosec // G115: delta bounded by meta box size change
-		if newSize64 > 0 {
-			binary.BigEndian.PutUint64(data[pos+8:], uint64(newSize64))
-		}
-		return pos, true
-	}
-	return pos + int(size64), false //nolint:gosec // G115: ISOBMFF box size bounded by file size
-}
-
-// patchAncestorSize32 handles the 32-bit size branch of patchAncestorSize.
-// Returns (newPos, true) when scanning must stop; returns (newPos, false) to
-// advance to the next box.
-func patchAncestorSize32(data []byte, pos, metaAbsStart, delta int) (newPos int, done bool) {
-	size := uint64(binary.BigEndian.Uint32(data[pos:]))
-	if size == 0 {
-		size = uint64(len(data) - pos) //nolint:gosec // G115: len(data)-pos is non-negative (guarded above)
-	}
-	if uint64(pos)+size > uint64(len(data)) { //nolint:gosec // G115: pos is non-negative (loop guard)
-		return pos, true
-	}
-	boxEnd := pos + int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
-	if pos < metaAbsStart && metaAbsStart < boxEnd {
-		// Guard against uint32 overflow: if newSize > 0xFFFFFFFF, skip the
-		// patch rather than silently truncating. ISO 14496-12 §4.2: boxes
-		// > 4 GB must use the extended-size (size==1) form.
-		newSize := int64(size) + int64(delta) //nolint:gosec // G115: delta bounded by meta box size change
-		if newSize > 0 && uint64(newSize) <= 0xFFFFFFFF {
-			binary.BigEndian.PutUint32(data[pos:], uint32(newSize))
-		}
-		return pos, true
-	}
-	return pos + int(size), false //nolint:gosec // G115: ISOBMFF box size bounded by file size
-}
-
-// appendUintN appends v encoded as an n-byte big-endian integer to b.
-// Uses binary.BigEndian.AppendUint* for the standard ISOBMFF field widths
-// (1, 2, 4, 8) to avoid a temporary allocation; falls back to a generic
-// loop for non-standard widths (unreachable in normal HEIF parsing).
-func appendUintN(b []byte, n int, v uint64) []byte {
-	switch n {
-	case 1:
-		return append(b, byte(v)) //nolint:gosec // G115: value range controlled by caller
-	case 2:
-		return binary.BigEndian.AppendUint16(b, uint16(v)) //nolint:gosec // G115: value range controlled by caller
-	case 4:
-		return binary.BigEndian.AppendUint32(b, uint32(v)) //nolint:gosec // G115: value range controlled by caller
-	case 8:
-		return binary.BigEndian.AppendUint64(b, v)
-	default:
-		// Fallback for non-standard widths (not reached in normal HEIF parsing).
-		tmp := make([]byte, n)
-		for i := n - 1; i >= 0; i-- {
-			tmp[i] = byte(v)
-			v >>= 8
-		}
-		return append(b, tmp...)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Extract helpers (unchanged from original)
-// ---------------------------------------------------------------------------
-
-// extractItemSlice returns the slice of data for the item at loc, applying
-// int-range and bounds guards. Returns nil if the location is invalid.
-//
-// Guard uint64→int conversion: on 32-bit platforms math.MaxInt is 2^31-1;
-// a pathologically large offset would wrap and panic on slice indexing.
-// ISO 23008-12 §6.6: item offsets are absolute positions within the file data.
-func extractItemSlice(data []byte, loc itemLoc) []byte {
-	if loc.offset > math.MaxInt || loc.offset+loc.length > math.MaxInt {
-		return nil
-	}
-	end := loc.offset + loc.length
-	if end > uint64(len(data)) {
-		return nil
-	}
-	return data[loc.offset:end]
-}
-
-// parseHEIFMetadata parses the box hierarchy to find EXIF and XMP items.
-// When multiple items of the same type exist, the primary item (per 'pitm' box)
-// is preferred; otherwise the item with the lowest ID is selected.
-// ISO 23008-12 §6.2 (primary item), §6.6.1 (EXIF item layout).
-func parseHEIFMetadata(data []byte) (rawEXIF, rawXMP []byte, err error) {
-	// Find the 'meta' box. It can be inside 'moov' or at top-level.
-	metaData, err := findBox(data, boxTypeMeta, 0)
-	if err != nil {
-		return nil, nil, err
-	}
-	if metaData == nil {
-		return nil, nil, nil
-	}
-
-	// Parse item info (iinf) to map item IDs to their type.
-	// Parse item locations (iloc) to find the data offset+size for each item.
-	itemTypes := parseIinf(metaData)
-	itemLocs := parseIloc(metaData)
-
-	// Determine primary item ID from pitm box; 0 means none found.
-	primaryID := parsePitm(metaData)
-
-	bestEXIFID, exifFound := selectBestItem(itemTypes, primaryID, itemTypeExif)
-	// See the identical comment in extractFromMetaData: the former "rdf+xml"
-	// candidate could never match a 4-byte ISOBMFF item_type and is dropped.
-	bestXMPID, xmpFound := selectBestItem(itemTypes, primaryID, itemTypeMime)
-
-	if exifFound {
-		if loc, ok := itemLocs[bestEXIFID]; ok {
-			// bytes.Clone here ensures the returned slice does not retain the
-			// full-file buffer `data` alive via a sub-slice reference.
-			// The slow path (io.ReadAll) loads the entire file into `data`;
-			// without Clone, Metadata.rawEXIF would pin that allocation for
-			// its entire lifetime. The fast path (readItemPayload) already
-			// makes an independent allocation; this matches that behaviour.
-			rawEXIF = extractExifFromData(bytes.Clone(extractItemSlice(data, loc)))
-		}
-	}
-	if xmpFound {
-		if loc, ok := itemLocs[bestXMPID]; ok {
-			// Same reasoning: Clone so Metadata.rawXMP does not retain `data`.
-			rawXMP = bytes.Clone(extractItemSlice(data, loc))
-		}
-	}
-
-	return rawEXIF, rawXMP, nil
 }
 
 // selectBestItem selects the best item ID from itemTypes matching one of
@@ -1046,67 +323,48 @@ func parsePitm(metaContent []byte) uint16 {
 	return uint16(id)
 }
 
-// itemLoc holds the resolved location of an ISOBMFF item.
-type itemLoc struct {
-	offset uint64
-	length uint64
-}
-
-// isContainerBox reports whether typ is an ISOBMFF container box that may
-// contain nested boxes (and therefore warrants recursive descent).
-func isContainerBox(typ [4]byte) bool {
-	return typ == boxTypeMoov || typ == boxTypeTrak || typ == boxTypeUdta
-}
-
-// findBox searches data for the first box of the given type, returning its data.
-// It performs a shallow search at the top level and recurses into container boxes
-// up to depth levels deep (max 32) to prevent stack exhaustion on crafted input.
-func findBox(data []byte, boxType [4]byte, depth int) ([]byte, error) {
-	if depth > 32 {
-		return nil, ErrMaxNestingDepth
-	}
-	pos := 0
-	for pos < len(data) {
-		size, typ, headerLen, ok := parseHEIFBoxHeader(data, pos)
-		if !ok {
-			break
-		}
-
-		boxData := data[pos+int(headerLen) : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by file size
-
-		if typ == boxType {
-			// Skip the 4-byte version/flags for full boxes.
-			if len(boxData) >= 4 {
-				return boxData[4:], nil
-			}
-			return boxData, nil
-		}
-
-		// Recurse into container boxes.
-		if isContainerBox(typ) {
-			inner, err := findBox(boxData, boxType, depth+1)
-			if err == nil && inner != nil {
-				return inner, nil
-			}
-		}
-
-		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
-	}
-	return nil, nil
-}
-
-// parseIinfItemCount decodes the item_count field from iinfData (or ilocData)
-// at pos, using version to determine whether it is a 2-byte or 4-byte field.
-// Returns count, updated pos, and success.
+// parseIinfEntryCount decodes the entry_count field of an 'iinf' box body at
+// pos, using the FullBox version to pick the width. Returns count, updated pos,
+// and success.
 //
-// ISO 14496-12 §8.11.3 / §8.11.6: version < 2 uses uint16, version 2 uses uint32.
-func parseIinfItemCount(data []byte, version byte, pos int) (count, newPos int, ok bool) {
+// ISO/IEC 14496-12 §8.11.6 (ItemInfoBox; the text of the standard is not
+// available locally, so the sub-clause is not cited): entry_count is
+// unsigned int(16) when version == 0 and unsigned int(32) otherwise. Reference
+// implementations that read it identically: libavif src/read.c avifParseItemInfoBox (BSD-2,
+// ab37e294; reads 32 bits for version 1 and rejects later versions), heic-rs
+// src/meta/iinf.rs (MIT/Apache-2.0, 999470f5). The 'iloc' item_count has a
+// different rule (16 bits below version 2), see parseIlocItemCount.
+//
+// Task #358: the width was previously "16 bits below version 2", which read
+// the high half of a 32-bit entry_count of a version 1 box and left pos two
+// bytes short, so the first infe box was parsed from the wrong offset.
+func parseIinfEntryCount(data []byte, version byte, pos int) (count, newPos int, ok bool) {
+	if version == 0 {
+		if pos+2 > len(data) {
+			return 0, pos, false
+		}
+		return int(binary.BigEndian.Uint16(data[pos:])), pos + 2, true
+	}
+	return readCount32(data, pos)
+}
+
+// parseIlocItemCount decodes the item_count field of an 'iloc' box body at
+// pos, using the FullBox version to pick the width. Returns count, updated pos,
+// and success.
+//
+// ISO 14496-12 §8.11.3.2: version < 2 uses uint16, version 2 uses uint32.
+func parseIlocItemCount(data []byte, version byte, pos int) (count, newPos int, ok bool) {
 	if version < 2 {
 		if pos+2 > len(data) {
 			return 0, pos, false
 		}
 		return int(binary.BigEndian.Uint16(data[pos:])), pos + 2, true
 	}
+	return readCount32(data, pos)
+}
+
+// readCount32 decodes a 32-bit item or entry count at pos.
+func readCount32(data []byte, pos int) (count, newPos int, ok bool) {
 	if pos+4 > len(data) {
 		return 0, pos, false
 	}
@@ -1142,7 +400,7 @@ func parseIinf(metaData []byte) map[uint16][4]byte {
 	version := iinfData[0]
 	pos := 4 // skip version + flags
 
-	itemCount, pos, ok := parseIinfItemCount(iinfData, version, pos)
+	itemCount, pos, ok := parseIinfEntryCount(iinfData, version, pos)
 	if !ok {
 		return result
 	}
@@ -1150,12 +408,17 @@ func parseIinf(metaData []byte) map[uint16][4]byte {
 
 	// Parse infe (item info entry) boxes.
 	for pos < len(iinfData) {
-		size, typ, _, ok := parseHEIFBoxHeader(iinfData, pos)
-		if !ok || size < 8 {
+		// The infe payload starts after the box header, which is 16 bytes
+		// when the box uses the 64-bit largesize form (ISO 14496-12 §4.2); the
+		// header length is never assumed (task #348; libavif src/read.c
+		// avifParseItemInfoBox reads each infe through
+		// avifROStreamReadBoxHeader).
+		size, typ, headerLen, ok := parseHEIFBoxHeader(iinfData, pos)
+		if !ok {
 			break
 		}
 		if typ == boxTypeInfe {
-			infeData := iinfData[pos+8 : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by file size
+			infeData := iinfData[pos+int(headerLen) : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by file size
 			id, itemType, ok := parseInfe(infeData)
 			if ok {
 				result[id] = itemType
@@ -1231,8 +494,14 @@ func parseInfeV0V1(data []byte, pos int) (id uint16, typ [4]byte, ok bool) {
 
 // parseInfeV2V3 handles infe version 2 and 3 parsing.
 // v2: item_ID is uint16; v3: item_ID is uint32 (must fit uint16).
-// Both versions include: item_protection_index(2) + item_type(4).
-// ISO 14496-12 §8.11.6.
+// Both versions include: item_protection_index(2) + item_type(4), then
+// item_name (NUL-terminated) and, for item_type 'mime', content_type
+// (NUL-terminated). ISO 14496-12 §8.11.6.2.
+//
+// A 'mime' item is reported as itemTypeMime (the XMP item) only when its
+// content_type is "application/rdf+xml", the test libavif applies
+// (avifDecoderFindMetadata). Any other 'mime' item is reported with the zero
+// type: a valid item that carries no metadata this package handles.
 func parseInfeV2V3(data []byte, pos int, version byte) (id uint16, typ [4]byte, ok bool) {
 	if version == 2 {
 		if pos+2 > len(data) {
@@ -1259,263 +528,138 @@ func parseInfeV2V3(data []byte, pos int, version byte) (id uint16, typ [4]byte, 
 	// Direct array conversion from the slice: zero allocation, unlike the
 	// former string(data[pos:pos+4]) conversion (task #228).
 	typ = [4]byte(data[pos : pos+4])
+	if typ == itemTypeMime && !isXMPContentType(data[pos+4:]) {
+		return id, [4]byte{}, true
+	}
 	return id, typ, true
 }
 
-// parseIloc parses an 'iloc' box body and returns a map from item ID to location.
-func parseIloc(metaData []byte) map[uint16]itemLoc {
-	result := make(map[uint16]itemLoc)
-	ilocData := findInnerBox(metaData, boxTypeIloc)
-	if ilocData == nil {
-		return result
+// isXMPContentType reports whether rest — the bytes of a 'mime' infe body
+// after item_type — holds the item_name string followed by the
+// content_type "application/rdf+xml". Both strings are NUL-terminated
+// (ISO 14496-12 §8.11.6.2); an unterminated content_type running to the end
+// of the box is accepted. The comparison does not allocate.
+func isXMPContentType(rest []byte) bool {
+	_, ct, found := bytes.Cut(rest, []byte{0x00}) // skip item_name
+	if !found {
+		return false
 	}
-
-	// HEIF-ILOC-OFFBYONE-01 fix (task #243): the fixed iloc header spans two
-	// size-nibble bytes — offset_size|length_size at index 4 and
-	// base_offset_size|index_size at index 5 — so both reads require
-	// len(ilocData) >= 6, not >= 5. The previous "< 5" guard let a 5-byte iloc
-	// body (box size=13, the minimum legal iloc box) pass the check, read
-	// ilocData[4] safely, then panic on ilocData[5] after pos++.
-	// ISO 14496-12 §8.11.3: both size-nibble bytes are mandatory fixed fields
-	// present in every iloc version (analogous to the #133/#177 bounds checks
-	// on the variable-length extent fields further down this parser).
-	if len(ilocData) < 6 {
-		return result
-	}
-	version := ilocData[0]
-	pos := 4 // skip version + flags
-
-	offsetSize := int(ilocData[pos] >> 4)
-	lengthSize := int(ilocData[pos] & 0x0F)
-	pos++
-	baseOffsetSize := int(ilocData[pos] >> 4)
-	indexSize := int(0)
-	if version == 1 || version == 2 {
-		indexSize = int(ilocData[pos] & 0x0F)
-	}
-	pos++
-
-	itemCount, pos, ok := parseIinfItemCount(ilocData, version, pos)
-	if !ok {
-		return result
-	}
-	// Security audit FIX 1 (HEIF-ILOC-EXTENT-AMPLIFICATION): see the identical
-	// guard in parseIlocFull for the full rationale — reject an iloc box whose
-	// declared item_count exceeds maxIlocItems before doing any per-item work.
-	if itemCount > maxIlocItems {
-		return result
-	}
-
-	for range itemCount {
-		id, loc, newPos, itemOK := parseIlocItemSimple(ilocData, pos, version, offsetSize, lengthSize, baseOffsetSize, indexSize)
-		if !itemOK {
-			break
-		}
-		pos = newPos
-		result[id] = loc
-	}
-	return result
+	ct, _, _ = bytes.Cut(ct, []byte{0x00})
+	return string(ct) == xmpContentType
 }
 
-// readIlocSimpleExtents reads extentCount extents from the simple iloc parser,
-// resolving each extent's offset against baseOffset. Returns the last observed
-// offset and length (matching the original accumulator behaviour), the updated
-// position, and whether parsing succeeded without truncation.
+// fullBoxFieldsLen is the byte length of the FullBox version(8) + flags(24)
+// fields that follow the box header (ISO 14496-12 §4.2.2 FullBox).
+const fullBoxFieldsLen = 4
+
+// findMetaBoxAbs selects the file's metadata container: the one 'meta' FullBox
+// that both Extract and Inject read and write (task #349). It returns its
+// absolute start, end, and the offset where its content begins (after the box
+// header and the FullBox version/flags).
 //
-// ISO 14496-12 §8.11.3: extents accumulate; only the last extent's values are
-// retained here (matching the original implementation's behaviour).
+// Selection rule:
+//  1. The first file-level (top-level) 'meta' box, in file order.
+//  2. Only when the file has no top-level 'meta' box at all: the first 'meta'
+//     box that is a direct child of the first top-level 'moov' box.
 //
-// Security (CWE-770/834, security audit FIX 1): when every per-extent field
-// width is zero (indexSize == offsetSize == lengthSize == 0), no iteration
-// consumes any input byte, so an attacker-controlled extent_count of up to
-// 65535 would otherwise force 65535 no-op iterations per item at zero cost —
-// combined across maxIlocItems items this is a CPU-exhaustion vector. The
-// loop bound is capped at maxIlocExtentsPerItem in that degenerate case,
-// mirroring the identical guard in readIlocFullExtents. When at least one
-// field has non-zero width, extentCount remains naturally bounded by the
-// per-field bounds checks below (truncation stops the loop early), so no
-// legitimate file is affected.
-func readIlocSimpleExtents(ilocData []byte, pos, extentCount int, baseOffset uint64, offsetSize, lengthSize, indexSize int) (offset, length uint64, newPos int, ok bool) { //nolint:gocyclo // binary parser: each branch is a mandatory spec-derived bounds check (indexSize/offsetSize/lengthSize) plus the FIX-1 zero-field-size DoS guard; splitting would reduce clarity without reducing branch count
-	extentFieldSize := indexSize + offsetSize + lengthSize
-	loopCount := extentCount
-	if extentFieldSize == 0 && loopCount > maxIlocExtentsPerItem {
-		loopCount = maxIlocExtentsPerItem
-	}
-	for range loopCount {
-		// #133 fix: bounds-check the extent_index field before advancing.
-		// ISO 14496-12 §8.11.3: extent_index is present when indexSize > 0 (iloc v1/v2).
-		// Missing this guard allows a truncated extent to silently advance pos past
-		// len(ilocData), producing a zero-offset/zero-length item that is recorded
-		// as valid — the metadata is silently dropped (regression gate:
-		// TestReadIlocSimpleExtentsTruncatedIndex).
-		if indexSize > 0 {
-			if pos+indexSize > len(ilocData) {
-				return offset, length, pos, false
-			}
-			pos += indexSize
-		}
-		if offsetSize > 0 {
-			if pos+offsetSize > len(ilocData) {
-				return offset, length, pos, false
-			}
-			rawOff := readUintN(ilocData[pos:], offsetSize)
-			// Guard against integer overflow in offset + baseOffset.
-			if rawOff > math.MaxUint64-baseOffset {
-				return offset, length, pos, false
-			}
-			offset = rawOff + baseOffset
-			pos += offsetSize
-		}
-		if lengthSize > 0 {
-			if pos+lengthSize > len(ilocData) {
-				return offset, length, pos, false
-			}
-			length = readUintN(ilocData[pos:], lengthSize)
-			pos += lengthSize
-		}
-	}
-	return offset, length, pos, true
-}
-
-// parseIlocItemSimple reads one item entry from the simple iloc parser (parseIloc).
-// It handles version-specific ID width, optional construction method, base offset,
-// extent count, and the extent loop — returning the resolved offset and length.
+// A top-level 'meta' box that is present but unusable (too small for a
+// FullBox) is NOT skipped in favour of a moov-nested one: the rule picks one
+// box and never falls through, so Extract and Inject cannot disagree.
 //
-// ISO 14496-12 §8.11.3: extents accumulate; only the last extent's values are
-// retained here (matching the original implementation's behaviour).
-func parseIlocItemSimple(ilocData []byte, pos int, version uint8, offsetSize, lengthSize, baseOffsetSize, indexSize int) (id uint16, loc itemLoc, newPos int, ok bool) { //nolint:cyclop,gocyclo // binary parser: each branch is a spec-derived field; ISO 14496-12 §8.11.3 construction_method handling requires nested version checks
-	// Read item ID (version-specific width).
-	id, pos, ok = readIlocItemID(ilocData, pos, version)
-	if !ok {
-		return 0, loc, pos, false
-	}
-
-	// #177 fix: read construction_method with a bounds check and honour it.
-	// ISO 14496-12 §8.11.3: construction_method is present only for iloc v1/v2.
-	//   0 = file-offset (absolute), 1 = idat-relative, 2 = item-relative.
-	// Previously the 2-byte field was consumed without a bounds check and its value
-	// was discarded, so method 1 and 2 items were silently resolved as file-absolute
-	// offsets — producing wrong metadata reads and a potential attacker-controlled
-	// seek (regression gate: TestHEIFRobustIlocConstructionMethod1).
-	if version == 1 || version == 2 { //nolint:nestif // ISO 14496-12 §8.11.3: construction_method handling requires per-field version-gated nested bounds checks; complexity is inherent to the spec structure
-		if pos+2 > len(ilocData) {
-			return id, itemLoc{}, pos, false
-		}
-		constructMethod := binary.BigEndian.Uint16(ilocData[pos:])
-		pos += 2
-		if constructMethod != 0 {
-			// Method 1 (idat-relative) and 2 (item-relative) cannot be resolved
-			// without idat box parsing, which is out of scope for this read path.
-			// Return a zero itemLoc so the item is skipped rather than mis-resolved.
-			// Advance past the remaining fields to keep the caller's position valid.
-			if baseOffsetSize > 0 {
-				if pos+baseOffsetSize > len(ilocData) {
-					return id, itemLoc{}, pos, true // parsed id; skip rest
-				}
-				pos += baseOffsetSize
-			}
-			if pos+2 > len(ilocData) {
-				return id, itemLoc{}, pos, true
-			}
-			extentCount := int(binary.BigEndian.Uint16(ilocData[pos:]))
-			pos += 2
-			// Advance past all extent fields without recording them.
-			extentFieldSize := indexSize + offsetSize + lengthSize
-			pos += extentCount * extentFieldSize
-			if pos > len(ilocData) {
-				pos = len(ilocData) // clamp: we only need to skip, not read
-			}
-			return id, itemLoc{}, pos, true // item valid but unsupported method; loc = zero
-		}
-	}
-
-	var baseOffset uint64
-	if baseOffsetSize > 0 {
-		if pos+baseOffsetSize > len(ilocData) {
-			return 0, loc, pos, false
-		}
-		baseOffset = readUintN(ilocData[pos:], baseOffsetSize)
-		pos += baseOffsetSize
-	}
-
-	if pos+2 > len(ilocData) {
-		return 0, loc, pos, false
-	}
-	extentCount := int(binary.BigEndian.Uint16(ilocData[pos:]))
-	pos += 2
-
-	// #133 fix: propagate the ok flag from readIlocSimpleExtents so that a
-	// truncated extent_index field (missing bounds check in the original) causes
-	// the item to be omitted rather than recorded with offset=0, length=0.
-	// A zero-offset/zero-length item produced by silent truncation causes the
-	// EXIF/XMP read to seek to offset 0, returning image bytes instead of metadata
-	// (regression gate: TestReadIlocSimpleExtentsTruncatedIndex).
-	var offset, length uint64
-	var extOK bool
-	offset, length, pos, extOK = readIlocSimpleExtents(ilocData, pos, extentCount, baseOffset, offsetSize, lengthSize, indexSize)
-	if !extOK {
-		return id, itemLoc{}, pos, false
-	}
-	return id, itemLoc{offset: offset, length: length}, pos, true
-}
-
-// metaFullBoxMinSize is the minimum valid size for a meta FullBox:
-// 4 bytes box-header-size + 4 bytes box-type + 4 bytes FullBox version/flags = 12 bytes.
-// A meta box with size < 12 bytes cannot contain valid FullBox metadata.
-// ISO 14496-12 §8.11.1: meta is a FullBox; its minimum declared size is 12.
-const metaFullBoxMinSize = 12
-
-// findMetaBoxAbs finds the 'meta' FullBox in the file and returns its
-// absolute start, end, and the offset where its content begins (after header+version/flags).
-// Returns found=false when the meta box is absent or smaller than metaFullBoxMinSize
-// (an under-sized FullBox cannot contain usable content and would otherwise cause
-// buildInjectComponents to slice data[12:8] → panic; regression gate:
-// TestHEIFInjectMetaTooSmallForFullBox).
-// ISO 14496-12 §8.11.1: meta FullBox minimum size = 12 bytes.
+// Rationale. The HEIF item table (iinf, iloc, pitm) lives in the file-level
+// MetaBox; libavif (src/read.c, avifParse: the top-level 'meta' box is parsed
+// as the item container and 'moov' only for tracks), libheif (libheif/file.cc,
+// HeifFile::parse_heif_file: m_meta_box is the top-level 'meta' box) and
+// heic-rs (src/meta/mod.rs) read only the top-level box. ISO/IEC 14496-12
+// §8.11.1 also allows a MetaBox inside 'moov'; that box is the fallback so that
+// a file whose only metadata container is movie-level keeps being read and
+// written, as before. Boxes nested deeper (trak, udta) describe a track or the
+// user data of a movie, not the file, and are not selected.
+//
+// The box header is 8 bytes, or 16 bytes when the box uses the 64-bit
+// largesize form (size == 1): contentOff = absStart + headerLen + 4. The
+// header length of the meta box and of the moov box that may wrap it comes
+// from parseHEIFBoxHeader, never from an assumed constant (task #334; libavif
+// src/stream.c avifROStreamReadBoxHeaderPartial reads the largesize the same
+// way, ISO 14496-12 §4.2).
+//
+// Returns found=false when no meta box is selected or the selected one is
+// smaller than its header plus the FullBox fields: 12 bytes with the 8-byte
+// header, 20 with the 16-byte one (an under-sized FullBox cannot contain
+// usable content and would otherwise cause buildInjectComponents to slice
+// data[12:8] → panic; regression gate: TestHEIFInjectMetaTooSmallForFullBox).
+// ISO 14496-12 §8.11.1: meta FullBox minimum size = header + 4 bytes.
 func findMetaBoxAbs(data []byte) (absStart, absEnd, contentOff int, found bool) {
-	// Search at top level first.
-	if s, e, ok := flatBoxRangeInFile(data, boxTypeMeta); ok {
-		if e-s < metaFullBoxMinSize {
-			// #169 fix: meta box too small to be a valid FullBox.
-			// ISO 14496-12 §8.11.1: meta is a FullBox (header[8]+version/flags[4]=12 bytes minimum).
-			// If size < 12, contentOff = s+12 would exceed e, causing data[s+12:e] to panic.
-			return 0, 0, 0, false
-		}
-		return s, e, s + 8 + 4, true // +8 header, +4 FullBox version/flags
+	if s, e, hl, ok := flatBoxRangeHdr(data, boxTypeMeta); ok {
+		return validMetaRange(s, e, hl, 0)
 	}
-	// Search inside moov.
-	ms, me, ok := flatBoxRangeInFile(data, boxTypeMoov)
+	ms, me, mhl, ok := flatBoxRangeHdr(data, boxTypeMoov)
 	if !ok {
 		return 0, 0, 0, false
 	}
-	moovContent := data[ms+8 : me]
-	if s, e, ok := flatBoxRangeInFile(moovContent, boxTypeMeta); ok {
-		if e-s < metaFullBoxMinSize {
-			// Same size guard for the moov-nested meta box.
-			return 0, 0, 0, false
-		}
-		absS := ms + 8 + s
-		absE := ms + 8 + e
-		return absS, absE, absS + 8 + 4, true
+	moovContent := data[ms+mhl : me]
+	if s, e, hl, ok := flatBoxRangeHdr(moovContent, boxTypeMeta); ok {
+		return validMetaRange(s, e, hl, ms+mhl)
 	}
 	return 0, 0, 0, false
+}
+
+// validMetaRange converts a meta box range relative to base into the absolute
+// triple findMetaBoxAbs returns, rejecting a box too small for a FullBox
+// (#169 fix: ISO 14496-12 §8.11.1, meta is a FullBox, so size >= header + 4;
+// otherwise contentOff would exceed the box end and data[contentOff:end]
+// would panic).
+func validMetaRange(start, end, headerLen, base int) (absStart, absEnd, contentOff int, found bool) {
+	if end-start < headerLen+fullBoxFieldsLen {
+		return 0, 0, 0, false
+	}
+	return base + start, base + end, base + start + headerLen + fullBoxFieldsLen, true
+}
+
+// metaContentInWindow returns the content of the selected meta box of data
+// (the bytes after its header and FullBox version/flags), or nil when none is
+// selected. complete states that data is the whole file; when it is only the
+// head of a file, a moov-nested meta box is not taken, because a file-level
+// meta box may still follow beyond data and would take precedence
+// (findMetaBoxAbs), so the caller must read the whole file instead.
+func metaContentInWindow(data []byte, complete bool) []byte {
+	if s, e, hl, ok := flatBoxRangeHdr(data, boxTypeMeta); ok {
+		if _, _, off, valid := validMetaRange(s, e, hl, 0); valid {
+			return data[off:e]
+		}
+		return nil
+	}
+	if !complete {
+		return nil
+	}
+	if _, end, off, ok := findMetaBoxAbs(data); ok {
+		return data[off:end]
+	}
+	return nil
 }
 
 // flatBoxRangeInFile performs a flat scan and returns start+end of the first
 // box matching boxType. Returns (0, 0, false) if not found.
 func flatBoxRangeInFile(data []byte, boxType [4]byte) (start, end int, found bool) {
+	start, end, _, found = flatBoxRangeHdr(data, boxType)
+	return start, end, found
+}
+
+// flatBoxRangeHdr is flatBoxRangeInFile that also returns the box's header
+// length (8, or 16 for a 64-bit largesize box, ISO 14496-12 §4.2).
+func flatBoxRangeHdr(data []byte, boxType [4]byte) (start, end, headerLen int, found bool) {
 	pos := 0
 	for pos < len(data) {
-		size, typ, _, ok := parseHEIFBoxHeader(data, pos)
+		size, typ, hl, ok := parseHEIFBoxHeader(data, pos)
 		if !ok {
 			break
 		}
 		if typ == boxType {
-			return pos, pos + int(size), true //nolint:gosec // G115: ISOBMFF box size bounded by file size
+			return pos, pos + int(size), int(hl), true //nolint:gosec // G115: ISOBMFF box size bounded by file size; hl is 8 or 16
 		}
 		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
 	}
-	return 0, 0, false
+	return 0, 0, 0, false
 }
 
 // findInnerBox searches for a box of the given type within data (flat scan).
@@ -1535,121 +679,6 @@ func findInnerBox(data []byte, boxType [4]byte) []byte {
 			return boxData
 		}
 		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
-	}
-	return nil
-}
-
-// readUintN reads an n-byte big-endian unsigned integer from b.
-func readUintN(b []byte, n int) uint64 {
-	var v uint64
-	for i := 0; i < n && i < len(b); i++ {
-		v = v<<8 | uint64(b[i])
-	}
-	return v
-}
-
-// ---------------------------------------------------------------------------
-// Inject helpers
-// ---------------------------------------------------------------------------
-
-// mapPendingItems maps item IDs to their new payloads based on itemTypes.
-// EXIF items get a 4-byte zero prefix prepended (ISO 23008-12 §6.6.1: the
-// EXIF item begins with a 4-byte offset to the TIFF header; value 0 means
-// immediate). XMP items are stored verbatim.
-//
-// The result map is pre-sized to len(itemTypes), a safe (if usually loose)
-// upper bound computed at zero extra cost — pendingByID can never gain more
-// entries than itemTypes has, and real files typically have only one or two
-// EXIF/XMP items among many image-variant items (task #229).
-func mapPendingItems(itemTypes map[uint16][4]byte, rawEXIF, rawXMP []byte) map[uint16][]byte {
-	pendingByID := make(map[uint16][]byte, len(itemTypes))
-	for id, typ := range itemTypes {
-		switch typ {
-		case itemTypeExif:
-			if rawEXIF != nil {
-				prefix := [4]byte{}
-				pendingByID[id] = append(prefix[:], rawEXIF...)
-			}
-		case itemTypeMime:
-			if rawXMP != nil {
-				pendingByID[id] = rawXMP
-			}
-		}
-	}
-	return pendingByID
-}
-
-// updateIlocItemsInPlace mutates items (the caller's freshly-parsed
-// ilocInfo.items — never aliased elsewhere) so that each item appearing in
-// pendingByID has its construction_method forced to 0 (file-offset), its base
-// offset zeroed, and its extents collapsed to a single placeholder extent
-// (offset=0, length=0). Real values are assigned later by assignItemOffsets
-// once the output layout is known.
-//
-// Unlike the former updateIlocItems, this does not allocate a copy of items:
-// it mutates in place, and reuses each matched item's existing extents
-// backing array when it already has room for one element (the common case —
-// almost every real HEIF item has exactly one extent already), only
-// allocating a fresh one-element slice when the existing array is empty
-// (task #229).
-//
-// ISO 14496-12 §8.11.3: construction_method 0 = file offset, 1 = idat-relative,
-// 2 = item-relative. Because relocation always appends the payload at an absolute
-// file position, we must force construction_method to 0 regardless of the
-// original value. Leaving it as 1 or 2 while writing an absolute file offset
-// would cause conformant readers to mis-resolve the metadata location.
-func updateIlocItemsInPlace(items []ilocFullItem, pendingByID map[uint16][]byte) {
-	for i := range items {
-		if _, ok := pendingByID[items[i].id]; !ok {
-			continue
-		}
-		// Force to file-offset semantics: the relocated payload is always
-		// written at an absolute file position (construction_method == 0).
-		items[i].constructMethod = 0
-		items[i].baseOffset = 0
-		if cap(items[i].extents) >= 1 {
-			items[i].extents = items[i].extents[:1]
-			items[i].extents[0] = ilocExtent{}
-		} else {
-			items[i].extents = []ilocExtent{{}}
-		}
-	}
-}
-
-// assignItemOffsets walks updatedItems, finds each item in pendingByID, and
-// assigns its real file offset by accumulating from newItemBaseOffset.
-// Returns the slice with offsets and lengths filled in.
-func assignItemOffsets(updatedItems []ilocFullItem, pendingByID map[uint16][]byte, newItemBaseOffset uint64) []ilocFullItem {
-	var accumOffset uint64
-	for i, item := range updatedItems {
-		if payload, ok := pendingByID[item.id]; ok {
-			updatedItems[i].extents[0].offset = newItemBaseOffset + accumOffset
-			updatedItems[i].extents[0].length = uint64(len(payload))
-			accumOffset += uint64(len(payload))
-		}
-	}
-	return updatedItems
-}
-
-// writeHEIFOutput writes the four output sections to w:
-// prefix (patched ancestor sizes), meta box, suffix, then new item payloads
-// in item order.
-func writeHEIFOutput(w io.Writer, prefix, meta, suffix []byte, updatedItems []ilocFullItem, pendingByID map[uint16][]byte) error {
-	if _, err := w.Write(prefix); err != nil {
-		return fmt.Errorf("heif: write prefix: %w", err)
-	}
-	if _, err := w.Write(meta); err != nil {
-		return fmt.Errorf("heif: write meta: %w", err)
-	}
-	if _, err := w.Write(suffix); err != nil {
-		return fmt.Errorf("heif: write suffix: %w", err)
-	}
-	for _, item := range updatedItems {
-		if payload, ok := pendingByID[item.id]; ok {
-			if _, err := w.Write(payload); err != nil {
-				return fmt.Errorf("heif: write item payload: %w", err)
-			}
-		}
 	}
 	return nil
 }

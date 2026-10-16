@@ -21,15 +21,29 @@ const (
 	NScc = "http://creativecommons.org/ns#"
 	// NSpdf is the PDF namespace (Adobe PDF 1.3 property set).
 	NSpdf = "http://ns.adobe.com/pdf/1.3/"
-	// NSxmpNote is the XMP namespace for extended XMP notes.
-	// Adobe XMP Specification Part 3 §1.1.4.
-	NSxmpNote = "http://ns.adobe.com/xap/1.0/se/Note/"
+	// NSxmpNote is the xmpNote namespace. Its property
+	// xmpNote:HasExtendedXMP links the standard XMP packet of a JPEG file to
+	// the extended XMP stored after it. Adobe XMP Specification Part 3
+	// (2020) §1.1.3.1: "The URI for the xmpNote: namespace is
+	// http://ns.adobe.com/xmp/note/"; XMP Toolkit kXMP_NS_XMP_Note
+	// (public/include/XMP_Const.h).
+	//
+	// Earlier releases of this package used the URI
+	// "http://ns.adobe.com/xap/1.0/se/Note/". Packets that use it still
+	// parse: namespaces are matched by URI, and ParseExtended removes
+	// HasExtendedXMP in both namespaces.
+	NSxmpNote = "http://ns.adobe.com/xmp/note/"
 	// NSgeo is the W3C Basic Geo vocabulary namespace for GPS coordinates.
 	// W3C Geo 2003/01: http://www.w3.org/2003/01/geo/wgs84_pos#
 	// Properties: lat (latitude, decimal degrees) and long/lon (longitude, decimal degrees).
 	// The coordinate format is "DDD,MM.mmmR" or "DDD,MM,SS.sssR", same as NSexif.
 	NSgeo = "http://www.w3.org/2003/01/geo/wgs84_pos#"
 )
+
+// nsXMPNoteLegacy is the xmpNote namespace URI that releases of this package
+// before task #315 wrote. It is not a namespace of the specification; it is
+// kept so that files written by those releases read like any other.
+const nsXMPNoteLegacy = "http://ns.adobe.com/xap/1.0/se/Note/"
 
 // arrayProperties is the single, spec-sourced table of every array-typed
 // (rdf:Seq / rdf:Bag / rdf:Alt) top-level property this package recognises,
@@ -51,12 +65,11 @@ const (
 //
 // A property NOT listed here is either a Simple (non-array) property, or an
 // array-typed property in a namespace/local this table has not yet been
-// extended to cover; for the latter case, effectiveContainerType (below)
-// still preserves round-trip fidelity for any property that was actually
-// parsed from a source document with a real rdf:Alt/Seq/Bag wrapper — see
-// the XMP.containerTypes field doc in xmp.go. This table is the fallback
-// authority for properties with no parse-time record, i.e. new properties
-// created via Set()/the named setters.
+// extended to cover; for the latter case, a property parsed from a source
+// document with a real rdf:Alt/Seq/Bag wrapper is retained in the parse tree
+// (XMP.nodes) and keeps its container on round trip. This table is the
+// authority for properties without a tree node, i.e. new properties created
+// via Set()/the named setters and parsed properties that agree with it.
 var arrayProperties = map[string]map[string]string{ //nolint:gochecknoglobals // read-only spec-sourced lookup table; never mutated after init
 	// Dublin Core (dc:) — Adobe XMP Specification Part 1, Appendix 8.3;
 	// exiv2.org/tags-xmp-dc.html. dc:format, dc:identifier, dc:source are
@@ -187,58 +200,23 @@ func isCollectionProperty(ns, local string) bool {
 	return ok
 }
 
-// specTableMatches reports whether the spec-sourced arrayProperties table
-// already records (ns, local) with exactly container kind ctype.
-//
-// Used by onStartCollection (rdf.go) to decide whether recording a
-// parse-time container override is actually necessary: if the table already
-// agrees with what the source document used, effectiveContainerType would
-// fall back to the identical answer anyway, so recording it is redundant.
-// Skipping the redundant record keeps the zero/low-alloc parse fast path
-// intact for the overwhelming majority of real-world XMP — standard
-// dc:/tiff:/exif:/xmpMM:/… properties written per spec — while still
-// recording (and thus correctly preserving on round trip) any property
-// whose container the table has never heard of, or gets wrong for this
-// specific document (task #273).
-func specTableMatches(ns, local, ctype string) bool {
-	m, ok := arrayProperties[ns]
-	if !ok {
-		return false
-	}
-	ct, ok := m[local]
-	return ok && ct == ctype
-}
-
 // effectiveContainerType determines whether the top-level property (ns,
 // local) must be serialised using an RDF collection container (rdf:Alt/Seq/
-// Bag) and, if so, which kind. local is the parent/top-level property name —
-// for struct-in-list properties this is the bracket-free parent (e.g.
-// "History"), matching how recordContainerType (rdf.go) and
-// writeStructInListProperty (write.go) key their lookups.
+// Bag) when Encode writes it from its Properties entries alone and, if so,
+// which kind. local is the parent/top-level property name — for
+// struct-in-list properties this is the bracket-free parent (e.g.
+// "History").
 //
-// Priority order (task #273 / ISO 16684-1 §7.5 round-trip fidelity):
-//  1. x.containerTypes — the container kind actually observed for this exact
-//     property when x was produced by Parse. This takes priority over the
-//     spec table so that ANY namespace — including unknown/custom ones the
-//     table below can never enumerate — round-trips with its original
-//     container structure preserved exactly, closing the class of
-//     corruption where a plain Parse → unrelated field write → Encode
-//     silently downgraded an untouched array property to a bare scalar.
-//  2. arrayProperties (via isCollectionProperty/collectionType) — for
-//     properties with no parse-time record, i.e. properties newly created
-//     by Set()/the named setters, which have no source document to
-//     preserve and must fall back to the spec-sourced default.
+// Only properties without a retained tree node reach this function: a
+// property parsed with a container other than the one this table yields is
+// retained in XMP.nodes and written with its own container (task #273,
+// superseded by the tree model of task #303), so the spec-sourced table is
+// the single authority here, used for properties created via Set()/the named
+// setters and for parsed properties whose container agrees with it.
 //
-// Returns ctype == "" and isColl == false when neither source identifies
+// Returns ctype == "" and isColl == false when the table does not identify
 // (ns, local) as a collection.
-func (x *XMP) effectiveContainerType(ns, local string) (ctype string, isColl bool) {
-	if x != nil && x.containerTypes != nil {
-		if m, ok := x.containerTypes[ns]; ok {
-			if ct, ok := m[local]; ok {
-				return ct, true
-			}
-		}
-	}
+func (*XMP) effectiveContainerType(ns, local string) (ctype string, isColl bool) {
 	if isCollectionProperty(ns, local) {
 		return collectionType(ns, local), true
 	}
@@ -247,7 +225,7 @@ func (x *XMP) effectiveContainerType(ns, local string) (ctype string, isColl boo
 
 // prefixMap maps well-known XMP namespace URIs to their canonical prefix strings.
 // XMP Part 1 §B, Adobe XMP Specification Appendix A.
-var prefixMap = map[string]string{ //nolint:gochecknoglobals // read-only namespace→prefix lookup table per XMP Part 1 §B; never mutated
+var prefixMap = withStandardNamespaces(map[string]string{ //nolint:gochecknoglobals // read-only namespace→prefix lookup table per XMP Part 1 §B; never mutated after package initialisation
 	NSxmp:       "xmp",
 	NSxmpRights: "xmpRights",
 	NSxmpMM:     "xmpMM",
@@ -271,7 +249,7 @@ var prefixMap = map[string]string{ //nolint:gochecknoglobals // read-only namesp
 	// conventional binding that xmp.GPS()'s W3C Geo fallback expects to see
 	// on write, and confusing for tools/readers that key off "geo:lat".
 	NSgeo: "geo",
-}
+})
 
 // uniquePrefixFor returns a prefix for uri that is not already in used.
 // For well-known URIs the canonical prefix is returned (it must already be in

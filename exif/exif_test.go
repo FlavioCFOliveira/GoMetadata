@@ -1976,14 +1976,14 @@ func TestParseMakerNoteIFD_SonyTooShort(t *testing.T) {
 // TestParseMakerNoteIFD_Fujifilm tests Fujifilm MakerNote parsing.
 func TestParseMakerNoteIFD_Fujifilm(t *testing.T) {
 	t.Parallel()
-	// Layout: "FUJIFILM"(8) + version(4) + ifdOffset(4=16) + IFD
+	// Layout: "FUJIFILM"(8) + ifdOffset(4=16) + filler(4) + IFD
 	ifdEntries := buildPlainIFD(binary.LittleEndian, [][4]uint32{
 		{0x1000, uint32(TypeShort), 1, 1},
 	})
 	b := make([]byte, 16+len(ifdEntries))
 	copy(b[0:], "FUJIFILM")
-	copy(b[8:], "0100")
-	binary.LittleEndian.PutUint32(b[12:], 16) // IFD starts at byte 16
+	binary.LittleEndian.PutUint32(b[8:], 16) // IFD starts at byte 16
+	copy(b[12:], "0100")
 	copy(b[16:], ifdEntries)
 
 	result := parseMakerNoteIFD(b, "FUJIFILM", binary.LittleEndian)
@@ -2054,10 +2054,10 @@ func TestParseMakerNoteIFD_PentaxPENTAX(t *testing.T) {
 	ifdEntries := buildPlainIFD(binary.LittleEndian, [][4]uint32{
 		{0x0001, uint32(TypeShort), 1, 1},
 	})
-	b := make([]byte, 12+len(ifdEntries))
+	b := make([]byte, 10+len(ifdEntries))
 	copy(b[0:], "PENTAX \x00")
 	b[8], b[9] = 'I', 'I' // LE
-	copy(b[12:], ifdEntries)
+	copy(b[10:], ifdEntries)
 
 	result := parseMakerNoteIFD(b, "Ricoh", binary.LittleEndian)
 	if result == nil {
@@ -2949,7 +2949,7 @@ func TestThumbnailRoundTripBothOrders(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// #21 — TypeUTF8 (CIPA DC-008-2023 §4.6.3, type code 13)
+// #21 — TypeUTF8 (Exif 3.1 §4.6.2, p. 28, type code 129)
 // ---------------------------------------------------------------------------
 
 // TestTypeUTF8RoundTrip verifies that an IFDEntry with TypeUTF8 survives a
@@ -3058,10 +3058,10 @@ func TestUTF8ValueHelper(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// #22 — SetGPS writes GPSVersionID {2,3,0,0} (EXIF §4.6.6 Table 15)
+// #22 — SetGPS writes GPSVersionID {2,4,0,0} (Exif 3.1 §4.6.7.1.1, p. 83: 2.4.0.0)
 // ---------------------------------------------------------------------------
 
-// TestSetGPSWritesVersionID verifies that SetGPS inserts GPSVersionID = {2,3,0,0}
+// TestSetGPSWritesVersionID verifies that SetGPS inserts GPSVersionID = {2,4,0,0}
 // into the GPS IFD when called on a fresh EXIF struct.
 func TestSetGPSWritesVersionID(t *testing.T) {
 	t.Parallel()
@@ -3081,7 +3081,7 @@ func TestSetGPSWritesVersionID(t *testing.T) {
 	if entry.Count != 4 {
 		t.Errorf("GPSVersionID Count = %d, want 4", entry.Count)
 	}
-	want := []byte{2, 3, 0, 0}
+	want := []byte{2, 4, 0, 0}
 	if !bytes.Equal(entry.Value, want) {
 		t.Errorf("GPSVersionID value = %v, want %v", entry.Value, want)
 	}
@@ -3129,7 +3129,7 @@ func TestSetGPSVersionIDRoundTrip(t *testing.T) {
 	if entry == nil {
 		t.Fatal("GPSVersionID missing after round-trip")
 	}
-	want := []byte{2, 3, 0, 0}
+	want := []byte{2, 4, 0, 0}
 	if !bytes.Equal(entry.Value, want) {
 		t.Errorf("GPSVersionID after round-trip = %v, want %v", entry.Value, want)
 	}

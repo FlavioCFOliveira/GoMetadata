@@ -21,7 +21,7 @@ import (
 // F-1: Table-driven test for all 13 TIFF data types
 //
 // TIFF 6.0 §2 defines twelve base types; CIPA DC-008-2023 §4.6.3 adds TypeUTF8
-// (code 13). Each type is tested in both its inline form (totalSize ≤ 4 bytes)
+// (code 129; IFD = 13 is tested in utf8_type_test.go). Each type is tested in both its inline form (totalSize ≤ 4 bytes)
 // and, where applicable, its out-of-line form (totalSize > 4 bytes). Tests run
 // for both LE and BE byte orders to give MM/II parity as a natural byproduct.
 // ---------------------------------------------------------------------------
@@ -45,7 +45,7 @@ type tiffTypeCase struct {
 //
 //	TypeByte(1), TypeASCII(2), TypeShort(3), TypeLong(4), TypeRational(5),
 //	TypeSByte(6), TypeUndefined(7), TypeSShort(8), TypeSLong(9),
-//	TypeSRational(10), TypeFloat(11), TypeDouble(12), TypeUTF8(13).
+//	TypeSRational(10), TypeFloat(11), TypeDouble(12), TypeUTF8(129).
 func TestAllTIFFTypesTableDriven(t *testing.T) {
 	t.Parallel()
 
@@ -428,7 +428,7 @@ func TestAllTIFFTypesTableDriven(t *testing.T) {
 				}
 			},
 		},
-		// ---- UTF8 (TypeUTF8 = 13) — 1 byte per element; out-of-line ----
+		// ---- UTF8 (TypeUTF8 = 129) — 1 byte per element; out-of-line ----
 		// CIPA DC-008-2023 §4.6.3: element size 1, NUL-terminated UTF-8 string.
 		{
 			name: "TypeUTF8_outofline",
@@ -1299,7 +1299,7 @@ func TestWriteIFDInlineDeterminismAllInlineTypes(t *testing.T) {
 	//   TypeSLong(9):     sz=4, count=1 → 4 bytes, 0 padding
 	//   TypeFloat(11):    sz=4, count=1 → 4 bytes, 0 padding
 	//   TypeASCII(2):     sz=1, count=4 → 4 bytes, 0 padding (e.g. "A\x00\x00\x00")
-	//   TypeUTF8(13):     sz=1, count=3 → 3 bytes, 1 padding byte
+	//   TypeUTF8(129):    sz=1, count=3 → 3 bytes, 1 padding byte
 	type inlineCase struct {
 		name    string
 		typ     DataType
@@ -1454,14 +1454,14 @@ func TestMakeTrailingSpaceFullParsePath(t *testing.T) {
 	//   [54..]     MakerNote payload (Fujifilm format)
 
 	// Fujifilm MakerNote with an IFD at byte 16.
-	// Layout: "FUJIFILM"(8) + "0100"(4) + ifdOff(4=16) + ifd_count(2) + next(4)
+	// Layout: "FUJIFILM"(8) + ifdOff(4=16) + filler(4) + ifd_count(2) + next(4)
 	fujiPayload := func() []byte {
 		b := make([]byte, 22)
 		copy(b[0:], "FUJIFILM")
-		copy(b[8:], "0100")
-		binary.LittleEndian.PutUint32(b[12:], 16) // IFD at byte 16
-		binary.LittleEndian.PutUint16(b[16:], 0)  // 0 entries (minimal valid IFD)
-		binary.LittleEndian.PutUint32(b[18:], 0)  // next IFD = 0
+		binary.LittleEndian.PutUint32(b[8:], 16) // IFD at byte 16
+		copy(b[12:], "0100")
+		binary.LittleEndian.PutUint16(b[16:], 0) // 0 entries (minimal valid IFD)
+		binary.LittleEndian.PutUint32(b[18:], 0) // next IFD = 0
 		return b
 	}()
 
@@ -1561,7 +1561,7 @@ func TestMakeTrailingSpaceFullParsePath(t *testing.T) {
 // ---------------------------------------------------------------------------
 // E-3: EXIF 2.3 vs 3.0 — TypeUTF8 as first-class tag type
 //
-// CIPA DC-008-2023 §4.6.3 introduces TypeUTF8 (code 13). An EXIF 3.0 file may
+// Exif 3.1 §4.6.2, p. 28 introduces TypeUTF8 (code 129). An EXIF 3.0 file may
 // carry UTF-8 encoded strings in any tag. The parser must handle TypeUTF8 in
 // IFD0, ExifIFD, and GPS IFD without errors.
 // ---------------------------------------------------------------------------

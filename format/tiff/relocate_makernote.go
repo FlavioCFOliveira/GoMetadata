@@ -1,338 +1,182 @@
 package tiff
 
-// relocate_makernote.go — generic MakerNote OOL-offset rebasing for the standard
-// TIFF relocation path (relocateTIFFFromParsed).
+// relocate_makernote.go — MakerNote value-offset rebasing for the standard
+// TIFF relocation path (relocateTIFFFromParsed) and the CR2 marker insertion.
 //
-// Problem (#127): manufacturers that store MakerNote OOL val_or_off fields as
-// TIFF-file-absolute offsets produce stale pointers after the MakerNote blob
-// moves to a new position during TIFF re-encoding.
+// Problem (#127, #310): a MakerNote IFD whose value offsets count from the
+// start of the TIFF stream holds stale pointers once the relocator moves the
+// MakerNote: every out-of-line value is read from the wrong place. ExifTool
+// reports it as "Adjusted MakerNotes base by N" and Canon tags as invalid.
 //
-// Two maker families require post-encode rebasing in the standard TIFF path:
+// Model (task #310). The MakerNote is copied verbatim and its out-of-line
+// value-or-offset fields are rebased by the distance the MakerNote moved,
+// when, and only when, its layout counts offsets from the TIFF header. The
+// layout (IFD position, byte order, offset base) comes from
+// exif.EXIF.MakerNoteLayout, which detects it exactly as Parse does
+// (exif/makernote_detect.go, adapted from metadata-extractor
+// ExifTiffHandler.processMakernote). TIFF-relative layouts include Canon,
+// Sony, Panasonic, Casio, Samsung, DJI, Kyocera, Sigma, Minolta, Nikon
+// Type 2 and Olympus "OLYMP\0"; layouts whose offsets count from a point
+// inside the MakerNote (Nikon Type 3, Olympus "OLYMPUS\0", Fujifilm, Pentax,
+// Apple, Ricoh, Sanyo) move unchanged.
 //
-//  1. Sony (plain-IFD MakerNotes — DSLR-A series, ILCE, SLT, Cybershot):
-//     A plain TIFF IFD at offset 0 within the blob; all OOL val_or_off fields
-//     are outer-TIFF-absolute (ExifTool Sony.pm).
-//     Note: Sony ARW files have a dedicated path (relocate_arw.go +
-//     rebaseSonyMakerNote) that handles both the MakerNote and the SR2Private
-//     block.  The function here provides equivalent rebasing when Sony-made files
-//     are read as standard TIFF (e.g. embedded preview TIFFs in JPEG APP1).
+// Alternative considered: keeping the MakerNote at its original absolute
+// offset, as Apache Commons Imaging (TiffImageWriterLossless, "frozen"
+// MakerNote field) and the Adobe XMP Toolkit (TIFF_FileWriter::
+// UpdateMemByAppend, which appends changes and never moves existing data) do.
+// Both rely on an update-in-place layout that leaves the original bytes
+// where they were; this relocator rebuilds the stream (IFDs first, image
+// data after), so the original offset of the MakerNote is generally occupied
+// by other data. Rebasing is the model of writers that rebuild the stream
+// (Exiv2 and ExifTool rewrite MakerNote offsets; studied, not copied).
 //
-//  2. Olympus "OLYMP\x00" (older compact cameras — C5050Z, C8080, SP350, SP500UZ):
-//     "OLYMP\x00" prefix + 2-byte version (8-byte header), then a plain IFD.
-//     All OOL val_or_off fields are outer-TIFF-absolute (ExifTool Olympus.pm).
-//     Newer Olympus cameras use the "OLYMPUS\x00" format with blob-relative
-//     offsets; those are safe to copy verbatim and are NOT handled here.
-//
-// Makers that are already correct and need NO rebasing:
-//
-//   - Canon:              plain IFD, blob-relative (offset 0 within blob)
-//   - Panasonic:          "Panasonic\0\0\0" prefix, IFD at 12, blob-relative
-//   - Olympus OLYMPUS\x00: newer format, blob-relative
-//   - Nikon Type-3:       embedded TIFF header — internal offsets are relative to
-//                          the embedded TIFF base at blob[tiffHdrOff], which moves
-//                          with the blob, so they remain self-consistent.
-//   - Pentax AOC / PENTAX: blob-relative
-//
-// Documented limitation — NOT rebased:
-//
-//   - Nikon Type-1 (legacy D1, plain IFD, big-endian): outer-TIFF-absolute offsets.
-//     Rebasing is NOT implemented because: (a) Type-1 cameras are extremely rare,
-//     (b) empirical analysis of real Type-1 files (ExifTool Nikon.pm) shows no
-//     known OOL sub-structures in practice, and (c) the format is no longer
-//     produced by any current or recent camera. Callers writing Nikon D1 files
-//     should be aware that MakerNote OOL values may be unreadable after write.
-//     This limitation does NOT corrupt image data or any other metadata.
-//
-// Algorithm (rebaseGenericMakerNote):
-//
-//  1. Detect whether the MakerNote blob is Sony-plain-IFD or Olympus-OLYMP-type.
-//  2. Locate the MakerNote blob in finalTIFF via OOL entry scan of ExifIFD.
-//  3. Compute delta = new_mn_abs − original_mn_abs (EXIF.MakerNoteOffset).
-//  4. Walk the MakerNote IFD; for each OOL entry (total > 4 bytes):
-//     a. Validate that old_voo falls within the original TIFF base space
-//        (at least >= original_mn_abs; upper bound is the TIFF file length,
-//        NOT the declared blob size — some Sony/Olympus models have OOL data
-//        that was captured verbatim by exif.Parse but lies just past the declared
-//        count; see #127 upper-bound-skip fix for rebaseSonyMakerNote).
-//     b. new_voo = old_voo + delta
-//     c. Overwrite the val_or_off field in finalTIFF at the entry position.
+// Limitation: a value the camera stored outside the MakerNote (Olympus
+// C-720UZ) is not carried by the verbatim copy; its pointer is rebased like
+// the others but the bytes it addresses are not the original value.
 //
 // Spec references:
 //   - EXIF §4.6.5, tag 0x927C (MakerNote).
-//   - ExifTool Sony.pm: Sony MakerNote OOL offset convention.
-//   - ExifTool Olympus.pm: OLYMP-type MakerNote OOL offset convention.
-//   - TIFF 6.0 §2: IFD entry layout — val_or_off holds absolute offset when
-//     total byte size > 4 bytes.
-//   - #127 audit finding: MakerNote OOL offset rebasing incomplete on write.
+//   - TIFF 6.0 §2: IFD entry layout — val_or_off is absolute when total > 4 bytes.
+//   - metadata-extractor ExifTiffHandler.processMakernote: offset base of each
+//     layout (tiffHeaderOffset or makernoteOffset).
 
 import (
 	"encoding/binary"
+	"math"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
 )
 
-// olympMNPrefix is the 6-byte prefix that identifies an older Olympus OLYMP-type
-// MakerNote (cameras such as C5050Z, C8080, SP350, SP500UZ).
-//
-// ExifTool Olympus.pm: OlympusMakerNote detection — "OLYMP\x00" prefix (6 bytes)
-// followed by a 2-byte version, then the IFD beginning at offset 8 within the blob.
-// All OOL val_or_off fields carry TIFF-file-absolute offsets.
-//
-// Distinguish from "OLYMPUS\x00" (8-byte prefix, IFD at offset 12, blob-relative).
-var olympMNPrefix = [6]byte{'O', 'L', 'Y', 'M', 'P', 0x00} //nolint:gochecknoglobals // package-level constant; never mutated
-
-// isOlympTypeMakerNote returns true when blob begins with "OLYMP\x00" (6 bytes),
-// which identifies the older Olympus OLYMP-type format that uses TIFF-absolute offsets.
-//
-// ExifTool Olympus.pm: "OLYMP\x00" magic (6 bytes) + 2-byte version; IFD at +8.
-// This is distinct from "OLYMPUS\x00" (newer format, blob-relative, move-safe).
-func isOlympTypeMakerNote(blob []byte) bool {
-	return len(blob) >= 8 &&
-		blob[0] == olympMNPrefix[0] &&
-		blob[1] == olympMNPrefix[1] &&
-		blob[2] == olympMNPrefix[2] &&
-		blob[3] == olympMNPrefix[3] &&
-		blob[4] == olympMNPrefix[4] &&
-		blob[5] == olympMNPrefix[5]
-}
-
-// isSonyPlainIFDMakerNote returns true when blob is a Sony plain-IFD MakerNote.
-//
-// Sony MakerNote (DSLR-A / ILCE / SLT / Cybershot) is a plain TIFF IFD at offset 0,
-// with NO magic prefix. All OOL val_or_off fields are TIFF-file-absolute.
-// (ExifTool Sony.pm: parseMakerNote — no magic header; plain IFD at offset 0.)
-//
-// Detection heuristic: no recognised prefix (not "Nikon\x00", "OLYMP\x00",
-// "OLYMPUS\x00", "Panasonic\x00\x00\x00", "FUJIFILM", "PENTAX \x00", "AOC\x00",
-// "QVC\x00", "SIGMA\x00", "FOVEON\x00", "LEICA\x00"); starts with a plausible
-// IFD entry count (> 0 and < 4096); and the caller has confirmed Make = "SONY".
-//
-// Note: Sony detection in rebaseGenericMakerNote is done by checking that the blob
-// does NOT have any of the known prefixes that indicate a different maker format.
-// This is safe because if a blob lacks all known prefixes it is either Sony (plain
-// IFD) or an unknown format — both should be treated the same way for rebasing:
-// attempt to scan as a plain IFD and only rebase entries whose old_voo is within
-// the plausible TIFF range.
-// knownMakerNotePrefixes are the magic prefixes of MakerNote formats that are
-// not Sony plain-IFD MakerNotes. Never mutated.
-var knownMakerNotePrefixes = [...]string{ //nolint:gochecknoglobals // package-level constant table; never mutated
-	"Nikon\x00",
-	"OLYMP\x00",     // OLYMP-type (handled separately)
-	"OLYMPUS\x00",   // newer Olympus (blob-relative, safe)
-	"OM SYSTEM\x00", // OM SYSTEM cameras (blob-relative, safe)
-	"Panasonic\x00",
-	"FUJIFILM",
-	"PENTAX \x00",
-	"AOC\x00",
-	"QVC\x00",
-	"SIGMA\x00",
-	"FOVEON\x00",
-	"LEICA\x00",
-}
-
-func isSonyPlainIFDMakerNote(blob []byte, order binary.ByteOrder) bool {
-	if len(blob) < 2 {
-		return false
-	}
-	// Must NOT start with any of the known magic prefixes.
-	for _, prefix := range knownMakerNotePrefixes {
-		if len(blob) >= len(prefix) && string(blob[:len(prefix)]) == prefix {
-			return false
-		}
-	}
-	// Plausible IFD entry count: > 0 and < 4096 to filter noise.
-	count := order.Uint16(blob)
-	return count > 0 && count < 4096
-}
-
-// makerNoteIFDOffset returns the byte offset WITHIN the MakerNote blob at which
-// the IFD data begins, and the byte order to use for parsing.
-//
-// For OLYMP-type blobs the IFD is at offset 8 (after the 8-byte header).
-// For Sony plain-IFD blobs the IFD is at offset 0 (no header).
-// Returns (0, nil) when the blob format is not handled by this function.
-//
-// ExifTool Olympus.pm: OLYMP-type IFD at blob[8].
-// ExifTool Sony.pm: plain IFD at blob[0].
-func makerNoteIFDOffset(blob []byte, parentOrder binary.ByteOrder) (ifdOff int, order binary.ByteOrder) {
-	if isOlympTypeMakerNote(blob) {
-		// OLYMP-type: IFD starts at byte 8 within the blob.
-		// Byte order is inherited from the outer TIFF (Olympus compacts are LE).
-		return 8, parentOrder
-	}
-	if isSonyPlainIFDMakerNote(blob, parentOrder) {
-		// Sony: plain IFD at byte 0, same byte order as the outer TIFF.
-		return 0, parentOrder
-	}
-	return 0, nil
-}
-
-// rebaseGenericMakerNote rebases all OOL val_or_off fields in a Sony or Olympus
-// OLYMP-type MakerNote that has moved to a new absolute position in finalTIFF.
-//
-// This function is called from relocateTIFFFromParsed (step 9.5) to handle makers
-// that use TIFF-file-absolute OOL offsets. It is a companion to rebaseSonyMakerNote
-// (in relocate_arw.go, which handles ARW-specific Sony rebasing) and
-// rebaseOlympMakerNote (in relocate_orf.go, which handles ORF-specific rebasing).
+// rebaseGenericMakerNote rebases the out-of-line value-or-offset fields of a
+// TIFF-relative MakerNote that exif.Encode placed at a new absolute position
+// in finalTIFF (see the model at the top of this file).
 //
 // Parameters:
 //   - finalTIFF: the re-encoded TIFF output (produced by exif.Encode in step 9).
-//   - e: the original parsed EXIF struct (provides MakerNoteOffset and MakerNote blob).
+//   - e: the parsed EXIF (provides MakerNote, MakerNoteOffset and the Make
+//     used for layout detection).
 //   - order: the outer TIFF byte order.
 //
-// The function is a no-op when:
-//   - e.MakerNote is nil or empty.
-//   - The MakerNote format is not Sony plain-IFD or Olympus OLYMP-type.
-//   - The blob did not move (new position == MakerNoteOffset).
-//   - The MakerNote OOL entry cannot be found in the re-encoded ExifIFD.
+// The function is a no-op when e has no MakerNote, when the layout is not
+// TIFF-relative or not an IFD, when the MakerNote did not move, or when the
+// MakerNote entry cannot be found in the re-encoded ExifIFD.
 //
-// TIFF 6.0 §2: val_or_off holds an absolute file offset when total byte size > 4.
-// ExifTool Sony.pm, Olympus.pm: both formats store outer-TIFF-absolute offsets.
-// #127: fix for MakerNote OOL offset rebasing incomplete on write.
-//
-//nolint:cyclop,gocyclo // IFD scan with inline/OOL discrimination is inherently branchy; complexity matches rebaseSonyMakerNote
+// #127, #310.
 func rebaseGenericMakerNote(finalTIFF []byte, e *exif.EXIF, order binary.ByteOrder) {
-	if e == nil || len(e.MakerNote) == 0 || e.ExifIFD == nil {
+	layout, ok := tiffRelativeMakerNote(e)
+	if !ok || len(finalTIFF) < 8 {
 		return
 	}
-	if len(finalTIFF) < 8 {
+	newMNAbs, found := encodedMakerNoteAbs(finalTIFF, order)
+	// EXIF.MakerNoteOffset is the source position of the MakerNote value
+	// (exif.Parse records the out-of-line offset of tag 0x927C).
+	oldMNAbs := uint64(e.MakerNoteOffset)
+	newAbs := uint64(newMNAbs) //nolint:gosec // G115: a non-negative buffer offset
+	if !found || oldMNAbs == 0 || newAbs == oldMNAbs {
 		return
 	}
-	// #270 documented fail-safe deferral: this function's OUTER-container scan
-	// below (finalTIFF[4:] for IFD0 offset, 12-byte entries in ExifIFD) is
-	// classic-TIFF-only. A Sony plain-IFD or Olympus OLYMP-type MakerNote
-	// combined with a genuinely BigTIFF outer container has no known real-world
-	// occurrence (both maker conventions predate BigTIFF, and BigTIFF is used
-	// for large scientific/GIS/aerial imagery, never for camera MakerNotes).
-	// Declining here is a SAFE no-op, not a corruption risk: every write below
-	// this point either patches bytes it has independently located via this
-	// same classic-only scan, or does nothing. Without this guard, the classic
-	// scan would silently misinterpret BigTIFF's 16-byte header/20-byte
-	// entries as classic 8-byte header/12-byte entries; the existing bounds
-	// checks throughout this function happen to make that misinterpretation
-	// fail closed (no writes occur — see relocate_makernote_bigtiff_test.go),
-	// but relying on that accident is not acceptable engineering. Full
-	// BigTIFF-aware outer-container rebasing is tracked as a follow-up.
-	if e.BigTIFF {
-		return
-	}
+	rebaseMakerNoteIFD(finalTIFF, newMNAbs+layout.IFDOffset, layout.ByteOrder, int64(newAbs)-int64(oldMNAbs), oldMNAbs) //nolint:gosec // G115: both are offsets in a classic TIFF, below 2^32
+	e.RebaseMakerNoteSubIFDs(finalTIFF, newMNAbs)                                                                       // task #370: the sub-IFDs of an Olympus "OLYMP\0" note
+	fixMakerNoteFooter(finalTIFF, newMNAbs, len(e.MakerNote), layout.ByteOrder, oldMNAbs, newAbs)
+}
 
-	// Determine IFD offset within blob and byte order for this maker.
-	ifdOff, mnOrder := makerNoteIFDOffset(e.MakerNote, order)
-	if mnOrder == nil {
-		// Not a maker format that requires rebasing by this function.
-		return
+// tiffRelativeMakerNote returns the layout of the MakerNote of e when it is a
+// TIFF-relative IFD that rebaseGenericMakerNote handles, and false otherwise.
+//
+// #270 documented fail-safe deferral: the outer-container scan of
+// rebaseGenericMakerNote (finalTIFF[4:] for the IFD0 offset, 12-byte entries
+// in the Exif IFD) is classic-TIFF-only. A TIFF-relative MakerNote in a
+// BigTIFF container has no known real-world occurrence (BigTIFF serves large
+// scientific and aerial imagery, not camera files); declining is a safe no-op.
+func tiffRelativeMakerNote(e *exif.EXIF) (exif.MakerNoteLayout, bool) {
+	if e == nil || len(e.MakerNote) == 0 || e.ExifIFD == nil || e.BigTIFF {
+		return exif.MakerNoteLayout{}, false
 	}
+	layout, ok := e.MakerNoteLayout()
+	return layout, ok && layout.TIFFRelative
+}
 
-	// ── Locate the ExifIFD in finalTIFF ──────────────────────────────────────
+// encodedMakerNoteAbs returns the offset of the MakerNote value in the
+// classic TIFF stream finalTIFF (IFD0 → Exif IFD → tag 0x927C), and false
+// when it cannot be located or is stored inline.
+func encodedMakerNoteAbs(finalTIFF []byte, order binary.ByteOrder) (int, bool) {
 	ifd0Off := int(order.Uint32(finalTIFF[4:]))
 	if ifd0Off+2 > len(finalTIFF) {
-		return
+		return 0, false
 	}
 	exifIFDOff, found := scanIFDForTagValOrOff(finalTIFF, ifd0Off, uint16(exif.TagExifIFDPointer), order)
-	if !found {
-		return // no ExifIFD pointer; skip
+	if !found || uint64(exifIFDOff)+2 > uint64(len(finalTIFF)) {
+		return 0, false
 	}
-	exifStart := int(exifIFDOff)
-	if exifStart+2 > len(finalTIFF) {
-		return
-	}
+	return findOOLEntryOffset(finalTIFF, int(exifIFDOff), uint16(exif.TagMakerNote), order)
+}
 
-	// ── Locate MakerNote blob in finalTIFF ───────────────────────────────────
-	// findOOLEntryOffset returns the absolute position of the MakerNote blob
-	// within finalTIFF (i.e., the value stored in the val_or_off field of the
-	// MakerNote entry in ExifIFD — an absolute TIFF stream offset).
-	newMNAbs, found := findOOLEntryOffset(finalTIFF, exifStart, uint16(exif.TagMakerNote), order)
-	if !found {
-		// MakerNote inline or absent; nothing to rebase.
+// fixMakerNoteFooter updates the TIFF footer that Canon writes at the end of
+// its MakerNotes: the 8 bytes "II*\0" or "MM\0*" (a TIFF header in the
+// MakerNote byte order) followed by the 32-bit TIFF offset of the MakerNote
+// itself. Readers compare that offset with the MakerNote's actual position to
+// detect a MakerNote moved without rebasing (ExifTool reports a footer that
+// disagrees as "Canon maker note footer may be invalid"). The MakerNote of n
+// bytes is at mnAbs in buf. The footer is rewritten to newAbs only when it is
+// present and holds oldAbs, the position the MakerNote had, so a footer that
+// was already wrong or a MakerNote without one is left untouched (task #310).
+func fixMakerNoteFooter(buf []byte, mnAbs, n int, order binary.ByteOrder, oldAbs, newAbs uint64) {
+	const footerLen = 8
+	if n <= footerLen || mnAbs < 0 || mnAbs+n > len(buf) {
 		return
 	}
+	f := buf[mnAbs+n-footerLen : mnAbs+n]
+	if !isTIFFHeaderMark(f, order) || uint64(order.Uint32(f[4:])) != oldAbs || newAbs > math.MaxUint32 {
+		return
+	}
+	order.PutUint32(f[4:], uint32(newAbs))
+}
 
-	// ── Compute rebasing delta ────────────────────────────────────────────────
-	// oldMNAbs is the original absolute file position of the MakerNote blob.
-	// EXIF.MakerNoteOffset is set by exif.Parse (ifd.go rawOffset) when the
-	// MakerNote entry is OOL (count > 4).
-	oldMNAbs := e.MakerNoteOffset
-	if oldMNAbs == 0 {
-		// Fallback: search base for the blob (rare, defensive).
-		// For this function we use the entry from e.MakerNote as fingerprint.
-		// If it cannot be found, skip rebasing (better than corrupting offsets).
-		return
+// isTIFFHeaderMark reports whether b starts with the TIFF header mark of
+// order: "II*\0" (little-endian) or "MM\0*" (big-endian), TIFF 6.0 §2.
+func isTIFFHeaderMark(b []byte, order binary.ByteOrder) bool {
+	if len(b) < 4 {
+		return false
 	}
-	if uint32(newMNAbs) == oldMNAbs { //nolint:gosec // G115: newMNAbs < len(finalTIFF) < 2^32
-		// Blob did not move; no rebasing needed.
-		return
+	if order == binary.LittleEndian {
+		return string(b[:4]) == "II*\x00"
 	}
+	return string(b[:4]) == "MM\x00*"
+}
 
-	// delta is the signed displacement of the MakerNote blob in the new stream.
-	// For OLYMP-type and Sony plain-IFD, all OOL val_or_off values are absolute;
-	// after the blob moves by delta, each pointer shifts by the same amount.
-	//
-	// #127: use int64 arithmetic for delta to handle both positive and negative
-	// displacement without uint32 wraparound (the new position may be either
-	// before or after the original in pathological cases, though in practice
-	// TIFF re-encoding always grows the header).
-	delta := int64(newMNAbs) - int64(oldMNAbs)
-
-	// ── Walk the MakerNote IFD and rebase OOL entries ────────────────────────
-	// The MakerNote IFD is at finalTIFF[newMNAbs + ifdOff].
-	// For OLYMP-type:    ifdOff = 8  (skip "OLYMP\x00" header + 2-byte version)
-	// For Sony plain-IFD: ifdOff = 0
-	ifdStart := newMNAbs + ifdOff
-	if ifdStart+2 > len(finalTIFF) {
+// rebaseMakerNoteIFD adds delta to the value-or-offset field of every
+// out-of-line entry (total size > 4 bytes, TIFF 6.0 §2) of the classic
+// MakerNote IFD at ifdStart in buf, read in order. A field whose value is
+// below minOld (it cannot address the MakerNote's own data: a zero or stale
+// pointer), or whose rebased value would leave buf, is left unchanged.
+//
+// #127 upper-bound note: the source pointer is NOT limited to the declared
+// MakerNote size, because some Sony and Olympus "OLYMP" bodies store values
+// just past it; only the rebased value is bounds-checked.
+func rebaseMakerNoteIFD(buf []byte, ifdStart int, order binary.ByteOrder, delta int64, minOld uint64) {
+	if ifdStart < 0 || ifdStart+2 > len(buf) {
 		return
 	}
-	count := int(mnOrder.Uint16(finalTIFF[ifdStart:]))
+	count := int(order.Uint16(buf[ifdStart:]))
 	pos := ifdStart + 2
-
 	for i := range count {
 		ep := pos + i*12
-		if ep+12 > len(finalTIFF) {
+		if ep+12 > len(buf) {
 			break
 		}
-		entryType := mnOrder.Uint16(finalTIFF[ep+2:])
-		entryCount := mnOrder.Uint32(finalTIFF[ep+4:])
-		sz := typeSize(entryType)
-		if sz == 0 || entryCount == 0 {
+		sz := typeSize(order.Uint16(buf[ep+2:]))
+		total := uint64(sz) * uint64(order.Uint32(buf[ep+4:]))
+		if sz == 0 || total <= 4 {
+			continue // unknown type or inline value: no pointer
+		}
+		old := uint64(order.Uint32(buf[ep+8:]))
+		if old < minOld {
 			continue
 		}
-		total := uint64(sz) * uint64(entryCount)
-		if total <= 4 {
-			continue // inline value; no pointer to rebase
-		}
-
-		// OOL entry: val_or_off is a TIFF-absolute offset.
-		oldVOO := mnOrder.Uint32(finalTIFF[ep+8:])
-
-		// Safety: only rebase if the old pointer was within the plausible range
-		// of the original TIFF. Specifically, it must be >= oldMNAbs (the blob
-		// could not have pointed to something before its own start) and fit within
-		// the declared val_or_off space.
-		//
-		// #127 upper-bound fix: the upper bound is intentionally NOT clamped to
-		// oldMNAbs + len(e.MakerNote). Some Sony and Olympus OLYMP-type cameras
-		// store OOL value data that extends slightly past the declared MakerNote
-		// blob count in the outer IFD entry, yet those bytes are faithfully copied
-		// by exif.Parse into the Value slice (it reads the full extent). Clamping
-		// to the declared blob size causes those entries to be silently skipped
-		// (the original bug in rebaseSonyMakerNote lines 728-729 for extra-OOL
-		// blocks). We relax the upper bound to len(finalTIFF) — any TIFF-absolute
-		// offset within the original TIFF is a valid OOL pointer for this maker.
-		//
-		// ExifTool Sony.pm: all Sony MakerNote OOL data is contiguous with or
-		// immediately following the IFD blob.
-		if uint64(oldVOO) < uint64(oldMNAbs) {
-			// Pointer precedes the MakerNote blob start — either a stale/zero
-			// entry or a known-bad file. Skip to avoid corrupting unrelated data.
+		v := int64(old) + delta //nolint:gosec // G115: old < 2^32 and |delta| < 2^32
+		if v < 0 || uint64(v)+total > uint64(len(buf)) {
 			continue
 		}
-
-		// Compute new absolute offset by applying the delta.
-		newVOO64 := int64(oldVOO) + delta
-		if newVOO64 < 0 || uint64(newVOO64)+total > uint64(len(finalTIFF)) {
-			// New pointer would be out of bounds; skip (defensive guard).
-			continue
-		}
-		mnOrder.PutUint32(finalTIFF[ep+8:], uint32(newVOO64)) //nolint:gosec // G115: newVOO64 > 0 and fits in uint32
+		order.PutUint32(buf[ep+8:], uint32(v)) //nolint:gosec // G115: 0 <= v < len(buf), a classic TIFF offset
 	}
 }

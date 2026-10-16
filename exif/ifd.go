@@ -107,6 +107,17 @@ const (
 	//   (buf len %d); chain terminated - resource-exhaustion guard (EXIF-IFDCHAIN-01)"
 	// Fields: offHi32, offLo32, bufLen32.
 	warnBigTIFFTraverseBudgetExceeded
+
+	// warnThumbnailBudgetExceeded (security audit F-06a): the JPEG thumbnail
+	// of an IFD was dropped because the thumbnails of the IFDs read before it
+	// already account for as many bytes as the buffer holds, which valid
+	// thumbnails (disjoint byte ranges of the buffer) never do. Several IFDs
+	// of a chain pointing at one range would otherwise be written once each
+	// by Encode.
+	// Message: "exif: thumbnail of %d bytes of the IFD at offset %d dropped:
+	//   the thumbnails of the IFD chain exceed the buffer (len %d)"
+	// Fields: offset32, thumbLen32, bufLen32.
+	warnThumbnailBudgetExceeded
 )
 
 // parseWarn is a compact, allocation-free record of a single parse warning.
@@ -155,6 +166,7 @@ const (
 //	warnBigTIFFNextOutOfBounds:val1=offHi32    val2=offLo32      val3=bufLen
 //	warnTraverseBudgetExceeded:        val1=offset     val2=bufLen
 //	warnBigTIFFTraverseBudgetExceeded: val1=offHi32    val2=offLo32     val3=bufLen
+//	warnThumbnailBudgetExceeded:       val1=offset     val2=thumbLen    val3=bufLen
 //
 // task #200: performance audit 2026-06-10.
 // EXIF-IFDCHAIN-01: warnTraverseBudgetExceeded / warnBigTIFFTraverseBudgetExceeded
@@ -279,6 +291,15 @@ func warnString(r parseWarn) string { //nolint:cyclop,gocyclo,funlen // one case
 		b = append(b, " (buf len "...)
 		b = strconv.AppendUint(b, uint64(r.val3), 10)
 		b = append(b, "); chain terminated \xe2\x80\x94 resource-exhaustion guard (EXIF-IFDCHAIN-01)"...)
+	case warnThumbnailBudgetExceeded:
+		// "exif: thumbnail of %d bytes of the IFD at offset %d dropped: the thumbnails of the IFD chain exceed the buffer (len %d)"
+		b = append(b, "exif: thumbnail of "...)
+		b = strconv.AppendUint(b, uint64(r.val2), 10)
+		b = append(b, " bytes of the IFD at offset "...)
+		b = strconv.AppendUint(b, uint64(r.val1), 10)
+		b = append(b, " dropped: the thumbnails of the IFD chain exceed the buffer (len "...)
+		b = strconv.AppendUint(b, uint64(r.val3), 10)
+		b = append(b, ')')
 	}
 	return string(b)
 }
@@ -577,10 +598,57 @@ gpsSection:
 // and 0x0202 JPEGInterchangeFormatLength).  It is populated by parseSingleIFD
 // so that Encode can re-append the bytes at the correct new offset and patch
 // tag 0x0201 accordingly.  Nil means no JPEG thumbnail is attached.
+//
+// Sub holds what is attached to an IFD of the chain that follows IFD0 (a
+// thumbnail IFD, "1st IFD"): its sub-IFDs and the strips of an uncompressed
+// thumbnail, see SubIFDs. It is nil for IFD0 (whose sub-IFDs are the ExifIFD,
+// GPSIFD and InteropIFD fields of EXIF) and for every chained IFD that has
+// none of its own.
 type IFD struct {
 	Entries       []IFDEntry
-	Next          *IFD   // linked IFDs (e.g. IFD1 for thumbnail)
-	ThumbnailData []byte // raw JPEG thumbnail bytes; non-nil when present
+	Next          *IFD     // linked IFDs (e.g. IFD1 for thumbnail)
+	ThumbnailData []byte   // raw JPEG thumbnail bytes; non-nil when present
+	Sub           *SubIFDs // data attached to a chained IFD (see SubIFDs); nil when none
+}
+
+// SubIFDs holds the sub-IFDs that an IFD of the chain after IFD0 addresses
+// through its own pointer tags. Exif 3.1 §4.6.9.2, Table 21, p. 99, lists the
+// Exif IFD pointer (0x8769) and the GPS Info IFD pointer (0x8825) among the
+// optional tags of the 1st IFD, so a thumbnail IFD may carry an Exif IFD and a
+// GPS IFD of its own (the Olympus μ Digital 800 of the corpus does: a copy of
+// the primary image's tags). Exif is the IFD that 0x8769 addresses, GPS the
+// one of 0x8825, Interop the one that the Interoperability pointer (0xA005)
+// of Exif addresses.
+//
+// Parse fills a field only for an IFD that differs from the one IFD0 itself
+// addresses with the same tag and that it can parse. A pointer that addresses
+// the IFD of IFD0 is rewritten by Encode to the block it writes for it; a
+// pointer that addresses an IFD that cannot be parsed is dropped (see
+// chainEntries).
+//
+// ThumbnailStrips holds the strips of an uncompressed thumbnail, in strip
+// order, when the IFD records its thumbnail as TIFF strips (Exif 3.1 §4.5.8,
+// pp. 25-26: an uncompressed thumbnail is recorded in the 1st IFD as a TIFF
+// image; tags 0x0111 StripOffsets and 0x0117 StripByteCounts, §4.6.5.2,
+// pp. 39-40). Parse fills it only when the CarryThumbnailStrips option is
+// given; Encode then writes the strips after the IFD and rewrites StripOffsets
+// to the new positions. Nil means no strips are carried (the default, and the
+// case when the strips lie outside the parsed bytes or exceed the carry
+// limits). It lives here and not in IFD so that the common IFD stays small.
+type SubIFDs struct {
+	Exif            *IFD
+	GPS             *IFD
+	Interop         *IFD
+	ThumbnailStrips [][]byte
+}
+
+// thumbnailStrips returns the strips of the uncompressed thumbnail of ifd (see
+// SubIFDs), or nil.
+func (ifd *IFD) thumbnailStrips() [][]byte {
+	if ifd.Sub == nil {
+		return nil
+	}
+	return ifd.Sub.ThumbnailStrips
 }
 
 // IFDEntry represents a single TIFF directory entry (TIFF §2, 12 bytes each).
@@ -610,9 +678,17 @@ type IFDEntry struct {
 	Tag   TagID
 	Type  DataType
 	Count uint32
-	// Value holds the decoded value. For types whose total size fits in 4 bytes
-	// the raw bytes are stored inline; otherwise this is a []byte slice into
-	// the original buffer (zero-copy).
+	// Value holds the raw value bytes, in the byte order of the stream.
+	//
+	// For an entry returned by Parse, Value is a zero-copy view of the
+	// buffer passed to Parse — of the 4-byte (BigTIFF: 8-byte) value field
+	// of the entry when the value fits there, otherwise of the out-of-line
+	// value it points to. Treat its bytes as read-only: writing into them
+	// writes into that buffer, which gometadata.Metadata retains as the base
+	// that Write relocates from, and into any other entry that shares the
+	// same bytes. To change a value, assign a new slice (and update Count),
+	// or use the Set* methods of EXIF. Value is capped at its own length, so
+	// append on it always copies (task #296).
 	Value     []byte
 	bigEndian bool
 	// rawOffset is the TIFF-stream offset stored in the value-or-offset field
@@ -678,14 +754,20 @@ func parseIFDEntry(b []byte, e int, order binary.ByteOrder) (IFDEntry, bool) {
 	typ := DataType(order.Uint16(b[e+2:]))
 	cnt := order.Uint32(b[e+4:])
 
+	// Type 13 is the 4-byte TIFF IFD type (TypeIFD; TIFF Tech Note 1) and type
+	// 129 the 1-byte Exif UTF-8 string (TypeUTF8; Exif 3.1 §4.6.2, p. 28).
 	sz := typeSize(typ)
 	totalSize := uint64(sz) * uint64(cnt)
 
+	// Every Value aliases b (zero-copy) and is capped at its own length with
+	// a full slice expression, so that append on a Value copies instead of
+	// overwriting the bytes of b that follow it — the next IFD entry or
+	// another value, which a later Write may read (task #296).
 	var value []byte
 	switch {
 	case sz == 0:
 		// Unknown type: store the raw 4-byte offset/value field verbatim.
-		value = b[e+8 : e+12]
+		value = b[e+8 : e+12 : e+12]
 	case totalSize > 4:
 		// Value is out-of-line; bytes 8-11 are the file offset (TIFF §2).
 		valOff := order.Uint32(b[e+8:])
@@ -694,7 +776,7 @@ func parseIFDEntry(b []byte, e int, order binary.ByteOrder) (IFDEntry, bool) {
 			// Out-of-bounds offset: skip this entry gracefully.
 			return IFDEntry{}, false
 		}
-		value = b[valOff:end]
+		value = b[valOff:end:end]
 		return IFDEntry{
 			Tag:       tag,
 			Type:      typ,
@@ -705,7 +787,7 @@ func parseIFDEntry(b []byte, e int, order binary.ByteOrder) (IFDEntry, bool) {
 		}, true
 	default:
 		// Value is inline, left-justified in the 4-byte field (TIFF §2).
-		value = b[e+8 : e+8+int(totalSize)]
+		value = b[e+8 : e+8+int(totalSize) : e+8+int(totalSize)]
 	}
 
 	return IFDEntry{
@@ -1188,13 +1270,46 @@ const (
 type traverseBudget struct {
 	entries int // remaining cumulative entry budget
 	ifds    int // remaining cumulative chain-length budget
+	thumb   int // remaining bytes of JPEG thumbnails that may be kept (see chargeThumbnail)
 }
 
 // newTraverseBudget returns a traverseBudget sized for a buffer of length n.
 // EXIF-IFDCHAIN-01; CWE-400/CWE-405/CWE-834.
 func newTraverseBudget(n int) traverseBudget {
 	entries := max(n/traverseEntryBudgetDivisor, traverseEntryBudgetFloor)
-	return traverseBudget{entries: entries, ifds: maxTraverseChainIFDs}
+	return traverseBudget{entries: entries, ifds: maxTraverseChainIFDs, thumb: n}
+}
+
+// chargeThumbnail charges the JPEG thumbnail of ifd, just parsed, to the
+// thumbnail allowance, which is the length of the buffer: thumbnails are
+// disjoint byte ranges of the buffer (Exif 3.1 §4.5.5, p. 24: JPEGInterchange-
+// Format "points to the start of the JPEG thumbnail", one thumbnail in the 1st
+// IFD), so a valid file never needs more. When the allowance is exhausted the
+// thumbnail is dropped, with its JPEGInterchangeFormat and
+// JPEGInterchangeFormatLength entries (their offsets would address nothing in
+// the stream Encode writes), and its length is returned (0 when kept).
+//
+// Security audit F-06a: 512 IFDs of a chain, each addressing one 1 MiB range,
+// made Parse copy it 512 times and Encode write it 512 times (a 1 MiB EXIF
+// re-encoded to 499 MiB). Only a thumbnail that Encode writes is charged:
+// carried is false for the first IFD of a traversal (IFD0 for the main chain,
+// whose thumbnail Encode never writes, so it must not use up the allowance
+// of IFD1), which is kept as parsed. Reference: Exiv2 reads only the thumbnail of IFD1
+// (TiffDecoder::decodeThumb); ExifTool extracts the first one it meets.
+func (bud *traverseBudget) chargeThumbnail(ifd *IFD, carried bool) (dropped int) {
+	n := len(ifd.ThumbnailData)
+	if n == 0 || bud == nil || !carried {
+		return 0
+	}
+	if n <= bud.thumb {
+		bud.thumb -= n
+		return 0
+	}
+	ifd.ThumbnailData = nil
+	ifd.Entries = slices.DeleteFunc(ifd.Entries, func(e IFDEntry) bool {
+		return e.Tag == TagJPEGInterchangeFormat || e.Tag == TagJPEGInterchangeFormatLength
+	})
+	return n
 }
 
 // exhausted reports whether the budget has no capacity left to visit
@@ -1343,6 +1458,9 @@ func traverse(b []byte, offset uint32, order binary.ByteOrder, budget *traverseB
 		// backing-array growth already happened. See parseSingleIFD's doc
 		// comment for the amplification this closes.
 		budget.spend(parsedCount)
+		if n := budget.chargeThumbnail(ifd, ifd != root); n > 0 {
+			warnings = append(warnings, parseWarn{kind: warnThumbnailBudgetExceeded, val1: cur, val2: uint32(n), val3: uint32(len(b))}) //nolint:gosec // G115: n <= len(b) < 2^32 for a classic TIFF stream
+		}
 
 		// Audit finding #131: if the next pointer is non-zero but falls outside the
 		// buffer, record a warning and stop following the chain. parseSingleIFD will
@@ -1561,6 +1679,9 @@ func traverseWithArena(b []byte, offset uint32, order binary.ByteOrder, arena *p
 		// count, not len(ifd.Entries) — see traverse()'s equivalent comment
 		// and parseSingleIFD's doc comment for the amplification this closes.
 		budget.spend(parsedCount)
+		if n := budget.chargeThumbnail(ifd, ifd != root); n > 0 {
+			warnings = append(warnings, parseWarn{kind: warnThumbnailBudgetExceeded, val1: cur, val2: uint32(n), val3: uint32(len(b))}) //nolint:gosec // G115: n <= len(b) < 2^32 for a classic TIFF stream
+		}
 
 		// Audit finding #131: if the next pointer is non-zero but falls outside the
 		// buffer, record a warning and stop following the chain. parseSingleIFD will
@@ -1663,7 +1784,9 @@ func parseIFDEntryBigTIFF(b []byte, e int, order binary.ByteOrder) (IFDEntry, bo
 		return IFDEntry{}, false
 	}
 
-	sz := typeSizeBigTIFF(typ)
+	sz := typeSizeBigTIFF(typ) // type 13 (TypeIFD) is 4 bytes, type 129 (TypeUTF8) 1 byte
+	// Every Value is capped at its own length (full slice expression), as in
+	// parseIFDEntry (task #296).
 	if sz == 0 {
 		// Unknown type: store the raw 8-byte value-or-offset field verbatim.
 		// We cannot determine whether this is inline or OOL, so treat it as
@@ -1673,7 +1796,7 @@ func parseIFDEntryBigTIFF(b []byte, e int, order binary.ByteOrder) (IFDEntry, bo
 			Tag:       tag,
 			Type:      typ,
 			Count:     uint32(cnt), // safe: cnt ≤ maxBigTIFFCount (2^30) < MaxUint32
-			Value:     b[e+12 : e+20],
+			Value:     b[e+12 : e+20 : e+20],
 			bigEndian: isBig,
 		}, true
 	}
@@ -1696,7 +1819,7 @@ func parseIFDEntryBigTIFF(b []byte, e int, order binary.ByteOrder) (IFDEntry, bo
 			Tag:       tag,
 			Type:      typ,
 			Count:     uint32(cnt), // safe: cnt ≤ maxBigTIFFCount (2^30) < MaxUint32
-			Value:     b[e+12 : end],
+			Value:     b[e+12 : end : end],
 			bigEndian: isBig,
 		}, true
 	}
@@ -1711,7 +1834,7 @@ func parseIFDEntryBigTIFF(b []byte, e int, order binary.ByteOrder) (IFDEntry, bo
 		Tag:       tag,
 		Type:      typ,
 		Count:     uint32(cnt), // safe: cnt ≤ maxBigTIFFCount (2^30) < MaxUint32
-		Value:     b[valOff : valOff+totalSize],
+		Value:     b[valOff : valOff+totalSize : valOff+totalSize],
 		bigEndian: isBig,
 		rawOffset: valOff, // BigTIFF spec §2: full 64-bit offset preserved; used by MakerNoteOffset64 (#142)
 	}, true
@@ -1750,7 +1873,7 @@ func parseSingleIFDBigTIFF(b []byte, offset uint64, order binary.ByteOrder, alia
 	pos := offset + 8 // first entry starts after the 8-byte count field
 
 	const maxPrealloc = 1024
-	preallocCap := min(int(count), maxPrealloc) //nolint:gosec // G115: count ≤ bigTIFFMaxEntries (65535) so fits int on all supported platforms
+	preallocCap := min(int(count), maxPrealloc)
 	ifd := &IFD{Entries: make([]IFDEntry, 0, preallocCap)}
 	return fillIFDBigTIFF(b, ifd, offset, pos, count, order, nil, aliasThumbnail)
 }
@@ -1923,6 +2046,9 @@ func traverseBigTIFF(b []byte, offset uint64, order binary.ByteOrder, budget *tr
 		// and parseSingleIFD's doc comment for the amplification this closes.
 		// parsedCount ≤ bigTIFFMaxEntries (65535) so narrowing to int is safe.
 		budget.spend(int(parsedCount)) //nolint:gosec // G115: parsedCount ≤ bigTIFFMaxEntries (65535); safe narrowing
+		if n := budget.chargeThumbnail(ifd, ifd != root); n > 0 {
+			warnings = append(warnings, parseWarn{kind: warnThumbnailBudgetExceeded, val1: uint32(cur), val2: uint32(n), val3: uint32(len(b))}) //nolint:gosec // G115: low 32 bits of the offset and of the lengths, for the message only
+		}
 
 		// Audit finding #131: next pointer OOB → warn and stop.
 		// task #200: val1=offHi32, val2=offLo32 for 64-bit offset; val3=bufLen.
@@ -1980,8 +2106,9 @@ func readBigTIFFSubIFDOffset(e *IFDEntry) (uint64, bool) {
 			return 0, false
 		}
 		return uint64(e.order().Uint16(e.Value)), true
-	case TypeLong:
+	case TypeLong, TypeIFD:
 		// TypeLong (4 bytes): used by tiffcp / libtiff even in BigTIFF containers.
+		// Type 13 is the 4-byte TIFF IFD type (TypeIFD; TIFF Tech Note 1).
 		if len(e.Value) < 4 {
 			return 0, false
 		}
@@ -2012,8 +2139,8 @@ func (ifd *IFD) Get(tag TagID) *IFDEntry {
 }
 
 // String decodes the entry value as a NUL-terminated string.
-// Handles TypeASCII (TIFF §2, US-ASCII) and TypeUTF8 (CIPA DC-008-2023 §4.6.3,
-// UTF-8 encoded Unicode). Both types use element size 1 and NUL termination.
+// Handles TypeASCII (TIFF §2, US-ASCII) and TypeUTF8 (type 129, Exif 3.1 §4.6.2,
+// p. 28: UTF-8 encoded Unicode). Both types use element size 1 and NUL termination.
 func (e *IFDEntry) String() string {
 	if (e.Type != TypeASCII && e.Type != TypeUTF8) || len(e.Value) == 0 {
 		return ""
@@ -2216,6 +2343,17 @@ func (ifd *IFD) set(tag TagID, typ DataType, count uint32, value []byte, bigEndi
 	ifd.Entries = slices.Insert(ifd.Entries, i, entry)
 }
 
+// remove deletes the entry of tag from the IFD, if present, keeping the
+// entries sorted. It shifts the following entries within the slice and never
+// grows it, so it is safe on entries that share a backing array with other
+// IFDs (the parse arena gives each IFD its own region).
+func (ifd *IFD) remove(tag TagID) {
+	i := sort.Search(len(ifd.Entries), func(i int) bool { return ifd.Entries[i].Tag >= tag })
+	if i < len(ifd.Entries) && ifd.Entries[i].Tag == tag {
+		ifd.Entries = slices.Delete(ifd.Entries, i, i+1)
+	}
+}
+
 // asciiValue encodes s as a NUL-terminated ASCII byte slice suitable for
 // IFDEntry.Value (TypeASCII, TIFF §2).
 func asciiValue(s string) []byte {
@@ -2226,8 +2364,8 @@ func asciiValue(s string) []byte {
 }
 
 // utf8Value encodes s as a NUL-terminated UTF-8 byte slice suitable for
-// IFDEntry.Value (TypeUTF8 = 13, CIPA DC-008-2023 §4.6.3). Analogous to
-// asciiValue but for the EXIF 3.0 UTF-8 string type.
+// IFDEntry.Value (TypeUTF8 = 129, Exif 3.1 §4.6.2, p. 28). Analogous to
+// asciiValue but for the Exif 3.0 UTF-8 string type.
 func utf8Value(s string) []byte {
 	v := make([]byte, len(s)+1)
 	copy(v, s)
@@ -2552,7 +2690,7 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 // before each out-of-line value whose running offset is odd, the full
 // len(Value) bytes (zero-filled up to Count × type size), and a trailing pad
 // when the block ends at an odd output length. thumbPatched mirrors
-// patchThumbnailEntries: the JPEGInterchangeFormat and
+// chainEntries: the JPEGInterchangeFormat and
 // JPEGInterchangeFormatLength values are 4 bytes long.
 func ifdWrittenLen(entries []IFDEntry, startOff uint64, bigTIFF, thumbPatched bool) uint64 { //nolint:gocyclo // mirrors writeIFD/writeIFDBigTIFF layout rules branch for branch
 	fixed, threshold := uint64(2+len(entries)*12+4), uint64(4)
