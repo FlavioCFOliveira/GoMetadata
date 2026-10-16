@@ -140,8 +140,11 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 	// cr3Sub receives the CMT2 (Exif IFD), CMT3 (MakerNote) and CMT4 (GPS)
 	// streams of a CR3 file (tasks #300, #336); it stays nil for every other
 	// format.
+	// keptExtGUID receives the GUID of the JPEG extended XMP segments that
+	// could not be merged (task #357).
 	var cr3Sub cr3SubStreams
-	rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, noCMT1Box, err := extractByFormat(r, fmtID, !cfg.lazyIPTC, !cfg.lazyXMP, &cr3Sub)
+	var keptExtGUID string
+	rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, noCMT1Box, err := extractByFormat(r, fmtID, !cfg.lazyIPTC, !cfg.lazyXMP, &cr3Sub, &keptExtGUID)
 	if err != nil {
 		return nil, err
 	}
@@ -165,6 +168,7 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 	// (Copyright, Caption, Keywords, Creator) becomes a plain field read
 	// instead of re-hashing rawIPTC with MD5 each time.
 	m.setIPTCTrust(fmtID, rawEXIF)
+	m.keptExtGUID = guidPointer(keptExtGUID)
 
 	// #134: surface extended XMP truncation as a ParseWarning so the caller
 	// can inspect it without aborting parsing. rawXMP still contains the main
@@ -581,6 +585,17 @@ func tiffFamilyRawEXIFIsWholeFile(r io.ReadSeeker, fmtID format.FormatID, rawEXI
 	return int64(len(rawEXIF)) == end
 }
 
+// guidPointer returns a pointer to a copy of guid, or nil for "". The copy is
+// made inside the branch, so the common case (nil) allocates nothing.
+func guidPointer(guid string) *string {
+	if guid == "" {
+		return nil
+	}
+	p := new(string)
+	*p = guid
+	return p
+}
+
 // cr3SubStreams holds the CMT2 (Exif IFD), CMT3 (MakerNote) and CMT4 (GPS)
 // TIFF streams of a CR3 file (tasks #300, #336), which extractByFormat returns
 // besides rawEXIF.
@@ -588,15 +603,18 @@ type cr3SubStreams struct {
 	exifIFD, makerNote, gps []byte
 }
 
-// wantIPTC and wantXMP (#238) are forwarded to jpeg.ExtractFullSelective so
+// keptExtGUID (task #357) receives, for JPEG, the GUID of the extended XMP
+// segments that the standard packet links to and that were not merged.
+//
+// wantIPTC and wantXMP (#238) are forwarded to jpeg.ExtractFullSelectiveKept so
 // the JPEG extractor can skip the 0x0425 IPTC digest and/or the extended-XMP
 // reassembly when the caller has opted out of that segment. Other formats do
 // not yet have an equivalent selective-extraction path (their raw-segment
 // extraction has no comparable reassembly cost) and are unaffected.
-func extractByFormat(r io.ReadSeeker, fmtID format.FormatID, wantIPTC, wantXMP bool, cr3Sub *cr3SubStreams) (rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire []byte, xmpTruncated, noCMT1Box bool, err error) {
+func extractByFormat(r io.ReadSeeker, fmtID format.FormatID, wantIPTC, wantXMP bool, cr3Sub *cr3SubStreams, keptExtGUID *string) (rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire []byte, xmpTruncated, noCMT1Box bool, err error) {
 	switch fmtID {
 	case format.FormatJPEG:
-		rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, err = jpeg.ExtractFullSelective(r, wantIPTC, wantXMP)
+		rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, *keptExtGUID, err = jpeg.ExtractFullSelectiveKept(r, wantIPTC, wantXMP)
 		if err != nil {
 			return nil, nil, nil, nil, nil, false, false, fmt.Errorf("gometadata: %w", err)
 		}

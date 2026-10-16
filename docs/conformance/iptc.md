@@ -213,6 +213,19 @@ Namespaces: `Iptc4xmpCore` = `http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/`,
   and data, reserved fields are zero; a write that moves nothing and changes no
   IPTC copy keeps the trailer byte for byte (CLAUDE.md §5). `TestTrailers_*`
   (`checkAFCPConsistent`), `TestTrailers_UnchangedIsByteIdentical`.
+- **TIFF-AFCP-01** AFCP trailer of a TIFF (task #354, the policy of #322: update the copies): a TIFF write
+  writes the AFCP trailer found at the end of the source after the last image block, with its `IPTC` data set
+  equal to the IIM written to tag `0x83BB` (or kept when there is none) and its offsets and EOF record set for the
+  position it takes in the output (ExifTool `ExifTool.pm` `IdentifyTrailer`/`ProcessTrailers`, study). The trailer
+  must start after every image block that is copied: a candidate inside image data is image data. The shared logic
+  lives in `internal/trailer`, used by `format/jpeg` and `format/tiff` (`writeRelocated`, so every TIFF-based
+  write path). Bytes of a source that no IFD addresses are otherwise not carried over by a TIFF write.
+  `TestTask354TIFFAFCPTrailerRewritten` (both byte orders, whole file and streamed).
+- **TIFF-AFCP-02** FotoStation records at the end of a TIFF, before and after an AFCP trailer, have their IPTC record
+  replaced. `TestTask354TIFFFotoStationTrailer`.
+- **TIFF-AFCP-03** A nil IIM keeps the IPTC copy but still moves the offsets; a look-alike inside image data and an
+  inconsistent trailer are not rewritten; a file without a trailer is written as before.
+  `TestTask354TIFFTrailerEdgeCases`.
 - **IIM-COPY-03** IPTC copy in the Nikon Capture data (task #322): the IPTC
   entry (`0x9EF5F6E0`) of MakerNote tag `0x0E01` of a NEF is rewritten with the
   IIM written to tag `0x83BB`: in place with zero padding when it fits its

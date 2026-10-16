@@ -29,7 +29,11 @@ var maxFileSize int64 = 256 << 20 //nolint:gochecknoglobals // test-overridable 
 // allocation. Callers can detect this specific condition with errors.Is.
 var ErrFileTooLarge = errors.New("heif: input exceeds maximum file size (256 MiB)")
 
-// ErrMaxNestingDepth is returned when findBox exceeds the maximum recursive nesting depth.
+// ErrMaxNestingDepth is no longer returned: the metadata container is selected
+// by a bounded, non-recursive scan (task #349). It is kept so that code
+// comparing against it keeps compiling.
+//
+// Deprecated: never returned.
 var ErrMaxNestingDepth = errors.New("heif: findBox: exceeded maximum nesting depth")
 
 // ErrCorruptXMP is returned when the rawXMP bytes passed to Inject are not a

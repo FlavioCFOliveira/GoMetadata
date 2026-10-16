@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/FlavioCFOliveira/GoMetadata/internal/trailer"
 )
 
 // jpegWithTail builds SOI, SOS, entropy data, EOI and tail.
@@ -22,7 +24,7 @@ func jpegWithTail(tail []byte) []byte {
 }
 
 // afcpOf builds an AFCP trailer that starts at absolute offset start.
-func afcpOf(order trailerOrder, sig string, start int64, entries [][2]string) []byte {
+func afcpOf(order trailer.Order, sig string, start int64, entries [][2]string) []byte {
 	var out []byte
 	out = append(out, sig...)
 	out = append(out, 0, 1)
@@ -44,13 +46,13 @@ func afcpOf(order trailerOrder, sig string, start int64, entries [][2]string) []
 }
 
 // fotoOf builds FotoStation records.
-func fotoOf(recs ...fotoRecord) []byte {
+func fotoOf(recs ...trailer.FotoRecord) []byte {
 	var out []byte
 	for _, r := range recs {
-		out = append(out, r.data...)
-		out = binary.BigEndian.AppendUint16(out, r.tag)
-		out = binary.BigEndian.AppendUint32(out, uint32(len(r.data)+10)) //nolint:gosec // G115: test sizes are small
-		out = append(out, fotoSig...)
+		out = append(out, r.Data...)
+		out = binary.BigEndian.AppendUint16(out, r.Tag)
+		out = binary.BigEndian.AppendUint32(out, uint32(len(r.Data)+10)) //nolint:gosec // G115: test sizes are small
+		out = append(out, trailer.FotoSig()...)
 	}
 	return out
 }
@@ -61,7 +63,7 @@ var (
 )
 
 // parseOut returns the AFCP trailer and FotoStation records of a JPEG.
-func parseOut(t *testing.T, data []byte) (*afcpTrailer, []fotoRecord) {
+func parseOut(t *testing.T, data []byte) (*trailer.AFCP, []trailer.FotoRecord) {
 	t.Helper()
 	eoi := bytes.Index(data, []byte{0xFF, 0xD9})
 	if eoi < 0 {
@@ -69,12 +71,12 @@ func parseOut(t *testing.T, data []byte) (*afcpTrailer, []fotoRecord) {
 	}
 	base := int64(eoi + 2)
 	region := data[base:]
-	afcp := findAFCP(region, base)
+	afcp := trailer.FindAFCP(region, base)
 	from := base
 	if afcp != nil {
-		from = afcp.end
+		from = afcp.End
 	}
-	recs, _, _ := findFotoStation(region, base, from)
+	recs, _, _ := trailer.FindFotoStation(region, base, from)
 	return afcp, recs
 }
 
@@ -87,11 +89,11 @@ func injectTail(t *testing.T, src []byte, rawEXIF, rawIPTC []byte) []byte {
 	return out.Bytes()
 }
 
-func entryData(t *testing.T, a *afcpTrailer, tag string) []byte {
+func entryData(t *testing.T, a *trailer.AFCP, tag string) []byte {
 	t.Helper()
-	for _, e := range a.entries {
-		if string(e.tag[:]) == tag {
-			return e.data
+	for _, e := range a.Entries {
+		if string(e.Tag[:]) == tag {
+			return e.Data
 		}
 	}
 	t.Fatalf("no %s entry", tag)
@@ -107,20 +109,20 @@ func checkAFCPConsistent(t *testing.T, data []byte, want [][2]string) {
 	if a == nil {
 		t.Fatal("no consistent AFCP trailer in the output")
 	}
-	if len(a.entries) != len(want) {
-		t.Fatalf("%d entries, want %d", len(a.entries), len(want))
+	if len(a.Entries) != len(want) {
+		t.Fatalf("%d entries, want %d", len(a.Entries), len(want))
 	}
-	hdr := data[a.start : a.start+12]
-	count := int(a.order.Uint16(hdr[6:]))
+	hdr := data[a.Start : a.Start+12]
+	count := int(a.Order.Uint16(hdr[6:]))
 	for i := range count {
-		d := data[a.start+12+int64(12*i):]
-		n := int64(a.order.Uint32(d[4:]))
-		off := int64(a.order.Uint32(d[8:]))
+		d := data[a.Start+12+int64(12*i):]
+		n := int64(a.Order.Uint32(d[4:]))
+		off := int64(a.Order.Uint32(d[8:]))
 		if string(d[:4]) != want[i][0] || string(data[off:off+n]) != want[i][1] { //nolint:gosec // G602: d holds the 12-byte directory entry
 			t.Errorf("entry %d: tag %q offset %d size %d does not name %q", i, d[:4], off, n, want[i][1]) //nolint:gosec // G602: see above
 		}
 	}
-	if int64(a.order.Uint32(data[a.end-8:])) != a.start {
+	if int64(a.Order.Uint32(data[a.End-8:])) != a.Start {
 		t.Error("the EOF record does not point at the header")
 	}
 }
@@ -131,7 +133,7 @@ func TestTrailers_AFCPRewrite(t *testing.T) {
 		t.Parallel()
 		for _, tc := range []struct {
 			name  string
-			order trailerOrder
+			order trailer.Order
 			sig   string
 		}{
 			{"Motorola", binary.BigEndian, "AXS!"},
@@ -147,13 +149,13 @@ func TestTrailers_AFCPRewrite(t *testing.T) {
 				want := [][2]string{{"TEXT", "a caption"}, {"IPTC", string(newIIM)}, {"Nail", "thumbnail-bytes"}}
 				checkAFCPConsistent(t, out, want)
 				a, _ := parseOut(t, out)
-				if a.start == int64(len(probe)) {
+				if a.Start == int64(len(probe)) {
 					t.Fatal("the trailer did not move: the test proves nothing")
 				}
-				if a.order != tc.order || string(a.sig[:]) != tc.sig {
-					t.Errorf("byte order or signature changed: %q", a.sig)
+				if a.Order != tc.order || string(a.Sig[:]) != tc.sig {
+					t.Errorf("byte order or signature changed: %q", a.Sig)
 				}
-				if !bytes.HasSuffix(out, make([]byte, 4)) || a.end != int64(len(out)) {
+				if !bytes.HasSuffix(out, make([]byte, 4)) || a.End != int64(len(out)) {
 					t.Error("the trailer does not end the file")
 				}
 
@@ -199,7 +201,7 @@ func TestTrailers_FollowedByOtherData(t *testing.T) {
 		gap := []byte("\x00\x00")
 		start := int64(len(probe) + len(gap))
 		afcp := afcpOf(binary.BigEndian, "AXS!", start, [][2]string{{"IPTC", string(oldIIM)}, {"%SCC", "\x02\x24\x02\x24"}})
-		foto := fotoOf(fotoRecord{1, oldIIM}, fotoRecord{4, []byte("preview")})
+		foto := fotoOf(trailer.FotoRecord{Tag: 1, Data: oldIIM}, trailer.FotoRecord{Tag: 4, Data: []byte("preview")})
 		after := []byte("CANON OPTIONAL DATA tail bytes")
 		src := jpegWithTail(bytes.Join([][]byte{gap, afcp, foto, after}, nil))
 		out := injectTail(t, src, []byte("II*\x00\x08\x00\x00\x00\x00\x00\x00\x00"), newIIM)
@@ -214,7 +216,7 @@ func TestTrailers_FollowedByOtherData(t *testing.T) {
 		if got := entryData(t, a, "%SCC"); string(got) != "\x02\x24\x02\x24" {
 			t.Errorf("another AFCP entry changed: %x", got)
 		}
-		if len(recs) != 2 || recs[0].tag != 1 || !bytes.Equal(recs[0].data, newIIM) || recs[1].tag != 4 || string(recs[1].data) != "preview" {
+		if len(recs) != 2 || recs[0].Tag != 1 || !bytes.Equal(recs[0].Data, newIIM) || recs[1].Tag != 4 || string(recs[1].Data) != "preview" {
 			t.Errorf("FotoStation records after the write: %+v", recs)
 		}
 		if !bytes.HasSuffix(out, after) {
@@ -230,10 +232,10 @@ func TestTrailers_FollowedByOtherData(t *testing.T) {
 // TestTrailers_FotoStationOnly: a FotoStation trailer right after EOI.
 func TestTrailers_FotoStationOnly(t *testing.T) {
 	t.Parallel()
-	src := jpegWithTail(fotoOf(fotoRecord{3, []byte("thumb")}, fotoRecord{1, oldIIM}))
+	src := jpegWithTail(fotoOf(trailer.FotoRecord{Tag: 3, Data: []byte("thumb")}, trailer.FotoRecord{Tag: 1, Data: oldIIM}))
 	out := injectTail(t, src, nil, newIIM)
 	_, recs := parseOut(t, out)
-	if len(recs) != 2 || string(recs[0].data) != "thumb" || !bytes.Equal(recs[1].data, newIIM) {
+	if len(recs) != 2 || string(recs[0].Data) != "thumb" || !bytes.Equal(recs[1].Data, newIIM) {
 		t.Errorf("records: %+v", recs)
 	}
 }
@@ -289,21 +291,21 @@ func TestTrailers_Corpus(t *testing.T) {
 			if got := entryData(t, a, "IPTC"); !bytes.Equal(got, newIIM) {
 				t.Errorf("AFCP IPTC copy = %x, want the new IIM", got)
 			}
-			for i, e := range inA.entries {
-				if string(e.tag[:]) != "IPTC" && !bytes.Equal(e.data, a.entries[i].data) {
-					t.Errorf("entry %q changed", e.tag)
+			for i, e := range inA.Entries {
+				if string(e.Tag[:]) != "IPTC" && !bytes.Equal(e.Data, a.Entries[i].Data) {
+					t.Errorf("entry %q changed", e.Tag)
 				}
 			}
 			checkAFCPConsistent(t, out, func() [][2]string {
 				var w [][2]string
-				for _, e := range a.entries {
-					w = append(w, [2]string{string(e.tag[:]), string(e.data)})
+				for _, e := range a.Entries {
+					w = append(w, [2]string{string(e.Tag[:]), string(e.Data)})
 				}
 				return w
 			}())
 			for _, r := range recs {
-				if r.tag == 1 && !bytes.Equal(r.data, newIIM) {
-					t.Errorf("FotoStation IPTC copy = %x", r.data)
+				if r.Tag == 1 && !bytes.Equal(r.Data, newIIM) {
+					t.Errorf("FotoStation IPTC copy = %x", r.Data)
 				}
 			}
 		})
@@ -316,8 +318,11 @@ func FuzzTrailers(f *testing.F) {
 	probe := jpegWithTail(nil)
 	f.Add(afcpOf(binary.BigEndian, "AXS!", int64(len(probe)), [][2]string{{"IPTC", string(oldIIM)}, {"TEXT", "x"}}))
 	f.Add(afcpOf(binary.LittleEndian, "AXS*", int64(len(probe)), [][2]string{{"IPTC", string(oldIIM)}}))
-	f.Add(fotoOf(fotoRecord{1, oldIIM}))
+	f.Add(fotoOf(trailer.FotoRecord{Tag: 1, Data: oldIIM}))
 	f.Add([]byte("AXS!\x00\x01\x00\xff\x00\x00\x00\x00"))
+	f.Add(samsungOf(int64(len(probe)), samsungAudio))
+	seedAFCP := afcpOf(binary.BigEndian, "AXS!", int64(len(probe)), [][2]string{{"IPTC", string(oldIIM)}})
+	f.Add(append(seedAFCP, samsungOf(int64(len(probe)+len(seedAFCP)), samsungAudio)...))
 	f.Fuzz(func(t *testing.T, tail []byte) {
 		src := jpegWithTail(tail)
 		var out bytes.Buffer
@@ -330,9 +335,18 @@ func FuzzTrailers(f *testing.F) {
 			t.Fatal("output lost its EOI")
 		}
 		base := int64(eoi + 2)
-		if a := findAFCP(data[base:], base); a != nil {
-			if int64(a.order.Uint32(data[a.end-8:])) != a.start {
+		if a := trailer.FindAFCP(data[base:], base); a != nil {
+			if int64(a.Order.Uint32(data[a.End-8:])) != a.Start {
 				t.Fatal("inconsistent AFCP trailer in the output")
+			}
+		}
+		// A Samsung trailer that still names bytes after the write names the
+		// same bytes (task #353). A trailer the package does not understand
+		// (its offsets lie among the other trailers, say) is left as it is, and
+		// then need not name anything valid in the output.
+		if before, ok := qdioAudio(src, int64(len(jpegWithTail(nil)))); ok {
+			if after, ok := qdioAudio(data, base); ok && !bytes.Equal(before, after) {
+				t.Fatalf("the Samsung audio offsets name %q after the write, want %q", after, before)
 			}
 		}
 	})

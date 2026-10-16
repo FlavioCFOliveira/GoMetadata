@@ -756,13 +756,22 @@ func relocateTIFFFromParsedNEF(base []byte, r io.ReadSeeker, fileLen uint64, e *
 	// the extension covers.
 	rewriteNikonCaptureIPTC(e, rawIPTC)
 
+	// #355: the Nikon Capture offsets (MakerNote tag 0x0E0E) copy the positions
+	// of IFD0, the PreviewIFD and the first SubIFD; note where they are in the
+	// source, before the relocation moves the structures they name.
+	captureSrc, hasCapture := locateNikonCapture(base, false)
+
 	if info == nil {
 		// No Nikon-specific preprocessing needed; use the standard path.
-		return relocateTIFFFromParsed(base, e, rawIPTC, rawXMP, fileLen)
+		header, blocks, err = relocateTIFFFromParsed(base, e, rawIPTC, rawXMP, fileLen)
+	} else {
+		// Step C (and the rest of the main algorithm) is handled here.
+		header, blocks, err = nefRelocateWithPreview(base, e, rawIPTC, rawXMP, info, order, fileLen)
 	}
-
-	// Step C (and the rest of the main algorithm) is handled here.
-	return nefRelocateWithPreview(base, e, rawIPTC, rawXMP, info, order, fileLen)
+	if err == nil && hasCapture {
+		patchNikonCaptureOffsets(header, captureSrc)
+	}
+	return header, blocks, err
 }
 
 // nefRelocateWithPreview runs the TIFF copy-and-relocate algorithm with the

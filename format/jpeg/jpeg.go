@@ -27,6 +27,7 @@ import (
 
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 	irbpkg "github.com/FlavioCFOliveira/GoMetadata/internal/irb"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/trailer"
 	xmppkg "github.com/FlavioCFOliveira/GoMetadata/xmp"
 )
 
@@ -149,6 +150,105 @@ func decodeXMPWire(raw []byte) (main, ext []byte, ok bool) {
 		return nil, nil, false
 	}
 	return body[:mainLen], body[mainLen:], true
+}
+
+// xmpKeepMagic is the 8-byte magic of the "keep extended XMP" frame (task
+// #357), the second internal encoding that crosses the rawXMP channel, next to
+// the wire-frame (xmpWireMagic). Layout: [8-byte magic][32-byte GUID][standard
+// XMP packet]. It asks Inject to carry over, byte for byte and in place, the
+// extended XMP segments of the source whose GUID is the one given, and to link
+// the standard packet to them. Like the wire-frame it is never exposed to
+// callers of the public API, and its first byte 0x00 is not a valid start for
+// an XMP packet.
+var xmpKeepMagic = []byte("\x00XMPKEEP") //nolint:gochecknoglobals // package-level constant bytes
+
+// EncodeKeptExtended returns the frame that asks Inject to keep the extended
+// XMP segments of GUID guid (see ExtractFullSelectiveKept) next to the
+// standard XMP packet packet. guid must be the 32 hexadecimal digits that
+// ExtractFullSelectiveKept returned. The frame is only for Inject of a JPEG:
+// every other container rejects it.
+func EncodeKeptExtended(packet []byte, guid string) []byte {
+	b := make([]byte, 0, len(xmpKeepMagic)+guidLen+len(packet))
+	b = append(b, xmpKeepMagic...)
+	b = append(b, guid...)
+	return append(b, packet...)
+}
+
+// decodeKeptExtended splits a keep frame into the standard packet and the
+// GUID. ok is false when raw is not a keep frame.
+func decodeKeptExtended(raw []byte) (packet []byte, guid string, ok bool) {
+	if len(raw) < len(xmpKeepMagic)+guidLen || !bytes.HasPrefix(raw, xmpKeepMagic) {
+		return nil, "", false
+	}
+	rest := raw[len(xmpKeepMagic):]
+	return rest[guidLen:], string(rest[:guidLen]), true
+}
+
+// resolveKeptExtended applies a keep frame (rawXMP) to the source in r: when
+// the source has an extended XMP segment of the frame's GUID, it returns the
+// standard packet linked to that GUID (xmpNote:HasExtendedXMP, Part 3 §1.1.3.1,
+// p. 14) and the GUID to keep; otherwise the packet as it is and no GUID, so
+// that a packet never links to extended XMP that is not in the file (the
+// source may be another file than the one the metadata was read from). A
+// rawXMP that is not a keep frame is returned unchanged at no cost. The
+// standard packet must still fit one APP1 segment: the file carries one
+// ExtendedXMP, whose GUID the standard packet holds (Part 3 §1.1.3.1, p. 14:
+// a reader incorporates only the extended segments of that GUID), so a packet
+// that needs a second one of its own cannot be written next to the segments
+// that are kept (ErrExtendedXMPConflict) and none is dropped silently.
+func resolveKeptExtended(r io.ReadSeeker, scratch *[]byte, rawXMP []byte) (xmp []byte, keepGUID string, err error) {
+	packet, guid, ok := decodeKeptExtended(rawXMP)
+	if !ok {
+		return rawXMP, "", nil
+	}
+	found, err := hasExtendedSegment(r, scratch, guid)
+	if err != nil || !found {
+		return packet, "", err
+	}
+	linked, err := xmppkg.WithExtendedLink(packet, guid)
+	if err != nil {
+		return nil, "", fmt.Errorf("jpeg: link standard XMP to the extended XMP kept from the source: %w", err)
+	}
+	if head, tail := trimPacketPadding(linked); len(head)+len(tail) > maxXMPPayload {
+		return nil, "", fmt.Errorf("jpeg: the XMP to write (%d bytes) does not fit one segment: %w", len(linked), ErrExtendedXMPConflict)
+	}
+	return linked, guid, nil
+}
+
+// hasExtendedSegment reports whether the JPEG in r has an extended XMP APP1
+// segment (Part 3 §1.1.4) whose GUID is guid, before its image data. r is left
+// at an unspecified position. err is non-nil only for a Seek failure or
+// ErrFileTooLarge.
+func hasExtendedSegment(r io.ReadSeeker, scratch *[]byte, guid string) (bool, error) {
+	if _, err := r.Seek(2, io.SeekStart); err != nil {
+		return false, fmt.Errorf("jpeg: seek: %w", err)
+	}
+	for {
+		marker, data, err := readSegment(r, scratch)
+		if err != nil {
+			if errors.Is(err, ErrFileTooLarge) {
+				return false, err
+			}
+			return false, nil
+		}
+		switch {
+		case isExtendedSegmentOf(marker, data, guid):
+			return true, nil
+		case marker == markerSOS, marker == markerEOI:
+			return false, nil
+		}
+	}
+}
+
+// isExtendedSegmentOf reports whether the segment is an extended XMP APP1
+// segment whose GUID is guid (compared without regard to case, like the
+// reader, which canonicalises it to upper case).
+func isExtendedSegmentOf(marker byte, data []byte, guid string) bool {
+	if marker != markerAPP1 || guid == "" || !bytes.HasPrefix(data, identXMPNote) {
+		return false
+	}
+	body := data[len(identXMPNote):]
+	return len(body) >= guidLen && strings.EqualFold(string(body[:guidLen]), guid)
 }
 
 // extChunk holds one chunk of an extended XMP segment.
@@ -321,6 +421,14 @@ type xmpResult struct {
 	rawXMP     []byte // reassembled, user-visible
 	rawXMPWire []byte // wire-frame for lossless passthrough writes (may be nil)
 	truncated  bool   // #134: extended XMP was capped or structurally invalid
+	// keptGUID is the GUID of extended XMP segments that the standard packet
+	// links to and that were NOT merged into rawXMP (their layout is invalid,
+	// or the assembled document cannot be merged): a write that rewrites the
+	// standard packet carries those segments over verbatim (task #357; see
+	// EncodeKeptExtended). Empty when there are none.
+	// A pointer, not a string: the result is copied up the call chain of every
+	// read, and the field is set only in the rare unmergeable case.
+	keptGUID *string
 }
 
 // buildXMPResult constructs an xmpResult from the raw main packet and any
@@ -374,7 +482,8 @@ func buildXMPResult(rawXMP []byte, extended map[string][]extChunk, extFullLens m
 	if !valid {
 		// Chunk layout is corrupt; return main packet only (without the link
 		// to the extended XMP that was not recomposed) and signal truncation.
-		return xmpResult{rawXMP: stripExtendedLink(rawXMP, wantXMP), truncated: true}
+		kept := guid // a copy of its own: guid itself stays on the stack in the other paths
+		return xmpResult{rawXMP: stripExtendedLink(rawXMP, wantXMP), truncated: true, keptGUID: &kept}
 	}
 
 	// Build wire-frame BEFORE any reassembly, so that the original raw bytes
@@ -413,7 +522,8 @@ func buildXMPResult(rawXMP []byte, extended map[string][]extChunk, extFullLens m
 			// only in the file). The caller is told through truncated, so a
 			// ParseWarning reports that the extended content was dropped; it
 			// stays in the wire-frame, so an unmodified write keeps it.
-			return xmpResult{rawXMP: stripExtendedLink(rawXMP, true), rawXMPWire: wire, truncated: true}
+			kept := guid // a copy of its own, as above
+			return xmpResult{rawXMP: stripExtendedLink(rawXMP, true), rawXMPWire: wire, truncated: true, keptGUID: &kept}
 		}
 	}
 
@@ -701,11 +811,27 @@ func ExtractFull(r io.ReadSeeker) (rawEXIF, rawIPTC, iptcDigest, rawXMP, rawXMPW
 // must remain available so an unmodified Write can pass them through
 // byte-for-byte (CLAUDE.md §5). ExtractFull calls this with both flags true.
 func ExtractFullSelective(r io.ReadSeeker, wantIPTC, wantXMP bool) (rawEXIF, rawIPTC, iptcDigest, rawXMP, rawXMPWire []byte, xmpTruncated bool, err error) {
+	rawEXIF, rawIPTC, iptcDigest, rawXMP, rawXMPWire, xmpTruncated, _, err = ExtractFullSelectiveKept(r, wantIPTC, wantXMP)
+	return rawEXIF, rawIPTC, iptcDigest, rawXMP, rawXMPWire, xmpTruncated, err
+}
+
+// ExtractFullSelectiveKept is ExtractFullSelective that also returns keptGUID,
+// the GUID of the extended XMP segments that the standard packet links to and
+// that could not be merged into rawXMP (an invalid chunk layout, or an
+// assembled document that cannot be merged; the cases that set xmpTruncated
+// with a matching GUID). It is empty when the extended XMP was merged or there
+// is none. A caller that rewrites the XMP passes the packet it writes through
+// EncodeKeptExtended, so that Inject carries those segments over verbatim
+// (task #357).
+func ExtractFullSelectiveKept(r io.ReadSeeker, wantIPTC, wantXMP bool) (rawEXIF, rawIPTC, iptcDigest, rawXMP, rawXMPWire []byte, xmpTruncated bool, keptGUID string, err error) {
 	rawEXIF, rawIPTC, iptcDigest, xmpRes, err := extractFullInternal(r, wantIPTC, wantXMP)
 	if err != nil {
-		return nil, nil, nil, nil, nil, false, err
+		return nil, nil, nil, nil, nil, false, "", err
 	}
-	return rawEXIF, rawIPTC, iptcDigest, xmpRes.rawXMP, xmpRes.rawXMPWire, xmpRes.truncated, nil
+	if xmpRes.keptGUID != nil {
+		keptGUID = *xmpRes.keptGUID
+	}
+	return rawEXIF, rawIPTC, iptcDigest, xmpRes.rawXMP, xmpRes.rawXMPWire, xmpRes.truncated, keptGUID, nil
 }
 
 // extractFullInternal is the shared implementation of Extract, ExtractWithWire, and ExtractFull.
@@ -1154,9 +1280,12 @@ func writeSOS(r io.Reader, w io.Writer, data []byte) error {
 
 // writeSOSOrTrailers is writeSOS, or writeSOSTrailers when plan lists trailers
 // to rewrite (task #322; r is then the seekable reader the plan was made from).
-func writeSOSOrTrailers(r io.Reader, w io.Writer, data []byte, plan *trailerPlan) error {
+func writeSOSOrTrailers(r io.Reader, w io.Writer, data []byte, plan *trailer.Plan) error {
 	if rs, ok := r.(io.ReadSeeker); ok && plan != nil {
-		return writeSOSTrailers(rs, w, data, plan)
+		// w is the counting writer startTrailerPlan returned with the plan.
+		if out, isOut := w.(*trailer.OutWriter); isOut {
+			return writeSOSTrailers(rs, w, out, data, plan)
+		}
 	}
 	return writeSOS(r, w, data)
 }
@@ -1184,8 +1313,10 @@ func isAppMarker(m byte) bool {
 //
 // plan (task #322) lists the trailer ranges after the image data that are
 // rewritten instead of copied; it is nil for a JPEG without such a trailer,
-// and then r need not be seekable.
-func copyNonMetadataSegments(r io.Reader, w io.Writer, scratch *[]byte, preserveUnknownSegments bool, plan *trailerPlan) error {
+// and then r need not be seekable. keepGUID (task #357) names the extended
+// XMP segments that are copied instead of dropped; it is empty in the common
+// case.
+func copyNonMetadataSegments(r io.Reader, w io.Writer, scratch *[]byte, preserveUnknownSegments bool, plan *trailer.Plan, keepGUID string) error {
 	for {
 		marker, data, err := readSegment(r, scratch)
 		if err != nil {
@@ -1195,20 +1326,7 @@ func copyNonMetadataSegments(r io.Reader, w io.Writer, scratch *[]byte, preserve
 			return err
 		}
 
-		// Skip segments we replaced (or removed when payload is nil).
-		if isOldMetadataSegment(marker, data) {
-			continue
-		}
-
-		// When preserveUnknownSegments is false, drop any APPn segment that
-		// is not a recognised metadata segment. isOldMetadataSegment already
-		// handles EXIF APP1, XMP APP1 (standard and extended), and
-		// Photoshop APP13 — so any remaining APPn here is "unknown" to the
-		// library (e.g. APP0/JFIF, APP2/ICC, APP12/Ducky, APP14/Adobe DCT).
-		//
-		// JPEG ISO/IEC 10918-1 §B.2.4.6: APPn markers are application
-		// extension segments; no APPn is required for image decoding.
-		if !preserveUnknownSegments && isAppMarker(marker) {
+		if dropsSegment(marker, data, preserveUnknownSegments, keepGUID) {
 			continue
 		}
 
@@ -1223,6 +1341,26 @@ func copyNonMetadataSegments(r io.Reader, w io.Writer, scratch *[]byte, preserve
 			}
 		}
 	}
+}
+
+// dropsSegment reports whether Inject leaves a source segment out of the
+// output.
+//
+//   - An extended XMP segment of keepGUID, the GUID that the standard packet
+//     written links to, is copied as it is, in its place (task #357).
+//   - A segment Inject replaced (or removes when its payload is nil) is
+//     dropped: isOldMetadataSegment.
+//   - When preserveUnknownSegments is false, any other APPn segment is dropped
+//     too: isOldMetadataSegment already covers EXIF APP1, XMP APP1 (standard and
+//     extended) and Photoshop APP13, so what remains is "unknown" to the
+//     library (e.g. APP0/JFIF, APP2/ICC, APP12/Ducky, APP14/Adobe DCT). JPEG
+//     ISO/IEC 10918-1 §B.2.4.6: APPn markers are application extension
+//     segments; no APPn is required for image decoding.
+func dropsSegment(marker byte, data []byte, preserveUnknownSegments bool, keepGUID string) bool {
+	if keepGUID != "" && isExtendedSegmentOf(marker, data, keepGUID) {
+		return false
+	}
+	return isOldMetadataSegment(marker, data) || (!preserveUnknownSegments && isAppMarker(marker))
 }
 
 // irbHasSibling reports whether an IRB payload contains any 8BIM resource
@@ -1404,21 +1542,32 @@ func resolveOrigIRB(r io.ReadSeeker, scratch *[]byte, rawIPTC []byte) ([]byte, e
 // leaves cr at the start of the file: the original Photoshop IRB (resolveOrigIRB,
 // #174, #217) and the trailers that hold an IPTC copy or absolute offsets
 // (startTrailerPlan, #322), whose plan is nil, with w returned as it is, when
-// there are none.
-func prepareInject(cr io.ReadSeeker, w io.Writer, scratch *[]byte, rawIPTC []byte) (origIRB []byte, plan *trailerPlan, out io.Writer, err error) {
+// there are none. A keep frame in rawXMP (#357) is resolved against the source
+// first: xmp is the standard packet to write and keepGUID the GUID of the
+// extended XMP segments to keep (see resolveKeptExtended).
+func prepareInject(cr io.ReadSeeker, w io.Writer, scratch *[]byte, rawIPTC, rawXMP []byte) (origIRB []byte, plan *trailer.Plan, out io.Writer, xmp []byte, keepGUID string, err error) {
+	// #357: a keep frame in rawXMP asks to carry over the extended XMP segments
+	// of the source that were not merged; it starts with 0x00, which no XMP
+	// packet does, so any other payload skips the call. Resolved against this
+	// source before another pass moves the reader.
+	if len(rawXMP) > 0 && rawXMP[0] == 0 {
+		if rawXMP, keepGUID, err = resolveKeptExtended(cr, scratch, rawXMP); err != nil {
+			return nil, nil, w, nil, "", err
+		}
+	}
 	origIRB, err = resolveOrigIRB(cr, scratch, rawIPTC)
 	if err != nil {
-		return nil, nil, w, err
+		return nil, nil, w, nil, "", err
 	}
 	plan, out, err = startTrailerPlan(cr, w, scratch, rawIPTC)
 	if err != nil {
-		return nil, nil, w, err
+		return nil, nil, w, nil, "", err
 	}
 	// Seek back to the start for the main copy pass.
 	if _, err := cr.Seek(0, io.SeekStart); err != nil {
-		return nil, nil, w, fmt.Errorf("jpeg: seek: %w", err)
+		return nil, nil, w, nil, "", fmt.Errorf("jpeg: seek: %w", err)
 	}
-	return origIRB, plan, out, nil
+	return origIRB, plan, out, rawXMP, keepGUID, nil
 }
 
 // Inject reads the JPEG marker stream from r, replaces the relevant APP
@@ -1483,7 +1632,10 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	// resources survive when rawIPTC replaces or removes the 0x0404 block,
 	// skipping the preserving clone pass when it provably cannot be needed.
 	// See resolveOrigIRB for the full rationale.
-	origIRB, plan, w, err := prepareInject(cr, w, scratch, rawIPTC)
+	// #357: a keep frame in rawXMP asks to carry over the extended XMP segments
+	// of the source that were not merged; resolve it against this source before
+	// any pass moves the reader.
+	origIRB, plan, w, rawXMP, keepGUID, err := prepareInject(cr, w, scratch, rawIPTC, rawXMP)
 	if err != nil {
 		return err
 	}
@@ -1508,7 +1660,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	}
 
 	// Copy remaining segments, skipping old metadata APP segments.
-	return copyNonMetadataSegments(cr, w, scratch, preserveUnknownSegments, plan)
+	return copyNonMetadataSegments(cr, w, scratch, preserveUnknownSegments, plan, keepGUID)
 }
 
 // parseIRBEntry delegates to irbpkg.ParseEntry; see there for the recoverable-miss

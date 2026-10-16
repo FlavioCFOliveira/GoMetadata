@@ -331,6 +331,21 @@ func StripExtendedLink(packet []byte) ([]byte, error) {
 	return serialise(x.subset(props, func(tp *topProp) bool { return !tp.isLink() }, true))
 }
 
+// WithExtendedLink returns packet, an XMP packet, with the property
+// xmpNote:HasExtendedXMP set to guid, re-serialised like Encode does. A JPEG
+// writer that keeps extended XMP segments it cannot merge (task #357) uses it
+// to link the standard packet it writes to them: Part 3 §1.1.3.1 (p. 14) stores
+// the GUID of the ExtendedXMP in that property, and a reader incorporates only
+// the extended segments whose GUID matches it. It returns the errors of Parse.
+func WithExtendedLink(packet []byte, guid string) ([]byte, error) {
+	x, err := Parse(packet)
+	if err != nil {
+		return nil, err
+	}
+	x.putProp(NSxmpNote, hasExtendedXMP, guid)
+	return serialise(x)
+}
+
 // partition is the state of one PackageForJPEG call: the top-level
 // properties of the XMP and which of them have moved to the extended portion.
 type partition struct {

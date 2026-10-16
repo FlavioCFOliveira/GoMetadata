@@ -6,6 +6,18 @@
 // "application/rdf+xml". Item locations are resolved via the 'iloc' box.
 package heif
 
+// Adapted from libavif src/read.c:avifParseItemInfoBox,avifParse, Copyright 2019 Joe Drago, SPDX-License-Identifier: BSD-2-Clause
+//
+// Changes from libavif: libavif reads each infe box through
+// avifROStreamReadBoxHeader, so that the box content starts after the real
+// header length (8 bytes, or 16 for a 64-bit largesize box); parseIinf does the
+// same through parseHEIFBoxHeader (task #348), and every other box content
+// offset of this package comes from that header length. libavif parses only
+// the file-level meta box as the item container (and moov for its tracks);
+// findMetaBoxAbs follows it and adds a fallback to a meta box that is a direct
+// child of moov when the file has no file-level one, which Extract and Inject
+// share (task #349). See THIRD_PARTY_NOTICES.md.
+
 import (
 	"bytes"
 	"encoding/binary"
@@ -37,7 +49,6 @@ var (
 	boxTypeMeta = [4]byte{'m', 'e', 't', 'a'} //nolint:gochecknoglobals // package-level constant box type; never mutated
 	boxTypeMoov = [4]byte{'m', 'o', 'o', 'v'} //nolint:gochecknoglobals // package-level constant box type; never mutated
 	boxTypeTrak = [4]byte{'t', 'r', 'a', 'k'} //nolint:gochecknoglobals // package-level constant box type; never mutated
-	boxTypeUdta = [4]byte{'u', 'd', 't', 'a'} //nolint:gochecknoglobals // package-level constant box type; never mutated
 	boxTypeIinf = [4]byte{'i', 'i', 'n', 'f'} //nolint:gochecknoglobals // package-level constant box type; never mutated
 	boxTypeIloc = [4]byte{'i', 'l', 'o', 'c'} //nolint:gochecknoglobals // package-level constant box type; never mutated
 	boxTypePitm = [4]byte{'p', 'i', 't', 'm'} //nolint:gochecknoglobals // package-level constant box type; never mutated
@@ -92,9 +103,13 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		return nil, nil, nil, fmt.Errorf("heif: read: %w", rerr)
 	}
 	hdr = hdr[:n]
+	// The window holds the whole file when the read ended short of it
+	// (io.ErrUnexpectedEOF): only then can the absence of a file-level meta box
+	// in the window be trusted (see findMetaBoxAbs, task #349).
+	complete := rerr != nil
 
-	// Find the meta box within the header window.
-	metaData, _ := findBox(hdr, boxTypeMeta, 0)
+	// Select the metadata container with the same rule Inject applies.
+	metaData := metaContentInWindow(hdr, complete)
 	if metaData != nil {
 		// Fast path: meta box fully within header window.
 		// Read item payloads by seeking rather than slicing a full in-memory copy.
@@ -106,9 +121,9 @@ func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 		iobuf.Put(hdrPtr)
 		return rawEXIF, nil, rawXMP, err
 	}
-
-	// Slow path fallback: meta box not found in first 64 KB (extremely rare —
-	// HEIF spec places meta at the file head). Read the full file.
+	// Slow path fallback: no file-level meta box in the first 64 KB (extremely
+	// rare — HEIF places meta at the file head — or a file whose only meta box
+	// is nested in moov). Read the full file.
 	iobuf.Put(hdrPtr)
 	if _, err = r.Seek(0, io.SeekStart); err != nil {
 		return nil, nil, nil, fmt.Errorf("heif: seek: %w", err)
@@ -183,11 +198,8 @@ func extractFromMetaData(r io.ReadSeeker, metaData []byte) (rawEXIF, rawXMP []by
 // Item payloads are read through extractFromMetaData into freshly allocated,
 // exactly-sized slices, so the returned rawEXIF/rawXMP never retain data.
 func parseHEIFMetadata(data []byte) (rawEXIF, rawXMP []byte, err error) {
-	// Find the 'meta' box. It can be inside 'moov' or at top-level.
-	metaData, err := findBox(data, boxTypeMeta, 0)
-	if err != nil {
-		return nil, nil, err
-	}
+	// The same selection rule Inject applies (findMetaBoxAbs, task #349).
+	metaData := metaContentInWindow(data, true)
 	if metaData == nil {
 		return nil, nil, nil
 	}
@@ -311,49 +323,6 @@ func parsePitm(metaContent []byte) uint16 {
 	return uint16(id)
 }
 
-// isContainerBox reports whether typ is an ISOBMFF container box that may
-// contain nested boxes (and therefore warrants recursive descent).
-func isContainerBox(typ [4]byte) bool {
-	return typ == boxTypeMoov || typ == boxTypeTrak || typ == boxTypeUdta
-}
-
-// findBox searches data for the first box of the given type, returning its data.
-// It performs a shallow search at the top level and recurses into container boxes
-// up to depth levels deep (max 32) to prevent stack exhaustion on crafted input.
-func findBox(data []byte, boxType [4]byte, depth int) ([]byte, error) {
-	if depth > 32 {
-		return nil, ErrMaxNestingDepth
-	}
-	pos := 0
-	for pos < len(data) {
-		size, typ, headerLen, ok := parseHEIFBoxHeader(data, pos)
-		if !ok {
-			break
-		}
-
-		boxData := data[pos+int(headerLen) : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by file size
-
-		if typ == boxType {
-			// Skip the 4-byte version/flags for full boxes.
-			if len(boxData) >= 4 {
-				return boxData[4:], nil
-			}
-			return boxData, nil
-		}
-
-		// Recurse into container boxes.
-		if isContainerBox(typ) {
-			inner, err := findBox(boxData, boxType, depth+1)
-			if err == nil && inner != nil {
-				return inner, nil
-			}
-		}
-
-		pos += int(size) //nolint:gosec // G115: ISOBMFF box size bounded by file size
-	}
-	return nil, nil
-}
-
 // parseIinfItemCount decodes the item_count field from iinfData (or ilocData)
 // at pos, using version to determine whether it is a 2-byte or 4-byte field.
 // Returns count, updated pos, and success.
@@ -409,12 +378,17 @@ func parseIinf(metaData []byte) map[uint16][4]byte {
 
 	// Parse infe (item info entry) boxes.
 	for pos < len(iinfData) {
-		size, typ, _, ok := parseHEIFBoxHeader(iinfData, pos)
-		if !ok || size < 8 {
+		// The infe payload starts after the box header, which is 16 bytes
+		// when the box uses the 64-bit largesize form (ISO 14496-12 §4.2); the
+		// header length is never assumed (task #348; libavif src/read.c
+		// avifParseItemInfoBox reads each infe through
+		// avifROStreamReadBoxHeader).
+		size, typ, headerLen, ok := parseHEIFBoxHeader(iinfData, pos)
+		if !ok {
 			break
 		}
 		if typ == boxTypeInfe {
-			infeData := iinfData[pos+8 : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by file size
+			infeData := iinfData[pos+int(headerLen) : pos+int(size)] //nolint:gosec // G115: ISOBMFF box size bounded by file size
 			id, itemType, ok := parseInfe(infeData)
 			if ok {
 				result[id] = itemType
@@ -548,9 +522,29 @@ func isXMPContentType(rest []byte) bool {
 // fields that follow the box header (ISO 14496-12 §4.2.2 FullBox).
 const fullBoxFieldsLen = 4
 
-// findMetaBoxAbs finds the 'meta' FullBox in the file and returns its
+// findMetaBoxAbs selects the file's metadata container: the one 'meta' FullBox
+// that both Extract and Inject read and write (task #349). It returns its
 // absolute start, end, and the offset where its content begins (after the box
 // header and the FullBox version/flags).
+//
+// Selection rule:
+//  1. The first file-level (top-level) 'meta' box, in file order.
+//  2. Only when the file has no top-level 'meta' box at all: the first 'meta'
+//     box that is a direct child of the first top-level 'moov' box.
+//
+// A top-level 'meta' box that is present but unusable (too small for a
+// FullBox) is NOT skipped in favour of a moov-nested one: the rule picks one
+// box and never falls through, so Extract and Inject cannot disagree.
+//
+// Rationale. The HEIF item table (iinf, iloc, pitm) lives in the file-level
+// MetaBox; libavif (src/read.c, avifParse: the top-level 'meta' box is parsed
+// as the item container and 'moov' only for tracks), libheif (libheif/file.cc,
+// HeifFile::parse_heif_file: m_meta_box is the top-level 'meta' box) and
+// heic-rs (src/meta/mod.rs) read only the top-level box. ISO/IEC 14496-12
+// §8.11.1 also allows a MetaBox inside 'moov'; that box is the fallback so that
+// a file whose only metadata container is movie-level keeps being read and
+// written, as before. Boxes nested deeper (trak, udta) describe a track or the
+// user data of a movie, not the file, and are not selected.
 //
 // The box header is 8 bytes, or 16 bytes when the box uses the 64-bit
 // largesize form (size == 1): contentOff = absStart + headerLen + 4. The
@@ -559,39 +553,59 @@ const fullBoxFieldsLen = 4
 // src/stream.c avifROStreamReadBoxHeaderPartial reads the largesize the same
 // way, ISO 14496-12 §4.2).
 //
-// Returns found=false when the meta box is absent or smaller than its header
-// plus the FullBox fields: 12 bytes with the 8-byte header, 20 with the
-// 16-byte one (an under-sized FullBox cannot contain usable content and would
-// otherwise cause buildInjectComponents to slice data[12:8] → panic; regression
-// gate: TestHEIFInjectMetaTooSmallForFullBox).
+// Returns found=false when no meta box is selected or the selected one is
+// smaller than its header plus the FullBox fields: 12 bytes with the 8-byte
+// header, 20 with the 16-byte one (an under-sized FullBox cannot contain
+// usable content and would otherwise cause buildInjectComponents to slice
+// data[12:8] → panic; regression gate: TestHEIFInjectMetaTooSmallForFullBox).
 // ISO 14496-12 §8.11.1: meta FullBox minimum size = header + 4 bytes.
 func findMetaBoxAbs(data []byte) (absStart, absEnd, contentOff int, found bool) {
-	// Search at top level first.
 	if s, e, hl, ok := flatBoxRangeHdr(data, boxTypeMeta); ok {
-		if e-s < hl+fullBoxFieldsLen {
-			// #169 fix: meta box too small to be a valid FullBox.
-			// ISO 14496-12 §8.11.1: meta is a FullBox (header + version/flags).
-			// If size < header+4, contentOff would exceed e, causing data[contentOff:e] to panic.
-			return 0, 0, 0, false
-		}
-		return s, e, s + hl + fullBoxFieldsLen, true
+		return validMetaRange(s, e, hl, 0)
 	}
-	// Search inside moov.
 	ms, me, mhl, ok := flatBoxRangeHdr(data, boxTypeMoov)
 	if !ok {
 		return 0, 0, 0, false
 	}
 	moovContent := data[ms+mhl : me]
 	if s, e, hl, ok := flatBoxRangeHdr(moovContent, boxTypeMeta); ok {
-		if e-s < hl+fullBoxFieldsLen {
-			// Same size guard for the moov-nested meta box.
-			return 0, 0, 0, false
-		}
-		absS := ms + mhl + s
-		absE := ms + mhl + e
-		return absS, absE, absS + hl + fullBoxFieldsLen, true
+		return validMetaRange(s, e, hl, ms+mhl)
 	}
 	return 0, 0, 0, false
+}
+
+// validMetaRange converts a meta box range relative to base into the absolute
+// triple findMetaBoxAbs returns, rejecting a box too small for a FullBox
+// (#169 fix: ISO 14496-12 §8.11.1, meta is a FullBox, so size >= header + 4;
+// otherwise contentOff would exceed the box end and data[contentOff:end]
+// would panic).
+func validMetaRange(start, end, headerLen, base int) (absStart, absEnd, contentOff int, found bool) {
+	if end-start < headerLen+fullBoxFieldsLen {
+		return 0, 0, 0, false
+	}
+	return base + start, base + end, base + start + headerLen + fullBoxFieldsLen, true
+}
+
+// metaContentInWindow returns the content of the selected meta box of data
+// (the bytes after its header and FullBox version/flags), or nil when none is
+// selected. complete states that data is the whole file; when it is only the
+// head of a file, a moov-nested meta box is not taken, because a file-level
+// meta box may still follow beyond data and would take precedence
+// (findMetaBoxAbs), so the caller must read the whole file instead.
+func metaContentInWindow(data []byte, complete bool) []byte {
+	if s, e, hl, ok := flatBoxRangeHdr(data, boxTypeMeta); ok {
+		if _, _, off, valid := validMetaRange(s, e, hl, 0); valid {
+			return data[off:e]
+		}
+		return nil
+	}
+	if !complete {
+		return nil
+	}
+	if _, end, off, ok := findMetaBoxAbs(data); ok {
+		return data[off:end]
+	}
+	return nil
 }
 
 // flatBoxRangeInFile performs a flat scan and returns start+end of the first

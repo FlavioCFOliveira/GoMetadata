@@ -2,7 +2,7 @@ package cr3
 
 import (
 	"bytes"
-	"io"
+	"errors"
 	"testing"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
@@ -158,16 +158,43 @@ func FuzzCR3Inject(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic regardless of input. Inject must return an error or
 		// write valid output — a panic is always a bug in the write path.
-		err := Inject(bytes.NewReader(data), io.Discard, rawEXIF, nil, rawXMP, true)
-		_ = err
+		var out bytes.Buffer
+		err := Inject(bytes.NewReader(data), &out, rawEXIF, nil, rawXMP, true)
+		checkInjectNeverDrops(t, data, out.Bytes(), err, true, true, rawXMP)
 		// The same with an EXIF stream that is split into CMT1, CMT2 and CMT4.
-		err = Inject(bytes.NewReader(data), io.Discard, richEXIF, nil, nil, true)
-		_ = err
+		out.Reset()
+		err = Inject(bytes.NewReader(data), &out, richEXIF, nil, nil, true)
+		checkInjectNeverDrops(t, data, out.Bytes(), err, true, false, nil)
 		// And with one that has no Exif or GPS IFD, which removes CMT2 and
 		// CMT4 when the source exposes them.
-		err = Inject(bytes.NewReader(data), io.Discard, minimalTIFF(), nil, nil, true)
-		_ = err
+		out.Reset()
+		err = Inject(bytes.NewReader(data), &out, minimalTIFF(), nil, nil, true)
+		checkInjectNeverDrops(t, data, out.Bytes(), err, true, false, nil)
+		// XMP only.
+		out.Reset()
+		err = Inject(bytes.NewReader(data), &out, nil, nil, rawXMP, true)
+		checkInjectNeverDrops(t, data, out.Bytes(), err, false, true, rawXMP)
 	})
+}
+
+// checkInjectNeverDrops enforces task #347 on one Inject call: a nil error
+// means the requested payload is in the output (a refusal returns an error and
+// no output, ErrNoMetadataContainer for a missing container).
+func checkInjectNeverDrops(t *testing.T, in, out []byte, err error, wantEXIF, wantXMP bool, xmp []byte) {
+	t.Helper()
+	if err != nil {
+		if len(out) != 0 && errors.Is(err, ErrNoMetadataContainer) {
+			t.Fatalf("refused write (%v) produced %d bytes of output", err, len(out))
+		}
+		return
+	}
+	gotEXIF, _, gotXMP, _ := Extract(bytes.NewReader(out))
+	if wantEXIF && gotEXIF == nil {
+		t.Fatalf("Inject returned nil but the output has no EXIF (input %d bytes, output %d, unchanged=%v)", len(in), len(out), bytes.Equal(in, out))
+	}
+	if wantXMP && !bytes.Equal(gotXMP, xmp) {
+		t.Fatalf("Inject returned nil but the output XMP = %q, want %q", gotXMP, xmp)
+	}
 }
 
 // buildMinimalCR3Seed returns a minimal little-endian TIFF stream (an empty

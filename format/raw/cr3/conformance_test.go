@@ -1474,22 +1474,33 @@ func TestCR3RobustDeepNestingNoPanic(t *testing.T) {
 	_, _, _, _ = Extract(bytes.NewReader(data))
 }
 
-// TestCR3RobustNoMoovPassThrough verifies that Inject passes the file through
-// unchanged when no moov box exists (corrupt/incomplete file).
+// TestCR3RobustNoMoovRefused verifies that Inject refuses, with
+// ErrNoMetadataContainer and without writing, to store EXIF in a file that has
+// no moov box (corrupt/incomplete file), and still copies it through when
+// nothing is requested (task #347).
 // containers.md §8(f): "malformed moov" — Inject degrades gracefully.
-func TestCR3RobustNoMoovPassThrough(t *testing.T) {
-	// CR3-robust-no-moov-inject: containers.md §8(f) — Inject on no-moov file passes through.
+func TestCR3RobustNoMoovRefused(t *testing.T) {
+	// CR3-robust-no-moov-inject: containers.md §8(f) — Inject on a no-moov file is refused.
 	t.Parallel()
 	ftyp := buildCR3FtypOnly()
 	original := make([]byte, len(ftyp))
 	copy(original, ftyp)
 
 	var out bytes.Buffer
-	if err := Inject(bytes.NewReader(ftyp), &out, conformanceTIFFLE, nil, nil, true); err != nil {
-		t.Fatalf("CR3-robust-no-moov-inject: Inject error: %v", err)
+	err := Inject(bytes.NewReader(ftyp), &out, conformanceTIFFLE, nil, nil, true)
+	if !errors.Is(err, ErrNoMetadataContainer) || !errors.Is(err, ErrNoMoovBox) {
+		t.Fatalf("CR3-robust-no-moov-inject: Inject error = %v, want ErrNoMetadataContainer and ErrNoMoovBox", err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("CR3-robust-no-moov-inject: a refused write produced %d bytes", out.Len())
+	}
+
+	out.Reset()
+	if err := Inject(bytes.NewReader(ftyp), &out, nil, nil, nil, true); err != nil {
+		t.Fatalf("CR3-robust-no-moov-inject: nothing requested: %v", err)
 	}
 	if !bytes.Equal(out.Bytes(), original) {
-		t.Error("CR3-robust-no-moov-inject: output differs from input for no-moov file")
+		t.Error("CR3-robust-no-moov-inject: output differs from input for a no-op write")
 	}
 }
 

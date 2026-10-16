@@ -169,12 +169,14 @@ for cross-checking only).
 - Source commit: `ab37e2946dfb6d2cc52886f39cb0fbf701db98e1`
 - Licence: BSD-2-Clause (see `LICENSES/BSD-2-Clause.txt`), SPDX-License-Identifier: `BSD-2-Clause`
 - Copyright: Copyright 2019 Joe Drago. All rights reserved.
-- Source files: `src/read.c` (`avifParseItemLocationBox`, `avifDecoderItemRead`); `src/write.c`
+- Source files: `src/read.c` (`avifParseItemLocationBox`, `avifDecoderItemRead`, `avifParseItemInfoBox`, `avifParse`); `src/write.c`
   (`avifEncoderDataCreateExifItem`, `avifEncoderDataCreateXMPItem`, `avifEncoderFinish`,
   `avifEncoderWriteTrackMetaBox`); `src/stream.c` (`avifROStreamReadBoxHeaderPartial`, consulted for the 64-bit
   largesize box header)
-- Destination files: `format/heif/iloc.go`, `format/heif/inject.go`
-- Adapted: yes (the item location box field order, including the 16-bit `data_reference_index` of every version, the
+- Destination files: `format/heif/heif.go`, `format/heif/iloc.go`, `format/heif/inject.go`
+- Adapted: yes (the content of an `infe` box starts after its real header length, 8 or 16 bytes, as
+  `avifParseItemInfoBox` reads it through the box header; the metadata container is the file-level `meta` box, as
+  `avifParse` takes it, with a fallback to a `meta` box that is a direct child of `moov`; the item location box field order, including the 16-bit `data_reference_index` of every version, the
   field-width validation, the concatenation of an item's extents and the idat construction method, re-implemented as
   allocation-free Go; the layout of a new Exif or XMP item — infe version 2, item name, XMP content type, iref `cdsc`
   reference to the primary item, iloc entry with construction method 0 — re-implemented to edit an existing file; the

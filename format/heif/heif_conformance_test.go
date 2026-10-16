@@ -605,7 +605,7 @@ func TestHEIFExifItemIlocOffset(t *testing.T) {
 	data := buildConformanceHEIF("heic", exif, nil)
 
 	// Parse meta to find iloc and verify the offset.
-	metaContent, err := findBox(data, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(data)
 	if err != nil || metaContent == nil {
 		t.Fatalf("HEIF-Exif-item-iloc-offset: meta box not found (err=%v)", err)
 	}
@@ -660,7 +660,7 @@ func TestHEIFMimeXMPContentTypeExact(t *testing.T) {
 	data := buildConformanceHEIF("heic", nil, xmp)
 
 	// Parse the infe box to verify the content_type bytes.
-	metaContent, err := findBox(data, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(data)
 	if err != nil || metaContent == nil {
 		t.Fatalf("HEIF-mime-xmp-content-type-exact: meta box not found (err=%v)", err)
 	}
@@ -781,7 +781,7 @@ func TestHEIFWriteEXIFPrefixOnInject(t *testing.T) {
 
 	// The EXIF item payload in the output file must begin with 4 zero bytes (the prefix).
 	outData := out.Bytes()
-	metaContent, err := findBox(outData, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(outData)
 	if err != nil || metaContent == nil {
 		t.Fatalf("HEIF-write-exif-prefix-on-inject: meta box not found in output (err=%v)", err)
 	}
@@ -824,7 +824,7 @@ func TestHEIFWriteIlocOffsetsPatched(t *testing.T) {
 	}
 	outData := out.Bytes()
 
-	metaContent, err := findBox(outData, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(outData)
 	if err != nil || metaContent == nil {
 		t.Fatalf("HEIF-write-iloc-offsets-patched: meta box not found (err=%v)", err)
 	}
@@ -886,7 +886,7 @@ func TestHEIFWriteXMPContentTypePreserved(t *testing.T) {
 		t.Fatalf("HEIF-write-xmp-content-type-preserved: Inject failed: %v", err)
 	}
 
-	metaContent, err := findBox(out.Bytes(), boxTypeMeta, 0)
+	metaContent, err := findMetaContent(out.Bytes())
 	if err != nil || metaContent == nil {
 		t.Fatalf("HEIF-write-xmp-content-type-preserved: meta box not found (err=%v)", err)
 	}
@@ -1104,23 +1104,22 @@ func TestHEIFRobustTruncatedMeta(t *testing.T) {
 }
 
 // TestHEIFRobustDeepNesting verifies that deeply nested container boxes do not
-// cause a stack overflow (findBox has a depth limit of 32).
+// cause a stack overflow or a false meta box (the selection scan is
+// non-recursive).
 // ISO 14496-12 §4.2: arbitrary nesting is not guaranteed valid.
 func TestHEIFRobustDeepNesting(t *testing.T) {
-	// HEIF-robust-deep-nesting: §5(f) — depth > 32 returns ErrMaxNestingDepth.
+	// HEIF-robust-deep-nesting: §5(f) — deep nesting is neither followed nor a panic.
 	t.Parallel()
 
-	// Build 35 levels of "moov" nesting (findBox limit is 32).
+	// Build 35 levels of "moov" nesting (the scan never recurses).
 	innerData := bmffFtyp("heic", 0)
 	for range 35 {
 		innerData = bmffBox("moov", innerData)
 	}
 
-	_, err := findBox(innerData, boxTypeMeta, 0)
-	if err == nil {
-		t.Log("HEIF-robust-deep-nesting: findBox returned nil error on >32 nesting (may have gracefully stopped)")
-	} else if !strings.Contains(err.Error(), "nesting") {
-		t.Logf("HEIF-robust-deep-nesting: got error %v (may be depth limit)", err)
+	_, _, _, found := findMetaBoxAbs(innerData)
+	if found {
+		t.Fatal("HEIF-robust-deep-nesting: a meta box was found in a ftyp nested in moov boxes")
 	}
 }
 

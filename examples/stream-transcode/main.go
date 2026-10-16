@@ -48,8 +48,7 @@ func main() {
 	// bytes.Buffer and wrap with bytes.NewReader first.
 	m, err := gometadata.Read(os.Stdin)
 	if err != nil {
-		var unsupported *gometadata.UnsupportedFormatError
-		if errors.As(err, &unsupported) {
+		if _, ok := errors.AsType[*gometadata.UnsupportedFormatError](err); ok {
 			fmt.Fprintln(os.Stderr, "stream-transcode: unsupported format")
 			os.Exit(1)
 		}

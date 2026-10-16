@@ -32,6 +32,15 @@ var ErrSegmentTooLarge = errors.New("jpeg: segment payload exceeds APP segment l
 // (Adobe XMP Specification Part 3 §1.1.3.1, p. 15).
 var ErrExtendedXMPTruncated = errors.New("jpeg: extended XMP is incomplete, too large or not valid and was not merged")
 
+// ErrExtendedXMPConflict is returned by Inject when the XMP to write is too
+// large for one APP1 segment and so needs extended XMP of its own, while the
+// file carries extended XMP that could not be merged and is being kept
+// verbatim (task #357). The file can hold one ExtendedXMP, whose GUID the
+// standard packet names (Adobe XMP Specification Part 3 §1.1.3.1, p. 14), so
+// both cannot be stored; nothing is written. Reducing the XMP to write, so
+// that it fits one segment, resolves it.
+var ErrExtendedXMPConflict = errors.New("jpeg: the XMP to write needs extended XMP of its own, but the file carries extended XMP that is kept")
+
 // ErrIRBDataSizeTooLarge is returned by parseIRBEntry when a 4-byte data-size
 // field in a Photoshop IRB entry names a value that cannot be safely represented
 // as a Go int on the current platform, or that would exceed the containing buffer.

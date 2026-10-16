@@ -795,6 +795,11 @@ func encodeXMP(m *Metadata, fmtID format.FormatID) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("gometadata: encode XMP: %w", err)
 		}
+		// #357: the extended XMP that Read could not merge is carried over
+		// verbatim by the JPEG writer; the frame says which segments.
+		if m.keptExtGUID != nil && fmtID == format.FormatJPEG {
+			return jpeg.EncodeKeptExtended(raw, *m.keptExtGUID), nil
+		}
 		return raw, nil
 	}
 	// The wire-frame encoding (rawXMPWire) carries the original JPEG main APP1

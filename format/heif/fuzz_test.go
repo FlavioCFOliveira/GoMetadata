@@ -313,7 +313,89 @@ func FuzzHEIFInject(f *testing.F) {
 			t.Fatal("Inject returned nil but the output equals the input: the requested metadata was silently dropped")
 		}
 		assertHEIFExtentsWithinBounds(t, out.Bytes())
+
+		// Task #349: Extract and Inject select the same metadata container, so
+		// what Inject stored is what Extract reads back. Two defects outside
+		// task #349, reported separately, are left out of this check: a child
+		// of meta, iinf or iref with a size field of 0, which a reader takes
+		// to include the boxes Inject appends after it, and an iinf box of
+		// version 1, whose 32-bit entry_count parseIinf reads as 16 bits.
+		if hasOpenEndedMetaChild(data) || hasIinfVersion1(data) {
+			return
+		}
+		gotEXIF, _, gotXMP, err := Extract(bytes.NewReader(out.Bytes()))
+		if err != nil {
+			return
+		}
+		if gotEXIF != nil && !bytes.Equal(gotEXIF, rawEXIF) {
+			t.Fatalf("Extract after Inject read EXIF %x, want %x", gotEXIF, rawEXIF)
+		}
+		if gotXMP != nil && !bytes.Equal(gotXMP, rawXMP) {
+			t.Fatalf("Extract after Inject read XMP %q, want %q", gotXMP, rawXMP)
+		}
+		if gotEXIF == nil && gotXMP == nil {
+			t.Fatal("Inject stored EXIF and XMP but Extract of the output reads neither")
+		}
 	})
+}
+
+// hasOpenEndedMetaChild reports whether the selected meta box of file, or its
+// iinf or iref box (the boxes Inject appends children to), has a child box whose
+// 32-bit size field is 0 (ISO/IEC 14496-12 §4.2: the box extends to the end of
+// its container).
+func hasOpenEndedMetaChild(file []byte) bool {
+	_, end, off, ok := findMetaBoxAbs(file)
+	if !ok {
+		return false
+	}
+	content := file[off:end]
+	if openEndedChild(content, 0) {
+		return true
+	}
+	for _, typ := range [][4]byte{boxTypeIinf, boxTypeIref} {
+		if body := findInnerBox(content, typ); len(body) >= 4 {
+			// iinf has an entry count after version/flags (2 bytes in version 0,
+			// 4 otherwise); iref has none.
+			skip := 4
+			if typ == boxTypeIinf {
+				skip += 2
+				if body[0] != 0 {
+					skip += 2
+				}
+			}
+			if skip <= len(body) && openEndedChild(body[skip:], 0) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasIinfVersion1 reports whether the selected meta box of file has an iinf box
+// whose version is not 0.
+func hasIinfVersion1(file []byte) bool {
+	_, end, off, ok := findMetaBoxAbs(file)
+	if !ok {
+		return false
+	}
+	body := findInnerBox(file[off:end], boxTypeIinf)
+	return len(body) > 0 && body[0] != 0
+}
+
+// openEndedChild reports whether a child box of data (a sequence of boxes,
+// starting at from) has a size field of 0.
+func openEndedChild(data []byte, from int) bool {
+	for pos := from; pos+8 <= len(data); {
+		size, _, _, valid := parseHEIFBoxHeader(data, pos)
+		if !valid {
+			return false
+		}
+		if binary.BigEndian.Uint32(data[pos:]) == 0 {
+			return true
+		}
+		pos += int(size) //nolint:gosec // G115: bounded by the slice length
+	}
+	return false
 }
 
 // assertHEIFExtentsWithinBounds parses output's meta/iloc box, if present,

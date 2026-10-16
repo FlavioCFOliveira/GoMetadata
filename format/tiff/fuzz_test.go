@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/trailer"
 )
 
 func FuzzTIFFExtract(f *testing.F) {
@@ -215,6 +216,11 @@ func FuzzTIFFInject(f *testing.F) {
 		[]byte("<xmpmeta/>"),
 	)
 	f.Add(minLE)
+
+	// Seeds (task #354): the same TIFF followed by an AFCP trailer and by a
+	// FotoStation trailer, which Inject rewrites after the image data.
+	f.Add(append(bytes.Clone(minLE), t354AFCP(binary.BigEndian, "AXS!", int64(len(minLE)), [][2]string{{"IPTC", string(t354OldIIM)}})...))
+	f.Add(append(bytes.Clone(minLE), t354Foto(trailer.FotoRecord{Tag: 1, Data: t354OldIIM})...))
 
 	// Seed 2: minimal BE TIFF — exercises big-endian parsing in exif.Parse.
 	minBE := buildMinimalTIFF(binary.BigEndian,

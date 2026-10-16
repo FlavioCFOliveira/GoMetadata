@@ -1323,7 +1323,7 @@ func TestInjectNormalizesConstructionMethod(t *testing.T) {
 	// Verify that the input really does encode construction_method=1.
 	// findBox returns meta box content with version+flags stripped (per its contract).
 	{
-		metaContent, err := findBox(input, boxTypeMeta, 0)
+		metaContent, err := findMetaContent(input)
 		if err != nil || len(metaContent) == 0 {
 			t.Fatalf("setup: meta box not found in synthetic input (err=%v)", err)
 		}
@@ -1346,7 +1346,7 @@ func TestInjectNormalizesConstructionMethod(t *testing.T) {
 	// Parse the output iloc and assert:
 	// 1. construction_method of the XMP item is 0 (file offset).
 	// 2. The extent_offset points at the appended XMP payload.
-	outMetaContent, err := findBox(output, boxTypeMeta, 0)
+	outMetaContent, err := findMetaContent(output)
 	if err != nil || len(outMetaContent) == 0 {
 		t.Fatalf("output: meta box not found (err=%v)", err)
 	}
@@ -1492,7 +1492,7 @@ func TestInjectMultiExtentItemCollapsesToOne(t *testing.T) {
 	data := buildHEIFTwoExtentEXIF(part1, part2)
 
 	// Sanity: the input really does carry 2 extents for the Exif item.
-	metaContent, err := findBox(data, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(data)
 	if err != nil || metaContent == nil {
 		t.Fatalf("setup: meta box not found (err=%v)", err)
 	}
@@ -1508,7 +1508,7 @@ func TestInjectMultiExtentItemCollapsesToOne(t *testing.T) {
 	}
 	output := out.Bytes()
 
-	outMetaContent, err := findBox(output, boxTypeMeta, 0)
+	outMetaContent, err := findMetaContent(output)
 	if err != nil || outMetaContent == nil {
 		t.Fatalf("output: meta box not found (err=%v)", err)
 	}
@@ -1659,7 +1659,7 @@ func TestInjectDuplicateIlocBoxesOffsetInBounds(t *testing.T) {
 	}
 	output := out.Bytes()
 
-	metaContent, err := findBox(output, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(output)
 	if err != nil || metaContent == nil {
 		t.Fatalf("output: meta box not found (err=%v)", err)
 	}
@@ -1799,7 +1799,7 @@ func TestInjectMetaWithTrailingUnparseableBytesOffsetInBounds(t *testing.T) {
 	}
 	output := out.Bytes()
 
-	metaContent, err := findBox(output, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(output)
 	if err != nil || metaContent == nil {
 		t.Fatalf("output: meta box not found (err=%v)", err)
 	}
@@ -1906,13 +1906,13 @@ func TestHEIFSlowPathMemory(t *testing.T) {
 
 	// Verify the file is large enough that meta is beyond 64 KB.
 	const headerWindow = 65536
-	metaData, err := findBox(fileData, boxTypeMeta, 0)
+	metaData, err := findMetaContent(fileData)
 	if err != nil || metaData == nil {
 		t.Fatalf("setup: meta box not found in slow-path synthetic HEIF")
 	}
 	// Confirm the meta box starts after headerWindow by checking that a quick
 	// scan of the first headerWindow bytes does NOT find the meta box.
-	quickMeta, _ := findBox(fileData[:headerWindow], boxTypeMeta, 0)
+	quickMeta, _ := findMetaContent(fileData[:headerWindow])
 	if quickMeta != nil {
 		t.Fatalf("setup: meta box found within first %d bytes — slow path will not be triggered", headerWindow)
 	}

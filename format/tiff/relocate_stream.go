@@ -10,6 +10,7 @@ import (
 	"io"
 
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/trailer"
 )
 
 // resolveFileLen returns the true total length of the original source: when
@@ -71,11 +72,73 @@ func writePassThrough(r io.ReadSeeker, w io.Writer, prefix []byte, wholeFile boo
 //     pooled buffer (iobuf.StreamCopyN) — never buffering the whole file.
 //     r must be seekable and remain valid for the duration of this call.
 //
+// iptc is the IIM written to the IPTC tag, or nil. An AFCP or FotoStation
+// trailer at the end of the source is written after the last block, with its
+// IPTC copy replaced by iptc and its absolute offsets set for its new position
+// (task #354, trailer.Plan); a source without such a trailer is unaffected.
+// Bytes of the source that no IFD addresses are otherwise not carried over.
+//
 // Every block is bounds-checked against the source's true total length
 // (resolveFileLen) before any Seek/Read is attempted, preserving the exact
 // ErrBlockOutOfBounds protection the pre-#291 single-buffer implementation
 // applied via `end > len(base)`.
-func writeRelocated(r io.ReadSeeker, w io.Writer, header []byte, blocks []*imageBlock, prefix []byte, wholeFile bool) error {
+func writeRelocated(r io.ReadSeeker, w io.Writer, header []byte, blocks []*imageBlock, prefix []byte, wholeFile bool, iptc []byte) error {
+	// Task #354: an AFCP or FotoStation trailer after the TIFF data holds an
+	// IPTC copy and absolute offsets, so it is rewritten for its new position
+	// instead of being left behind. A file without such a trailer costs one
+	// 12-byte read at its end.
+	plan, err := planTrailers(r, prefix, wholeFile, blocks, iptc)
+	if err != nil {
+		return err
+	}
+	if len(plan.Spans) == 0 {
+		return writeHeaderAndBlocks(r, w, header, blocks, prefix, wholeFile)
+	}
+	out := &trailer.OutWriter{W: w}
+	if err := writeHeaderAndBlocks(r, out, header, blocks, prefix, wholeFile); err != nil {
+		return err
+	}
+	if err := plan.WriteRegion(out, out); err != nil {
+		return fmt.Errorf("tiff: write trailer: %w", err)
+	}
+	return nil
+}
+
+// planTrailers returns the plan to rewrite the AFCP and FotoStation trailers
+// at the end of the original source; it has no spans when there is none. The
+// trailer must start after every image block the write copies: a candidate that
+// overlaps one is image data that merely looks like a trailer, and is ignored.
+// iptc is the IIM written to the IPTC tag (nil: leave the IPTC copies as they
+// are). The trailers are those of the source (prefix when wholeFile, else r).
+func planTrailers(r io.ReadSeeker, prefix []byte, wholeFile bool, blocks []*imageBlock, iptc []byte) (trailer.Plan, error) {
+	fileLen, err := resolveFileLen(r, prefix, wholeFile)
+	if err != nil {
+		return trailer.Plan{}, err
+	}
+	var region []byte
+	var base int64
+	if wholeFile {
+		region, base, err = trailer.FindTail(trailer.BytesSource(prefix), int64(fileLen)) //nolint:gosec // G115: fileLen is bounded by maxFileSize
+	} else {
+		region, base, err = trailer.FindTail(trailer.ReaderSource{R: r}, int64(fileLen)) //nolint:gosec // G115: fileLen is bounded by maxFileSize
+	}
+	if err != nil {
+		return trailer.Plan{}, fmt.Errorf("tiff: look for trailers: %w", err)
+	}
+	if region == nil {
+		return trailer.Plan{}, nil
+	}
+	for _, blk := range blocks {
+		if blk.srcOffset+blk.size > uint64(base) { //nolint:gosec // G115: base is a non-negative file offset
+			return trailer.Plan{}, nil
+		}
+	}
+	return trailer.PlanFromRegion(region, base, iptc), nil
+}
+
+// writeHeaderAndBlocks writes header and then every block's bytes to w (see
+// writeRelocated).
+func writeHeaderAndBlocks(r io.ReadSeeker, w io.Writer, header []byte, blocks []*imageBlock, prefix []byte, wholeFile bool) error {
 	if _, err := w.Write(header); err != nil {
 		return fmt.Errorf("tiff: write header: %w", err)
 	}

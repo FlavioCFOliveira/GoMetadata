@@ -749,10 +749,27 @@ func rebuildUUIDContent(uuidContent []byte, st cmtStreams, rawXMP []byte) (newCo
 		if !ok {
 			break
 		}
-		b.add(typ, uuidContent[pos:pos+int(size)], int(headerLen)) //nolint:gosec // G115: ISOBMFF box size bounded by file size; headerLen is 8 or 16
-		pos += int(size)                                           //nolint:gosec // G115: ISOBMFF box size bounded by file size
+		b.add(typ, closeOpenEnded(uuidContent[pos:pos+int(size)]), int(headerLen)) //nolint:gosec // G115: ISOBMFF box size bounded by file size; headerLen is 8 or 16
+		pos += int(size)                                                           //nolint:gosec // G115: ISOBMFF box size bounded by file size
 	}
 	return b.finish(), b.hadXMP
+}
+
+// closeOpenEnded returns box with an explicit size when its 32-bit size field
+// is 0. ISO/IEC 14496-12 §4.2: size 0 means "this box extends to the end of
+// its container", which stops being true when rebuildUUIDContent appends a
+// box after it (a new CMT1, CMT2 or CMT4): a reader would read the appended
+// box as part of the open-ended one and the written EXIF would be lost (found
+// by FuzzCR3Inject, task #347). The box is copied, never edited in place: it
+// aliases the caller's moov buffer. A box whose length does not fit 32 bits
+// is returned as is.
+func closeOpenEnded(box []byte) []byte {
+	if binary.BigEndian.Uint32(box) != 0 || uint64(len(box)) > math.MaxUint32 {
+		return box
+	}
+	out := bytes.Clone(box)
+	binary.BigEndian.PutUint32(out, uint32(len(out))) //nolint:gosec // G115: len(out) <= MaxUint32 checked above
+	return out
 }
 
 // uuidRebuild accumulates the output of rebuildUUIDContent.
@@ -1133,8 +1150,10 @@ type boxEdit struct {
 // ErrPreserveUnknownSegmentsNotSupported because CR3 ISOBMFF boxes are
 // structurally mandatory and cannot be selectively stripped.
 //
-// If all payloads are nil, or no moov box is found, the source is streamed
-// through unchanged.
+// A write is never silently skipped: when rawEXIF or rawXMP is non-nil, Inject
+// either stores it or returns an error. ErrNoMetadataContainer reports a file
+// with no moov box, or (for rawEXIF) a moov box with no Canon uuid box. Only
+// when both payloads are nil is the source streamed through unchanged.
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error { //nolint:gocyclo,cyclop // #292: sequential error-checked streaming steps (size cap, pass-through, box locate/rebuild, edit-list reassembly) are inherent in the streaming design; each branch is a distinct, independently-tested failure mode
 	if !preserveUnknownSegments {
 		return ErrPreserveUnknownSegmentsNotSupported
@@ -1150,8 +1169,11 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 		return fmt.Errorf("cr3: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
 	}
 
-	// All payloads nil: no box changes size, so the file is streamed through.
-	if rawEXIF == nil && rawIPTC == nil && rawXMP == nil {
+	// Nothing storable requested (rawIPTC is never stored: CR3 has no IPTC
+	// carrier): no box changes size, so the file is streamed through. Every
+	// other branch below either writes the requested payloads or returns an
+	// error (task #347).
+	if rawEXIF == nil && rawXMP == nil {
 		return streamWholeFile(r, w, fileLen)
 	}
 
@@ -1160,8 +1182,19 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 		return err
 	}
 	if lay.moov == nil {
-		// No moov box — file is corrupt/incomplete. Pass through unchanged.
-		return streamWholeFile(r, w, fileLen)
+		// No moov box: the file has no place to anchor the metadata boxes.
+		return fmt.Errorf("%w: %w", ErrNoMetadataContainer, ErrNoMoovBox)
+	}
+	// EXIF lives only in the CMT sub-boxes of the Canon uuid box in moov
+	// (lclevy canon_cr3). Creating that box is not attempted, so a request
+	// for EXIF on a file without it cannot be honoured: refuse it before any
+	// output is produced, never dropping it silently (task #347; ExifTool
+	// WriteQuickTime.pl likewise reports an error when it cannot write a tag
+	// group). XMP needs no Canon box: it goes to the top-level XMP uuid box.
+	if rawEXIF != nil {
+		if _, _, hasCanon := flatUUIDBoxRange(lay.moov, canonUUID); !hasCanon {
+			return fmt.Errorf("%w: moov has no Canon uuid box", ErrNoMetadataContainer)
+		}
 	}
 
 	st, err := splitEXIF(rawEXIF)

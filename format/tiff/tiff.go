@@ -349,7 +349,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ boo
 	if err != nil {
 		return err
 	}
-	if err := writeRelocated(r, w, header, blocks, base, true); err != nil {
+	if err := writeRelocated(r, w, header, blocks, base, true, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -447,7 +447,7 @@ func InjectWithEXIFStream(r io.ReadSeeker, prefix []byte, wholeFile bool, modifi
 	if err != nil {
 		return err
 	}
-	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -538,7 +538,7 @@ func InjectWithEXIFCR2Stream(r io.ReadSeeker, prefix []byte, wholeFile bool, mod
 		return insertErr
 	}
 
-	if err := writeRelocated(r, w, newHeader, blocks, prefix, wholeFile); err != nil {
+	if err := writeRelocated(r, w, newHeader, blocks, prefix, wholeFile, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -976,7 +976,7 @@ func InjectWithEXIFNEFStream(r io.ReadSeeker, prefix []byte, wholeFile bool, mod
 	if err != nil {
 		return err
 	}
-	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -1029,7 +1029,7 @@ func InjectWithEXIFARWStream(r io.ReadSeeker, prefix []byte, wholeFile bool, mod
 	if err != nil {
 		return err
 	}
-	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -1088,7 +1088,7 @@ func InjectWithEXIFORFStream(r io.ReadSeeker, prefix []byte, wholeFile bool, mod
 	if err != nil {
 		return err
 	}
-	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil
@@ -1146,7 +1146,7 @@ func InjectWithEXIFRW2Stream(r io.ReadSeeker, prefix []byte, wholeFile bool, mod
 	if err != nil {
 		return err
 	}
-	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile); err != nil {
+	if err := writeRelocated(r, w, header, blocks, prefix, wholeFile, rawIPTC); err != nil {
 		return fmt.Errorf("tiff: write updated: %w", err)
 	}
 	return nil

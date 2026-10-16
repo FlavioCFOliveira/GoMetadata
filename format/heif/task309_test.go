@@ -37,7 +37,7 @@ func injectBytes(t *testing.T, src, rawEXIF, rawXMP []byte) []byte {
 // under test through parseIlocFull.
 func itemBytes(t *testing.T, file []byte, id uint16) []byte {
 	t.Helper()
-	metaContent, err := findBox(file, boxTypeMeta, 0)
+	metaContent, err := findMetaContent(file)
 	if err != nil || metaContent == nil {
 		t.Fatalf("meta box not found: %v", err)
 	}
@@ -67,7 +67,7 @@ func itemBytes(t *testing.T, file []byte, id uint16) []byte {
 // referencing item and its targets.
 func cdscTargets(t *testing.T, file []byte) map[uint32][]uint32 {
 	t.Helper()
-	metaContent, _ := findBox(file, boxTypeMeta, 0)
+	metaContent, _ := findMetaContent(file)
 	iref := findInnerBox(metaContent, boxTypeIref)
 	refs := map[uint32][]uint32{}
 	if len(iref) < 4 {
@@ -100,7 +100,7 @@ func cdscTargets(t *testing.T, file []byte) map[uint32][]uint32 {
 // number of infe boxes it holds.
 func iinfEntryCount(t *testing.T, file []byte) (declared, actual int) {
 	t.Helper()
-	metaContent, _ := findBox(file, boxTypeMeta, 0)
+	metaContent, _ := findMetaContent(file)
 	iinf := findInnerBox(metaContent, boxTypeIinf)
 	count, pos, ok := parseIinfItemCount(iinf, iinf[0], 4)
 	if !ok {

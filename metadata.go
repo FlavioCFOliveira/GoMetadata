@@ -168,6 +168,19 @@ type Metadata struct {
 	// same XMP always produces the same bytes.
 	rawXMPWire []byte
 
+	// keptExtGUID is the GUID of the extended XMP segments of a JPEG that the
+	// standard packet links to and that Read could not merge into the XMP
+	// model (an invalid chunk layout, or a document that cannot be merged; a
+	// ParseWarning wraps jpeg.ErrExtendedXMPTruncated). It is empty when the
+	// extended XMP was merged or there is none. When Write encodes m.XMP into a
+	// JPEG, it asks Inject to carry those segments over byte for byte and to
+	// link the standard packet to them, so that a setter write does not drop
+	// data the model cannot hold (task #357; XMP Part 3 §1.1.3.1, pp. 14-15).
+	// It is a pointer so that the common case (nil) keeps Metadata within its
+	// allocation size class: a string field moves it to the next one, which
+	// costs every Read 16 bytes.
+	keptExtGUID *string
+
 	// xmpOpaque is set by Read when the container carried an XMP packet that
 	// the caller cannot edit through the model, because it is not well-formed
 	// XML and so could not be parsed (the reason is in ParseWarnings; task
