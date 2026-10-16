@@ -1,5 +1,7 @@
 # Security Auditor Memory Index
 
+- [v1.5.0 pre-release audit — 2026-10-16, HEAD 3d74da6](audit_20261016_v150_preclearance.md) — BLOCKED (1 CRIT + 5 HIGH + 4 MED); blind fuzz found none, structure-aware generators + amplification probes found all; attack-class lessons for sprints 45/46 rewrite
+
 - [Re-audit of 5 fixes — 2026-07-06 (uncommitted, base 48e6f20)](audit_findings_20260706_reaudit_5fixes.md) — ALL CLOSED, 0 regressions: HEIF-ILOC-EXTENT-AMPLIFICATION (maxIlocItems/maxIlocExtentsPerItem), ORF-DBLWR-01 (cloneEXIF now on all 6 TIFF-family paths), WRITE-OOM-01 (readAllCapped, real infinite-reader PoC bounded ~185ms/0MB), EXIF-BO-002 (21 call sites verified, Encode() output SHA-256 identical pre/post fix for LE+BE), TIFF-OVF-001 (uint64 guard, GOARCH=386 cross-compile clean). GO for production once committed.
 - [Production-readiness verdict — 2026-07-06](production_readiness_20260706.md) — **GO (production-ready)** at HEAD 6a0bbc6. Fresh full-module audit (post-v1.2.0): 5 findings (1 CRIT HEIF-ILOC-OFFBYONE-01, 1 HIGH XMPCONC-01, 2 MED DETECT-SHORTREAD-01/EXIF-BO-001, 1 LOW PERF-201) ALL fixed+gated in 89dac1e & 6a0bbc6; the 7 post-v1.2.0 perf commits certified SOUND (0 regressions); go test -race 21 pkgs PASS, golangci-lint 0, govulncheck clean, fuzz 20 targets ~67M execs 0 crashers.
 
