@@ -2138,16 +2138,101 @@ func (ifd *IFD) Get(tag TagID) *IFDEntry {
 	return nil
 }
 
-// String decodes the entry value as a NUL-terminated string.
-// Handles TypeASCII (TIFF §2, US-ASCII) and TypeUTF8 (type 129, Exif 3.1 §4.6.2,
-// p. 28: UTF-8 encoded Unicode). Both types use element size 1 and NUL termination.
+// String decodes the entry value as a NUL-terminated string: it returns the
+// bytes before the first NUL byte.
+// Handles TypeASCII (TIFF 6.0 §2, p. 15: "ASCII ... 8-bit bytes that store
+// ASCII codes; the last byte must be NUL") and TypeUTF8 (type 129, Exif 3.1
+// §4.6.2, p. 28: UTF-8 encoded Unicode). Both types use element size 1 and
+// NUL termination.
+//
+// Bytes after the first NUL are not part of the first string: they are
+// padding or the further strings of a multi-string value (use Strings), or
+// garbage that a camera left in a fixed-size buffer (Task #386). The raw
+// bytes stay in Value, so Encode never changes. Trailing blanks are kept; they
+// are content, not a terminator.
 func (e *IFDEntry) String() string {
 	if (e.Type != TypeASCII && e.Type != TypeUTF8) || len(e.Value) == 0 {
 		return ""
 	}
-	// bytes.TrimRight avoids a byte-by-byte loop; returns a sub-slice (no allocation).
-	return string(bytes.TrimRight(e.Value, "\x00"))
+	v := e.Value
+	// bytes.IndexByte is vectorised; the slice is a sub-slice (no allocation
+	// before the string conversion).
+	if i := bytes.IndexByte(v, 0); i >= 0 {
+		v = v[:i]
+	}
+	return string(v)
 }
+
+// blanks8 is eight ASCII spaces read as a uint64, whatever the byte order.
+const blanks8 uint64 = 0x2020202020202020
+
+// blankTrimmedString is String with the trailing blanks removed. It is nil-safe
+// (a nil entry gives ""), so accessors can chain it onto IFD.Get.
+//
+// Cameras fill fixed-size text tags (Make, Model, Software, Artist, LensModel)
+// with trailing spaces, and the EXIF specification allows a writer to pad an
+// unknown value with blanks (CIPA DC-008-2026 §4.6.2, ASCII type). ExifTool
+// removes them with s/\s+$// (Exif.pm, tags 0x10F, 0x110, 0x131, 0x13B), so
+// the blanks removed are the Perl \s class: space, \t, \n, \v, \f and \r. The
+// stored bytes are never modified; only the returned string is trimmed
+// (task #401).
+func (e *IFDEntry) blankTrimmedString() string {
+	if e == nil || (e.Type != TypeASCII && e.Type != TypeUTF8) || len(e.Value) == 0 {
+		return ""
+	}
+	v := e.Value
+	if i := bytes.IndexByte(v, 0); i >= 0 {
+		v = v[:i]
+	}
+	return string(v[:trimmedLen(v)])
+}
+
+// trimmedLen returns the length of v without its trailing blanks.
+func trimmedLen(v []byte) int {
+	n := len(v)
+	for n >= 8 && binary.LittleEndian.Uint64(v[n-8:n]) == blanks8 { // eight spaces at once
+		n -= 8
+	}
+	// '\t', '\n', '\v', '\f' and '\r' are the contiguous codes 9 to 13: one
+	// unsigned comparison tests all five, which keeps a long run of padding
+	// cheap (the padded fields are 20 to 32 bytes of blanks).
+	for n > 0 && (v[n-1] == ' ' || v[n-1]-'\t' <= '\r'-'\t') {
+		n--
+	}
+	return n
+}
+
+// Strings decodes the entry value as the list of NUL-separated strings of a
+// multi-string ASCII or UTF-8 value (TIFF 6.0 §2, p. 15: an ASCII field may
+// hold several NUL-terminated strings, its Count covers all of them).
+//
+// The final NUL terminator, and any further trailing NUL padding, is not a
+// separator: "a\x00b\x00" and "a\x00b\x00\x00\x00" both give ["a", "b"].
+// A NUL between two strings that encloses nothing gives an empty string, so
+// positions are kept ("a\x00\x00b\x00" gives ["a", "", "b"]). It returns nil
+// for an entry of another type, an empty value, or a value made of NUL bytes
+// only.
+func (e *IFDEntry) Strings() []string {
+	if (e.Type != TypeASCII && e.Type != TypeUTF8) || len(e.Value) == 0 {
+		return nil
+	}
+	v := bytes.TrimRight(e.Value, "\x00")
+	if len(v) == 0 {
+		return nil
+	}
+	out := make([]string, 0, bytes.Count(v, nulSep)+1)
+	for {
+		i := bytes.IndexByte(v, 0)
+		if i < 0 {
+			return append(out, string(v))
+		}
+		out = append(out, string(v[:i]))
+		v = v[i+1:]
+	}
+}
+
+// nulSep is the one-byte NUL separator used to count the strings of Strings.
+var nulSep = []byte{0} //nolint:gochecknoglobals // immutable sentinel; avoids an allocation per call
 
 // Uint16 decodes the first SHORT (unsigned 16-bit) value.
 // Returns 0 when the entry type is not TypeShort or the value is shorter than

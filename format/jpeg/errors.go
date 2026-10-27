@@ -20,6 +20,11 @@ var ErrInvalidMarkerPrefix = errors.New("jpeg: invalid marker prefix")
 // ErrInvalidMarkerLength is returned when a marker length field is less than 2.
 var ErrInvalidMarkerLength = errors.New("jpeg: marker has invalid length")
 
+// ErrTooManySegments is returned by Inject when the file has more runs of
+// segments to leave out than any real file has (a crafted file whose every
+// other segment is an old metadata segment); nothing is written.
+var ErrTooManySegments = errors.New("jpeg: too many metadata segments to replace")
+
 // ErrSegmentTooLarge is returned when a segment payload would exceed the 65535-byte APP segment limit.
 var ErrSegmentTooLarge = errors.New("jpeg: segment payload exceeds APP segment limit")
 

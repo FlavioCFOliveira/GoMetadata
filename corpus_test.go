@@ -216,6 +216,7 @@ func TestWriteModifyRoundTrip(t *testing.T) {
 		}
 	}
 
+	m.MarkModified(SegmentEXIF) // task #387: the entry was edited through the exported field
 	var out bytes.Buffer
 	if err := Write(bytes.NewReader(jpeg), &out, m); err != nil {
 		t.Fatalf("Write: %v", err)

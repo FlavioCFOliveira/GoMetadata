@@ -252,9 +252,12 @@ func (m *Metadata) exifSubSecOriginal(t time.Time) time.Time {
 // formatted for the type of the Toolkit mapping of the tag; a tag whose type
 // differs from the mapping, or that the Toolkit does not map, is not copied.
 // mirrorToXMP allocates only the strings it stores.
-func (m *Metadata) mirrorToXMP(f reconcile.Field) {
+//
+// It reports whether it wrote a property, that is, whether the XMP changed
+// (task #387).
+func (m *Metadata) mirrorToXMP(f reconcile.Field) (wrote bool) {
 	if m.XMP == nil || m.EXIF == nil {
-		return
+		return false
 	}
 	mp := reconcile.Lookup(f)
 	for i := range mp.XMP {
@@ -272,8 +275,10 @@ func (m *Metadata) mirrorToXMP(f reconcile.Field) {
 		}
 		if v, ok := xmpText(e, tm.Type); ok {
 			m.XMP.Set(p.NS, p.Name, v)
+			wrote = true
 		}
 	}
+	return wrote
 }
 
 // exifEntry returns the entry of tag in the directory ifd of e, or nil.

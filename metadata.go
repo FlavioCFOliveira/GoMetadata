@@ -90,6 +90,10 @@ type Metadata struct {
 	// are not safe for concurrent mutation (see the concurrency contract
 	// above).
 	//
+	// Write encodes a segment only when it was modified. The Set* methods
+	// record what they change; after editing one of these fields directly, call
+	// MarkModified for it, or Write copies the segment from the image unchanged.
+	//
 	// The entry values of EXIF (exif.IFDEntry.Value, EXIF.MakerNote) are
 	// zero-copy views of the raw EXIF bytes that Read retains and that Write
 	// uses as the source of everything it copies from the original file
@@ -113,10 +117,14 @@ type Metadata struct {
 
 	// unexported: detected container format and original raw segments
 	// retained so round-trip writes can reconstruct the file correctly.
-	format  uint8
-	rawEXIF []byte
-	rawIPTC []byte
-	rawXMP  []byte
+	format uint8
+	// modified is the set of segments that the Set* methods and MarkModified
+	// recorded as changed since Read (task #387). Guarded by mu. Write encodes
+	// only these segments and copies the others from the source image.
+	modified Segment
+	rawEXIF  []byte
+	rawIPTC  []byte
+	rawXMP   []byte
 
 	// rawEXIFIsWholeFile is true when rawEXIF, as extracted by Read, happens
 	// to equal the ENTIRE source file rather than just a metadata prefix.
@@ -215,6 +223,81 @@ type Metadata struct {
 	// nil and iptcTrustElev correctly keeps its zero value (false), matching
 	// computeIPTCTrustElevated's own nil-digest fast path exactly.
 	iptcTrustElev bool
+}
+
+// Segment names one of the three metadata segments of an image. Segment values
+// are bit flags that can be combined with |.
+type Segment uint8
+
+// The metadata segments of an image (see Metadata.MarkModified).
+const (
+	// SegmentEXIF is the EXIF metadata, Metadata.EXIF.
+	SegmentEXIF Segment = 1 << iota
+	// SegmentIPTC is the IPTC metadata, Metadata.IPTC.
+	SegmentIPTC
+	// SegmentXMP is the XMP metadata, Metadata.XMP.
+	SegmentXMP
+)
+
+// segmentAll is every Segment.
+const segmentAll = SegmentEXIF | SegmentIPTC | SegmentXMP
+
+// MarkModified records that the given segments were changed by editing the
+// exported fields EXIF, IPTC or XMP directly, so that Write encodes them.
+//
+// Write encodes only the segments that were modified and copies every other
+// metadata segment from the image it writes, byte for byte (task #387). The Set*
+// methods mark the segments they change on their own. An edit made through the
+// fields (for example m.IPTC.AddKeyword("x"), or assigning a new *exif.EXIF)
+// is not seen by Write until the segment is marked:
+//
+//	m.IPTC.AddKeyword("sunset")
+//	m.MarkModified(gometadata.SegmentIPTC)
+//
+// A segment that the Metadata holds but the image does not (a new EXIF created
+// by assigning m.EXIF, with no EXIF in the image read) is always written, with
+// or without a mark. A segment that is marked but nil is left as the image has
+// it: MarkModified does not remove a segment. Marking a segment that was not
+// edited is harmless: the segment is re-encoded from the parsed values, which
+// can change its bytes without changing its content.
+//
+// Metadata moved to another image is the one case in which Write ignores the
+// marks: when the image written is not the image that m was read from, every
+// segment of m is written, so that the metadata of one file can be copied to
+// another with Read and Write alone.
+//
+// MarkModified is safe for concurrent use with the Set* methods.
+func (m *Metadata) MarkModified(segments ...Segment) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, s := range segments {
+		m.modified |= s & segmentAll
+	}
+}
+
+// touch records the segments of s that m holds as modified. The caller holds
+// m.mu. A setter calls it after its ensure* calls, with the segments it writes
+// to: a segment that does not exist (the format cannot carry it) was not
+// touched.
+func (m *Metadata) touch(s Segment) {
+	if m.EXIF == nil {
+		s &^= SegmentEXIF
+	}
+	if m.IPTC == nil {
+		s &^= SegmentIPTC
+	}
+	if m.XMP == nil {
+		s &^= SegmentXMP
+	}
+	m.modified |= s
+}
+
+// mirrorAndTouch is mirrorToXMP that records the XMP as modified when it wrote
+// to it. The caller holds m.mu.
+func (m *Metadata) mirrorAndTouch(f reconcile.Field) {
+	if m.mirrorToXMP(f) {
+		m.modified |= SegmentXMP
+	}
 }
 
 // Format returns the detected container format ID of the image.
@@ -576,14 +659,13 @@ func (m *Metadata) Keywords() []string {
 	return m.resolveKeywords()
 }
 
-// Make returns the camera manufacturer string.
+// Make returns the camera manufacturer string. Trailing blanks of the EXIF
+// value are removed, as ExifTool does; a value of only blanks counts as absent.
 // Source priority: EXIF > XMP (tiff:Make).
 func (m *Metadata) Make() string {
-	if m.EXIF != nil && m.EXIF.IFD0 != nil {
-		if e := m.EXIF.IFD0.Get(exif.TagMake); e != nil {
-			if v := e.String(); v != "" {
-				return v
-			}
+	if m.EXIF != nil {
+		if v := m.EXIF.Make(); v != "" {
+			return v
 		}
 	}
 	if m.XMP != nil {
@@ -593,13 +675,13 @@ func (m *Metadata) Make() string {
 }
 
 // Software returns the software / firmware string used to produce the image.
+// Trailing blanks of the EXIF value are removed, as ExifTool does; a value of
+// only blanks counts as absent.
 // Source priority: EXIF > XMP (xmp:CreatorTool).
 func (m *Metadata) Software() string {
-	if m.EXIF != nil && m.EXIF.IFD0 != nil {
-		if e := m.EXIF.IFD0.Get(exif.TagSoftware); e != nil {
-			if v := e.String(); v != "" {
-				return v
-			}
+	if m.EXIF != nil {
+		if v := m.EXIF.Software(); v != "" {
+			return v
 		}
 	}
 	if m.XMP != nil {
@@ -667,22 +749,9 @@ func (m *Metadata) ExposureMode() (uint16, bool) {
 // (negative) sea level from the GPS IFD (EXIF §4.6.6 tags 0x0005/0x0006).
 // ok is false when not present.
 func (m *Metadata) Altitude() (float64, bool) {
-	if m.EXIF == nil || m.EXIF.GPSIFD == nil {
-		return 0, false
-	}
-	altEntry := m.EXIF.GPSIFD.Get(exif.TagGPSAltitude)
-	if altEntry == nil {
-		return 0, false
-	}
-	r := altEntry.Rational(0)
-	if r[1] == 0 {
-		return 0, false
-	}
-	alt := float64(r[0]) / float64(r[1])
-	if ref := m.EXIF.GPSIFD.Get(exif.TagGPSAltitudeRef); ref != nil && len(ref.Value) > 0 && ref.Value[0] == 1 {
-		alt = -alt
-	}
-	return alt, true
+	// Task #385: the exif package decodes RATIONAL and the SRATIONAL variant
+	// some cameras write.
+	return m.EXIF.GPSAltitude()
 }
 
 // SubjectDistance returns the distance to the subject in metres from ExifIFD
@@ -915,6 +984,7 @@ func (m *Metadata) SetCaption(s string) {
 	m.ensureEXIF()
 	m.ensureIPTC()
 	m.ensureXMP()
+	m.touch(SegmentEXIF | SegmentIPTC | SegmentXMP)
 	if m.EXIF != nil {
 		m.EXIF.SetCaption(s)
 	}
@@ -935,6 +1005,7 @@ func (m *Metadata) SetCopyright(s string) {
 	m.ensureEXIF()
 	m.ensureIPTC()
 	m.ensureXMP()
+	m.touch(SegmentEXIF | SegmentIPTC | SegmentXMP)
 	if m.EXIF != nil {
 		m.EXIF.SetCopyright(s)
 	}
@@ -962,6 +1033,7 @@ func (m *Metadata) SetCreator(s string) {
 	m.ensureEXIF()
 	m.ensureIPTC()
 	m.ensureXMP()
+	m.touch(SegmentEXIF | SegmentIPTC | SegmentXMP)
 	one := [1]string{s}
 	if m.EXIF != nil {
 		m.EXIF.SetCreator(reconcile.JoinArtist(one[:]))
@@ -993,6 +1065,7 @@ func (m *Metadata) SetCreators(creators []string) {
 	m.ensureEXIF()
 	m.ensureIPTC()
 	m.ensureXMP()
+	m.touch(SegmentEXIF | SegmentIPTC | SegmentXMP)
 	if m.EXIF != nil {
 		if len(creators) > 0 {
 			m.EXIF.SetCreator(reconcile.JoinArtist(creators))
@@ -1015,6 +1088,7 @@ func (m *Metadata) SetCameraModel(s string) {
 	defer m.mu.Unlock()
 	m.ensureEXIF()
 	m.ensureXMP()
+	m.touch(SegmentEXIF | SegmentXMP)
 	if m.EXIF != nil {
 		m.EXIF.SetCameraModel(s)
 	}
@@ -1031,6 +1105,7 @@ func (m *Metadata) SetGPS(lat, lon float64) {
 	defer m.mu.Unlock()
 	m.ensureEXIF()
 	m.ensureXMP()
+	m.touch(SegmentEXIF | SegmentXMP)
 	if m.EXIF != nil {
 		m.EXIF.SetGPS(lat, lon)
 	}
@@ -1050,6 +1125,7 @@ func (m *Metadata) SetKeywords(kws []string) {
 	defer m.mu.Unlock()
 	m.ensureIPTC()
 	m.ensureXMP()
+	m.touch(SegmentIPTC | SegmentXMP)
 	if m.IPTC != nil {
 		m.IPTC.SetKeywords(kws)
 	}
@@ -1067,13 +1143,14 @@ func (m *Metadata) SetLensModel(s string) {
 	defer m.mu.Unlock()
 	m.ensureEXIF()
 	m.ensureXMP()
+	m.touch(SegmentEXIF | SegmentXMP)
 	if m.EXIF != nil {
 		m.EXIF.SetLensModel(s)
 	}
 	if m.XMP != nil {
 		m.XMP.SetLensModel(s)
 	}
-	m.mirrorToXMP(reconcile.LensModel)
+	m.mirrorAndTouch(reconcile.LensModel)
 }
 
 // SetMake writes s to EXIF (0x010F Make), and to XMP tiff:Make when the XMP
@@ -1084,8 +1161,9 @@ func (m *Metadata) SetMake(s string) {
 	defer m.mu.Unlock()
 	m.ensureEXIF()
 	if m.EXIF != nil {
+		m.touch(SegmentEXIF)
 		m.EXIF.SetMake(s)
-		m.mirrorToXMP(reconcile.Make)
+		m.mirrorAndTouch(reconcile.Make)
 	}
 }
 
@@ -1125,6 +1203,7 @@ func (m *Metadata) SetDateTimeOriginal(t time.Time) {
 	m.ensureEXIF()
 	m.ensureIPTC()
 	m.ensureXMP()
+	m.touch(SegmentEXIF | SegmentIPTC | SegmentXMP)
 	if m.EXIF != nil {
 		m.EXIF.SetDateTimeOriginal(t)
 	}
@@ -1145,8 +1224,9 @@ func (m *Metadata) SetExposureTime(num, den uint32) {
 	defer m.mu.Unlock()
 	m.ensureEXIF()
 	if m.EXIF != nil {
+		m.touch(SegmentEXIF)
 		m.EXIF.SetExposureTime(num, den)
-		m.mirrorToXMP(reconcile.ExposureTime)
+		m.mirrorAndTouch(reconcile.ExposureTime)
 	}
 }
 
@@ -1158,8 +1238,9 @@ func (m *Metadata) SetFNumber(f float64) {
 	defer m.mu.Unlock()
 	m.ensureEXIF()
 	if m.EXIF != nil {
+		m.touch(SegmentEXIF)
 		m.EXIF.SetFNumber(f)
-		m.mirrorToXMP(reconcile.FNumber)
+		m.mirrorAndTouch(reconcile.FNumber)
 	}
 }
 
@@ -1172,8 +1253,9 @@ func (m *Metadata) SetISO(iso uint) {
 	defer m.mu.Unlock()
 	m.ensureEXIF()
 	if m.EXIF != nil {
+		m.touch(SegmentEXIF)
 		m.EXIF.SetISO(iso)
-		m.mirrorToXMP(reconcile.ISO)
+		m.mirrorAndTouch(reconcile.ISO)
 	}
 }
 
@@ -1185,8 +1267,9 @@ func (m *Metadata) SetFocalLength(mm float64) {
 	defer m.mu.Unlock()
 	m.ensureEXIF()
 	if m.EXIF != nil {
+		m.touch(SegmentEXIF)
 		m.EXIF.SetFocalLength(mm)
-		m.mirrorToXMP(reconcile.FocalLength)
+		m.mirrorAndTouch(reconcile.FocalLength)
 	}
 }
 
@@ -1199,8 +1282,9 @@ func (m *Metadata) SetOrientation(v uint16) {
 	defer m.mu.Unlock()
 	m.ensureEXIF()
 	if m.EXIF != nil {
+		m.touch(SegmentEXIF)
 		m.EXIF.SetOrientation(v)
-		m.mirrorToXMP(reconcile.Orientation)
+		m.mirrorAndTouch(reconcile.Orientation)
 	}
 }
 
@@ -1213,8 +1297,9 @@ func (m *Metadata) SetImageSize(width, height uint32) {
 	defer m.mu.Unlock()
 	m.ensureEXIF()
 	if m.EXIF != nil {
+		m.touch(SegmentEXIF)
 		m.EXIF.SetImageSize(width, height)
-		m.mirrorToXMP(reconcile.PixelXDimension)
-		m.mirrorToXMP(reconcile.PixelYDimension)
+		m.mirrorAndTouch(reconcile.PixelXDimension)
+		m.mirrorAndTouch(reconcile.PixelYDimension)
 	}
 }

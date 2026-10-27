@@ -148,27 +148,3 @@ func scanForEOI(r io.ReadSeeker) (int64, error) {
 		}
 	}
 }
-
-// writeSOSTrailers is writeSOS for a JPEG with trailers to rewrite: it copies
-// the compressed data up to the end of the image, then writes the region after
-// EOI with each trailer of plan replaced by its rewritten bytes (the bytes
-// between and after them are copied as they are). w must be the writer that
-// counts the output (out), which has seen every byte of the output so far.
-func writeSOSTrailers(r io.ReadSeeker, w io.Writer, out *trailer.OutWriter, data []byte, plan *trailer.Plan) error {
-	if err := writeSegmentCopy(w, markerSOS, data); err != nil {
-		return err
-	}
-	pos, err := r.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return fmt.Errorf("jpeg: seek: %w", err)
-	}
-	if n := plan.Base - pos; n > 0 {
-		if err := iobuf.StreamCopyN(r, w, n); err != nil {
-			return fmt.Errorf("jpeg: copy image data: %w", err)
-		}
-	}
-	if err := plan.WriteRegion(w, out); err != nil {
-		return fmt.Errorf("jpeg: write trailers: %w", err)
-	}
-	return nil
-}

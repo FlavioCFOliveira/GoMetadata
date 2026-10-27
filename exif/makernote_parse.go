@@ -85,7 +85,7 @@ func parseMakerNoteIFD(b []byte, cameraMake string, parentOrder binary.ByteOrder
 // (*IFDEntry).String() would incur.
 //
 // Trim semantics are byte-for-byte equivalent to the string-based path:
-//   - bytes.TrimRight(makeValue, "\x00")  ≡ (*IFDEntry).String()'s NUL stripping
+//   - the cut at the first NUL byte        ≡ (*IFDEntry).String()'s NUL termination
 //   - bytes.TrimSpace(…)                  ≡ strings.TrimSpace applied inside parseMakerNoteIFD
 //
 // Detection (detectMakerNote) works on the []byte directly through generic
@@ -129,12 +129,15 @@ func makerNoteDispatchAt(makeValue []byte, parentOrder binary.ByteOrder, makerNo
 	return parse(makerNoteView(l, makerNote, tiff, mnOff), parentOrder)
 }
 
-// trimMake strips the trailing NUL bytes of a raw Make value (matching
-// (*IFDEntry).String()) and then surrounding ASCII whitespace (matching
-// strings.TrimSpace in parseMakerNoteIFD; Canon EOS bodies emit "Canon ").
-// Both steps return sub-slices: nothing is allocated.
+// trimMake cuts a raw Make value at its first NUL byte (matching
+// (*IFDEntry).String(), Task #386) and then strips surrounding ASCII
+// whitespace (matching strings.TrimSpace in parseMakerNoteIFD; Canon EOS
+// bodies emit "Canon "). Both steps return sub-slices: nothing is allocated.
 func trimMake(makeValue []byte) []byte {
-	return bytes.TrimSpace(bytes.TrimRight(makeValue, "\x00"))
+	if i := bytes.IndexByte(makeValue, 0); i >= 0 {
+		makeValue = makeValue[:i]
+	}
+	return bytes.TrimSpace(makeValue)
 }
 
 // makerNoteView returns the view layout l parses: the TIFF stream as base for

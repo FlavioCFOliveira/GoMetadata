@@ -1,6 +1,7 @@
 package jpeg
 
 import (
+	"fmt"
 	"io"
 	"sync"
 )
@@ -184,6 +185,39 @@ func (c *countingReader) Seek(offset int64, whence int) (int64, error) {
 	// implements the io.Seeker contract and must preserve the underlying
 	// error's identity for callers that compare it directly.
 	return pos, err //nolint:wrapcheck // io.Seeker contract: preserve underlying error identity
+}
+
+// skip moves the position of the wrapped reader by n bytes, forward or back,
+// without reading them, and counts the distance in the budget as if the bytes
+// had been read (a pass that skips the payload of a segment is bounded by
+// maxFileSize like one that reads it; a move back gives the bytes back). Unlike
+// Seek it does not reset the budget.
+func (c *countingReader) skip(n int64) error {
+	if n == 0 {
+		return nil
+	}
+	if c.exceeded && n > 0 {
+		return ErrFileTooLarge
+	}
+	if _, err := c.r.Seek(n, io.SeekCurrent); err != nil {
+		return fmt.Errorf("jpeg: seek: %w", err)
+	}
+	c.n = max(c.n+n, 0)
+	if c.n > maxFileSize {
+		c.exceeded = true
+		return ErrFileTooLarge
+	}
+	return nil
+}
+
+// rewindTo moves the wrapped reader to the absolute offset pos without
+// resetting the budget (see skip); it is used after a failed read, where the
+// position is not known to the caller.
+func (c *countingReader) rewindTo(pos int64) error {
+	if _, err := c.r.Seek(pos, io.SeekStart); err != nil {
+		return fmt.Errorf("jpeg: seek: %w", err)
+	}
+	return nil
 }
 
 // countingReaderPool recycles *countingReader values across Extract/Inject

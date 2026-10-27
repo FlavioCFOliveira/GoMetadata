@@ -100,8 +100,17 @@ libtiff.gitlab.io/libtiff/specification/bigtiff.html. First stable libtiff impl:
 
 — TIFF 6.0 §2 (1–12), TIFF Tech Note 1 (13), Exif 3.1 §4.6.2 p. 28 (129), BigTIFF (16–18). Unknown type
 code MUST be skipped/preserved (treat 4 value bytes as raw, never dereference). 
-- **S-19** RATIONAL = two u32 (num/den); SRATIONAL = two i32. Denominator 0 must not divide/crash.
-- **S-20** ASCII MUST be NUL-terminated; count includes NUL; parser strips trailing NUL.
+- **S-19** RATIONAL = two u32 (num/den); SRATIONAL = two i32. Denominator 0 must not divide/crash. A GPS RATIONAL or SRATIONAL
+  value (latitude, longitude, altitude, time stamp) with a zero denominator is not a number (TIFF 6.0 §2, p. 15: the quotient of
+  two LONGs): the value is reported as absent (`GPS()`, `GPSAltitude()`, `GPSTimeStamp()` return ok=false) and `Parse` adds a
+  warning naming the tag (task #402). `TestGPSZeroDenominator`, `TestGPSZeroDenominatorAltitudeAndTime`,
+  `TestTask402_Corpus_GPSMatchesExifTool`, `FuzzGPSDecode`.
+- **S-20** ASCII MUST be NUL-terminated; count includes NUL; parser strips trailing NUL. The accessors of the text tags that
+  cameras pad with blanks (Make, Model, Software, Artist, LensModel; `EXIF.Make`, `CameraModel`, `Software`, `Creator`,
+  `LensModel`) end the value at the first NUL and remove trailing blanks (space, tab, newline, vertical tab, form feed, carriage
+  return), as ExifTool does (`Exif.pm`, tags `0x10F`, `0x110`, `0x131`, `0x13B`: `s/\s+$//`); the stored bytes are not changed,
+  and `Caption` (ImageDescription) and `Copyright` keep their blanks (task #401). `TestBlankTrimmedText`,
+  `TestTask401_Corpus_TextTagsMatchExifTool` (4035 values compared with `exiftool -G1`, no mismatch).
 - **S-21 (Exif 3.0/3.1, task #320)** UTF-8 is type **129**: NUL-terminated UTF-8, element size 1, the count is the
   bytes including the NUL (Exif 3.1 §4.6.2, p. 28). An entry of type 129 parses as a string and the entry keeps
   its type and bytes. Type 13 is the 4-byte IFD type on every tag (TIFF Tech Note 1), never a string; an Exif-2.x

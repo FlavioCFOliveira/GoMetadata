@@ -569,7 +569,7 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 
 		// task #200: materialise all deferred warn records into []string ONCE here.
 		// On clean files warnRecs is nil so this is a nil-check + return nil (zero cost).
-		e.Warnings = materializeWarnings(warnRecs)
+		e.Warnings = append(materializeWarnings(warnRecs), gpsDeviationWarnings(e.GPSIFD)...)
 		if cfg.thumbStrips && ifd0.Next != nil {
 			attachThumbnailStrips(b, e, cfg.aliasThumbnail)
 		}
@@ -623,7 +623,7 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 		}
 
 		// task #200: materialise all deferred warn records into []string ONCE here.
-		e.Warnings = materializeWarnings(warnRecs)
+		e.Warnings = append(materializeWarnings(warnRecs), gpsDeviationWarnings(e.GPSIFD)...)
 		if cfg.thumbStrips && ifd0.Next != nil {
 			attachThumbnailStrips(b, e, cfg.aliasThumbnail)
 		}
@@ -732,15 +732,38 @@ func ParseIFDAt(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint32, 
 }
 
 // CameraModel returns the value of IFD0 tag 0x0110 (Model, EXIF §4.6.4 Table 3).
+//
+// The value ends at the first NUL byte and trailing blanks are removed: cameras
+// pad the fixed-size Model field with spaces ("DSC-HX9V" followed by blanks and
+// NUL bytes), and ExifTool removes trailing blanks from Make and Model the same
+// way (Exif.pm, tag 0x110 RawConv). Tasks #386 and #401.
 func (e *EXIF) CameraModel() string {
 	if e == nil {
 		return ""
 	}
-	entry := e.IFD0.Get(TagModel)
-	if entry == nil {
+	return e.IFD0.Get(TagModel).blankTrimmedString()
+}
+
+// Make returns the value of IFD0 tag 0x010F (Make, EXIF §4.6.4 Table 3), the
+// camera manufacturer. The value ends at the first NUL byte and trailing
+// blanks are removed, as CameraModel does (ExifTool Exif.pm, tag 0x10F
+// RawConv). The stored bytes are not modified. Task #401.
+func (e *EXIF) Make() string {
+	if e == nil {
 		return ""
 	}
-	return entry.String()
+	return e.IFD0.Get(TagMake).blankTrimmedString()
+}
+
+// Software returns the value of IFD0 tag 0x0131 (Software, EXIF §4.6.4
+// Table 3). The value ends at the first NUL byte and trailing blanks are
+// removed, as CameraModel does (ExifTool Exif.pm, tag 0x131 RawConv). The
+// stored bytes are not modified. Task #401.
+func (e *EXIF) Software() string {
+	if e == nil {
+		return ""
+	}
+	return e.IFD0.Get(TagSoftware).blankTrimmedString()
 }
 
 // GPS returns decimal-degree coordinates from the GPS IFD.
@@ -749,6 +772,26 @@ func (e *EXIF) GPS() (lat, lon float64, ok bool) {
 		return 0, 0, false
 	}
 	return parseGPS(e.GPSIFD)
+}
+
+// GPSAltitude returns the GPS altitude in metres: positive above and negative
+// below sea level (GPSAltitudeRef 1), EXIF §4.6.6 tags 0x0005/0x0006. ok is
+// false when the altitude is absent or invalid (see decodeGPSRational).
+func (e *EXIF) GPSAltitude() (metres float64, ok bool) {
+	if e == nil || e.GPSIFD == nil {
+		return 0, false
+	}
+	return parseGPSAltitude(e.GPSIFD)
+}
+
+// GPSTimeStamp returns the UTC time of day of the GPS fix (GPSTimeStamp, EXIF
+// §4.6.6 tag 0x0007: hour, minute and second). ok is false when the tag is
+// absent or invalid (see decodeGPSRational).
+func (e *EXIF) GPSTimeStamp() (hour, minute, second float64, ok bool) {
+	if e == nil || e.GPSIFD == nil {
+		return 0, 0, 0, false
+	}
+	return parseGPSTimeStamp(e.GPSIFD)
 }
 
 // Copyright returns the value of IFD0 tag 0x8298 (Copyright, EXIF §4.6.4 Table 3).
@@ -882,16 +925,13 @@ func (e *EXIF) FocalLength() (float64, bool) {
 }
 
 // LensModel returns the lens model string from ExifIFD tag 0xA434
-// (LensModel, EXIF §4.6.5). Returns an empty string when not present.
+// (LensModel, EXIF §4.6.5). Returns an empty string when not present. The value
+// ends at the first NUL byte and trailing blanks are removed (task #401).
 func (e *EXIF) LensModel() string {
 	if e == nil || e.ExifIFD == nil {
 		return ""
 	}
-	entry := e.ExifIFD.Get(TagLensModel)
-	if entry == nil {
-		return ""
-	}
-	return entry.String()
+	return e.ExifIFD.Get(TagLensModel).blankTrimmedString()
 }
 
 // Orientation returns the image orientation from IFD0 tag 0x0112
@@ -999,16 +1039,14 @@ func (e *EXIF) XPKeywords() string { return e.xpTagString(TagXPKeywords) }
 func (e *EXIF) XPSubject() string { return e.xpTagString(TagXPSubject) }
 
 // Creator returns the artist / creator string from IFD0 tag 0x013B
-// (Artist, EXIF §4.6.4 Table 3).
+// (Artist, EXIF §4.6.4 Table 3). The value ends at the first NUL byte and
+// trailing blanks are removed, as ExifTool does (Exif.pm, tag 0x13B RawConv;
+// task #401).
 func (e *EXIF) Creator() string {
 	if e == nil {
 		return ""
 	}
-	entry := e.IFD0.Get(TagArtist)
-	if entry == nil {
-		return ""
-	}
-	return entry.String()
+	return e.IFD0.Get(TagArtist).blankTrimmedString()
 }
 
 // ---------------------------------------------------------------------------

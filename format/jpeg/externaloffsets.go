@@ -13,14 +13,16 @@ package jpeg
 //
 // Inject writes the new metadata segments before it copies the rest of the
 // file, so it must know the movement of the image data before it writes the
-// EXIF. measureShift reads the segments before the first scan once, as the
-// main pass does, and counts what the new metadata segments take; everything
-// from the end of the scan header on is copied unchanged (the trailers that
-// internal/trailer rewrites are accounted for from their plan), so one number,
-// the difference between the position of the end of the scan header in the
-// output and in the source, is the movement of every byte after it. The same
-// pass records where the old EXIF stream was, so the position the preview had
-// in the source is known: the old MakerNote position plus the stored offset.
+// EXIF. measureShift takes the steps of the write (splice.go: the segments
+// that are put in and the runs that are left out) and counts what the new
+// metadata segments take; everything from the end of the scan header on is
+// copied unchanged (the trailers that internal/trailer rewrites are accounted
+// for from their plan), so one number, the difference between the position of
+// the end of the scan header in the output and in the source, is the movement
+// of every byte after it. The position of the new EXIF stream in the output
+// follows from the same steps, and the position of the old one, which the scan
+// records, tells where the preview was in the source: the old MakerNote
+// position plus the stored offset.
 // Only streams that hold such an offset pay for this: exif.ExternalOffsets
 // answers nil for every other stream after one search of the stream.
 //
@@ -31,7 +33,7 @@ package jpeg
 //     the MakerNote;
 //   - bytes of a segment before the first scan header that the write copies (an
 //     APPn segment): the offset follows the segment, whose new position
-//     measureShift records;
+//     shiftInfo.movedHeader computes;
 //   - a JPEG stream (the SOI marker) after the first scan header and inside the
 //     file: the bytes there are copied as they are and move by the difference of
 //     the positions of the end of the scan header, plus the growth of every
@@ -43,7 +45,6 @@ package jpeg
 // trailer that is rewritten, and bytes outside the file.
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -53,9 +54,10 @@ import (
 	"github.com/FlavioCFOliveira/GoMetadata/internal/trailer"
 )
 
-// newEXIFTIFFPos is the position of the TIFF header of the EXIF that Inject
-// writes: SOI (2), then the APP1 marker (2), its length (2) and "Exif\0\0" (6).
-const newEXIFTIFFPos = 2 + 4 + len("Exif\x00\x00")
+// exifTIFFOffset is the offset of the TIFF header of an EXIF stream from the
+// start of the APP1 segment that holds it: the marker (2), the length (2) and
+// "Exif\0\0" (6).
+const exifTIFFOffset int64 = 4 + int64(len("Exif\x00\x00"))
 
 // countWriter counts the bytes written to it.
 type countWriter struct{ n int64 }
@@ -70,34 +72,41 @@ func (c *countWriter) Write(p []byte) (int, error) {
 type shiftInfo struct {
 	sosEnd int64 // position in the source of the end of the first scan header
 	delta  int64 // position in the output minus position in the source of that point
-	// kept are the segments before the first scan header that the write copies
-	// unchanged, with their position in the output.
-	kept []keptSegment
+	// steps are the steps of the write before the first scan header, each with
+	// the number of bytes it puts in the output: a segment put in (off == end)
+	// or a run of the source left out.
+	steps []shiftStep
+	// newTIFFPos is the position in the output of the TIFF header of the EXIF
+	// stream that the write puts in.
+	newTIFFPos int64
 	// oldTIFF is the EXIF stream of the source (the first EXIF APP1 segment),
 	// and oldTIFFPos the position in the source of its first byte.
 	oldTIFF    []byte
 	oldTIFFPos int64
 }
 
-// keptSegment is a segment of the source (marker, length and data: positions
-// [src, end)) that the write copies unchanged to position out of the output.
-type keptSegment struct{ src, end, out int64 }
+// shiftStep is a step of the write: the segments of one kind put in at offset
+// off of the source with n bytes (off == end), or, for kindNone, the run
+// [off, end) left out.
+type shiftStep struct {
+	off, end int64
+	n        int64
+	kind     segKind
+}
 
 // shiftExternalOffsets returns rawEXIF with the MakerNote offsets that address
 // data outside the EXIF stream (exif.ExternalOffsets) rewritten for the
 // position the MakerNote and the data have in the output of Inject, or rawEXIF
 // itself when it holds none, or none that can be resolved. rawEXIF is never
 // modified. cr is left at the start of the file.
-func shiftExternalOffsets(cr io.ReadSeeker, scratch *[]byte, rawEXIF, rawIPTC, rawXMP, origIRB []byte, preserveUnknownSegments bool, keepGUID string, plan *trailer.Plan) ([]byte, error) {
+func shiftExternalOffsets(cr io.ReadSeeker, scratch *[]byte, sp *splicePlan, pl *payloads, plan *trailer.Plan) ([]byte, error) {
+	rawEXIF := pl.rawEXIF
 	offs := exif.ExternalOffsets(rawEXIF)
 	if len(offs) == 0 {
 		return rawEXIF, nil
 	}
-	size, err := cr.Seek(0, io.SeekEnd)
-	if err != nil {
-		return nil, fmt.Errorf("jpeg: seek: %w", err)
-	}
-	info, ok, err := measureShift(cr, scratch, rawEXIF, rawIPTC, rawXMP, origIRB, preserveUnknownSegments, keepGUID)
+	size := sp.size
+	info, ok, err := measureShift(cr, sp, pl)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +157,7 @@ func seekStart(r io.Seeker) error {
 // the data cannot be placed (see the top of this file).
 func (s *shiftInfo) newValue(cr io.ReadSeeker, scratch *[]byte, old, o exif.ExternalOffset, size int64, plan *trailer.Plan) (uint32, bool) {
 	q, ok := s.outputPosition(cr, scratch, old, o, size, plan)
-	nv := q - (int64(newEXIFTIFFPos) + int64(o.Base)) // counted from the byte the new stream counts from
+	nv := q - (s.newTIFFPos + int64(o.Base)) // counted from the byte the new stream counts from
 	if !ok || nv < 0 || nv > math.MaxUint32 {
 		return 0, false
 	}
@@ -164,7 +173,7 @@ func (s *shiftInfo) outputPosition(cr io.ReadSeeker, scratch *[]byte, old, o exi
 	switch {
 	case rel >= int64(old.MNStart) && rel+n <= int64(old.MNStart)+int64(old.MNLen):
 		// Inside the MakerNote: it is copied as it is to the new stream.
-		return int64(newEXIFTIFFPos) + int64(o.MNStart) + (rel - int64(old.MNStart)), true
+		return s.newTIFFPos + int64(o.MNStart) + (rel - int64(old.MNStart)), true
 	case rel >= 0 && rel < int64(len(s.oldTIFF)):
 		return 0, false // the EXIF stream outside the MakerNote is encoded again
 	case p < s.sosEnd:
@@ -176,13 +185,27 @@ func (s *shiftInfo) outputPosition(cr io.ReadSeeker, scratch *[]byte, old, o exi
 }
 
 // movedHeader returns the position in the output of the n bytes at position p of
-// the source, when they lie inside one segment before the first scan header that
-// the write copies unchanged.
+// the source, when they lie before the first scan header and the write copies
+// them as one piece: no run left out touches them and no segment is put in
+// between them. It replays the steps as writeSplice does.
 func (s *shiftInfo) movedHeader(p, n int64) (int64, bool) {
-	for _, k := range s.kept {
-		if p >= k.src && p+n <= k.end {
-			return k.out + (p - k.src), true
+	cursor, out := int64(0), int64(0)
+	for _, st := range s.steps {
+		if st.off > cursor {
+			if p >= cursor && p+n <= st.off {
+				return out + (p - cursor), true
+			}
+			out += st.off - cursor
+			cursor = st.off
 		}
+		if st.kind != kindNone {
+			out += st.n
+			continue
+		}
+		cursor = max(cursor, st.end)
+	}
+	if p >= cursor {
+		return out + (p - cursor), true
 	}
 	return 0, false
 }
@@ -230,48 +253,67 @@ func movedPosition(p, delta int64, plan *trailer.Plan) (int64, bool) {
 	return q, true
 }
 
-// measureShift reads the source exactly as the main pass does
-// (copyNonMetadataSegments) up to the first scan header, counting what
-// writeNewMetadataSegments writes, and returns what shiftInfo holds. ok is
-// false when the source has no scan header, or no EXIF segment.
-func measureShift(cr io.ReadSeeker, scratch *[]byte, rawEXIF, rawIPTC, rawXMP, origIRB []byte, preserveUnknownSegments bool, keepGUID string) (info shiftInfo, ok bool, err error) {
-	var cw countWriter
-	if werr := writeNewMetadataSegments(&cw, rawEXIF, rawIPTC, rawXMP, origIRB); werr != nil {
-		return info, false, werr
+// measureShift computes what shiftInfo holds from the steps of the write (see
+// splicePlan.ops), counting what each segment put in takes. ok is false when the
+// source has no scan header, or no EXIF segment.
+func measureShift(cr io.ReadSeeker, sp *splicePlan, pl *payloads) (info shiftInfo, ok bool, err error) {
+	var opsBuf [16]spliceOp
+	ops := sp.ops(pl, opsBuf[:0])
+	info.steps = make([]shiftStep, 0, len(ops))
+	cursor, out := int64(0), int64(0) // replays the steps as writeSplice does
+	for _, op := range ops {
+		if op.off > cursor {
+			out += op.off - cursor
+			cursor = op.off
+		}
+		st := shiftStep{off: op.off, end: op.end, kind: op.kind}
+		if op.kind == kindNone {
+			cursor = max(cursor, op.end)
+		} else {
+			if st.n, err = countSegments(pl, op.kind); err != nil {
+				return info, false, err
+			}
+			if op.kind == kindEXIF {
+				info.newTIFFPos = out + exifTIFFOffset
+			}
+			out += st.n
+		}
+		info.steps = append(info.steps, st)
 	}
-	if _, err = cr.Seek(2, io.SeekStart); err != nil { // after SOI
-		return info, false, fmt.Errorf("jpeg: seek: %w", err)
+	if sp.sosEnd < 0 || !sp.first[kindEXIF].ok {
+		return info, false, nil // no scan header or no old EXIF: nothing is moved
 	}
-	out := 2 + cw.n // SOI and the new metadata segments
-	for {
-		marker, data, rerr := readSegment(cr, scratch)
-		if rerr != nil || marker == markerEOI {
-			return info, false, nil //nolint:nilerr // no scan header: the main pass reports a damaged stream, and nothing is moved
-		}
-		end, serr := cr.Seek(0, io.SeekCurrent)
-		if serr != nil {
-			return info, false, fmt.Errorf("jpeg: seek: %w", serr)
-		}
-		info.noteOldEXIF(marker, data, end)
-		if dropsSegment(marker, data, preserveUnknownSegments, keepGUID) {
-			continue
-		}
-		if marker != markerSOS { // the scan header is where the shift starts
-			info.kept = append(info.kept, keptSegment{src: end - int64(len(data)) - 4, end: end, out: out})
-		}
-		out += int64(len(data)) + 4 // marker, length and data
-		if marker == markerSOS {
-			info.sosEnd, info.delta = end, out-end
-			return info, info.oldTIFF != nil, nil
-		}
-	}
+	// Every byte from the first scan header on moves by out - cursor.
+	info.sosEnd, info.delta = sp.sosEnd, out-cursor
+	info.oldTIFF, info.oldTIFFPos, err = readOldEXIF(cr, sp.first[kindEXIF])
+	return info, err == nil && info.oldTIFF != nil, err
 }
 
-// noteOldEXIF records the first EXIF segment of the source: data is its payload
-// and end the position in the source after it.
-func (s *shiftInfo) noteOldEXIF(marker byte, data []byte, end int64) {
-	if marker == markerAPP1 && s.oldTIFF == nil && bytes.HasPrefix(data, identExif) {
-		s.oldTIFF = bytes.Clone(data[len(identExif):])
-		s.oldTIFFPos = end - int64(len(data)) + int64(len(identExif))
+// countSegments returns the number of bytes the segments of kind k take.
+func countSegments(pl *payloads, k segKind) (int64, error) {
+	var cw countWriter
+	if err := pl.emit(&cw, k); err != nil {
+		return 0, err
 	}
+	return cw.n, nil
+}
+
+// readOldEXIF returns the EXIF stream of the first EXIF segment f of the source
+// (what the offsets of the old MakerNote are counted in) and the position in the
+// source of its first byte. The stream is nil when the segment cannot be read:
+// nothing is then moved.
+func readOldEXIF(cr io.ReadSeeker, f oldSeg) (stream []byte, pos int64, err error) {
+	pos = f.dataStart + int64(len(identExif))
+	n := f.end - pos
+	if n <= 0 {
+		return nil, 0, nil
+	}
+	if _, serr := cr.Seek(pos, io.SeekStart); serr != nil {
+		return nil, 0, fmt.Errorf("jpeg: seek: %w", serr)
+	}
+	stream = make([]byte, n)
+	if _, rerr := io.ReadFull(cr, stream); rerr != nil {
+		return nil, 0, nil //nolint:nilerr // the segment cannot be read: nothing is moved
+	}
+	return stream, pos, nil
 }
