@@ -259,107 +259,15 @@ type extChunk struct {
 	data   []byte
 }
 
-// appendExtendedXMPChunk adds one extended XMP chunk body to the accumulation
-// maps, enforcing the maxExtendedXMPTotal aggregate cap per GUID (#40).
-//
-// body must be at least 40 bytes (32-byte GUID + 4-byte fullLen + 4-byte offset
-// + chunk data). It is the caller's responsibility to verify this precondition.
-//
-// Returns updated extended and extSizes maps and the (possibly set) extTruncated
-// flag. DoS mitigation: the wire fullLen field from the first chunk for a GUID
-// is validated against maxExtendedXMPTotal; if it exceeds the cap the GUID is
-// blacklisted. Subsequent chunks are individually bounded by the same cap.
-// Adobe XMP Specification Part 3 §1.1.4 describes the wire fullLen field.
-func appendExtendedXMPChunk(
-	body []byte,
-	extended map[string][]extChunk,
-	extSizes map[string]uint64,
-	extFullLens map[string]uint64,
-	extTruncated bool,
-) (map[string][]extChunk, map[string]uint64, map[string]uint64, bool) {
-	rawGUID := body[:32]
-	// #135: validate that the GUID is exactly 32 hex characters and canonicalise to
-	// uppercase before keying the map. Adobe XMP Specification Part 3 §1.1.4 defines
-	// the GUID as a 32-character uppercase hex string; real-world writers may emit
-	// lowercase. A case mismatch between the main packet's HasExtendedXMP attribute
-	// and the chunk GUID would silently discard all extended properties without this
-	// normalisation.
-	if !isAllHex(rawGUID) {
-		// GUID contains non-hex characters — discard this chunk silently.
-		return extended, extSizes, extFullLens, extTruncated
-	}
-	guid := strings.ToUpper(string(rawGUID))
-	// fullLen is the wire-declared total size for this GUID's assembled payload.
-	fullLen := uint64(binary.BigEndian.Uint32(body[32:36]))
-	offset := binary.BigEndian.Uint32(body[36:40])
-	chunkData := body[40:]
-
-	// Lazily initialise maps on first encounter.
-	if extended == nil {
-		extended = make(map[string][]extChunk)
-	}
-	if extSizes == nil {
-		extSizes = make(map[string]uint64)
-	}
-	if extFullLens == nil {
-		extFullLens = make(map[string]uint64)
-	}
-
-	// First-seen check: validate the declared total against the cap and enforce
-	// the per-file GUID count cap.
-	//
-	// Adobe XMP Specification Part 3 §1.1.3.1: a conforming file uses exactly
-	// one GUID. We allow up to maxExtendedXMPGUIDs (4) to tolerate non-conforming
-	// files without permitting unbounded memory growth: an adversary crafting a
-	// JPEG with many distinct GUIDs (each up to maxExtendedXMPTotal bytes) could
-	// otherwise aggregate far beyond 16 MiB of allocations.
-	if _, seen := extSizes[guid]; !seen {
-		if len(extSizes) >= maxExtendedXMPGUIDs {
-			// Too many distinct GUIDs: stop accumulating and mark truncated.
-			return extended, extSizes, extFullLens, true // extTruncated
-		}
-		if fullLen > maxExtendedXMPTotal {
-			return extended, extSizes, extFullLens, true // extTruncated
-		}
-		extSizes[guid] = 0 // mark as seen with zero bytes accumulated
-		// #122: record the wire-declared total size so buildXMPResult can validate
-		// that the assembled chunks cover exactly fullLen bytes with no gaps or
-		// overlaps. Adobe XMP Specification Part 3 §1.1.4.
-		extFullLens[guid] = fullLen
-	}
-
-	// Per-chunk running total check: drop this chunk if it would exceed the cap.
-	accumulated := extSizes[guid]
-	chunkSize := uint64(len(chunkData))
-	if accumulated+chunkSize > maxExtendedXMPTotal {
-		return extended, extSizes, extFullLens, true // extTruncated
-	}
-
-	// Copy chunk data: body aliases scratch and must outlive this loop.
-	extSizes[guid] = accumulated + chunkSize
-	extended[guid] = append(extended[guid], extChunk{
-		offset: offset,
-		data:   bytes.Clone(chunkData),
-	})
-	return extended, extSizes, extFullLens, extTruncated
-}
-
 // processAPP1Segment dispatches an APP1 segment payload to the appropriate
 // metadata bucket (EXIF, standard XMP, or extended XMP).
 //
-// It returns updated values for rawEXIF, rawXMP, the extended chunk map,
-// the per-GUID accumulated byte counter map, the per-GUID declared total map,
-// and the extTruncated flag. Pass-through values are returned unchanged when
-// the segment does not apply.
+// It returns updated values for rawEXIF and rawXMP; extended XMP chunks are
+// added to acc. Pass-through values are returned unchanged when the segment
+// does not apply.
 //
-// Extended XMP DoS mitigation is delegated to appendExtendedXMPChunk (#40).
-func processAPP1Segment(
-	data, rawEXIF, rawXMP []byte,
-	extended map[string][]extChunk,
-	extSizes map[string]uint64,
-	extFullLens map[string]uint64,
-	extTruncated bool,
-) ([]byte, []byte, map[string][]extChunk, map[string]uint64, map[string]uint64, bool) {
+// Extended XMP DoS mitigation is delegated to extAcc.add (#40).
+func processAPP1Segment(data, rawEXIF, rawXMP []byte, acc *extAcc) (newEXIF, newXMP []byte) {
 	switch {
 	case bytes.HasPrefix(data, identExif):
 		// EXIF payload begins after the 6-byte "Exif\x00\x00" header.
@@ -391,11 +299,11 @@ func processAPP1Segment(
 		// Extended XMP chunk: GUID (32 bytes) + fullLength (4 bytes) +
 		// offset (4 bytes) + chunk data. Adobe XMP Spec Part 3 §1.1.4.
 		if body := data[len(identXMPNote):]; len(body) >= 40 {
-			extended, extSizes, extFullLens, extTruncated = appendExtendedXMPChunk(body, extended, extSizes, extFullLens, extTruncated)
+			acc.add(body)
 		}
 	}
 
-	return rawEXIF, rawXMP, extended, extSizes, extFullLens, extTruncated
+	return rawEXIF, rawXMP
 }
 
 // processAPP13Segment checks a segment payload for the Photoshop IRB prefix and,
@@ -439,19 +347,21 @@ type xmpResult struct {
 // When extended chunks are present and valid: rawXMP = reassembled(main, ext),
 // rawXMPWire = encodeXMPWire(main, assembledExt).
 //
-// extTruncated is forwarded to the returned xmpResult.truncated field.
-// extFullLens carries the wire-declared total size per GUID for validation (#122).
+// acc.truncated is forwarded to the returned xmpResult.truncated field.
+// The wire-declared total size per GUID, kept by acc, validates the assembled
+// chunks (#122).
 //
 // wantXMP controls whether the expensive reassembly (parse both packets,
 // merge properties, re-encode) is performed at all (#238). When false (the
 // caller opted out via WithoutXMP), rawXMP degrades to the main packet only;
 // rawXMPWire — computed before reassembly either way — still carries the
 // original main+extended payload, so a JPEG round-trip write stays byte
-// stable (encodeXMP prefers rawXMPWire for JPEG destinations). extTruncated
+// stable (encodeXMP prefers rawXMPWire for JPEG destinations). acc.truncated
 // is still computed and returned regardless of wantXMP, so warnings for
 // wanted segments are unaffected.
-func buildXMPResult(rawXMP []byte, extended map[string][]extChunk, extFullLens map[string]uint64, extTruncated, wantXMP bool) xmpResult {
-	if rawXMP == nil || len(extended) == 0 {
+func buildXMPResult(rawXMP []byte, acc *extAcc, wantXMP bool) xmpResult {
+	extTruncated := acc.truncated
+	if rawXMP == nil || len(acc.guids) == 0 {
 		return xmpResult{rawXMP: rawXMP, truncated: extTruncated}
 	}
 
@@ -461,12 +371,12 @@ func buildXMPResult(rawXMP []byte, extended map[string][]extChunk, extFullLens m
 	}
 
 	// #135: canonicalize the GUID from the main packet to uppercase so it
-	// matches the normalised keys stored by appendExtendedXMPChunk.
+	// matches the normalised keys stored by extAcc.add.
 	// Adobe XMP Specification Part 3 §1.1.4: GUID is 32 uppercase hex chars.
 	guid = strings.ToUpper(guid)
 
-	chunks, ok := extended[guid]
-	if !ok || len(chunks) == 0 {
+	g := acc.guids[guid]
+	if g == nil || len(g.chunks) == 0 {
 		// Extended chunks exist but none has the GUID of the main packet:
 		// HasExtendedXMP "must only be in the file" (Part 3 §1.1.3.1, p. 15),
 		// so it is removed, as JPEG_Handler.cpp:JPEG_MetaHandler::ProcessXMP
@@ -478,8 +388,7 @@ func buildXMPResult(rawXMP []byte, extended map[string][]extChunk, extFullLens m
 	// Part 3 §1.1.4: chunks must cover [0, fullLen) contiguously with no gaps,
 	// overlaps, or duplicated offsets. On any violation degrade gracefully to
 	// the main (standard) XMP packet and mark truncated.
-	declaredTotal, hasDeclared := extFullLens[guid]
-	extBytes, valid := mergeExtendedChunksValidated(chunks, declaredTotal, hasDeclared)
+	extBytes, valid := g.assemble()
 	if !valid {
 		// Chunk layout is corrupt; return main packet only (without the link
 		// to the extended XMP that was not recomposed) and signal truncation.
@@ -489,7 +398,7 @@ func buildXMPResult(rawXMP []byte, extended map[string][]extChunk, extFullLens m
 
 	// Build wire-frame BEFORE any reassembly, so that the original raw bytes
 	// are preserved verbatim for passthrough writes.
-	wire := encodeXMPWire(rawXMP, extBytes)
+	wire := g.wireFrame(rawXMP, extBytes)
 
 	if !wantXMP {
 		// #238: skip the reassembly parse/merge/encode entirely when the
@@ -596,19 +505,15 @@ func readSOI(soi []byte) error {
 // and rawIPTC themselves are always extracted regardless of these flags —
 // they must remain available so an unmodified Write can pass them through
 // byte-for-byte (CLAUDE.md §5).
-func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte, wantIPTC, wantXMP bool) (rawEXIF, rawIPTC, iptcDigest []byte, xmp xmpResult, err error) {
-	// extended collects chunks from extended XMP APP1 segments, keyed by GUID.
-	// Adobe XMP Specification Part 3 §1.1.4.
-	// Lazily initialised: most JPEGs do not contain extended XMP, so we avoid
-	// the map allocation on the fast path.
-	//
-	// extSizes tracks accumulated byte totals per GUID for the #40 DoS cap.
-	// extFullLens stores the wire-declared total size per GUID for #122 validation.
-	// extTruncated is set true when any GUID's payload was capped or invalid.
-	var extended map[string][]extChunk
-	var extSizes map[string]uint64
-	var extFullLens map[string]uint64
-	var extTruncated bool
+func scanMetadataSegmentsWithWire(r io.Reader, src io.Seeker, scratchPtr *[]byte, wantIPTC, wantXMP bool) (rawEXIF, rawIPTC, iptcDigest []byte, xmp xmpResult, err error) { //nolint:gocyclo // the stop on a failed size query of the source (task #394) adds one decision to a linear segment loop
+	// acc collects the chunks of extended XMP APP1 segments, keyed by GUID.
+	// Adobe XMP Specification Part 3 §1.1.4. Its zero value allocates nothing:
+	// most JPEGs do not contain extended XMP, so the fast path pays only for
+	// the struct itself. acc.truncated is set when any GUID's payload was
+	// capped or invalid; the per-GUID byte totals enforce the #40 DoS cap and
+	// the wire-declared total size validates the assembled payload (#122).
+	// src, when not nil, bounds the pre-sizing of the chunk buffers (task #394).
+	acc := extAcc{src: src}
 	var mainXMP []byte
 
 	// IRB-APP13-09 / ROBUST-15 (iptc.md §2.4, §5): multiple APP13 "Photoshop 3.0"
@@ -648,9 +553,10 @@ func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte, wantIPTC, wan
 
 		switch marker {
 		case markerAPP1:
-			rawEXIF, mainXMP, extended, extSizes, extFullLens, extTruncated = processAPP1Segment(
-				data, rawEXIF, mainXMP, extended, extSizes, extFullLens, extTruncated,
-			)
+			rawEXIF, mainXMP = processAPP1Segment(data, rawEXIF, mainXMP, &acc)
+			if acc.err != nil {
+				return nil, nil, nil, xmpResult{}, acc.err
+			}
 		case markerAPP13:
 			// Accumulate each Photoshop APP13 payload (after stripping the header);
 			// do NOT search for IPTC yet — the 0x0404 block might be in a later
@@ -670,12 +576,12 @@ func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte, wantIPTC, wan
 		case markerSOS, markerEOI:
 			// SOS/EOI: no more metadata segments follow.
 			rawIPTC, iptcDigest = extractIPTCAndDigestFromIRBPayloads(app13Payloads, wantIPTC)
-			return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, extended, extFullLens, extTruncated, wantXMP), nil
+			return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, &acc, wantXMP), nil
 		}
 	}
 
 	rawIPTC, iptcDigest = extractIPTCAndDigestFromIRBPayloads(app13Payloads, wantIPTC)
-	return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, extended, extFullLens, extTruncated, wantXMP), nil
+	return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, &acc, wantXMP), nil
 }
 
 // parseIRBForIPTCAndDigest scans a single contiguous Photoshop IRB byte block
@@ -864,7 +770,7 @@ func extractFullInternal(r io.ReadSeeker, wantIPTC, wantXMP bool) (rawEXIF, rawI
 		return nil, nil, nil, xmpResult{}, soiErr
 	}
 
-	rawEXIF, rawIPTC, iptcDigest, xmp, err = scanMetadataSegmentsWithWire(cr, scratchPtr, wantIPTC, wantXMP)
+	rawEXIF, rawIPTC, iptcDigest, xmp, err = scanMetadataSegmentsWithWire(cr, r, scratchPtr, wantIPTC, wantXMP)
 	if err != nil {
 		return nil, nil, nil, xmpResult{}, err
 	}
@@ -1812,7 +1718,7 @@ func isAllHex(b []byte) bool {
 
 // mergeExtendedChunks sorts chunks by their byte offset and concatenates their
 // data fields into a single contiguous extended XMP byte slice.
-// This function does NOT validate chunk layout; use mergeExtendedChunksValidated
+// This function does NOT validate chunk layout; use extGUID.assemble
 // when the declared total size is known.
 func mergeExtendedChunks(chunks []extChunk) []byte {
 	sort.Slice(chunks, func(i, j int) bool {
@@ -1828,59 +1734,6 @@ func mergeExtendedChunks(chunks []extChunk) []byte {
 		extBytes = append(extBytes, c.data...)
 	}
 	return extBytes
-}
-
-// mergeExtendedChunksValidated sorts chunks by offset, validates that they form
-// a contiguous, non-overlapping sequence starting at offset 0 and covering
-// exactly declaredTotal bytes (when hasDeclaredTotal is true), and returns the
-// assembled bytes and a validity flag.
-//
-// Validation rules (Adobe XMP Specification Part 3 §1.1.4, #122):
-//   - First chunk must have offset == 0.
-//   - Each subsequent chunk must start exactly where the previous one ended
-//     (chunk[i].offset == chunk[i-1].offset + len(chunk[i-1].data)).
-//   - When hasDeclaredTotal is true, the assembled length must equal declaredTotal.
-//
-// On any violation, returns (nil, false): buildXMPResult must degrade to the
-// main packet only rather than returning corrupted or doubled reassembled bytes.
-func mergeExtendedChunksValidated(chunks []extChunk, declaredTotal uint64, hasDeclaredTotal bool) ([]byte, bool) {
-	if len(chunks) == 0 {
-		return nil, false
-	}
-	sort.Slice(chunks, func(i, j int) bool {
-		return chunks[i].offset < chunks[j].offset
-	})
-
-	// First chunk must start at offset 0.
-	if chunks[0].offset != 0 {
-		return nil, false
-	}
-
-	// Each subsequent chunk must be contiguous with the previous one.
-	var totalLen int
-	for i, c := range chunks {
-		if i > 0 {
-			expectedOffset := chunks[i-1].offset + uint32(len(chunks[i-1].data)) //nolint:gosec // G115: chunk offset/size bounded by maxExtendedXMPTotal (16 MiB)
-			if c.offset != expectedOffset {
-				// Gap or overlap detected: reject the assembled payload.
-				return nil, false
-			}
-		}
-		totalLen += len(c.data)
-	}
-
-	// When the wire-declared total is known, assembled length must match exactly.
-	// Adobe XMP Specification Part 3 §1.1.4: fullLength is the total size of the
-	// extended XMP document; every byte must be accounted for.
-	if hasDeclaredTotal && uint64(totalLen) != declaredTotal {
-		return nil, false
-	}
-
-	extBytes := make([]byte, 0, totalLen)
-	for _, c := range chunks {
-		extBytes = append(extBytes, c.data...)
-	}
-	return extBytes, true
 }
 
 // reassembleExtendedXMPByParse recomposes the standard XMP packet mainBytes

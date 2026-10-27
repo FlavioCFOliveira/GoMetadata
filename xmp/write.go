@@ -68,12 +68,27 @@ func serialiseMode(x *XMP, mode serialiseOpts) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	n := buf.Len()
+	if n >= encHandOffMin && buf.Cap() <= n+n/4 {
+		// A large packet is handed to the caller with its buffer instead of
+		// being copied, and the buffer leaves the pool: the pool would pin
+		// the backing array of one big document for the life of the process
+		// (task #394, sprint 50: the copy was 14% of the bytes allocated
+		// by a read of a 1.7 MiB extended XMP). The limit on the unused tail
+		// keeps the caller from retaining a much larger array than the
+		// packet. The buffer is not reachable from anywhere else after this.
+		return buf.Bytes()[:n:n], nil
+	}
 	// Copy the result before returning the buffer to the pool so callers own
 	// their slice independently of the pooled backing array.
 	result := bytes.Clone(buf.Bytes())
 	encBufPool.Put(buf)
 	return result, nil
 }
+
+// encHandOffMin is the size from which serialiseMode returns the buffer of
+// the packet instead of a copy of it.
+const encHandOffMin = 64 << 10
 
 // serialiseBuf is serialiseMode without the final copy: it returns the pooled
 // buffer that holds the packet, which the caller must hand back to encBufPool
@@ -85,12 +100,15 @@ func serialiseBuf(x *XMP, mode serialiseOpts) (*bytes.Buffer, error) {
 	buf := encBufPool.Get().(*bytes.Buffer) //nolint:forcetypeassert,revive // encBufPool.New always stores *bytes.Buffer; pool invariant
 	buf.Reset()
 
-	// Estimate output size: fixed wrapper (~250 B) + 2 KB padding + ~100 B per property.
+	// Estimate output size: fixed wrapper (~250 B) + 2 KB padding + ~100 B per
+	// property + the strings that a parse stored in the arena (the names and
+	// values of the properties, task #394: a packet that carries a large value
+	// would otherwise regrow the buffer by 25% steps up to its size).
 	nProps := len(x.nodes)
 	for _, props := range x.Properties {
 		nProps += len(props)
 	}
-	buf.Grow(256 + 2048 + nProps*100)
+	buf.Grow(256 + 2048 + nProps*100 + len(x.arena))
 
 	writePacketHead(buf, x, wrapper)
 

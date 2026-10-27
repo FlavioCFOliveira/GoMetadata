@@ -73,7 +73,7 @@ func buildExtChunkJPEG(mainXMP []byte, guid string, chunks []struct {
 
 // TestExtendedXMPReassemblyValidation is the mandatory regression gate for #122.
 //
-// It verifies that mergeExtendedChunksValidated rejects structurally invalid
+// It verifies that extGUID.assemble rejects structurally invalid
 // chunk layouts (duplicate offsets, gaps, fullLen mismatch), causing buildXMPResult
 // to degrade to the main XMP packet rather than returning corrupt doubled bytes.
 //
@@ -282,7 +282,7 @@ func TestExtendedXMPNonRDFPrefix(t *testing.T) {
 // ParseWarning carrying ErrExtendedXMPTruncated.
 //
 // The test builds a JPEG where the declared fullLen for the single extended
-// XMP GUID exceeds the 16 MiB cap; appendExtendedXMPChunk will set extTruncated.
+// XMP GUID exceeds the 16 MiB cap; extAcc.add will set truncated.
 func TestExtendedXMPTruncationSurfaced(t *testing.T) {
 	t.Parallel()
 
