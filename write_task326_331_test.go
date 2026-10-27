@@ -93,6 +93,7 @@ func TestTask327ExplicitXMPReplacesPacket(t *testing.T) {
 	}
 	m.XMP = &xmp.XMP{Properties: map[string]map[string]string{}}
 	m.XMP.SetCaption("replacement")
+	m.MarkModified(SegmentXMP) // task #387: the field was assigned
 	var out bytes.Buffer
 	if err := Write(bytes.NewReader(src), &out, m); err != nil {
 		t.Fatalf("Write: %v", err)

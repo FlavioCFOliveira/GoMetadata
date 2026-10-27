@@ -88,7 +88,7 @@ type keptSegment struct{ src, end, out int64 }
 // position the MakerNote and the data have in the output of Inject, or rawEXIF
 // itself when it holds none, or none that can be resolved. rawEXIF is never
 // modified. cr is left at the start of the file.
-func shiftExternalOffsets(cr io.ReadSeeker, scratch *[]byte, rawEXIF, rawIPTC, rawXMP, origIRB []byte, preserveUnknownSegments bool, keepGUID string, plan *trailer.Plan) ([]byte, error) {
+func shiftExternalOffsets(cr io.ReadSeeker, scratch *[]byte, rawEXIF, rawIPTC, rawXMP, origIRB []byte, preserveUnknownSegments bool, keepGUID string, keep Keep, plan *trailer.Plan) ([]byte, error) {
 	offs := exif.ExternalOffsets(rawEXIF)
 	if len(offs) == 0 {
 		return rawEXIF, nil
@@ -97,7 +97,7 @@ func shiftExternalOffsets(cr io.ReadSeeker, scratch *[]byte, rawEXIF, rawIPTC, r
 	if err != nil {
 		return nil, fmt.Errorf("jpeg: seek: %w", err)
 	}
-	info, ok, err := measureShift(cr, scratch, rawEXIF, rawIPTC, rawXMP, origIRB, preserveUnknownSegments, keepGUID)
+	info, ok, err := measureShift(cr, scratch, rawEXIF, rawIPTC, rawXMP, origIRB, preserveUnknownSegments, keepGUID, keep)
 	if err != nil {
 		return nil, err
 	}
@@ -234,7 +234,7 @@ func movedPosition(p, delta int64, plan *trailer.Plan) (int64, bool) {
 // (copyNonMetadataSegments) up to the first scan header, counting what
 // writeNewMetadataSegments writes, and returns what shiftInfo holds. ok is
 // false when the source has no scan header, or no EXIF segment.
-func measureShift(cr io.ReadSeeker, scratch *[]byte, rawEXIF, rawIPTC, rawXMP, origIRB []byte, preserveUnknownSegments bool, keepGUID string) (info shiftInfo, ok bool, err error) {
+func measureShift(cr io.ReadSeeker, scratch *[]byte, rawEXIF, rawIPTC, rawXMP, origIRB []byte, preserveUnknownSegments bool, keepGUID string, keep Keep) (info shiftInfo, ok bool, err error) {
 	var cw countWriter
 	if werr := writeNewMetadataSegments(&cw, rawEXIF, rawIPTC, rawXMP, origIRB); werr != nil {
 		return info, false, werr
@@ -253,7 +253,7 @@ func measureShift(cr io.ReadSeeker, scratch *[]byte, rawEXIF, rawIPTC, rawXMP, o
 			return info, false, fmt.Errorf("jpeg: seek: %w", serr)
 		}
 		info.noteOldEXIF(marker, data, end)
-		if dropsSegment(marker, data, preserveUnknownSegments, keepGUID) {
+		if dropsSegmentKeeping(marker, data, preserveUnknownSegments, keepGUID, keep) {
 			continue
 		}
 		if marker != markerSOS { // the scan header is where the shift starts

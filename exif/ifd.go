@@ -2138,16 +2138,62 @@ func (ifd *IFD) Get(tag TagID) *IFDEntry {
 	return nil
 }
 
-// String decodes the entry value as a NUL-terminated string.
-// Handles TypeASCII (TIFF §2, US-ASCII) and TypeUTF8 (type 129, Exif 3.1 §4.6.2,
-// p. 28: UTF-8 encoded Unicode). Both types use element size 1 and NUL termination.
+// String decodes the entry value as a NUL-terminated string: it returns the
+// bytes before the first NUL byte.
+// Handles TypeASCII (TIFF 6.0 §2, p. 15: "ASCII ... 8-bit bytes that store
+// ASCII codes; the last byte must be NUL") and TypeUTF8 (type 129, Exif 3.1
+// §4.6.2, p. 28: UTF-8 encoded Unicode). Both types use element size 1 and
+// NUL termination.
+//
+// Bytes after the first NUL are not part of the first string: they are
+// padding or the further strings of a multi-string value (use Strings), or
+// garbage that a camera left in a fixed-size buffer (Task #386). The raw
+// bytes stay in Value, so Encode never changes. Trailing blanks are kept; they
+// are content, not a terminator.
 func (e *IFDEntry) String() string {
 	if (e.Type != TypeASCII && e.Type != TypeUTF8) || len(e.Value) == 0 {
 		return ""
 	}
-	// bytes.TrimRight avoids a byte-by-byte loop; returns a sub-slice (no allocation).
-	return string(bytes.TrimRight(e.Value, "\x00"))
+	v := e.Value
+	// bytes.IndexByte is vectorised; the slice is a sub-slice (no allocation
+	// before the string conversion).
+	if i := bytes.IndexByte(v, 0); i >= 0 {
+		v = v[:i]
+	}
+	return string(v)
 }
+
+// Strings decodes the entry value as the list of NUL-separated strings of a
+// multi-string ASCII or UTF-8 value (TIFF 6.0 §2, p. 15: an ASCII field may
+// hold several NUL-terminated strings, its Count covers all of them).
+//
+// The final NUL terminator, and any further trailing NUL padding, is not a
+// separator: "a\x00b\x00" and "a\x00b\x00\x00\x00" both give ["a", "b"].
+// A NUL between two strings that encloses nothing gives an empty string, so
+// positions are kept ("a\x00\x00b\x00" gives ["a", "", "b"]). It returns nil
+// for an entry of another type, an empty value, or a value made of NUL bytes
+// only.
+func (e *IFDEntry) Strings() []string {
+	if (e.Type != TypeASCII && e.Type != TypeUTF8) || len(e.Value) == 0 {
+		return nil
+	}
+	v := bytes.TrimRight(e.Value, "\x00")
+	if len(v) == 0 {
+		return nil
+	}
+	out := make([]string, 0, bytes.Count(v, nulSep)+1)
+	for {
+		i := bytes.IndexByte(v, 0)
+		if i < 0 {
+			return append(out, string(v))
+		}
+		out = append(out, string(v[:i]))
+		v = v[i+1:]
+	}
+}
+
+// nulSep is the one-byte NUL separator used to count the strings of Strings.
+var nulSep = []byte{0} //nolint:gochecknoglobals // immutable sentinel; avoids an allocation per call
 
 // Uint16 decodes the first SHORT (unsigned 16-bit) value.
 // Returns 0 when the entry type is not TypeShort or the value is shorter than

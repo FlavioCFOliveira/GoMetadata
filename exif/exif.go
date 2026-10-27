@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/FlavioCFOliveira/GoMetadata/internal/metaerr"
@@ -569,7 +570,7 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 
 		// task #200: materialise all deferred warn records into []string ONCE here.
 		// On clean files warnRecs is nil so this is a nil-check + return nil (zero cost).
-		e.Warnings = materializeWarnings(warnRecs)
+		e.Warnings = append(materializeWarnings(warnRecs), gpsDeviationWarnings(e.GPSIFD)...)
 		if cfg.thumbStrips && ifd0.Next != nil {
 			attachThumbnailStrips(b, e, cfg.aliasThumbnail)
 		}
@@ -623,7 +624,7 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 		}
 
 		// task #200: materialise all deferred warn records into []string ONCE here.
-		e.Warnings = materializeWarnings(warnRecs)
+		e.Warnings = append(materializeWarnings(warnRecs), gpsDeviationWarnings(e.GPSIFD)...)
 		if cfg.thumbStrips && ifd0.Next != nil {
 			attachThumbnailStrips(b, e, cfg.aliasThumbnail)
 		}
@@ -732,6 +733,11 @@ func ParseIFDAt(b []byte, offset uint32, order binary.ByteOrder) (*IFD, uint32, 
 }
 
 // CameraModel returns the value of IFD0 tag 0x0110 (Model, EXIF §4.6.4 Table 3).
+//
+// The value ends at the first NUL byte and trailing blanks are removed: cameras
+// pad the fixed-size Model field with spaces ("DSC-HX9V" followed by blanks and
+// NUL bytes), and ExifTool removes trailing blanks from Make and Model the same
+// way (Exif.pm, tag 0x110 RawConv). Task #386.
 func (e *EXIF) CameraModel() string {
 	if e == nil {
 		return ""
@@ -740,7 +746,7 @@ func (e *EXIF) CameraModel() string {
 	if entry == nil {
 		return ""
 	}
-	return entry.String()
+	return strings.TrimRight(entry.String(), " ")
 }
 
 // GPS returns decimal-degree coordinates from the GPS IFD.
@@ -749,6 +755,26 @@ func (e *EXIF) GPS() (lat, lon float64, ok bool) {
 		return 0, 0, false
 	}
 	return parseGPS(e.GPSIFD)
+}
+
+// GPSAltitude returns the GPS altitude in metres: positive above and negative
+// below sea level (GPSAltitudeRef 1), EXIF §4.6.6 tags 0x0005/0x0006. ok is
+// false when the altitude is absent or invalid (see decodeGPSRational).
+func (e *EXIF) GPSAltitude() (metres float64, ok bool) {
+	if e == nil || e.GPSIFD == nil {
+		return 0, false
+	}
+	return parseGPSAltitude(e.GPSIFD)
+}
+
+// GPSTimeStamp returns the UTC time of day of the GPS fix (GPSTimeStamp, EXIF
+// §4.6.6 tag 0x0007: hour, minute and second). ok is false when the tag is
+// absent or invalid (see decodeGPSRational).
+func (e *EXIF) GPSTimeStamp() (hour, minute, second float64, ok bool) {
+	if e == nil || e.GPSIFD == nil {
+		return 0, 0, 0, false
+	}
+	return parseGPSTimeStamp(e.GPSIFD)
 }
 
 // Copyright returns the value of IFD0 tag 0x8298 (Copyright, EXIF §4.6.4 Table 3).

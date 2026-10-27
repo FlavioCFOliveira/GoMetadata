@@ -269,6 +269,7 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 | Write | All three standards across all 13 container formats, including BigTIFF (magic `0x002B`); preserves unmodified metadata byte-for-byte. All TIFF-based formats (TIFF, DNG, CR2, NEF, ARW, ORF, RW2) use a copy-and-relocate serializer that preserves image-data blocks (strips/tiles/MakerNote blobs) at corrected offsets; BigTIFF uses a native 64-bit encoder and a container-width-aware relocator. |
 | Atomic writes | `WriteFile` uses temp file + rename — no partial writes |
 | Format detection | Magic bytes only; file extension is never consulted |
+| Selective write | `Write` encodes only the segments that were modified and copies the others byte for byte; a Read and Write with no change returns the image unchanged. The `Set*` methods mark what they change; after editing `m.EXIF`, `m.IPTC` or `m.XMP` directly, call `m.MarkModified(gometadata.SegmentIPTC)` (or the segment you changed). TIFF-based formats lay their IFDs out again whenever something is written |
 | MakerNote (read) | Canon, Nikon, Sony, Sony Ericsson, Olympus, OM System, Epson, Agfa, Panasonic, Pentax, Ricoh, DJI, FujiFilm, Leica, Samsung, Sigma, Minolta, Casio, Kyocera, Sanyo, Apple; the layout is detected from the MakerNote signature, then from the Make |
 | Convenience getters | 30+ typed getters with explicit source-priority resolution |
 | Convenience setters | 15+ setters that write to all applicable non-nil components simultaneously |
@@ -289,13 +290,13 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 | WebP | .webp | Yes | Yes | Yes | No | Yes |
 | HEIF | .heif, .heic | Yes | Yes | Yes | No | Yes |
 | AVIF | .avif | Yes | Yes | Yes | No | Yes |
-| Canon CR2 | .cr2 | Yes | Yes² | Yes | No | Yes |
+| Canon CR2 | .cr2 | Yes | Yes² | Yes | Yes | Yes |
 | Canon CR3 | .cr3 | Yes | Yes | Yes | No | Yes |
-| Nikon NEF | .nef | Yes | Yes² | Yes | No | Yes |
-| Sony ARW | .arw | Yes | Yes² | Yes | No | Yes |
-| Adobe DNG | .dng | Yes | Yes² | Yes | No | Yes |
-| Olympus ORF | .orf | Yes | Yes³ | Yes | No | Yes |
-| Panasonic RW2 | .rw2 | Yes | Yes⁴ | Yes | No | Yes |
+| Nikon NEF | .nef | Yes | Yes² | Yes | Yes | Yes |
+| Sony ARW | .arw | Yes | Yes² | Yes | Yes | Yes |
+| Adobe DNG | .dng | Yes | Yes² | Yes | Yes | Yes |
+| Olympus ORF | .orf | Yes | Yes³ | Yes | Yes | Yes |
+| Panasonic RW2 | .rw2 | Yes | Yes⁴ | Yes | Yes | Yes |
 
 > ² **Copy-and-relocate write** (`format/tiff/relocate.go`). Image strips, tiles, and non-thumbnail JPEG blocks are enumerated, copied verbatim to fresh absolute offsets in the output stream, and all offset entries are patched. DNG additionally relocates SubIFD structures and their out-of-line values (RATIONAL, SRATIONAL, etc.). CR2 and NEF route through the same path; MakerNotes are copied verbatim, and those whose value offsets count from the TIFF header (Canon, Sony, Panasonic, Olympus "OLYMP", ...) are rebased when they move. SubIFDs of every chained IFD, SubIFD arrays and SubIFD chains are carried. NEF extends the Nikon Type-3 MakerNote blob to cover PreviewIFD and NikonScanIFD. ARW rebases Sony MakerNote TIFF-absolute offsets and relocates the SR2Private block verbatim. Use `format.SupportsWrite(id)` to check programmatically. BigTIFF sources (magic `0x002B`) are written through the same TIFF row: `exif.Encode` emits a native 16-byte-header, 64-bit-offset BigTIFF IFD skeleton, and the relocator's raw-offset scans, image-block enumeration, and SubIFD handling are all container-width-aware, so image data and metadata round-trip byte-for-byte just as they do for classic TIFF.
 >
@@ -303,7 +304,7 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 >
 > ⁴ **RW2 copy-and-relocate write**: the Panasonic 16-byte device GUID header is preserved and all absolute IFD0 offsets are rebased after GUID insertion.
 >
-> ⁵ **PNG IPTC**: PNG has no native IPTC chunk. IPTC stored in a `tEXt`, `zTXt` or `iTXt` chunk keyed "Raw profile type iptc" is read, and `Write` rewrites that chunk in place; `Write` never adds one.
+> ⁵ **PNG IPTC**: PNG has no native IPTC chunk. IPTC stored in a `tEXt`, `zTXt` or `iTXt` chunk keyed "Raw profile type iptc" is read, and `Write` rewrites that chunk in place when the IPTC is modified; `Write` never adds one.
 
 ## Performance
 

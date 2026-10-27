@@ -1128,7 +1128,7 @@ func TestCopyNonMetadataSegmentsReadError(t *testing.T) {
 
 	scratch := make([]byte, 0, 4096)
 	var out bytes.Buffer
-	err := copyNonMetadataSegments(bytes.NewReader(buf.Bytes()), &out, &scratch, true, nil, "")
+	err := copyNonMetadataSegments(bytes.NewReader(buf.Bytes()), &out, &scratch, true, nil, "", 0)
 	// The truncated read should produce an error (non-EOF, unexpected EOF).
 	if err == nil {
 		t.Error("expected error for truncated segment, got nil")

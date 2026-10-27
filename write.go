@@ -58,6 +58,12 @@ var injectors = map[format.FormatID]func(io.ReadSeeker, io.Writer, []byte, []byt
 // result to w. Image data and unmodified metadata segments are preserved
 // byte-for-byte. r must support seeking (io.ReadSeeker).
 //
+// Only the segments that were modified are encoded (task #387): the Set*
+// methods and Metadata.MarkModified mark them, and every other segment is
+// copied from r. A Metadata that was read from r and not modified gives back
+// the bytes of r. When r is not the image that m was read from, every segment
+// of m is written. See the package documentation, section "Writing".
+//
 // Write calls m.Validate before performing any I/O. A non-nil error from
 // Validate is returned unchanged so callers can inspect it with errors.Is.
 //
@@ -122,6 +128,14 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 		}
 	}
 
+	// Task #387: decide which segments are encoded from m and which are carried
+	// from r unchanged. Nothing modified, and r the image m was read from: the
+	// output is r itself.
+	plan := planWrite(r, fmtID, m)
+	if plan.bypass && cfg.preserveUnknownSegments {
+		return copyThrough(r, w)
+	}
+
 	// All TIFF-based containers use dedicated write paths that keep the ORIGINAL
 	// TIFF bytes as the image-data relocation base (epic #33 Option A).  Passing
 	// an exif.Encode-produced skeleton as the relocation base causes
@@ -135,10 +149,10 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	// FormatORF: non-standard IIRO/IIRS magic patch-and-restore (writeTIFFORF, task #104).
 	// FormatRW2: Panasonic GUID insertion + IFD0 offset rebasing (writeTIFFRW2, task #104).
 	if fmtID == format.FormatTIFF || fmtID == format.FormatDNG {
-		return writeTIFF(r, w, m)
+		return writeTIFF(r, w, m, plan.encode)
 	}
 	if fmtID == format.FormatCR2 {
-		return writeTIFFCR2(r, w, m)
+		return writeTIFFCR2(r, w, m, plan.encode)
 	}
 
 	// FormatNEF uses the NEF-specific write path that extends the Nikon MakerNote
@@ -146,7 +160,7 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	// and patches the MakerNote-relative PreviewIFD offsets after relocation.
 	// Un-gated in task #102 after real-corpus validation.
 	if fmtID == format.FormatNEF {
-		return writeTIFFNEF(r, w, m)
+		return writeTIFFNEF(r, w, m, plan.encode)
 	}
 
 	// FormatARW uses the ARW-specific write path that:
@@ -157,7 +171,7 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	//     patches the IFD0 tag to point to the new SR2 block position.
 	// Un-gated in task #103 after real-corpus validation (Sony DSLR-A500.arw).
 	if fmtID == format.FormatARW {
-		return writeTIFFARW(r, w, m)
+		return writeTIFFARW(r, w, m, plan.encode)
 	}
 
 	// FormatORF uses the ORF-specific write path that patches the non-standard
@@ -167,7 +181,7 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	// are supported.
 	// Un-gated in task #104 after real-corpus validation.
 	if fmtID == format.FormatORF {
-		return writeTIFFORF(r, w, m)
+		return writeTIFFORF(r, w, m, plan.encode)
 	}
 
 	// FormatRW2 uses the RW2-specific write path that:
@@ -180,14 +194,34 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 	//     inline val_or_off is patched with the new raw sensor data offset.
 	// Un-gated in task #104 after real-corpus validation.
 	if fmtID == format.FormatRW2 {
-		return writeTIFFRW2(r, w, m)
+		return writeTIFFRW2(r, w, m, plan.encode)
 	}
 
-	rawEXIF, rawIPTC, rawXMP, err := encodeLocked(r, m, fmtID)
+	rawEXIF, rawIPTC, rawXMP, err := encodeLocked(r, m, fmtID, plan.encode)
 	if err != nil {
 		return err
 	}
 
+	// Task #387: a PNG leaves the chunks of the carried segments as they are:
+	// nil payloads mean "unchanged" to png.Inject, which would otherwise write a
+	// carried EXIF, IPTC or XMP again (an IPTC raw profile text chunk, for
+	// one, is rewritten from the IIM bytes).
+	if fmtID == format.FormatPNG {
+		if plan.carry&SegmentEXIF != 0 {
+			rawEXIF = nil
+		}
+		if plan.carry&SegmentIPTC != 0 {
+			rawIPTC = nil
+		}
+		if plan.carry&SegmentXMP != 0 {
+			rawXMP = nil
+		}
+	}
+
+	// Task #387: a JPEG leaves the segments carried from r where they are.
+	if fmtID == format.FormatJPEG && plan.carry != 0 {
+		return wrapInject(jpeg.InjectKeeping(r, w, rawEXIF, rawIPTC, rawXMP, cfg.preserveUnknownSegments, plan.carry.jpegKeep()))
+	}
 	return injectByFormat(r, w, fmtID, rawEXIF, rawIPTC, rawXMP, cfg.preserveUnknownSegments)
 }
 
@@ -452,7 +486,7 @@ func tiffPrefixBytes(r io.ReadSeeker, m *Metadata, tag string) (prefix []byte, w
 	return data, true, nil
 }
 
-func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error {
+func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata, enc Segment) error {
 	// #291: prefix is m.rawEXIF as-is — a metadata PREFIX for most real files
 	// (#289's scanner: every IFD and out-of-line tag value, never the strip/
 	// tile pixel data or embedded previews a real TIFF/DNG spends the
@@ -465,13 +499,13 @@ func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error {
 	}
 
 	// Encode IPTC and XMP the normal way (nil → pass-through original bytes).
-	rawIPTC, err := encodeIPTC(m)
+	rawIPTC, err := encodeIPTC(m, enc)
 	if err != nil {
 		return err
 	}
 	// FormatTIFF is never JPEG, so the XMP wire-frame is never used;
 	// encodeXMP returns rawXMP directly for non-JPEG formats.
-	rawXMP, err := encodeXMP(m, format.FormatTIFF)
+	rawXMP, err := encodeXMP(m, format.FormatTIFF, enc)
 	if err != nil {
 		return err
 	}
@@ -506,18 +540,18 @@ func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata) error {
 //
 // containers.md §8(e): "CR2: preserve CR 02 00 at offset 8."
 // Validated against real Canon EOS 350D/70D/7D corpus files.
-func writeTIFFCR2(r io.ReadSeeker, w io.Writer, m *Metadata) error {
+func writeTIFFCR2(r io.ReadSeeker, w io.Writer, m *Metadata, enc Segment) error {
 	// #291: see writeTIFF's own comment — identical rationale for CR2.
 	prefix, wholeFile, err := tiffPrefixBytes(r, m, "cr2")
 	if err != nil {
 		return err
 	}
 
-	rawIPTC, err := encodeIPTC(m)
+	rawIPTC, err := encodeIPTC(m, enc)
 	if err != nil {
 		return err
 	}
-	rawXMP, err := encodeXMP(m, format.FormatCR2)
+	rawXMP, err := encodeXMP(m, format.FormatCR2, enc)
 	if err != nil {
 		return err
 	}
@@ -550,7 +584,7 @@ func writeTIFFCR2(r io.ReadSeeker, w io.Writer, m *Metadata) error {
 //
 // Validated against real.arw (Sony DSLR-A500, 13 MB): ImageDataHash IN==OUT,
 // all metadata including 52 MakerNote tags and SR2Private block preserved.
-func writeTIFFARW(r io.ReadSeeker, w io.Writer, m *Metadata) error {
+func writeTIFFARW(r io.ReadSeeker, w io.Writer, m *Metadata, enc Segment) error {
 	// #289: m.rawEXIF is only the metadata prefix for ARW too in the general
 	// case (see writeTIFF's comment above).
 	//
@@ -565,11 +599,11 @@ func writeTIFFARW(r io.ReadSeeker, w io.Writer, m *Metadata) error {
 		return err
 	}
 
-	rawIPTC, err := encodeIPTC(m)
+	rawIPTC, err := encodeIPTC(m, enc)
 	if err != nil {
 		return err
 	}
-	rawXMP, err := encodeXMP(m, format.FormatARW)
+	rawXMP, err := encodeXMP(m, format.FormatARW, enc)
 	if err != nil {
 		return err
 	}
@@ -603,7 +637,7 @@ func writeTIFFARW(r io.ReadSeeker, w io.Writer, m *Metadata) error {
 //
 // Un-gated in task #104 after real-corpus validation (Olympus E-M10 IIRO,
 // Olympus C5050Z IIRS): ImageDataHash IN==OUT, all metadata preserved.
-func writeTIFFORF(r io.ReadSeeker, w io.Writer, m *Metadata) error {
+func writeTIFFORF(r io.ReadSeeker, w io.Writer, m *Metadata, enc Segment) error {
 	// #117: orf.Extract stores rawEXIF with the ORIGINAL ORF magic preserved
 	// (bytes[0:4]) — it never patches in place. #285/#286: no clone is needed
 	// here any more: relocateTIFFFromParsedORF derives and restores the magic
@@ -628,11 +662,11 @@ func writeTIFFORF(r io.ReadSeeker, w io.Writer, m *Metadata) error {
 		return err
 	}
 
-	rawIPTC, err := encodeIPTC(m)
+	rawIPTC, err := encodeIPTC(m, enc)
 	if err != nil {
 		return err
 	}
-	rawXMP, err := encodeXMP(m, format.FormatORF)
+	rawXMP, err := encodeXMP(m, format.FormatORF, enc)
 	if err != nil {
 		return err
 	}
@@ -674,7 +708,7 @@ func writeTIFFORF(r io.ReadSeeker, w io.Writer, m *Metadata) error {
 //
 // Un-gated in task #104 after real-corpus validation (Panasonic DMC-GF1):
 // ImageDataHash IN==OUT, JpgFromRaw (0x002E) and raw sensor data preserved.
-func writeTIFFRW2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cyclop // conditional logic mirrors writeTIFF; splitting reduces clarity
+func writeTIFFRW2(r io.ReadSeeker, w io.Writer, m *Metadata, enc Segment) error { //nolint:cyclop // conditional logic mirrors writeTIFF; splitting reduces clarity
 	// Obtain the original RW2 bytes for use as the image-data relocation base.
 	//
 	// #117: rw2.Extract stores rawEXIF with the ORIGINAL RW2 magic preserved
@@ -699,11 +733,11 @@ func writeTIFFRW2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 		return err
 	}
 
-	rawIPTC, err := encodeIPTC(m)
+	rawIPTC, err := encodeIPTC(m, enc)
 	if err != nil {
 		return err
 	}
-	rawXMP, err := encodeXMP(m, format.FormatRW2)
+	rawXMP, err := encodeXMP(m, format.FormatRW2, enc)
 	if err != nil {
 		return err
 	}
@@ -723,13 +757,13 @@ func writeTIFFRW2(r io.ReadSeeker, w io.Writer, m *Metadata) error { //nolint:cy
 // encodeLocked completes and serialises the metadata of m with m.mu held, so
 // that the dimensions that fillPixelSize records cannot race with a setter or
 // with another Write that encodes the same Metadata.
-func encodeLocked(r io.ReadSeeker, m *Metadata, fmtID format.FormatID) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+func encodeLocked(r io.ReadSeeker, m *Metadata, fmtID format.FormatID, enc Segment) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if fmtID == format.FormatJPEG {
+	if fmtID == format.FormatJPEG && enc&SegmentEXIF != 0 {
 		fillPixelSize(r, m)
 	}
-	return encodeMetadata(m, fmtID)
+	return encodeMetadata(m, fmtID, enc)
 }
 
 // fillPixelSize records the pixel dimensions of the JPEG r in the EXIF of m
@@ -750,30 +784,31 @@ func fillPixelSize(r io.ReadSeeker, m *Metadata) {
 	m.EXIF.SetImageSize(w, h)
 }
 
-// encodeMetadata serialises each modified metadata segment. If a segment was
-// not modified (m.EXIF/IPTC/XMP is nil) the original raw bytes are passed
-// through unchanged. Returns the first encoding error encountered.
+// encodeMetadata serialises each segment in enc from m. A segment that is not in
+// enc, or whose m.EXIF/IPTC/XMP is nil, is passed as the original raw bytes,
+// unchanged (task #387). Returns the first encoding error encountered.
 //
 // fmtID is the detected destination container format. It is forwarded to
 // encodeXMP so that the JPEG extended-XMP wire-frame is never handed to a
 // non-JPEG injector.
-func encodeMetadata(m *Metadata, fmtID format.FormatID) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
-	if rawEXIF, err = encodeEXIF(m); err != nil {
+func encodeMetadata(m *Metadata, fmtID format.FormatID, enc Segment) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+	if rawEXIF, err = encodeEXIF(m, enc); err != nil {
 		return nil, nil, nil, err
 	}
-	if rawIPTC, err = encodeIPTC(m); err != nil {
+	if rawIPTC, err = encodeIPTC(m, enc); err != nil {
 		return nil, nil, nil, err
 	}
-	if rawXMP, err = encodeXMP(m, fmtID); err != nil {
+	if rawXMP, err = encodeXMP(m, fmtID, enc); err != nil {
 		return nil, nil, nil, err
 	}
 	return rawEXIF, rawIPTC, rawXMP, nil
 }
 
 // encodeEXIF returns the EXIF bytes to write: freshly encoded when m.EXIF is
-// non-nil, or the original raw bytes when the caller did not modify EXIF.
-func encodeEXIF(m *Metadata) ([]byte, error) {
-	if m.EXIF != nil {
+// non-nil and enc holds SegmentEXIF, or the original raw bytes when the EXIF
+// was not modified.
+func encodeEXIF(m *Metadata, enc Segment) ([]byte, error) {
+	if m.EXIF != nil && enc&SegmentEXIF != 0 {
 		// The container holds this stream on its own, so the MakerNote it
 		// moves must stay valid there (tasks #317, #318): offsets that count
 		// from the TIFF header are set for the new position and the data the
@@ -789,7 +824,8 @@ func encodeEXIF(m *Metadata) ([]byte, error) {
 }
 
 // encodeIPTC returns the IPTC bytes to write: freshly encoded when m.IPTC is
-// non-nil, or the original raw bytes when the caller did not modify IPTC.
+// non-nil and enc holds SegmentIPTC, or the original raw bytes when the IPTC
+// was not modified.
 //
 // #190 fix: a zero-length result from iptc.Encode (which occurs when m.IPTC is
 // a non-nil but structurally empty *iptc.IPTC with no datasets) is normalised to
@@ -797,8 +833,8 @@ func encodeEXIF(m *Metadata) ([]byte, error) {
 // tag into the TIFF IFD when the caller merely set m.IPTC = new(iptc.IPTC)
 // without adding any datasets. Nil signals "no IPTC to write"; a non-nil empty
 // slice is an encoding artifact that must not be stored as a tag value.
-func encodeIPTC(m *Metadata) ([]byte, error) {
-	if m.IPTC != nil {
+func encodeIPTC(m *Metadata, enc Segment) ([]byte, error) {
+	if m.IPTC != nil && enc&SegmentIPTC != 0 {
 		raw, err := iptc.Encode(m.IPTC)
 		if err != nil {
 			return nil, fmt.Errorf("gometadata: encode IPTC: %w", err)
@@ -812,9 +848,9 @@ func encodeIPTC(m *Metadata) ([]byte, error) {
 }
 
 // encodeXMP returns the XMP bytes to write: freshly encoded when m.XMP is
-// non-nil, the wire-frame encoding when the image carried extended XMP and the
-// XMP was not modified (guarantees byte-stable round-trips for JPEG), or the
-// original raw bytes otherwise.
+// non-nil and enc holds SegmentXMP, the wire-frame encoding when the image
+// carried extended XMP and the XMP was not modified (guarantees byte-stable
+// round-trips for JPEG), or the original raw bytes otherwise.
 //
 // fmtID is the destination container format. The wire-frame encoding is only
 // valid for JPEG: jpeg.Inject is the only injector that knows how to decode it
@@ -824,8 +860,8 @@ func encodeIPTC(m *Metadata) ([]byte, error) {
 // PNG/WebP/HEIF/AVIF and other non-JPEG containers.
 //
 // See task #70: Extended-XMP wire-frame leaks to PNG/WebP/HEIF inject.
-func encodeXMP(m *Metadata, fmtID format.FormatID) ([]byte, error) {
-	if m.XMP != nil {
+func encodeXMP(m *Metadata, fmtID format.FormatID, enc Segment) ([]byte, error) {
+	if m.XMP != nil && enc&SegmentXMP != 0 {
 		raw, err := xmppkg.Encode(m.XMP)
 		if err != nil {
 			return nil, fmt.Errorf("gometadata: encode XMP: %w", err)
@@ -1007,7 +1043,7 @@ func cloneSubIFDs(s *exif.SubIFDs) *exif.SubIFDs {
 //
 // Validated against real.nef (Nikon D70): ImageDataHash IN==OUT, all metadata
 // including PreviewIFD and NikonScanIFD preserved, file size unchanged.
-func writeTIFFNEF(r io.ReadSeeker, w io.Writer, m *Metadata) error {
+func writeTIFFNEF(r io.ReadSeeker, w io.Writer, m *Metadata, enc Segment) error {
 	// #289: m.rawEXIF is only the metadata prefix for NEF too in the general
 	// case (see writeTIFF's comment above).
 	//
@@ -1024,11 +1060,11 @@ func writeTIFFNEF(r io.ReadSeeker, w io.Writer, m *Metadata) error {
 		return err
 	}
 
-	rawIPTC, err := encodeIPTC(m)
+	rawIPTC, err := encodeIPTC(m, enc)
 	if err != nil {
 		return err
 	}
-	rawXMP, err := encodeXMP(m, format.FormatNEF)
+	rawXMP, err := encodeXMP(m, format.FormatNEF, enc)
 	if err != nil {
 		return err
 	}

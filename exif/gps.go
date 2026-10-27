@@ -36,33 +36,133 @@ const (
 	TagGPSHPositioningError TagID = 0x001F // Rational 1    — horizontal positioning error (EXIF 2.31+)
 )
 
+// decodeGPSRational returns the i-th value of a GPS RATIONAL field as an
+// unsigned numerator and denominator.
+//
+// Exif 3.1 (CIPA DC-008-2026) §4.6.6, Table 15 defines GPSLatitude,
+// GPSLongitude, GPSAltitude and GPSTimeStamp as RATIONAL (type 5, unsigned).
+// Some manufacturers write SRATIONAL (type 10) instead; HMD Nokia 8.3 5G files
+// are an example (Task #385; ExifTool and metadata-extractor, TiffReader.java
+// and GpsDirectory.java, read them). That deviation is accepted here: an
+// SRATIONAL value is valid when its numerator is not negative and its
+// denominator is positive, and then it has the same meaning as the RATIONAL of
+// the same bits. A negative numerator or a zero or negative denominator is not
+// a valid coordinate, altitude magnitude or time, so ok is false (the Parse
+// warning is added by gpsDeviationWarnings). The entry bytes are never
+// modified, so the write path keeps the original type.
+//
+// A RATIONAL value is returned as stored, even with a zero denominator; the
+// callers decide what a zero denominator means for their field.
+func decodeGPSRational(entry *IFDEntry, i int) (num, den uint32, ok bool) {
+	switch entry.Type {
+	case TypeRational:
+		r := entry.Rational(i)
+		return r[0], r[1], true
+	case TypeSRational:
+		r := entry.SRational(i)
+		if r[0] < 0 || r[1] <= 0 {
+			return 0, 0, false
+		}
+		return uint32(r[0]), uint32(r[1]), true //nolint:gosec // G115: r[0] >= 0 and r[1] > 0 checked above
+	default:
+		return 0, 0, false
+	}
+}
+
 // decodeCoordinate extracts a DMS (degrees/minutes/seconds) triplet from an
 // IFDEntry that must carry exactly 3 RATIONAL values (EXIF §4.6.6).
 // Returns (zero, false) when entry is nil, Count != 3, or the entry Type is
-// not TypeRational.
+// neither TypeRational nor TypeSRational with valid values (see
+// decodeGPSRational).
 //
 // EXIF 2.32 CIPA DC-008-2023 §4.6.6 Table 15: GPSLatitude and GPSLongitude
-// are defined as RATIONAL (unsigned) with Count=3. TypeSRational is
-// explicitly rejected: Rational(i) returns [0,0] for TypeSRational entries,
-// so accepting TypeSRational here silently produces the (0,0,true) "Null
-// Island" result rather than the correct (0,0,false) absent signal.
-// Audit finding #119.
+// are defined as RATIONAL (unsigned) with Count=3. TypeSRational is accepted
+// as a documented manufacturer deviation (Task #385), decoded by
+// decodeGPSRational, never through Rational(i): that returns [0,0] for
+// TypeSRational entries, which would give the false "Null Island" result
+// (0,0,true) instead of the correct absent signal (audit finding #119).
 func decodeCoordinate(entry *IFDEntry) ([3][2]uint32, bool) {
 	if entry == nil || entry.Count != 3 {
 		return [3][2]uint32{}, false
 	}
-	// EXIF 2.32 CIPA DC-008-2023 §4.6.6 Table 15: only TypeRational is valid
-	// for GPS coordinate fields. TypeSRational must be rejected: Rational(i)
-	// returns [0,0] for non-TypeRational entries, which would give the caller
-	// (0,0,true) — a false Null Island — instead of (0,0,false) = absent.
-	if entry.Type != TypeRational {
-		return [3][2]uint32{}, false
-	}
 	var dms [3][2]uint32
 	for i := range 3 {
-		dms[i] = entry.Rational(i)
+		num, den, ok := decodeGPSRational(entry, i)
+		if !ok {
+			return [3][2]uint32{}, false
+		}
+		dms[i] = [2]uint32{num, den}
 	}
 	return dms, true
+}
+
+// parseGPSAltitude decodes GPSAltitude (0x0006, Rational 1) and applies
+// GPSAltitudeRef (0x0005: 1 = below sea level). ok is false when the altitude is
+// absent, not a valid RATIONAL or SRATIONAL (see decodeGPSRational), or has a
+// zero denominator.
+func parseGPSAltitude(ifd *IFD) (float64, bool) {
+	entry := ifd.Get(TagGPSAltitude)
+	if entry == nil {
+		return 0, false
+	}
+	num, den, ok := decodeGPSRational(entry, 0)
+	if !ok || den == 0 {
+		return 0, false
+	}
+	alt := float64(num) / float64(den)
+	if ref := ifd.Get(TagGPSAltitudeRef); ref != nil && len(ref.Value) > 0 && ref.Value[0] == 1 {
+		alt = -alt
+	}
+	return alt, true
+}
+
+// parseGPSTimeStamp decodes GPSTimeStamp (0x0007, Rational 3: hour, minute,
+// second of the UTC time). ok is false when the tag is absent, does not hold
+// three valid values, or one of them has a zero denominator.
+func parseGPSTimeStamp(ifd *IFD) (hour, minute, second float64, ok bool) {
+	entry := ifd.Get(TagGPSTimeStamp)
+	if entry == nil || entry.Count != 3 {
+		return 0, 0, 0, false
+	}
+	var v [3]float64
+	for i := range 3 {
+		num, den, valid := decodeGPSRational(entry, i)
+		if !valid || den == 0 {
+			return 0, 0, 0, false
+		}
+		v[i] = float64(num) / float64(den)
+	}
+	return v[0], v[1], v[2], true
+}
+
+// gpsDeviationTags lists the GPS tags decodeGPSRational reads.
+var gpsDeviationTags = [...]TagID{TagGPSLatitude, TagGPSLongitude, TagGPSAltitude, TagGPSTimeStamp} //nolint:gochecknoglobals // immutable lookup table
+
+// gpsDeviationWarnings returns one warning for each GPS tag that is written as
+// SRATIONAL and holds a value decodeGPSRational rejects (negative numerator,
+// zero or negative denominator). A valid SRATIONAL value is accepted silently.
+// It reads no more than four entries and allocates only when it finds a
+// rejected value, so Parse pays almost nothing on a file with a compliant GPS
+// IFD (Task #385).
+func gpsDeviationWarnings(gps *IFD) []string {
+	if gps == nil {
+		return nil
+	}
+	var out []string
+	for _, tag := range gpsDeviationTags {
+		entry := gps.Get(tag)
+		if entry == nil || entry.Type != TypeSRational {
+			continue
+		}
+		for i := range int(min(entry.Count, 3)) {
+			if _, _, ok := decodeGPSRational(entry, i); !ok {
+				out = append(out, "exif: GPS tag 0x"+string(appendHex4(nil, uint32(tag)))+
+					" is SRATIONAL with a negative numerator or a non-positive denominator; value ignored (Exif 3.1 \u00a74.6.6 defines RATIONAL)")
+				break
+			}
+		}
+	}
+	return out
 }
 
 // refByte extracts the first byte of a GPS ref entry (e.g. GPSLatitudeRef).

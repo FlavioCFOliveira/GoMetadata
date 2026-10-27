@@ -25,6 +25,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/FlavioCFOliveira/GoMetadata/exif"
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 	irbpkg "github.com/FlavioCFOliveira/GoMetadata/internal/irb"
 	"github.com/FlavioCFOliveira/GoMetadata/internal/trailer"
@@ -1315,8 +1316,9 @@ func isAppMarker(m byte) bool {
 // rewritten instead of copied; it is nil for a JPEG without such a trailer,
 // and then r need not be seekable. keepGUID (task #357) names the extended
 // XMP segments that are copied instead of dropped; it is empty in the common
-// case.
-func copyNonMetadataSegments(r io.Reader, w io.Writer, scratch *[]byte, preserveUnknownSegments bool, plan *trailer.Plan, keepGUID string) error {
+// case. keep (task #387) names the metadata segments that are copied in place
+// instead of dropped; it is 0 for Inject.
+func copyNonMetadataSegments(r io.Reader, w io.Writer, scratch *[]byte, preserveUnknownSegments bool, plan *trailer.Plan, keepGUID string, keep Keep) error {
 	for {
 		marker, data, err := readSegment(r, scratch)
 		if err != nil {
@@ -1326,7 +1328,7 @@ func copyNonMetadataSegments(r io.Reader, w io.Writer, scratch *[]byte, preserve
 			return err
 		}
 
-		if dropsSegment(marker, data, preserveUnknownSegments, keepGUID) {
+		if dropsSegmentKeeping(marker, data, preserveUnknownSegments, keepGUID, keep) {
 			continue
 		}
 
@@ -1361,6 +1363,15 @@ func dropsSegment(marker byte, data []byte, preserveUnknownSegments bool, keepGU
 		return false
 	}
 	return isOldMetadataSegment(marker, data) || (!preserveUnknownSegments && isAppMarker(marker))
+}
+
+// dropsSegmentKeeping is dropsSegment for a write that keeps the metadata
+// segments in keep in place (task #387): those are never dropped.
+func dropsSegmentKeeping(marker byte, data []byte, preserveUnknownSegments bool, keepGUID string, keep Keep) bool {
+	if keep != 0 && keepsSegment(marker, data, keep) {
+		return false
+	}
+	return dropsSegment(marker, data, preserveUnknownSegments, keepGUID)
 }
 
 // irbHasSibling reports whether an IRB payload contains any 8BIM resource
@@ -1545,7 +1556,7 @@ func resolveOrigIRB(r io.ReadSeeker, scratch *[]byte, rawIPTC []byte) ([]byte, e
 // there are none. A keep frame in rawXMP (#357) is resolved against the source
 // first: xmp is the standard packet to write and keepGUID the GUID of the
 // extended XMP segments to keep (see resolveKeptExtended).
-func prepareInject(cr io.ReadSeeker, w io.Writer, scratch *[]byte, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) (origIRB []byte, plan *trailer.Plan, out io.Writer, exifOut, xmp []byte, keepGUID string, err error) {
+func prepareInject(cr io.ReadSeeker, w io.Writer, scratch *[]byte, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool, keep Keep) (origIRB []byte, plan *trailer.Plan, out io.Writer, exifOut, xmp []byte, keepGUID string, err error) {
 	// #357: a keep frame in rawXMP asks to carry over the extended XMP segments
 	// of the source that were not merged; it starts with 0x00, which no XMP
 	// packet does, so any other payload skips the call. Resolved against this
@@ -1555,9 +1566,12 @@ func prepareInject(cr io.ReadSeeker, w io.Writer, scratch *[]byte, rawEXIF, rawI
 			return nil, nil, w, nil, nil, "", err
 		}
 	}
-	origIRB, err = resolveOrigIRB(cr, scratch, rawIPTC)
-	if err != nil {
-		return nil, nil, w, nil, nil, "", err
+	// Task #387: an IPTC kept in place keeps its Photoshop resources with it,
+	// so no sibling is carried into a new APP13 segment.
+	if keep&KeepIPTC == 0 {
+		if origIRB, err = resolveOrigIRB(cr, scratch, rawIPTC); err != nil {
+			return nil, nil, w, nil, nil, "", err
+		}
 	}
 	plan, out, err = startTrailerPlan(cr, w, scratch, rawIPTC)
 	if err != nil {
@@ -1570,7 +1584,7 @@ func prepareInject(cr io.ReadSeeker, w io.Writer, scratch *[]byte, rawEXIF, rawI
 	// 5% on the 300 ns Inject benchmark; here the arguments are at hand).
 	exifOut = rawEXIF
 	if bytes.IndexByte(rawEXIF, 'O') >= 0 {
-		if exifOut, err = shiftExternalOffsets(cr, scratch, rawEXIF, rawIPTC, rawXMP, origIRB, preserveUnknownSegments, keepGUID, plan); err != nil {
+		if exifOut, err = shiftExternalOffsets(cr, scratch, rawEXIF, rawIPTC, rawXMP, origIRB, preserveUnknownSegments, keepGUID, keep, plan); err != nil {
 			return nil, nil, w, nil, nil, "", err
 		}
 	}
@@ -1615,6 +1629,75 @@ func prepareInject(cr io.ReadSeeker, w io.Writer, scratch *[]byte, rawEXIF, rawI
 // trailer.go). Oversized XMP is partitioned into a standard packet and
 // extended XMP (#332; see writeXMPSegments).
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
+	return injectSegments(r, w, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments, 0)
+}
+
+// Keep is a set of the metadata segments of a JPEG that InjectKeeping leaves
+// as they are in the source (task #387).
+type Keep uint8
+
+// The segments a Keep can hold.
+const (
+	// KeepEXIF is every EXIF APP1 segment.
+	KeepEXIF Keep = 1 << iota
+	// KeepIPTC is every Photoshop APP13 segment (the IPTC and the other
+	// Photoshop resources, the IPTC digest included).
+	KeepIPTC
+	// KeepXMP is every XMP APP1 segment, the standard packet and the extended
+	// XMP segments.
+	KeepXMP
+)
+
+// InjectKeeping is Inject for a write that changes only some of the metadata
+// segments (task #387): the segments in keep stay in the output exactly as
+// the source has them, byte for byte and at the same place; the others are
+// replaced by the payload given, or removed when it is nil, as Inject does.
+//
+// The payload of a kept segment is not written. A caller passes it anyway
+// when it holds it: Inject semantics apply to the whole write whenever a kept
+// segment cannot stay in place, which InjectKeeping detects and which is
+// reported by nothing but the output. That happens for the EXIF: when its
+// stream holds MakerNote offsets to data outside it (exif.ExternalOffsets;
+// Olympus), the position of that data depends on the size of every segment
+// before it, so the EXIF is written from rawEXIF, with the offsets rewritten
+// for the new layout as in Inject, even when it is in keep.
+//
+// A kept IPTC is not rewritten, so the IPTC digest is left as the source has
+// it, whatever is written to XMP (MWG Guidelines v2.0 §4.2.3.2, p. 29: a
+// digest that no longer matches tells a reader the IPTC was edited after the
+// XMP). The AFCP and FotoStation trailers are left as they are too.
+func InjectKeeping(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool, keep Keep) error {
+	if keep&KeepEXIF != 0 && bytes.IndexByte(rawEXIF, 'O') >= 0 && len(exif.ExternalOffsets(rawEXIF)) > 0 {
+		keep &^= KeepEXIF
+	}
+	if keep&KeepEXIF != 0 {
+		rawEXIF = nil
+	}
+	if keep&KeepIPTC != 0 {
+		rawIPTC = nil
+	}
+	if keep&KeepXMP != 0 {
+		rawXMP = nil
+	}
+	return injectSegments(r, w, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments, keep)
+}
+
+// keepsSegment reports whether the source segment marker+data is one that keep
+// leaves in place.
+func keepsSegment(marker byte, data []byte, keep Keep) bool {
+	switch marker {
+	case markerAPP1:
+		return keep&KeepEXIF != 0 && bytes.HasPrefix(data, identExif) ||
+			keep&KeepXMP != 0 && (bytes.HasPrefix(data, identXMP) || bytes.HasPrefix(data, identXMPNote))
+	case markerAPP13:
+		return keep&KeepIPTC != 0 && bytes.HasPrefix(data, identPS)
+	}
+	return false
+}
+
+// injectSegments is Inject and InjectKeeping: rawEXIF, rawIPTC and rawXMP are
+// nil for a segment in keep.
+func injectSegments(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool, keep Keep) error {
 	// #262: wrap r so the total bytes read across the IRB pre-scan, the SOI
 	// check, and the main copy pass (including the passthrough io.Copy of the
 	// compressed image data in writeSOS) are bounded by maxFileSize, mirroring
@@ -1646,7 +1729,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	// #357: a keep frame in rawXMP asks to carry over the extended XMP segments
 	// of the source that were not merged; resolve it against this source before
 	// any pass moves the reader.
-	origIRB, plan, w, rawEXIF, rawXMP, keepGUID, err := prepareInject(cr, w, scratch, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments)
+	origIRB, plan, w, rawEXIF, rawXMP, keepGUID, err := prepareInject(cr, w, scratch, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments, keep)
 	if err != nil {
 		return err
 	}
@@ -1671,7 +1754,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	}
 
 	// Copy remaining segments, skipping old metadata APP segments.
-	return copyNonMetadataSegments(cr, w, scratch, preserveUnknownSegments, plan, keepGUID)
+	return copyNonMetadataSegments(cr, w, scratch, preserveUnknownSegments, plan, keepGUID, keep)
 }
 
 // parseIRBEntry delegates to irbpkg.ParseEntry; see there for the recoverable-miss
