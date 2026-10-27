@@ -1028,10 +1028,7 @@ func writeExtendedChunks(w io.Writer, guidBytes, ext []byte) error {
 	// Header = identXMPNote(35) + GUID(32) + fullLen(4) + offset(4) = 75 bytes.
 	const extHdrSize = 75
 	for offset < fullLen {
-		chunkEnd := offset + uint32(maxExtChunkSize) // min builtin shadowed by test-only helper in fuzz_test.go; cannot use min here
-		if chunkEnd > fullLen {
-			chunkEnd = fullLen
-		}
+		chunkEnd := min(offset+uint32(maxExtChunkSize), fullLen)
 		chunk := ext[offset:chunkEnd]
 
 		// #216: segment header + extended-XMP header + chunk data built in
@@ -1168,9 +1165,14 @@ func spliceIPTCIntoIRB(origIRB, newIPTCData []byte) []byte {
 	return appendSplicedIRB(out, origIRB, newIPTCData, false)
 }
 
-// writeNewMetadataSegments writes EXIF APP1, XMP APP1 (with extended-XMP
-// splitting when the payload exceeds the single-segment limit), and IPTC
-// APP13 segments to w. Returns the first error encountered.
+// writeIPTCOrSiblings handles the IPTC / Photoshop-sibling write decision.
+//
+//   - rawIPTC non-nil  → write APP13 with rawIPTC spliced into origIRB (or bare).
+//   - rawIPTC nil, origIRB non-nil → strip 0x0404, write APP13 with remaining siblings.
+//   - rawIPTC nil, origIRB nil  → no APP13 emitted.
+//
+// withXMP is true when an XMP packet is written in the same pass; it lets the
+// IPTC digest be created (task #323, MWG Guidelines v2.0 §4.2.3.2, p. 29).
 //
 // origIRB is the full Photoshop IRB block (the bytes after the "Photoshop
 // 3.0\x00" header) from the source JPEG, or nil if the source had no APP13.
@@ -1182,34 +1184,6 @@ func spliceIPTCIntoIRB(origIRB, newIPTCData []byte) []byte {
 // segment is only written when the stripped IRB is non-empty (i.e. when the
 // original APP13 contained resources other than 0x0404). If the stripped IRB
 // is empty (0x0404 was the only resource) no APP13 segment is emitted.
-func writeNewMetadataSegments(w io.Writer, rawEXIF, rawIPTC, rawXMP, origIRB []byte) error {
-	if rawEXIF != nil {
-		if err := writeEXIFSegment(w, rawEXIF); err != nil {
-			return err
-		}
-	}
-	if rawXMP != nil {
-		if err := writeXMPSegments(w, rawXMP); err != nil {
-			return err
-		}
-	}
-	if err := writeIPTCOrSiblings(w, rawIPTC, origIRB, rawXMP != nil); err != nil {
-		return err
-	}
-	return nil
-}
-
-// writeIPTCOrSiblings handles the IPTC / Photoshop-sibling write decision.
-//
-//   - rawIPTC non-nil  → write APP13 with rawIPTC spliced into origIRB (or bare).
-//   - rawIPTC nil, origIRB non-nil → strip 0x0404, write APP13 with remaining siblings.
-//   - rawIPTC nil, origIRB nil  → no APP13 emitted.
-//
-// withXMP is true when an XMP packet is written in the same pass; it lets the
-// IPTC digest be created (task #323, MWG Guidelines v2.0 §4.2.3.2, p. 29).
-//
-// This helper exists solely to satisfy the nestif linter; the logic matches
-// the comment in writeNewMetadataSegments (#174).
 func writeIPTCOrSiblings(w io.Writer, rawIPTC, origIRB []byte, withXMP bool) error {
 	if rawIPTC != nil {
 		return writeIPTCSegment(w, rawIPTC, origIRB, withXMP)
@@ -1240,57 +1214,6 @@ func isOldMetadataSegment(marker byte, data []byte) bool {
 	return false
 }
 
-// writeMarker writes a standalone JPEG marker (FF <marker>) to w.
-//
-// #216: the 2-byte marker is written into a pooled buffer instead of a stack
-// composite literal, which would otherwise escape to the heap on every call
-// through the io.Writer interface boundary.
-func writeMarker(w io.Writer, marker byte) error {
-	bufPtr := iobuf.Get(2)
-	b := *bufPtr
-	b[0], b[1] = 0xFF, marker
-	_, err := w.Write(b)
-	iobuf.Put(bufPtr)
-	if err != nil {
-		return fmt.Errorf("jpeg: write marker: %w", err)
-	}
-	return nil
-}
-
-// writePassThroughSegment writes a single non-metadata segment to w.
-// Standalone markers (nil data) are written as FF <marker>; segments with
-// data are written with the standard length-prefixed format.
-func writePassThroughSegment(w io.Writer, marker byte, data []byte) error {
-	if data == nil {
-		return writeMarker(w, marker)
-	}
-	return writeSegmentCopy(w, marker, data)
-}
-
-// writeSOS writes the SOS segment and then copies the remaining compressed
-// image data from r to w verbatim.
-func writeSOS(r io.Reader, w io.Writer, data []byte) error {
-	if err := writeSegmentCopy(w, markerSOS, data); err != nil {
-		return err
-	}
-	if _, err := io.Copy(w, r); err != nil {
-		return fmt.Errorf("jpeg: copy image data: %w", err)
-	}
-	return nil
-}
-
-// writeSOSOrTrailers is writeSOS, or writeSOSTrailers when plan lists trailers
-// to rewrite (task #322; r is then the seekable reader the plan was made from).
-func writeSOSOrTrailers(r io.Reader, w io.Writer, data []byte, plan *trailer.Plan) error {
-	if rs, ok := r.(io.ReadSeeker); ok && plan != nil {
-		// w is the counting writer startTrailerPlan returned with the plan.
-		if out, isOut := w.(*trailer.OutWriter); isOut {
-			return writeSOSTrailers(rs, w, out, data, plan)
-		}
-	}
-	return writeSOS(r, w, data)
-}
-
 // isAppMarker reports whether m is an APPn marker (APP0–APP15, markers
 // 0xE0–0xEF). These segments carry optional application-specific data and are
 // never required for image decoding.
@@ -1301,48 +1224,6 @@ func writeSOSOrTrailers(r io.Reader, w io.Writer, data []byte, plan *trailer.Pla
 // "unknown" application payloads from the library's perspective.
 func isAppMarker(m byte) bool {
 	return m >= 0xE0 && m <= 0xEF
-}
-
-// copyNonMetadataSegments reads segments from r, skips old metadata APP
-// segments, and passes the rest through to w. It terminates on SOS (copying
-// the compressed stream verbatim) or EOI.
-//
-// When preserveUnknownSegments is false, APPn segments (APP0–APP15) that are
-// not the recognised metadata segments (EXIF APP1, XMP APP1, IPTC APP13) are
-// also dropped. Structural markers, DQT, DHT, SOF, SOS, and compressed image
-// data are never dropped regardless of this flag.
-//
-// plan (task #322) lists the trailer ranges after the image data that are
-// rewritten instead of copied; it is nil for a JPEG without such a trailer,
-// and then r need not be seekable. keepGUID (task #357) names the extended
-// XMP segments that are copied instead of dropped; it is empty in the common
-// case. keep (task #387) names the metadata segments that are copied in place
-// instead of dropped; it is 0 for Inject.
-func copyNonMetadataSegments(r io.Reader, w io.Writer, scratch *[]byte, preserveUnknownSegments bool, plan *trailer.Plan, keepGUID string, keep Keep) error {
-	for {
-		marker, data, err := readSegment(r, scratch)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		}
-
-		if dropsSegmentKeeping(marker, data, preserveUnknownSegments, keepGUID, keep) {
-			continue
-		}
-
-		switch marker {
-		case markerSOS:
-			return writeSOSOrTrailers(r, w, data, plan)
-		case markerEOI:
-			return writeMarker(w, markerEOI)
-		default:
-			if err := writePassThroughSegment(w, marker, data); err != nil {
-				return err
-			}
-		}
-	}
 }
 
 // dropsSegment reports whether Inject leaves a source segment out of the
@@ -1551,54 +1432,59 @@ func resolveOrigIRB(r io.ReadSeeker, scratch *[]byte, rawIPTC []byte) ([]byte, e
 
 // prepareInject runs the passes of Inject that precede the main copy pass and
 // leaves cr at the start of the file: the original Photoshop IRB (resolveOrigIRB,
-// #174, #217) and the trailers that hold an IPTC copy or absolute offsets
+// #174, #217), the trailers that hold an IPTC copy or absolute offsets
 // (startTrailerPlan, #322), whose plan is nil, with w returned as it is, when
-// there are none. A keep frame in rawXMP (#357) is resolved against the source
-// first: xmp is the standard packet to write and keepGUID the GUID of the
-// extended XMP segments to keep (see resolveKeptExtended).
-func prepareInject(cr io.ReadSeeker, w io.Writer, scratch *[]byte, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool, keep Keep) (origIRB []byte, plan *trailer.Plan, out io.Writer, exifOut, xmp []byte, keepGUID string, err error) {
+// there are none, and the scan of the segments before the first scan header
+// (scanSplice, #400, #403), which fills sp and reports ErrNotJPEG for a source
+// that does not start with the SOI marker. A keep frame in rawXMP (#357) is
+// resolved against the source first: xmp is the standard packet to write and
+// keepGUID the GUID of the extended XMP segments to keep (see
+// resolveKeptExtended).
+func prepareInject(cr *countingReader, w io.Writer, scratch *[]byte, sp *splicePlan, rawIPTC, rawXMP []byte, preserveUnknownSegments bool, keep Keep) (origIRB []byte, plan *trailer.Plan, out io.Writer, xmp []byte, keepGUID string, err error) {
 	// #357: a keep frame in rawXMP asks to carry over the extended XMP segments
 	// of the source that were not merged; it starts with 0x00, which no XMP
 	// packet does, so any other payload skips the call. Resolved against this
 	// source before another pass moves the reader.
 	if len(rawXMP) > 0 && rawXMP[0] == 0 {
 		if rawXMP, keepGUID, err = resolveKeptExtended(cr, scratch, rawXMP); err != nil {
-			return nil, nil, w, nil, nil, "", err
+			return nil, nil, w, nil, "", err
 		}
 	}
 	// Task #387: an IPTC kept in place keeps its Photoshop resources with it,
 	// so no sibling is carried into a new APP13 segment.
 	if keep&KeepIPTC == 0 {
 		if origIRB, err = resolveOrigIRB(cr, scratch, rawIPTC); err != nil {
-			return nil, nil, w, nil, nil, "", err
+			return nil, nil, w, nil, "", err
 		}
 	}
 	plan, out, err = startTrailerPlan(cr, w, scratch, rawIPTC)
 	if err != nil {
-		return nil, nil, w, nil, nil, "", err
+		return nil, nil, w, nil, "", err
 	}
-	// #362: a MakerNote offset to data outside the EXIF stream follows the data
-	// it addresses. Only an Olympus MakerNote holds one, and its signature
-	// starts with 'O': the single-byte search keeps the common stream from
-	// paying for more (a call with this many arguments from Inject itself cost
-	// 5% on the 300 ns Inject benchmark; here the arguments are at hand).
-	exifOut = rawEXIF
-	if bytes.IndexByte(rawEXIF, 'O') >= 0 {
-		if exifOut, err = shiftExternalOffsets(cr, scratch, rawEXIF, rawIPTC, rawXMP, origIRB, preserveUnknownSegments, keepGUID, keep, plan); err != nil {
-			return nil, nil, w, nil, nil, "", err
-		}
+	if err := scanSplice(cr, scratch, sp, preserveUnknownSegments, keepGUID, keep); err != nil {
+		return nil, nil, w, nil, "", err
 	}
 	// Seek back to the start for the main copy pass.
 	if _, err := cr.Seek(0, io.SeekStart); err != nil {
-		return nil, nil, w, nil, nil, "", fmt.Errorf("jpeg: seek: %w", err)
+		return nil, nil, w, nil, "", fmt.Errorf("jpeg: seek: %w", err)
 	}
-	return origIRB, plan, out, exifOut, rawXMP, keepGUID, nil
+	return origIRB, plan, out, rawXMP, keepGUID, nil
 }
 
 // Inject reads the JPEG marker stream from r, replaces the relevant APP
 // segments with the provided payloads, and writes the result to w.
 // A nil payload means the corresponding segment is removed.
 // The SOS segment and compressed image data are passed through unchanged.
+//
+// The output is the source with only the metadata segments changed (tasks #400
+// and #403; see splice.go): a new segment replaces the first old segment of its
+// kind where it is, a kind the file has none of goes after the JFIF APP0 segment
+// (ITU-T T.871 | ISO/IEC 10918-5 §6.3, p. 3) and the JFIF extension and Adobe
+// APP14 segments that follow it, EXIF before XMP before IPTC, and every other
+// byte (segment order, fill bytes, other APPn segments, tables, scan data,
+// trailers) is copied as it is. Only the segment headers before the first scan
+// header are read. A source whose marker stream cannot be followed is copied
+// from the first byte that cannot be read, with the metadata added before it.
 //
 // rawXMP may be a wire-frame payload (produced by ExtractWithWire) when the
 // XMP was not modified; in that case the original main and extended APP1
@@ -1729,32 +1615,28 @@ func injectSegments(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byt
 	// #357: a keep frame in rawXMP asks to carry over the extended XMP segments
 	// of the source that were not merged; resolve it against this source before
 	// any pass moves the reader.
-	origIRB, plan, w, rawEXIF, rawXMP, keepGUID, err := prepareInject(cr, w, scratch, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments, keep)
+	sp := getSplicePlan()
+	defer putSplicePlan(sp)
+	origIRB, plan, w, rawXMP, _, err := prepareInject(cr, w, scratch, sp, rawIPTC, rawXMP, preserveUnknownSegments, keep)
 	if err != nil {
 		return err
 	}
 
-	// Read and write SOI using the pooled scratch buffer (#216): avoids the
-	// stack-array escape that occurs when a fixed-size array is passed to
-	// io.Reader/io.Writer through the interface boundary.
-	soi := (*scratch)[:2]
-	if _, err := io.ReadFull(cr, soi); err != nil {
-		return fmt.Errorf("jpeg: read SOI: %w", err)
+	// Copy the source, with the old metadata segments left out and the new ones
+	// put in (splice.go). The SOI marker, which scanSplice has checked, is
+	// copied with the rest.
+	pl := payloads{rawEXIF: rawEXIF, rawIPTC: rawIPTC, rawXMP: rawXMP, origIRB: origIRB}
+	// #362: a MakerNote offset to data outside the EXIF stream follows the data
+	// it addresses. Only an Olympus MakerNote holds one, and its signature
+	// starts with 'O': the single-byte search keeps the common stream from
+	// paying for more.
+	if bytes.IndexByte(rawEXIF, 'O') >= 0 {
+		if pl.rawEXIF, err = shiftExternalOffsets(cr, scratch, sp, &pl, plan); err != nil {
+			return err
+		}
 	}
-	if soi[0] != 0xFF || soi[1] != markerSOI {
-		return ErrNotJPEG
-	}
-	if _, err := w.Write(soi); err != nil {
-		return fmt.Errorf("jpeg: write segment: %w", err)
-	}
-
-	// Write new metadata segments before any existing ones.
-	if err := writeNewMetadataSegments(w, rawEXIF, rawIPTC, rawXMP, origIRB); err != nil {
-		return err
-	}
-
-	// Copy remaining segments, skipping old metadata APP segments.
-	return copyNonMetadataSegments(cr, w, scratch, preserveUnknownSegments, plan, keepGUID, keep)
+	var opsBuf [16]spliceOp
+	return writeSplice(cr, w, scratch, sp, sp.ops(&pl, opsBuf[:0]), &pl, plan)
 }
 
 // parseIRBEntry delegates to irbpkg.ParseEntry; see there for the recoverable-miss
@@ -1914,17 +1796,6 @@ func writeHeaderedBuf(w io.Writer, marker byte, bufPtr *[]byte) error {
 		return fmt.Errorf("jpeg: write segment: %w", err)
 	}
 	return nil
-}
-
-// writeSegmentCopy writes marker+data as a single JPEG segment, copying data
-// into a freshly pooled header+body buffer so the header and body leave in
-// one w.Write call. Used for pass-through segments (#216) where data aliases
-// the caller's scratch buffer and was not originally built with head-room for
-// the header.
-func writeSegmentCopy(w io.Writer, marker byte, data []byte) error {
-	bufPtr := iobuf.Get(segHeaderSize + len(data))
-	copy((*bufPtr)[segHeaderSize:], data)
-	return writeHeaderedBuf(w, marker, bufPtr)
 }
 
 // isAllHex reports whether b consists entirely of ASCII hex digits (0-9, a-f, A-F).

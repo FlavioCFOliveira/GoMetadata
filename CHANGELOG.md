@@ -6,6 +6,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
+### Added
+
+- **`exif.EXIF.Make` and `exif.EXIF.Software`** (`exif/exif.go`, #401): the IFD0 Make and Software text, with the value ended at the first NUL byte and the trailing blanks removed.
+- **`jpeg.ErrTooManySegments`, `png.ErrNoImageHeader`** (`format/jpeg/errors.go`, `format/png/errors.go`, #403): `jpeg.Inject` refuses a source with more than 65536 separate runs of metadata segments to replace; `png.Inject` refuses to add EXIF or XMP to a file with no IHDR chunk to place them after (before, the metadata was silently not written).
+
+### Changed
+
+- **Trailing blanks are removed from Make, Model, Software, Artist and LensModel** (`exif/exif.go`, `exif/ifd.go`, `metadata.go`, #401): `Metadata.Make`, `CameraModel`, `Software`, `LensModel` and `Creator` (and the matching `exif.EXIF` accessors) return the text of the tag without the blanks cameras pad it with, as ExifTool does (`Exif.pm` `s/\s+$//`). `Caption` and `Copyright` are unchanged, and so are the stored bytes. A Make or Software of only blanks counts as absent, so the XMP value is used. `Creator` returns the first creator of the trimmed Artist string. A value set with trailing blanks (`SetMake("x  ")`) is read back without them; the XMP mirror of a Set* call still receives the value as it was given.
+- **A GPS value with a zero denominator is reported as absent** (`exif/gps.go`, #402): `GPS`, `GPSAltitude` and `GPSTimeStamp` return ok=false for a RATIONAL or SRATIONAL with a zero denominator (before, a zero denominator in a coordinate gave a wrong latitude or longitude), and `Parse` adds a warning naming the tag.
+- **A JPEG write puts the modified metadata where the old segment was, or after the JFIF segment** (`format/jpeg/splice.go`, #400, #403): `Write` and `jpeg.Inject` no longer write the modified segments right after SOI, which put them before the JFIF APP0 segment (ITU-T T.871 §6.3). A replaced segment keeps its place; a new one goes after JFIF, JFXX and a leading Adobe APP14, and EXIF comes before XMP before IPTC. The write reads only the segment headers before the first scan header and copies everything else byte for byte, so a source whose segments cannot be followed (for example a segment that runs past the end of the file) is written, with the metadata added, where it was refused before. The Olympus preview offsets follow the new layout.
+- **A PNG write replaces the old eXIf and XMP chunks in place** (`format/png/png.go`, #403): a new chunk takes the place of the first old chunk of its kind; only a kind the file has none of goes after IHDR. The bytes after IEND are copied. After IHDR, a chunk that cannot be followed (header cut short, length past the end of the file) is copied with the rest of the file instead of failing the write, and no IEND is invented for it. A file that ends at a chunk boundary without IEND still receives one.
+
 ## [1.5.0] - 2026-10-17
 
 ### Added

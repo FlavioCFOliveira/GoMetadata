@@ -263,11 +263,10 @@ func checkChunkTruncation(chunkType [4]byte, pos, length, total int64) error {
 // stop is not limited to the skip path): both files predate whatever
 // metadata chunk their declared length overruns, so ce1dc82 itself read
 // nothing from them either — the correct outcome is "no metadata, no
-// error", not "no metadata, error". Inject's own truncation check
-// (injectOneChunk) is unaffected and continues to reject a truncated input
-// outright: writing a NEW file that silently drops trailing content the
-// caller did not ask to remove is a materially different, unsafe operation
-// from a best-effort Read.
+// error", not "no metadata, error". Inject (tasks #400, #403) treats the same
+// file in the same spirit: after IHDR it adds the metadata and copies the
+// stream it cannot follow as it is, so nothing the caller did not ask to
+// remove is lost.
 func Extract(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if _, err = r.Seek(0, io.SeekStart); err != nil {
 		return nil, nil, nil, fmt.Errorf("png: seek: %w", err)
@@ -549,31 +548,74 @@ func writeVerbatimChunk(w io.Writer, hdr *[8]byte, data []byte, crcB [4]byte) er
 	return nil
 }
 
+// injectState is what the chunk loop of Inject carries from chunk to chunk.
+type injectState struct {
+	rawEXIF, rawIPTC, rawXMP []byte
+	// total is the size of the stream, or -1 when it is not known.
+	total  int64
+	budget profileBudget
+	// exifOld and xmpOld report that the source holds an eXIf chunk, or an XMP
+	// iTXt chunk, that the new chunk of the same kind replaces in place
+	// (scanOldMetadata); a kind the source does not hold goes after IHDR.
+	exifOld, xmpOld bool
+	// exifDone and xmpDone report that the new chunk has been written.
+	exifDone, xmpDone bool
+	// ihdrDone reports that the IHDR chunk has been copied: from there on a
+	// chunk that cannot be read is copied as it is with the rest of the stream
+	// (copyRest) instead of failing the write.
+	ihdrDone bool
+	hdr      [8]byte
+}
+
+// copyRest copies the source from offset from to its end, after the point
+// where the chunk stream could not be followed (a truncated chunk, a damaged
+// header), and ends the chunk loop. Nothing is added: the bytes are not a
+// chunk this package can place metadata around, and none is left out.
+func (st *injectState) copyRest(r io.ReadSeeker, w io.Writer, from int64) error {
+	if _, err := r.Seek(from, io.SeekStart); err != nil {
+		return fmt.Errorf("png: seek: %w", err)
+	}
+	if _, err := io.Copy(w, r); err != nil {
+		return fmt.Errorf("png: copy remaining data: %w", err)
+	}
+	return errPNGDone
+}
+
 // injectOneChunk reads one PNG chunk header from r and either:
-//   - skips the existing eXIf chunk (always replaced, dropped without ever
-//     being read);
+//   - skips the existing eXIf chunk without reading its payload: the new eXIf
+//     chunk takes its place when it is the first and Inject has one to write,
+//     and the chunk is dropped otherwise;
 //   - reads an iTXt chunk's payload to decide whether it is the XMP chunk
-//     being replaced — dropping it if so, or copying it through
-//     byte-identical (including its original CRC) if not;
+//     being replaced, which is replaced or dropped in the same way, or is
+//     copied through byte-identical (including its original CRC) if not;
 //   - copies every other chunk through byte-identical, verbatim, including
-//     its original CRC — writing the library's own eXIf/XMP chunks
-//     immediately after IHDR, and signalling errPNGDone after IEND.
+//     its original CRC, writing the library's own eXIf and XMP chunks
+//     immediately after IHDR when the source holds none to replace, and, after
+//     IEND, copying what follows as it is (tasks #400 and #403).
 //
 // #288 / USER DECISION: a chunk that is copied through is NEVER "repaired" —
 // its original CRC trailer is written back exactly as read, even when that
 // CRC does not match the chunk's data (matches ExifTool/Exiv2's documented
 // behaviour; see TestInjectPreservesOriginalCRCEvenWhenInvalid). CRC is
 // computed only for the eXIf and XMP-iTXt chunks the library itself
-// constructs (writeChunk, called from writeMetadataAfterIHDR).
+// constructs (writeChunk).
 //
 // pos/total mirror readOrSkipChunk's bounds-checking contract (see
-// checkChunkTruncation): every chunk's declared length is checked against
-// the remaining stream before any Seek or read, so a truncated source PNG is
-// rejected here rather than silently accepted.
+// checkChunkTruncation). Task #403 (USER DECISION): once IHDR has been copied,
+// a chunk that cannot be followed (the header is cut short, or the declared
+// length runs past the end of the stream) is not an error: the rest of the
+// stream is copied as it is from the start of that chunk (injectState.copyRest),
+// so a damaged image still receives its metadata and loses nothing. Before IHDR
+// the same conditions are errors, as there is no place to put the metadata.
 //
 //nolint:cyclop,gocyclo // straight-line chunk-type dispatch; splitting would obscure the shared bounds check every branch needs
-func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64, rawEXIF, rawIPTC, rawXMP []byte, budget *profileBudget) (int64, error) {
+func injectOneChunk(r io.ReadSeeker, w io.Writer, st *injectState, pos int64) (int64, error) {
+	start := pos
+	hdr := &st.hdr
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		if st.ihdrDone && errors.Is(err, io.ErrUnexpectedEOF) {
+			return pos, st.copyRest(r, w, start)
+		}
 		return pos, fmt.Errorf("png: read chunk header: %w", err)
 	}
 	pos += int64(len(hdr))
@@ -582,6 +624,9 @@ func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64
 	copy(chunkType[:], hdr[4:8])
 
 	rawLen := binary.BigEndian.Uint32(hdr[:4])
+	if st.ihdrDone && st.total >= 0 && pos+int64(rawLen)+4 > st.total {
+		return pos, st.copyRest(r, w, start)
+	}
 	if rawLen > math.MaxInt32 {
 		return pos, fmt.Errorf("png: chunk %q length %d exceeds 2^31-1: %w", chunkTypeStr(chunkType), rawLen, ErrChunkTooLarge)
 	}
@@ -589,16 +634,21 @@ func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64
 	if length > maxPNGChunkSize {
 		return pos, fmt.Errorf("png: chunk %q length %d exceeds limit: %w", chunkTypeStr(chunkType), length, ErrChunkTooLarge)
 	}
-	if err := checkChunkTruncation(chunkType, pos, length, total); err != nil {
+	if err := checkChunkTruncation(chunkType, pos, length, st.total); err != nil {
 		return pos, err
 	}
 
-	if shouldDropChunk(chunkType, nil) {
-		// Only eXIf can be identified as a drop target without its data
-		// (shouldDropChunk's iTXt branch always returns false for nil data);
+	if chunkType == chunkEXIf {
+		// Only eXIf can be identified as a drop target without its data:
 		// skip it without ever reading its payload (#288).
 		if _, err := r.Seek(length+4, io.SeekCurrent); err != nil {
 			return pos, fmt.Errorf("png: skip chunk %q: %w", chunkTypeStr(chunkType), err)
+		}
+		if st.rawEXIF != nil && !st.exifDone {
+			st.exifDone = true
+			if err := writeEXIfChunk(w, st.rawEXIF); err != nil {
+				return pos, err
+			}
 		}
 		return pos + length + 4, nil
 	}
@@ -607,12 +657,12 @@ func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64
 	// tEXt and zTXt only when the write may have to rewrite or drop a "Raw
 	// profile type ..." chunk (tasks #314, #325), so a write without any
 	// metadata payload still streams them.
-	if chunkType == chunkITXt || ((rawIPTC != nil || rawEXIF != nil || rawXMP != nil) && (chunkType == chunkTEXt || chunkType == chunkZTXt)) {
+	if chunkType == chunkITXt || ((st.rawIPTC != nil || st.rawEXIF != nil || st.rawXMP != nil) && (chunkType == chunkTEXt || chunkType == chunkZTXt)) {
 		data, crcB, release, err := readChunkBody(r, length)
 		if err != nil {
 			return pos, fmt.Errorf("png: chunk %q: %w", chunkTypeStr(chunkType), err)
 		}
-		werr := writeTextChunk(w, hdr, chunkType, data, crcB, rawEXIF, rawIPTC, rawXMP, budget)
+		werr := writeTextChunk(w, hdr, chunkType, data, crcB, st)
 		release()
 		if werr != nil {
 			return pos, werr
@@ -620,43 +670,79 @@ func injectOneChunk(r io.ReadSeeker, w io.Writer, hdr *[8]byte, pos, total int64
 		return pos + length + 4, nil
 	}
 
+	if chunkType == chunkIEND && !st.ihdrDone && (st.rawEXIF != nil || st.rawXMP != nil) {
+		return pos, ErrNoImageHeader // IEND before any IHDR: nowhere to put the metadata
+	}
 	if err := copyChunkVerbatim(r, w, hdr, length); err != nil {
 		return pos, err
 	}
 	switch chunkType {
 	case chunkIHDR:
-		if err := writeMetadataAfterIHDR(w, rawEXIF, rawXMP); err != nil {
+		st.ihdrDone = true
+		if err := st.writeNewAfterIHDR(w); err != nil {
 			return pos, err
 		}
 	case chunkIEND:
+		// W3C PNG 3rd ed. §5.6: IEND is the last chunk. Bytes after it are not
+		// part of the datastream, but they are the file's: copy them (tasks
+		// #400 and #403).
+		if _, err := io.Copy(w, r); err != nil {
+			return pos, fmt.Errorf("png: copy data after IEND: %w", err)
+		}
 		return pos + length + 4, errPNGDone
 	}
 	return pos + length + 4, nil
 }
 
+// writeNewAfterIHDR writes the eXIf chunk and the XMP chunk that the source has
+// no chunk to replace, in that order, right after IHDR (PNG metadata
+// extension: eXIf and iTXt may appear anywhere between IHDR and IEND, before
+// the first IDAT chunk being the usual place).
+func (st *injectState) writeNewAfterIHDR(w io.Writer) error {
+	if st.rawEXIF != nil && !st.exifOld && !st.exifDone {
+		st.exifDone = true
+		if err := writeEXIfChunk(w, st.rawEXIF); err != nil {
+			return err
+		}
+	}
+	if st.rawXMP != nil && !st.xmpOld && !st.xmpDone {
+		st.xmpDone = true
+		if err := writeXMPChunk(w, st.rawXMP); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // writeTextChunk writes the text chunk data (type chunkType, original CRC
-// crcB) read by injectOneChunk: an XMP iTXt chunk is dropped (Inject writes
-// its own); an EXIF, APP1 or XMP raw profile chunk is dropped when Inject
-// writes the standard chunk that replaces its content (rawProfileSuperseded,
-// task #325); an IPTC raw profile chunk is rewritten with rawIPTC when it
-// holds another IIM (rewriteRawProfileIPTC; a fresh CRC is computed); and any
-// other chunk is copied through byte-identical, original CRC included.
+// crcB) read by injectOneChunk: an XMP iTXt chunk is replaced by the new XMP
+// chunk when it is the first and there is one to write, and dropped otherwise
+// (Inject writes its own); an EXIF, APP1 or XMP raw profile chunk is dropped
+// when Inject writes the standard chunk that replaces its content
+// (rawProfileSuperseded, task #325); an IPTC raw profile chunk is rewritten
+// with rawIPTC when it holds another IIM (rewriteRawProfileIPTC; a fresh CRC is
+// computed); and any other chunk is copied through byte-identical, original CRC
+// included.
 //
-// budget bounds the text that all the raw profile chunks of the file inflate
+// st.budget bounds the text that all the raw profile chunks of the file inflate
 // to (security audit F-08); ErrRawProfileBudget is returned when it runs out.
-func writeTextChunk(w io.Writer, hdr *[8]byte, chunkType [4]byte, data []byte, crcB [4]byte, rawEXIF, rawIPTC, rawXMP []byte, budget *profileBudget) error {
+func writeTextChunk(w io.Writer, hdr *[8]byte, chunkType [4]byte, data []byte, crcB [4]byte, st *injectState) error {
 	if shouldDropChunk(chunkType, data) {
+		if st.rawXMP != nil && !st.xmpDone {
+			st.xmpDone = true
+			return writeXMPChunk(w, st.rawXMP)
+		}
 		return nil
 	}
-	superseded, serr := rawProfileSupersededB(chunkType, data, rawEXIF != nil, rawXMP != nil, budget)
+	superseded, serr := rawProfileSupersededB(chunkType, data, st.rawEXIF != nil, st.rawXMP != nil, &st.budget)
 	if serr != nil {
 		return serr
 	}
 	if superseded {
 		return nil
 	}
-	if rawIPTC != nil {
-		payload, ok, err := rewriteRawProfileIPTCB(chunkType, data, rawIPTC, rawXMP != nil, budget)
+	if st.rawIPTC != nil {
+		payload, ok, err := rewriteRawProfileIPTCB(chunkType, data, st.rawIPTC, st.rawXMP != nil, &st.budget)
 		if err != nil {
 			return err
 		}
@@ -670,6 +756,67 @@ func writeTextChunk(w io.Writer, hdr *[8]byte, chunkType [4]byte, data []byte, c
 	return writeVerbatimChunk(w, hdr, data, crcB)
 }
 
+// scanOldMetadata reports whether the PNG in r holds an eXIf chunk and an XMP
+// iTXt chunk, reading the chunk headers from offset pos (after the signature)
+// and, for an iTXt chunk, its keyword; the rest of every chunk is skipped. It
+// stops at IEND and at the first chunk that cannot be followed, as
+// injectOneChunk does, and leaves r at pos. total is the size of the stream, or
+// -1 when it is not known. Only the kinds that Inject has a payload for are
+// looked for (wantEXIF, wantXMP). hdr is a buffer for the chunk headers (a local
+// array passed to a Reader would escape to the heap).
+//
+//nolint:cyclop,gocyclo // a header walk: each branch is one way a chunk is skipped or the walk ends
+func scanOldMetadata(r io.ReadSeeker, hdr *[8]byte, pos, total int64, wantEXIF, wantXMP bool) (exifOld, xmpOld bool, err error) {
+	start := pos
+	kwBuf := iobuf.Get(len(xmpKeyword) + 1)
+	defer iobuf.Put(kwBuf)
+	for (wantEXIF && !exifOld) || (wantXMP && !xmpOld) {
+		length, typ, ok := nextChunkHead(r, hdr, pos, total)
+		if !ok || typ == chunkIEND {
+			break
+		}
+		pos += 8
+		skip := length + 4 // the data and the CRC
+		if typ == chunkEXIf {
+			exifOld = true
+		}
+		if typ == chunkITXt && wantXMP && length > int64(len(xmpKeyword)) {
+			kw := (*kwBuf)[:len(xmpKeyword)+1]
+			if _, rerr := io.ReadFull(r, kw); rerr != nil {
+				break
+			}
+			xmpOld = xmpOld || isXMPChunk(kw)
+			skip -= int64(len(kw))
+		}
+		if _, serr := r.Seek(skip, io.SeekCurrent); serr != nil {
+			return false, false, fmt.Errorf("png: seek: %w", serr)
+		}
+		pos += length + 4
+	}
+	if _, serr := r.Seek(start, io.SeekStart); serr != nil {
+		return false, false, fmt.Errorf("png: seek: %w", serr)
+	}
+	return exifOld && wantEXIF, xmpOld && wantXMP, nil
+}
+
+// nextChunkHead reads the header of the chunk that starts at offset pos of r
+// (r is at pos) into hdr: the length of its data and its type. ok is false when the
+// header cannot be read or the chunk cannot be followed (a length above 2^31-1
+// or the limit, or one that runs past the end of a stream of size total, -1
+// when it is not known), as injectOneChunk judges it.
+func nextChunkHead(r io.Reader, hdr *[8]byte, pos, total int64) (length int64, typ [4]byte, ok bool) {
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return 0, typ, false
+	}
+	rawLen := binary.BigEndian.Uint32(hdr[:4])
+	length = int64(rawLen)
+	if rawLen > math.MaxInt32 || length > maxPNGChunkSize || (total >= 0 && pos+8+length+4 > total) {
+		return 0, typ, false
+	}
+	copy(typ[:], hdr[4:8])
+	return length, typ, true
+}
+
 // Inject reads the PNG chunk stream from r, replaces or inserts the eXIf and
 // iTXt(XMP) chunks, and writes the result to w. PNG has no native IPTC
 // chunk, so rawIPTC is not added to a file that has none; when the file
@@ -679,7 +826,16 @@ func writeTextChunk(w io.Writer, hdr *[8]byte, chunkType [4]byte, data []byte, c
 // leaves such a chunk unchanged.
 //
 // EXIF and XMP are always written to their standard chunks (eXIf and the
-// "XML:com.adobe.xmp" iTXt). A "Raw profile type exif", "APP1" or "xmp" text
+// "XML:com.adobe.xmp" iTXt). A new chunk replaces the first old chunk of its
+// kind where it is, and the other old chunks of the kind are dropped; a kind
+// the file has none of goes right after IHDR. Every other byte of the source is
+// copied as it is, the bytes after IEND included. When the chunk stream cannot
+// be followed after IHDR (a chunk that runs past the end of the file, a damaged
+// header), the rest of the file is copied as it is from that point: the write
+// adds the metadata and does not decide whether the rest is a PNG (tasks #400
+// and #403). A file that ends at a chunk boundary without IEND receives one
+// (§5.6). A file with no IHDR to place the metadata after returns
+// ErrNoImageHeader. A "Raw profile type exif", "APP1" or "xmp" text
 // chunk whose content that standard chunk replaces is dropped, so exactly one
 // current copy remains (task #325; PNG 3rd Edition §11.3.4.5: only one eXIf
 // chunk; XMP Specification Part 3 §1.1.5, p. 16: no more than one chunk
@@ -738,28 +894,38 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 		return fmt.Errorf("png: write signature: %w", err)
 	}
 
-	var hdr [8]byte
+	st := injectState{rawEXIF: rawEXIF, rawIPTC: rawIPTC, rawXMP: rawXMP, total: total, budget: newProfileBudget()}
 	pos := int64(len(pngSig))
-	budget := newProfileBudget()
+	if rawEXIF != nil || rawXMP != nil {
+		// A new chunk replaces the old chunk of its kind in place; only the
+		// kinds the source does not hold go after IHDR (tasks #400, #403).
+		var err error
+		if st.exifOld, st.xmpOld, err = scanOldMetadata(r, &st.hdr, pos, total, rawEXIF != nil, rawXMP != nil); err != nil {
+			return err
+		}
+	}
 	for {
 		var err error
-		pos, err = injectOneChunk(r, w, &hdr, pos, total, rawEXIF, rawIPTC, rawXMP, &budget)
+		pos, err = injectOneChunk(r, w, &st, pos)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break
 			}
 			if errors.Is(err, errPNGDone) {
-				// Source PNG had an IEND chunk; it has already been copied
-				// through verbatim by injectOneChunk. Return immediately so
-				// we do not write a second IEND (W3C PNG 3rd ed. §5.6: IEND
-				// is unique).
+				// The chunk stream ended with IEND, or could not be followed
+				// and was copied as it is: nothing is left to write (a second
+				// IEND would break W3C PNG 3rd ed. §5.6: IEND is unique).
 				return nil
 			}
 			return err
 		}
 	}
 
-	// The source PNG ended without an IEND chunk (truncated or malformed input).
+	// The source PNG ended, at a chunk boundary, without an IEND chunk
+	// (truncated or malformed input).
+	if !st.ihdrDone && (rawEXIF != nil || rawXMP != nil) {
+		return ErrNoImageHeader
+	}
 	// W3C PNG 3rd ed. §5.6: "The IEND chunk must appear LAST. It marks the end
 	// of the PNG datastream." Write a synthetic IEND so the output is always a
 	// structurally complete PNG regardless of whether the source was well-formed.
@@ -774,38 +940,45 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 const xmpITXtOverhead = len(xmpKeyword) + 5 // 17 + 5 = 22
 
 // writeMetadataAfterIHDR writes the eXIf chunk (if rawEXIF is non-nil) and
-// the iTXt XMP chunk (if rawXMP is non-nil) to w. Both chunks are placed
-// immediately after IHDR per the PNG metadata extension specification.
-//
-// Size guards (W3C PNG 3rd ed. §5.3 / ISO 15948 §11.2.1): the PNG chunk
-// Length field is a 31-bit unsigned integer; values >= 2^31 are forbidden.
-// If either payload would exceed this limit the function returns ErrXMPTooLarge
-// (for XMP) or ErrChunkTooLarge (for EXIF) without writing any bytes.
+// the iTXt XMP chunk (if rawXMP is non-nil) to w, in that order.
 func writeMetadataAfterIHDR(w io.Writer, rawEXIF, rawXMP []byte) error {
 	if rawEXIF != nil {
-		// PNG §5.3: chunk Length must be ≤ 2^31−1.
-		if len(rawEXIF) > math.MaxInt32 {
-			return fmt.Errorf("png: EXIF payload (%d bytes) exceeds PNG chunk limit of 2^31-1: %w",
-				len(rawEXIF), ErrChunkTooLarge)
-		}
-		if err := writeChunk(w, chunkEXIf, rawEXIF); err != nil {
+		if err := writeEXIfChunk(w, rawEXIF); err != nil {
 			return err
 		}
 	}
 	if rawXMP != nil {
-		// W3C PNG 3rd ed. §5.3: chunk Length field is 31-bit unsigned.
-		// The iTXt payload = xmpITXtOverhead + len(rawXMP); guard against overflow
-		// before PutUint32 silently truncates a value ≥ 2^31.
-		if len(rawXMP) > math.MaxInt32-xmpITXtOverhead {
-			return fmt.Errorf("png: XMP payload (%d bytes) would produce iTXt chunk length > 2^31-1: %w",
-				len(rawXMP), ErrXMPTooLarge)
-		}
-		xmpChunk := buildXMPChunk(rawXMP)
-		if err := writeChunk(w, chunkITXt, xmpChunk); err != nil {
-			return err
-		}
+		return writeXMPChunk(w, rawXMP)
 	}
 	return nil
+}
+
+// writeEXIfChunk writes rawEXIF as an eXIf chunk.
+//
+// Size guard (W3C PNG 3rd ed. §5.3 / ISO 15948 §11.2.1): the PNG chunk Length
+// field is a 31-bit unsigned integer; a payload above that limit returns
+// ErrChunkTooLarge without writing any bytes.
+func writeEXIfChunk(w io.Writer, rawEXIF []byte) error {
+	// PNG §5.3: chunk Length must be ≤ 2^31−1.
+	if len(rawEXIF) > math.MaxInt32 {
+		return fmt.Errorf("png: EXIF payload (%d bytes) exceeds PNG chunk limit of 2^31-1: %w",
+			len(rawEXIF), ErrChunkTooLarge)
+	}
+	return writeChunk(w, chunkEXIf, rawEXIF)
+}
+
+// writeXMPChunk writes rawXMP as an iTXt chunk with the XMP keyword.
+//
+// Size guard (W3C PNG 3rd ed. §5.3): the chunk Length field is 31-bit
+// unsigned. The iTXt payload = xmpITXtOverhead + len(rawXMP); it is checked
+// before PutUint32 silently truncates a value ≥ 2^31, and a payload above the
+// limit returns ErrXMPTooLarge without writing any bytes.
+func writeXMPChunk(w io.Writer, rawXMP []byte) error {
+	if len(rawXMP) > math.MaxInt32-xmpITXtOverhead {
+		return fmt.Errorf("png: XMP payload (%d bytes) would produce iTXt chunk length > 2^31-1: %w",
+			len(rawXMP), ErrXMPTooLarge)
+	}
+	return writeChunk(w, chunkITXt, buildXMPChunk(rawXMP))
 }
 
 // errPNGDone is a sentinel returned from the readChunk callback to signal that

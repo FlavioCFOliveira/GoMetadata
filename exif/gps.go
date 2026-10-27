@@ -46,17 +46,26 @@ const (
 // and GpsDirectory.java, read them). That deviation is accepted here: an
 // SRATIONAL value is valid when its numerator is not negative and its
 // denominator is positive, and then it has the same meaning as the RATIONAL of
-// the same bits. A negative numerator or a zero or negative denominator is not
-// a valid coordinate, altitude magnitude or time, so ok is false (the Parse
-// warning is added by gpsDeviationWarnings). The entry bytes are never
-// modified, so the write path keeps the original type.
+// the same bits. A negative numerator is not a valid coordinate, altitude
+// magnitude or time.
 //
-// A RATIONAL value is returned as stored, even with a zero denominator; the
-// callers decide what a zero denominator means for their field.
+// A zero denominator is invalid for both types: TIFF 6.0 §2 (p. 15) defines a
+// RATIONAL as the quotient of two LONGs, which is undefined for a zero
+// denominator, and the value would otherwise decode to a wrong coordinate
+// (Task #402). ExifTool treats x/0 as an invalid rational as well (it yields
+// "undef" or "inf"; it never reports a position computed from it). Reading
+// fewer bytes than the value needs also gives a zero denominator.
+//
+// ok is false for each of these cases; the Parse warning is added by
+// gpsDeviationWarnings. The entry bytes are never modified, so the write path
+// keeps the original type and value.
 func decodeGPSRational(entry *IFDEntry, i int) (num, den uint32, ok bool) {
 	switch entry.Type {
 	case TypeRational:
 		r := entry.Rational(i)
+		if r[1] == 0 {
+			return 0, 0, false
+		}
 		return r[0], r[1], true
 	case TypeSRational:
 		r := entry.SRational(i)
@@ -106,7 +115,7 @@ func parseGPSAltitude(ifd *IFD) (float64, bool) {
 		return 0, false
 	}
 	num, den, ok := decodeGPSRational(entry, 0)
-	if !ok || den == 0 {
+	if !ok {
 		return 0, false
 	}
 	alt := float64(num) / float64(den)
@@ -127,7 +136,7 @@ func parseGPSTimeStamp(ifd *IFD) (hour, minute, second float64, ok bool) {
 	var v [3]float64
 	for i := range 3 {
 		num, den, valid := decodeGPSRational(entry, i)
-		if !valid || den == 0 {
+		if !valid {
 			return 0, 0, 0, false
 		}
 		v[i] = float64(num) / float64(den)
@@ -138,12 +147,12 @@ func parseGPSTimeStamp(ifd *IFD) (hour, minute, second float64, ok bool) {
 // gpsDeviationTags lists the GPS tags decodeGPSRational reads.
 var gpsDeviationTags = [...]TagID{TagGPSLatitude, TagGPSLongitude, TagGPSAltitude, TagGPSTimeStamp} //nolint:gochecknoglobals // immutable lookup table
 
-// gpsDeviationWarnings returns one warning for each GPS tag that is written as
-// SRATIONAL and holds a value decodeGPSRational rejects (negative numerator,
-// zero or negative denominator). A valid SRATIONAL value is accepted silently.
-// It reads no more than four entries and allocates only when it finds a
-// rejected value, so Parse pays almost nothing on a file with a compliant GPS
-// IFD (Task #385).
+// gpsDeviationWarnings returns one warning for each GPS tag that holds a value
+// decodeGPSRational rejects: a zero denominator (RATIONAL or SRATIONAL), or an
+// SRATIONAL with a negative numerator or a negative denominator. A valid value
+// is accepted silently. It reads no more than four entries and allocates only
+// when it finds a rejected value, so Parse pays almost nothing on a file with
+// a compliant GPS IFD (Tasks #385 and #402).
 func gpsDeviationWarnings(gps *IFD) []string {
 	if gps == nil {
 		return nil
@@ -151,13 +160,18 @@ func gpsDeviationWarnings(gps *IFD) []string {
 	var out []string
 	for _, tag := range gpsDeviationTags {
 		entry := gps.Get(tag)
-		if entry == nil || entry.Type != TypeSRational {
+		if entry == nil || (entry.Type != TypeSRational && entry.Type != TypeRational) {
 			continue
 		}
 		for i := range int(min(entry.Count, 3)) {
 			if _, _, ok := decodeGPSRational(entry, i); !ok {
-				out = append(out, "exif: GPS tag 0x"+string(appendHex4(nil, uint32(tag)))+
-					" is SRATIONAL with a negative numerator or a non-positive denominator; value ignored (Exif 3.1 \u00a74.6.6 defines RATIONAL)")
+				if entry.Type == TypeRational {
+					out = append(out, "exif: GPS tag 0x"+string(appendHex4(nil, uint32(tag)))+
+						" has a RATIONAL value with a zero denominator; value ignored (TIFF 6.0 \u00a72)")
+				} else {
+					out = append(out, "exif: GPS tag 0x"+string(appendHex4(nil, uint32(tag)))+
+						" is SRATIONAL with a negative numerator or a non-positive denominator; value ignored (Exif 3.1 \u00a74.6.6 defines RATIONAL)")
+				}
 				break
 			}
 		}

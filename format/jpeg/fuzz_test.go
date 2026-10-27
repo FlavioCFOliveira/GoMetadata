@@ -89,14 +89,6 @@ func FuzzJPEGExtract(f *testing.F) {
 	})
 }
 
-// min returns the smaller of a and b.
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // FuzzJPEGInject feeds arbitrary bytes as the source JPEG container and
 // asserts that Inject never panics — it must return an error or write valid
 // output, never crash. The no-panic contract is the primary correctness

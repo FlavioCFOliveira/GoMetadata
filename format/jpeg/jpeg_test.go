@@ -3,7 +3,6 @@ package jpeg
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -1005,16 +1004,6 @@ func TestParseIRBEntryMissingResourceIDField(t *testing.T) {
 	}
 }
 
-// TestWriteMarkerError verifies that writeMarker returns an error when the
-// writer fails.
-func TestWriteMarkerError(t *testing.T) {
-	t.Parallel()
-	err := writeMarker(errorWriter{}, 0xD9)
-	if err == nil {
-		t.Error("writeMarker: expected error from failing writer, got nil")
-	}
-}
-
 // TestWriteSegmentTooLarge verifies that writeSegment returns ErrSegmentTooLarge
 // when the payload exceeds the JPEG 16-bit length field limit.
 func TestWriteSegmentTooLarge(t *testing.T) {
@@ -1065,13 +1054,6 @@ func TestReadSegmentInvalidLength(t *testing.T) {
 // TestSkipPascalStringEdgeCases moved to internal/irb (TestSkipPascalString_EdgeCases)
 // together with the parser it exercises.
 
-// errorWriter is a test helper that always returns an error on Write.
-type errorWriter struct{}
-
-func (errorWriter) Write(_ []byte) (int, error) {
-	return 0, errors.New("simulated write error")
-}
-
 // TestProcessAPP13PhotoshopPrefixNoIRB verifies that processAPP13Segment returns
 // nil when the data starts with the Photoshop prefix but contains no valid 8BIM
 // entries (parseIRB returns nil).
@@ -1085,18 +1067,17 @@ func TestProcessAPP13PhotoshopPrefixNoIRB(t *testing.T) {
 	}
 }
 
-// TestWriteSOSCopyError verifies that writeSOS returns an error when
-// io.Copy fails (failing writer after SOS segment header is written).
-func TestWriteSOSCopyError(t *testing.T) {
+// TestInjectCopyErrorPropagates verifies that Inject returns the error of the
+// writer when it fails while the image data is copied (the splice write of
+// splice.go ends with that copy).
+func TestInjectCopyErrorPropagates(t *testing.T) {
 	t.Parallel()
-	// writeSOS with empty data calls writeSegment (1 Write: the 4-byte header),
-	// then io.Copy. failAfter=1 lets the header write succeed, then fails on copy.
-	ew := &countingWriter{failAfter: 1}
-	data := []byte{}
-	reader := bytes.NewReader([]byte{0x01, 0x02}) // some image data to copy
-	err := writeSOS(reader, ew, data)
-	if err == nil {
-		t.Error("expected error from writeSOS when io.Copy fails, got nil")
+	src := []byte{0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02, 0x01, 0x02, 0xFF, 0xD9}
+	for failAfter := range 3 {
+		ew := &countingWriter{failAfter: failAfter}
+		if err := Inject(bytes.NewReader(src), ew, minimalTIFFBytes(), nil, nil, true); err == nil {
+			t.Errorf("failAfter=%d: expected the writer error, got nil", failAfter)
+		}
 	}
 }
 
@@ -1112,27 +1093,6 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 		return 0, fmt.Errorf("simulated write error after %d writes", w.failAfter)
 	}
 	return len(p), nil
-}
-
-// TestCopyNonMetadataSegmentsReadError verifies that copyNonMetadataSegments
-// returns the non-EOF error when readSegment fails.
-func TestCopyNonMetadataSegmentsReadError(t *testing.T) {
-	t.Parallel()
-	// Build a valid JPEG SOI, then one APP0 segment, then truncated data.
-	// This will cause readSegment to return a non-EOF error.
-	var buf bytes.Buffer
-	// Write an APP0 marker with length=5 (2-byte length field = 5, but data only 3 bytes follow).
-	buf.Write([]byte{0xFF, 0xE0}) // APP0 marker
-	buf.Write([]byte{0x00, 0x05}) // length=5 means 3 bytes of data
-	buf.Write([]byte{0x00, 0x00}) // only 2 bytes — truncated
-
-	scratch := make([]byte, 0, 4096)
-	var out bytes.Buffer
-	err := copyNonMetadataSegments(bytes.NewReader(buf.Bytes()), &out, &scratch, true, nil, "", 0)
-	// The truncated read should produce an error (non-EOF, unexpected EOF).
-	if err == nil {
-		t.Error("expected error for truncated segment, got nil")
-	}
 }
 
 // --- Regression test: APP1 EXIF payload shorter than a TIFF header ---

@@ -61,3 +61,8 @@ var ErrXMPTooLarge = errors.New("png: XMP payload too large for a single PNG chu
 // has to be inflated to be read, and a file that repeats a 64 MiB zlib bomb in
 // many chunks would otherwise cost seconds of CPU per Read or Write (CWE-409).
 var ErrRawProfileBudget = errors.New("png: the embedded metadata profiles expand to more data than the limit")
+
+// ErrNoImageHeader is returned by Inject when it has EXIF or XMP to write and the
+// file has no image header chunk to place them after (a file that is cut short
+// before it, or whose first chunk cannot be read).
+var ErrNoImageHeader = errors.New("png: the file has no image header, so metadata cannot be stored in it")

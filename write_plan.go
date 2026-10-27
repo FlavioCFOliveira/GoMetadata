@@ -34,8 +34,10 @@ import (
 // What the output of a write is made of, per container:
 //
 //   - Nothing modified: byte-identical to the source in every container.
-//   - JPEG: the modified segments are written after SOI, the others stay where
-//     they are in the source, byte for byte (the IPTC digest included).
+//   - JPEG: a modified segment is written in the place of the old one, or after
+//     the JFIF APP0 segment when the source has none (tasks #400, #403); the
+//     others stay where they are in the source, byte for byte (the IPTC digest
+//     included), and so does every other byte up to the end of the file.
 //   - PNG, WebP, HEIF/AVIF, CR3: the modified segments are encoded; the others
 //     are written from the raw bytes Read kept, which equal the source's.
 //   - TIFF, DNG, CR2, NEF, ARW, ORF, RW2: byte identity is not attainable

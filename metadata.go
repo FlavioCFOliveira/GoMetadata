@@ -659,14 +659,13 @@ func (m *Metadata) Keywords() []string {
 	return m.resolveKeywords()
 }
 
-// Make returns the camera manufacturer string.
+// Make returns the camera manufacturer string. Trailing blanks of the EXIF
+// value are removed, as ExifTool does; a value of only blanks counts as absent.
 // Source priority: EXIF > XMP (tiff:Make).
 func (m *Metadata) Make() string {
-	if m.EXIF != nil && m.EXIF.IFD0 != nil {
-		if e := m.EXIF.IFD0.Get(exif.TagMake); e != nil {
-			if v := e.String(); v != "" {
-				return v
-			}
+	if m.EXIF != nil {
+		if v := m.EXIF.Make(); v != "" {
+			return v
 		}
 	}
 	if m.XMP != nil {
@@ -676,13 +675,13 @@ func (m *Metadata) Make() string {
 }
 
 // Software returns the software / firmware string used to produce the image.
+// Trailing blanks of the EXIF value are removed, as ExifTool does; a value of
+// only blanks counts as absent.
 // Source priority: EXIF > XMP (xmp:CreatorTool).
 func (m *Metadata) Software() string {
-	if m.EXIF != nil && m.EXIF.IFD0 != nil {
-		if e := m.EXIF.IFD0.Get(exif.TagSoftware); e != nil {
-			if v := e.String(); v != "" {
-				return v
-			}
+	if m.EXIF != nil {
+		if v := m.EXIF.Software(); v != "" {
+			return v
 		}
 	}
 	if m.XMP != nil {

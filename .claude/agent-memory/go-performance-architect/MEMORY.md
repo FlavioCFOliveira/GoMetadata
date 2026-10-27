@@ -1,5 +1,6 @@
 # Memory Index
 
+- [Sprint 49 #400-#403 (2026-10-27)](project_sprint49_400_403_splice_write.md) — JPEG/PNG splice write, GPS zero denominator, trimmed EXIF text; traps: test-only min shadow, StreamCopyN 512 B growth, PNG nil-EXIF drop bug
 - [Sprint 49 #385-#388 (2026-10-27)](project_sprint49_385_388_selective_write.md) — SRATIONAL GPS, first-NUL, selective Write (Segment/MarkModified/InjectKeeping); _386_test.go GOARCH trap, A/B bench method
 - [Sprint 47 security clearance (2026-10-16, done)](project_sprint47_security_clearance.md) — F-01..F-10 fixes (#372-#383): limits/errors chosen, growing hash index, zero-value budget, 386 vet on darwin
 - [Sprint 46 E6 (2026-10-16, done)](project_sprint46_e6_progress.md) — #358-#365: iinf count, bmff open-ended, Samsung rigid piece, Olympus MN-relative preview offset, KodakIFD, ExifVersion table, headerless Nikon, JPEG DNL

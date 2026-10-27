@@ -2163,6 +2163,45 @@ func (e *IFDEntry) String() string {
 	return string(v)
 }
 
+// blanks8 is eight ASCII spaces read as a uint64, whatever the byte order.
+const blanks8 uint64 = 0x2020202020202020
+
+// blankTrimmedString is String with the trailing blanks removed. It is nil-safe
+// (a nil entry gives ""), so accessors can chain it onto IFD.Get.
+//
+// Cameras fill fixed-size text tags (Make, Model, Software, Artist, LensModel)
+// with trailing spaces, and the EXIF specification allows a writer to pad an
+// unknown value with blanks (CIPA DC-008-2026 §4.6.2, ASCII type). ExifTool
+// removes them with s/\s+$// (Exif.pm, tags 0x10F, 0x110, 0x131, 0x13B), so
+// the blanks removed are the Perl \s class: space, \t, \n, \v, \f and \r. The
+// stored bytes are never modified; only the returned string is trimmed
+// (task #401).
+func (e *IFDEntry) blankTrimmedString() string {
+	if e == nil || (e.Type != TypeASCII && e.Type != TypeUTF8) || len(e.Value) == 0 {
+		return ""
+	}
+	v := e.Value
+	if i := bytes.IndexByte(v, 0); i >= 0 {
+		v = v[:i]
+	}
+	return string(v[:trimmedLen(v)])
+}
+
+// trimmedLen returns the length of v without its trailing blanks.
+func trimmedLen(v []byte) int {
+	n := len(v)
+	for n >= 8 && binary.LittleEndian.Uint64(v[n-8:n]) == blanks8 { // eight spaces at once
+		n -= 8
+	}
+	// '\t', '\n', '\v', '\f' and '\r' are the contiguous codes 9 to 13: one
+	// unsigned comparison tests all five, which keeps a long run of padding
+	// cheap (the padded fields are 20 to 32 bytes of blanks).
+	for n > 0 && (v[n-1] == ' ' || v[n-1]-'\t' <= '\r'-'\t') {
+		n--
+	}
+	return n
+}
+
 // Strings decodes the entry value as the list of NUL-separated strings of a
 // multi-string ASCII or UTF-8 value (TIFF 6.0 §2, p. 15: an ASCII field may
 // hold several NUL-terminated strings, its Count covers all of them).

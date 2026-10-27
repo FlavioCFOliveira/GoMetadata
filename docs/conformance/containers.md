@@ -26,6 +26,31 @@ EXIF write must not exceed 65533 (cannot span) — fail rather than truncate.
 `Exif\0\0` (use first); ExtendedXMP missing/dup/overlapping chunks, GUID mismatch; malformed IRB
 length/padding; fill bytes (`FF FF…`).
 
+**Rule IDs (JPEG splice write).** (tasks #400, #403) `Inject` copies the source and changes only the metadata
+segments; the scan (`format/jpeg/splice.go`) reads the segment headers before the first scan header and nothing after.
+- **JFIF-01** A new metadata segment of a kind the source has none of goes after the JFIF APP0 segment (ITU-T T.871 | ISO/IEC
+  10918-5 §6.3, p. 3: it "shall immediately follow the SOI marker"), after the JFIF extension APP0 segments that follow it
+  (§10.2, p. 7) and after a leading Adobe APP14 segment; EXIF, then XMP, then IPTC. A source with none of them gets the segment
+  right after SOI. A JFIF segment that is not first, or that follows another segment, is not moved or passed over.
+  `TestSplice_Placement/JFIF-*`, `TestTask400_ModifiedWriteKeepsJFIFFirst` (Canon_40D after `SetISO`: APP0, APP1, APP2, DQT),
+  `TestTask400_Corpus_JFIFStaysFirst`.
+- **PLACE-01** A new segment replaces the first old segment of its kind where it is, and the other old segments of the kind
+  are dropped; a new XMP follows the EXIF of the source and a new IPTC follows the XMP, else the EXIF (CIPA DC-008-2026
+  §4.5.4, p. 20, and Table 4, p. 22: APP1 immediately after SOI, which a file with a JFIF APP0 cannot satisfy together with
+  T.871 §6.3; JFIF wins, as in ExifTool, and the Exif APP1 stays the first APP1); a nil payload removes the old segments. `TestSplice_Placement/PLACE-*`,
+  `TestSplice_KeepInPlace`.
+- **JPEG-IDENT** Every other byte of the source is copied as it is: segment order, fill bytes (ISO/IEC 10918-1 §B.1.1.2), other
+  APPn segments, tables, the scan header, the image data (never parsed) and what follows EOI; the fill bytes before a dropped
+  segment go with it. `TestSplice_ByteIdentity`, `TestTask403_Corpus_JPEGSpliceMetadataless` (377 metadata-less corpus
+  JPEGs: no error, output without the metadata segments equals the source without them, a rewritten AFCP/FotoStation trailer
+  excepted), `FuzzJPEGSplice`.
+- **JPEG-DAMAGE** A source whose segments cannot be followed before the first scan header (no marker prefix, a length below 2, a
+  segment past the end of the file, a cut header) is copied from the first byte that cannot be read; the metadata is added before
+  it. A source that does not start with SOI is refused and nothing is written (`ErrNotJPEG`); more than 65536 separate runs of
+  segments to leave out are refused (`ErrTooManySegments`). `TestSplice_DamagedSource`, `TestSplice_TooManyRuns`.
+- **R-27 (layout)** The Olympus preview offset follows the new layout: the position of the new EXIF stream and of the segments
+  before the scan header is computed from the steps of the write. `TestSplice_ExternalOffsetsLayout`, `TestExternalOffsets_*`.
+
 **Rule IDs (JPEG trailers; sub-test names).**
 - **TRAILER-SAMSUNG-01** (task #353) The Samsung "Sound & Shot" trailer ends with a QDIO block (`QDIO`,
   101, 1, the absolute offsets of the start and the end of its audio file, all little-endian, then the block
@@ -93,6 +118,18 @@ XMP → `iTXt` keyword `XML:com.adobe.xmp`, compression 0, empty lang/translated
 **(e)** Length = data length; recompute CRC over Type+Data; insert ancillary chunks between
 IHDR and IEND (eXIf/text before IDAT recommended); preserve unknown safe-to-copy chunks.
 **PNG-EXIF-01** (task #325) A write that emits the eXIf chunk drops a `Raw profile type exif` or `APP1` text chunk (tEXt, zTXt or iTXt) whose decoded profile is the EXIF it replaces (PNG-3 §11.3.4.5: one eXIf chunk), so one current copy remains; an undecodable profile, a profile of another kind and a nil EXIF payload leave the chunk byte-identical. `TestInject_RawProfileEXIFDropped`, `TestInject_RawProfileKeptWhenNotSuperseded`, `TestInject_RawProfilesAllKinds`. (`Raw profile type iptc` is rewritten in place: task #314.)
+**Rule IDs (PNG splice write).** (tasks #400, #403)
+- **PNG-PLACE** A new eXIf or XMP iTXt chunk replaces the first old chunk of its kind where it is and the other old chunks of
+  the kind are dropped; a kind the file has none of goes right after IHDR (eXIf and iTXt may appear anywhere between IHDR and
+  IEND, PNG-3 §11.3.4.5 and §11.3.4.4). A nil payload drops the old chunk, as before. `TestInjectPlacement`, `TestScanOldMetadata`.
+- **PNG-IDENT** Every other byte is copied as it is: a chunk with a wrong CRC, unknown chunks, and the bytes after IEND.
+  `TestInjectVerbatim`, `TestTask403_Corpus_PNGSpliceMetadataless` (667 metadata-less corpus PNGs), `FuzzPNGSplice`.
+- **PNG-DAMAGE** After IHDR a chunk that cannot be followed (header cut short, declared length past the end of the file or above
+  2^31-1) is copied with the rest of the file, the metadata is added, and no IEND is invented; before IHDR the same is refused,
+  as is an IEND with no IHDR before it (`ErrNoImageHeader`): a file whose first chunk is not IHDR has no place for metadata (the
+  26 such corpus files, for example `m1-593d4b1a0b5d13b539c6c098dc5797ca.png`, first chunk `vHDR`). `TestInjectDamaged`.
+- **PNG-IEND** A file that ends at a chunk boundary without IEND receives one (PNG-3 §5.6: IEND is last): this is the 12-byte
+  growth of `m6-1f97f040d0b6b26faeb0a1a7f1499590.png` (856 bytes; last chunk `IFND`). `TestInjectIEND`, `TestTask403_PNG_M6GrowsByIEND`.
 **(f)** Bad signature; truncated chunk; Length past EOF; CRC mismatch (detect, no crash);
 Length > 2³¹−1; zero-length data (legal); duplicate IHDR/IEND; chunks after IEND; bad iTXt
 zlib/separators; non-UTF-8 XMP; bad eXIf TIFF header.
