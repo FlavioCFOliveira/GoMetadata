@@ -202,20 +202,11 @@ func Write(r io.ReadSeeker, w io.Writer, m *Metadata, opts ...WriteOption) error
 		return err
 	}
 
-	// Task #387: a PNG leaves the chunks of the carried segments as they are:
-	// nil payloads mean "unchanged" to png.Inject, which would otherwise write a
-	// carried EXIF, IPTC or XMP again (an IPTC raw profile text chunk, for
-	// one, is rewritten from the IIM bytes).
-	if fmtID == format.FormatPNG {
-		if plan.carry&SegmentEXIF != 0 {
-			rawEXIF = nil
-		}
-		if plan.carry&SegmentIPTC != 0 {
-			rawIPTC = nil
-		}
-		if plan.carry&SegmentXMP != 0 {
-			rawXMP = nil
-		}
+	// Tasks #387, #405: a PNG copies the chunks of the carried segments as they
+	// are. A nil payload cannot say that to png.Inject (it removes the eXIf and
+	// XMP chunks), so the carried segments go in a png.Keep.
+	if fmtID == format.FormatPNG && plan.carry != 0 {
+		return wrapInject(png.InjectKeeping(r, w, rawEXIF, rawIPTC, rawXMP, cfg.preserveUnknownSegments, plan.carry.pngKeep()))
 	}
 
 	// Task #387: a JPEG leaves the segments carried from r where they are.

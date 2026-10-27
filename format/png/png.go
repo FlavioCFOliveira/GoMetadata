@@ -551,6 +551,9 @@ func writeVerbatimChunk(w io.Writer, hdr *[8]byte, data []byte, crcB [4]byte) er
 // injectState is what the chunk loop of Inject carries from chunk to chunk.
 type injectState struct {
 	rawEXIF, rawIPTC, rawXMP []byte
+	// keep is the set of segments whose chunks are copied through as they are
+	// (InjectKeeping): their payload is nil and none is dropped or replaced.
+	keep Keep
 	// total is the size of the stream, or -1 when it is not known.
 	total  int64
 	budget profileBudget
@@ -638,7 +641,7 @@ func injectOneChunk(r io.ReadSeeker, w io.Writer, st *injectState, pos int64) (i
 		return pos, err
 	}
 
-	if chunkType == chunkEXIf {
+	if chunkType == chunkEXIf && st.keep&KeepEXIF == 0 {
 		// Only eXIf can be identified as a drop target without its data:
 		// skip it without ever reading its payload (#288).
 		if _, err := r.Seek(length+4, io.SeekCurrent); err != nil {
@@ -714,6 +717,12 @@ func (st *injectState) writeNewAfterIHDR(w io.Writer) error {
 	return nil
 }
 
+// dropsChunk reports whether Inject drops the chunk because the chunk it writes
+// replaces it (shouldDropChunk), which a kept XMP never is.
+func (st *injectState) dropsChunk(chunkType [4]byte, data []byte) bool {
+	return st.keep&KeepXMP == 0 && shouldDropChunk(chunkType, data)
+}
+
 // writeTextChunk writes the text chunk data (type chunkType, original CRC
 // crcB) read by injectOneChunk: an XMP iTXt chunk is replaced by the new XMP
 // chunk when it is the first and there is one to write, and dropped otherwise
@@ -727,7 +736,7 @@ func (st *injectState) writeNewAfterIHDR(w io.Writer) error {
 // st.budget bounds the text that all the raw profile chunks of the file inflate
 // to (security audit F-08); ErrRawProfileBudget is returned when it runs out.
 func writeTextChunk(w io.Writer, hdr *[8]byte, chunkType [4]byte, data []byte, crcB [4]byte, st *injectState) error {
-	if shouldDropChunk(chunkType, data) {
+	if st.dropsChunk(chunkType, data) {
 		if st.rawXMP != nil && !st.xmpDone {
 			st.xmpDone = true
 			return writeXMPChunk(w, st.rawXMP)
@@ -848,7 +857,47 @@ func nextChunkHead(r io.Reader, hdr *[8]byte, pos, total int64) (length int64, t
 // readers. Selective stripping without exhaustive chunk-type knowledge risks
 // corrupting the file. Pass PreserveUnknownSegments(true) (the default) when
 // writing to PNG. Passing false returns ErrPreserveUnknownSegmentsNotSupported.
-func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error { //nolint:cyclop,gocyclo // preserveUnknownSegments guard adds one branch; function already contained maximum allowed complexity pre-#85
+func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
+	return injectChunks(r, w, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments, 0)
+}
+
+// Keep is a set of the metadata segments of a PNG that InjectKeeping leaves
+// as the source has them.
+type Keep uint8
+
+// The segments a Keep can hold.
+const (
+	// KeepEXIF is every eXIf chunk and every "Raw profile type exif" or
+	// "Raw profile type APP1" text chunk.
+	KeepEXIF Keep = 1 << iota
+	// KeepIPTC is every "Raw profile type iptc" text chunk.
+	KeepIPTC
+	// KeepXMP is every XMP iTXt chunk and every XMP raw profile or legacy text
+	// chunk.
+	KeepXMP
+)
+
+// InjectKeeping is Inject for a write that changes only some of the metadata
+// segments (task #405): the chunks of the segments in keep are copied to w as
+// the source has them, byte for byte (CRC included) and at the same place; the
+// other segments are replaced by the payload given, or removed when it is nil,
+// as Inject does. The payload of a kept segment is ignored. Inject cannot
+// express this, because a nil payload means "remove" there.
+func InjectKeeping(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool, keep Keep) error {
+	return injectChunks(r, w, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments, keep)
+}
+
+// injectChunks is Inject and InjectKeeping.
+func injectChunks(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool, keep Keep) error { //nolint:cyclop,gocyclo // preserveUnknownSegments guard adds one branch; function already contained maximum allowed complexity pre-#85
+	if keep&KeepEXIF != 0 {
+		rawEXIF = nil
+	}
+	if keep&KeepIPTC != 0 {
+		rawIPTC = nil
+	}
+	if keep&KeepXMP != 0 {
+		rawXMP = nil
+	}
 	// Reject PreserveUnknownSegments(false) for PNG: PNG chunk semantics are not
 	// equivalent to JPEG APPn segments. Chunks like tEXt, gAMA, cHRM, and custom
 	// application chunks may be required by downstream tools; stripping them
@@ -894,7 +943,7 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 		return fmt.Errorf("png: write signature: %w", err)
 	}
 
-	st := injectState{rawEXIF: rawEXIF, rawIPTC: rawIPTC, rawXMP: rawXMP, total: total, budget: newProfileBudget()}
+	st := injectState{rawEXIF: rawEXIF, rawIPTC: rawIPTC, rawXMP: rawXMP, keep: keep, total: total, budget: newProfileBudget()}
 	pos := int64(len(pngSig))
 	if rawEXIF != nil || rawXMP != nil {
 		// A new chunk replaces the old chunk of its kind in place; only the

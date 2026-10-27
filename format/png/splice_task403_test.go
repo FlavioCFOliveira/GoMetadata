@@ -109,30 +109,45 @@ func TestInjectPlacement(t *testing.T) {
 		src       []byte
 		exif, xmp []byte
 		want      []string
+		keep      Keep
 	}{
 		{"PNG-PLACE-01 none old: EXIF then XMP after IHDR", spPNG(spIHDR, spGAMA, spIDAT, spIEND), spNewE, spNewX,
-			eq("IHDR", "eXIf", "XMP", "gAMA", "IDAT", "IEND")},
+			eq("IHDR", "eXIf", "XMP", "gAMA", "IDAT", "IEND"), 0},
 		{"PNG-PLACE-02 old eXIf is replaced where it is", spPNG(spIHDR, spGAMA, spOldE, spIDAT, spIEND), spNewE, nil,
-			eq("IHDR", "gAMA", "eXIf", "IDAT", "IEND")},
+			eq("IHDR", "gAMA", "eXIf", "IDAT", "IEND"), 0},
 		{"PNG-PLACE-03 old XMP after IDAT is replaced where it is", spPNG(spIHDR, spIDAT, spOldX, spIEND), nil, spNewX,
-			eq("IHDR", "IDAT", "XMP", "IEND")},
+			eq("IHDR", "IDAT", "XMP", "IEND"), 0},
 		{"PNG-PLACE-04 a kind with no old chunk goes after IHDR, the other stays", spPNG(spIHDR, spGAMA, spOldE, spIDAT, spIEND), spNewE, spNewX,
-			eq("IHDR", "XMP", "gAMA", "eXIf", "IDAT", "IEND")},
+			eq("IHDR", "XMP", "gAMA", "eXIf", "IDAT", "IEND"), 0},
 		{"PNG-PLACE-05 second old eXIf is dropped", spPNG(spIHDR, spOldE, spGAMA, spOldE, spIDAT, spIEND), spNewE, nil,
-			eq("IHDR", "eXIf", "gAMA", "IDAT", "IEND")},
+			eq("IHDR", "eXIf", "gAMA", "IDAT", "IEND"), 0},
 		{"PNG-PLACE-06 second old XMP is dropped", spPNG(spIHDR, spGAMA, spOldX, spOldX, spIDAT, spIEND), nil, spNewX,
-			eq("IHDR", "gAMA", "XMP", "IDAT", "IEND")},
+			eq("IHDR", "gAMA", "XMP", "IDAT", "IEND"), 0},
 		{"PNG-PLACE-07 an iTXt that is not XMP is copied and does not place the XMP", spPNG(spIHDR, spOtrX, spIDAT, spIEND), nil, spNewX,
-			eq("IHDR", "XMP", "iTXt", "IDAT", "IEND")},
-		{"PNG-PLACE-08 nothing to write: old eXIf and XMP are dropped, as before", spPNG(spIHDR, spOldE, spOldX, spTEXt, spIDAT, spIEND), nil, nil,
-			eq("IHDR", "tEXt", "IDAT", "IEND")},
+			eq("IHDR", "XMP", "iTXt", "IDAT", "IEND"), 0},
+		{"PNG-PLACE-08 nothing to write: old eXIf and XMP are dropped by Inject, as before", spPNG(spIHDR, spOldE, spOldX, spTEXt, spIDAT, spIEND), nil, nil,
+			eq("IHDR", "tEXt", "IDAT", "IEND"), 0},
+		{"PNG-PLACE-08k nothing to write, eXIf and XMP kept: every chunk stays, byte for byte", spPNG(spIHDR, spOldE, spOldX, spTEXt, spIDAT, spIEND), nil, nil,
+			eq("IHDR", "eXIf", "XMP", "tEXt", "IDAT", "IEND"), KeepEXIF | KeepXMP},
 		{"PNG-PLACE-09 both old: each in its own place", spPNG(spIHDR, spOldX, spGAMA, spOldE, spIDAT, spIEND), spNewE, spNewX,
-			eq("IHDR", "XMP", "gAMA", "eXIf", "IDAT", "IEND")},
+			eq("IHDR", "XMP", "gAMA", "eXIf", "IDAT", "IEND"), 0},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			out := spInjectPNG(t, tc.src, tc.exif, tc.xmp)
+			var out []byte
+			if tc.keep != 0 {
+				var buf bytes.Buffer
+				if err := InjectKeeping(bytes.NewReader(tc.src), &buf, tc.exif, nil, tc.xmp, true, tc.keep); err != nil {
+					t.Fatalf("InjectKeeping: %v", err)
+				}
+				out = buf.Bytes()
+				if !bytes.Equal(out, tc.src) {
+					t.Error("keeping every metadata chunk and writing none must give the source")
+				}
+			} else {
+				out = spInjectPNG(t, tc.src, tc.exif, tc.xmp)
+			}
 			got := spTypes(t, out)
 			if len(got) != len(tc.want) {
 				t.Fatalf("chunks = %v, want %v", got, tc.want)
@@ -327,6 +342,76 @@ func FuzzPNGSplice(f *testing.F) {
 		}
 		if !bytes.Contains(out.Bytes(), pngChunk("eXIf", spNewE)) || !bytes.Contains(out.Bytes(), pngChunk("iTXt", buildXMPChunk(spNewX))) {
 			t.Fatal("a new chunk is not in the output")
+		}
+	})
+}
+
+// TestInjectKeeping covers PNG-KEEP (task #405): the chunks of the kept
+// segments stay as the source has them, whatever is written to the others.
+func TestInjectKeeping(t *testing.T) {
+	t.Parallel()
+	badE := pngChunk("eXIf", []byte{'I', 'I', 42, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'B', 'D'})
+	badE[len(badE)-1] ^= 0xFF // a CRC that is wrong stays wrong
+	rawExif := pngChunk("zTXt", []byte("Raw profile type exif\x00\x00x"))
+	tests := []struct {
+		name      string
+		src       []byte
+		exif, xmp []byte
+		keep      Keep
+		want      []string
+		kept      [][]byte // chunks the output must contain verbatim
+	}{
+		{"PNG-KEEP-01 eXIf kept, XMP replaced", spPNG(spIHDR, spOldE, spOldX, spIDAT, spIEND), nil, spNewX, KeepEXIF,
+			eq("IHDR", "eXIf", "XMP", "IDAT", "IEND"), [][]byte{spOldE}},
+		{"PNG-KEEP-02 XMP kept, eXIf replaced", spPNG(spIHDR, spOldE, spOldX, spIDAT, spIEND), spNewE, nil, KeepXMP,
+			eq("IHDR", "eXIf", "XMP", "IDAT", "IEND"), [][]byte{spOldX}},
+		{"PNG-KEEP-03 eXIf kept with a wrong CRC and a duplicate", spPNG(spIHDR, badE, spGAMA, spOldE, spIDAT, spIEND), nil, spNewX, KeepEXIF,
+			eq("IHDR", "XMP", "eXIf", "gAMA", "eXIf", "IDAT", "IEND"), [][]byte{badE, spOldE}},
+		{"PNG-KEEP-04 an XMP kept is not replaced by a new one that is ignored", spPNG(spIHDR, spOldX, spIDAT, spIEND), spNewE, spNewX, KeepXMP,
+			eq("IHDR", "eXIf", "XMP", "IDAT", "IEND"), [][]byte{spOldX}},
+		{"PNG-KEEP-05 EXIF raw profile kept, no eXIf written", spPNG(spIHDR, rawExif, spIDAT, spIEND), nil, spNewX, KeepEXIF,
+			eq("IHDR", "XMP", "zTXt", "IDAT", "IEND"), [][]byte{rawExif}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var out bytes.Buffer
+			if err := InjectKeeping(bytes.NewReader(tc.src), &out, tc.exif, nil, tc.xmp, true, tc.keep); err != nil {
+				t.Fatalf("InjectKeeping: %v", err)
+			}
+			got := spTypes(t, out.Bytes())
+			if len(got) != len(tc.want) {
+				t.Fatalf("chunks = %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("chunks = %v, want %v", got, tc.want)
+				}
+			}
+			for _, c := range tc.kept {
+				if !bytes.Contains(out.Bytes(), c) {
+					t.Errorf("a kept chunk is not in the output byte for byte")
+				}
+			}
+		})
+	}
+}
+
+// FuzzPNGInjectKeeping: a write that keeps every metadata segment and writes
+// none is the source (task #405), plus the IEND chunk that a source ending at a
+// chunk boundary without one receives; it never panics and writes no metadata.
+func FuzzPNGInjectKeeping(f *testing.F) {
+	f.Add(spPNG(spIHDR, spGAMA, spOldE, spOldX, spTEXt, spIDAT, spIEND, []byte("tail")))
+	f.Add(spPNG(spIHDR, spIDAT, pngChunk("IFND", nil)))
+	f.Add(append(spPNG(spIHDR, spGAMA), 0, 0, 0x13, 0x88, 'i', 'C', 'C', 'P', 1))
+	f.Add(spPNG(spOtrX))
+	f.Fuzz(func(t *testing.T, src []byte) {
+		var out bytes.Buffer
+		if err := InjectKeeping(bytes.NewReader(src), &out, spNewE, nil, spNewX, true, KeepEXIF|KeepIPTC|KeepXMP); err != nil {
+			return
+		}
+		if !bytes.Equal(out.Bytes(), src) && !bytes.Equal(out.Bytes(), append(append([]byte(nil), src...), spIEND...)) {
+			t.Fatalf("keeping every segment did not give the source:\n out %x\n src %x", out.Bytes(), src)
 		}
 	})
 }

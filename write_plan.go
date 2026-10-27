@@ -8,6 +8,7 @@ import (
 
 	"github.com/FlavioCFOliveira/GoMetadata/format"
 	"github.com/FlavioCFOliveira/GoMetadata/format/jpeg"
+	"github.com/FlavioCFOliveira/GoMetadata/format/png"
 	"github.com/FlavioCFOliveira/GoMetadata/format/raw/cr3"
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 )
@@ -64,6 +65,21 @@ func (s Segment) jpegKeep() jpeg.Keep {
 	}
 	if s&SegmentXMP != 0 {
 		k |= jpeg.KeepXMP
+	}
+	return k
+}
+
+// pngKeep returns the png.Keep that holds the segments of s.
+func (s Segment) pngKeep() png.Keep {
+	var k png.Keep
+	if s&SegmentEXIF != 0 {
+		k |= png.KeepEXIF
+	}
+	if s&SegmentIPTC != 0 {
+		k |= png.KeepIPTC
+	}
+	if s&SegmentXMP != 0 {
+		k |= png.KeepXMP
 	}
 	return k
 }

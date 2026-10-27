@@ -121,7 +121,11 @@ IHDR and IEND (eXIf/text before IDAT recommended); preserve unknown safe-to-copy
 **Rule IDs (PNG splice write).** (tasks #400, #403)
 - **PNG-PLACE** A new eXIf or XMP iTXt chunk replaces the first old chunk of its kind where it is and the other old chunks of
   the kind are dropped; a kind the file has none of goes right after IHDR (eXIf and iTXt may appear anywhere between IHDR and
-  IEND, PNG-3 §11.3.4.5 and §11.3.4.4). A nil payload drops the old chunk, as before. `TestInjectPlacement`, `TestScanOldMetadata`.
+  IEND, PNG-3 §11.3.4.5 and §11.3.4.4). A nil payload drops the old chunk in `Inject`, as before; `InjectKeeping` keeps it (PNG-KEEP). `TestInjectPlacement`, `TestScanOldMetadata`.
+- **PNG-KEEP** (task #405) `InjectKeeping` copies the chunks of the segments in its `Keep` (every eXIf and EXIF raw profile chunk,
+  every XMP chunk, every IPTC raw profile chunk) as they are, CRC included, and writes no chunk for them; the others are replaced or
+  removed as `Inject` does. `Write` uses it for every segment it does not modify, so one modified segment never removes another.
+  `TestInjectKeeping`, `TestTask405_PNGKeepsUnmodifiedChunks`.
 - **PNG-IDENT** Every other byte is copied as it is: a chunk with a wrong CRC, unknown chunks, and the bytes after IEND.
   `TestInjectVerbatim`, `TestTask403_Corpus_PNGSpliceMetadataless` (667 metadata-less corpus PNGs), `FuzzPNGSplice`.
 - **PNG-DAMAGE** After IHDR a chunk that cannot be followed (header cut short, declared length past the end of the file or above
