@@ -354,6 +354,42 @@ func (d *xmlDoc) truncateScope(n int32) {
 	d.scope = d.scope[:n]
 }
 
+// elemLargeDoc is the size from which elemHint counts the start tags of a
+// document instead of estimating them from its length.
+const elemLargeDoc = 64 << 10
+
+// elemHint returns the number of elements to reserve for the document b.
+//
+// A small document gets the estimate of one element per 48 bytes. For a large
+// one the estimate can be far off in either direction: a document that
+// carries a big text value (extended XMP holds binary data as base64, for
+// example) has few elements per byte, and reserving one slot per 48 bytes
+// would allocate many times the table that the parse needs (task #394, sprint
+// 50: 4.4 MiB for a 1.7 MiB document of 1,200 elements). The start tags are
+// then counted: "<" opens every start tag, end tag, comment and processing
+// instruction, and "</" every end tag, so their difference bounds the number
+// of start tags from above, within the comments and processing instructions
+// of the document. Both counts are vectorised and read the document once
+// each, a small fraction of the scan that follows. The count comes from the
+// document itself, so a hostile document cannot make it larger than it is;
+// the caller still bounds it by maxXMLElements. The result never exceeds the
+// estimate of one element per 48 bytes: a document whose "<" bytes sit in
+// CDATA sections would otherwise make the count, not the document, set the
+// size of the table. A document with more elements than that estimate grows
+// the table on demand, as before.
+func elemHint(b []byte) int {
+	est := len(b) / 48
+	if len(b) < elemLargeDoc {
+		return est
+	}
+	return min(est, bytes.Count(b, ltBytes)-bytes.Count(b, ltSlashBytes)+1)
+}
+
+var (
+	ltBytes      = []byte("<")  //nolint:gochecknoglobals // immutable sentinel; avoids a per-call []byte literal
+	ltSlashBytes = []byte("</") //nolint:gochecknoglobals // immutable sentinel; avoids a per-call []byte literal
+)
+
 // scanXML builds the element tree of b into d.
 //
 // The scanner enforces the well-formedness constraints on which the element
@@ -379,7 +415,7 @@ func scanXML(b []byte, d *xmlDoc) error { //nolint:cyclop,gocyclo // one branch 
 	// Size the element table once for a large document, instead of doubling
 	// (and re-copying) it up to the cap; a pooled scratch value that already
 	// has the capacity makes this a no-op. About one element per 48 bytes.
-	d.elems = slices.Grow(d.elems, min(len(b)/48, maxXMLElements))
+	d.elems = slices.Grow(d.elems, min(elemHint(b), maxXMLElements))
 	pos := 0
 	for pos < len(b) {
 		i := bytes.IndexByte(b[pos:], '<')

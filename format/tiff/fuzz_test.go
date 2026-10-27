@@ -182,9 +182,20 @@ func FuzzTIFFExtract(f *testing.F) {
 		f.Add(buf)
 	}
 
+	// Seeds (task #389): the layouts of the compacted read — a trailing Exif IFD,
+	// IFD0 and a thumbnail among the image data — and hostile variants with
+	// overlapping ranges, offsets beyond the end of the file, cycles and shared
+	// values.
+	for _, s := range sparseSeedFiles() {
+		f.Add(s)
+	}
+
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must not panic regardless of input.
 		_, _, _, _ = Extract(bytes.NewReader(data))
+		// Task #389: the compacted read must not panic, and must parse like the
+		// whole file whenever it parses cleanly.
+		checkSparseProperty(t, data)
 	})
 }
 

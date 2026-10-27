@@ -464,6 +464,14 @@ func readAllCapped(r io.ReadSeeker, tag string) ([]byte, error) {
 // fresh from r and treated as authoritative (wholeFile=true) — the same
 // safety net originalTIFFBytes has always provided for NEF/ARW/ORF/RW2.
 func tiffPrefixBytes(r io.ReadSeeker, m *Metadata, tag string) (prefix []byte, wholeFile bool, err error) {
+	if m.rawEXIFSparse {
+		// Task #389: m.rawEXIF is only the Head of the source (Read compacted the
+		// IFDs that lie among the image data), which does not reach every IFD the
+		// relocation walks. Read the metadata prefix of the source again, as Read
+		// does for a file that is not compacted: the same bytes, so the output is
+		// the one a write of that Metadata has always produced.
+		return sourceMetadataPrefix(r, tag)
+	}
 	if m.rawEXIF != nil {
 		return m.rawEXIF, m.rawEXIFIsWholeFile, nil
 	}
@@ -475,6 +483,20 @@ func tiffPrefixBytes(r io.ReadSeeker, m *Metadata, tag string) (prefix []byte, w
 		return nil, false, err
 	}
 	return data, true, nil
+}
+
+// sourceMetadataPrefix reads the metadata prefix of the TIFF or DNG r with
+// tiff.Extract, the extraction Read uses for a file that it does not compact,
+// and reports whether it is the whole file (as rawEXIFIsWholeFile does).
+func sourceMetadataPrefix(r io.ReadSeeker, tag string) (prefix []byte, wholeFile bool, err error) {
+	if _, err = r.Seek(0, io.SeekStart); err != nil {
+		return nil, false, fmt.Errorf("gometadata: %s seek: %w", tag, err)
+	}
+	prefix, _, _, err = tiff.Extract(r)
+	if err != nil {
+		return nil, false, fmt.Errorf("gometadata: %s read: %w", tag, err)
+	}
+	return prefix, tiffFamilyRawEXIFIsWholeFile(r, format.FormatTIFF, prefix), nil
 }
 
 func writeTIFF(r io.ReadSeeker, w io.Writer, m *Metadata, enc Segment) error {

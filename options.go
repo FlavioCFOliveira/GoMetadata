@@ -15,7 +15,15 @@ type readConfig struct {
 	// strict causes Read to return a ParseSegmentError immediately when a
 	// segment is present but fails to parse, instead of silently skipping it.
 	strict bool
+	// denseTIFF makes Read of a TIFF or DNG read the metadata as one prefix
+	// of the file instead of compacting it (task #389). Read sets it itself
+	// when the compacted metadata did not parse like the file.
+	denseTIFF bool
 }
+
+// withoutSparse is the option Read passes to itself to read a TIFF or DNG
+// without the compaction of task #389.
+func withoutSparse() ReadOption { return func(c *readConfig) { c.denseTIFF = true } }
 
 // WithoutXMP skips XMP parsing, reducing allocations when XMP is not needed.
 // The XMP packet is not lost: a Write of the Metadata carries it unchanged,

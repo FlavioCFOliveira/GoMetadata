@@ -2,8 +2,9 @@ package rw2
 
 // oom_gate_test.go — regression gate for #140: uncapped io.ReadAll OOM.
 //
-// These tests verify that Extract and Inject reject inputs that exceed
-// maxFileSize with ErrFileTooLarge, and that normal-sized inputs continue to
+// These tests verify that Extract rejects inputs that exceed maxFileSize with
+// ErrFileTooLarge (Inject has no such limit, task #392: see
+// stream_task392_test.go), and that normal-sized inputs continue to
 // be handled correctly even when maxFileSize is temporarily lowered.
 //
 // The tests lower maxFileSize to a tiny value (capBytesOOM) for the OOM path
@@ -13,7 +14,6 @@ package rw2
 import (
 	"bytes"
 	"errors"
-	"io"
 	"testing"
 )
 
@@ -46,25 +46,6 @@ func TestExtractFileTooLarge(t *testing.T) {
 	}
 	if !errors.Is(err, ErrFileTooLarge) {
 		t.Errorf("Extract: expected errors.Is(err, ErrFileTooLarge), got: %v", err)
-	}
-}
-
-// TestInjectFileTooLarge verifies that Inject returns ErrFileTooLarge when
-// the reader exceeds maxFileSize.
-//
-// Gate for #140 (rw2.Inject uncapped io.ReadAll).
-//
-//nolint:paralleltest // sets package-level maxFileSize; must not run in parallel
-func TestInjectFileTooLarge(t *testing.T) {
-	setMaxFileSizeForTest(t, capBytesOOM)
-
-	r := bytes.NewReader(make([]byte, capBytesOOM+1))
-	err := Inject(r, io.Discard, nil, []byte{0x1C}, nil, true)
-	if err == nil {
-		t.Fatal("Inject: expected error for oversized input, got nil")
-	}
-	if !errors.Is(err, ErrFileTooLarge) {
-		t.Errorf("Inject: expected errors.Is(err, ErrFileTooLarge), got: %v", err)
 	}
 }
 

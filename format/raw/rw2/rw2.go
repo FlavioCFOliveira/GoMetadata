@@ -123,8 +123,15 @@ func extractSizeCappedShortCircuit(r io.ReadSeeker) (data []byte, handled bool, 
 }
 
 // Inject writes a modified RW2 stream to w by delegating to the TIFF writer.
-// RW2 magic bytes are patched to standard TIFF LE before injection and
-// restored in the output so the file remains a valid RW2.
+// The RW2 magic is accepted by the TIFF writer in place of the standard 0x002A
+// and restored in the output so the file remains a valid RW2.
+//
+// Task #392: the file is never held in memory. Inject reads the 4 magic bytes
+// and the TIFF writer reads the metadata prefix of r (and, with no IPTC or XMP
+// to write, copies r unchanged); the image data is streamed from r to w through
+// a fixed pooled buffer, so memory use is proportional to the metadata and a
+// seekable r has no size limit but the 4 GiB of classic TIFF offsets
+// (ErrFileTooLarge). A source that cannot seek is buffered whole, up to 256 MiB.
 // Note: RW2 uses non-standard IFD encoding; some entries may not survive the
 // round-trip, but EXIF/IPTC/XMP metadata is correctly updated.
 //
@@ -135,39 +142,42 @@ func extractSizeCappedShortCircuit(r io.ReadSeeker) (data []byte, handled bool, 
 // call Inject directly from a user-facing write path; use gometadata.Write
 // instead, which routes RW2 through the dedicated writeTIFFRW2 path
 // (tiff.InjectWithEXIFRW2) that handles GUID preservation and offset rebasing.
-func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
+func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ bool) error {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("rw2: seek: %w", err)
 	}
-	data, err := readInput(r)
-	if err != nil {
-		return err
+	// Only the magic is read here; the TIFF writer reads the rest of r as it
+	// needs it (task #392: the file is never held in memory).
+	var peek [4]byte
+	n, err := io.ReadFull(r, peek[:])
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("rw2: read: %w", err)
 	}
-	if !bytes.HasPrefix(data, rw2Magic) {
+	if !bytes.HasPrefix(peek[:n], rw2Magic) {
 		return ErrInvalidMagic
 	}
 
-	// Patch bytes 2-3 to standard TIFF LE magic (TIFF 6.0 §2: 0x002A) so
-	// tiff.Inject accepts the stream. data is exclusively owned (returned by
-	// readInput), so in-place mutation is safe.
-	data[2] = 0x2A
-	data[3] = 0x00
-
-	// mw restores the RW2 magic ("IIU\x00") on the first write; tiff.Inject
-	// writes its output with a single Write call, so no output buffering is
-	// needed.
+	// mw restores the RW2 magic on the first write: the TIFF writer produces a
+	// standard TIFF stream, and the magic of the source (bytes [2:4]) is the one
+	// it accepted in place of 0x002A (TIFF 6.0 §2).
 	mw := &iobuf.MagicWriter{W: w, Magic: [2]byte{rw2Magic[2], rw2Magic[3]}}
-	injectErr := tiff.Inject(bytes.NewReader(data), mw, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments)
-	if mw.Err != nil {
+	injectErr := tiff.InjectWithMagic(r, mw, rawEXIF, rawIPTC, rawXMP, binary.LittleEndian.Uint16(peek[2:4]))
+	return injectResult(mw, injectErr)
+}
+
+// injectResult maps the outcome of the TIFF writer, which wrote through mw, to
+// the error of Inject.
+func injectResult(mw *iobuf.MagicWriter, injectErr error) error {
+	switch {
+	case mw.Err != nil:
 		return fmt.Errorf("rw2: write: %w", mw.Err)
-	}
-	if errors.Is(injectErr, iobuf.ErrShortFirstWrite) {
+	case errors.Is(injectErr, iobuf.ErrShortFirstWrite):
 		return ErrOutputTooShort
-	}
-	if injectErr != nil {
+	case errors.Is(injectErr, tiff.ErrFileTooLarge):
+		return fmt.Errorf("rw2: inject: %w: %w", ErrFileTooLarge, injectErr)
+	case injectErr != nil:
 		return fmt.Errorf("rw2: inject: %w", injectErr)
-	}
-	if !mw.Started() {
+	case !mw.Started():
 		return ErrOutputTooShort
 	}
 	return nil

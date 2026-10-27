@@ -613,30 +613,45 @@ func growBuffer(r io.ReadSeeker, buf []byte, need uint64) ([]byte, error) {
 // (recomputed once more, cheaply) to decide whether to fall back to a
 // whole-file read — see Extract.
 func scanMetadataExtent(r io.ReadSeeker, initial []byte, ifd0Off uint64, order binary.ByteOrder, bigTIFF bool, fileSize uint64) ([]byte, error) {
-	buf := initial
+	buf, _, _, err := scanMetadataExtentJump(r, initial, ifd0Off, order, bigTIFF, fileSize, 0)
+	return buf, err
+}
+
+// scanMetadataExtentJump is scanMetadataExtent with an escape for a metadata
+// structure far from the bytes read (task #389): when maxJump is not zero and a
+// pass would grow the buffer by more than maxJump bytes, the scan stops before
+// reading them and reports jumped with the pass's raw need, leaving the caller
+// to read the structures it needs without the bytes between (see sparse.go) or
+// to continue the scan by calling scanMetadataExtent on the returned buffer.
+// With maxJump zero it is scanMetadataExtent.
+func scanMetadataExtentJump(r io.ReadSeeker, initial []byte, ifd0Off uint64, order binary.ByteOrder, bigTIFF bool, fileSize, maxJump uint64) (buf []byte, jumped bool, need uint64, err error) {
+	buf = initial
 	// One extentScan (and its seenIFD map) for every pass this call makes —
 	// see scanExtentPass's own doc comment for why reuse across passes,
 	// rather than one per pass, matters for allocs/op.
 	scan := &extentScan{seenIFD: make(map[uint64]bool, 16)}
 	for range maxExtentGrowthPasses {
-		need := scanExtentPass(scan, buf, ifd0Off, order, bigTIFF)
+		need = scanExtentPass(scan, buf, ifd0Off, order, bigTIFF)
 		if need <= uint64(len(buf)) {
-			return buf, nil
+			return buf, false, need, nil
 		}
 		target := nextGrowthTarget(need, fileSize)
-		grown, err := growBuffer(r, buf, target)
-		if err != nil {
-			return buf, err
+		if maxJump != 0 && target-uint64(len(buf)) > maxJump {
+			return buf, true, need, nil
+		}
+		grown, gerr := growBuffer(r, buf, target)
+		if gerr != nil {
+			return buf, false, need, gerr
 		}
 		if uint64(len(grown)) <= uint64(len(buf)) {
 			// No progress: r has no more data to offer (need pointed past
 			// the real end of the stream). Stop; the caller's own
 			// convergence check will decide what to do with this buffer.
-			return grown, nil
+			return grown, false, need, nil
 		}
 		buf = grown
 	}
-	return buf, nil
+	return buf, false, need, nil
 }
 
 // nextGrowthTarget computes how large scanMetadataExtent's next growBuffer
