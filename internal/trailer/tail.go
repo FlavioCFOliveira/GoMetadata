@@ -5,14 +5,23 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 )
 
-// Source gives random access to the bytes of a file, for FindTail.
+// Source gives random access to the bytes of a file, for FindTail and
+// PlanFromSource.
 type Source interface {
 	// Range returns the n bytes of the file at offset off (the caller keeps
 	// 0 <= off and off+n <= the file size). The result may alias the file's own
 	// buffer and must not be modified.
 	Range(off, n int64) ([]byte, error)
+	// Index returns the offset of the first occurrence of pat in the bytes
+	// [from, to) of the file, or -1 (the caller keeps 0 <= from <= to <= the file
+	// size). A streaming source finds it without holding the range in memory.
+	Index(from, to int64, pat []byte) (int64, error)
+	// CopyRange writes the n bytes of the file at offset off to w.
+	CopyRange(w io.Writer, off, n int64) error
 }
 
 // BytesSource is a Source over a file held in memory.
@@ -21,8 +30,41 @@ type BytesSource []byte
 // Range implements Source.
 func (b BytesSource) Range(off, n int64) ([]byte, error) { return b[off : off+n : off+n], nil }
 
+// Index implements Source.
+func (b BytesSource) Index(from, to int64, pat []byte) (int64, error) {
+	i := bytes.Index(b[from:to], pat)
+	if i < 0 {
+		return -1, nil
+	}
+	return from + int64(i), nil
+}
+
+// CopyRange implements Source.
+func (b BytesSource) CopyRange(w io.Writer, off, n int64) error {
+	if n <= 0 {
+		return nil
+	}
+	_, err := w.Write(b[off : off+n])
+	return err
+}
+
 // ReaderSource is a Source over a seekable stream.
 type ReaderSource struct{ R io.ReadSeeker }
+
+// Index implements Source: a sequential scan through one pooled buffer
+// (iobuf.IndexRange).
+func (s ReaderSource) Index(from, to int64, pat []byte) (int64, error) {
+	i, err := iobuf.IndexRange(s.R, from, to, pat)
+	if err != nil {
+		return -1, fmt.Errorf("trailer: search: %w", err)
+	}
+	return i, nil
+}
+
+// CopyRange implements Source: iobuf.CopyRange, through the pooled buffer.
+func (s ReaderSource) CopyRange(w io.Writer, off, n int64) error {
+	return iobuf.CopyRange(s.R, w, off, n)
+}
 
 // Range implements Source.
 func (s ReaderSource) Range(off, n int64) ([]byte, error) {

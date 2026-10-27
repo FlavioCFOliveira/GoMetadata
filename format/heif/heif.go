@@ -218,23 +218,36 @@ func parseHEIFBoxHeader(data []byte, pos int) (size uint64, typ [4]byte, headerL
 	if pos+8 > len(data) {
 		return 0, [4]byte{}, 0, false
 	}
-	size = uint64(binary.BigEndian.Uint32(data[pos:]))
-	typ = [4]byte(data[pos+4 : pos+8])
+	// len(data)-pos is non-negative: guarded by the pos+8 ≤ len(data) check above.
+	remaining := uint64(len(data) - pos) //nolint:gosec // G115: len(data)-pos is non-negative (guarded above)
+	return parseBoxHeader(data[pos:min(pos+16, len(data))], remaining)
+}
+
+// parseBoxHeader is parseHEIFBoxHeader for a box whose header starts at
+// head[0], with remaining bytes in the enclosing range from the start of the
+// box (the container, or the file, ends there): head holds the first
+// min(remaining, 16) bytes of the box. The streaming write reads headers
+// through a window and has no buffer that spans the file (task #390).
+func parseBoxHeader(head []byte, remaining uint64) (size uint64, typ [4]byte, headerLen uint64, valid bool) {
+	if remaining < 8 || len(head) < 8 {
+		return 0, [4]byte{}, 0, false
+	}
+	size = uint64(binary.BigEndian.Uint32(head))
+	typ = [4]byte(head[4:8])
 	headerLen = 8
 
 	if size == 1 {
-		if pos+16 > len(data) {
+		if remaining < 16 || len(head) < 16 {
 			return 0, [4]byte{}, 0, false
 		}
-		size = binary.BigEndian.Uint64(data[pos+8:])
+		size = binary.BigEndian.Uint64(head[8:])
 		headerLen = 16
 	}
 	if size == 0 {
-		// len(data)-pos is non-negative: guarded by pos+8 ≤ len(data) check above.
-		size = uint64(len(data) - pos) //nolint:gosec // G115: len(data)-pos is non-negative (guarded above)
+		size = remaining
 	}
-	// Bounds check without casting pos: size must not exceed remaining bytes.
-	if size > uint64(len(data)-pos) { //nolint:gosec // G115: len(data)-pos is non-negative (guarded above)
+	// Bounds check: size must not exceed the remaining bytes.
+	if size > remaining {
 		return 0, [4]byte{}, 0, false
 	}
 	// ISO 14496-12 §4.2: a box whose declared size is smaller than its own

@@ -25,7 +25,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"sync"
 
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 	"github.com/FlavioCFOliveira/GoMetadata/internal/riff"
@@ -256,9 +255,19 @@ func readPaddedChunk(r io.Reader, chunk riff.Chunk, streamEnd int64) ([]byte, er
 // XMP (VP8, VP8L, VP8X, ANIM, ANMF, ALPH, etc.) are structurally required for
 // correct image decoding and are never "unknown" in the JPEG APPn sense.
 // Passing false returns ErrPreserveUnknownSegmentsNotSupported.
+//
+// Task #391: the file is never held in memory. Two passes over the chunk
+// headers of r (which must be seekable) compute the RIFF size field and the VP8X
+// chunk of the output; the image chunks are then copied from r to w through a
+// fixed pooled buffer (iobuf.CopyRange), so memory use is independent of the
+// size of the file, which has no size limit but the 4 GiB of the RIFF size
+// field. The bytes written are those the former whole-file implementation wrote.
+// A source that is shorter than it was when the first pass measured it makes
+// Inject return an error after part of the output has been written (Write has
+// the same trust boundary).
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
-	// Reject PreserveUnknownSegments(false) for WebP: all non-metadata RIFF
-	// chunks (VP8, VP8L, VP8X, ANIM, ANMF, ALPH) are required for correct image
+	// Reject PreserveUnknownSegments(false) for WebP: all non-metadata chunks
+	// (VP8, VP8L, VP8X, ANIM, ANMF, ALPH) are required for correct image
 	// decoding. There is no equivalent of JPEG's "unknown APPn" in WebP.
 	if !preserveUnknownSegments {
 		return ErrPreserveUnknownSegmentsNotSupported
@@ -272,196 +281,324 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	if len(rawXMP) >= len(xmpWireFrameMagic) && [8]byte(rawXMP[:8]) == xmpWireFrameMagic {
 		return fmt.Errorf("webp: rawXMP contains an internal JPEG wire-frame encoding that cannot be stored in a WebP container: %w", ErrCorruptXMP)
 	}
-	if _, err := r.Seek(0, io.SeekStart); err != nil {
+	size, err := r.Seek(0, io.SeekEnd)
+	if err != nil {
 		return fmt.Errorf("webp: seek: %w", err)
 	}
-
-	// Buffer the whole file and rebuild (simple but correct approach).
-	// #140 fix, #230 refinement: cap the full-file read to maxFileSize bytes
-	// so that an oversized or infinite streaming reader cannot trigger
-	// unbounded heap allocation. iobuf.ReadAll allocates exactly one buffer
-	// sized to the input's Seek-reported length (filled with a single
-	// io.ReadFull) instead of io.ReadAll's geometric-growth strategy, and
-	// rejects an oversized input via ErrTooLarge before allocating anything.
-	original, err := iobuf.ReadAll(r, maxFileSize)
-	if err != nil {
-		if errors.Is(err, iobuf.ErrTooLarge) {
-			return fmt.Errorf("webp: input exceeds %d bytes: %w", maxFileSize, ErrFileTooLarge)
-		}
-		return fmt.Errorf("webp: read: %w", err)
-	}
-	if len(original) < 12 {
+	if size < 12 {
 		return ErrFileTooShort
 	}
 
-	// buildWebPBody writes the 12-byte RIFF header (with a patched size field)
-	// and the full chunk stream into ONE pooled buffer (task #234), so the
-	// former separate riffHdr allocation and second w.Write call are gone.
-	body := buildWebPBody(original, rawEXIF, rawXMP)
-	defer webpBufPool.Put(body)
+	win := iobuf.NewWindow(r, size)
+	defer win.Close()
+	out, err := planOutput(win, size, rawEXIF, rawXMP)
+	if err != nil {
+		return err
+	}
+	return out.write(r, w, win)
+}
 
-	if _, err := w.Write(body.Bytes()); err != nil {
-		return fmt.Errorf("webp: write body: %w", err)
+// output is the plan of the file Inject writes, made by the first pass over the
+// chunks of the source.
+type output struct {
+	size      int64 // size of the source
+	rawEXIF   []byte
+	rawXMP    []byte
+	hasEXIF   bool
+	hasXMP    bool
+	writeVP8X bool                // the output has a VP8X chunk
+	vp8x      [vp8xChunkSize]byte // its payload
+	riffSize  uint32              // the size field of the RIFF header
+}
+
+// planOutput makes the first pass: it measures the output and builds the VP8X
+// chunk of it.
+func planOutput(win *iobuf.Window, size int64, rawEXIF, rawXMP []byte) (output, error) {
+	out := output{size: size, rawEXIF: rawEXIF, rawXMP: rawXMP, hasEXIF: rawEXIF != nil, hasXMP: rawXMP != nil}
+	scan, err := scanOriginalChunks(win, size, out.hasEXIF || out.hasXMP)
+	if err != nil {
+		return out, fmt.Errorf("webp: read chunks: %w", err)
+	}
+	// The VP8X chunk of the output: written when EXIF or XMP is present or the
+	// source was already extended. When the source has none, it is built from
+	// the image bitstream (task #299), or from a zero canvas when no image chunk
+	// has a decodable header.
+	out.writeVP8X = out.hasEXIF || out.hasXMP || scan.haveVP8X
+	if out.writeVP8X {
+		out.vp8x = scan.vp8xPayload(out.hasEXIF, out.hasXMP)
+	}
+
+	// RIFF size = the "WEBP" form type + every chunk of the output
+	// (RFC 9649 §2.3: the file size minus the 8 bytes of "RIFF" and the size).
+	body := int64(4) + scan.retained
+	if out.writeVP8X {
+		body += chunkLen(vp8xChunkSize)
+	}
+	if out.hasEXIF {
+		body += chunkLen(int64(len(rawEXIF)))
+	}
+	if out.hasXMP {
+		body += chunkLen(int64(len(rawXMP)))
+	}
+	if body > math.MaxUint32 {
+		return out, fmt.Errorf("webp: the output is %d bytes, more than the RIFF size field can hold: %w", body+8, ErrFileTooLarge)
+	}
+	out.riffSize = uint32(body) //nolint:gosec // G115: body <= MaxUint32 checked above
+	return out, nil
+}
+
+// write makes the second pass: the RIFF header, the VP8X chunk, the chunks of
+// the source that are kept (copied from r), then the EXIF and XMP chunks.
+func (o *output) write(r io.ReadSeeker, w io.Writer, win *iobuf.Window) error {
+	// hdr is the scratch of the headers written below: declared once, because
+	// passing a stack array through io.Writer allocates it on every call.
+	hdr := new([riffHeaderLen]byte)
+	copy(hdr[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(hdr[4:8], o.riffSize)
+	copy(hdr[8:12], "WEBP")
+	if _, err := w.Write(hdr[:riffHeaderLen]); err != nil {
+		return fmt.Errorf("webp: write header: %w", err)
+	}
+	if o.writeVP8X {
+		if err := writeChunk(w, hdr, fourCCVP8X, o.vp8x[:]); err != nil {
+			return err
+		}
+	}
+	if err := copyOriginalChunks(r, w, win, o.size, hdr); err != nil {
+		return err
+	}
+	if o.hasEXIF {
+		if err := writeChunk(w, hdr, fourCCEXIF, o.rawEXIF); err != nil {
+			return err
+		}
+	}
+	if o.hasXMP {
+		return writeChunk(w, hdr, fourCCXMP, o.rawXMP)
 	}
 	return nil
 }
 
-// webpBufPool stores reusable *bytes.Buffer values for buildWebPBody.
-// Reusing them avoids a large heap allocation on every Inject call.
-var webpBufPool = sync.Pool{ //nolint:gochecknoglobals // sync.Pool: reuse reduces GC pressure
-	New: func() any { return new(bytes.Buffer) },
+// riffHeaderLen is the length of the RIFF header: "RIFF", the size, "WEBP".
+const riffHeaderLen = 12
+
+// chunkLen returns the length of a chunk of n data bytes in the output: the
+// 8-byte header, the data and the pad byte of an odd size (RIFF: chunks are
+// word aligned).
+func chunkLen(n int64) int64 { return 8 + n + n&1 }
+
+// writeChunk writes a chunk with the data given: header, data and the pad
+// byte of an odd size. hdr is the caller's scratch.
+func writeChunk(w io.Writer, hdr *[riffHeaderLen]byte, id [4]byte, data []byte) error {
+	if err := writeChunkHeader(w, hdr, id, int64(len(data))); err != nil {
+		return err
+	}
+	if _, err := w.Write(data); err != nil {
+		return fmt.Errorf("webp: write %s chunk: %w", id[:], err)
+	}
+	return writePad(w, hdr, int64(len(data)))
 }
 
-// buildWebPBody assembles the FULL RIFF stream — the 12-byte "RIFF"+size+"WEBP"
-// header followed by every chunk — from the original file bytes plus the new
-// EXIF and XMP payloads, into a single pooled buffer. It rebuilds VP8X flags,
-// preserves all non-metadata chunks in order, and appends EXIF/XMP chunks at
-// the end. The RIFF size field is patched in place once the final length is
-// known (header placeholder, body, patch size — task #234), eliminating the
-// former separate 12-byte riffHdr allocation and second w.Write call. The
-// caller must call webpBufPool.Put on the returned buffer after all writes to
-// w are complete.
-func buildWebPBody(original, rawEXIF, rawXMP []byte) *bytes.Buffer {
-	chunks, origVP8XData := collectOriginalChunks(original)
-
-	hasEXIF := rawEXIF != nil
-	hasXMP := rawXMP != nil
-
-	body := webpBufPool.Get().(*bytes.Buffer) //nolint:forcetypeassert,revive // webpBufPool.New always stores *bytes.Buffer; pool invariant
-	body.Reset()
-
-	// Reserve the 12-byte RIFF header at the start of the same pooled buffer
-	// used for the chunk stream: "RIFF" + a zero size placeholder + "WEBP".
-	// The size field is patched in place once the final length is known,
-	// after every chunk below has been appended.
-	body.WriteString("RIFF")
-	var sizePlaceholder [4]byte
-	body.Write(sizePlaceholder[:])
-	body.WriteString("WEBP")
-
-	// Write VP8X if needed (EXIF or XMP present, or was already extended).
-	if hasEXIF || hasXMP || origVP8XData != nil {
-		writeVP8XChunk(body, chunks, hasEXIF, hasXMP, origVP8XData)
+// writeChunkHeader writes the 8-byte header of a chunk of n data bytes.
+func writeChunkHeader(w io.Writer, hdr *[riffHeaderLen]byte, id [4]byte, n int64) error {
+	copy(hdr[0:4], id[:])
+	binary.LittleEndian.PutUint32(hdr[4:8], uint32(n)) //nolint:gosec // G115: RIFF chunk size bounded by the size field of the output, checked by Inject
+	if _, err := w.Write(hdr[:8]); err != nil {
+		return fmt.Errorf("webp: write %s chunk header: %w", id[:], err)
 	}
-
-	// Write original image chunks.
-	for _, c := range chunks {
-		writeRIFFChunk(body, c.id, c.data)
-	}
-
-	// Append metadata chunks.
-	if hasEXIF {
-		writeRIFFChunk(body, fourCCEXIF, rawEXIF)
-	}
-	if hasXMP {
-		writeRIFFChunk(body, fourCCXMP, rawXMP)
-	}
-
-	// Patch the RIFF size field now that the final body length is known:
-	// per the RIFF spec, size = total byte count following the size field
-	// itself (i.e. everything after the first 8 bytes).
-	buf := body.Bytes()
-	binary.LittleEndian.PutUint32(buf[4:8], uint32(len(buf)-8)) //nolint:gosec // G115: RIFF size bounded by buffer length
-
-	return body
+	return nil
 }
 
-// webpOriginalChunk is one preserved chunk from collectOriginalChunks. id is
-// a [4]byte FourCC (task #234): converting it to a string per chunk, as the
-// former implementation did, allocated on every non-metadata chunk in the
-// file — the vast majority of chunks in a real WebP (VP8/VP8L image data,
-// ANMF frames, ICCP, etc.).
-type webpOriginalChunk struct {
-	id   [4]byte
-	data []byte
+// writePad writes the zero pad byte that follows a chunk of n data bytes when
+// n is odd.
+func writePad(w io.Writer, hdr *[riffHeaderLen]byte, n int64) error {
+	if n&1 == 0 {
+		return nil
+	}
+	hdr[0] = 0
+	if _, err := w.Write(hdr[:1]); err != nil {
+		return fmt.Errorf("webp: write chunk padding: %w", err)
+	}
+	return nil
 }
 
-// collectOriginalChunks parses the flat RIFF chunk list starting at byte 12 of
-// original (after the RIFF/WEBP header). It drops VP8X, EXIF, and XMP chunks
-// (caller rebuilds them) and returns all remaining chunks. The VP8X payload is
-// returned separately so canvas dimensions and other feature bits can be
-// preserved by buildVP8XFlags.
-func collectOriginalChunks(original []byte) (chunks []webpOriginalChunk, origVP8XData []byte) {
-	pos := 12 // skip RIFF header
-	for pos+8 <= len(original) {
-		var id [4]byte
-		copy(id[:], original[pos:pos+4])
-		// Read the raw uint32 chunk size BEFORE converting to int. On a 32-bit
-		// platform (GOARCH=386/arm, int=32 bits), a RIFF chunk size >= 2^31 would
-		// become negative after int(uint32), causing dataStart+size to underflow
-		// and dataEnd to be clamped to a wrong position. Skip oversized chunks
-		// (they cannot contain valid EXIF/XMP metadata anyway) (task #74).
-		rawSize := binary.LittleEndian.Uint32(original[pos+4:])
-		if rawSize > math.MaxInt32 {
-			break // chunk claims to be >= 2 GiB; treat rest of stream as unreadable
+// chunkWalker iterates over the RIFF chunk list of a source of size bytes,
+// from byte 12 (after the RIFF/WEBP header), reading only the chunk headers.
+type chunkWalker struct {
+	win  *iobuf.Window
+	size int64
+	pos  int64
+}
+
+// origChunk is one chunk of the source as chunkWalker reports it.
+type origChunk struct {
+	id [4]byte
+	// declared is the size field of the chunk; start and end bound its data,
+	// clamped to the source (truncated or RIFF-size-mismatched files).
+	declared   int64
+	start, end int64
+}
+
+// dataLen returns the number of data bytes the chunk has in the source.
+func (c origChunk) dataLen() int64 { return c.end - c.start }
+
+// next returns the next chunk, or false when the list ends. The list ends at
+// fewer than 8 bytes, and at a chunk that claims 2 GiB or more (a RIFF chunk
+// size is 32 bits, and on a 32-bit platform such a size would wrap negative,
+// task #74; such a chunk cannot hold valid EXIF or XMP, and the rest of the
+// stream is treated as unreadable).
+func (cw *chunkWalker) next() (c origChunk, ok bool, err error) {
+	if cw.pos+8 > cw.size {
+		return c, false, nil
+	}
+	hdr, err := cw.win.Peek(cw.pos, 8)
+	if err != nil {
+		return c, false, fmt.Errorf("webp: read chunk header: %w", err)
+	}
+	rawSize := binary.LittleEndian.Uint32(hdr[4:])
+	if rawSize > math.MaxInt32 {
+		return c, false, nil
+	}
+	copy(c.id[:], hdr[:4])
+	c.declared = int64(rawSize)
+	c.start = cw.pos + 8
+	// Clamp to the available data so that the chunks after a truncated one are
+	// not dropped when its size exceeds the remaining bytes.
+	c.end = min(c.start+c.declared, cw.size)
+	cw.pos = c.end + c.declared&1 // RIFF padding byte
+	return c, true, nil
+}
+
+// isMetadataChunk reports whether the chunk is one the output rebuilds: VP8X,
+// EXIF and XMP (RFC 9649 §2.7.1.5: at most one chunk of each type); a
+// non-standard "XMP\0" chunk is XMP read as such (task #333) and is dropped
+// with them so that only one XMP chunk remains.
+func isMetadataChunk(id [4]byte) bool {
+	switch id {
+	case fourCCVP8X, fourCCEXIF, fourCCXMP, fourCCXMPNul:
+		return true
+	}
+	return false
+}
+
+// originalScan is what the first pass over the chunks of the source finds.
+type originalScan struct {
+	// retained is the length, in the output, of the chunks that are kept.
+	retained int64
+	// vp8x holds the first 10 bytes of the VP8X payload of the source when
+	// haveVP8X: the last one whose declared region is trusted.
+	vp8x     [vp8xChunkSize]byte
+	haveVP8X bool
+	still    stillImage
+}
+
+// scanOriginalChunks makes the first pass: it measures the chunks that stay in
+// the output, captures the VP8X payload of the source, and, when wantImage,
+// reads what a VP8X chunk built from the image bitstream needs.
+func scanOriginalChunks(win *iobuf.Window, size int64, wantImage bool) (scan originalScan, err error) {
+	cw := chunkWalker{win: win, size: size, pos: 12}
+	for {
+		c, ok, err := cw.next()
+		if err != nil || !ok {
+			return scan, err
 		}
-		size := int(rawSize)
-		dataStart := pos + 8
-		// Clamp to available data so subsequent chunks are not silently dropped
-		// when chunk size exceeds remaining bytes (truncated or RIFF size mismatch).
-		dataEnd := min(dataStart+size, len(original))
-		switch id {
-		case fourCCVP8X:
-			// Capture original VP8X payload so canvas dimensions can be preserved.
-			//
-			// Cross-chunk contamination guard (rmp task #57):
-			// A malformed file can declare VP8X size=10 while writing only N < 10
-			// real VP8X bytes, followed immediately by the next RIFF chunk. Because
-			// dataEnd is clamped to len(original), the condition
-			// "dataEnd-dataStart >= 10" passes even though 5 of the 10 captured bytes
-			// belong to the adjacent chunk header (its FourCC and size bytes).
-			// Those bytes would corrupt canvas width/height in the rebuilt VP8X.
-			//
-			// Similarly, "dataStart+size <= len(original)" also passes when the file
-			// continues past the declared VP8X region — the 10 declared bytes are
-			// available in the backing array even though they span into adjacent data.
-			//
-			// Robust fix: after the declared VP8X region we must see either EOF or a
-			// recognised WebP chunk FourCC. If the bytes at dataStart+size are not
-			// a known FourCC (and are not EOF), the declared size is wrong and the
-			// captured slice contains contaminating bytes from the adjacent chunk.
-			// In that case we discard origVP8XData; buildVP8XFlags produces a
-			// zero-canvas payload with only the requested EXIF/XMP flags set.
-			nextPos := dataStart + size
-			if size >= 10 && nextPos <= len(original) && isEOFOrKnownFourCC(original, nextPos) {
-				origVP8XData = original[dataStart:nextPos]
+		if c.id == fourCCVP8X {
+			if cerr := scan.captureVP8X(win, size, c); cerr != nil {
+				return scan, cerr
 			}
-		case fourCCEXIF, fourCCXMP, fourCCXMPNul:
-			// Drop: caller will re-append updated versions in the standard
-			// 'EXIF' and 'XMP ' chunks (RFC 9649 §2.7.1.5: at most one chunk of
-			// each type); a non-standard "XMP\0" chunk is XMP read as such (task
-			// #333) and is dropped with them so only one XMP chunk remains.
-		default:
-			chunks = append(chunks, webpOriginalChunk{id: id, data: original[dataStart:dataEnd]})
+			continue
 		}
-		pos = dataEnd
-		if size%2 != 0 {
-			pos++ // RIFF padding byte
+		if isMetadataChunk(c.id) {
+			continue
 		}
+		scan.retained += chunkLen(c.dataLen())
+		if !wantImage {
+			continue
+		}
+		var head []byte
+		if scan.still.wantsHead(c.id) {
+			if head, err = win.Peek(c.start, int(min(c.dataLen(), headBytes))); err != nil {
+				return scan, fmt.Errorf("webp: read chunk data: %w", err)
+			}
+		}
+		scan.still.add(c.id, head, int(c.dataLen()))
 	}
-	return chunks, origVP8XData
 }
 
-// writeVP8XChunk writes the VP8X chunk of the output.
+// captureVP8X records the payload of the VP8X chunk c, so that the canvas
+// dimensions and the other feature bits can be kept.
 //
-// When the source already has a VP8X chunk, its canvas and feature flags are
-// kept and only the EXIF and XMP flags are updated (buildVP8XFlags). When the
-// source is a simple-format file (VP8 or VP8L only, no VP8X), the chunk is
-// built from the image bitstream (newVP8XPayload, task #299): the WebP
-// Container Specification requires the VP8X canvas to match the image
-// dimensions, and libwebp's decoder rejects a mismatch as BITSTREAM_ERROR
-// (src/dec/webp_dec.c ParseHeadersInternal: canvas_width != image_width).
-// Only when no image chunk has a decodable header — a malformed source with
-// no valid canvas size to copy — does it fall back to buildVP8XFlags' zero
-// canvas.
-func writeVP8XChunk(body *bytes.Buffer, chunks []webpOriginalChunk, hasEXIF, hasXMP bool, origVP8XData []byte) {
-	if origVP8XData == nil {
-		if payload, ok := newVP8XPayload(chunks, hasEXIF, hasXMP); ok {
-			writeRIFFChunk(body, fourCCVP8X, payload[:])
-			return
+// Cross-chunk contamination guard (rmp task #57): a malformed file can declare
+// VP8X size=10 while holding fewer real VP8X bytes, followed immediately by the
+// next RIFF chunk; the declared bytes would then include the header of the
+// next chunk and corrupt the canvas. So after the declared region there must be
+// the end of the file or a recognised WebP chunk FourCC; otherwise the declared
+// size is wrong and the payload is discarded (the VP8X chunk of the output
+// then has a zero canvas, or is built from the image bitstream).
+func (s *originalScan) captureVP8X(win *iobuf.Window, size int64, c origChunk) error {
+	next := c.start + c.declared
+	if c.declared < vp8xChunkSize || next > size {
+		return nil
+	}
+	known, err := isEOFOrKnownFourCCAt(win, size, next)
+	if err != nil || !known {
+		return err
+	}
+	payload, err := win.Peek(c.start, vp8xChunkSize)
+	if err != nil {
+		return fmt.Errorf("webp: read VP8X chunk: %w", err)
+	}
+	copy(s.vp8x[:], payload)
+	s.haveVP8X = true
+	return nil
+}
+
+// vp8xPayload returns the payload of the VP8X chunk of the output. When the
+// source has a VP8X chunk its canvas and feature flags are kept and only the
+// EXIF and XMP flags are updated (buildVP8XFlags). When the source is a
+// simple-format file (VP8 or VP8L only, no VP8X), the chunk is built from the
+// image bitstream: the WebP Container Specification requires the VP8X canvas
+// to match the image dimensions, and libwebp's decoder rejects a mismatch as
+// BITSTREAM_ERROR (src/dec/webp_dec.c ParseHeadersInternal:
+// canvas_width != image_width). Only when no image chunk has a decodable
+// header, a malformed source with no valid canvas size to copy, does it fall
+// back to buildVP8XFlags' zero canvas.
+func (s *originalScan) vp8xPayload(hasEXIF, hasXMP bool) [vp8xChunkSize]byte {
+	var orig []byte
+	if s.haveVP8X {
+		orig = s.vp8x[:]
+	} else if payload, ok := s.still.payload(hasEXIF, hasXMP); ok {
+		return payload
+	}
+	return [vp8xChunkSize]byte(buildVP8XFlags(hasEXIF, hasXMP, orig))
+}
+
+// copyOriginalChunks makes the second pass: it writes every chunk of the source
+// that is not rebuilt, in order, each with its size field set to the data it
+// has in the source (the clamped length) and a zero pad byte after an odd size.
+func copyOriginalChunks(r io.ReadSeeker, w io.Writer, win *iobuf.Window, size int64, hdr *[riffHeaderLen]byte) error {
+	cw := chunkWalker{win: win, size: size, pos: 12}
+	for {
+		c, ok, err := cw.next()
+		if err != nil {
+			return fmt.Errorf("webp: read chunks: %w", err)
+		}
+		if !ok {
+			return nil
+		}
+		if isMetadataChunk(c.id) {
+			continue
+		}
+		n := c.dataLen()
+		if err := writeChunkHeader(w, hdr, c.id, n); err != nil {
+			return err
+		}
+		if err := iobuf.CopyRange(r, w, c.start, n); err != nil {
+			return fmt.Errorf("webp: copy %s chunk: %w", c.id[:], err)
+		}
+		if err := writePad(w, hdr, n); err != nil {
+			return err
 		}
 	}
-	writeRIFFChunk(body, fourCCVP8X, buildVP8XFlags(hasEXIF, hasXMP, origVP8XData))
 }
 
 // buildVP8XFlags constructs a 10-byte VP8X chunk payload with the EXIF (bit 3)
@@ -471,9 +608,9 @@ func writeVP8XChunk(body *bytes.Buffer, chunks []webpOriginalChunk, hasEXIF, has
 func buildVP8XFlags(hasEXIF, hasXMP bool, origVP8XData []byte) []byte {
 	vp8xData := make([]byte, vp8xChunkSize)
 	// Guard: only copy from origVP8XData when it is known to hold at least 10
-	// bytes. collectOriginalChunks now enforces this invariant at capture time,
-	// but the explicit len check here makes the safety guarantee local and
-	// prevents a future caller from accidentally passing a short slice.
+	// bytes. captureVP8X enforces this invariant at capture time, but the
+	// explicit len check here makes the safety guarantee local and prevents a
+	// future caller from accidentally passing a short slice.
 	if len(origVP8XData) >= 10 {
 		copy(vp8xData, origVP8XData[:10])
 	}
@@ -495,43 +632,35 @@ func buildVP8XFlags(hasEXIF, hasXMP bool, origVP8XData []byte) []byte {
 
 // knownWebPFourCCs is the exhaustive set of chunk FourCC identifiers defined
 // by the WebP container specification (https://developers.google.com/speed/webp/docs/riff_container).
-// Used by isEOFOrKnownFourCC to validate VP8X region boundaries. [4]byte
-// values (task #234) let isEOFOrKnownFourCC compare without allocating.
+// Used by isEOFOrKnownFourCCAt to validate VP8X region boundaries. [4]byte
+// values (task #234) let the comparison avoid allocating.
 var knownWebPFourCCs = [...][4]byte{ //nolint:gochecknoglobals // immutable lookup table
 	{'V', 'P', '8', ' '}, {'V', 'P', '8', 'L'}, {'V', 'P', '8', 'X'},
 	{'A', 'N', 'I', 'M'}, {'A', 'N', 'M', 'F'}, {'A', 'L', 'P', 'H'},
 	{'I', 'C', 'C', 'P'}, {'E', 'X', 'I', 'F'}, {'X', 'M', 'P', ' '},
 }
 
-// isEOFOrKnownFourCC reports whether position pos in data is either past the
-// end of data (EOF) or the start of a recognised WebP chunk FourCC (4 bytes).
-// A VP8X declared region is only trusted when the byte immediately following
-// it satisfies this predicate — otherwise the declared size is wrong and the
-// captured bytes span into an adjacent chunk.
-func isEOFOrKnownFourCC(data []byte, pos int) bool {
-	if pos >= len(data) {
-		return true // EOF is valid
+// isEOFOrKnownFourCCAt reports whether position pos of a source of size bytes
+// is either past the end of the source (EOF) or the start of a recognised WebP
+// chunk FourCC (4 bytes). A VP8X declared region is only trusted when the byte
+// immediately following it satisfies this predicate — otherwise the declared
+// size is wrong and the captured bytes span into an adjacent chunk.
+func isEOFOrKnownFourCCAt(win *iobuf.Window, size, pos int64) (bool, error) {
+	if pos >= size {
+		return true, nil // EOF is valid
 	}
-	if pos+4 > len(data) {
-		return false // not enough bytes to read a FourCC
+	if pos+4 > size {
+		return false, nil // not enough bytes to read a FourCC
 	}
-	var candidate [4]byte
-	copy(candidate[:], data[pos:pos+4])
+	b, err := win.Peek(pos, 4)
+	if err != nil {
+		return false, fmt.Errorf("webp: read chunk header: %w", err)
+	}
+	candidate := [4]byte(b)
 	for _, known := range knownWebPFourCCs {
 		if candidate == known {
-			return true
+			return true, nil
 		}
 	}
-	return false
-}
-
-func writeRIFFChunk(w *bytes.Buffer, id [4]byte, data []byte) {
-	w.Write(id[:])
-	var sz [4]byte
-	binary.LittleEndian.PutUint32(sz[:], uint32(len(data))) //nolint:gosec // G115: RIFF chunk size bounded by buffer size
-	w.Write(sz[:])
-	w.Write(data)
-	if len(data)%2 != 0 {
-		w.WriteByte(0x00)
-	}
+	return false, nil
 }

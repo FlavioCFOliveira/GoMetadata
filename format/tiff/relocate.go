@@ -323,13 +323,21 @@ type subIFDInfo struct {
 // Set* methods) should call relocateTIFFFromParsed directly to avoid the
 // redundant parse and to ensure IFD edits (copyright, GPS, etc.) are not lost.
 func relocateTIFF(base []byte, rawIPTC, rawXMP []byte) (header []byte, blocks []*imageBlock, err error) {
+	// relocateTIFF's own callers (tiff.Inject) always supply the whole file as
+	// base (see Inject's own doc comment), so fileLen == len(base) exactly.
+	return relocateTIFFPrefix(base, rawIPTC, rawXMP, uint64(len(base)))
+}
+
+// relocateTIFFPrefix is relocateTIFF for a base that is the metadata prefix of
+// a source of fileLen bytes (task #392): the IFDs and their values, as the
+// extent scanner of Extract finds them, which is all that parsing and relocating
+// read; the image blocks it enumerates are streamed from the source.
+func relocateTIFFPrefix(base []byte, rawIPTC, rawXMP []byte, fileLen uint64) (header []byte, blocks []*imageBlock, err error) {
 	e, err := exif.Parse(base)
 	if err != nil {
 		return nil, nil, fmt.Errorf("tiff: parse for relocation: %w", err)
 	}
-	// relocateTIFF's own callers (tiff.Inject) always supply the whole file as
-	// base (see Inject's own doc comment), so fileLen == len(base) exactly.
-	return relocateTIFFFromParsed(base, e, rawIPTC, rawXMP, uint64(len(base)))
+	return relocateTIFFFromParsed(base, e, rawIPTC, rawXMP, fileLen)
 }
 
 // relocateTIFFFromParsed is the implementation of the TIFF copy-and-relocate

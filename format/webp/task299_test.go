@@ -114,14 +114,13 @@ func TestTask299ICCPAndALPHChunksSetFlags(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, image := vp8xOf(t, src)
-	chunks := []webpOriginalChunk{
-		{id: fourCCICCP, data: []byte("icc")},
-		{id: fourCCALPH, data: []byte{0}},
-		{id: fourCCVP8, data: image},
-	}
-	payload, ok := newVP8XPayload(chunks, false, false)
+	var still stillImage
+	still.add(fourCCICCP, []byte("icc"), 3)
+	still.add(fourCCALPH, []byte{0}, 1)
+	still.add(fourCCVP8, image[:headBytes], len(image))
+	payload, ok := still.payload(false, false)
 	if !ok {
-		t.Fatal("newVP8XPayload failed on a valid VP8 bitstream")
+		t.Fatal("stillImage.payload failed on a valid VP8 bitstream")
 	}
 	if flags := binary.LittleEndian.Uint32(payload[:]); flags != vp8xFlagICCP|vp8xFlagAlpha {
 		t.Errorf("flags = 0x%02x, want ICCP|ALPHA", flags)
@@ -159,7 +158,7 @@ func TestTask299BitstreamHeaders(t *testing.T) {
 		{"zero width", vp8(good, start, 0, 24), false, [2]int{}},
 		{"truncated", vp8(good, start, 40, 24)[:9], false, [2]int{}},
 	} {
-		w, h, ok := vp8Info(tc.data)
+		w, h, ok := vp8Info(tc.data, len(tc.data))
 		if ok != tc.ok || (ok && (w != tc.wantWH[0] || h != tc.wantWH[1])) {
 			t.Errorf("vp8Info %s = %dx%d %v, want %v %v", tc.name, w, h, ok, tc.wantWH, tc.ok)
 		}

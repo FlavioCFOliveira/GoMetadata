@@ -2,20 +2,22 @@ package heif
 
 import "errors"
 
-// maxFileSize is the upper bound on the total number of bytes this package will
-// read from an io.Reader in a single Extract (slow path) or Inject call. Reads
-// via io.ReadAll are wrapped with io.LimitReader(r, maxFileSize+1); if the
-// reader delivers more bytes than this limit the operation is aborted with
-// ErrFileTooLarge before any allocation proportional to file size is retained.
+// maxFileSize is the upper bound on the number of bytes this package will hold
+// in memory for one structure: the whole file that the Extract slow path reads
+// (io.ReadAll wrapped with io.LimitReader(r, maxFileSize+1)), and each of the
+// boxes that Inject rebuilds in memory (the meta box and the moov boxes whose
+// chunk offsets move). Inject never holds the file itself (task #390): it has no
+// limit on the size of the file, and ErrFileTooLarge is returned for a single
+// meta or moov box above this limit. An input above it is aborted before any
+// allocation proportional to it is retained.
 //
-// Real-world HEIF/HEIC/AVIF files are well under 100 MiB; 256 MiB gives ample
-// headroom for future camera improvements while bounding worst-case heap
-// allocation to a predictable, safe value.
+// Real-world HEIF/HEIC/AVIF files are well under 100 MiB, and their meta boxes
+// are a few kilobytes; 256 MiB gives ample headroom while bounding worst-case
+// heap allocation to a predictable, safe value.
 //
-// The fast-path Extract (meta box within 64 KB header window) is already safe:
+// The fast-path Extract (meta box within 64 KB header window) is not affected:
 // it reads at most 64 KB for the header and then seeks to individual item
-// payloads which are already capped by maxItemPayloadSize. Only the slow-path
-// io.ReadAll fallback and the Inject full-file read are affected by this guard.
+// payloads, which are capped by maxItemPayloadSize.
 //
 // Declared as a var (not a const) so that tests can lower it temporarily to
 // verify the OOM-guard path without allocating 256 MiB of memory.
@@ -24,7 +26,9 @@ import "errors"
 // infinite streaming readers.
 var maxFileSize int64 = 256 << 20 //nolint:gochecknoglobals // test-overridable cap; never mutated in production paths
 
-// ErrFileTooLarge is returned when the input exceeds maxFileSize. This prevents
+// ErrFileTooLarge is returned by Extract when the input exceeds maxFileSize
+// and its metadata is not found in the first 64 KB, and by Inject when the meta
+// box or a moov box it has to hold in memory exceeds maxFileSize. This prevents
 // a streaming or adversarially large reader from causing unbounded heap
 // allocation. Callers can detect this specific condition with errors.Is.
 var ErrFileTooLarge = errors.New("heif: input exceeds maximum file size (256 MiB)")

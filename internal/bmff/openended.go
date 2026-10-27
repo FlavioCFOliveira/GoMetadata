@@ -80,17 +80,23 @@ func closeWithLimit(box []byte, limit uint64) []byte {
 // open-ended and the size fits its header (32 bits, or the 64-bit field). It
 // reports whether the box is explicit afterwards (true when it already was).
 // Use it on a buffer the caller owns; use Close on a view of a shared buffer.
-func CloseInPlace(box []byte) bool {
-	if !OpenEnded(box) {
+func CloseInPlace(box []byte) bool { return CloseHeader(box, uint64(len(box))) }
+
+// CloseHeader is CloseInPlace for a box of size bytes of which only the first
+// bytes, the header, are at hand: hdr holds at least 8 bytes, or 16 for the
+// 64-bit form. A streaming writer closes the header of an open-ended box that
+// it does not hold in memory (task #390).
+func CloseHeader(hdr []byte, size uint64) bool {
+	if !OpenEnded(hdr) {
 		return true
 	}
-	if binary.BigEndian.Uint32(box) == 1 {
-		binary.BigEndian.PutUint64(box[8:], uint64(len(box)))
+	if binary.BigEndian.Uint32(hdr) == 1 {
+		binary.BigEndian.PutUint64(hdr[8:], size)
 		return true
 	}
-	if uint64(len(box)) > math.MaxUint32 {
+	if size > math.MaxUint32 {
 		return false
 	}
-	binary.BigEndian.PutUint32(box, uint32(len(box))) //nolint:gosec // G115: len(box) <= MaxUint32 checked above
+	binary.BigEndian.PutUint32(hdr, uint32(size))
 	return true
 }

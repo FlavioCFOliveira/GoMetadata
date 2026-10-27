@@ -328,6 +328,12 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ boo
 		}
 	}
 
+	return injectBase(r, w, base, rawIPTC, rawXMP)
+}
+
+// injectBase is Inject from the base TIFF bytes it works on: the whole file, or
+// the rawEXIF the caller supplied.
+func injectBase(r io.ReadSeeker, w io.Writer, base, rawIPTC, rawXMP []byte) error {
 	// Pass-through: no metadata changes requested.
 	// #190 fix: treat zero-length slices the same as nil — an empty rawIPTC or
 	// rawXMP must not trigger the copy-and-relocate path or write a zero-length
