@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
 	"github.com/FlavioCFOliveira/GoMetadata/format"
@@ -94,7 +95,7 @@ func (m *Metadata) setIPTCTrust(fmtID format.FormatID, rawEXIF []byte) {
 // To distinguish "parsed successfully" from "no metadata in file", inspect
 // m.EXIF, m.IPTC, and m.XMP directly — a nil value means that type was absent
 // (or failed to parse in best-effort mode).
-func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
+func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) { //nolint:gocyclo // the compacted-TIFF branch (task #389) adds one decision to a linear sequence of steps
 	// #204: cfg is a stack value, not a heap-allocated *readConfig. Applying
 	// opts is confined to the out-of-line, non-inlined applyReadOptions so
 	// that the escape this indirection forces (see that function's doc
@@ -144,7 +145,10 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 	// could not be merged (task #357).
 	var cr3Sub cr3SubStreams
 	var keptExtGUID string
-	rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, noCMT1Box, err := extractByFormat(r, fmtID, !cfg.lazyIPTC, !cfg.lazyXMP, &cr3Sub, &keptExtGUID)
+	// sparse receives the compacted metadata of a TIFF or DNG whose IFDs lie
+	// among the image data (task #389); it stays nil for every other file.
+	var sparse *tiff.Sparse
+	rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, noCMT1Box, err := extractByFormat(r, fmtID, !cfg.lazyIPTC, !cfg.lazyXMP, !cfg.denseTIFF, &cr3Sub, &keptExtGUID, &sparse)
 	if err != nil {
 		return nil, err
 	}
@@ -192,6 +196,9 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 		})
 	}
 
+	if sparse != nil {
+		return readCompacted(r, m, sparse, rawEXIF, rawIPTC, rawXMP, &cfg, opts)
+	}
 	if err := parseParsedMetadata(m, rawEXIF, rawIPTC, rawXMP, &cfg); err != nil {
 		return nil, err
 	}
@@ -200,6 +207,50 @@ func Read(r io.ReadSeeker, opts ...ReadOption) (*Metadata, error) {
 	}
 
 	return m, nil
+}
+
+// readCompacted completes Read of a TIFF or DNG whose metadata tiff.ExtractCompact
+// compacted (task #389): the EXIF is parsed from the compacted stream, the IPTC
+// and XMP from their payloads. When the compacted stream does not parse like the
+// file (see finishSparse), the file is read again without the compaction.
+func readCompacted(r io.ReadSeeker, m *Metadata, sparse *tiff.Sparse, rawEXIF, rawIPTC, rawXMP []byte, cfg *readConfig, opts []ReadOption) (*Metadata, error) {
+	ok, err := finishSparse(m, sparse, rawEXIF, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		if _, serr := r.Seek(0, io.SeekStart); serr != nil {
+			return nil, fmt.Errorf("gometadata: seek: %w", serr)
+		}
+		return Read(r, append(slices.Clip(opts), withoutSparse())...)
+	}
+	if err := parseIPTCAndXMP(m, rawIPTC, rawXMP, cfg); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// finishSparse parses the compacted metadata of a TIFF or DNG (task #389) and
+// reports whether m may keep the result. stream is the compacted stream; the
+// offsets of the file are put back into it as soon as the parse is done, and m
+// keeps the Head of the file as its raw EXIF.
+//
+// The compacted stream carries the offsets of its own layout while it is
+// parsed, so an EXIF parse error or warning (whose text names offsets) is not
+// the one a parse of the file would report: ok is then false and Read reads the
+// file the long way, which reports it exactly. A parse that was not asked for
+// (WithoutEXIF) cannot differ.
+func finishSparse(m *Metadata, sp *tiff.Sparse, stream []byte, cfg *readConfig) (ok bool, err error) {
+	perr := parseEXIF(m, stream, cfg)
+	fits := perr == nil && (m.EXIF == nil || len(m.EXIF.Warnings) == 0)
+	sp.Restore()
+	if !fits {
+		return false, nil
+	}
+	m.rawEXIF = sp.Head()
+	m.rawEXIFSparse = true
+	m.rawEXIFIsWholeFile = false
+	return true, applyOrWarn(m, perr, cfg.strict)
 }
 
 // parseCR3SubIFDs attaches the IFDs that a CR3 file stores outside CMT1
@@ -371,6 +422,11 @@ func parseParsedMetadata(m *Metadata, rawEXIF, rawIPTC, rawXMP []byte, cfg *read
 	if err := applyOrWarn(m, parseEXIF(m, rawEXIF, cfg), cfg.strict); err != nil {
 		return err
 	}
+	return parseIPTCAndXMP(m, rawIPTC, rawXMP, cfg)
+}
+
+// parseIPTCAndXMP is the part of parseParsedMetadata after the EXIF.
+func parseIPTCAndXMP(m *Metadata, rawIPTC, rawXMP []byte, cfg *readConfig) error {
 	if err := applyOrWarn(m, parseIPTC(m, rawIPTC, cfg), cfg.strict); err != nil {
 		return err
 	}
@@ -623,8 +679,16 @@ type cr3SubStreams struct {
 // reassembly when the caller has opted out of that segment. Other formats do
 // not yet have an equivalent selective-extraction path (their raw-segment
 // extraction has no comparable reassembly cost) and are unaffected.
-func extractByFormat(r io.ReadSeeker, fmtID format.FormatID, wantIPTC, wantXMP bool, cr3Sub *cr3SubStreams, keptExtGUID *string) (rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire []byte, xmpTruncated, noCMT1Box bool, err error) {
+//
+// A TIFF or DNG is read by tiff.ExtractCompact unless compact is false; when the
+// file is compacted, *sparse receives the stream (task #389).
+func extractByFormat(r io.ReadSeeker, fmtID format.FormatID, wantIPTC, wantXMP, compact bool, cr3Sub *cr3SubStreams, keptExtGUID *string, sparse **tiff.Sparse) (rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire []byte, xmpTruncated, noCMT1Box bool, err error) {
 	switch fmtID {
+	case format.FormatTIFF, format.FormatDNG:
+		if compact {
+			rawEXIF, rawIPTC, rawXMP, err = extractCompactTIFF(r, fmtID, sparse)
+			return rawEXIF, rawIPTC, nil, rawXMP, nil, false, false, err
+		}
 	case format.FormatJPEG:
 		rawEXIF, rawIPTC, rawIPTCDigest, rawXMP, rawXMPWire, xmpTruncated, *keptExtGUID, err = jpeg.ExtractFullSelectiveKept(r, wantIPTC, wantXMP)
 		if err != nil {
@@ -646,6 +710,20 @@ func extractByFormat(r io.ReadSeeker, fmtID format.FormatID, wantIPTC, wantXMP b
 		return nil, nil, nil, nil, nil, false, false, fmt.Errorf("gometadata: %w", err)
 	}
 	return rawEXIF, rawIPTC, nil, rawXMP, nil, false, false, nil
+}
+
+// extractCompactTIFF reads a TIFF or DNG with tiff.ExtractCompact (task #389);
+// *sparse receives the compacted stream, or stays nil when the file is read as
+// tiff.Extract reads it.
+func extractCompactTIFF(r io.ReadSeeker, fmtID format.FormatID, sparse **tiff.Sparse) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+	rawEXIF, rawIPTC, rawXMP, *sparse, err = tiff.ExtractCompact(r)
+	if err != nil {
+		if fmtID == format.FormatDNG {
+			err = fmt.Errorf("dng: %w", err) // dng.Extract's own wrapping
+		}
+		return nil, nil, nil, fmt.Errorf("gometadata: %w", err)
+	}
+	return rawEXIF, rawIPTC, rawXMP, nil
 }
 
 // extractCR3 returns the EXIF and XMP payloads of a CR3 file and stores its

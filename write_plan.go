@@ -10,6 +10,7 @@ import (
 	"github.com/FlavioCFOliveira/GoMetadata/format/jpeg"
 	"github.com/FlavioCFOliveira/GoMetadata/format/png"
 	"github.com/FlavioCFOliveira/GoMetadata/format/raw/cr3"
+	"github.com/FlavioCFOliveira/GoMetadata/format/tiff"
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 )
 
@@ -179,7 +180,7 @@ func sourceMatches(r io.ReadSeeker, fmtID format.FormatID, m *Metadata, check Se
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return false
 	}
-	rawEXIF, rawIPTC, rawXMP, rawXMPWire, err := extractRaw(r, fmtID, wantIPTC, wantXMP)
+	rawEXIF, rawIPTC, rawXMP, rawXMPWire, err := extractRaw(r, fmtID, wantIPTC, wantXMP, m.rawEXIFSparse)
 	if err != nil {
 		return false
 	}
@@ -196,7 +197,14 @@ func sourceMatches(r io.ReadSeeker, fmtID format.FormatID, m *Metadata, check Se
 // compares. It differs in what it leaves out: the CR3 sub-streams, the
 // extended-XMP GUID and the digest, which cost allocations a comparison does not
 // need.
-func extractRaw(r io.ReadSeeker, fmtID format.FormatID, wantIPTC, wantXMP bool) (rawEXIF, rawIPTC, rawXMP, rawXMPWire []byte, err error) {
+//
+// sparse is true for a Metadata whose raw EXIF is the Head of a compacted TIFF or
+// DNG (task #389): its raw segments are then read the way Read read them.
+func extractRaw(r io.ReadSeeker, fmtID format.FormatID, wantIPTC, wantXMP, sparse bool) (rawEXIF, rawIPTC, rawXMP, rawXMPWire []byte, err error) {
+	if sparse {
+		rawEXIF, rawIPTC, rawXMP, err = extractSparseRaw(r)
+		return rawEXIF, rawIPTC, rawXMP, nil, err
+	}
 	switch fmtID {
 	case format.FormatJPEG:
 		rawEXIF, rawIPTC, _, rawXMP, rawXMPWire, _, err = jpeg.ExtractFullSelective(r, wantIPTC, wantXMP)
@@ -215,6 +223,24 @@ func extractRaw(r io.ReadSeeker, fmtID format.FormatID, wantIPTC, wantXMP bool) 
 		rawEXIF, rawIPTC, rawXMP, err = fn(r)
 	}
 	return rawEXIF, rawIPTC, rawXMP, rawXMPWire, err
+}
+
+// errNotCompacted is returned by extractSparseRaw for a file that tiff.ExtractCompact
+// does not compact any more.
+var errNotCompacted = errors.New("gometadata: the image is not the one that was read")
+
+// extractSparseRaw returns the raw segments of the TIFF or DNG r as Read kept
+// them for a compacted file (task #389): the Head of the file as the raw EXIF.
+func extractSparseRaw(r io.ReadSeeker) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
+	_, _, _, sp, err := tiff.ExtractCompact(r)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("gometadata: %w", err)
+	}
+	if sp == nil {
+		return nil, nil, nil, errNotCompacted
+	}
+	sp.Restore()
+	return sp.Head(), sp.IPTC(), sp.XMP(), nil
 }
 
 // copyThrough writes the whole of r to w: the output of a write in which no

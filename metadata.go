@@ -150,6 +150,15 @@ type Metadata struct {
 	// false only means "re-read to be safe", never "this write is unsafe".
 	rawEXIFIsWholeFile bool
 
+	// rawEXIFSparse is true when rawEXIF is only the Head of a TIFF or DNG
+	// whose IFDs lie among the image data (task #389: tiff.ExtractCompact read
+	// the metadata structures without the image data between them, and
+	// m.EXIF was parsed from them). rawEXIF is then a byte-for-byte prefix of
+	// the source that does not reach every IFD, so Write, which relocates the
+	// IFDs and the image data from the source, reads the metadata prefix of
+	// the source again instead of using rawEXIF (see tiffPrefixBytes).
+	rawEXIFSparse bool
+
 	// rawIPTCDigest is the 16-byte MD5 value stored in Photoshop resource
 	// 0x0425 ("IPTC Digest") inside the APP13 IRB, or nil when absent.
 	// MWG Guidelines v2.0 §4.2.3.2: the digest is used at read time to determine
@@ -319,6 +328,13 @@ func (m *Metadata) Format() format.FormatID { return format.FormatID(m.format) }
 // whole file. A caller that needs the original bytes verbatim — for example
 // to re-embed a thumbnail this package never reads — must keep its own copy
 // of the source rather than relying on RawEXIF.
+//
+// A TIFF or DNG whose IFDs lie after, or among, the image data (a DNG whose
+// Exif IFD is the last thing in the file, a TIFF whose IFD0 follows the strips)
+// is read without its image data (task #389), and RawEXIF then returns only the
+// leading bytes of the file, from offset 0 to the end of its first group of
+// metadata structures: still a byte-for-byte prefix of the file, but not one
+// that reaches every IFD. The parsed EXIF (Metadata.EXIF) is complete.
 //
 // For every other supported format (JPEG, PNG, WebP, HEIF/AVIF, CR3),
 // RawEXIF already returned just the EXIF segment/box/chunk rather than the

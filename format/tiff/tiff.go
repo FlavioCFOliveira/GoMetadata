@@ -193,6 +193,12 @@ func extractPrefixed(r io.ReadSeeker, fileSize int64, acceptMagic uint16) (rawEX
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	return extractPrefixedFrom(r, initial, uint64(fileSize), acceptMagic) //nolint:gosec // G115: Extract validates 0 <= fileSize <= maxFileSize before calling extractPrefixed
+}
+
+// extractPrefixedFrom is extractPrefixed from the first bytes of the file,
+// already read (ExtractCompact reads them before it knows the variant).
+func extractPrefixedFrom(r io.ReadSeeker, initial []byte, fileSize uint64, acceptMagic uint16) (rawEXIF, rawIPTC, rawXMP []byte, err error) {
 	if len(initial) < 8 {
 		return nil, nil, nil, ErrFileTooShort
 	}
@@ -208,9 +214,9 @@ func extractPrefixed(r io.ReadSeeker, fileSize int64, acceptMagic uint16) (rawEX
 	magic := order.Uint16(initial[2:])
 	switch {
 	case magic == 0x002A || (acceptMagic != 0 && magic == acceptMagic):
-		return extractClassicPrefix(r, initial, order, uint64(fileSize)) //nolint:gosec // G115: Extract validates 0 <= fileSize <= maxFileSize before calling extractPrefixed
+		return extractClassicPrefix(r, initial, order, fileSize)
 	case magic == 0x002B:
-		return extractBigTIFFPrefix(r, initial, order, uint64(fileSize)) //nolint:gosec // G115: same rationale
+		return extractBigTIFFPrefix(r, initial, order, fileSize)
 	default:
 		return nil, nil, nil, fmt.Errorf("tiff: unsupported magic 0x%04X (expected 0x002A classic TIFF or 0x002B BigTIFF): %w",
 			magic, ErrUnsupportedMagic)
