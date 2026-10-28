@@ -126,7 +126,10 @@ func TestSecurityAuditV150HEIF(t *testing.T) {
 			done := make(chan error, 1)
 			go func() { done <- patchAncestorSize(bytes.Clone(data), len(data)-8, 4) }()
 			select {
-			case <-done:
+			case err := <-done:
+				// Only termination is asserted: a size that cannot describe a box is
+				// reported as an error, one that wraps is not, and both are correct.
+				_ = err
 			case <-time.After(30 * time.Second):
 				t.Fatalf("%s: patchAncestorSize did not return", name)
 			}
