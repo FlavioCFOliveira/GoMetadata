@@ -367,7 +367,7 @@ func TestRebaseIFDInBlob_TypeLongSubIFDPointerRebased(t *testing.T) {
 	// val_or_off = srcOff + subIFDPtrRelOff = 2040.
 	buf := make([]byte, 14)
 	order.PutUint16(buf[0:], 1)      // 1 entry
-	order.PutUint16(buf[2:], 0x0001) // tag
+	order.PutUint16(buf[2:], 0x74C0) // tag: SR2DataIFD, the only array of IFD offsets (task #409)
 	order.PutUint16(buf[4:], 4)      // TypeLong
 	order.PutUint32(buf[6:], 2)      // count=2 → total=8 → OOL
 	order.PutUint32(buf[10:], srcOff+subIFDPtrRelOff)

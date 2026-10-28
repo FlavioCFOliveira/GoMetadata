@@ -184,7 +184,7 @@ func TestCanonBase_R407_Corpus(t *testing.T) {
 			corrected++
 			continue
 		}
-		legacy := mnLayouts[mnCanon].parse(makerNoteView(mnCanon, e.MakerNote, tiff, uint64(e.MakerNoteOffset)), e.ByteOrder)
+		legacy := mnLayouts[mnCanon].parse(makerNoteView(mnBaseTIFF, e.MakerNote, tiff, uint64(e.MakerNoteOffset)), e.ByteOrder)
 		if !sameIFD(legacy, e.MakerNoteIFD) {
 			t.Errorf("%s: the IFD read differs from the one read without the correction", f)
 		}

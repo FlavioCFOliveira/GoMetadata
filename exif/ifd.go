@@ -2493,29 +2493,30 @@ func filterEntriesInto(ifd *IFD, dst *[]IFDEntry, extraCap int, exclude ...TagID
 	}
 	// Reuse the pooled backing array.  Reset to length 0 while preserving capacity.
 	result := (*dst)[:0]
+	src := skipPaddingEntries(ifd.Entries)
 
 	// Fast path: no excluded tag present — bulk-copy all entries.
 	anyPresent := false
 	for _, tag := range exclude {
-		if hasEntry(ifd.Entries, tag) {
+		if hasEntry(src, tag) {
 			anyPresent = true
 			break
 		}
 	}
 	if !anyPresent {
 		// Ensure capacity for len+extraCap entries, then bulk-copy.
-		need := len(ifd.Entries) + extraCap
+		need := len(src) + extraCap
 		if cap(result) < need {
-			result = make([]IFDEntry, len(ifd.Entries), need)
+			result = make([]IFDEntry, len(src), need)
 		} else {
-			result = result[:len(ifd.Entries)]
+			result = result[:len(src)]
 		}
-		copy(result, ifd.Entries)
+		copy(result, src)
 		return result
 	}
 
 	// Filtered path: copy only the non-excluded entries.
-	for _, entry := range ifd.Entries {
+	for _, entry := range src {
 		if !slices.Contains(exclude, entry.Tag) {
 			result = append(result, entry)
 		}
@@ -2527,6 +2528,32 @@ func filterEntriesInto(ifd *IFD, dst *[]IFDEntry, extraCap int, exclude ...TagID
 		result = grown
 	}
 	return result
+}
+
+// skipPaddingEntries returns entries without the all-zero entries that open
+// it: tag 0, type 0, count 0 and an empty value field. Some cameras pad an IFD
+// with such an entry (the Samsung NX3000 writes one at the end of IFD0), which
+// sorts first once the entries are in tag order, and a reader that finds an
+// entry of type 0 first takes the IFD for corrupted and reads none of it
+// (ExifTool, Exif.pm ProcessExif: "assume corrupted IFD if this is our first
+// entry"; the same reader ignores the entry at the end of an IFD, "unless the
+// IFD was just padded with zeros"). TIFF 6.0 §2 lists no type 0. The entries
+// are in tag order (see hasEntry), so a padding entry can only be at the head.
+func skipPaddingEntries(entries []IFDEntry) []IFDEntry {
+	for len(entries) > 0 && entries[0].Tag == 0 && entries[0].Type == 0 && entries[0].Count == 0 && isZero(entries[0].Value) {
+		entries = entries[1:]
+	}
+	return entries
+}
+
+// isZero reports whether every byte of b is 0.
+func isZero(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // hasEntry reports whether entries contains an entry with the given tag.

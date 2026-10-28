@@ -84,7 +84,7 @@ func TestDetectMakerNote_Signatures(t *testing.T) {
 		{"kodak", []byte("KDK INFO\x00\x00\x00\x00\x00\x00\x00\x00\x00"), "EASTMAN KODAK COMPANY", le, "kodak", -1, mnBaseNone, false},
 		{"casio-2 QVC", mnBlob(be, "QVC\x00\x00\x00", 6), "CASIO COMPUTER CO.,LTD.", le, "casio-2", 6, mnBaseTIFF, true},
 		{"fujifilm", fuji, "FUJIFILM", le, "fujifilm", -1, mnBaseBlob, true},
-		{"kyocera", mnBlob(le, "KYOCERA", 22), "KYOCERA", le, "kyocera", 22, mnBaseTIFF, true},
+		{"kyocera", mnBlob(le, "KYOCERA", 22), "KYOCERA", le, "kyocera", 22, mnBaseBlob, true},
 		{"leica", mnBlob(le, "LEICA\x00\x01\x00", 8), "LEICA CAMERA AG", le, "leica", 8, mnBaseBlob, true},
 		{"leica TIFF-based", mnBlob(le, "LEICA\x00\x02\xFF", 8), "Leica Camera AG", le, "leica", 8, mnBaseTIFF, true},
 		{"panasonic", mnBlob(le, "Panasonic\x00\x00\x00", 12), "Panasonic", le, "panasonic", 12, mnBaseTIFF, true},

@@ -147,6 +147,8 @@ func newMakerNoteEdit(e *EXIF) (*mnEdit, error) {
 	switch {
 	case !ok || lay.layout == mnNone:
 		return nil, notEditable("the manufacturer layout of the MakerNote is not known, so the base of its offsets is not")
+	case lay.layout == mnKyocera:
+		return nil, notEditable("the offsets of a Kyocera MakerNote count from their own entries, which an edit does not keep")
 	case lay.TIFFRelative && mnOff == 0:
 		return nil, notEditable("the position of the MakerNote in the file it was read from is not known")
 	}
