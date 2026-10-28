@@ -347,6 +347,9 @@ func (m *mnEdit) deleteEntries(del func(TagID) bool) error {
 			gone = append(gone, i)
 		}
 	}
+	if len(gone) == 0 {
+		return nil // nothing to delete: the note is left as it is (gone[len(gone)-1] below needs one)
+	}
 	if len(gone) >= n {
 		return notEditable("the tag is the last one of the MakerNote")
 	}

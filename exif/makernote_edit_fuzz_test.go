@@ -24,6 +24,8 @@ func FuzzMakerNoteEdit(f *testing.F) {
 		f.Add(tiff, uint8(1), uint8(1), uint8(40))
 		f.Add(tiff, uint8(2), uint8(2), uint8(1))
 	}
+	f.Add(mustNote(cases[0].spec), uint8(0x80), uint8(0), uint8(0))
+	f.Add(mustNote(cases[0].spec), uint8(0x81), uint8(0), uint8(1))
 	shifted, _ := testutil.MakerNoteTIFF(canonSpec(binary.LittleEndian, 164))
 	f.Add(shifted, uint8(1), uint8(1), uint8(30))
 	// Notes whose table repeats a tag (task #416): the entries of the repeated tag
@@ -77,8 +79,15 @@ func FuzzMakerNoteEdit(f *testing.F) {
 
 		var editErr error
 		var promised []topEntry
-		switch op % 3 {
-		case 0:
+		switch {
+		case sel&0x80 != 0: // an empty or nil list (task #420): a no-op that leaves every entry
+			if size&1 == 0 {
+				editErr = e.DeleteMakerNoteTags(nil)
+			} else {
+				editErr = e.DeleteMakerNoteTags([]TagID{})
+			}
+			promised = want
+		case op%3 == 0:
 			editErr = e.DeleteMakerNoteTag(victim.tag)
 			for _, te := range want {
 				if te.tag != victim.tag {
@@ -143,4 +152,10 @@ func FuzzMakerNoteEdit(f *testing.F) {
 			}
 		}
 	})
+}
+
+// mustNote returns the TIFF stream of spec, for a seed.
+func mustNote(spec testutil.MNSpec) []byte {
+	tiff, _ := testutil.MakerNoteTIFF(spec)
+	return tiff
 }
