@@ -13,7 +13,7 @@ package jpeg
 //   TestJPEGInjectMultiAPP13SiblingPreservation      — #174 (b): 0x0425 in second APP13 survives
 //
 // References:
-//   Adobe XMP Specification Part 3 §1.1.4 (extended XMP wire format)
+//   Adobe XMP Specification Part 3 §1.1.3.1 (extended XMP wire format)
 //   Adobe Photoshop IRB spec §"Image Resources" (8BIM layout)
 
 import (
@@ -77,7 +77,7 @@ func buildExtChunkJPEG(mainXMP []byte, guid string, chunks []struct {
 // chunk layouts (duplicate offsets, gaps, fullLen mismatch), causing buildXMPResult
 // to degrade to the main XMP packet rather than returning corrupt doubled bytes.
 //
-// Adobe XMP Specification Part 3 §1.1.4: chunks must cover [0, fullLen) with no
+// Adobe XMP Specification Part 3 §1.1.3.1: chunks must cover [0, fullLen) with no
 // gaps or overlaps; fullLen must equal the assembled total.
 func TestExtendedXMPReassemblyValidation(t *testing.T) {
 	t.Parallel()
@@ -220,7 +220,7 @@ func TestExtendedXMPReassemblyValidation(t *testing.T) {
 // of "rdf:"). The old byte-splice reassembler would fail silently for such
 // prefixes; the new xmp.Parse-based merge handles any binding.
 //
-// Adobe XMP Specification Part 3 §1.1.4: the assembler must handle arbitrary
+// Adobe XMP Specification Part 3 §1.1.3.1: the assembler must handle arbitrary
 // namespace prefix assignments.
 func TestExtendedXMPNonRDFPrefix(t *testing.T) {
 	t.Parallel()
@@ -331,7 +331,7 @@ func TestExtendedXMPTruncationSurfaced(t *testing.T) {
 // lowercase, the reassembly succeeds and extended properties are present in
 // rawXMP. Both GUIDs are normalised to uppercase before keying the map.
 //
-// Adobe XMP Specification Part 3 §1.1.4: GUID is defined as 32 uppercase hex
+// Adobe XMP Specification Part 3 §1.1.3.1: GUID is defined as 32 uppercase hex
 // characters, but non-conforming writers emit lowercase hex.
 func TestExtendedXMPGUIDCaseMismatch(t *testing.T) {
 	t.Parallel()

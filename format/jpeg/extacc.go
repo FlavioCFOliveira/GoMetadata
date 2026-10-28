@@ -122,12 +122,12 @@ func canonicalGUID(raw []byte) (key [guidLen]byte, ok bool) {
 // (32-byte GUID + 4-byte fullLen + 4-byte offset). The wire fullLen field of
 // the first chunk of a GUID is validated against maxExtendedXMPTotal; if it
 // exceeds the cap the GUID is blacklisted. Subsequent chunks are individually
-// bounded by the same cap. Adobe XMP Specification Part 3 §1.1.4 describes the
+// bounded by the same cap. Adobe XMP Specification Part 3 §1.1.3.1 describes the
 // wire fields.
 func (a *extAcc) add(body []byte) {
 	// #135: validate that the GUID is exactly 32 hex characters and
 	// canonicalise it to uppercase before keying the map. Adobe XMP
-	// Specification Part 3 §1.1.4 defines the GUID as a 32-character uppercase
+	// Specification Part 3 §1.1.3.1 defines the GUID as a 32-character uppercase
 	// hex string; real-world writers may emit lowercase. A case mismatch
 	// between the main packet's HasExtendedXMP attribute and the chunk GUID
 	// would silently discard all extended properties without this
@@ -160,7 +160,7 @@ func (a *extAcc) add(body []byte) {
 		}
 		// #122: record the wire-declared total size so buildXMPResult can
 		// validate that the assembled chunks cover exactly fullLen bytes with
-		// no gaps or overlaps. Adobe XMP Specification Part 3 §1.1.4.
+		// no gaps or overlaps. Adobe XMP Specification Part 3 §1.1.3.1.
 		g = &extGUID{fullLen: fullLen}
 		a.guids[string(key[:])] = g
 	}
@@ -214,7 +214,7 @@ func (a *extAcc) blockCap(g *extGUID, n int) int {
 // exactly the declared full length, and returns the assembled document and a
 // validity flag.
 //
-// Validation rules (Adobe XMP Specification Part 3 §1.1.4, #122):
+// Validation rules (Adobe XMP Specification Part 3 §1.1.3.1, #122):
 //   - First chunk must have offset == 0.
 //   - Each subsequent chunk must start exactly where the previous one ended
 //     (chunk[i].offset == chunk[i-1].offset + len(chunk[i-1].data)).

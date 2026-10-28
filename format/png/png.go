@@ -36,7 +36,7 @@ var pngSig = [8]byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A} //nolint:go
 // The leading 0x00 is unambiguous: no valid XMP packet starts with a null byte.
 var xmpWireFrameMagic = [8]byte{0x00, 'X', 'M', 'P', 'E', 'X', 'T', 0x00} //nolint:gochecknoglobals // package-level constant bytes
 
-// xmpKeyword is the iTXt keyword used by Adobe XMP (XMP Part 3 §1.1.4).
+// xmpKeyword is the iTXt keyword used by Adobe XMP (XMP Part 3 §1.1.5).
 const xmpKeyword = "XML:com.adobe.xmp"
 
 // PNG chunk types compared against the [4]byte chunk type readChunk decodes

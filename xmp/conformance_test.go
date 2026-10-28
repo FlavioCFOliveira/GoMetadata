@@ -775,11 +775,13 @@ func TestConformanceVT06(t *testing.T) {
 	})
 }
 
-// TestConformance_VT-07 verifies GUID: 32 hex digits, write lowercase.
-// XMP Part 1 §8.2.7.
+// TestConformance_VT-07 verifies GUID: 32 hex digits; both cases are accepted
+// and a GUID-valued property is carried as stored (no case conversion). The
+// uppercase form of the ExtendedXMP GUID is written by format/jpeg
+// (XMP Part 3 §1.1.3.1, p. 14). XMP Part 1 §8.2.7.
 func TestConformanceVT07(t *testing.T) {
 	t.Parallel()
-	t.Run("VT-07/lowercase", func(t *testing.T) {
+	t.Run("VT-07/lowercase-carried-verbatim", func(t *testing.T) {
 		t.Parallel()
 		guid := "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
 		x := &XMP{Properties: map[string]map[string]string{NSxmpMM: {"InstanceID": guid}}}
@@ -1790,6 +1792,39 @@ func TestConformanceROB09(t *testing.T) {
 		garbage := []byte{0x00, 0x01, 0x02, 0x03, 0x04}
 		_, _ = Parse(garbage) // must not panic; error is acceptable
 	})
+}
+
+// TestConformanceROB14 verifies the parse-side handling of a raw forbidden C0
+// control written literally in element text (XML 1.0 §2.2): the document is
+// accepted, the byte is retained in the value, and Encode substitutes U+FFFD so
+// the written packet is well-formed.
+func TestConformanceROB14(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ name, raw string }{
+		{"U+001E", "a\x1eb"},
+		{"U+0001", "a\x01b"},
+		{"U+001E-CDATA", "<![CDATA[a\x1eb]]>"},
+	} {
+		t.Run("ROB-14/"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			x, err := Parse(xmpDoc(`<rdf:Description rdf:about="" xmlns:my="urn:rob14/"><my:Prop>` + tc.raw + `</my:Prop></rdf:Description>`))
+			if err != nil {
+				t.Fatalf("ROB-14: Parse rejected a literal forbidden C0 control: %v", err)
+			}
+			if got := x.Get("urn:rob14/", "Prop"); len(got) != 3 || got[0] != 'a' || got[2] != 'b' {
+				t.Errorf("ROB-14: value %q, want the control byte retained between a and b", got)
+			}
+			enc := mustEncode(t, x)
+			for i, b := range enc {
+				if b < 0x20 && b != '\t' && b != '\n' && b != '\r' {
+					t.Fatalf("ROB-14: forbidden byte 0x%02X at position %d in encoded output", b, i)
+				}
+			}
+			if !strings.Contains(string(enc), "a\uFFFDb") {
+				t.Error("ROB-14: Encode did not substitute U+FFFD for the control byte")
+			}
+		})
+	}
 }
 
 // TestConformance_ROB-10 verifies filter/replace of XML 1.0 §2.2 forbidden chars before serialization.
