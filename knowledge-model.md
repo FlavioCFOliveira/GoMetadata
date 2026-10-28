@@ -80,7 +80,7 @@ do with format X" and mirrors the README *Supported formats* table and `format.S
 | `format` | container name — JPEG, TIFF, PNG, WebP, HEIF, AVIF, CR2, CR3, NEF, ARW, DNG, ORF, RW2 |
 | `extensions` | recognised extensions (detection is by magic bytes, never by extension) |
 | `read` | metadata read supported — `true` for all 13 |
-| `write` | metadata write supported — **equals `format.SupportsWrite`**: `true` for **all 13 formats**. TIFF/DNG: copy-and-relocate (#92/#93/#94; DNG re-enabled after the #98 SubIFD out-of-line value fix). CR2: copy-and-relocate + Canon marker restore (#95). CR3: stco/co64 relocation (#91). NEF/ARW/ORF/RW2: un-gated (#102/#103/#104) with manufacturer MakerNote/SR2 rebasing, real-corpus validated. The **only** write exception is **BigTIFF**, which returns `ErrWriteNotSupported` (BigTIFF read is supported; #107). |
+| `write` | metadata write supported — **equals `format.SupportsWrite`**: `true` for **all 13 formats**. TIFF/DNG: copy-and-relocate (#92/#93/#94; DNG re-enabled after the #98 SubIFD out-of-line value fix). CR2: copy-and-relocate + Canon marker restore (#95). CR3: stco/co64 relocation (#91). NEF/ARW/ORF/RW2: un-gated (#102/#103/#104) with manufacturer MakerNote/SR2 rebasing, real-corpus validated. BigTIFF (magic `0x002B`) is read (#54) and written (`ef9041e`): `exif.Encode` emits a native 16-byte-header, 64-bit-offset IFD skeleton and `format/tiff/relocate_bigtiff.go` relocates with container-width-aware offsets. |
 | `exif` / `iptc` / `xmp` | which metadata blocks the format carries on read (`iptc` only JPEG + TIFF) |
 | `container` | structural family: `JPEG` / `TIFF` / `TIFF-based` / `ISOBMFF` / `RIFF` / `PNG` |
 
@@ -366,7 +366,7 @@ tasks #193–#197) remediated five findings. Knowledge-graph impact (this file �
 
 - **Capabilities matrix corrected (#196):** the `write` property description and the example
   queries now match `format.SupportsWrite` and the live `FormatCapability` nodes — **all 13
-  formats `write=true`** (BigTIFF write the sole exception), and `iptc=true` only for **JPEG and
+  formats `write=true`**, BigTIFF included, and `iptc=true` only for **JPEG and
   TIFF** (the earlier "JPEG, TIFF, DNG" note was wrong; DNG carries no IPTC on read).
 - **Ghost packages reconciled (#197):** see "Graph/file discrepancy — RESOLVED" above. A
   filtered `DETACH DELETE` removed 14 ghost `Package` nodes + 48 child nodes; engine constraint
