@@ -102,6 +102,7 @@ type mnPlan struct {
 	changed bool             // blob is such a copy
 	origLen int              // length of the original MakerNote
 	tiffRel bool
+	footer  bool    // the original ends with a genuine Canon footer (genuineFooter)
 	fixes   []mnFix // pointers to set once the position is known (TIFF-relative layouts)
 }
 
@@ -142,6 +143,38 @@ func holdsMakerNote(src []byte, off uint64, mn []byte) bool {
 	return src != nil && off+uint64(len(mn)) <= uint64(len(src)) && bytes.Equal(src[off:off+uint64(len(mn))], mn)
 }
 
+// resolveMakerNote returns the layout of the MakerNote mn of e (the Make of
+// IFD0 trimmed is mk) with the offset base decided as the repair of a moved
+// MakerNote decides it (offsetsCountFromTIFF), and the position of the
+// MakerNote in the source stream. ok is false when mn holds no IFD this package
+// reads. The editor of MakerNote values (makernote_edit.go) uses the same
+// decision, so that an edit and the write that follows read the offsets alike.
+func resolveMakerNote(e *EXIF, mn, mk []byte) (lay MakerNoteLayout, mnOff uint64, ok bool) {
+	mnOff = makerNoteSourceOffset(e)
+	lay, ok = resolveLayout(detectLayout(mn, mk), mn, e.ifd0ByteOrder(), mnOff)
+	if !ok {
+		return lay, 0, false
+	}
+	return lay, mnOff, true
+}
+
+// resolveLayout is the one place that decides how the offsets of the MakerNote
+// mn of the detected layout l, at offset mnOff of the source stream, are based:
+// Parse (resolvedBase), the repair of a moved MakerNote and the MakerNote
+// editor all read the offsets of a note alike (task #412). ok is false when mn
+// holds no IFD this package reads. An unknown position (mnOff 0) keeps the
+// table.
+func resolveLayout(l mnLayout, mn []byte, order binary.ByteOrder, mnOff uint64) (lay MakerNoteLayout, ok bool) {
+	lay, ok = layoutOf(l, mn, order)
+	if !ok {
+		return lay, false
+	}
+	if lay.layout != mnNikon3 && mnOff > 0 {
+		lay.TIFFRelative = dataBaseIsTIFF(mn, lay, int64(mnOff)) //nolint:gosec // G115: a classic TIFF offset, below 2^32
+	}
+	return lay, true
+}
+
 // planMakerNote walks the MakerNote of e and returns the repair, or nil when
 // the MakerNote needs none (absent, inline, not an IFD, BigTIFF, or a layout
 // that moves unchanged and addresses nothing outside itself). src is the
@@ -154,16 +187,15 @@ func planMakerNote(e *EXIF, src []byte, carry *int) *mnPlan {
 	if mn == nil {
 		return nil
 	}
-	lay, ok := makerNoteLayoutOf(mn, mk, e.ifd0ByteOrder())
+	lay, mnOff, ok := resolveMakerNote(e, mn, mk)
 	if !ok {
 		return nil
 	}
-	mnOff := makerNoteSourceOffset(e)
-	if lay.layout != mnNikon3 && mnOff > 0 {
-		lay.TIFFRelative = offsetsCountFromTIFF(mn, lay, int64(mnOff)) //nolint:gosec // G115: a classic TIFF offset, below 2^32
-	}
 	if lay.TIFFRelative && mnOff == 0 {
 		return nil // the source position is unknown: no delta to apply
+	}
+	if lay.layout == mnKyocera {
+		return nil // its offsets count from their own entries: it moves as it is (makernote_kyocera_base.go)
 	}
 	var w mnWalker
 	w.init(mn, lay, int64(mnOff)) //nolint:gosec // G115: a classic TIFF offset, below 2^32
@@ -182,6 +214,7 @@ func planMakerNote(e *EXIF, src []byte, carry *int) *mnPlan {
 		changed: w.copied,
 		origLen: len(mn),
 		tiffRel: lay.TIFFRelative,
+		footer:  genuineFooter(mn, lay, w.origin),
 		fixes:   w.fixes,
 	}
 }
@@ -232,7 +265,9 @@ func (p *mnPlan) finish(out []byte, order binary.ByteOrder) {
 		}
 		p.order.PutUint32(out[mnAbs+f.field:], uint32(v))
 	}
-	fixMakerNoteFooter(out, mnAbs, p.origLen, p.order, uint64(mnAbs)) //nolint:gosec // G115: non-negative offset
+	if p.footer {
+		fixMakerNoteFooter(out, mnAbs, p.origLen, p.order, uint64(mnAbs)) //nolint:gosec // G115: non-negative offset
+	}
 }
 
 // fixMakerNoteFooter updates the TIFF footer that Canon writes at the end of
@@ -247,7 +282,7 @@ func (p *mnPlan) finish(out []byte, order binary.ByteOrder) {
 // brought in step with them. A MakerNote without the footer is left alone
 // (task #310).
 func fixMakerNoteFooter(buf []byte, mnAbs, n int, order binary.ByteOrder, newAbs uint64) {
-	const footerLen = 8
+	const footerLen = canonFooterLen
 	if n <= footerLen || mnAbs < 0 || mnAbs+n > len(buf) {
 		return
 	}
@@ -256,6 +291,30 @@ func fixMakerNoteFooter(buf []byte, mnAbs, n int, order binary.ByteOrder, newAbs
 		return
 	}
 	order.PutUint32(f[4:], uint32(newAbs))
+}
+
+// genuineFooter reports whether mn ends with a Canon footer that is not part of
+// a value: its last 8 bytes are a TIFF header mark in the byte order of lay
+// (isTIFFHeaderMark) and no out-of-line value of the IFD, read against the TIFF
+// header at -origin relative to mn, overlaps them. Canon writes the footer after
+// the last value, never inside one (ExifTool Canon.pm, "Canon maker note
+// footer": a structure of its own at the end of the note, which its writer
+// validates and rewrites apart from the values), so a value whose tail merely
+// looks like a header mark (task #418) must be preserved byte for byte and its
+// tail must not be patched. This is GoMetadata's rule; Exif 3.1 does not define
+// the footer.
+func genuineFooter(mn []byte, lay MakerNoteLayout, origin int64) bool {
+	if len(mn) <= canonFooterLen || !isTIFFHeaderMark(mn[len(mn)-canonFooterLen:], lay.ByteOrder) {
+		return false
+	}
+	start := int64(len(mn) - canonFooterLen)
+	genuine := true
+	eachOOL(mn, lay, func(ptr, total int64) {
+		if t := ptr - origin; t < int64(len(mn)) && t+total > start {
+			genuine = false
+		}
+	})
+	return genuine
 }
 
 // isTIFFHeaderMark reports whether b starts with the TIFF header mark of
@@ -373,4 +432,37 @@ func isTopOOLField(mn []byte, lay MakerNoteLayout, field int) bool {
 		return false
 	}
 	return readMNEntry(mn, lay.IFDOffset+2+d, lay.ByteOrder).total > 4
+}
+
+// CarryMakerNoteTail extends the MakerNote of e, which was parsed from src, with
+// the data that its IFD addresses after the end of the bytes it declares, and
+// reports whether it did. It is for the Samsung SRW files of the NX series:
+// the PreviewIFD of the note and the preview JPEG behind it lie after the
+// declared length, and every offset counts from the first MakerNote byte, so a
+// writer that moves the note as declared drops the preview and leaves the
+// PreviewIFD pointing at nothing (task #408). The note keeps its offsets: the
+// tail is appended, so what addressed it still does. Other layouts are left to
+// their own writers. src must be the buffer e was parsed from; e is modified only
+// when the result is true (e.MakerNote and the MakerNote entry of the Exif IFD).
+func (e *EXIF) CarryMakerNoteTail(src []byte) bool {
+	mn, mk := makerNoteOf(e)
+	if mn == nil {
+		return false
+	}
+	if lay, _, ok := resolveMakerNote(e, mn, mk); !ok || lay.layout != mnSamsung || lay.TIFFRelative {
+		return false
+	}
+	carry := min(len(src), maxMakerNoteCarry)
+	p := planMakerNote(e, src, &carry)
+	if p == nil || !p.changed {
+		return false
+	}
+	ent := e.ExifIFD.Get(TagMakerNote)
+	if ent == nil {
+		return false
+	}
+	ent.Value = p.blob
+	ent.Count = uint32(len(p.blob)) //nolint:gosec // G115: bounded by maxMakerNoteCarry and the source size
+	e.MakerNote = p.blob
+	return true
 }

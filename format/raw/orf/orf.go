@@ -7,7 +7,6 @@
 package orf
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -143,8 +142,16 @@ func extractSizeCappedShortCircuit(r io.ReadSeeker) (data []byte, handled bool, 
 }
 
 // Inject writes a modified ORF stream to w by delegating to the TIFF writer.
-// ORF magic bytes (IIRO or IIRS) are patched to standard TIFF LE before
-// injection and restored in the output so the file remains a valid ORF.
+// ORF magic bytes (IIRO or IIRS) are accepted by the TIFF writer in place of
+// the standard 0x002A and restored in the output so the file remains a valid
+// ORF.
+//
+// Task #392: the file is never held in memory. Inject reads the 4 magic bytes
+// and the TIFF writer reads the metadata prefix of r (and, with no IPTC or XMP
+// to write, copies r unchanged); the image data is streamed from r to w through
+// a fixed pooled buffer, so memory use is proportional to the metadata and a
+// seekable r has no size limit but the 4 GiB of classic TIFF offsets
+// (ErrFileTooLarge). A source that cannot seek is buffered whole, up to 256 MiB.
 //
 // WARNING — image-data corruption risk: ORF is TIFF-based. Writing metadata
 // into an ORF file re-encodes the IFD block (via tiff.Inject → exif.Encode)
@@ -153,40 +160,42 @@ func extractSizeCappedShortCircuit(r io.ReadSeeker) (data []byte, handled bool, 
 // call Inject directly on files from a user-facing write path; use
 // gometadata.Write instead, which routes ORF through tiff.InjectWithEXIFORF
 // (the copy-and-relocate path that correctly rebases all image-data offsets).
-func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
+func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, _ bool) error {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("orf: seek: %w", err)
 	}
-	data, err := readInput(r)
-	if err != nil {
-		return err
+	// Only the magic is read here; the TIFF writer reads the rest of r as it
+	// needs it (task #392: the file is never held in memory).
+	var peek [4]byte
+	n, err := io.ReadFull(r, peek[:])
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("orf: read: %w", err)
 	}
-	if !isORFMagic(data) {
+	if !isORFMagic(peek[:n]) {
 		return ErrInvalidMagic
 	}
 
-	// Save the original magic variant (IIRO or IIRS) for the output.
-	mw := &iobuf.MagicWriter{W: w, Magic: [2]byte{data[2], data[3]}}
+	// mw restores the ORF magic on the first write: the TIFF writer produces a
+	// standard TIFF stream, and the magic of the source (bytes [2:4]) is the one
+	// it accepted in place of 0x002A (TIFF 6.0 §2).
+	mw := &iobuf.MagicWriter{W: w, Magic: [2]byte{peek[2], peek[3]}}
+	injectErr := tiff.InjectWithMagic(r, mw, rawEXIF, rawIPTC, rawXMP, binary.LittleEndian.Uint16(peek[2:4]))
+	return injectResult(mw, injectErr)
+}
 
-	// Patch bytes 2-3 to standard TIFF LE magic (TIFF 6.0 §2: 0x002A) so
-	// tiff.Inject accepts the stream. data is exclusively owned (returned by
-	// readInput), so in-place mutation is safe.
-	data[2] = 0x2A
-	data[3] = 0x00
-
-	// mw restores the ORF magic on the first write; tiff.Inject writes its
-	// output with a single Write call, so no output buffering is needed.
-	injectErr := tiff.Inject(bytes.NewReader(data), mw, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments)
-	if mw.Err != nil {
+// injectResult maps the outcome of the TIFF writer, which wrote through mw, to
+// the error of Inject.
+func injectResult(mw *iobuf.MagicWriter, injectErr error) error {
+	switch {
+	case mw.Err != nil:
 		return fmt.Errorf("orf: write: %w", mw.Err)
-	}
-	if errors.Is(injectErr, iobuf.ErrShortFirstWrite) {
+	case errors.Is(injectErr, iobuf.ErrShortFirstWrite):
 		return ErrOutputTooShort
-	}
-	if injectErr != nil {
+	case errors.Is(injectErr, tiff.ErrFileTooLarge):
+		return fmt.Errorf("orf: inject: %w: %w", ErrFileTooLarge, injectErr)
+	case injectErr != nil:
 		return fmt.Errorf("orf: inject: %w", injectErr)
-	}
-	if !mw.Started() {
+	case !mw.Started():
 		return ErrOutputTooShort
 	}
 	return nil

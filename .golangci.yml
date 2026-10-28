@@ -133,7 +133,7 @@ linters:
     # MODERNIZATION
     # ===========================================================================
 
-    # Go 1.26 idiom suggestions: min/max builtins, slices.Contains, clear(), etc.
+    # Go 1.27 idiom suggestions: min/max builtins, slices.Contains, clear(), etc.
     - modernize
     # Detects golang.org/x/exp functions promoted to stdlib (slices.*, maps.*).
     - exptostd

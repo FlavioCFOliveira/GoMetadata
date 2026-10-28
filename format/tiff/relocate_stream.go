@@ -312,8 +312,8 @@ func checkBlocks(blocks []*imageBlock, fileLen uint64) (disjoint bool, err error
 		// itself already exceeds cap(prefix) (security audit finding,
 		// 2026-09-26).
 		if !fits(blk.srcOffset, blk.size, fileLen) {
-			return false, fmt.Errorf("tiff: image block offset=%d size=%d: %w",
-				blk.srcOffset, blk.size, ErrBlockOutOfBounds)
+			return false, fmt.Errorf("tiff: image block offset=%d size=%d: %w: %w",
+				blk.srcOffset, blk.size, ErrBlockOutOfBounds, errTruncatedImageData())
 		}
 		if blk.size > 0 {
 			disjoint = disjoint && blk.srcOffset >= end

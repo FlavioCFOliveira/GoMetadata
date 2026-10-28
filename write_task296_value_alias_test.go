@@ -100,6 +100,7 @@ func TestTask296_AppendToValueKeepsRawEXIF(t *testing.T) {
 		t.Fatalf("CameraModel after append to Make = %q, want %q", got, "CapModel")
 	}
 
+	m.MarkModified(SegmentEXIF) // task #387: the entry was edited through the exported field
 	var out bytes.Buffer
 	if err := Write(bytes.NewReader(src), &out, m); err != nil {
 		t.Fatalf("Write: %v", err)
@@ -140,6 +141,7 @@ func TestTask296_AssignedValueKeepsRawEXIF(t *testing.T) {
 	if rawAfter, _, _ := m.RawSegments(); !bytes.Equal(rawAfter, rawBefore) {
 		t.Fatal("assigning an entry value modified the retained raw EXIF bytes")
 	}
+	m.MarkModified(SegmentEXIF) // task #387: the entry was edited through the exported field
 	var first, second bytes.Buffer
 	if err := Write(bytes.NewReader(src), &first, m); err != nil {
 		t.Fatalf("first Write: %v", err)

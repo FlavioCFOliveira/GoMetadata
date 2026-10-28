@@ -5,14 +5,31 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 )
 
-// Source gives random access to the bytes of a file, for FindTail.
+// Source gives random access to the bytes of a file, for FindTail and
+// PlanFromSource.
 type Source interface {
 	// Range returns the n bytes of the file at offset off (the caller keeps
 	// 0 <= off and off+n <= the file size). The result may alias the file's own
 	// buffer and must not be modified.
 	Range(off, n int64) ([]byte, error)
+	// IndexEach calls vis.Visit for the occurrences of pat in the bytes
+	// [from, to) of the file (the caller keeps 0 <= from <= to <= the file
+	// size), in ascending order of offset, in one pass over the range: a
+	// streaming source never reads a byte twice, so that a range with many
+	// occurrences costs time proportional to its size (task #417; one search per
+	// occurrence costs a read of a buffer each). Visit receives the offset at and
+	// win, the bytes [at-behind, at+ahead) of the file (ahead >= len(pat)), or
+	// nil when they are not wholly inside [from, to); win is valid until Visit
+	// returns, and Visit must not use the source. Visit returns the offset where
+	// the search for the next occurrence starts (at or before at means at+1), or
+	// a negative offset to stop; its error ends the scan and is returned.
+	IndexEach(from, to int64, pat []byte, behind, ahead int, vis iobuf.ScanVisitor) error
+	// CopyRange writes the n bytes of the file at offset off to w.
+	CopyRange(w io.Writer, off, n int64) error
 }
 
 // BytesSource is a Source over a file held in memory.
@@ -21,8 +38,36 @@ type BytesSource []byte
 // Range implements Source.
 func (b BytesSource) Range(off, n int64) ([]byte, error) { return b[off : off+n : off+n], nil }
 
+// IndexEach implements Source.
+func (b BytesSource) IndexEach(from, to int64, pat []byte, behind, ahead int, vis iobuf.ScanVisitor) error {
+	return indexEachBytes(b, 0, from, to, pat, behind, ahead, vis)
+}
+
+// CopyRange implements Source.
+func (b BytesSource) CopyRange(w io.Writer, off, n int64) error {
+	if n <= 0 {
+		return nil
+	}
+	_, err := w.Write(b[off : off+n])
+	return err
+}
+
 // ReaderSource is a Source over a seekable stream.
 type ReaderSource struct{ R io.ReadSeeker }
+
+// IndexEach implements Source: iobuf.ScanRange, one pass through the pooled
+// buffer.
+func (s ReaderSource) IndexEach(from, to int64, pat []byte, behind, ahead int, vis iobuf.ScanVisitor) error {
+	if err := iobuf.ScanRange(s.R, from, to, pat, behind, ahead, vis); err != nil {
+		return fmt.Errorf("trailer: search: %w", err)
+	}
+	return nil
+}
+
+// CopyRange implements Source: iobuf.CopyRange, through the pooled buffer.
+func (s ReaderSource) CopyRange(w io.Writer, off, n int64) error {
+	return iobuf.CopyRange(s.R, w, off, n)
+}
 
 // Range implements Source.
 func (s ReaderSource) Range(off, n int64) ([]byte, error) {

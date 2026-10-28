@@ -40,10 +40,12 @@ type mnBase uint8
 const (
 	// mnBaseBlob: value offsets count from the first byte of the MakerNote
 	// (the layout carries its own header: Olympus "OLYMPUS\0II", Apple, Ricoh,
-	// Sanyo, Fujifilm, Nikon Type 3 relative to its embedded TIFF header).
+	// Sanyo, Fujifilm, Nikon Type 3 relative to its embedded TIFF header; the
+	// offsets of Kyocera count from their own entries, which the Kyocera reader
+	// resolves, makernote_kyocera_base.go).
 	mnBaseBlob mnBase = iota
 	// mnBaseTIFF: value offsets count from the start of the enclosing TIFF
-	// stream (Canon, Sony, Casio, Kyocera, Panasonic, "OLYMP\0", plain-IFD
+	// stream (Canon, Sony, Casio, Panasonic, "OLYMP\0", plain-IFD
 	// layouts). When the caller supplies that stream (makerNoteDispatch from
 	// Parse) the IFD is read from it, as metadata-extractor's
 	// processMakernote does (processIfd with tiffHeaderOffset as the base), so
@@ -134,7 +136,7 @@ var mnLayouts = [...]makerNoteFormat{
 	mnKodak:        {"kodak", -1, mnBaseNone, parseBinaryMN},
 	mnCasio2:       {"casio-2", 6, mnBaseTIFF, parseCasioMN},
 	mnFujifilm:     {"fujifilm", -1, mnBaseBlob, parseFujifilmMN},
-	mnKyocera:      {"kyocera", 22, mnBaseTIFF, parseKyoceraMN},
+	mnKyocera:      {"kyocera", 22, mnBaseBlob, parseKyoceraMN}, // entry-relative offsets: makernote_kyocera_base.go
 	mnLeica:        {"leica", 8, mnBaseBlob, parseLeicaMN},
 	mnLeicaTIFF:    {"leica", 8, mnBaseTIFF, parseLeicaMN},
 	mnPanasonic:    {"panasonic", 12, mnBaseTIFF, parsePanasonicMN},

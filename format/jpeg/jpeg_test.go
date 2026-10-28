@@ -3,7 +3,6 @@ package jpeg
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -196,7 +195,7 @@ func buildExtendedXMPJPEG(mainXMP []byte, guid string, extContent []byte) []byte
 
 	// Extended XMP APP1
 	// Structure: identXMPNote + 32-byte GUID + 4-byte fullLen + 4-byte offset + data
-	// identXMPNote is "http://ns.adobe.com/xmp/extension/\x00" per Adobe XMP Spec Part 3 §1.1.4.
+	// identXMPNote is "http://ns.adobe.com/xmp/extension/\x00" per Adobe XMP Spec Part 3 §1.1.3.1.
 	var extBody bytes.Buffer
 	extBody.WriteString("http://ns.adobe.com/xmp/extension/\x00")
 	extBody.WriteString(guid) // 32 bytes
@@ -563,7 +562,7 @@ func TestExtractBareJPEGAllNil(t *testing.T) {
 
 // TestInjectExtendedXMP verifies that Inject correctly splits an XMP packet
 // larger than maxXMPPayload (65502 bytes) across a main APP1 and one or more
-// extended APP1 segments (Adobe XMP Specification Part 3 §1.1.4), and that
+// extended APP1 segments (Adobe XMP Specification Part 3 §1.1.3.1), and that
 // the subsequent Extract call reassembles the full XMP content.
 func TestInjectExtendedXMP(t *testing.T) {
 	t.Parallel()
@@ -637,7 +636,7 @@ func TestInjectExtendedXMPMultiChunk(t *testing.T) {
 	}
 
 	// Count the number of extended XMP APP1 segments in the output.
-	// The correct extended XMP APP1 identifier is per Adobe XMP Spec Part 3 §1.1.4.
+	// The correct extended XMP APP1 identifier is per Adobe XMP Spec Part 3 §1.1.3.1.
 	outBytes := out.Bytes()
 	extNoteIdent := []byte("http://ns.adobe.com/xmp/extension/\x00")
 	extCount := bytes.Count(outBytes, extNoteIdent)
@@ -660,7 +659,7 @@ func TestInjectExtendedXMPMultiChunk(t *testing.T) {
 // TestExtendedXMPSegmentIdentifier verifies that extended XMP APP1 segments
 // written by Inject carry exactly the correct APP1 identifier byte sequence
 // ("http://ns.adobe.com/xmp/extension/\x00") as mandated by Adobe XMP
-// Specification Part 3 §1.1.4, and that the old incorrect identifier
+// Specification Part 3 §1.1.3.1, and that the old incorrect identifier
 // ("http://ns.adobe.com/xap/1.0/se/\x00") is absent from the output.
 //
 // This test guards against interoperability regressions: ExifTool, Exiv2, and
@@ -732,7 +731,7 @@ func TestInjectSmallXMPFastPath(t *testing.T) {
 	}
 
 	outBytes := out.Bytes()
-	// Must have zero extended XMP segments (correct identifier per Adobe XMP Spec Part 3 §1.1.4).
+	// Must have zero extended XMP segments (correct identifier per Adobe XMP Spec Part 3 §1.1.3.1).
 	extNoteIdent := []byte("http://ns.adobe.com/xmp/extension/\x00")
 	if bytes.Contains(outBytes, extNoteIdent) {
 		t.Error("small XMP inject produced extended APP1 segment(s); expected fast path only")
@@ -1005,16 +1004,6 @@ func TestParseIRBEntryMissingResourceIDField(t *testing.T) {
 	}
 }
 
-// TestWriteMarkerError verifies that writeMarker returns an error when the
-// writer fails.
-func TestWriteMarkerError(t *testing.T) {
-	t.Parallel()
-	err := writeMarker(errorWriter{}, 0xD9)
-	if err == nil {
-		t.Error("writeMarker: expected error from failing writer, got nil")
-	}
-}
-
 // TestWriteSegmentTooLarge verifies that writeSegment returns ErrSegmentTooLarge
 // when the payload exceeds the JPEG 16-bit length field limit.
 func TestWriteSegmentTooLarge(t *testing.T) {
@@ -1065,13 +1054,6 @@ func TestReadSegmentInvalidLength(t *testing.T) {
 // TestSkipPascalStringEdgeCases moved to internal/irb (TestSkipPascalString_EdgeCases)
 // together with the parser it exercises.
 
-// errorWriter is a test helper that always returns an error on Write.
-type errorWriter struct{}
-
-func (errorWriter) Write(_ []byte) (int, error) {
-	return 0, errors.New("simulated write error")
-}
-
 // TestProcessAPP13PhotoshopPrefixNoIRB verifies that processAPP13Segment returns
 // nil when the data starts with the Photoshop prefix but contains no valid 8BIM
 // entries (parseIRB returns nil).
@@ -1085,18 +1067,17 @@ func TestProcessAPP13PhotoshopPrefixNoIRB(t *testing.T) {
 	}
 }
 
-// TestWriteSOSCopyError verifies that writeSOS returns an error when
-// io.Copy fails (failing writer after SOS segment header is written).
-func TestWriteSOSCopyError(t *testing.T) {
+// TestInjectCopyErrorPropagates verifies that Inject returns the error of the
+// writer when it fails while the image data is copied (the splice write of
+// splice.go ends with that copy).
+func TestInjectCopyErrorPropagates(t *testing.T) {
 	t.Parallel()
-	// writeSOS with empty data calls writeSegment (1 Write: the 4-byte header),
-	// then io.Copy. failAfter=1 lets the header write succeed, then fails on copy.
-	ew := &countingWriter{failAfter: 1}
-	data := []byte{}
-	reader := bytes.NewReader([]byte{0x01, 0x02}) // some image data to copy
-	err := writeSOS(reader, ew, data)
-	if err == nil {
-		t.Error("expected error from writeSOS when io.Copy fails, got nil")
+	src := []byte{0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02, 0x01, 0x02, 0xFF, 0xD9}
+	for failAfter := range 3 {
+		ew := &countingWriter{failAfter: failAfter}
+		if err := Inject(bytes.NewReader(src), ew, minimalTIFFBytes(), nil, nil, true); err == nil {
+			t.Errorf("failAfter=%d: expected the writer error, got nil", failAfter)
+		}
 	}
 }
 
@@ -1112,27 +1093,6 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 		return 0, fmt.Errorf("simulated write error after %d writes", w.failAfter)
 	}
 	return len(p), nil
-}
-
-// TestCopyNonMetadataSegmentsReadError verifies that copyNonMetadataSegments
-// returns the non-EOF error when readSegment fails.
-func TestCopyNonMetadataSegmentsReadError(t *testing.T) {
-	t.Parallel()
-	// Build a valid JPEG SOI, then one APP0 segment, then truncated data.
-	// This will cause readSegment to return a non-EOF error.
-	var buf bytes.Buffer
-	// Write an APP0 marker with length=5 (2-byte length field = 5, but data only 3 bytes follow).
-	buf.Write([]byte{0xFF, 0xE0}) // APP0 marker
-	buf.Write([]byte{0x00, 0x05}) // length=5 means 3 bytes of data
-	buf.Write([]byte{0x00, 0x00}) // only 2 bytes — truncated
-
-	scratch := make([]byte, 0, 4096)
-	var out bytes.Buffer
-	err := copyNonMetadataSegments(bytes.NewReader(buf.Bytes()), &out, &scratch, true, nil, "")
-	// The truncated read should produce an error (non-EOF, unexpected EOF).
-	if err == nil {
-		t.Error("expected error for truncated segment, got nil")
-	}
 }
 
 // --- Regression test: APP1 EXIF payload shorter than a TIFF header ---

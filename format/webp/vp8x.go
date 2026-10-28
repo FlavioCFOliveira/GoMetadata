@@ -46,7 +46,12 @@ var (
 // VP8GetInfo validates and decodes them (RFC 6386 §9.1, §19.1: 3-byte frame
 // tag, start code 9d 01 2a, then 14-bit width and height with 2-bit scale).
 // ok is false when data is not a decodable VP8 key frame header.
-func vp8Info(data []byte) (width, height int, ok bool) {
+//
+// Only the first bytes of the chunk are at hand: data holds at least
+// min(chunkSize, 10) of them (the frame header is the first 10 bytes of the
+// chunk), and chunkSize, the size of the whole chunk, is what the
+// first-partition length is checked against.
+func vp8Info(data []byte, chunkSize int) (width, height int, ok bool) {
 	if len(data) < vp8FrameHeaderSize {
 		return 0, 0, false
 	}
@@ -54,7 +59,7 @@ func vp8Info(data []byte) (width, height int, ok bool) {
 	if data[3] != 0x9d || data[4] != 0x01 || data[5] != 0x2a {
 		return 0, 0, false
 	}
-	if !vp8FrameTagOK(uint32(data[0])|uint32(data[1])<<8|uint32(data[2])<<16, len(data)) {
+	if !vp8FrameTagOK(uint32(data[0])|uint32(data[1])<<8|uint32(data[2])<<16, chunkSize) {
 		return 0, 0, false
 	}
 	width = int(binary.LittleEndian.Uint16(data[6:]) & 0x3fff)
@@ -96,18 +101,61 @@ func vp8lInfo(data []byte) (width, height int, alpha, ok bool) {
 	return width, height, alpha, true
 }
 
-// newVP8XPayload builds the 10-byte VP8X payload of a still image whose
-// chunks (excluding VP8X, EXIF and XMP) are chunks, following libwebp
-// CreateVP8XChunk: ICCP when an ICCP chunk is present; ALPHA when an ALPH
-// chunk is present or the VP8L bitstream declares alpha; EXIF and XMP as
-// requested; canvas width-1 and height-1 as 24-bit little-endian values
-// taken from the image bitstream. ok is false when no image chunk has a
-// decodable header, so no valid canvas size exists.
-func newVP8XPayload(chunks []webpOriginalChunk, hasEXIF, hasXMP bool) (payload [vp8xChunkSize]byte, ok bool) {
-	width, height, flags, ok := stillImageInfo(chunks)
-	if !ok {
+// stillImage accumulates, chunk by chunk, what the VP8X chunk of a still image
+// needs from the image chunks (excluding VP8X, EXIF and XMP): the canvas size
+// of the first decodable VP8 or VP8L bitstream, and the ICCP and ALPHA feature
+// flags the chunks imply. The zero value is empty.
+type stillImage struct {
+	width, height int
+	flags         uint32
+	ok            bool // a bitstream header was decoded
+}
+
+// headBytes is how many leading bytes of an image chunk stillImage.add reads
+// (the longest frame header is the 10 bytes of a VP8 key frame).
+const headBytes = vp8FrameHeaderSize
+
+// add takes the next image chunk: its FourCC, its size and its first bytes
+// (head holds at least min(size, headBytes) of them).
+func (s *stillImage) add(id [4]byte, head []byte, size int) {
+	switch id {
+	case fourCCICCP:
+		s.flags |= vp8xFlagICCP
+	case fourCCALPH:
+		s.flags |= vp8xFlagAlpha
+	case fourCCVP8, fourCCVP8L:
+		if s.ok {
+			return
+		}
+		var alpha bool
+		if id == fourCCVP8 {
+			s.width, s.height, s.ok = vp8Info(head, size)
+		} else {
+			s.width, s.height, alpha, s.ok = vp8lInfo(head)
+		}
+		if alpha {
+			s.flags |= vp8xFlagAlpha
+		}
+	}
+}
+
+// wantsHead reports whether add reads the first bytes of a chunk with this
+// FourCC, so that a caller that has to fetch them can skip the others.
+func (s *stillImage) wantsHead(id [4]byte) bool {
+	return !s.ok && (id == fourCCVP8 || id == fourCCVP8L)
+}
+
+// payload builds the 10-byte VP8X payload of the still image, following libwebp
+// CreateVP8XChunk: ICCP when an ICCP chunk is present; ALPHA when an ALPH chunk
+// is present or the VP8L bitstream declares alpha; EXIF and XMP as requested;
+// canvas width-1 and height-1 as 24-bit little-endian values taken from the
+// image bitstream. ok is false when no image chunk has a decodable header, so
+// no valid canvas size exists.
+func (s *stillImage) payload(hasEXIF, hasXMP bool) (payload [vp8xChunkSize]byte, ok bool) {
+	if !s.ok {
 		return payload, false
 	}
+	flags := s.flags
 	if hasEXIF {
 		flags |= vp8xFlagEXIF
 	}
@@ -115,38 +163,9 @@ func newVP8XPayload(chunks []webpOriginalChunk, hasEXIF, hasXMP bool) (payload [
 		flags |= vp8xFlagXMP
 	}
 	binary.LittleEndian.PutUint32(payload[0:4], flags)
-	putLE24(payload[4:7], uint32(width-1))   //nolint:gosec // G115: width is in [1, 16384]
-	putLE24(payload[7:10], uint32(height-1)) //nolint:gosec // G115: height is in [1, 16384]
+	putLE24(payload[4:7], uint32(s.width-1))   //nolint:gosec // G115: width is in [1, 16384]
+	putLE24(payload[7:10], uint32(s.height-1)) //nolint:gosec // G115: height is in [1, 16384]
 	return payload, true
-}
-
-// stillImageInfo returns the canvas size of a still image — the size of its
-// first decodable VP8 or VP8L bitstream — and the ICCP and ALPHA feature
-// flags its chunks imply. ok is false when no image chunk has a decodable
-// header.
-func stillImageInfo(chunks []webpOriginalChunk) (width, height int, flags uint32, ok bool) {
-	for _, c := range chunks {
-		switch c.id {
-		case fourCCICCP:
-			flags |= vp8xFlagICCP
-		case fourCCALPH:
-			flags |= vp8xFlagAlpha
-		case fourCCVP8, fourCCVP8L:
-			if ok {
-				continue
-			}
-			var alpha bool
-			if c.id == fourCCVP8 {
-				width, height, ok = vp8Info(c.data)
-			} else {
-				width, height, alpha, ok = vp8lInfo(c.data)
-			}
-			if alpha {
-				flags |= vp8xFlagAlpha
-			}
-		}
-	}
-	return width, height, flags, ok
 }
 
 // putLE24 stores the low 24 bits of v in b[0:3], little-endian

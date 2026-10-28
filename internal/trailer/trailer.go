@@ -124,13 +124,29 @@ type Span struct {
 	Build      func(outPos int64) (b []byte, changed bool, err error)
 }
 
-// Plan lists the trailer ranges to rewrite, in input order. Region holds the
-// bytes of the input from the absolute offset Base to its end, which the
-// spans refer to. The zero value is an empty plan.
+// Plan lists the trailer ranges to rewrite, in input order, and holds what is
+// needed to write the bytes of the region around them. The spans address the
+// input by absolute offsets; the region starts at Base.
+//
+// A plan made by PlanFromRegion has the bytes of the region in Region. A plan
+// made by PlanFromSource (task #393) has none: the bytes between and after the
+// spans are copied from the Source when the plan is written, so that a region
+// that is mostly the payload of a trailer (the audio file of a Samsung trailer)
+// is never held in memory. The zero value is an empty plan.
 type Plan struct {
 	Spans  []Span
 	Region []byte
 	Base   int64
+
+	// end is the offset one past the last byte of the region, and src the source
+	// the bytes between the spans are copied from; both are set by PlanFromSource.
+	end int64
+	src copier
+}
+
+// copier writes a range of a file to w.
+type copier interface {
+	CopyRange(w io.Writer, off, n int64) error
 }
 
 // PlanFromRegion finds the trailers in region, the bytes of the file from the
@@ -142,22 +158,27 @@ type Plan struct {
 // of PNG, task #314), but the absolute offsets are still rewritten when a
 // trailer moves.
 func PlanFromRegion(region []byte, base int64, newIPTC []byte) Plan {
-	plan := Plan{Region: region, Base: base}
-	afcp := FindAFCP(region, base)
-	from := base
-	if afcp != nil {
-		plan.Spans = append(plan.Spans, afcp.span(newIPTC))
-		from = afcp.End
+	plan, _ := PlanFromSource(regionSource{b: region, base: base}, base, int64(len(region)), newIPTC) // a region in memory cannot fail to read
+	plan.Region = region
+	return plan
+}
+
+// PlanFromSource is PlanFromRegion for a region that is not in memory: the
+// bytes of the file from the absolute offset base to base+size, read through
+// src (task #393). The plan finds the same trailers and spans, reading only
+// what it has to inspect: the signatures are searched for with a streaming scan
+// (Source.IndexEach), and a trailer that is rewritten is read in full.
+//
+// A read error of src is returned; the plan is then incomplete and must not be
+// used.
+func PlanFromSource[S Source](src S, base, size int64, newIPTC []byte) (Plan, error) {
+	v := view[S]{src: src, base: base, end: base + size}
+	plan := Plan{Base: base, end: v.end, src: src}
+	spans, err := planAFCPAndFoto(v, newIPTC)
+	if err != nil {
+		return Plan{}, err
 	}
-	if recs, start, end := FindFotoStation(region, base, from); recs != nil {
-		plan.Spans = append(plan.Spans, fotoSpan(recs, start, end, newIPTC))
-	}
-	if afcp != nil {
-		// A FotoStation trailer that precedes the AFCP trailer.
-		if recs, start, end := FindFotoStation(region, base, base); recs != nil && end <= afcp.Start {
-			plan.Spans = append(plan.Spans, fotoSpan(recs, start, end, newIPTC))
-		}
-	}
+	plan.Spans = spans
 	// Task #361: the audio file, the blocks after it and the QDIO block move
 	// as one rigid piece, so that the two offsets name the same audio bytes
 	// when they are shifted by the movement of the QDIO block. Every other
@@ -168,7 +189,11 @@ func PlanFromRegion(region []byte, base int64, newIPTC []byte) Plan {
 	// span before the piece or after it does not matter: the movement of the
 	// QDIO block already includes the size change of the spans before it, and
 	// the spans after it move nothing the offsets name.
-	if sp, rigidStart, ok := findSamsungQDIO(region, base); ok {
+	sp, rigidStart, ok, err := scanSamsungQDIO(v)
+	if err != nil {
+		return Plan{}, err
+	}
+	if ok {
 		kept := plan.Spans[:0]
 		for _, other := range plan.Spans {
 			if other.End <= rigidStart || other.Start >= sp.End {
@@ -178,7 +203,40 @@ func PlanFromRegion(region []byte, base int64, newIPTC []byte) Plan {
 		plan.Spans = append(kept, sp)
 	}
 	plan.Spans = disjoint(sortSpans(plan.Spans))
-	return plan
+	return plan, nil
+}
+
+// planAFCPAndFoto finds the AFCP trailer and the FotoStation trailers of the
+// view and returns the spans that rewrite them (and the AFCP trailer).
+func planAFCPAndFoto[S Source](v view[S], newIPTC []byte) (spans []Span, err error) {
+	afcp, found, err := scanAFCP(v)
+	if err != nil {
+		return nil, err
+	}
+	from := v.base
+	if found {
+		spans = append(spans, afcp.span(newIPTC))
+		from = afcp.End
+	}
+	recs, start, end, err := scanFotoStation(v, from)
+	if err != nil {
+		return nil, err
+	}
+	if recs != nil {
+		spans = append(spans, fotoSpan(recs, start, end, newIPTC))
+	}
+	if !found {
+		return spans, nil
+	}
+	// A FotoStation trailer that precedes the AFCP trailer.
+	recs, start, end, err = scanFotoStation(v, v.base)
+	if err != nil {
+		return nil, err
+	}
+	if recs != nil && end <= afcp.Start {
+		spans = append(spans, fotoSpan(recs, start, end, newIPTC))
+	}
+	return spans, nil
 }
 
 // sortSpans orders spans by start (at most a handful).
@@ -226,28 +284,43 @@ func (c *OutWriter) Write(p []byte) (int, error) {
 // has seen every byte of the output so far (w itself, or w wrapped by out):
 // the absolute offsets of a trailer are those of its position in the output.
 func (p *Plan) WriteRegion(w io.Writer, out *OutWriter) error {
-	cur := int64(0) // offset in Region of the first byte not yet written
+	src, end := p.src, p.end
+	if src == nil { // a plan that holds its region (or was built by hand)
+		src, end = regionSource{b: p.Region, base: p.Base}, p.Base+int64(len(p.Region))
+	}
+	cur := p.Base // the first byte of the region not yet written
 	for _, sp := range p.Spans {
-		s, e := sp.Start-p.Base, sp.End-p.Base
-		if s < cur || e > int64(len(p.Region)) {
+		if sp.Start < cur || sp.End > end {
 			continue // not inside the unwritten part of the region: leave it as it is
 		}
-		if _, err := w.Write(p.Region[cur:s]); err != nil {
-			return fmt.Errorf("trailer: write: %w", err)
-		}
-		b, changed, err := sp.Build(out.N)
-		if err != nil {
+		if err := writeSpan(w, out, src, cur, sp); err != nil {
 			return err
 		}
-		if !changed {
-			b = p.Region[s:e]
-		}
-		if _, err := w.Write(b); err != nil {
+		cur = sp.End
+	}
+	if err := src.CopyRange(w, cur, end-cur); err != nil {
+		return fmt.Errorf("trailer: write: %w", err)
+	}
+	return nil
+}
+
+// writeSpan writes the region from cur to the end of the span: the bytes before
+// it as they are, then the span rewritten, or as it is when it does not change.
+func writeSpan(w io.Writer, out *OutWriter, src copier, cur int64, sp Span) error {
+	if err := src.CopyRange(w, cur, sp.Start-cur); err != nil {
+		return fmt.Errorf("trailer: write: %w", err)
+	}
+	b, changed, err := sp.Build(out.N)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		if err = src.CopyRange(w, sp.Start, sp.End-sp.Start); err != nil {
 			return fmt.Errorf("trailer: write: %w", err)
 		}
-		cur = e
+		return nil
 	}
-	if _, err := w.Write(p.Region[cur:]); err != nil {
+	if _, err = w.Write(b); err != nil {
 		return fmt.Errorf("trailer: write: %w", err)
 	}
 	return nil
@@ -294,130 +367,8 @@ const maxAFCPSignatures = 256
 // by an EOF record that carries the offset of the candidate (AFCP
 // specification: the EOF record "points to AFCP header").
 func FindAFCP(region []byte, base int64) *AFCP {
-	var buf [maxAFCPSignatures]int
-	sigs := collectAFCPSigs(buf[:0], region)
-	if sigs == nil {
-		return nil // more than maxAFCPSignatures signatures: see the constant
-	}
-	for ci, at := range sigs {
-		if t := parseAFCP(region, base, at, sigs[ci+1:]); t != nil {
-			return t
-		}
-	}
-	return nil
-}
-
-// collectAFCPSigs appends to dst the offsets, in ascending order, of every
-// AFCP signature of region, in one pass. It returns nil when there are more
-// than cap(dst); a non-nil dst[:0] therefore always yields a non-nil result.
-func collectAFCPSigs(dst []int, region []byte) []int {
-	sigs := dst[:0]
-	from := 0
-	for from < len(region) {
-		i := bytes.Index(region[from:], afcpSigPrefix)
-		if i < 0 {
-			break
-		}
-		at := from + i
-		from = at + 1
-		if at+4 > len(region) || (region[at+3] != '!' && region[at+3] != '*') {
-			continue
-		}
-		if len(sigs) == cap(sigs) {
-			return nil
-		}
-		sigs = append(sigs, at)
-		from = at + 4 // a signature cannot overlap another one
-	}
-	return sigs
-}
-
-// parseAFCP parses the candidate AFCP trailer at region[at:], or returns nil.
-// later holds the offsets of the signatures that follow at, the places the EOF
-// record can be.
-func parseAFCP(region []byte, base int64, at int, later []int) *AFCP {
-	rem := region[at:]
-	if len(rem) < 24 { // header and EOF record
-		return nil
-	}
-	t := &AFCP{Start: base + int64(at)}
-	copy(t.Sig[:], rem[:4])
-	t.Order = binary.LittleEndian
-	if rem[3] == '!' {
-		t.Order = binary.BigEndian
-	}
-	copy(t.Version[:], rem[4:6])
-	count, dataEnd, ok := t.checkDirectory(rem)
-	if !ok {
-		return nil
-	}
-	rec, ok := t.findEOFRecord(region, at, dataEnd, later)
-	if !ok {
-		return nil
-	}
-	t.End = t.Start + rec + 12
-	t.readEntries(rem, count) // only a trailer that is accepted allocates
+	t, _, _ := scanAFCP(view[regionSource]{src: regionSource{b: region, base: base}, base: base, end: base + int64(len(region))}) // a region in memory cannot fail to read
 	return t
-}
-
-// checkDirectory validates the directory entries of the trailer whose bytes
-// start at rem[0], without allocating, and returns their count and the end of
-// the data they name, relative to the trailer. The entries must lie after the
-// directory and inside rem.
-func (t *AFCP) checkDirectory(rem []byte) (count int, dataEnd int64, ok bool) {
-	count = int(t.Order.Uint16(rem[6:]))
-	dirEnd := 12 + 12*count
-	if count > maxAFCPEntries || dirEnd+12 > len(rem) {
-		return 0, 0, false
-	}
-	dataEnd = int64(dirEnd)
-	for i := range count {
-		d := rem[12+12*i:]
-		n := int64(t.Order.Uint32(d[4:]))
-		off := int64(t.Order.Uint32(d[8:])) - t.Start // relative to the trailer
-		if off < int64(dirEnd) || n > int64(len(rem)) || off > int64(len(rem))-n {
-			return 0, 0, false
-		}
-		dataEnd = max(dataEnd, off+n)
-	}
-	return count, dataEnd, true
-}
-
-// readEntries fills t.Entries from the directory that checkDirectory accepted.
-func (t *AFCP) readEntries(rem []byte, count int) {
-	if count == 0 {
-		return
-	}
-	t.Entries = make([]AFCPEntry, count)
-	for i := range count {
-		d := rem[12+12*i:]
-		e := &t.Entries[i]
-		copy(e.Tag[:], d[:4])
-		n := int64(t.Order.Uint32(d[4:]))
-		off := int64(t.Order.Uint32(d[8:])) - t.Start
-		e.Data = rem[off : off+n]
-	}
-}
-
-// findEOFRecord returns the offset, relative to the trailer, of the EOF
-// record: a record that follows the data (a gap with other bytes is allowed),
-// carries the same signature as the header, and carries the offset of the
-// header. later lists the offsets of the signatures after the header, so the
-// search never rescans the region.
-func (t *AFCP) findEOFRecord(region []byte, at int, dataEnd int64, later []int) (int64, bool) {
-	for _, rec := range later {
-		rel := int64(rec - at)
-		if rel < dataEnd || region[rec+3] != t.Sig[3] {
-			continue
-		}
-		if rec+12 > len(region) {
-			return 0, false // this and every later signature is too close to the end
-		}
-		if int64(t.Order.Uint32(region[rec+4:])) == t.Start {
-			return rel, true
-		}
-	}
-	return 0, false
 }
 
 // span returns the range of the trailer and its replacement.
@@ -492,29 +443,8 @@ type FotoRecord struct {
 // which locates the record's first byte; the record must start where the
 // previous one ended.
 func FindFotoStation(region []byte, base, from int64) (recs []FotoRecord, start, end int64) {
-	cur := from
-	for {
-		rel := cur - base
-		if rel < 0 || rel > int64(len(region)) {
-			break
-		}
-		i := bytes.Index(region[rel:], fotoSig)
-		if i < 6 {
-			break
-		}
-		footer := rel + int64(i) - 6
-		tag := binary.BigEndian.Uint16(region[footer:])
-		size := int64(binary.BigEndian.Uint32(region[footer+2:]))
-		if size < 10 || footer+10-size != rel {
-			break
-		}
-		recs = append(recs, FotoRecord{Tag: tag, Data: region[rel:footer]})
-		cur = base + footer + 10
-	}
-	if len(recs) == 0 {
-		return nil, 0, 0
-	}
-	return recs, from, cur
+	recs, start, end, _ = scanFotoStation(view[regionSource]{src: regionSource{b: region, base: base}, base: base, end: base + int64(len(region))}, from) // a region in memory cannot fail to read
+	return recs, start, end
 }
 
 // fotoSpan returns the range of a FotoStation trailer and its replacement,
@@ -560,75 +490,3 @@ var (
 	samsungSEFT    = []byte("SEFT")   //nolint:gochecknoglobals // package-level constant bytes
 	samsungSEFH    = []byte("SEFH")   //nolint:gochecknoglobals // package-level constant bytes
 )
-
-// findSamsungQDIO returns the span of the two absolute audio offsets of the
-// Samsung trailer in region (the bytes of the file from base to its end), the
-// absolute offset of the start of the audio file, or false when there is no
-// such trailer. The QDIO block is found by its end, "QDIO" + "BS", and
-// accepted only when it has the layout of the package comment and follows a
-// directory block ("SEFT" whose data starts with "SEFH"); the last such block
-// of the region is used. The audio file offsets are rewritten only when the
-// audio file lies in the region (at or after base, before the QDIO block), as
-// it does in a file written by the camera: anything else is not understood and
-// is left alone.
-func findSamsungQDIO(region []byte, base int64) (sp Span, audioStart int64, ok bool) {
-	for from := 0; ; {
-		i := bytes.Index(region[from:], samsungQDIOSig)
-		if i < 0 {
-			return sp, audioStart, ok
-		}
-		q := from + i // index of the QDIO block type
-		from = q + 1
-		if cand, start, valid := samsungSpanAt(region, base, q); valid {
-			sp, audioStart, ok = cand, start, true
-		}
-	}
-}
-
-// samsungSpanAt validates the QDIO block whose type field starts at region[q]
-// and returns the span of its audio offsets and the start of the audio file.
-func samsungSpanAt(region []byte, base int64, q int) (sp Span, audioStart int64, ok bool) {
-	blockStart := q - samsungQDIOBlockLen + 4 // start of the QDIO data
-	if blockStart < 12 || q+len(samsungQDIOSig) > len(region) || !samsungBlocksValid(region, blockStart, q) {
-		return Span{}, 0, false
-	}
-	le := binary.LittleEndian
-	data := region[blockStart : blockStart+samsungQDIODataLen]
-	start := int64(le.Uint32(data[samsungOffsetsAt:]))
-	end := int64(le.Uint32(data[samsungOffsetsAt+4:]))
-	qdioAbs := base + int64(blockStart)
-	if start < base || end < start || end > qdioAbs {
-		return Span{}, 0, false
-	}
-	spanStart := qdioAbs + samsungOffsetsAt
-	return Span{Start: spanStart, End: spanStart + 8, Build: func(outPos int64) ([]byte, bool, error) {
-		delta := outPos - spanStart
-		if delta == 0 {
-			return nil, false, nil
-		}
-		ns, ne := start+delta, end+delta
-		if ns < 0 || ne > math.MaxUint32 {
-			return nil, false, fmt.Errorf("%w: Samsung audio file at %d-%d", ErrOverflow, ns, ne)
-		}
-		var b [8]byte
-		le.PutUint32(b[:], uint32(ns))  //nolint:gosec // G115: bounded by the check above
-		le.PutUint32(b[4:], uint32(ne)) //nolint:gosec // G115: bounded by the check above
-		return b[:], true, nil
-	}}, start, true
-}
-
-// samsungBlocksValid reports whether the QDIO block with its data at
-// region[blockStart] and its type field at region[q] has the layout of the
-// package comment, and follows a directory block ("SEFT", whose data starts
-// with "SEFH").
-func samsungBlocksValid(region []byte, blockStart, q int) bool {
-	le := binary.LittleEndian
-	if string(region[blockStart:blockStart+4]) != "QDIO" || le.Uint32(region[q-4:]) != samsungQDIODataLen {
-		return false
-	}
-	if !bytes.Equal(region[blockStart-4:blockStart], samsungSEFT) {
-		return false
-	}
-	dirLen := int(le.Uint32(region[blockStart-8:]))
-	return dirLen >= 12 && dirLen <= blockStart-8 && bytes.Equal(region[blockStart-8-dirLen:][:4], samsungSEFH)
-}

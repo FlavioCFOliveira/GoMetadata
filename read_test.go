@@ -1010,7 +1010,7 @@ func TestEncodeMetadataRawPassthrough(t *testing.T) {
 		rawIPTC: wantIPTC,
 		rawXMP:  wantXMP,
 	}
-	gotE, gotI, gotX, err := encodeMetadata(m, format.FormatJPEG)
+	gotE, gotI, gotX, err := encodeMetadata(m, format.FormatJPEG, segmentAll)
 	if err != nil {
 		t.Fatalf("encodeMetadata: %v", err)
 	}

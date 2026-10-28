@@ -246,6 +246,7 @@ func TestCR3_Task337_GPSDelete(t *testing.T) {
 				t.Fatal("source has no GPS IFD to delete")
 			}
 			m.EXIF.GPSIFD = nil
+			m.MarkModified(SegmentEXIF) // task #387: the IFD was removed through the exported field
 			out := writeCR3(t, src, m)
 
 			after, err := cr3.ExtractSegments(bytes.NewReader(out))

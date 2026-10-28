@@ -25,6 +25,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/FlavioCFOliveira/GoMetadata/exif"
 	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 	irbpkg "github.com/FlavioCFOliveira/GoMetadata/internal/irb"
 	"github.com/FlavioCFOliveira/GoMetadata/internal/trailer"
@@ -48,7 +49,7 @@ var identExif = []byte("Exif\x00\x00") //nolint:gochecknoglobals // package-leve
 var identXMP = []byte("http://ns.adobe.com/xap/1.0/\x00") //nolint:gochecknoglobals // package-level constant bytes
 
 // identXMPNote is the NUL-terminated APP1 segment identifier for extended XMP
-// chunks. Adobe XMP Specification Part 3 §1.1.4.
+// chunks. Adobe XMP Specification Part 3 §1.1.3.1.
 //
 // NOTE: this is the APP1 segment identifier ("http://ns.adobe.com/xmp/extension/\x00"),
 // which is distinct from the xmpNote namespace URI (xmp.NSxmpNote,
@@ -73,13 +74,13 @@ var identPS = []byte("Photoshop 3.0\x00") //nolint:gochecknoglobals // package-l
 // conforming reader accepts. The reader applies no such limit: it accepts the
 // packet of any APP1 segment, so files written with up to 65504 bytes still
 // read.
-// maxExtChunkSize: max chunk data per extended XMP APP1 (Adobe XMP Spec Part 3 §1.1.4).
+// maxExtChunkSize: max chunk data per extended XMP APP1 (Adobe XMP Spec Part 3 §1.1.3.1).
 //
 //	Extended APP1 layout: identXMPNote(35) + GUID(32) + fullLen(4) + offset(4) + chunk
 //	Overhead = 35 + 32 + 4 + 4 = 75 bytes → chunk data ≤ 65533 − 75 = 65458 bytes.
 //
 // maxExtendedXMPTotal: aggregate cap on all extended XMP chunk bytes accumulated
-// for a single GUID during parsing. Adobe XMP Specification Part 3 §1.1.4 allows
+// for a single GUID during parsing. Adobe XMP Specification Part 3 §1.1.3.1 allows
 // an extended XMP document up to 2^32−1 bytes on wire, but accepting that from an
 // untrusted JPEG stream would allow a ~268 MiB memory exhaustion attack (#40).
 // 16 MiB is generous for any real-world extended XMP use (Google Cardboard depth
@@ -103,7 +104,7 @@ const (
 // xmpWireMagic is the 8-byte magic that identifies an XMP wire-frame payload.
 //
 // A wire-frame payload is an internal encoding used when a JPEG carries
-// extended XMP (Adobe XMP Specification Part 3 §1.1.4). It carries the
+// extended XMP (Adobe XMP Specification Part 3 §1.1.3.1). It carries the
 // ORIGINAL main XMP APP1 content and the ASSEMBLED extended XMP payload as a
 // single byte slice that can be passed through the rawXMP channel without
 // changing any public interface.
@@ -216,7 +217,7 @@ func resolveKeptExtended(r io.ReadSeeker, scratch *[]byte, rawXMP []byte) (xmp [
 }
 
 // hasExtendedSegment reports whether the JPEG in r has an extended XMP APP1
-// segment (Part 3 §1.1.4) whose GUID is guid, before its image data. r is left
+// segment (Part 3 §1.1.3.1) whose GUID is guid, before its image data. r is left
 // at an unspecified position. err is non-nil only for a Seek failure or
 // ErrFileTooLarge.
 func hasExtendedSegment(r io.ReadSeeker, scratch *[]byte, guid string) (bool, error) {
@@ -252,113 +253,21 @@ func isExtendedSegmentOf(marker byte, data []byte, guid string) bool {
 }
 
 // extChunk holds one chunk of an extended XMP segment.
-// Adobe XMP Specification Part 3 §1.1.4.
+// Adobe XMP Specification Part 3 §1.1.3.1.
 type extChunk struct {
 	offset uint32
 	data   []byte
 }
 
-// appendExtendedXMPChunk adds one extended XMP chunk body to the accumulation
-// maps, enforcing the maxExtendedXMPTotal aggregate cap per GUID (#40).
-//
-// body must be at least 40 bytes (32-byte GUID + 4-byte fullLen + 4-byte offset
-// + chunk data). It is the caller's responsibility to verify this precondition.
-//
-// Returns updated extended and extSizes maps and the (possibly set) extTruncated
-// flag. DoS mitigation: the wire fullLen field from the first chunk for a GUID
-// is validated against maxExtendedXMPTotal; if it exceeds the cap the GUID is
-// blacklisted. Subsequent chunks are individually bounded by the same cap.
-// Adobe XMP Specification Part 3 §1.1.4 describes the wire fullLen field.
-func appendExtendedXMPChunk(
-	body []byte,
-	extended map[string][]extChunk,
-	extSizes map[string]uint64,
-	extFullLens map[string]uint64,
-	extTruncated bool,
-) (map[string][]extChunk, map[string]uint64, map[string]uint64, bool) {
-	rawGUID := body[:32]
-	// #135: validate that the GUID is exactly 32 hex characters and canonicalise to
-	// uppercase before keying the map. Adobe XMP Specification Part 3 §1.1.4 defines
-	// the GUID as a 32-character uppercase hex string; real-world writers may emit
-	// lowercase. A case mismatch between the main packet's HasExtendedXMP attribute
-	// and the chunk GUID would silently discard all extended properties without this
-	// normalisation.
-	if !isAllHex(rawGUID) {
-		// GUID contains non-hex characters — discard this chunk silently.
-		return extended, extSizes, extFullLens, extTruncated
-	}
-	guid := strings.ToUpper(string(rawGUID))
-	// fullLen is the wire-declared total size for this GUID's assembled payload.
-	fullLen := uint64(binary.BigEndian.Uint32(body[32:36]))
-	offset := binary.BigEndian.Uint32(body[36:40])
-	chunkData := body[40:]
-
-	// Lazily initialise maps on first encounter.
-	if extended == nil {
-		extended = make(map[string][]extChunk)
-	}
-	if extSizes == nil {
-		extSizes = make(map[string]uint64)
-	}
-	if extFullLens == nil {
-		extFullLens = make(map[string]uint64)
-	}
-
-	// First-seen check: validate the declared total against the cap and enforce
-	// the per-file GUID count cap.
-	//
-	// Adobe XMP Specification Part 3 §1.1.3.1: a conforming file uses exactly
-	// one GUID. We allow up to maxExtendedXMPGUIDs (4) to tolerate non-conforming
-	// files without permitting unbounded memory growth: an adversary crafting a
-	// JPEG with many distinct GUIDs (each up to maxExtendedXMPTotal bytes) could
-	// otherwise aggregate far beyond 16 MiB of allocations.
-	if _, seen := extSizes[guid]; !seen {
-		if len(extSizes) >= maxExtendedXMPGUIDs {
-			// Too many distinct GUIDs: stop accumulating and mark truncated.
-			return extended, extSizes, extFullLens, true // extTruncated
-		}
-		if fullLen > maxExtendedXMPTotal {
-			return extended, extSizes, extFullLens, true // extTruncated
-		}
-		extSizes[guid] = 0 // mark as seen with zero bytes accumulated
-		// #122: record the wire-declared total size so buildXMPResult can validate
-		// that the assembled chunks cover exactly fullLen bytes with no gaps or
-		// overlaps. Adobe XMP Specification Part 3 §1.1.4.
-		extFullLens[guid] = fullLen
-	}
-
-	// Per-chunk running total check: drop this chunk if it would exceed the cap.
-	accumulated := extSizes[guid]
-	chunkSize := uint64(len(chunkData))
-	if accumulated+chunkSize > maxExtendedXMPTotal {
-		return extended, extSizes, extFullLens, true // extTruncated
-	}
-
-	// Copy chunk data: body aliases scratch and must outlive this loop.
-	extSizes[guid] = accumulated + chunkSize
-	extended[guid] = append(extended[guid], extChunk{
-		offset: offset,
-		data:   bytes.Clone(chunkData),
-	})
-	return extended, extSizes, extFullLens, extTruncated
-}
-
 // processAPP1Segment dispatches an APP1 segment payload to the appropriate
 // metadata bucket (EXIF, standard XMP, or extended XMP).
 //
-// It returns updated values for rawEXIF, rawXMP, the extended chunk map,
-// the per-GUID accumulated byte counter map, the per-GUID declared total map,
-// and the extTruncated flag. Pass-through values are returned unchanged when
-// the segment does not apply.
+// It returns updated values for rawEXIF and rawXMP; extended XMP chunks are
+// added to acc. Pass-through values are returned unchanged when the segment
+// does not apply.
 //
-// Extended XMP DoS mitigation is delegated to appendExtendedXMPChunk (#40).
-func processAPP1Segment(
-	data, rawEXIF, rawXMP []byte,
-	extended map[string][]extChunk,
-	extSizes map[string]uint64,
-	extFullLens map[string]uint64,
-	extTruncated bool,
-) ([]byte, []byte, map[string][]extChunk, map[string]uint64, map[string]uint64, bool) {
+// Extended XMP DoS mitigation is delegated to extAcc.add (#40).
+func processAPP1Segment(data, rawEXIF, rawXMP []byte, acc *extAcc) (newEXIF, newXMP []byte) {
 	switch {
 	case bytes.HasPrefix(data, identExif):
 		// EXIF payload begins after the 6-byte "Exif\x00\x00" header.
@@ -388,13 +297,13 @@ func processAPP1Segment(
 
 	case bytes.HasPrefix(data, identXMPNote):
 		// Extended XMP chunk: GUID (32 bytes) + fullLength (4 bytes) +
-		// offset (4 bytes) + chunk data. Adobe XMP Spec Part 3 §1.1.4.
+		// offset (4 bytes) + chunk data. Adobe XMP Spec Part 3 §1.1.3.1.
 		if body := data[len(identXMPNote):]; len(body) >= 40 {
-			extended, extSizes, extFullLens, extTruncated = appendExtendedXMPChunk(body, extended, extSizes, extFullLens, extTruncated)
+			acc.add(body)
 		}
 	}
 
-	return rawEXIF, rawXMP, extended, extSizes, extFullLens, extTruncated
+	return rawEXIF, rawXMP
 }
 
 // processAPP13Segment checks a segment payload for the Photoshop IRB prefix and,
@@ -438,19 +347,21 @@ type xmpResult struct {
 // When extended chunks are present and valid: rawXMP = reassembled(main, ext),
 // rawXMPWire = encodeXMPWire(main, assembledExt).
 //
-// extTruncated is forwarded to the returned xmpResult.truncated field.
-// extFullLens carries the wire-declared total size per GUID for validation (#122).
+// acc.truncated is forwarded to the returned xmpResult.truncated field.
+// The wire-declared total size per GUID, kept by acc, validates the assembled
+// chunks (#122).
 //
 // wantXMP controls whether the expensive reassembly (parse both packets,
 // merge properties, re-encode) is performed at all (#238). When false (the
 // caller opted out via WithoutXMP), rawXMP degrades to the main packet only;
 // rawXMPWire — computed before reassembly either way — still carries the
 // original main+extended payload, so a JPEG round-trip write stays byte
-// stable (encodeXMP prefers rawXMPWire for JPEG destinations). extTruncated
+// stable (encodeXMP prefers rawXMPWire for JPEG destinations). acc.truncated
 // is still computed and returned regardless of wantXMP, so warnings for
 // wanted segments are unaffected.
-func buildXMPResult(rawXMP []byte, extended map[string][]extChunk, extFullLens map[string]uint64, extTruncated, wantXMP bool) xmpResult {
-	if rawXMP == nil || len(extended) == 0 {
+func buildXMPResult(rawXMP []byte, acc *extAcc, wantXMP bool) xmpResult {
+	extTruncated := acc.truncated
+	if rawXMP == nil || len(acc.guids) == 0 {
 		return xmpResult{rawXMP: rawXMP, truncated: extTruncated}
 	}
 
@@ -460,12 +371,12 @@ func buildXMPResult(rawXMP []byte, extended map[string][]extChunk, extFullLens m
 	}
 
 	// #135: canonicalize the GUID from the main packet to uppercase so it
-	// matches the normalised keys stored by appendExtendedXMPChunk.
-	// Adobe XMP Specification Part 3 §1.1.4: GUID is 32 uppercase hex chars.
+	// matches the normalised keys stored by extAcc.add.
+	// Adobe XMP Specification Part 3 §1.1.3.1: GUID is 32 uppercase hex chars.
 	guid = strings.ToUpper(guid)
 
-	chunks, ok := extended[guid]
-	if !ok || len(chunks) == 0 {
+	g := acc.guids[guid]
+	if g == nil || len(g.chunks) == 0 {
 		// Extended chunks exist but none has the GUID of the main packet:
 		// HasExtendedXMP "must only be in the file" (Part 3 §1.1.3.1, p. 15),
 		// so it is removed, as JPEG_Handler.cpp:JPEG_MetaHandler::ProcessXMP
@@ -474,11 +385,10 @@ func buildXMPResult(rawXMP []byte, extended map[string][]extChunk, extFullLens m
 	}
 
 	// #122: validate chunk layout before assembling. Adobe XMP Specification
-	// Part 3 §1.1.4: chunks must cover [0, fullLen) contiguously with no gaps,
+	// Part 3 §1.1.3.1: chunks must cover [0, fullLen) contiguously with no gaps,
 	// overlaps, or duplicated offsets. On any violation degrade gracefully to
 	// the main (standard) XMP packet and mark truncated.
-	declaredTotal, hasDeclared := extFullLens[guid]
-	extBytes, valid := mergeExtendedChunksValidated(chunks, declaredTotal, hasDeclared)
+	extBytes, valid := g.assemble()
 	if !valid {
 		// Chunk layout is corrupt; return main packet only (without the link
 		// to the extended XMP that was not recomposed) and signal truncation.
@@ -488,7 +398,7 @@ func buildXMPResult(rawXMP []byte, extended map[string][]extChunk, extFullLens m
 
 	// Build wire-frame BEFORE any reassembly, so that the original raw bytes
 	// are preserved verbatim for passthrough writes.
-	wire := encodeXMPWire(rawXMP, extBytes)
+	wire := g.wireFrame(rawXMP, extBytes)
 
 	if !wantXMP {
 		// #238: skip the reassembly parse/merge/encode entirely when the
@@ -595,19 +505,15 @@ func readSOI(soi []byte) error {
 // and rawIPTC themselves are always extracted regardless of these flags —
 // they must remain available so an unmodified Write can pass them through
 // byte-for-byte (CLAUDE.md §5).
-func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte, wantIPTC, wantXMP bool) (rawEXIF, rawIPTC, iptcDigest []byte, xmp xmpResult, err error) {
-	// extended collects chunks from extended XMP APP1 segments, keyed by GUID.
-	// Adobe XMP Specification Part 3 §1.1.4.
-	// Lazily initialised: most JPEGs do not contain extended XMP, so we avoid
-	// the map allocation on the fast path.
-	//
-	// extSizes tracks accumulated byte totals per GUID for the #40 DoS cap.
-	// extFullLens stores the wire-declared total size per GUID for #122 validation.
-	// extTruncated is set true when any GUID's payload was capped or invalid.
-	var extended map[string][]extChunk
-	var extSizes map[string]uint64
-	var extFullLens map[string]uint64
-	var extTruncated bool
+func scanMetadataSegmentsWithWire(r io.Reader, src io.Seeker, scratchPtr *[]byte, wantIPTC, wantXMP bool) (rawEXIF, rawIPTC, iptcDigest []byte, xmp xmpResult, err error) { //nolint:gocyclo // the stop on a failed size query of the source (task #394) adds one decision to a linear segment loop
+	// acc collects the chunks of extended XMP APP1 segments, keyed by GUID.
+	// Adobe XMP Specification Part 3 §1.1.3.1. Its zero value allocates nothing:
+	// most JPEGs do not contain extended XMP, so the fast path pays only for
+	// the struct itself. acc.truncated is set when any GUID's payload was
+	// capped or invalid; the per-GUID byte totals enforce the #40 DoS cap and
+	// the wire-declared total size validates the assembled payload (#122).
+	// src, when not nil, bounds the pre-sizing of the chunk buffers (task #394).
+	acc := extAcc{src: src}
 	var mainXMP []byte
 
 	// IRB-APP13-09 / ROBUST-15 (iptc.md §2.4, §5): multiple APP13 "Photoshop 3.0"
@@ -647,9 +553,10 @@ func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte, wantIPTC, wan
 
 		switch marker {
 		case markerAPP1:
-			rawEXIF, mainXMP, extended, extSizes, extFullLens, extTruncated = processAPP1Segment(
-				data, rawEXIF, mainXMP, extended, extSizes, extFullLens, extTruncated,
-			)
+			rawEXIF, mainXMP = processAPP1Segment(data, rawEXIF, mainXMP, &acc)
+			if acc.err != nil {
+				return nil, nil, nil, xmpResult{}, acc.err
+			}
 		case markerAPP13:
 			// Accumulate each Photoshop APP13 payload (after stripping the header);
 			// do NOT search for IPTC yet — the 0x0404 block might be in a later
@@ -669,12 +576,12 @@ func scanMetadataSegmentsWithWire(r io.Reader, scratchPtr *[]byte, wantIPTC, wan
 		case markerSOS, markerEOI:
 			// SOS/EOI: no more metadata segments follow.
 			rawIPTC, iptcDigest = extractIPTCAndDigestFromIRBPayloads(app13Payloads, wantIPTC)
-			return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, extended, extFullLens, extTruncated, wantXMP), nil
+			return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, &acc, wantXMP), nil
 		}
 	}
 
 	rawIPTC, iptcDigest = extractIPTCAndDigestFromIRBPayloads(app13Payloads, wantIPTC)
-	return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, extended, extFullLens, extTruncated, wantXMP), nil
+	return rawEXIF, rawIPTC, iptcDigest, buildXMPResult(mainXMP, &acc, wantXMP), nil
 }
 
 // parseIRBForIPTCAndDigest scans a single contiguous Photoshop IRB byte block
@@ -863,7 +770,7 @@ func extractFullInternal(r io.ReadSeeker, wantIPTC, wantXMP bool) (rawEXIF, rawI
 		return nil, nil, nil, xmpResult{}, soiErr
 	}
 
-	rawEXIF, rawIPTC, iptcDigest, xmp, err = scanMetadataSegmentsWithWire(cr, scratchPtr, wantIPTC, wantXMP)
+	rawEXIF, rawIPTC, iptcDigest, xmp, err = scanMetadataSegmentsWithWire(cr, r, scratchPtr, wantIPTC, wantXMP)
 	if err != nil {
 		return nil, nil, nil, xmpResult{}, err
 	}
@@ -1018,7 +925,7 @@ func writeRawXMPSegment(w io.Writer, main []byte) error {
 }
 
 // writeExtendedChunks splits ext into extended APP1 chunks and writes them.
-// guid must be exactly 32 ASCII hex characters (per Adobe XMP Spec Part 3 §1.1.4).
+// guid must be exactly 32 ASCII hex characters (per Adobe XMP Spec Part 3 §1.1.3.1).
 func writeExtendedChunks(w io.Writer, guidBytes, ext []byte) error {
 	fullLen := uint32(len(ext)) //nolint:gosec // G115: XMP payload size bounded by input
 	offset := uint32(0)
@@ -1027,10 +934,7 @@ func writeExtendedChunks(w io.Writer, guidBytes, ext []byte) error {
 	// Header = identXMPNote(35) + GUID(32) + fullLen(4) + offset(4) = 75 bytes.
 	const extHdrSize = 75
 	for offset < fullLen {
-		chunkEnd := offset + uint32(maxExtChunkSize) // min builtin shadowed by test-only helper in fuzz_test.go; cannot use min here
-		if chunkEnd > fullLen {
-			chunkEnd = fullLen
-		}
+		chunkEnd := min(offset+uint32(maxExtChunkSize), fullLen)
 		chunk := ext[offset:chunkEnd]
 
 		// #216: segment header + extended-XMP header + chunk data built in
@@ -1167,9 +1071,14 @@ func spliceIPTCIntoIRB(origIRB, newIPTCData []byte) []byte {
 	return appendSplicedIRB(out, origIRB, newIPTCData, false)
 }
 
-// writeNewMetadataSegments writes EXIF APP1, XMP APP1 (with extended-XMP
-// splitting when the payload exceeds the single-segment limit), and IPTC
-// APP13 segments to w. Returns the first error encountered.
+// writeIPTCOrSiblings handles the IPTC / Photoshop-sibling write decision.
+//
+//   - rawIPTC non-nil  → write APP13 with rawIPTC spliced into origIRB (or bare).
+//   - rawIPTC nil, origIRB non-nil → strip 0x0404, write APP13 with remaining siblings.
+//   - rawIPTC nil, origIRB nil  → no APP13 emitted.
+//
+// withXMP is true when an XMP packet is written in the same pass; it lets the
+// IPTC digest be created (task #323, MWG Guidelines v2.0 §4.2.3.2, p. 29).
 //
 // origIRB is the full Photoshop IRB block (the bytes after the "Photoshop
 // 3.0\x00" header) from the source JPEG, or nil if the source had no APP13.
@@ -1181,34 +1090,6 @@ func spliceIPTCIntoIRB(origIRB, newIPTCData []byte) []byte {
 // segment is only written when the stripped IRB is non-empty (i.e. when the
 // original APP13 contained resources other than 0x0404). If the stripped IRB
 // is empty (0x0404 was the only resource) no APP13 segment is emitted.
-func writeNewMetadataSegments(w io.Writer, rawEXIF, rawIPTC, rawXMP, origIRB []byte) error {
-	if rawEXIF != nil {
-		if err := writeEXIFSegment(w, rawEXIF); err != nil {
-			return err
-		}
-	}
-	if rawXMP != nil {
-		if err := writeXMPSegments(w, rawXMP); err != nil {
-			return err
-		}
-	}
-	if err := writeIPTCOrSiblings(w, rawIPTC, origIRB, rawXMP != nil); err != nil {
-		return err
-	}
-	return nil
-}
-
-// writeIPTCOrSiblings handles the IPTC / Photoshop-sibling write decision.
-//
-//   - rawIPTC non-nil  → write APP13 with rawIPTC spliced into origIRB (or bare).
-//   - rawIPTC nil, origIRB non-nil → strip 0x0404, write APP13 with remaining siblings.
-//   - rawIPTC nil, origIRB nil  → no APP13 emitted.
-//
-// withXMP is true when an XMP packet is written in the same pass; it lets the
-// IPTC digest be created (task #323, MWG Guidelines v2.0 §4.2.3.2, p. 29).
-//
-// This helper exists solely to satisfy the nestif linter; the logic matches
-// the comment in writeNewMetadataSegments (#174).
 func writeIPTCOrSiblings(w io.Writer, rawIPTC, origIRB []byte, withXMP bool) error {
 	if rawIPTC != nil {
 		return writeIPTCSegment(w, rawIPTC, origIRB, withXMP)
@@ -1239,57 +1120,6 @@ func isOldMetadataSegment(marker byte, data []byte) bool {
 	return false
 }
 
-// writeMarker writes a standalone JPEG marker (FF <marker>) to w.
-//
-// #216: the 2-byte marker is written into a pooled buffer instead of a stack
-// composite literal, which would otherwise escape to the heap on every call
-// through the io.Writer interface boundary.
-func writeMarker(w io.Writer, marker byte) error {
-	bufPtr := iobuf.Get(2)
-	b := *bufPtr
-	b[0], b[1] = 0xFF, marker
-	_, err := w.Write(b)
-	iobuf.Put(bufPtr)
-	if err != nil {
-		return fmt.Errorf("jpeg: write marker: %w", err)
-	}
-	return nil
-}
-
-// writePassThroughSegment writes a single non-metadata segment to w.
-// Standalone markers (nil data) are written as FF <marker>; segments with
-// data are written with the standard length-prefixed format.
-func writePassThroughSegment(w io.Writer, marker byte, data []byte) error {
-	if data == nil {
-		return writeMarker(w, marker)
-	}
-	return writeSegmentCopy(w, marker, data)
-}
-
-// writeSOS writes the SOS segment and then copies the remaining compressed
-// image data from r to w verbatim.
-func writeSOS(r io.Reader, w io.Writer, data []byte) error {
-	if err := writeSegmentCopy(w, markerSOS, data); err != nil {
-		return err
-	}
-	if _, err := io.Copy(w, r); err != nil {
-		return fmt.Errorf("jpeg: copy image data: %w", err)
-	}
-	return nil
-}
-
-// writeSOSOrTrailers is writeSOS, or writeSOSTrailers when plan lists trailers
-// to rewrite (task #322; r is then the seekable reader the plan was made from).
-func writeSOSOrTrailers(r io.Reader, w io.Writer, data []byte, plan *trailer.Plan) error {
-	if rs, ok := r.(io.ReadSeeker); ok && plan != nil {
-		// w is the counting writer startTrailerPlan returned with the plan.
-		if out, isOut := w.(*trailer.OutWriter); isOut {
-			return writeSOSTrailers(rs, w, out, data, plan)
-		}
-	}
-	return writeSOS(r, w, data)
-}
-
 // isAppMarker reports whether m is an APPn marker (APP0–APP15, markers
 // 0xE0–0xEF). These segments carry optional application-specific data and are
 // never required for image decoding.
@@ -1300,47 +1130,6 @@ func writeSOSOrTrailers(r io.Reader, w io.Writer, data []byte, plan *trailer.Pla
 // "unknown" application payloads from the library's perspective.
 func isAppMarker(m byte) bool {
 	return m >= 0xE0 && m <= 0xEF
-}
-
-// copyNonMetadataSegments reads segments from r, skips old metadata APP
-// segments, and passes the rest through to w. It terminates on SOS (copying
-// the compressed stream verbatim) or EOI.
-//
-// When preserveUnknownSegments is false, APPn segments (APP0–APP15) that are
-// not the recognised metadata segments (EXIF APP1, XMP APP1, IPTC APP13) are
-// also dropped. Structural markers, DQT, DHT, SOF, SOS, and compressed image
-// data are never dropped regardless of this flag.
-//
-// plan (task #322) lists the trailer ranges after the image data that are
-// rewritten instead of copied; it is nil for a JPEG without such a trailer,
-// and then r need not be seekable. keepGUID (task #357) names the extended
-// XMP segments that are copied instead of dropped; it is empty in the common
-// case.
-func copyNonMetadataSegments(r io.Reader, w io.Writer, scratch *[]byte, preserveUnknownSegments bool, plan *trailer.Plan, keepGUID string) error {
-	for {
-		marker, data, err := readSegment(r, scratch)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		}
-
-		if dropsSegment(marker, data, preserveUnknownSegments, keepGUID) {
-			continue
-		}
-
-		switch marker {
-		case markerSOS:
-			return writeSOSOrTrailers(r, w, data, plan)
-		case markerEOI:
-			return writeMarker(w, markerEOI)
-		default:
-			if err := writePassThroughSegment(w, marker, data); err != nil {
-				return err
-			}
-		}
-	}
 }
 
 // dropsSegment reports whether Inject leaves a source segment out of the
@@ -1361,6 +1150,15 @@ func dropsSegment(marker byte, data []byte, preserveUnknownSegments bool, keepGU
 		return false
 	}
 	return isOldMetadataSegment(marker, data) || (!preserveUnknownSegments && isAppMarker(marker))
+}
+
+// dropsSegmentKeeping is dropsSegment for a write that keeps the metadata
+// segments in keep in place (task #387): those are never dropped.
+func dropsSegmentKeeping(marker byte, data []byte, preserveUnknownSegments bool, keepGUID string, keep Keep) bool {
+	if keep != 0 && keepsSegment(marker, data, keep) {
+		return false
+	}
+	return dropsSegment(marker, data, preserveUnknownSegments, keepGUID)
 }
 
 // irbHasSibling reports whether an IRB payload contains any 8BIM resource
@@ -1540,51 +1338,59 @@ func resolveOrigIRB(r io.ReadSeeker, scratch *[]byte, rawIPTC []byte) ([]byte, e
 
 // prepareInject runs the passes of Inject that precede the main copy pass and
 // leaves cr at the start of the file: the original Photoshop IRB (resolveOrigIRB,
-// #174, #217) and the trailers that hold an IPTC copy or absolute offsets
+// #174, #217), the trailers that hold an IPTC copy or absolute offsets
 // (startTrailerPlan, #322), whose plan is nil, with w returned as it is, when
-// there are none. A keep frame in rawXMP (#357) is resolved against the source
-// first: xmp is the standard packet to write and keepGUID the GUID of the
-// extended XMP segments to keep (see resolveKeptExtended).
-func prepareInject(cr io.ReadSeeker, w io.Writer, scratch *[]byte, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) (origIRB []byte, plan *trailer.Plan, out io.Writer, exifOut, xmp []byte, keepGUID string, err error) {
+// there are none, and the scan of the segments before the first scan header
+// (scanSplice, #400, #403), which fills sp and reports ErrNotJPEG for a source
+// that does not start with the SOI marker. A keep frame in rawXMP (#357) is
+// resolved against the source first: xmp is the standard packet to write and
+// keepGUID the GUID of the extended XMP segments to keep (see
+// resolveKeptExtended).
+func prepareInject(cr *countingReader, w io.Writer, scratch *[]byte, sp *splicePlan, rawIPTC, rawXMP []byte, preserveUnknownSegments bool, keep Keep) (origIRB []byte, plan *trailer.Plan, out io.Writer, xmp []byte, keepGUID string, err error) {
 	// #357: a keep frame in rawXMP asks to carry over the extended XMP segments
 	// of the source that were not merged; it starts with 0x00, which no XMP
 	// packet does, so any other payload skips the call. Resolved against this
 	// source before another pass moves the reader.
 	if len(rawXMP) > 0 && rawXMP[0] == 0 {
 		if rawXMP, keepGUID, err = resolveKeptExtended(cr, scratch, rawXMP); err != nil {
-			return nil, nil, w, nil, nil, "", err
+			return nil, nil, w, nil, "", err
 		}
 	}
-	origIRB, err = resolveOrigIRB(cr, scratch, rawIPTC)
-	if err != nil {
-		return nil, nil, w, nil, nil, "", err
+	// Task #387: an IPTC kept in place keeps its Photoshop resources with it,
+	// so no sibling is carried into a new APP13 segment.
+	if keep&KeepIPTC == 0 {
+		if origIRB, err = resolveOrigIRB(cr, scratch, rawIPTC); err != nil {
+			return nil, nil, w, nil, "", err
+		}
 	}
 	plan, out, err = startTrailerPlan(cr, w, scratch, rawIPTC)
 	if err != nil {
-		return nil, nil, w, nil, nil, "", err
+		return nil, nil, w, nil, "", err
 	}
-	// #362: a MakerNote offset to data outside the EXIF stream follows the data
-	// it addresses. Only an Olympus MakerNote holds one, and its signature
-	// starts with 'O': the single-byte search keeps the common stream from
-	// paying for more (a call with this many arguments from Inject itself cost
-	// 5% on the 300 ns Inject benchmark; here the arguments are at hand).
-	exifOut = rawEXIF
-	if bytes.IndexByte(rawEXIF, 'O') >= 0 {
-		if exifOut, err = shiftExternalOffsets(cr, scratch, rawEXIF, rawIPTC, rawXMP, origIRB, preserveUnknownSegments, keepGUID, plan); err != nil {
-			return nil, nil, w, nil, nil, "", err
-		}
+	if err := scanSplice(cr, scratch, sp, preserveUnknownSegments, keepGUID, keep); err != nil {
+		return nil, nil, w, nil, "", err
 	}
 	// Seek back to the start for the main copy pass.
 	if _, err := cr.Seek(0, io.SeekStart); err != nil {
-		return nil, nil, w, nil, nil, "", fmt.Errorf("jpeg: seek: %w", err)
+		return nil, nil, w, nil, "", fmt.Errorf("jpeg: seek: %w", err)
 	}
-	return origIRB, plan, out, exifOut, rawXMP, keepGUID, nil
+	return origIRB, plan, out, rawXMP, keepGUID, nil
 }
 
 // Inject reads the JPEG marker stream from r, replaces the relevant APP
 // segments with the provided payloads, and writes the result to w.
 // A nil payload means the corresponding segment is removed.
 // The SOS segment and compressed image data are passed through unchanged.
+//
+// The output is the source with only the metadata segments changed (tasks #400
+// and #403; see splice.go): a new segment replaces the first old segment of its
+// kind where it is, a kind the file has none of goes after the JFIF APP0 segment
+// (ITU-T T.871 | ISO/IEC 10918-5 §6.3, p. 3) and the JFIF extension and Adobe
+// APP14 segments that follow it, EXIF before XMP before IPTC, and every other
+// byte (segment order, fill bytes, other APPn segments, tables, scan data,
+// trailers) is copied as it is. Only the segment headers before the first scan
+// header are read. A source whose marker stream cannot be followed is copied
+// from the first byte that cannot be read, with the metadata added before it.
 //
 // rawXMP may be a wire-frame payload (produced by ExtractWithWire) when the
 // XMP was not modified; in that case the original main and extended APP1
@@ -1615,6 +1421,75 @@ func prepareInject(cr io.ReadSeeker, w io.Writer, scratch *[]byte, rawEXIF, rawI
 // trailer.go). Oversized XMP is partitioned into a standard packet and
 // extended XMP (#332; see writeXMPSegments).
 func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool) error {
+	return injectSegments(r, w, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments, 0)
+}
+
+// Keep is a set of the metadata segments of a JPEG that InjectKeeping leaves
+// as they are in the source (task #387).
+type Keep uint8
+
+// The segments a Keep can hold.
+const (
+	// KeepEXIF is every EXIF APP1 segment.
+	KeepEXIF Keep = 1 << iota
+	// KeepIPTC is every Photoshop APP13 segment (the IPTC and the other
+	// Photoshop resources, the IPTC digest included).
+	KeepIPTC
+	// KeepXMP is every XMP APP1 segment, the standard packet and the extended
+	// XMP segments.
+	KeepXMP
+)
+
+// InjectKeeping is Inject for a write that changes only some of the metadata
+// segments (task #387): the segments in keep stay in the output exactly as
+// the source has them, byte for byte and at the same place; the others are
+// replaced by the payload given, or removed when it is nil, as Inject does.
+//
+// The payload of a kept segment is not written. A caller passes it anyway
+// when it holds it: Inject semantics apply to the whole write whenever a kept
+// segment cannot stay in place, which InjectKeeping detects and which is
+// reported by nothing but the output. That happens for the EXIF: when its
+// stream holds MakerNote offsets to data outside it (exif.ExternalOffsets;
+// Olympus), the position of that data depends on the size of every segment
+// before it, so the EXIF is written from rawEXIF, with the offsets rewritten
+// for the new layout as in Inject, even when it is in keep.
+//
+// A kept IPTC is not rewritten, so the IPTC digest is left as the source has
+// it, whatever is written to XMP (MWG Guidelines v2.0 §4.2.3.2, p. 29: a
+// digest that no longer matches tells a reader the IPTC was edited after the
+// XMP). The AFCP and FotoStation trailers are left as they are too.
+func InjectKeeping(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool, keep Keep) error {
+	if keep&KeepEXIF != 0 && bytes.IndexByte(rawEXIF, 'O') >= 0 && len(exif.ExternalOffsets(rawEXIF)) > 0 {
+		keep &^= KeepEXIF
+	}
+	if keep&KeepEXIF != 0 {
+		rawEXIF = nil
+	}
+	if keep&KeepIPTC != 0 {
+		rawIPTC = nil
+	}
+	if keep&KeepXMP != 0 {
+		rawXMP = nil
+	}
+	return injectSegments(r, w, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments, keep)
+}
+
+// keepsSegment reports whether the source segment marker+data is one that keep
+// leaves in place.
+func keepsSegment(marker byte, data []byte, keep Keep) bool {
+	switch marker {
+	case markerAPP1:
+		return keep&KeepEXIF != 0 && bytes.HasPrefix(data, identExif) ||
+			keep&KeepXMP != 0 && (bytes.HasPrefix(data, identXMP) || bytes.HasPrefix(data, identXMPNote))
+	case markerAPP13:
+		return keep&KeepIPTC != 0 && bytes.HasPrefix(data, identPS)
+	}
+	return false
+}
+
+// injectSegments is Inject and InjectKeeping: rawEXIF, rawIPTC and rawXMP are
+// nil for a segment in keep.
+func injectSegments(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, preserveUnknownSegments bool, keep Keep) error {
 	// #262: wrap r so the total bytes read across the IRB pre-scan, the SOI
 	// check, and the main copy pass (including the passthrough io.Copy of the
 	// compressed image data in writeSOS) are bounded by maxFileSize, mirroring
@@ -1646,32 +1521,28 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 	// #357: a keep frame in rawXMP asks to carry over the extended XMP segments
 	// of the source that were not merged; resolve it against this source before
 	// any pass moves the reader.
-	origIRB, plan, w, rawEXIF, rawXMP, keepGUID, err := prepareInject(cr, w, scratch, rawEXIF, rawIPTC, rawXMP, preserveUnknownSegments)
+	sp := getSplicePlan()
+	defer putSplicePlan(sp)
+	origIRB, plan, w, rawXMP, _, err := prepareInject(cr, w, scratch, sp, rawIPTC, rawXMP, preserveUnknownSegments, keep)
 	if err != nil {
 		return err
 	}
 
-	// Read and write SOI using the pooled scratch buffer (#216): avoids the
-	// stack-array escape that occurs when a fixed-size array is passed to
-	// io.Reader/io.Writer through the interface boundary.
-	soi := (*scratch)[:2]
-	if _, err := io.ReadFull(cr, soi); err != nil {
-		return fmt.Errorf("jpeg: read SOI: %w", err)
+	// Copy the source, with the old metadata segments left out and the new ones
+	// put in (splice.go). The SOI marker, which scanSplice has checked, is
+	// copied with the rest.
+	pl := payloads{rawEXIF: rawEXIF, rawIPTC: rawIPTC, rawXMP: rawXMP, origIRB: origIRB}
+	// #362: a MakerNote offset to data outside the EXIF stream follows the data
+	// it addresses. Only an Olympus MakerNote holds one, and its signature
+	// starts with 'O': the single-byte search keeps the common stream from
+	// paying for more.
+	if bytes.IndexByte(rawEXIF, 'O') >= 0 {
+		if pl.rawEXIF, err = shiftExternalOffsets(cr, scratch, sp, &pl, plan); err != nil {
+			return err
+		}
 	}
-	if soi[0] != 0xFF || soi[1] != markerSOI {
-		return ErrNotJPEG
-	}
-	if _, err := w.Write(soi); err != nil {
-		return fmt.Errorf("jpeg: write segment: %w", err)
-	}
-
-	// Write new metadata segments before any existing ones.
-	if err := writeNewMetadataSegments(w, rawEXIF, rawIPTC, rawXMP, origIRB); err != nil {
-		return err
-	}
-
-	// Copy remaining segments, skipping old metadata APP segments.
-	return copyNonMetadataSegments(cr, w, scratch, preserveUnknownSegments, plan, keepGUID)
+	var opsBuf [16]spliceOp
+	return writeSplice(cr, w, scratch, sp, sp.ops(&pl, opsBuf[:0]), &pl, plan)
 }
 
 // parseIRBEntry delegates to irbpkg.ParseEntry; see there for the recoverable-miss
@@ -1833,20 +1704,9 @@ func writeHeaderedBuf(w io.Writer, marker byte, bufPtr *[]byte) error {
 	return nil
 }
 
-// writeSegmentCopy writes marker+data as a single JPEG segment, copying data
-// into a freshly pooled header+body buffer so the header and body leave in
-// one w.Write call. Used for pass-through segments (#216) where data aliases
-// the caller's scratch buffer and was not originally built with head-room for
-// the header.
-func writeSegmentCopy(w io.Writer, marker byte, data []byte) error {
-	bufPtr := iobuf.Get(segHeaderSize + len(data))
-	copy((*bufPtr)[segHeaderSize:], data)
-	return writeHeaderedBuf(w, marker, bufPtr)
-}
-
 // isAllHex reports whether b consists entirely of ASCII hex digits (0-9, a-f, A-F).
 // Used to validate the 32-character GUID in extended XMP APP1 segments.
-// Adobe XMP Specification Part 3 §1.1.4: GUID is a 32-character uppercase hex string.
+// Adobe XMP Specification Part 3 §1.1.3.1: GUID is a 32-character uppercase hex string.
 func isAllHex(b []byte) bool {
 	for _, c := range b {
 		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
@@ -1858,7 +1718,7 @@ func isAllHex(b []byte) bool {
 
 // mergeExtendedChunks sorts chunks by their byte offset and concatenates their
 // data fields into a single contiguous extended XMP byte slice.
-// This function does NOT validate chunk layout; use mergeExtendedChunksValidated
+// This function does NOT validate chunk layout; use extGUID.assemble
 // when the declared total size is known.
 func mergeExtendedChunks(chunks []extChunk) []byte {
 	sort.Slice(chunks, func(i, j int) bool {
@@ -1874,59 +1734,6 @@ func mergeExtendedChunks(chunks []extChunk) []byte {
 		extBytes = append(extBytes, c.data...)
 	}
 	return extBytes
-}
-
-// mergeExtendedChunksValidated sorts chunks by offset, validates that they form
-// a contiguous, non-overlapping sequence starting at offset 0 and covering
-// exactly declaredTotal bytes (when hasDeclaredTotal is true), and returns the
-// assembled bytes and a validity flag.
-//
-// Validation rules (Adobe XMP Specification Part 3 §1.1.4, #122):
-//   - First chunk must have offset == 0.
-//   - Each subsequent chunk must start exactly where the previous one ended
-//     (chunk[i].offset == chunk[i-1].offset + len(chunk[i-1].data)).
-//   - When hasDeclaredTotal is true, the assembled length must equal declaredTotal.
-//
-// On any violation, returns (nil, false): buildXMPResult must degrade to the
-// main packet only rather than returning corrupted or doubled reassembled bytes.
-func mergeExtendedChunksValidated(chunks []extChunk, declaredTotal uint64, hasDeclaredTotal bool) ([]byte, bool) {
-	if len(chunks) == 0 {
-		return nil, false
-	}
-	sort.Slice(chunks, func(i, j int) bool {
-		return chunks[i].offset < chunks[j].offset
-	})
-
-	// First chunk must start at offset 0.
-	if chunks[0].offset != 0 {
-		return nil, false
-	}
-
-	// Each subsequent chunk must be contiguous with the previous one.
-	var totalLen int
-	for i, c := range chunks {
-		if i > 0 {
-			expectedOffset := chunks[i-1].offset + uint32(len(chunks[i-1].data)) //nolint:gosec // G115: chunk offset/size bounded by maxExtendedXMPTotal (16 MiB)
-			if c.offset != expectedOffset {
-				// Gap or overlap detected: reject the assembled payload.
-				return nil, false
-			}
-		}
-		totalLen += len(c.data)
-	}
-
-	// When the wire-declared total is known, assembled length must match exactly.
-	// Adobe XMP Specification Part 3 §1.1.4: fullLength is the total size of the
-	// extended XMP document; every byte must be accounted for.
-	if hasDeclaredTotal && uint64(totalLen) != declaredTotal {
-		return nil, false
-	}
-
-	extBytes := make([]byte, 0, totalLen)
-	for _, c := range chunks {
-		extBytes = append(extBytes, c.data...)
-	}
-	return extBytes, true
 }
 
 // reassembleExtendedXMPByParse recomposes the standard XMP packet mainBytes
@@ -1960,7 +1767,7 @@ func reassembleExtendedXMPByParse(mainBytes, extBytes []byte) []byte {
 }
 
 // reassembleExtendedXMP merges extended XMP chunks into the main XMP packet
-// per Adobe XMP Specification Part 3 §1.1.4.
+// per Adobe XMP Specification Part 3 §1.1.3.1.
 //
 // The main XMP packet carries a HasExtendedXMP property whose value is the
 // 32-hex-character MD5 GUID of the corresponding extended segments. This

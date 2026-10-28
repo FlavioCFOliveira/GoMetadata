@@ -413,9 +413,10 @@ func TestInjectPreservesAPP4Segment(t *testing.T) {
 	}
 }
 
-// TestInjectSegmentOrderPreserved verifies that Inject emits segments in the
-// expected order: SOI → new metadata → existing non-metadata segments (in their
-// original relative order) → SOS → scan data → EOI.
+// TestInjectSegmentOrderPreserved verifies that Inject keeps the order of the
+// source: SOI → COM → APP4 → the new EXIF in the place of the old one → SOS →
+// scan data → EOI (a replaced metadata segment keeps its place, tasks #400 and
+// #403; before them the new metadata was written right after the SOI marker).
 //
 // The order check is important for interoperability: some decoders expect APP
 // segments to precede frame markers (SOF*) which precede SOS.
@@ -452,8 +453,8 @@ func TestInjectSegmentOrderPreserved(t *testing.T) {
 		t.Errorf("SOI not at position 0; got %d", markerPositions[markerSOI])
 	}
 
-	// New EXIF APP1 (0xE1) must come before COM (0xFE) and APP4 (0xE4).
-	// Inject writes new metadata first, then passes through non-metadata in order.
+	// The new EXIF APP1 (0xE1) replaces the old one, which follows COM (0xFE)
+	// and APP4 (0xE4) in the source: it follows them in the output too.
 	exifPos := markerPositions[markerAPP1]
 	comPos := markerPositions[0xFE]
 	app4Pos := markerPositions[0xE4]
@@ -462,14 +463,14 @@ func TestInjectSegmentOrderPreserved(t *testing.T) {
 	if comPos == 0 || app4Pos == 0 {
 		t.Fatalf("COM or APP4 marker not found in output")
 	}
-	if exifPos >= comPos {
-		t.Errorf("new EXIF APP1 (pos=%d) must precede COM (pos=%d)", exifPos, comPos)
-	}
 	if comPos >= app4Pos {
 		t.Errorf("COM (pos=%d) must precede APP4 (pos=%d) — relative order not preserved", comPos, app4Pos)
 	}
-	if app4Pos >= sosPos {
-		t.Errorf("APP4 (pos=%d) must precede SOS (pos=%d)", app4Pos, sosPos)
+	if app4Pos >= exifPos {
+		t.Errorf("APP4 (pos=%d) must precede the new EXIF APP1 (pos=%d), which replaces the old one in place", app4Pos, exifPos)
+	}
+	if exifPos >= sosPos {
+		t.Errorf("the new EXIF APP1 (pos=%d) must precede SOS (pos=%d)", exifPos, sosPos)
 	}
 }
 
@@ -1024,7 +1025,7 @@ func TestInjectAllThreeMetadataPreservesUnknownAndScan(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestExtendedXMPMultiSegmentGUIDReassembly verifies the full extended-XMP
-// reassembly pipeline as specified in Adobe XMP Specification Part 3 §1.1.4:
+// reassembly pipeline as specified in Adobe XMP Specification Part 3 §1.1.3.1:
 //
 //  1. A standard XMP APP1 carries HasExtendedXMP="<GUID>" in the main packet.
 //  2. Multiple extended XMP APP1 segments carry the same GUID, each with
@@ -1068,7 +1069,7 @@ func TestExtendedXMPMultiSegmentGUIDReassembly(t *testing.T) {
 }
 
 // TestExtendedXMPHeaderLayout verifies that the extended XMP APP1 binary
-// header layout matches Adobe XMP Specification Part 3 §1.1.4:
+// header layout matches Adobe XMP Specification Part 3 §1.1.3.1:
 //
 //	Bytes 0–34: "http://ns.adobe.com/xmp/extension/\x00" (35 bytes)
 //	Bytes 35–66: GUID (32 ASCII hex characters)

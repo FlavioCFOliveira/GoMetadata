@@ -107,6 +107,7 @@ func TestTask343ExplicitXMPReplacesPacket(t *testing.T) {
 		t.Fatalf("Read: %v", err)
 	}
 	m.XMP = &xmp.XMP{Properties: map[string]map[string]string{xmp.NSxmp: {"Label": "Blue"}}}
+	m.MarkModified(SegmentXMP) // task #387: the field was assigned
 	back := task343Write(t, src, m)
 	if got := back.XMP.Get(xmp.NSxmp, "Label"); got != "Blue" {
 		t.Errorf("xmp:Label = %q, want Blue", got)

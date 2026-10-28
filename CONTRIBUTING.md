@@ -23,7 +23,7 @@ Thank you for your interest in contributing to GoMetadata. This document covers 
 
 | Tool | Minimum version | Notes |
 |---|---|---|
-| Go | 1.26 | <https://go.dev/doc/install> |
+| Go | 1.27 | <https://go.dev/doc/install> |
 | golangci-lint | latest stable | `go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest` |
 | GNU Make | any | Optional; all targets have plain `go` equivalents |
 

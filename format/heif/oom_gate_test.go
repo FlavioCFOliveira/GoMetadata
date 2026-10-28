@@ -2,9 +2,11 @@ package heif
 
 // oom_gate_test.go — regression gate for #140: uncapped io.ReadAll OOM.
 //
-// These tests verify that Extract (slow path) and Inject reject inputs that
-// exceed maxFileSize with ErrFileTooLarge, and that the fast-path Extract
-// (meta box within 64 KB header window) is not affected.
+// These tests verify that Extract (slow path) rejects inputs that exceed
+// maxFileSize with ErrFileTooLarge, and that the fast-path Extract (meta box
+// within 64 KB header window) is not affected. Inject never holds the file in
+// memory (task #390): maxFileSize limits only the boxes it holds, and its gates
+// are in stream_task390_test.go.
 //
 // The tests lower maxFileSize to a tiny value (capBytes) for the OOM path and
 // restore it via t.Cleanup so the production default (256 MiB) is never changed
@@ -13,7 +15,6 @@ package heif
 import (
 	"bytes"
 	"errors"
-	"io"
 	"testing"
 )
 
@@ -58,85 +59,6 @@ func TestExtractSlowPathFileTooLarge(t *testing.T) {
 	}
 	if !errors.Is(err, ErrFileTooLarge) {
 		t.Errorf("Extract slow path: expected errors.Is(err, ErrFileTooLarge), got: %v", err)
-	}
-}
-
-// TestInjectFileTooLarge verifies that Inject returns ErrFileTooLarge when
-// the reader exceeds maxFileSize.
-//
-// Gate for #140 (heif.Inject uncapped io.ReadAll).
-//
-//nolint:paralleltest // sets package-level maxFileSize; must not run in parallel
-func TestInjectFileTooLarge(t *testing.T) {
-	setMaxFileSizeForTest(t, capBytes)
-
-	// Feed capBytes+1 bytes with a non-nil rawEXIF to bypass the pass-through branch.
-	r := bytes.NewReader(make([]byte, capBytes+1))
-	err := Inject(r, io.Discard, []byte{0x49, 0x49, 0x2A, 0x00}, nil, nil, true)
-	if err == nil {
-		t.Fatal("Inject: expected error for oversized input, got nil")
-	}
-	if !errors.Is(err, ErrFileTooLarge) {
-		t.Errorf("Inject: expected errors.Is(err, ErrFileTooLarge), got: %v", err)
-	}
-}
-
-// onlyReader hides every method except Read, mirroring
-// internal/iobuf.onlyReader.
-type onlyReader struct{ r io.Reader }
-
-func (o onlyReader) Read(p []byte) (int, error) { return o.r.Read(p) } //nolint:wrapcheck // test helper: deliberate pass-through, mirrors internal/iobuf's onlyReader
-
-// seekStartOnlyReader allows Seek(0, io.SeekStart) — the rewind Inject itself
-// performs before delegating to iobuf.ReadAll — but fails every other Seek
-// call. This forces iobuf.ReadAll's non-seekable fallback path (task #230)
-// without failing Inject's own unconditional leading rewind.
-type seekStartOnlyReader struct{ onlyReader }
-
-func (seekStartOnlyReader) Seek(offset int64, whence int) (int64, error) {
-	if offset == 0 && whence == io.SeekStart {
-		return 0, nil
-	}
-	return 0, errors.New("seek not supported beyond initial rewind")
-}
-
-// TestInjectFileTooLargeNonSeekable is the non-seekable counterpart of
-// TestInjectFileTooLarge (task #230): heif.Inject now reads its input via
-// iobuf.ReadAll, which falls back to a bounded io.ReadAll(io.LimitReader(...))
-// when Seek fails. This proves that fallback still enforces maxFileSize
-// (ErrFileTooLarge) for a reader that cannot report its size up front.
-//
-//nolint:paralleltest // sets package-level maxFileSize; must not run in parallel
-func TestInjectFileTooLargeNonSeekable(t *testing.T) {
-	setMaxFileSizeForTest(t, capBytes)
-
-	r := seekStartOnlyReader{onlyReader{bytes.NewReader(make([]byte, capBytes+1))}}
-	err := Inject(r, io.Discard, []byte{0x49, 0x49, 0x2A, 0x00}, nil, nil, true)
-	if err == nil {
-		t.Fatal("Inject (non-seekable): expected error for oversized input, got nil")
-	}
-	if !errors.Is(err, ErrFileTooLarge) {
-		t.Errorf("Inject (non-seekable): expected errors.Is(err, ErrFileTooLarge), got: %v", err)
-	}
-}
-
-// TestInjectFileTooLargeNonSeekableUnderLimit is the positive control for
-// TestInjectFileTooLargeNonSeekable: a non-seekable input under the size cap
-// must not be rejected by the size guard itself (it may still fail later for
-// unrelated structural reasons, which this test does not assert on).
-//
-//nolint:paralleltest // sets package-level maxFileSize; must not run in parallel
-func TestInjectFileTooLargeNonSeekableUnderLimit(t *testing.T) {
-	data := buildHEIF(minimalTIFFExif(), nil)
-	// A cap comfortably larger than the synthetic fixture, but still far
-	// below the 256 MiB production default, keeps this a fast, deterministic
-	// positive control without allocating anywhere near maxFileSize.
-	setMaxFileSizeForTest(t, int64(len(data)+1))
-	r := seekStartOnlyReader{onlyReader{bytes.NewReader(data)}}
-	newEXIF := minimalTIFFExif()
-	err := Inject(r, io.Discard, newEXIF, nil, nil, true)
-	if errors.Is(err, ErrFileTooLarge) {
-		t.Fatalf("Inject (non-seekable, under limit): unexpected ErrFileTooLarge")
 	}
 }
 

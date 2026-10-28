@@ -6,7 +6,7 @@ package tiff
 // Each test:
 //  1. Builds a minimal TIFF with a MakerNote blob embedded in an ExifIFD.
 //  2. The MakerNote contains at least one OOL IFD entry (total > 4 bytes) whose
-//     val_or_off is set according to the maker's convention (file-absolute or
+//     val_or_off is set according to the maker's convention (TIFF-relative or
 //     blob-relative).
 //  3. Calls Inject (the public TIFF write path, which internally calls
 //     relocateTIFFFromParsed → exif.Encode → rebaseGenericMakerNote).
@@ -21,7 +21,7 @@ package tiff
 //	TestEncodeOlympusMakerNoteOOL      — OLYMP-type (file-absolute, was CORRUPT → CORRECT)
 //	TestSonyMakerNoteOOLRoundtrip      — Sony plain-IFD (file-absolute, was CORRUPT → CORRECT)
 //	TestNikonMakerNoteOOLRoundtrip     — Nikon Type-3 (embedded-TIFF-relative, already CORRECT → regression lock)
-//	TestPanasonicMakerNoteOOLRoundtrip — Panasonic (blob-relative, already CORRECT → regression lock)
+//	TestPanasonicMakerNoteOOLRoundtrip — Panasonic (TIFF-relative layout; the fixture's pointer is below the MakerNote position, so the test locks the blob bytes, not a rebase)
 //
 // Additional:
 //
@@ -35,7 +35,7 @@ package tiff
 //	ExifTool Olympus.pm: OLYMP-type OOL offsets are outer-TIFF-absolute.
 //	ExifTool Sony.pm:    Sony plain-IFD OOL offsets are outer-TIFF-absolute.
 //	ExifTool Nikon.pm:   Type-3 offsets relative to embedded TIFF header.
-//	ExifTool Panasonic.pm: all OOL offsets relative to blob start.
+//	ExifTool Panasonic.pm / metadata-extractor processMakernote: Panasonic OOL offsets count from the TIFF header (layout mnPanasonic, mnBaseTIFF).
 //	#127 audit finding: MakerNote OOL offset rebasing incomplete on write.
 
 import (
@@ -480,19 +480,25 @@ func TestNikonMakerNoteOOLRoundtrip(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestPanasonicMakerNoteOOLRoundtrip is a regression-lock test verifying that
-// Panasonic MakerNote OOL entries remain correct after relocation.
+// the out-of-line bytes of a Panasonic MakerNote travel with the MakerNote
+// blob when Inject moves it.
 //
 // Convention: Panasonic MakerNotes have a "Panasonic\x00\x00\x00" prefix
-// (12 bytes) followed by an IFD.  All val_or_off values are relative to the
-// start of the blob (blob[0]).  The blob is copied verbatim; its internal
-// layout doesn't change; all OOL pointers remain correct after move.
+// (12 bytes) followed by an IFD. Its value-or-offset fields count from the
+// start of the TIFF header, not from the blob (layout mnPanasonic is
+// mnBaseTIFF in exif/makernote_detect.go; exif.MakerNoteLayout reports
+// TIFFRelative). Inject therefore rebases them: rebaseGenericMakerNote adds the
+// distance the blob moved to every out-of-line pointer that is at least the old
+// MakerNote position.
 //
-// After #127: rebaseGenericMakerNote recognises the "Panasonic\x00" prefix
-// and is a no-op (blob-relative, safe).  This test locks that behaviour and
-// confirms the values are preserved.
+// This fixture writes the pointer as 30, the offset of the data inside the blob.
+// 30 is below the old MakerNote position, so rebaseGenericMakerNote leaves it
+// unchanged (it cannot address the blob's own data), and the test asserts only
+// that the 8 data bytes follow the blob to blob[30]. It does not assert the
+// rebased pointer.
 //
-// ExifTool Panasonic.pm: "Panasonic\0\0\0" prefix, IFD at offset 12,
-// "value offsets relative to b[0]".
+// ExifTool Panasonic.pm: "Panasonic\0\0\0" prefix, IFD at offset 12;
+// metadata-extractor processMakernote: offsets count from the TIFF header.
 func TestPanasonicMakerNoteOOLRoundtrip(t *testing.T) {
 	t.Parallel()
 
@@ -523,7 +529,7 @@ func TestPanasonicMakerNoteOOLRoundtrip(t *testing.T) {
 	order.PutUint16(mnBlob[ep:], 0x0001)          // arbitrary tag
 	order.PutUint16(mnBlob[ep+2:], 7)             // TypeUndefined
 	order.PutUint32(mnBlob[ep+4:], 8)             // count = 8
-	order.PutUint32(mnBlob[ep+8:], oolBlobOffset) // BLOB-RELATIVE
+	order.PutUint32(mnBlob[ep+8:], oolBlobOffset) // blob offset of the data; below the MakerNote position, so not rebased
 	// next-IFD at ep+12 = blob[26]; already zero.
 
 	copy(mnBlob[oolBlobOffset:], wantOOLValue)
@@ -533,7 +539,7 @@ func TestPanasonicMakerNoteOOLRoundtrip(t *testing.T) {
 
 	newMNAbs := findMakerNoteAbs(t, finalTIFF, order)
 
-	// Panasonic: blob-relative val_or_off is still valid after move.
+	// The out-of-line bytes are part of the blob and move with it.
 	// OOL data at blob[30] = finalTIFF[newMNAbs+30].
 	oolAbsInFinal := newMNAbs + oolBlobOffset
 	if oolAbsInFinal+8 > len(finalTIFF) {

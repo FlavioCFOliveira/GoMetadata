@@ -3656,25 +3656,25 @@ func TestParseHighOffsetIFD(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Audit finding #119 — GPS TypeSRational must be rejected
+// Audit finding #119 — GPS TypeSRational must never give a false Null Island
 // ---------------------------------------------------------------------------
 
-// TestDecodeCoordinateSRationalReturnsNotOK is the regression gate for audit
-// finding #119.
+// TestDecodeCoordinateSRationalNeverNullIsland is the regression gate for audit
+// finding #119, as revised by task #385.
 //
-// EXIF 2.32 CIPA DC-008-2023 §4.6.6 Table 15: GPSLatitude and GPSLongitude
-// must be TypeRational (unsigned). A malformed entry with TypeSRational and a
-// non-zero value must not silently produce (0,0,true) "Null Island".
-//
-// Prior to the fix, decodeCoordinate accepted TypeSRational; Rational(i) then
-// returned [0,0] for each element (wrong-type guard), so all denominators were
-// 0 and dmsToDecimal returned 0 for each component — yielding (0,0,true).
-func TestDecodeCoordinateSRationalReturnsNotOK(t *testing.T) {
+// EXIF 2.32 CIPA DC-008-2023 §4.6.6 Table 15 defines GPSLatitude and
+// GPSLongitude as RATIONAL. Before #119, decodeCoordinate accepted
+// TypeSRational and decoded it with Rational(i), which returns [0,0] for that
+// type, so a valid coordinate came back as (0,0,true) "Null Island". Since #385
+// the SRATIONAL variant that some cameras write is accepted and decoded with
+// SRational, so the same entry now gives its real value; an invalid one gives
+// ok=false. The values the entry holds must never produce (0,0,true).
+func TestDecodeCoordinateSRationalNeverNullIsland(t *testing.T) {
 	t.Parallel()
 
 	order := binary.LittleEndian
 
-	// Encode a non-zero coordinate as TypeSRational (33° 52' 0" N — Sydney).
+	// 33° 52' 0" N, 151° 12' 0" E (Sydney) as SRATIONAL latitude, RATIONAL longitude.
 	sratVal := make([]byte, 24)      // 3 × 8 bytes
 	order.PutUint32(sratVal[0:], 33) // degrees numerator
 	order.PutUint32(sratVal[4:], 1)  // degrees denominator
@@ -3683,7 +3683,6 @@ func TestDecodeCoordinateSRationalReturnsNotOK(t *testing.T) {
 	order.PutUint32(sratVal[16:], 0) // seconds numerator
 	order.PutUint32(sratVal[20:], 1) // seconds denominator
 
-	// Build a GPS IFD with TypeSRational GPSLatitude.
 	validLonVal := make([]byte, 24)
 	order.PutUint32(validLonVal[0:], 151)
 	order.PutUint32(validLonVal[4:], 1)
@@ -3703,10 +3702,14 @@ func TestDecodeCoordinateSRationalReturnsNotOK(t *testing.T) {
 	sortEntries(gpsIFD.Entries)
 
 	lat, lon, ok := parseGPS(gpsIFD)
-	if ok {
-		// A TypeSRational GPS coordinate must be treated as absent (ok=false),
-		// not as (0,0,true) — the silent Null Island result from the bug.
-		t.Errorf("parseGPS with TypeSRational GPSLatitude: got ok=true (lat=%f lon=%f), want ok=false (coordinate absent)", lat, lon)
+	if !ok {
+		t.Fatalf("parseGPS with TypeSRational GPSLatitude: ok=false, want the coordinate")
+	}
+	if lat == 0 && lon == 0 {
+		t.Fatalf("parseGPS returned the false Null Island (0,0,true) for a non-zero SRATIONAL coordinate")
+	}
+	if math.Abs(lat-(33+52.0/60)) > 1e-9 || math.Abs(lon-(151+12.0/60)) > 1e-9 {
+		t.Errorf("parseGPS = (%f, %f), want (%f, %f)", lat, lon, 33+52.0/60, 151+12.0/60)
 	}
 }
 

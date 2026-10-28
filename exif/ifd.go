@@ -2146,16 +2146,101 @@ func (ifd *IFD) Get(tag TagID) *IFDEntry {
 	return nil
 }
 
-// String decodes the entry value as a NUL-terminated string.
-// Handles TypeASCII (TIFF §2, US-ASCII) and TypeUTF8 (type 129, Exif 3.1 §4.6.2,
-// p. 28: UTF-8 encoded Unicode). Both types use element size 1 and NUL termination.
+// String decodes the entry value as a NUL-terminated string: it returns the
+// bytes before the first NUL byte.
+// Handles TypeASCII (TIFF 6.0 §2, p. 15: "ASCII ... 8-bit bytes that store
+// ASCII codes; the last byte must be NUL") and TypeUTF8 (type 129, Exif 3.1
+// §4.6.2, p. 28: UTF-8 encoded Unicode). Both types use element size 1 and
+// NUL termination.
+//
+// Bytes after the first NUL are not part of the first string: they are
+// padding or the further strings of a multi-string value (use Strings), or
+// garbage that a camera left in a fixed-size buffer (Task #386). The raw
+// bytes stay in Value, so Encode never changes. Trailing blanks are kept; they
+// are content, not a terminator.
 func (e *IFDEntry) String() string {
 	if (e.Type != TypeASCII && e.Type != TypeUTF8) || len(e.Value) == 0 {
 		return ""
 	}
-	// bytes.TrimRight avoids a byte-by-byte loop; returns a sub-slice (no allocation).
-	return string(bytes.TrimRight(e.Value, "\x00"))
+	v := e.Value
+	// bytes.IndexByte is vectorised; the slice is a sub-slice (no allocation
+	// before the string conversion).
+	if i := bytes.IndexByte(v, 0); i >= 0 {
+		v = v[:i]
+	}
+	return string(v)
 }
+
+// blanks8 is eight ASCII spaces read as a uint64, whatever the byte order.
+const blanks8 uint64 = 0x2020202020202020
+
+// blankTrimmedString is String with the trailing blanks removed. It is nil-safe
+// (a nil entry gives ""), so accessors can chain it onto IFD.Get.
+//
+// Cameras fill fixed-size text tags (Make, Model, Software, Artist, LensModel)
+// with trailing spaces, and the EXIF specification allows a writer to pad an
+// unknown value with blanks (CIPA DC-008-2026 §4.6.2, ASCII type). ExifTool
+// removes them with s/\s+$// (Exif.pm, tags 0x10F, 0x110, 0x131, 0x13B), so
+// the blanks removed are the Perl \s class: space, \t, \n, \v, \f and \r. The
+// stored bytes are never modified; only the returned string is trimmed
+// (task #401).
+func (e *IFDEntry) blankTrimmedString() string {
+	if e == nil || (e.Type != TypeASCII && e.Type != TypeUTF8) || len(e.Value) == 0 {
+		return ""
+	}
+	v := e.Value
+	if i := bytes.IndexByte(v, 0); i >= 0 {
+		v = v[:i]
+	}
+	return string(v[:trimmedLen(v)])
+}
+
+// trimmedLen returns the length of v without its trailing blanks.
+func trimmedLen(v []byte) int {
+	n := len(v)
+	for n >= 8 && binary.LittleEndian.Uint64(v[n-8:n]) == blanks8 { // eight spaces at once
+		n -= 8
+	}
+	// '\t', '\n', '\v', '\f' and '\r' are the contiguous codes 9 to 13: one
+	// unsigned comparison tests all five, which keeps a long run of padding
+	// cheap (the padded fields are 20 to 32 bytes of blanks).
+	for n > 0 && (v[n-1] == ' ' || v[n-1]-'\t' <= '\r'-'\t') {
+		n--
+	}
+	return n
+}
+
+// Strings decodes the entry value as the list of NUL-separated strings of a
+// multi-string ASCII or UTF-8 value (TIFF 6.0 §2, p. 15: an ASCII field may
+// hold several NUL-terminated strings, its Count covers all of them).
+//
+// The final NUL terminator, and any further trailing NUL padding, is not a
+// separator: "a\x00b\x00" and "a\x00b\x00\x00\x00" both give ["a", "b"].
+// A NUL between two strings that encloses nothing gives an empty string, so
+// positions are kept ("a\x00\x00b\x00" gives ["a", "", "b"]). It returns nil
+// for an entry of another type, an empty value, or a value made of NUL bytes
+// only.
+func (e *IFDEntry) Strings() []string {
+	if (e.Type != TypeASCII && e.Type != TypeUTF8) || len(e.Value) == 0 {
+		return nil
+	}
+	v := bytes.TrimRight(e.Value, "\x00")
+	if len(v) == 0 {
+		return nil
+	}
+	out := make([]string, 0, bytes.Count(v, nulSep)+1)
+	for {
+		i := bytes.IndexByte(v, 0)
+		if i < 0 {
+			return append(out, string(v))
+		}
+		out = append(out, string(v[:i]))
+		v = v[i+1:]
+	}
+}
+
+// nulSep is the one-byte NUL separator used to count the strings of Strings.
+var nulSep = []byte{0} //nolint:gochecknoglobals // immutable sentinel; avoids an allocation per call
 
 // Uint16 decodes the first SHORT (unsigned 16-bit) value.
 // Returns 0 when the entry type is not TypeShort or the value is shorter than
@@ -2416,29 +2501,30 @@ func filterEntriesInto(ifd *IFD, dst *[]IFDEntry, extraCap int, exclude ...TagID
 	}
 	// Reuse the pooled backing array.  Reset to length 0 while preserving capacity.
 	result := (*dst)[:0]
+	src := skipPaddingEntries(ifd.Entries)
 
 	// Fast path: no excluded tag present — bulk-copy all entries.
 	anyPresent := false
 	for _, tag := range exclude {
-		if hasEntry(ifd.Entries, tag) {
+		if hasEntry(src, tag) {
 			anyPresent = true
 			break
 		}
 	}
 	if !anyPresent {
 		// Ensure capacity for len+extraCap entries, then bulk-copy.
-		need := len(ifd.Entries) + extraCap
+		need := len(src) + extraCap
 		if cap(result) < need {
-			result = make([]IFDEntry, len(ifd.Entries), need)
+			result = make([]IFDEntry, len(src), need)
 		} else {
-			result = result[:len(ifd.Entries)]
+			result = result[:len(src)]
 		}
-		copy(result, ifd.Entries)
+		copy(result, src)
 		return result
 	}
 
 	// Filtered path: copy only the non-excluded entries.
-	for _, entry := range ifd.Entries {
+	for _, entry := range src {
 		if !slices.Contains(exclude, entry.Tag) {
 			result = append(result, entry)
 		}
@@ -2450,6 +2536,32 @@ func filterEntriesInto(ifd *IFD, dst *[]IFDEntry, extraCap int, exclude ...TagID
 		result = grown
 	}
 	return result
+}
+
+// skipPaddingEntries returns entries without the all-zero entries that open
+// it: tag 0, type 0, count 0 and an empty value field. Some cameras pad an IFD
+// with such an entry (the Samsung NX3000 writes one at the end of IFD0), which
+// sorts first once the entries are in tag order, and a reader that finds an
+// entry of type 0 first takes the IFD for corrupted and reads none of it
+// (ExifTool, Exif.pm ProcessExif: "assume corrupted IFD if this is our first
+// entry"; the same reader ignores the entry at the end of an IFD, "unless the
+// IFD was just padded with zeros"). TIFF 6.0 §2 lists no type 0. The entries
+// are in tag order (see hasEntry), so a padding entry can only be at the head.
+func skipPaddingEntries(entries []IFDEntry) []IFDEntry {
+	for len(entries) > 0 && entries[0].Tag == 0 && entries[0].Type == 0 && entries[0].Count == 0 && isZero(entries[0].Value) {
+		entries = entries[1:]
+	}
+	return entries
+}
+
+// isZero reports whether every byte of b is 0.
+func isZero(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // hasEntry reports whether entries contains an entry with the given tag.
@@ -2641,6 +2753,7 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 		sizeOff += uint32(total) //nolint:gosec // G115: total bounded by Count*typeSize ≤ MaxUint32 enforced by ifdTotalSize
 	}
 
+	moveKnownTypeFirst(entryBuf, 12, order, false)
 	out = append(out, entryBuf...)
 	// TIFF §2: next-IFD pointer is a 4-byte unsigned integer (0 = no next IFD).
 	out = appendUint32Order(out, order, nextIFDOffset)
@@ -2690,6 +2803,59 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 		out = append(out, 0x00)
 	}
 	return out
+}
+
+// moveKnownTypeFirst makes the first entry record of the IFD table in
+// entryBuf (records of recSize bytes: 12 for classic TIFF, 20 for BigTIFF) an
+// entry of known type, so that ExifTool reads the IFD. It moves the leading
+// records of unknown type to just after the first record of known type and
+// leaves every other record in place. It does nothing when the first record
+// is of known type or when no record is.
+//
+// A type is unknown when its element size is 0 (typeSize, typeSizeBigTIFF):
+// type 0 or a code the container does not define. TIFF 6.0 §2, p. 16 says a
+// reader should skip such a field, and ExifTool does so with a warning, except
+// when it is the first entry of the IFD: it then takes the IFD for corrupted
+// and reads none of it (ExifTool 13.55, Exif.pm ProcessExif: "assume corrupted
+// IFD if this is our first entry"). The entries are in tag order, so an entry
+// whose tag is below every valid one, such as the tag 0x0001 of type 0 that the
+// Sony DSC-HX5V holds in place of XResolution, led IFD0, and ExifTool read no
+// IFD0, ExifIFD or MakerNote from the rewritten file (task #366). Dropping the
+// entry would break V-14 (an unknown-type entry round-trips byte for byte),
+// so it is kept, out of tag order, where ExifTool only warns about it, as it
+// does for the source. Only the pooled table is permuted; the entries of the
+// caller are not touched, and the value area (pass 2) does not depend on the
+// order because an unknown type has no out-of-line value.
+//
+// References: metadata-extractor TiffReader.java (Apache-2.0): an entry whose
+// format code is invalid is skipped ("continue"), the reader goes on with the
+// next one; ExifTool Exif.pm (study and oracle only, not copied).
+func moveKnownTypeFirst(entryBuf []byte, recSize int, order binary.ByteOrder, bigTIFF bool) {
+	n := len(entryBuf) / recSize
+	if n < 2 || !unknownTypeRecord(entryBuf[2:4], order, bigTIFF) {
+		return
+	}
+	j := 1
+	for j < n && unknownTypeRecord(entryBuf[j*recSize+2:], order, bigTIFF) {
+		j++
+	}
+	if j == n {
+		return
+	}
+	var known [20]byte
+	copy(known[:recSize], entryBuf[j*recSize:])
+	copy(entryBuf[recSize:(j+1)*recSize], entryBuf[:j*recSize])
+	copy(entryBuf, known[:recSize])
+}
+
+// unknownTypeRecord reports whether the 2-byte type field at the start of b
+// holds a type of unknown element size (see moveKnownTypeFirst).
+func unknownTypeRecord(b []byte, order binary.ByteOrder, bigTIFF bool) bool {
+	t := DataType(order.Uint16(b))
+	if bigTIFF {
+		return typeSizeBigTIFF(t) == 0
+	}
+	return typeSize(t) == 0
 }
 
 // ifdWrittenLen returns the exact number of bytes writeIFD (bigTIFF false)
@@ -2894,6 +3060,7 @@ func writeIFDBigTIFF(out []byte, entries []IFDEntry, order binary.ByteOrder, sta
 		sizeOff += total
 	}
 
+	moveKnownTypeFirst(entryBuf, 20, order, true)
 	out = append(out, entryBuf...)
 	// BigTIFF spec §2: next-IFD pointer is an 8-byte unsigned integer (0 = end).
 	out = appendUint64Order(out, order, nextIFDOffset)

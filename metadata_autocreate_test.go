@@ -153,7 +153,7 @@ func TestSetKeywordsAutoCreatesComponent(t *testing.T) {
 }
 
 // TestSetKeywordsXMPOnlyWhenIPTCNotSupported verifies that SetKeywords on a
-// PNG *Metadata (which does not support IPTC) only auto-creates XMP, and that
+// PNG *Metadata (which creates no IPTC component) only auto-creates XMP, and that
 // the value survives a Write→Read round-trip via the XMP pathway.
 func TestSetKeywordsXMPOnlyWhenIPTCNotSupported(t *testing.T) {
 	t.Parallel()

@@ -62,6 +62,52 @@
 //	fmt.Println(m.CameraModel())
 //	lat, lon, ok := m.GPS()
 //
+// # Writing
+//
+// Write encodes only the metadata segments (EXIF, IPTC, XMP) that were
+// modified and copies every other segment from the image it writes, byte for
+// byte. A Read followed by a Write with no change gives back the image
+// unchanged, and a Set* method that touches only some segments leaves the
+// others as they are, with the IPTC digest of a JPEG included.
+//
+// The Set* methods mark the segments they change. An edit made through the
+// exported fields is not seen until the segment is marked with
+// [Metadata.MarkModified]:
+//
+//	m.IPTC.AddKeyword("sunset")
+//	m.MarkModified(gometadata.SegmentIPTC)
+//	err = gometadata.WriteFile("photo.jpg", m)
+//
+// A segment that Metadata holds and the image does not (for example an EXIF
+// assigned to m.EXIF after reading an image with none) is written without a
+// mark. When Write is given an image other than the one the Metadata was read
+// from, it writes every segment, so Read and Write copy the metadata of one
+// image to another.
+//
+// # MakerNote
+//
+// The MakerNote is the camera-specific block of the Exif data. [Metadata.DeleteMakerNoteTag]
+// removes a tag of it together with its value (a camera or lens serial number
+// is gone from the file), and [Metadata.SetMakerNoteTag] replaces a value with
+// one of the same size or of another size; the tag is named as exif.TagNameIn
+// names it or by its hexadecimal ID:
+//
+//	err = m.DeleteMakerNoteTag("CameraSerialNumber")
+//	err = m.SetMakerNoteTag("0x0096", "ABC123")
+//	err = gometadata.WriteFile("photo.jpg", m)
+//
+// The offsets inside the MakerNote stay valid, only the EXIF segment is
+// rewritten, and the image data is not touched. A MakerNote that cannot be
+// edited without risk to the file is refused with [ErrMakerNoteNotEditable]
+// and the reason, and the Metadata is unchanged.
+//
+// In a TIFF-based container (TIFF, DNG, CR2, NEF, ARW, ORF, RW2) the EXIF
+// directories are the structure of the file: once anything is written, the
+// directories are laid out again from the parsed EXIF and the offsets of the
+// data that follows them move, so the output is not byte-identical to the
+// source outside an unmodified write. The metadata and the image data are
+// preserved.
+//
 // # Concurrency
 //
 // The Set* methods of [Metadata] are serialised by an internal mutex, and
@@ -69,7 +115,8 @@
 // Metadata.EXIF, Metadata.IPTC and Metadata.XMP are not safe for concurrent
 // use: mutating them directly from several goroutines, bypassing the Set*
 // methods of Metadata, needs the caller's own synchronisation (see the
-// concurrency contract of [Metadata]).
+// concurrency contract of [Metadata]). [Metadata.MarkModified] is serialised
+// like the Set* methods.
 //
 // # Parsed EXIF values
 //

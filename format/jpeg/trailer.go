@@ -39,48 +39,52 @@ func startTrailerPlan(r io.ReadSeeker, w io.Writer, scratch *[]byte, newIPTC []b
 // planTrailers looks for AFCP and FotoStation trailers after the EOI marker
 // of the JPEG that r holds and returns the plan to rewrite their IPTC copies
 // with newIPTC; the plan has no spans when there is nothing to do. scratch is
-// the caller's pooled buffer. r is left at an unspecified position.
+// the caller's pooled buffer. r is left at an unspecified position, and the plan
+// reads from r when it is written, so r must stay valid until then.
+//
+// Task #393: the area after the EOI marker is not read into memory. The finders
+// search it for the signatures of the trailers with a streaming scan and read
+// only the bytes they have to inspect (trailer.PlanFromSource); the rest of the
+// area, the audio file of a Samsung trailer for example, is copied from r when
+// the plan is written. A read error while looking means a malformed trailer
+// area, which is copied unchanged, as before.
 //
 // A nil newIPTC leaves the IPTC copies as they are (as for the raw profiles
 // of PNG, task #314), but the AFCP offsets are still rewritten when the
 // trailer moves.
 func planTrailers(r io.ReadSeeker, scratch *[]byte, newIPTC []byte) (trailer.Plan, error) {
-	region, base, err := readTrailerRegion(r, scratch)
-	if err != nil || region == nil {
+	base, size, err := locateTrailerRegion(r, scratch)
+	if err != nil || size == 0 {
 		return trailer.Plan{}, err
 	}
-	return trailer.PlanFromRegion(region, base, newIPTC), nil
+	plan, perr := trailer.PlanFromSource(trailer.ReaderSource{R: r}, base, size, newIPTC)
+	if perr != nil {
+		return trailer.Plan{}, nil //nolint:nilerr // a short or failing read means a malformed trailer area: copy it unchanged
+	}
+	return plan, nil
 }
 
-// readTrailerRegion returns the bytes after the EOI marker of the JPEG in r
-// and the absolute offset of the first of them, or a nil region when there
-// are none to look at: the JPEG ends with EOI (the common case, found with
-// one seek and one two-byte read), has no EOI, or the area is larger than
-// trailer.MaxRegion.
-func readTrailerRegion(r io.ReadSeeker, scratch *[]byte) (region []byte, base int64, err error) { //nolint:gocyclo // a sequence of cheap exits, each with the reason it is not an error
+// locateTrailerRegion returns the absolute offset of the first byte after the
+// EOI marker of the JPEG in r and the number of bytes from it to the end of the
+// file, or a zero size when there are none to look at: the JPEG ends with EOI
+// (the common case, found with one seek and one two-byte read), has no EOI, or
+// the area is larger than trailer.MaxRegion.
+func locateTrailerRegion(r io.ReadSeeker, scratch *[]byte) (base, size int64, err error) {
 	// One seek finds the length and the position of the last two bytes.
 	pos, err := r.Seek(-2, io.SeekEnd)
 	if err != nil || pos < 4 {
-		return nil, 0, nil //nolint:nilerr // a stream too short to hold a trailer has none to rewrite
+		return 0, 0, nil //nolint:nilerr // a stream too short to hold a trailer has none to rewrite
 	}
-	size := pos + 2
+	fileSize := pos + 2
 	tail := (*scratch)[:2]
 	if n, _ := r.Read(tail); n == 2 && tail[0] == 0xFF && tail[1] == markerEOI {
-		return nil, 0, nil
+		return 0, 0, nil
 	}
 	eoi, err := findEOI(r, scratch)
-	if err != nil || eoi < 0 || eoi+2 >= size || size-(eoi+2) > trailer.MaxRegion {
-		return nil, 0, err
+	if err != nil || eoi < 0 || eoi+2 >= fileSize || fileSize-(eoi+2) > trailer.MaxRegion {
+		return 0, 0, err
 	}
-	base = eoi + 2
-	region = make([]byte, size-base)
-	if _, err := r.Seek(base, io.SeekStart); err != nil {
-		return nil, 0, fmt.Errorf("jpeg: seek: %w", err)
-	}
-	if _, err := io.ReadFull(r, region); err != nil {
-		return nil, 0, nil //nolint:nilerr // a short read means a malformed trailer area: copy it unchanged
-	}
-	return region, base, nil
+	return eoi + 2, fileSize - (eoi + 2), nil
 }
 
 // findEOI returns the offset of the EOI marker that ends the image data of the
@@ -147,28 +151,4 @@ func scanForEOI(r io.ReadSeeker) (int64, error) {
 			return -1, nil
 		}
 	}
-}
-
-// writeSOSTrailers is writeSOS for a JPEG with trailers to rewrite: it copies
-// the compressed data up to the end of the image, then writes the region after
-// EOI with each trailer of plan replaced by its rewritten bytes (the bytes
-// between and after them are copied as they are). w must be the writer that
-// counts the output (out), which has seen every byte of the output so far.
-func writeSOSTrailers(r io.ReadSeeker, w io.Writer, out *trailer.OutWriter, data []byte, plan *trailer.Plan) error {
-	if err := writeSegmentCopy(w, markerSOS, data); err != nil {
-		return err
-	}
-	pos, err := r.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return fmt.Errorf("jpeg: seek: %w", err)
-	}
-	if n := plan.Base - pos; n > 0 {
-		if err := iobuf.StreamCopyN(r, w, n); err != nil {
-			return fmt.Errorf("jpeg: copy image data: %w", err)
-		}
-	}
-	if err := plan.WriteRegion(w, out); err != nil {
-		return fmt.Errorf("jpeg: write trailers: %w", err)
-	}
-	return nil
 }

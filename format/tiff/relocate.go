@@ -59,12 +59,28 @@ import (
 	"sort"
 
 	"github.com/FlavioCFOliveira/GoMetadata/exif"
+	"github.com/FlavioCFOliveira/GoMetadata/internal/metaerr"
 )
+
+// errTruncatedImageData returns the public error that an image block beyond the
+// end of the file is reported as (see ErrBlockOutOfBounds).
+func errTruncatedImageData() error {
+	return &metaerr.TruncatedFileError{At: "image data (the file ends before the strips or tiles its offsets address)"}
+}
 
 // Sentinel errors for the relocate subsystem.
 var (
 	// ErrBlockOutOfBounds is returned when an image-data block offset+size
-	// exceeds the source TIFF buffer length.
+	// exceeds the source TIFF buffer length: the strips, tiles or JPEG data that
+	// StripOffsets, TileOffsets or JPEGInterchangeFormat address are not all in
+	// the file (TIFF 6.0 §3, StripOffsets: "the byte offset of each strip"; §15,
+	// TileOffsets; DNG 1.7.1.0 stores its image in tiles of a SubIFD). Such a file
+	// is truncated or was stripped of its image data (the corpus file
+	// IMG_1361.dng is 64104 bytes, its first strip starts at 64104 and its tiles
+	// lie between 5.5 MB and 28.9 MB). A copy cannot carry data the file does not
+	// hold, and an output that kept the offsets would address nothing, so the
+	// write is refused, as ExifTool does ("Error reading image data"). The error
+	// also matches *metaerr.TruncatedFileError (gometadata.TruncatedFileError).
 	ErrBlockOutOfBounds = errors.New("tiff: image block out of bounds")
 
 	// ErrUnsupportedOffsetType is returned when an offset array entry has an
@@ -323,13 +339,21 @@ type subIFDInfo struct {
 // Set* methods) should call relocateTIFFFromParsed directly to avoid the
 // redundant parse and to ensure IFD edits (copyright, GPS, etc.) are not lost.
 func relocateTIFF(base []byte, rawIPTC, rawXMP []byte) (header []byte, blocks []*imageBlock, err error) {
+	// relocateTIFF's own callers (tiff.Inject) always supply the whole file as
+	// base (see Inject's own doc comment), so fileLen == len(base) exactly.
+	return relocateTIFFPrefix(base, rawIPTC, rawXMP, uint64(len(base)))
+}
+
+// relocateTIFFPrefix is relocateTIFF for a base that is the metadata prefix of
+// a source of fileLen bytes (task #392): the IFDs and their values, as the
+// extent scanner of Extract finds them, which is all that parsing and relocating
+// read; the image blocks it enumerates are streamed from the source.
+func relocateTIFFPrefix(base []byte, rawIPTC, rawXMP []byte, fileLen uint64) (header []byte, blocks []*imageBlock, err error) {
 	e, err := exif.Parse(base)
 	if err != nil {
 		return nil, nil, fmt.Errorf("tiff: parse for relocation: %w", err)
 	}
-	// relocateTIFF's own callers (tiff.Inject) always supply the whole file as
-	// base (see Inject's own doc comment), so fileLen == len(base) exactly.
-	return relocateTIFFFromParsed(base, e, rawIPTC, rawXMP, uint64(len(base)))
+	return relocateTIFFFromParsed(base, e, rawIPTC, rawXMP, fileLen)
 }
 
 // relocateTIFFFromParsed is the implementation of the TIFF copy-and-relocate
@@ -417,6 +441,13 @@ func relocateTIFFFromParsed(base []byte, e *exif.EXIF, rawIPTC, rawXMP []byte, f
 	// preview JPEG (not the IFD1 thumbnail) and must be treated as an image block.
 	if e.IFD0 != nil {
 		e.IFD0.ThumbnailData = nil
+	}
+
+	// Step 2.6 (task #408): a Samsung MakerNote whose PreviewIFD and preview
+	// JPEG follow its declared end is extended to hold them, so that the copy of
+	// the MakerNote keeps its preview.
+	if !e.BigTIFF {
+		e.CarryMakerNoteTail(base)
 	}
 
 	// Step 3: enumerate image blocks from the IFD chain.
@@ -925,8 +956,8 @@ func extractParallelOffsetBlocks( //nolint:cyclop,gocyclo // bounds-checking on 
 		// wholeFile==true path (relocate_stream.go) and panics on
 		// `prefix[blk.srcOffset:end]` (security audit finding, 2026-09-26).
 		if !fits(off, size, fileLen) {
-			return nil, fmt.Errorf("tiff: tag 0x%04X[%d] offset=%d size=%d: %w",
-				offsetTag, i, off, size, ErrBlockOutOfBounds)
+			return nil, fmt.Errorf("tiff: tag 0x%04X[%d] offset=%d size=%d: %w: %w",
+				offsetTag, i, off, size, ErrBlockOutOfBounds, errTruncatedImageData())
 		}
 		blk.size = size
 		blocks = append(blocks, blk)
