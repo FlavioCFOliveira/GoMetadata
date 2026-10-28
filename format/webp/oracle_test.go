@@ -22,7 +22,7 @@ func oracleInject(original, rawEXIF, rawXMP []byte) ([]byte, error) {
 var _ = io.Discard
 
 func oracleBuildBody(original, rawEXIF, rawXMP []byte) *bytes.Buffer {
-	chunks, origVP8XData := oracleCollectChunks(original)
+	chunks, origVP8XData, xmpNul := oracleCollectChunks(original)
 
 	hasEXIF := rawEXIF != nil
 	hasXMP := rawXMP != nil
@@ -43,6 +43,15 @@ func oracleBuildBody(original, rawEXIF, rawXMP []byte) *bytes.Buffer {
 	if hasEXIF || hasXMP || origVP8XData != nil {
 		oracleWriteVP8X(body, chunks, hasEXIF, hasXMP, origVP8XData)
 	}
+	// Task #413: an XMP payload equal to the data of the source's "XMP\0"
+	// chunk (the one the reader uses) is copied with that FourCC, and the VP8X
+	// XMP flag of the source is kept with it.
+	keepNul := hasXMP && xmpNul.used && bytes.Equal(xmpNul.data, rawXMP)
+	if keepNul && origVP8XData != nil {
+		buf := body.Bytes()
+		const vp8xFlagsAt = 12 + 8 // RIFF header, VP8X chunk header
+		buf[vp8xFlagsAt] = buf[vp8xFlagsAt]&^vp8xFlagXMP | origVP8XData[0]&vp8xFlagXMP
+	}
 
 	// Write original image chunks.
 	for _, c := range chunks {
@@ -54,7 +63,11 @@ func oracleBuildBody(original, rawEXIF, rawXMP []byte) *bytes.Buffer {
 		writeRIFFChunk(body, fourCCEXIF, rawEXIF)
 	}
 	if hasXMP {
-		writeRIFFChunk(body, fourCCXMP, rawXMP)
+		if keepNul {
+			writeRIFFChunk(body, fourCCXMPNul, rawXMP)
+		} else {
+			writeRIFFChunk(body, fourCCXMP, rawXMP)
+		}
 	}
 
 	// Patch the RIFF size field now that the final body length is known:
@@ -64,6 +77,13 @@ func oracleBuildBody(original, rawEXIF, rawXMP []byte) *bytes.Buffer {
 	binary.LittleEndian.PutUint32(buf[4:8], uint32(len(buf)-8)) //nolint:gosec // G115: RIFF size bounded by buffer length
 
 	return body
+}
+
+// oracleXMPNul is the first "XMP\0" chunk of a source; used is false when the
+// source has none or has a standard "XMP " chunk, which the reader prefers.
+type oracleXMPNul struct {
+	data []byte
+	used bool
 }
 
 type oracleChunk struct {
@@ -76,7 +96,8 @@ type oracleChunk struct {
 // (caller rebuilds them) and returns all remaining chunks. The VP8X payload is
 // returned separately so canvas dimensions and other feature bits can be
 // preserved by buildVP8XFlags.
-func oracleCollectChunks(original []byte) (chunks []oracleChunk, origVP8XData []byte) {
+func oracleCollectChunks(original []byte) (chunks []oracleChunk, origVP8XData []byte, xmpNul oracleXMPNul) {
+	var haveNul, haveStd bool
 	pos := 12 // skip RIFF header
 	for pos+8 <= len(original) {
 		var id [4]byte
@@ -122,6 +143,13 @@ func oracleCollectChunks(original []byte) (chunks []oracleChunk, origVP8XData []
 				origVP8XData = original[dataStart:nextPos]
 			}
 		case fourCCEXIF, fourCCXMP, fourCCXMPNul:
+			if id == fourCCXMP {
+				haveStd = true
+			}
+			if id == fourCCXMPNul && !haveNul {
+				haveNul = true
+				xmpNul.data = original[dataStart:dataEnd]
+			}
 			// Drop: caller will re-append updated versions in the standard
 			// 'EXIF' and 'XMP ' chunks (RFC 9649 §2.7.1.5: at most one chunk of
 			// each type); a non-standard "XMP\0" chunk is XMP read as such (task
@@ -134,7 +162,8 @@ func oracleCollectChunks(original []byte) (chunks []oracleChunk, origVP8XData []
 			pos++ // RIFF padding byte
 		}
 	}
-	return chunks, origVP8XData
+	xmpNul.used = haveNul && !haveStd
+	return chunks, origVP8XData, xmpNul
 }
 
 func oracleWriteVP8X(body *bytes.Buffer, chunks []oracleChunk, hasEXIF, hasXMP bool, origVP8XData []byte) {

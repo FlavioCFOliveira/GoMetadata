@@ -185,8 +185,9 @@ func TestCorpus_Issue473(t *testing.T) {
 	if err := Inject(bytes.NewReader(src), &out, rawEXIF, nil, rawXMP, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
+	// The XMP is unchanged, so its "XMP\0" chunk is copied as it is (task #413).
 	cs := chunksOf(t, out.Bytes())
-	if countFourCC(cs, "EXIF") != 1 || countFourCC(cs, "XMP ") != 1 || countFourCC(cs, "XMP\x00") != 0 {
+	if countFourCC(cs, "EXIF") != 1 || countFourCC(cs, "XMP ") != 0 || countFourCC(cs, "XMP\x00") != 1 {
 		t.Errorf("chunks after the write: %v", func() []string {
 			ids := make([]string, 0, len(cs))
 			for _, c := range cs {

@@ -6,7 +6,8 @@
 //   - "EXIF": raw EXIF payload (VP8X feature bit 0x08). A leading "Exif\0\0"
 //     identifier, written by some tools, is skipped on read and never written.
 //   - "XMP ": XMP packet (VP8X feature bit 0x04). The non-standard FourCC
-//     "XMP\0" is read as XMP too and replaced by "XMP " on write.
+//     "XMP\0" is read as XMP too; a write that leaves the XMP unchanged
+//     copies that chunk as it is, one that changes the XMP writes "XMP ".
 package webp
 
 // Adapted from metadata-extractor Source/com/drew/metadata/webp/WebpRiffHandler.java:WebpRiffHandler.processChunk, Copyright 2002-2019 Drew Noakes and contributors, SPDX-License-Identifier: Apache-2.0
@@ -15,8 +16,9 @@ package webp
 // test of ExifReader.startsWithJpegExifPreamble is re-implemented in Go as
 // stripExifPreamble, applied while the chunk is read; the reference ignores a
 // chunk with the FourCC "XMP\0", which is read here as XMP, and the write path
-// that the reference does not have drops both the identifier and that FourCC
-// (task #333). See THIRD_PARTY_NOTICES.md.
+// that the reference does not have drops the identifier, and writes the
+// standard FourCC when the XMP changes (tasks #333, #413). See
+// THIRD_PARTY_NOTICES.md.
 
 import (
 	"bytes"
@@ -301,14 +303,18 @@ func Inject(r io.ReadSeeker, w io.Writer, rawEXIF, rawIPTC, rawXMP []byte, prese
 // output is the plan of the file Inject writes, made by the first pass over the
 // chunks of the source.
 type output struct {
-	size      int64 // size of the source
-	rawEXIF   []byte
-	rawXMP    []byte
-	hasEXIF   bool
-	hasXMP    bool
-	writeVP8X bool                // the output has a VP8X chunk
-	vp8x      [vp8xChunkSize]byte // its payload
-	riffSize  uint32              // the size field of the RIFF header
+	size    int64 // size of the source
+	rawEXIF []byte
+	rawXMP  []byte
+	hasEXIF bool
+	hasXMP  bool
+	// keepXMPNul is set when the XMP payload is the one of a non-standard
+	// "XMP\0" chunk of the source: the output then carries that chunk with its
+	// own FourCC instead of rewriting it as "XMP " (task #413).
+	keepXMPNul bool
+	writeVP8X  bool                // the output has a VP8X chunk
+	vp8x       [vp8xChunkSize]byte // its payload
+	riffSize   uint32              // the size field of the RIFF header
 }
 
 // planOutput makes the first pass: it measures the output and builds the VP8X
@@ -319,13 +325,8 @@ func planOutput(win *iobuf.Window, size int64, rawEXIF, rawXMP []byte) (output, 
 	if err != nil {
 		return out, fmt.Errorf("webp: read chunks: %w", err)
 	}
-	// The VP8X chunk of the output: written when EXIF or XMP is present or the
-	// source was already extended. When the source has none, it is built from
-	// the image bitstream (task #299), or from a zero canvas when no image chunk
-	// has a decodable header.
-	out.writeVP8X = out.hasEXIF || out.hasXMP || scan.haveVP8X
-	if out.writeVP8X {
-		out.vp8x = scan.vp8xPayload(out.hasEXIF, out.hasXMP)
+	if err := out.planVP8XAndXMP(win, &scan); err != nil {
+		return out, err
 	}
 
 	// RIFF size = the "WEBP" form type + every chunk of the output
@@ -345,6 +346,39 @@ func planOutput(win *iobuf.Window, size int64, rawEXIF, rawXMP []byte) (output, 
 	}
 	out.riffSize = uint32(body) //nolint:gosec // G115: body <= MaxUint32 checked above
 	return out, nil
+}
+
+// planVP8XAndXMP builds the VP8X chunk of the output and decides whether the
+// XMP payload is the one of the source's "XMP\0" chunk, which is then copied as
+// it is and not a change (task #413).
+// When the source has a VP8X chunk its XMP flag is kept too: RFC 9649 §2.7.1.5
+// defines the flag for the "XMP " chunk, which such a source does not hold, and
+// the reader of this package takes the XMP from the chunk whatever the flag
+// says. A source without a VP8X chunk gets a new one, with the flag set for the
+// chunk the output holds.
+func (o *output) planVP8XAndXMP(win *iobuf.Window, scan *originalScan) error {
+	// The VP8X chunk of the output: written when EXIF or XMP is present or the
+	// source was already extended. When the source has none, it is built from
+	// the image bitstream (task #299), or from a zero canvas when no image chunk
+	// has a decodable header.
+	o.writeVP8X = o.hasEXIF || o.hasXMP || scan.haveVP8X
+	if o.writeVP8X {
+		o.vp8x = scan.vp8xPayload(o.hasEXIF, o.hasXMP)
+	}
+	if !o.hasXMP {
+		return nil
+	}
+	keep, err := scan.sameAsXMPNul(win, o.rawXMP)
+	if err != nil {
+		return fmt.Errorf("webp: read chunk data: %w", err)
+	}
+	o.keepXMPNul = keep
+	if keep && scan.haveVP8X {
+		flags := binary.LittleEndian.Uint32(o.vp8x[0:4]) &^ vp8xFlagXMP
+		flags |= binary.LittleEndian.Uint32(scan.vp8x[0:4]) & vp8xFlagXMP
+		binary.LittleEndian.PutUint32(o.vp8x[0:4], flags)
+	}
+	return nil
 }
 
 // write makes the second pass: the RIFF header, the VP8X chunk, the chunks of
@@ -373,7 +407,11 @@ func (o *output) write(r io.ReadSeeker, w io.Writer, win *iobuf.Window) error {
 		}
 	}
 	if o.hasXMP {
-		return writeChunk(w, hdr, fourCCXMP, o.rawXMP)
+		id := fourCCXMP
+		if o.keepXMPNul {
+			id = fourCCXMPNul
+		}
+		return writeChunk(w, hdr, id, o.rawXMP)
 	}
 	return nil
 }
@@ -489,6 +527,11 @@ type originalScan struct {
 	vp8x     [vp8xChunkSize]byte
 	haveVP8X bool
 	still    stillImage
+	// xmpNul is the first non-standard "XMP\0" chunk, set when haveXMPNul;
+	// haveXMP reports a standard "XMP " chunk, which the reader prefers.
+	xmpNul     origChunk
+	haveXMPNul bool
+	haveXMP    bool
 }
 
 // scanOriginalChunks makes the first pass: it measures the chunks that stay in
@@ -507,6 +550,7 @@ func scanOriginalChunks(win *iobuf.Window, size int64, wantImage bool) (scan ori
 			}
 			continue
 		}
+		scan.noteXMP(c)
 		if isMetadataChunk(c.id) {
 			continue
 		}
@@ -522,6 +566,41 @@ func scanOriginalChunks(win *iobuf.Window, size int64, wantImage bool) (scan ori
 		}
 		scan.still.add(c.id, head, int(c.dataLen()))
 	}
+}
+
+// noteXMP records the XMP chunks of the source that sameAsXMPNul needs.
+func (s *originalScan) noteXMP(c origChunk) {
+	switch c.id {
+	case fourCCXMP:
+		s.haveXMP = true
+	case fourCCXMPNul:
+		if !s.haveXMPNul {
+			s.xmpNul, s.haveXMPNul = c, true
+		}
+	}
+}
+
+// sameAsXMPNul reports whether xmp, the XMP payload to write, is the data of
+// the "XMP\0" chunk the reader takes the XMP from: the source has no "XMP "
+// chunk (the reader prefers it) and the first "XMP\0" chunk holds exactly xmp.
+func (s *originalScan) sameAsXMPNul(win *iobuf.Window, xmp []byte) (bool, error) {
+	if !s.haveXMPNul || s.haveXMP || s.xmpNul.dataLen() != int64(len(xmp)) {
+		return false, nil
+	}
+	for pos := int64(0); pos < int64(len(xmp)); {
+		part, err := win.Peek(s.xmpNul.start+pos, len(xmp)-int(pos))
+		if err != nil {
+			return false, fmt.Errorf("webp: read XMP chunk: %w", err)
+		}
+		if len(part) == 0 {
+			return false, nil
+		}
+		if !bytes.Equal(part, xmp[pos:pos+int64(len(part))]) {
+			return false, nil
+		}
+		pos += int64(len(part))
+	}
+	return true, nil
 }
 
 // captureVP8X records the payload of the VP8X chunk c, so that the canvas

@@ -852,10 +852,29 @@ func assignItemOffsets(info ilocBoxInfo, pendingByID map[uint16]pendingPayload, 
 		}
 		off := base + accum
 		n := payload.size()
-		if !fitsIlocField(off, info.offsetSize) || !fitsIlocField(n, info.lengthSize) {
+		if !fitsIlocField(n, info.lengthSize) {
 			return 0, errIlocFieldOverflow
 		}
-		info.items[i].extents[0].offset = off
+		// ISO/IEC 14496-12 §8.11.3.3: the item data starts at
+		// base_offset + extent_offset. When the source declares a base_offset
+		// field, the absolute position is stored there with extent_offset 0,
+		// the form the source itself uses for its items. Exiv2 0.28
+		// (BmffImage::boxHandler, TAG_iloc)
+		// reads only base_offset for an 18-byte version 0 item and ignores
+		// extent_offset, so the other, equally valid split made the Exif item
+		// unreadable by Exiv2 (task #411).
+		if info.baseOffsetSize > 0 {
+			if !fitsIlocField(off, info.baseOffsetSize) {
+				return 0, errIlocFieldOverflow
+			}
+			info.items[i].baseOffset = off
+			info.items[i].extents[0].offset = 0
+		} else {
+			if !fitsIlocField(off, info.offsetSize) {
+				return 0, errIlocFieldOverflow
+			}
+			info.items[i].extents[0].offset = off
+		}
 		info.items[i].extents[0].length = n
 		accum += n
 	}
