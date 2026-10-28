@@ -68,3 +68,39 @@ var ErrBigTIFFEncodeSizeExceeded = errors.New("exif: encoded BigTIFF size exceed
 // leave pointers that no longer address their data, or let a small stream
 // grow without bound (CWE-400).
 var ErrCarriedDataTooLarge = errors.New("exif: the data referenced by the metadata is larger than the Exif block it was read from")
+
+// ErrNoMakerNote is returned by the MakerNote editing methods (DeleteMakerNoteTag,
+// SetMakerNoteTag, MakerNoteTagIDs) when the EXIF has no MakerNote, or has one
+// that the library did not parse into tags (a manufacturer layout it does not
+// read, or the SkipMakerNote option).
+var ErrNoMakerNote = errors.New("exif: the image has no MakerNote with tags to edit")
+
+// ErrMakerNoteTagNotFound is returned by the MakerNote editing methods when the
+// MakerNote has no tag of the given name or ID. A tag cannot be added to a
+// MakerNote: that would move every value behind the tag table.
+var ErrMakerNoteTagNotFound = errors.New("exif: the MakerNote has no such tag")
+
+// ErrMakerNoteNotEditable is returned by the MakerNote editing methods when the
+// edit cannot be made without risking the file. The error wraps this value with
+// the reason, which is one of: the manufacturer layout of the MakerNote is not
+// known (so the base of its offsets is not), the position of the MakerNote in
+// its file is not known, the MakerNote refers to data outside its own bytes (an
+// edited MakerNote would lose it), the edit could not be verified, or the value
+// is larger than the limit. The EXIF is left unchanged.
+var ErrMakerNoteNotEditable = errors.New("exif: this MakerNote cannot be edited safely")
+
+// ErrMakerNoteValueType is returned by SetMakerNoteTag when the value does not fit
+// the type of the tag it replaces (for example a string for a numeric tag, or an
+// integer outside the range of a SHORT).
+var ErrMakerNoteValueType = errors.New("exif: the value does not fit the type of the MakerNote tag")
+
+// ErrMakerNoteSizeChange is returned when a MakerNote value would have to change
+// size and the caller asked for a value of the same size (the FixedSize option of
+// SetMakerNoteTag).
+var ErrMakerNoteSizeChange = errors.New("exif: the new MakerNote value has a different size from the one it replaces")
+
+// ErrMakerNoteAmbiguousTag is returned by Metadata.SetMakerNoteTag when the name
+// it was given belongs to several tags of the MakerNote ("CameraSerialNumber"
+// is both tag 0x001D and tag 0x00A0 of a Nikon MakerNote): the value belongs to
+// one of them. Name the tag by its hexadecimal ID, for example "0x001D".
+var ErrMakerNoteAmbiguousTag = errors.New("exif: the name belongs to several MakerNote tags; name the tag by its ID")

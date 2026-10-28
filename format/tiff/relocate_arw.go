@@ -123,6 +123,12 @@ const (
 	// ExifTool Sony.pm: tag 0x7240, "IDC_IFD".
 	sr2TagIDCIFD = exif.TagID(0x7240)
 
+	// sr2TagDataIFD is the SR2SubIFD entry that holds the offsets of the
+	// SR2DataIFD sub-IFDs (TypeLong array; the A7M3 has 13). It is the only entry
+	// of the SR2SubIFD whose values are IFD offsets.
+	// ExifTool Sony.pm: tag 0x74c0, "SR2DataIFD" (SubIFD => 1; study only).
+	sr2TagDataIFD = exif.TagID(0x74C0)
+
 	// sr2TagSubIFDKey is the SR2 IFD entry that holds the 32-bit key used to
 	// decrypt the SR2SubIFD blob (TypeUndefined, Count=4, inline as a uint32).
 	// ExifTool Sony.pm: tag 0x7221, "SR2SubIFDKey".
@@ -591,6 +597,7 @@ func rebaseIFDInBlob(blob, rawSR2 []byte, srcOff, newOff uint32, order binary.By
 		if e+12 > len(blob) {
 			break
 		}
+		entryTag := exif.TagID(order.Uint16(blob[e:]))
 		entryType := order.Uint16(blob[e+2:])
 		entryCnt := order.Uint32(blob[e+4:])
 		sz := typeSize(entryType)
@@ -615,8 +622,13 @@ func rebaseIFDInBlob(blob, rawSR2 []byte, srcOff, newOff uint32, order binary.By
 		newVOO := newOff + relOff
 		order.PutUint32(blob[e+8:], newVOO)
 
-		if !followSubIFDs || sz != 4 {
-			continue // only TypeLong arrays may carry sub-IFD offsets
+		if !followSubIFDs || sz != 4 || entryTag != sr2TagDataIFD {
+			// Only the SR2DataIFD array holds IFD offsets (task #409). Any other
+			// LONG array holds data (tone curves, levels): a value of it that
+			// happens to fall inside the SR2 block was rebased as if it were a
+			// pointer, and the "IFD" it addressed was rebased in turn, which
+			// shifted the pointers of a real sub-IFD a second time.
+			continue
 		}
 
 		// Scan each uint32 value in the OOL array.

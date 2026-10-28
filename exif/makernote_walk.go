@@ -24,6 +24,12 @@ const (
 	nikonTagPreviewIFD = TagID(0x0011)
 	nikonTagScanIFD    = TagID(0x0E10)
 
+	// Samsung: PreviewIFD, an IFD whose offset counts from the first MakerNote
+	// byte and that follows the declared end of the note in the SRW files of the
+	// NX series, with the preview JPEG behind it (ExifTool Samsung.pm, tag 0x0035
+	// PreviewIFD, Start => $val, Base => the MakerNote; study only).
+	samsungTagPreviewIFD = TagID(0x0035)
+
 	// Ricoh: the value of this tag is "[Ricoh Camera Info]" and a version byte
 	// (20 bytes) followed by an IFD (ExifTool Ricoh.pm, 0x2001 RicohSubdir,
 	// Validate /^\[Ricoh Camera Info\]/, Start => $valuePtr + 20, big endian).
@@ -104,7 +110,70 @@ func offsetsCountFromTIFF(mn []byte, lay MakerNoteLayout, mnOff int64) bool {
 	case blob > tiff:
 		return false
 	}
+	// A tie: a big note holds every value of either reading (the Samsung SRW
+	// notes carry the preview image). The reading under which a value starts
+	// inside the entry table is the wrong one; otherwise the table decides.
+	other := lay
+	other.TIFFRelative = !lay.TIFFRelative
+	if !valuesClearTable(mn, lay, mnOff) && valuesClearTable(mn, other, mnOff) {
+		return other.TIFFRelative
+	}
 	return lay.TIFFRelative
+}
+
+// valuesAllInside reports whether every out-of-line value of the top IFD of mn
+// lies wholly inside mn when the offsets are read with the base of lay (from the
+// TIFF header, whose offset in the source stream is mnOff, or from the point
+// lay.Base of the note) and none starts inside the entry table. It is the common
+// case, and it decides
+// offsetsCountFromTIFF without its passes: the base of the table has all the
+// values inside, no other base has more, and a tie keeps the table. It takes one
+// pass and allocates nothing.
+func valuesAllInside(mn []byte, lay MakerNoteLayout, mnOff int64) bool {
+	n, ok := ifdEntryCount(mn, lay.IFDOffset, lay.ByteOrder)
+	if !ok {
+		return false
+	}
+	shift := int64(lay.Base)
+	if lay.TIFFRelative {
+		shift = -mnOff
+	}
+	tableEnd := int64(lay.IFDOffset + 2 + 12*n + 4)
+	// The byte order is tested once: a call through binary.ByteOrder per field
+	// costs more than the rest of the loop on the hot path of Parse.
+	le := lay.ByteOrder == binary.LittleEndian
+	end := int64(len(mn))
+	for i := range n {
+		ep := lay.IFDOffset + 2 + i*12
+		e := mn[ep : ep+12 : ep+12]
+		var typ uint16
+		var cnt, ptr uint32
+		if le {
+			typ, cnt, ptr = binary.LittleEndian.Uint16(e[2:]), binary.LittleEndian.Uint32(e[4:]), binary.LittleEndian.Uint32(e[8:])
+		} else {
+			typ, cnt, ptr = binary.BigEndian.Uint16(e[2:]), binary.BigEndian.Uint32(e[4:]), binary.BigEndian.Uint32(e[8:])
+		}
+		if total := int64(typeSize(DataType(typ))) * int64(cnt); total > 4 {
+			// A value that starts inside the entry table shows a wrong base (see
+			// valuesClearTable), as does one outside the note.
+			if t := int64(ptr) + shift; t < 0 || t+total > end || (t >= int64(lay.IFDOffset) && t < tableEnd) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// dataBaseIsTIFF reports whether the data decide that the offsets of the
+// MakerNote IFD of mn count from the TIFF header (true) or from the MakerNote
+// (false), given the base lay holds, the one of the layout table. It is
+// offsetsCountFromTIFF, without its passes in the common case that the table
+// base has every value inside the note.
+func dataBaseIsTIFF(mn []byte, lay MakerNoteLayout, mnOff int64) bool {
+	if valuesAllInside(mn, lay, mnOff) {
+		return lay.TIFFRelative
+	}
+	return offsetsCountFromTIFF(mn, lay, mnOff)
 }
 
 // valuesInside counts the out-of-line values of the MakerNote IFD of mn that
@@ -123,6 +192,34 @@ func valuesInside(mn []byte, lay MakerNoteLayout, tiff bool, origin int64) int {
 		}
 	})
 	return in
+}
+
+// valuesClearTable reports whether no out-of-line value of the top IFD of the
+// MakerNote mn starts inside the entry table of that IFD, reading the offsets as
+// lay says (TIFF 6.0 §2: the values of an IFD are stored apart from its entries;
+// a value that starts among the entries shows a base that is wrong). A value
+// that lies outside the MakerNote is not inside the table.
+func valuesClearTable(mn []byte, lay MakerNoteLayout, mnOff int64) bool {
+	n, ok := ifdEntryCount(mn, lay.IFDOffset, lay.ByteOrder)
+	if !ok {
+		return false
+	}
+	tableStart, tableEnd := int64(lay.IFDOffset), int64(lay.IFDOffset+2+12*n+4)
+	origin := mnOff
+	if lay.TIFFRelative {
+		origin = pointerOrigin(mn, lay, mnOff)
+	}
+	clean := true
+	eachOOL(mn, lay, func(ptr, _ int64) {
+		t := ptr + int64(lay.Base)
+		if lay.TIFFRelative {
+			t = ptr - origin
+		}
+		if t >= tableStart && t < tableEnd {
+			clean = false
+		}
+	})
+	return clean
 }
 
 // pointerOrigin returns the TIFF offset that the TIFF-relative pointers of the
@@ -212,7 +309,9 @@ type mnWalker struct {
 	nikon   bool // a Nikon note: Type 1, 2 (headerless) or 3
 	olympus bool
 	ricoh   bool
+	samsung bool // a Samsung note: its PreviewIFD (tag 0x0035) follows the declared end of the note (SRW)
 	noCarry bool // the pointers are inconsistent: carry nothing from outside
+	lost    int  // pointers that address data outside the blob and were left as they are (makernote_edit.go tests it to be 0)
 	fixes   []mnFix
 	carried map[[2]int64]int // source range -> position in buf, so one value is carried once
 }
@@ -230,6 +329,7 @@ func (w *mnWalker) init(mn []byte, lay MakerNoteLayout, mnOff int64) {
 		nikon:   lay.layout == mnNikon1 || lay.layout == mnNikon2 || lay.layout == mnNikon3,
 		olympus: lay.layout == mnOlympusOld || lay.layout == mnOlympus || lay.layout == mnOMSystem || lay.layout == mnOlympusMake,
 		ricoh:   lay.layout == mnRicoh || lay.layout == mnRicohMake,
+		samsung: lay.layout == mnSamsung,
 	}
 	w.origin = mnOff
 	if lay.TIFFRelative {
@@ -266,6 +366,8 @@ func (w *mnWalker) isSubIFDTag(tag TagID) bool {
 		}
 	case w.ricoh:
 		return tag == ricohTagSubdir
+	case w.samsung:
+		return tag == samsungTagPreviewIFD
 	}
 	return false
 }
@@ -315,7 +417,7 @@ func (w *mnWalker) entry(e mnEntry, depth int, pair *jpegPair) {
 		w.valueEntry(e, depth)
 	case depth == 0 && w.isSubIFDTag(e.tag) && e.cnt == 1 && (e.typ == TypeLong || e.typ == TypeIFD):
 		w.subIFD(e.field, depth)
-	case w.nikon && depth > 0:
+	case (w.nikon || w.samsung) && depth > 0:
 		w.jpegEntry(e, pair)
 	}
 }
@@ -362,6 +464,7 @@ func (w *mnWalker) walkValueIFD(loc, depth int) {
 func (w *mnWalker) ref(field int, total int64) (int, bool) {
 	target := w.targetOf(int64(w.order.Uint32(w.buf[field:])))
 	if w.tiffRel && target < 0 {
+		w.lost++
 		return 0, false // before the MakerNote: a stale or zero pointer, left as it is
 	}
 	if target >= 0 && target+total <= int64(w.origLen) {
@@ -377,12 +480,14 @@ func (w *mnWalker) ref(field int, total int64) (int, bool) {
 			w.point(field, int(target))
 			return int(target), true
 		}
+		w.lost++
 		return 0, false
 	}
 	if loc, ok := w.carry(target, total); ok {
 		w.point(field, loc)
 		return loc, true
 	}
+	w.lost++
 	return 0, false
 }
 
@@ -400,6 +505,7 @@ func (w *mnWalker) subIFD(field, depth int) {
 	case w.src != nil && target >= 0 && w.mnOff+target+2 <= int64(len(w.src)):
 		n = int64(w.order.Uint16(w.src[w.mnOff+target:]))
 	default:
+		w.lost++
 		return
 	}
 	span := 2 + 12*n + 4 // TIFF 6.0 §2: count, entries, next-IFD offset
@@ -411,7 +517,9 @@ func (w *mnWalker) subIFD(field, depth int) {
 	if loc, ok := w.carry(target, span); ok {
 		w.point(field, loc)
 		w.walkIFD(loc, depth+1)
+		return
 	}
+	w.lost++
 }
 
 // carry copies total bytes that lie at offset target of the MakerNote (outside

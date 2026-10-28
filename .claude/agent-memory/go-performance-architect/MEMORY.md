@@ -1,5 +1,6 @@
 # Memory Index
 
+- [Sprint 51 B MakerNote edit (2026-10-28)](project_sprint51_makernote_edit.md) — #407 Canon shifted base read; #398/#399 byte-level delete/set/grow, verify-or-refuse; ExifTool gap warning, Nikon key, traps
 - [Sprint 50 #390-#393 streaming writes (2026-10-27)](project_sprint50_390_393_streaming_write.md) — HEIF/WebP/ORF/RW2/JPEG-trailer copy from the ReadSeeker; iobuf CopyRange/Window/IndexRange; oracle+differential method; traps
 - [Task #389 compact TIFF Read (2026-10-27)](project_task389_compact_tiff_read.md) — compacted stream + restore, fallback on warnings, verification harness method, traps
 - [Sprint 49 #400-#403 (2026-10-27)](project_sprint49_400_403_splice_write.md) — JPEG/PNG splice write, GPS zero denominator, trimmed EXIF text; traps: test-only min shadow, StreamCopyN 512 B growth, PNG nil-EXIF drop bug

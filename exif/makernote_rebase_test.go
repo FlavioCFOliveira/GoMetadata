@@ -334,7 +334,7 @@ func TestMakerNoteRebase_R24_TheDataDecidesTheBase(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if l, _ := e.MakerNoteLayout(); l.TIFFRelative {
+		if l, _ := makerNoteLayoutOf(e.MakerNote, []byte("SANYO"), le); l.TIFFRelative {
 			t.Fatal("fixture: the table must say blob-relative for Sanyo")
 		}
 		out, err := EncodeRebased(e, tiff)
@@ -358,7 +358,7 @@ func TestMakerNoteRebase_R24_TheDataDecidesTheBase(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if l, _ := e.MakerNoteLayout(); !l.TIFFRelative {
+		if l, _ := makerNoteLayoutOf(e.MakerNote, []byte("SAMSUNG"), le); !l.TIFFRelative {
 			t.Fatal("fixture: the table must say TIFF-relative for Samsung")
 		}
 		out, err := EncodeRebased(e, tiff)

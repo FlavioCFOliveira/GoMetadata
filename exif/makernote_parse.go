@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"math"
 	"strings"
+	"sync"
 )
 
 // parseMakerNoteIFD attempts to parse the raw MakerNote bytes into an IFD.
@@ -126,7 +127,95 @@ func makerNoteDispatchAt(makeValue []byte, parentOrder binary.ByteOrder, makerNo
 	if parse == nil {
 		return nil
 	}
-	return parse(makerNoteView(l, makerNote, tiff, mnOff), parentOrder)
+	if l == mnKyocera {
+		// Task #412: the pointers of a Kyocera note count from their own entries
+		// (makernote_kyocera_base.go).
+		if c, ok := kyoceraRebasedCopy(makerNote, parentOrder); ok {
+			return parse(blobView(c), parentOrder)
+		}
+	}
+	if tiff == nil || mnOff == 0 {
+		return parse(blobView(makerNote), parentOrder)
+	}
+	if l == mnCanon {
+		// Task #407: a Canon note that was moved without updating its pointers
+		// is read against the base its footer names (makernote_canon_base.go).
+		if c, ok := canonRebasedCopy(makerNote, parentOrder, mnOff); ok {
+			return parse(blobView(c), parentOrder)
+		}
+	}
+	return dispatchResolved(l, makerNote, tiff, mnOff, parentOrder)
+}
+
+// dispatchResolved parses the MakerNote of layout l read from tiff at mnOff with
+// the offset base the data decide (task #412), the base the writers and the
+// MakerNote editor use (dataBaseIsTIFF), and not the one of the layout table.
+//
+// The note is parsed once with the base of the table, which records where its
+// IFD is. When every out-of-line value lies inside the note under that base,
+// which is the case of a note that the table describes, the result stands: no
+// other base has more values inside, and a tie keeps the table. Otherwise the
+// note is parsed again with the other base, when the data prefer it and it
+// explains the note (valuesClearTable): the Sanyo S1 keeps offsets that are off
+// by a constant (ExifTool repairs them with a Sanyo-specific FixOffsets), and
+// reading them from either base would return bytes that are not the values,
+// where the table base returns no value at all. A layout the table gives no IFD,
+// Nikon Type 3, whose offsets always count from its embedded TIFF header, and
+// Kyocera, whose offsets count from their own entries, keep the table.
+func dispatchResolved(l mnLayout, makerNote, tiff []byte, mnOff uint64, parentOrder binary.ByteOrder) *IFD {
+	f := &mnLayouts[l]
+	v := makerNoteView(f.base, makerNote, tiff, mnOff)
+	if l == mnNikon3 || l == mnKyocera || f.base == mnBaseNone || (f.base == mnBaseTIFF && v.at == 0) {
+		return f.parse(v, parentOrder) // nothing to decide: the table base is the only one
+	}
+	loc := getLoc()
+	loc.build = true
+	v.loc = loc
+	ifd := f.parse(v, parentOrder)
+	lay := MakerNoteLayout{IFDOffset: loc.off, ByteOrder: loc.order, TIFFRelative: f.base == mnBaseTIFF, layout: l}
+	putLoc(loc)
+	if ifd == nil || lay.ByteOrder == nil || valuesAllInside(makerNote, lay, int64(mnOff)) { //nolint:gosec // G115: a classic TIFF offset, below 2^32
+		return ifd
+	}
+	return reparseOtherBase(ifd, f.parse, lay, makerNote, tiff, mnOff, parentOrder)
+}
+
+// reparseOtherBase is the slow path of dispatchResolved: the note read as ifd
+// with the base of lay (the table's) has a value outside the note or on its entry
+// table. It returns ifd when the data keep that base or the other one does not
+// explain the note, and the note parsed again with the other base otherwise.
+func reparseOtherBase(ifd *IFD, parse makerNoteParserFunc, lay MakerNoteLayout, makerNote, tiff []byte, mnOff uint64, parentOrder binary.ByteOrder) *IFD {
+	if offsetsCountFromTIFF(makerNote, lay, int64(mnOff)) == lay.TIFFRelative { //nolint:gosec // G115: a classic TIFF offset, below 2^32
+		return ifd // the data keep the table
+	}
+	lay.TIFFRelative = !lay.TIFFRelative
+	if !valuesClearTable(makerNote, lay, int64(mnOff)) { //nolint:gosec // G115: a classic TIFF offset, below 2^32
+		return ifd
+	}
+	base := mnBaseBlob
+	if lay.TIFFRelative {
+		base = mnBaseTIFF
+	}
+	return parse(makerNoteView(base, makerNote, tiff, mnOff), parentOrder)
+}
+
+// locPool recycles the position records of the MakerNote parsers; a pointer
+// that goes through an indirect call escapes, so a local record would allocate.
+var locPool = sync.Pool{New: func() any { return new(mnLoc) }} //nolint:gochecknoglobals // pool of scratch records
+
+// getLoc returns a zeroed record from locPool.
+func getLoc() *mnLoc {
+	if l, ok := locPool.Get().(*mnLoc); ok {
+		*l = mnLoc{}
+		return l
+	}
+	return new(mnLoc)
+}
+
+// putLoc returns l to locPool.
+func putLoc(l *mnLoc) {
+	*l = mnLoc{}
+	locPool.Put(l)
 }
 
 // trimMake cuts a raw Make value at its first NUL byte (matching
@@ -140,11 +229,11 @@ func trimMake(makeValue []byte) []byte {
 	return bytes.TrimSpace(makeValue)
 }
 
-// makerNoteView returns the view layout l parses: the TIFF stream as base for
-// a TIFF-relative layout when tiff[mnOff:] holds makerNote, the MakerNote
-// alone otherwise.
-func makerNoteView(l mnLayout, makerNote, tiff []byte, mnOff uint64) mnView {
-	if mnLayouts[l].base == mnBaseTIFF && mnOff > 0 && len(makerNote) > 0 &&
+// makerNoteView returns the view a layout parser reads: the TIFF stream as base
+// for a TIFF-relative note (base is mnBaseTIFF) when tiff[mnOff:] holds
+// makerNote, the MakerNote alone otherwise.
+func makerNoteView(base mnBase, makerNote, tiff []byte, mnOff uint64) mnView {
+	if base == mnBaseTIFF && mnOff > 0 && len(makerNote) > 0 &&
 		mnOff <= uint64(len(tiff)) && uint64(len(makerNote)) <= uint64(len(tiff))-mnOff &&
 		&tiff[mnOff] == &makerNote[0] {
 		return mnView{base: tiff, at: int(mnOff), n: len(makerNote)} //nolint:gosec // G115: mnOff <= len(tiff)
@@ -187,9 +276,13 @@ type MakerNoteLayout struct {
 // reported as a TIFF-relative IFD at offset 0 in the TIFF byte order: the
 // layout ExifTool assumes for unknown MakerNotes (MakerNotes.pm,
 // MakerNoteUnknown: an IFD with the default, TIFF-header base) and the one of
-// most signature-less vendors (Canon, Sony, Samsung, Casio). ok is false when
-// e has no MakerNote, when the MakerNote is not an IFD layout, or when its IFD
-// cannot be parsed. It parses the MakerNote once and does not modify e.
+// most signature-less vendors (Canon, Sony, Samsung, Casio). TIFFRelative is
+// the base the data decide when e knows where the MakerNote was in the stream
+// it was parsed from (a Samsung SRW whose offsets count from the MakerNote
+// although the table of layouts says the TIFF header, task #408), and the base
+// of the table when it does not. ok is false when e has no MakerNote, when the
+// MakerNote is not an IFD layout, or when its IFD cannot be parsed. It parses
+// the MakerNote once and does not modify e.
 func (e *EXIF) MakerNoteLayout() (layout MakerNoteLayout, ok bool) {
 	if e == nil || len(e.MakerNote) == 0 {
 		return MakerNoteLayout{}, false
@@ -200,44 +293,52 @@ func (e *EXIF) MakerNoteLayout() (layout MakerNoteLayout, ok bool) {
 			makeValue = me.Value
 		}
 	}
-	order := e.ByteOrder
-	if order == nil {
-		order = binary.LittleEndian
+	if e.BigTIFF {
+		return makerNoteLayoutOf(e.MakerNote, trimMake(makeValue), e.ifd0ByteOrder())
 	}
-	return makerNoteLayoutOf(e.MakerNote, trimMake(makeValue), order)
+	layout, _, ok = resolveMakerNote(e, e.MakerNote, trimMake(makeValue))
+	return layout, ok
 }
 
 // makerNoteLayoutOf is MakerNoteLayout for the MakerNote bytes mn of a camera
 // of Make mk (already trimmed) in a stream of byte order order.
 func makerNoteLayoutOf(mn, mk []byte, order binary.ByteOrder) (MakerNoteLayout, bool) {
-	loc, base, l, ok := probeMakerNote(mn, mk, order)
+	return layoutOf(detectLayout(mn, mk), mn, order)
+}
+
+// layoutOf is makerNoteLayoutOf for the detected layout l.
+func layoutOf(l mnLayout, mn []byte, order binary.ByteOrder) (MakerNoteLayout, bool) {
+	loc := getLoc()
+	base, ok := probeLayout(l, mn, order, loc)
 	if !ok {
+		putLoc(loc)
 		return MakerNoteLayout{}, false
 	}
 	lay := MakerNoteLayout{IFDOffset: loc.off, ByteOrder: loc.order, TIFFRelative: base == mnBaseTIFF, layout: l}
 	if !lay.TIFFRelative {
 		lay.Base = loc.base
 	}
+	putLoc(loc)
 	return lay, true
 }
 
-// probeMakerNote parses mn on its own bytes as Parse would for a camera of
-// Make mk and returns where its IFD was found and its offset base; an
-// undetected MakerNote holding a plausible IFD at offset 0 is reported as
-// TIFF-relative (see MakerNoteLayout).
-func probeMakerNote(mn, mk []byte, order binary.ByteOrder) (loc mnLoc, base mnBase, l mnLayout, ok bool) {
-	l = detectLayout(mn, mk)
-	f := mnLayouts[l]
+// probeLayout parses mn on its own bytes as Parse would for the detected layout
+// l, records in loc where its IFD was found, and returns its offset base; an undetected
+// MakerNote holding a plausible IFD at offset 0 is reported as TIFF-relative
+// (see MakerNoteLayout).
+func probeLayout(l mnLayout, mn []byte, order binary.ByteOrder, loc *mnLoc) (base mnBase, ok bool) {
+	f := &mnLayouts[l]
+	base = f.base
 	v := blobView(mn)
-	v.loc = &loc
+	v.loc = loc
 	switch {
 	case l == mnNone:
 		if parsePlausibleIFD(v, order) == nil {
-			return loc, 0, l, false
+			return 0, false
 		}
-		f.base = mnBaseTIFF
+		base = mnBaseTIFF
 	case f.parse == nil || f.base == mnBaseNone:
-		return loc, 0, l, false
+		return 0, false
 	case f.parse(v, order) == nil:
 		// A layout the Make selects for a plain IFD at offset 0 whose parser
 		// declines it is still an IFD of the TIFF byte order whose offsets
@@ -245,11 +346,11 @@ func probeMakerNote(mn, mk []byte, order binary.ByteOrder) (loc mnLoc, base mnBa
 		// an unidentified note. Only the repair of a moved MakerNote uses this;
 		// Parse still reports no MakerNote IFD for it.
 		if f.ifdOffset != 0 || parsePlausibleIFD(v, order) == nil {
-			return loc, 0, l, false
+			return 0, false
 		}
-		f.base = mnBaseTIFF
+		base = mnBaseTIFF
 	}
-	return loc, f.base, l, loc.order != nil
+	return base, loc.order != nil
 }
 
 // mnView is the MakerNote handed to a layout parser: its bytes, and the
@@ -282,7 +383,8 @@ type mnView struct {
 type mnLoc struct {
 	off   int
 	order binary.ByteOrder
-	base  int // offset of the origin of the value offsets, when it is inside the MakerNote
+	base  int  // offset of the origin of the value offsets, when it is inside the MakerNote
+	build bool // the parser builds the IFD, besides recording its position (dispatchResolved)
 }
 
 // blobView returns the view of a MakerNote parsed on its own bytes: value
@@ -298,7 +400,8 @@ var probeIFD = &IFD{} //nolint:gochecknoglobals // read-only sentinel
 
 // ifdAt parses the IFD that starts off bytes into the MakerNote, with value
 // offsets resolved against v.base. The IFD entry count must lie inside the
-// MakerNote. It records the position and byte order in v.loc on success.
+// MakerNote. It records the position and byte order in v.loc on success; a
+// probe (loc set, build not) records them and does not build the IFD.
 //
 // Byte order: an entry count above 255 whose low byte, read in order, is
 // zero is taken as a byte-swapped count and the other byte order is used,
@@ -319,7 +422,7 @@ func (v mnView) ifdAt(off int, order binary.ByteOrder) *IFD {
 	if start > math.MaxUint32 {
 		return nil
 	}
-	if v.loc != nil {
+	if v.loc != nil && !v.loc.build {
 		// Probe: accept exactly when traverse would (parseSingleIFD rejects an
 		// IFD whose first entry does not fit) without building the IFD.
 		if count > 0 && uint64(len(v.base))-start-2 < 12 {
@@ -331,6 +434,9 @@ func (v mnView) ifdAt(off int, order binary.ByteOrder) *IFD {
 	ifd, _, err := traverse(v.base, uint32(start), order, nil, false)
 	if err != nil {
 		return nil
+	}
+	if v.loc != nil { // build mode: record the position of the IFD that was read
+		v.loc.off, v.loc.order = off, order
 	}
 	return ifd
 }

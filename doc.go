@@ -84,6 +84,23 @@
 // from, it writes every segment, so Read and Write copy the metadata of one
 // image to another.
 //
+// # MakerNote
+//
+// The MakerNote is the camera-specific block of the Exif data. [Metadata.DeleteMakerNoteTag]
+// removes a tag of it together with its value (a camera or lens serial number
+// is gone from the file), and [Metadata.SetMakerNoteTag] replaces a value with
+// one of the same size or of another size; the tag is named as exif.TagNameIn
+// names it or by its hexadecimal ID:
+//
+//	err = m.DeleteMakerNoteTag("CameraSerialNumber")
+//	err = m.SetMakerNoteTag("0x0096", "ABC123")
+//	err = gometadata.WriteFile("photo.jpg", m)
+//
+// The offsets inside the MakerNote stay valid, only the EXIF segment is
+// rewritten, and the image data is not touched. A MakerNote that cannot be
+// edited without risk to the file is refused with [ErrMakerNoteNotEditable]
+// and the reason, and the Metadata is unchanged.
+//
 // In a TIFF-based container (TIFF, DNG, CR2, NEF, ARW, ORF, RW2) the EXIF
 // directories are the structure of the file: once anything is written, the
 // directories are laid out again from the parsed EXIF and the offsets of the
