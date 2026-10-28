@@ -631,21 +631,30 @@ func (m *Metadata) FocalLength() (float64, bool) {
 
 // LensModel returns the lens model string.
 // Source priority: EXIF (tag 0xA434) > XMP aux:Lens > XMP exifEX:LensModel
-// (the XMP Toolkit mapping of tag 0xA434).
+// (the XMP Toolkit mapping of tag 0xA434) > the MakerNote lens description.
+//
+// The MakerNote is the last resort, for files whose EXIF and XMP name no
+// lens: a Canon MakerNote gives the lens model the camera wrote, a Nikon
+// MakerNote gives the lens specification ("18-55mm f/3.5-5.6", see
+// exif.EXIF.MakerNoteLens). It is never used when another source has a value,
+// so a file that had a lens model before still returns the same one. The
+// fallback is not available when the MakerNote is not parsed (SkipMakerNote).
 func (m *Metadata) LensModel() string {
 	if m.EXIF != nil {
 		if v := m.EXIF.LensModel(); v != "" {
 			return v
 		}
 	}
-	if m.XMP == nil {
-		return ""
+	if m.XMP != nil {
+		if v := m.XMP.LensModel(); v != "" {
+			return v
+		}
+		p := &reconcile.Lookup(reconcile.LensModel).XMP[1]
+		if v := m.XMP.Get(p.NS, p.Name); v != "" {
+			return v
+		}
 	}
-	if v := m.XMP.LensModel(); v != "" {
-		return v
-	}
-	p := &reconcile.Lookup(reconcile.LensModel).XMP[1]
-	return m.XMP.Get(p.NS, p.Name)
+	return m.EXIF.MakerNoteLens()
 }
 
 // Orientation returns the image orientation (1–8 per EXIF §4.6.4).
