@@ -147,6 +147,12 @@ func chainEntries(e *EXIF, ifd *IFD) chainBlocks {
 	return cb
 }
 
+// isUncarriedStrip reports whether tag is StripOffsets or StripByteCounts of an
+// ifd whose strips were not carried (SubIFDs.stripsNotCarried): Encode omits it.
+func isUncarriedStrip(ifd *IFD, tag TagID) bool {
+	return ifd.Sub != nil && ifd.Sub.stripsNotCarried && (tag == TagStripOffsets || tag == TagStripByteCounts)
+}
+
 // chainBaseEntries copies the entries of ifd without its pointer tags (they
 // are re-added when they have a target), and gives the thumbnail tags their
 // 4-byte placeholder values, patched once the position is known (Exif 3.1
@@ -156,6 +162,9 @@ func chainEntries(e *EXIF, ifd *IFD) chainBlocks {
 func chainBaseEntries(ifd *IFD) []IFDEntry {
 	entries := make([]IFDEntry, 0, len(ifd.Entries)+2)
 	for _, ent := range ifd.Entries {
+		if isUncarriedStrip(ifd, ent.Tag) {
+			continue
+		}
 		if !slices.Contains(chainPointerTags[:], ent.Tag) {
 			entries = append(entries, ent)
 		}
