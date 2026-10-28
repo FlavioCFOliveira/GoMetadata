@@ -329,6 +329,11 @@ func FuzzTrailers(f *testing.F) {
 	f.Add(append(bytes.Clone(seedSam), afcpOf(binary.BigEndian, "AXS!", int64(len(probe)+len(seedSam)), [][2]string{{"IPTC", string(oldIIM)}})...))
 	seedAudioAFCP := afcpOf(binary.BigEndian, "AXS!", int64(len(probe)), [][2]string{{"IPTC", string(oldIIM)}})
 	f.Add(append(bytes.Clone(seedAudioAFCP), samsungOf(int64(len(probe)), seedAudioAFCP)[len(seedAudioAFCP):]...))
+	// Task #417: signature candidates that are not trailers, and a chain of short
+	// FotoStation records.
+	f.Add(bytes.Repeat([]byte("AXSA"), 1024))
+	f.Add(bytes.Repeat([]byte("QDIOBS"), 1024))
+	f.Add(bytes.Repeat([]byte("\x00\x01\x00\x00\x00\x0a\xa1\xb2\xc3\xd4"), 512))
 	f.Fuzz(func(t *testing.T, tail []byte) {
 		src := jpegWithTail(tail)
 		var out bytes.Buffer

@@ -7,6 +7,10 @@ package trailer
 // file. A read that falls outside the region the finders look at is the same
 // as the bytes not being there: the candidate is rejected, as the bounds checks
 // of the in-memory implementation rejected it.
+//
+// Each finder reads the region once, forward (Source.IndexEach), whatever the
+// number of candidates it holds: a read for each candidate made a region of
+// short ones quadratic (task #417).
 
 import (
 	"bytes"
@@ -14,6 +18,9 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sync"
+
+	"github.com/FlavioCFOliveira/GoMetadata/internal/iobuf"
 )
 
 // view is the part [base, end) of a Source that the finders look at.
@@ -35,16 +42,39 @@ func (v view[S]) at(off, n int64) ([]byte, bool, error) {
 	return b, true, nil
 }
 
-// index returns the offset of the first occurrence of pat at or after from
-// inside the view, or -1.
-func (v view[S]) index(from int64, pat []byte) (int64, error) {
+// indexEach is Source.IndexEach for the part of the Source that the view holds:
+// the search starts at the base of the view, or at from when that is later.
+func (v view[S]) indexEach(from int64, pat []byte, behind, ahead int, vis iobuf.ScanVisitor) error {
 	if from < v.base {
 		from = v.base
 	}
 	if v.end-from < int64(len(pat)) {
-		return -1, nil
+		return nil
 	}
-	return v.src.Index(from, v.end, pat)
+	return v.src.IndexEach(from, v.end, pat, behind, ahead, vis)
+}
+
+// indexEachBytes is Source.IndexEach over b, whose first byte is at the
+// absolute offset base: bytes.Index from each starting point, the reference that
+// iobuf.ScanRange follows.
+func indexEachBytes(b []byte, base, from, to int64, pat []byte, behind, ahead int, vis iobuf.ScanVisitor) error {
+	for searchAt := from; searchAt < to && to-searchAt >= int64(len(pat)); {
+		i := bytes.Index(b[searchAt-base:to-base], pat)
+		if i < 0 {
+			return nil
+		}
+		at := searchAt + int64(i)
+		var win []byte
+		if at-int64(behind) >= from && at+int64(ahead) <= to {
+			win = b[at-int64(behind)-base : at+int64(ahead)-base]
+		}
+		next, err := vis.Visit(at, win)
+		if err != nil || next < 0 {
+			return err
+		}
+		searchAt = max(next, at+1)
+	}
+	return nil
 }
 
 // regionSource is a Source over a region held in memory that starts at the
@@ -59,13 +89,9 @@ func (r regionSource) Range(off, n int64) ([]byte, error) {
 	return r.b[off-r.base : off-r.base+n : off-r.base+n], nil
 }
 
-// Index implements Source.
-func (r regionSource) Index(from, to int64, pat []byte) (int64, error) {
-	i := bytes.Index(r.b[from-r.base:to-r.base], pat)
-	if i < 0 {
-		return -1, nil
-	}
-	return from + int64(i), nil
+// IndexEach implements Source.
+func (r regionSource) IndexEach(from, to int64, pat []byte, behind, ahead int, vis iobuf.ScanVisitor) error {
+	return indexEachBytes(r.b, r.base, from, to, pat, behind, ahead, vis)
 }
 
 // CopyRange implements Source.
@@ -83,42 +109,51 @@ type afcpSig struct {
 	kind byte
 }
 
-// collectAFCPSigs appends to dst the AFCP signatures of the view in ascending
-// order of offset. It returns nil when there are more than cap(dst); a
-// non-nil dst[:0] therefore always yields a non-nil result.
-func collectAFCPSigs[S Source](dst []afcpSig, v view[S]) ([]afcpSig, error) {
-	sigs := dst[:0]
-	from := v.base
-	for from < v.end {
-		at, err := v.index(from, afcpSigPrefix)
-		if err != nil {
-			return nil, err
-		}
-		if at < 0 {
-			break
-		}
-		from = at + 1
-		quad, ok, err := v.at(at, 4)
-		if err != nil {
-			return nil, err
-		}
-		if !ok || (quad[3] != '!' && quad[3] != '*') {
-			continue
-		}
-		if len(sigs) == cap(sigs) {
-			return nil, nil
-		}
-		sigs = append(sigs, afcpSig{at: at, kind: quad[3]})
-		from = at + 4 // a signature cannot overlap another one
+// afcpScan is the state of the search for the AFCP signatures of a view. It is
+// pooled: the search allocates nothing in the usual case (task #417).
+type afcpScan struct {
+	buf  [maxAFCPSignatures]afcpSig
+	sigs []afcpSig
+	over bool // there are more signatures than buf holds
+}
+
+var afcpScanPool = sync.Pool{New: func() any { return new(afcpScan) }} //nolint:gochecknoglobals // pool of scan states
+
+// Visit implements iobuf.ScanVisitor for an "AXS" candidate: quad is the
+// candidate and the byte that follows it, nil when that is outside the view.
+func (st *afcpScan) Visit(at int64, quad []byte) (int64, error) {
+	if len(quad) < 4 || (quad[3] != '!' && quad[3] != '*') {
+		return at + 1, nil
 	}
-	return sigs, nil
+	if len(st.sigs) == cap(st.sigs) {
+		st.over = true
+		return -1, nil
+	}
+	st.sigs = append(st.sigs, afcpSig{at: at, kind: quad[3]})
+	return at + 4, nil // a signature cannot overlap another one
+}
+
+// collectAFCPSigs returns, with the state st, the AFCP signatures of the view in ascending order of offset,
+// valid until st is reused. It returns nil when there are more than
+// maxAFCPSignatures; the result of a search that finds none is not nil.
+//
+// The view is scanned once (task #417): a candidate "AXS" that is not followed
+// by '!' or '*' costs the bytes it covers, not a read of its own, so a region
+// made of such candidates is linear in its size.
+func collectAFCPSigs[S Source](st *afcpScan, v view[S]) ([]afcpSig, error) {
+	st.sigs, st.over = st.buf[:0], false
+	if err := v.indexEach(v.base, afcpSigPrefix, 0, 4, st); err != nil || st.over {
+		return nil, err
+	}
+	return st.sigs, nil
 }
 
 // scanAFCP returns the AFCP trailer of the view and whether there is one: see
 // FindAFCP.
 func scanAFCP[S Source](v view[S]) (t *AFCP, found bool, err error) {
-	var buf [maxAFCPSignatures]afcpSig
-	sigs, err := collectAFCPSigs(buf[:0], v)
+	st := afcpScanPool.Get().(*afcpScan) //nolint:forcetypeassert,revive // the pool holds only *afcpScan
+	defer afcpScanPool.Put(st)
+	sigs, err := collectAFCPSigs(st, v)
 	if err != nil || sigs == nil {
 		return nil, false, err // more than maxAFCPSignatures signatures: see the constant
 	}
@@ -235,49 +270,64 @@ func findEOFRecord[S Source](v view[S], t *AFCP, dataEnd int64, later []afcpSig)
 	return 0, false, nil
 }
 
-// scanFotoStation returns the FotoStation records that follow each other from
-// the absolute offset from, and the range they cover: see FindFotoStation.
-func scanFotoStation[S Source](v view[S], from int64) (recs []FotoRecord, start, end int64, err error) {
-	cur := from
-	for cur >= v.base && cur <= v.end {
-		rec, next, ok, err := nextFotoRecord(v, cur)
-		if err != nil {
-			return nil, 0, 0, err
-		}
-		if !ok {
-			break
-		}
-		recs = append(recs, rec)
-		cur = next
-	}
-	if len(recs) == 0 {
-		return nil, 0, 0, nil
-	}
-	return recs, from, cur, nil
+// fotoScan is the state of the walk along the FotoStation records of a view.
+// It is pooled (task #417).
+type fotoScan struct {
+	cur     int64        // where the record being looked for starts
+	recs    []FotoRecord // the records found
+	footers []int64      // offset of the footer of each record
 }
 
-// nextFotoRecord returns the FotoStation record that starts at the absolute
-// offset cur and the offset where the next one starts. A record is found by its
-// footer, the first signature at or after cur.
-func nextFotoRecord[S Source](v view[S], cur int64) (rec FotoRecord, next int64, ok bool, err error) {
-	at, err := v.index(cur, fotoSig)
-	if err != nil || at < 0 || at-cur < 6 {
-		return rec, 0, false, err
+var fotoScanPool = sync.Pool{New: func() any { return new(fotoScan) }} //nolint:gochecknoglobals // pool of scan states
+
+// Visit implements iobuf.ScanVisitor for a FotoStation signature: win is the
+// footer (tag, size) and the signature that ends it.
+func (st *fotoScan) Visit(at int64, win []byte) (int64, error) {
+	if win == nil || at-st.cur < 6 {
+		return -1, nil
 	}
 	footer := at - 6
-	foot, _, err := v.at(footer, 6)
+	size := int64(binary.BigEndian.Uint32(win[2:]))
+	if size < 10 || footer+10-size != st.cur {
+		return -1, nil
+	}
+	st.recs = append(st.recs, FotoRecord{Tag: binary.BigEndian.Uint16(win)})
+	st.footers = append(st.footers, footer)
+	st.cur = footer + 10
+	return st.cur, nil
+}
+
+// scanFotoStation returns the FotoStation records that follow each other from
+// the absolute offset from, and the range they cover: see FindFotoStation.
+//
+// A record is found by its footer, the first signature at or after the end of
+// the previous record, so the chain is one forward pass over the view (task
+// #417: a read per record is quadratic when the records are short). The pass
+// takes the tag and the size from the bytes around each signature; the data of
+// the records, which is contiguous, is then read once.
+func scanFotoStation[S Source](v view[S], from int64) (recs []FotoRecord, start, end int64, err error) {
+	if from < v.base || from > v.end {
+		return nil, 0, 0, nil
+	}
+	st := fotoScanPool.Get().(*fotoScan) //nolint:forcetypeassert,revive // the pool holds only *fotoScan
+	defer func() {
+		st.recs, st.footers = nil, st.footers[:0] // the records belong to the caller
+		fotoScanPool.Put(st)
+	}()
+	st.cur, st.recs, st.footers = from, nil, st.footers[:0]
+	if err = v.indexEach(from, fotoSig, 6, len(fotoSig), st); err != nil || len(st.recs) == 0 {
+		return nil, 0, 0, err
+	}
+	blob, _, err := v.at(from, st.cur-from) // inside the view: every footer is
 	if err != nil {
-		return rec, 0, false, err
+		return nil, 0, 0, err
 	}
-	size := int64(binary.BigEndian.Uint32(foot[2:]))
-	if size < 10 || footer+10-size != cur {
-		return rec, 0, false, nil
+	rs := from
+	for i, footer := range st.footers {
+		st.recs[i].Data = blob[rs-from : footer-from : footer-from]
+		rs = footer + 10
 	}
-	data, _, err := v.at(cur, footer-cur)
-	if err != nil {
-		return rec, 0, false, err
-	}
-	return FotoRecord{Tag: binary.BigEndian.Uint16(foot), Data: data}, footer + 10, true, nil
+	return st.recs, from, st.cur, nil
 }
 
 // scanSamsungQDIO returns the span of the two absolute audio offsets of the
@@ -289,51 +339,104 @@ func nextFotoRecord[S Source](v view[S], cur int64) (rec FotoRecord, next int64,
 // only when the audio file lies in the view (at or after its base, before the
 // QDIO block), as it does in a file written by the camera: anything else is not
 // understood and is left alone.
+//
+// The view is scanned once (task #417): the checks that need only the bytes
+// around the signature run during the scan, and the one read that does not (the
+// head of the directory block) runs afterwards for the candidates that passed
+// them, newest first, so a region of signatures costs time proportional to its
+// size. Only the last maxSamsungCandidates candidates are kept: a file that
+// has more block-shaped candidates than that is not one a camera wrote, and its
+// last valid block is looked for among the newest of them.
 func scanSamsungQDIO[S Source](v view[S]) (sp Span, audioStart int64, ok bool, err error) {
-	for from := v.base; ; {
-		q, err := v.index(from, samsungQDIOSig) // offset of the type field of the QDIO block
+	st := samsungScanPool.Get().(*samsungScan) //nolint:forcetypeassert,revive // the pool holds only *samsungScan
+	defer samsungScanPool.Put(st)
+	st.base, st.cands, st.total = v.base, st.cands[:0], 0
+	if scanErr := v.indexEach(v.base, samsungQDIOSig, samsungQDIOBlockLen+4, len(samsungQDIOSig), st); scanErr != nil {
+		return sp, audioStart, false, scanErr
+	}
+	for i := st.total - 1; i >= 0 && i >= st.total-maxSamsungCandidates; i-- {
+		c := st.cands[i%maxSamsungCandidates]
+		head, inView, err := v.at(c.blockStart-8-c.dirLen, 4)
 		if err != nil {
 			return sp, audioStart, false, err
 		}
-		if q < 0 {
-			return sp, audioStart, ok, nil
-		}
-		from = q + 1
-		cand, start, valid, err := samsungSpanAt(v, q)
-		if err != nil {
-			return sp, audioStart, false, err
-		}
-		if valid {
-			sp, audioStart, ok = cand, start, true
+		if inView && bytes.Equal(head, samsungSEFH) {
+			return samsungSpan(c.blockStart+samsungOffsetsAt, c.start, c.end), c.start, true, nil
 		}
 	}
+	return sp, audioStart, false, nil
 }
 
-// samsungSpanAt validates the QDIO block whose type field starts at the
-// absolute offset q and returns the span of its audio offsets and the start of
-// the audio file.
-func samsungSpanAt[S Source](v view[S], q int64) (sp Span, audioStart int64, ok bool, err error) {
+// samsungScan is the state of the search for the QDIO blocks of a view. It is
+// pooled (task #417).
+type samsungScan struct {
+	base  int64         // the base of the view
+	cands []samsungCand // the candidates, the newest overwriting the oldest once there are maxSamsungCandidates
+	total int           // the candidates found
+}
+
+var samsungScanPool = sync.Pool{New: func() any { return new(samsungScan) }} //nolint:gochecknoglobals // pool of scan states
+
+// Visit implements iobuf.ScanVisitor for a "QDIOBS" signature at q, with the
+// window that samsungCandidateAt takes.
+func (st *samsungScan) Visit(q int64, win []byte) (int64, error) {
+	if c, valid := samsungCandidateAt(st.base, q, win); valid {
+		if len(st.cands) < maxSamsungCandidates {
+			st.cands = append(st.cands, c)
+		} else {
+			st.cands[st.total%maxSamsungCandidates] = c
+		}
+		st.total++
+	}
+	return q + 1, nil
+}
+
+// maxSamsungCandidates bounds the QDIO block candidates that scanSamsungQDIO
+// keeps for the final check.
+const maxSamsungCandidates = 256
+
+// samsungCand is a candidate QDIO block that passed the checks of
+// samsungCandidateAt.
+type samsungCand struct {
+	blockStart int64 // start of the QDIO data
+	dirLen     int64 // length of the directory block
+	start, end int64 // the audio file
+}
+
+// samsungCandidateAt checks the QDIO block whose type field starts at the
+// absolute offset q against the layout of the package comment, using win, the
+// bytes from 8 before the QDIO data to the end of the signature (the length of
+// the directory block and its type, the QDIO data, and the type of the QDIO
+// block), or nil when they are not all inside the view that starts at base.
+// Only the read of the head of the directory block is left to the caller.
+func samsungCandidateAt(base, q int64, win []byte) (samsungCand, bool) {
 	blockStart := q - samsungQDIOBlockLen + 4 // start of the QDIO data
-	if blockStart < v.base+12 || q+int64(len(samsungQDIOSig)) > v.end {
-		return Span{}, 0, false, nil
+	if win == nil || blockStart < base+12 || !samsungWindowValid(win, q, blockStart) {
+		return samsungCand{}, false
 	}
-	// The bytes from 8 before the QDIO data to the end of the signature: the
-	// length of the directory block and its type, the QDIO data, and the type
-	// of the QDIO block.
-	win, ok, err := v.at(blockStart-8, q+int64(len(samsungQDIOSig))-(blockStart-8))
-	if err != nil || !ok {
-		return Span{}, 0, false, err
-	}
-	if ok, err = samsungBlocksValid(v, win, blockStart, q); err != nil || !ok {
-		return Span{}, 0, false, err
+	le := binary.LittleEndian
+	dirLen := int64(le.Uint32(win))
+	rel := blockStart - base // blockStart relative to the view, as the in-memory region was indexed
+	if dirLen < 12 || dirLen > rel-8 {
+		return samsungCand{}, false
 	}
 	data := win[8 : 8+samsungQDIODataLen]
-	start := int64(binary.LittleEndian.Uint32(data[samsungOffsetsAt:]))
-	end := int64(binary.LittleEndian.Uint32(data[samsungOffsetsAt+4:]))
-	if start < v.base || end < start || end > blockStart {
-		return Span{}, 0, false, nil
+	start := int64(le.Uint32(data[samsungOffsetsAt:]))
+	end := int64(le.Uint32(data[samsungOffsetsAt+4:]))
+	if start < base || end < start || end > blockStart {
+		return samsungCand{}, false
 	}
-	return samsungSpan(blockStart+samsungOffsetsAt, start, end), start, true, nil
+	return samsungCand{blockStart: blockStart, dirLen: dirLen, start: start, end: end}, true
+}
+
+// samsungWindowValid reports whether win (see samsungCandidateAt) holds a QDIO
+// block of the layout of the package comment, preceded by the type of a
+// directory block ("SEFT").
+func samsungWindowValid(win []byte, q, blockStart int64) bool {
+	qdio := win[8:] // the QDIO data and the type field of the block
+	return string(qdio[:4]) == "QDIO" &&
+		binary.LittleEndian.Uint32(win[q-4-(blockStart-8):]) == samsungQDIODataLen &&
+		bytes.Equal(win[4:8], samsungSEFT)
 }
 
 // samsungSpan returns the span of the two absolute audio offsets, which are at
@@ -355,29 +458,4 @@ func samsungSpan(spanStart, start, end int64) Span {
 		le.PutUint32(b[4:], uint32(ne)) //nolint:gosec // G115: bounded by the check above
 		return b[:], true, nil
 	}}
-}
-
-// samsungBlocksValid reports whether the QDIO block with its data at blockStart
-// and its type field at q has the layout of the package comment, and follows a
-// directory block ("SEFT", whose data starts with "SEFH"). win holds the bytes
-// from blockStart-8 to the end of the QDIO signature.
-func samsungBlocksValid[S Source](v view[S], win []byte, blockStart, q int64) (bool, error) {
-	le := binary.LittleEndian
-	qdio := win[8:] // the QDIO data and the type field of the block
-	if string(qdio[:4]) != "QDIO" || le.Uint32(win[q-4-(blockStart-8):]) != samsungQDIODataLen {
-		return false, nil
-	}
-	if !bytes.Equal(win[4:8], samsungSEFT) {
-		return false, nil
-	}
-	dirLen := int64(le.Uint32(win))
-	rel := blockStart - v.base // blockStart relative to the view, as the in-memory region was indexed
-	if dirLen < 12 || dirLen > rel-8 {
-		return false, nil
-	}
-	head, ok, err := v.at(blockStart-8-dirLen, 4)
-	if err != nil || !ok {
-		return false, err
-	}
-	return bytes.Equal(head, samsungSEFH), nil
 }
