@@ -204,7 +204,8 @@ linters:
     exhaustive:
       default-signifies-exhaustive: true
       # TagID has ~130 hex constants; switches are intentionally partial.
-      ignore-enum-types: "exif.TagID"
+      ignore-types:
+        - "exif.TagID"
 
     gocyclo:
       min-complexity: 10

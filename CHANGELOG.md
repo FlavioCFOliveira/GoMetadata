@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-10-28
+
+### Fixed
+
+- **CI** (`.github/workflows/ci.yml`): the workflow also runs on `develop` and on manual dispatch; every job runs on `ubuntu-24.04`; only the lint job saves the `setup-go` cache, and the other jobs keep a per-job `actions/cache` entry, so parallel jobs no longer fail to reserve the same cache key; actions updated to `actions/checkout` v7.0.1, `actions/setup-go` v7.0.0, `golangci/golangci-lint-action` v9.3.0 (golangci-lint v2.15.0) and `codecov/codecov-action` v7.1.1. The Go version stays 1.26 (`go-version-file: go.mod`).
+- **Lint** (`.golangci.yml`, `format/heif/security_audit_v150_test.go`): the `exhaustive` option `ignore-enum-types` is replaced by `ignore-types`, and the test that waits on `patchAncestorSize` handles the received error. No library behaviour changes.
+
 ## [1.5.0] - 2026-10-17
 
 ### Added
