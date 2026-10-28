@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"math"
 	"os"
@@ -26,7 +27,7 @@ import (
 func corpusFiles(t *testing.T, dir string, exts ...string) []string {
 	t.Helper()
 	root := filepath.Join("testdata", "corpus", dir)
-	if _, err := os.Stat(root); os.IsNotExist(err) {
+	if _, err := os.Stat(root); errors.Is(err, fs.ErrNotExist) {
 		t.Skipf("corpus absent (run testdata/download.sh): %s", root)
 	}
 	var files []string
@@ -337,7 +338,7 @@ func TestTask403_PNG_M6GrowsByIEND(t *testing.T) {
 	t.Parallel()
 	const f = "testdata/corpus/png/metadata-extractor/m6-1f97f040d0b6b26faeb0a1a7f1499590.png"
 	data, err := os.ReadFile(f)
-	if os.IsNotExist(err) {
+	if errors.Is(err, fs.ErrNotExist) {
 		t.Skipf("corpus file absent (run testdata/download.sh): %s", f)
 	}
 	if err != nil {
@@ -474,7 +475,7 @@ func TestTask401_Corpus_NamedFiles(t *testing.T) {
 		{"testdata/corpus/heif/exiv2/Stonehenge.heic", (*Metadata).Software, "Ver.1.00"},
 	} {
 		m, err := ReadFile(tc.file)
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			t.Skipf("corpus file absent (run testdata/download.sh): %s", tc.file)
 		}
 		if err != nil {
@@ -486,7 +487,7 @@ func TestTask401_Corpus_NamedFiles(t *testing.T) {
 	}
 	const f = "testdata/corpus/jpeg/exif-samples/32-lens_data.jpeg"
 	m, err := ReadFile(f)
-	if os.IsNotExist(err) {
+	if errors.Is(err, fs.ErrNotExist) {
 		t.Skipf("corpus file absent (run testdata/download.sh): %s", f)
 	}
 	if err != nil {
