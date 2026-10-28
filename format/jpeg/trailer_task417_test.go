@@ -9,16 +9,21 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
-// countingSeeker counts the reads and the seeks of a source.
+// countingSeeker counts the reads, the bytes read and the seeks of a source.
 type countingSeeker struct {
 	r            io.ReadSeeker
 	reads, seeks int
+	bytes        int64
 }
 
-func (c *countingSeeker) Read(p []byte) (int, error) { c.reads++; return c.r.Read(p) } //nolint:wrapcheck // a test double: the error is the reader's
+func (c *countingSeeker) Read(p []byte) (int, error) {
+	c.reads++
+	n, err := c.r.Read(p)
+	c.bytes += int64(n)
+	return n, err //nolint:wrapcheck // a test double: the error is the reader's
+}
 func (c *countingSeeker) Seek(off int64, whence int) (int64, error) {
 	c.seeks++
 	return c.r.Seek(off, whence) //nolint:wrapcheck // a test double: the error is the seeker's
@@ -27,10 +32,12 @@ func (c *countingSeeker) Seek(off int64, whence int) (int64, error) {
 // TestInject_R417_TrailerCandidatesAreLinear: TRAILER-STREAM-05. Inject of a
 // JPEG with 4 MiB of AFCP prefixes that are not signatures ("AXSA"), of Samsung
 // signatures that are not blocks ("QDIOBS"), and of FotoStation records, reads
-// the area a bounded number of times, copies it unchanged, and takes well under
-// a second (v1.5.2: 58 ms for 16 MiB; the first streaming write: 9 s for
-// 16 MiB held in memory and 20 s from a file). The number of reads is the
-// measure that is not affected by the machine or the race detector.
+// the area a bounded number of times, and copies it unchanged (v1.5.2: 58 ms for
+// 16 MiB; the first streaming write: 9 s for 16 MiB held in memory and 20 s from
+// a file). The test counts reads, seeks and bytes read, which do not depend on
+// the speed of the machine, its load or the race detector; a wall-clock bound
+// failed under CPU contention with -race (task #419). A quadratic scan shows as
+// a count of reads and bytes that grows with the square of the area.
 func TestInject_R417_TrailerCandidatesAreLinear(t *testing.T) {
 	t.Parallel()
 	const size = 4 << 20
@@ -54,12 +61,12 @@ func TestInject_R417_TrailerCandidatesAreLinear(t *testing.T) {
 		for label, r := range map[string]io.ReadSeeker{"file": f, "memory": bytes.NewReader(src)} {
 			cr := &countingSeeker{r: r}
 			var out bytes.Buffer
-			start := time.Now()
 			if err := Inject(cr, &out, nil, newIIM, nil, true); err != nil {
 				t.Fatalf("%s/%s: Inject: %v", name, label, err)
 			}
-			if d := time.Since(start); d > time.Second {
-				t.Errorf("%s/%s: Inject of %d bytes took %v", name, label, len(src), d)
+			// Measured: 4.01x (the scan passes and the copy); a quadratic scan reads orders of magnitude more.
+			if cr.bytes > 8*int64(len(src)) {
+				t.Errorf("%s/%s: %d bytes read for a source of %d, want at most 8x", name, label, cr.bytes, len(src))
 			}
 			if limit := 16 * (size/(32<<10) + 16); cr.reads > limit || cr.seeks > limit {
 				t.Errorf("%s/%s: %d reads and %d seeks, want at most %d of each", name, label, cr.reads, cr.seeks, limit)

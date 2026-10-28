@@ -12,7 +12,6 @@ import (
 	"io"
 	"math/rand/v2"
 	"testing"
-	"time"
 )
 
 // countingReader counts the reads and the seeks that a source costs.
@@ -34,10 +33,10 @@ func repeatTo(unit string, size int) []byte {
 
 // TestScanRegion_R417_Linear: TRAILER-STREAM-03. A region of candidates that
 // are not trailers is planned with a number of reads and seeks proportional to
-// its size (never one per candidate), and quickly. The number of reads is the
-// measure that holds under the race detector and on a loaded machine; the time
-// bound is a generous second, against the 9 to 20 seconds that a read per
-// candidate took for 16 MiB.
+// its size (never one per candidate). The number of reads and seeks is the
+// measure that holds under the race detector and on a loaded machine; a read per
+// candidate took 9 to 20 seconds for 16 MiB. There is no wall-clock bound: it
+// failed under CPU contention with -race (task #419).
 func TestScanRegion_R417_Linear(t *testing.T) {
 	t.Parallel()
 	const size = 4 << 20
@@ -51,12 +50,8 @@ func TestScanRegion_R417_Linear(t *testing.T) {
 	for name, unit := range units {
 		file := repeatTo(unit, size)
 		cr := &countingReader{r: bytes.NewReader(file)}
-		start := time.Now()
 		if _, err := PlanFromSource(ReaderSource{R: cr}, 0, int64(len(file)), newIIM); err != nil {
 			t.Fatalf("%s: %v", name, err)
-		}
-		if d := time.Since(start); d > time.Second {
-			t.Errorf("%s: planning %d bytes took %v", name, len(file), d)
 		}
 		// Each pass over the region reads it in buffers of 32 KiB or more; a few
 		// passes (AFCP, FotoStation twice, Samsung, and the one read of a chain).

@@ -120,12 +120,12 @@ func noteEntries(tb testing.TB, e *EXIF) []topEntry {
 
 // dupBudget is the time that the edit of a table of 20,000 repeated tags may take
 // (task #416). Linear in the table it takes a few milliseconds, and quadratic
-// 20 seconds; the bound is far above the first, so that the race detector and a
-// busy machine cannot trip it, and far below the second, so that the quadratic
-// cost cannot pass. An absolute bound is used instead of the ratio between two
+// 20 seconds (more under the race detector); the bound is 1000 times the first,
+// so that the race detector and a busy machine cannot trip it (a one-second bound
+// did, task #419), and below the second, so that the quadratic cost cannot pass. An absolute bound is used instead of the ratio between two
 // sizes because the ratio of two timings of a few milliseconds is the noisier
 // of the two.
-const dupBudget = time.Second
+const dupBudget = 10 * time.Second
 
 // TestMakerNoteEdit_R416_RepeatedTagIsLinear: the deletion and the replacement of
 // 20,000 entries of one tag complete within dupBudget, for values that are inline,
