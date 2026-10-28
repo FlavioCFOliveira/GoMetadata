@@ -2434,3 +2434,51 @@ func TestHEIFInjectPatchAncestorSizeOverflow(t *testing.T) {
 		}
 	})
 }
+
+// TestTask415_ExifItemShorterThanTIFFHeader: an Exif item must hold the 4-byte
+// exif_tiff_header_offset and then a TIFF header of 8 bytes (ISO/IEC 23008-12
+// Annex A.2.1; TIFF 6.0 §2). A shorter remainder is not an Exif payload:
+// extractExifFromData returns nil, the same degradation as for a prefix that
+// points outside the item (fuzz seed testdata/fuzz/FuzzHEIFExtract/
+// 22d8cc09c6c5dd0d returned 2 bytes as EXIF).
+func TestTask415_ExifItemShorterThanTIFFHeader(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		prefix uint32
+		tail   int // bytes after the prefix
+		want   int // expected length of the result, -1 for nil
+	}{
+		{"empty remainder", 0, 0, -1},
+		{"2-byte remainder", 0, 2, -1},
+		{"7-byte remainder", 0, 7, -1},
+		{"8-byte remainder", 0, 8, 8},
+		{"prefix leaves 7 bytes", 5, 12, -1},
+		{"prefix leaves 8 bytes", 4, 12, 8},
+		{"prefix beyond the item", 100, 12, -1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			data := make([]byte, 4+tc.tail)
+			binary.BigEndian.PutUint32(data, tc.prefix)
+			got := extractExifFromData(data)
+			if tc.want < 0 {
+				if got != nil {
+					t.Errorf("got %d bytes, want nil", len(got))
+				}
+				return
+			}
+			if len(got) != tc.want {
+				t.Errorf("got %d bytes, want %d", len(got), tc.want)
+			}
+		})
+	}
+
+	// The fuzz seed through Extract: no EXIF, no error.
+	seed := []byte("\x00\x00\x00ameta0000\x00\x00\x00#iinf\x0000000\x00\x00\x00\x15infe\x02000\x00\x0100Exif0\x00\x00\x000iloc\x00000\b\x00\x000\x00\x01\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x007\x00\x00\x00\x00\x00\x00\x000000000000000")
+	rawEXIF, _, _, err := Extract(bytes.NewReader(seed))
+	if err == nil && rawEXIF != nil {
+		t.Errorf("Extract returned %d bytes of EXIF for an Exif item shorter than a TIFF header", len(rawEXIF))
+	}
+}

@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-10-28
+
+### Fixed
+
+- **EXIF thumbnail strips** (`exif/thumbnail_strips.go`, `exif/chain.go`, #414): with `CarryThumbnailStrips`, an IFD of the chain whose StripOffsets strips could not be carried kept its source offsets, and `Encode` wrote them unchanged; they then addressed unrelated bytes of the written stream, and a `Parse` of the output carried those bytes as strips (4 strips before the round trip, 8 after). `Encode` now omits StripOffsets and StripByteCounts of such an IFD, so the strips are identical after a round trip. Found by `FuzzParseEXIF`.
+- **HEIF/AVIF Exif item** (`format/heif/heif.go`, #415): `Extract` returned the remainder of an Exif item as EXIF even when it was shorter than a TIFF header (2 bytes in the fuzz seed). An Exif item that does not hold the 4-byte `exif_tiff_header_offset` and 8 bytes of TIFF header (ISO/IEC 23008-12 Annex A.2.1) now yields no EXIF, like an offset that points outside the item. Found by `FuzzHEIFExtract`.
+
 ## [1.5.1] - 2026-10-28
 
 ### Fixed
