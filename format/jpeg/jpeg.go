@@ -49,7 +49,7 @@ var identExif = []byte("Exif\x00\x00") //nolint:gochecknoglobals // package-leve
 var identXMP = []byte("http://ns.adobe.com/xap/1.0/\x00") //nolint:gochecknoglobals // package-level constant bytes
 
 // identXMPNote is the NUL-terminated APP1 segment identifier for extended XMP
-// chunks. Adobe XMP Specification Part 3 §1.1.4.
+// chunks. Adobe XMP Specification Part 3 §1.1.3.1.
 //
 // NOTE: this is the APP1 segment identifier ("http://ns.adobe.com/xmp/extension/\x00"),
 // which is distinct from the xmpNote namespace URI (xmp.NSxmpNote,
@@ -74,13 +74,13 @@ var identPS = []byte("Photoshop 3.0\x00") //nolint:gochecknoglobals // package-l
 // conforming reader accepts. The reader applies no such limit: it accepts the
 // packet of any APP1 segment, so files written with up to 65504 bytes still
 // read.
-// maxExtChunkSize: max chunk data per extended XMP APP1 (Adobe XMP Spec Part 3 §1.1.4).
+// maxExtChunkSize: max chunk data per extended XMP APP1 (Adobe XMP Spec Part 3 §1.1.3.1).
 //
 //	Extended APP1 layout: identXMPNote(35) + GUID(32) + fullLen(4) + offset(4) + chunk
 //	Overhead = 35 + 32 + 4 + 4 = 75 bytes → chunk data ≤ 65533 − 75 = 65458 bytes.
 //
 // maxExtendedXMPTotal: aggregate cap on all extended XMP chunk bytes accumulated
-// for a single GUID during parsing. Adobe XMP Specification Part 3 §1.1.4 allows
+// for a single GUID during parsing. Adobe XMP Specification Part 3 §1.1.3.1 allows
 // an extended XMP document up to 2^32−1 bytes on wire, but accepting that from an
 // untrusted JPEG stream would allow a ~268 MiB memory exhaustion attack (#40).
 // 16 MiB is generous for any real-world extended XMP use (Google Cardboard depth
@@ -104,7 +104,7 @@ const (
 // xmpWireMagic is the 8-byte magic that identifies an XMP wire-frame payload.
 //
 // A wire-frame payload is an internal encoding used when a JPEG carries
-// extended XMP (Adobe XMP Specification Part 3 §1.1.4). It carries the
+// extended XMP (Adobe XMP Specification Part 3 §1.1.3.1). It carries the
 // ORIGINAL main XMP APP1 content and the ASSEMBLED extended XMP payload as a
 // single byte slice that can be passed through the rawXMP channel without
 // changing any public interface.
@@ -217,7 +217,7 @@ func resolveKeptExtended(r io.ReadSeeker, scratch *[]byte, rawXMP []byte) (xmp [
 }
 
 // hasExtendedSegment reports whether the JPEG in r has an extended XMP APP1
-// segment (Part 3 §1.1.4) whose GUID is guid, before its image data. r is left
+// segment (Part 3 §1.1.3.1) whose GUID is guid, before its image data. r is left
 // at an unspecified position. err is non-nil only for a Seek failure or
 // ErrFileTooLarge.
 func hasExtendedSegment(r io.ReadSeeker, scratch *[]byte, guid string) (bool, error) {
@@ -253,7 +253,7 @@ func isExtendedSegmentOf(marker byte, data []byte, guid string) bool {
 }
 
 // extChunk holds one chunk of an extended XMP segment.
-// Adobe XMP Specification Part 3 §1.1.4.
+// Adobe XMP Specification Part 3 §1.1.3.1.
 type extChunk struct {
 	offset uint32
 	data   []byte
@@ -297,7 +297,7 @@ func processAPP1Segment(data, rawEXIF, rawXMP []byte, acc *extAcc) (newEXIF, new
 
 	case bytes.HasPrefix(data, identXMPNote):
 		// Extended XMP chunk: GUID (32 bytes) + fullLength (4 bytes) +
-		// offset (4 bytes) + chunk data. Adobe XMP Spec Part 3 §1.1.4.
+		// offset (4 bytes) + chunk data. Adobe XMP Spec Part 3 §1.1.3.1.
 		if body := data[len(identXMPNote):]; len(body) >= 40 {
 			acc.add(body)
 		}
@@ -372,7 +372,7 @@ func buildXMPResult(rawXMP []byte, acc *extAcc, wantXMP bool) xmpResult {
 
 	// #135: canonicalize the GUID from the main packet to uppercase so it
 	// matches the normalised keys stored by extAcc.add.
-	// Adobe XMP Specification Part 3 §1.1.4: GUID is 32 uppercase hex chars.
+	// Adobe XMP Specification Part 3 §1.1.3.1: GUID is 32 uppercase hex chars.
 	guid = strings.ToUpper(guid)
 
 	g := acc.guids[guid]
@@ -385,7 +385,7 @@ func buildXMPResult(rawXMP []byte, acc *extAcc, wantXMP bool) xmpResult {
 	}
 
 	// #122: validate chunk layout before assembling. Adobe XMP Specification
-	// Part 3 §1.1.4: chunks must cover [0, fullLen) contiguously with no gaps,
+	// Part 3 §1.1.3.1: chunks must cover [0, fullLen) contiguously with no gaps,
 	// overlaps, or duplicated offsets. On any violation degrade gracefully to
 	// the main (standard) XMP packet and mark truncated.
 	extBytes, valid := g.assemble()
@@ -507,7 +507,7 @@ func readSOI(soi []byte) error {
 // byte-for-byte (CLAUDE.md §5).
 func scanMetadataSegmentsWithWire(r io.Reader, src io.Seeker, scratchPtr *[]byte, wantIPTC, wantXMP bool) (rawEXIF, rawIPTC, iptcDigest []byte, xmp xmpResult, err error) { //nolint:gocyclo // the stop on a failed size query of the source (task #394) adds one decision to a linear segment loop
 	// acc collects the chunks of extended XMP APP1 segments, keyed by GUID.
-	// Adobe XMP Specification Part 3 §1.1.4. Its zero value allocates nothing:
+	// Adobe XMP Specification Part 3 §1.1.3.1. Its zero value allocates nothing:
 	// most JPEGs do not contain extended XMP, so the fast path pays only for
 	// the struct itself. acc.truncated is set when any GUID's payload was
 	// capped or invalid; the per-GUID byte totals enforce the #40 DoS cap and
@@ -925,7 +925,7 @@ func writeRawXMPSegment(w io.Writer, main []byte) error {
 }
 
 // writeExtendedChunks splits ext into extended APP1 chunks and writes them.
-// guid must be exactly 32 ASCII hex characters (per Adobe XMP Spec Part 3 §1.1.4).
+// guid must be exactly 32 ASCII hex characters (per Adobe XMP Spec Part 3 §1.1.3.1).
 func writeExtendedChunks(w io.Writer, guidBytes, ext []byte) error {
 	fullLen := uint32(len(ext)) //nolint:gosec // G115: XMP payload size bounded by input
 	offset := uint32(0)
@@ -1706,7 +1706,7 @@ func writeHeaderedBuf(w io.Writer, marker byte, bufPtr *[]byte) error {
 
 // isAllHex reports whether b consists entirely of ASCII hex digits (0-9, a-f, A-F).
 // Used to validate the 32-character GUID in extended XMP APP1 segments.
-// Adobe XMP Specification Part 3 §1.1.4: GUID is a 32-character uppercase hex string.
+// Adobe XMP Specification Part 3 §1.1.3.1: GUID is a 32-character uppercase hex string.
 func isAllHex(b []byte) bool {
 	for _, c := range b {
 		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
@@ -1767,7 +1767,7 @@ func reassembleExtendedXMPByParse(mainBytes, extBytes []byte) []byte {
 }
 
 // reassembleExtendedXMP merges extended XMP chunks into the main XMP packet
-// per Adobe XMP Specification Part 3 §1.1.4.
+// per Adobe XMP Specification Part 3 §1.1.3.1.
 //
 // The main XMP packet carries a HasExtendedXMP property whose value is the
 // 32-hex-character MD5 GUID of the corresponding extended segments. This

@@ -309,8 +309,8 @@ fmt.Printf("PASS/FAIL %s (%s): caption=%v\n",
 
 ## Performance
 
-Benchmarks run with `go test -bench=. -benchmem -benchtime=2s ./...` (Go 1.26, macOS, `GOMAXPROCS=10`).  
-All figures are the mean of multiple runs; allocation counts are stable across runs.
+Benchmarks run with `go test -run '^$' -bench <name> -benchmem -count=5 <package>` (Go 1.27.3, macOS, Apple M4, `GOMAXPROCS=10`).  
+All figures are the median of five runs, as `benchstat` reports it; allocation counts are stable across runs.
 
 ### Reproducing the benchmarks
 
@@ -332,7 +332,7 @@ Run a single named benchmark:
 go test -bench=BenchmarkParseEXIF -benchmem -benchtime=2s ./exif/...
 ```
 
-Results vary by machine. The figures in this README were collected on macOS with Go 1.26 and `GOMAXPROCS=10`. Pin `GOMAXPROCS` to make comparisons across machines more meaningful:
+Results vary by machine. The figures in this README were collected on macOS (Apple M4) with Go 1.27.3 and `GOMAXPROCS=10`. Pin `GOMAXPROCS` to make comparisons across machines more meaningful:
 
 ```
 GOMAXPROCS=10 go test -bench=. -benchmem -benchtime=2s ./...
@@ -351,63 +351,59 @@ go test -bench=. -benchmem -benchtime=2s -count=5 ./... | benchstat /dev/stdin
 
 | Scenario | Time/op | Memory/op | Allocs/op |
 |---|---:|---:|---:|
-| Progressive JPEG (no metadata) | 163 ns | 176 B | 4 |
-| JPEG — EXIF + IPTC + XMP combined | 10.6 µs | 22.8 kB | 24 |
-| Real-world JPEG corpus file | 1.55 µs | 4.7 kB | 14 |
-| Concurrent reads (parallel goroutines) | 11.4 µs | 544 B | 11 |
+| Progressive JPEG (no metadata) | 226 ns | 208 B | 1 |
+| JPEG — EXIF + IPTC + XMP combined | 18.3 µs | 24.2 kB | 56 |
+| Real-world JPEG corpus file | 3.51 µs | 7.9 kB | 15 |
+| Concurrent reads (parallel goroutines) | 12.0 µs | 708 B | 9 |
 
 ### Write
 
 | Operation | Time/op | Memory/op | Allocs/op |
 |---|---:|---:|---:|
-| JPEG — metadata update | 282 ns | 264 B | 15 |
-| PNG — pass-through | 188 ns | 168 B | 17 |
+| JPEG — metadata update | 394 ns | 112 B | 3 |
+| PNG — pass-through | 155 ns | 80 B | 6 |
 
 ### Metadata format parsers
 
 | Format | Operation | Time/op | Memory/op | Allocs/op |
 |---|---|---:|---:|---:|
-| EXIF | Parse — minimal TIFF (width, height, orientation) | 121 ns | 257 B | 4 |
-| EXIF | Parse — camera tags | 997 ns | 2.4 kB | 8 |
-| EXIF | Encode | 121 ns | 240 B | 6 |
-| EXIF | IFD tag lookup — 100-entry set (binary search) | 3.8 ns | 0 B | 0 |
-| IPTC | Parse | 102 ns | 944 B | 2 |
-| IPTC | Encode | 68 ns | 96 B | 1 |
-| IPTC | Field accessor | 26 ns | 64 B | 1 |
-| XMP | Parse | 1.06 µs | 968 B | 12 |
-| XMP | Encode | 650 ns | 3.1 kB | 2 |
+| EXIF | Parse — minimal TIFF (width, height, orientation) | 170 ns | 344 B | 4 |
+| EXIF | Parse — camera tags | 1.61 µs | 2.6 kB | 8 |
+| EXIF | Encode | 126 ns | 80 B | 2 |
+| EXIF | IFD tag lookup — 100-entry set (binary search) | 3.7 ns | 0 B | 0 |
+| IPTC | Parse | 121 ns | 480 B | 4 |
+| IPTC | Encode | 168 ns | 304 B | 2 |
+| IPTC | Field accessor | 17 ns | 48 B | 1 |
+| XMP | Parse | 1.40 µs | 1.2 kB | 8 |
+| XMP | Encode | 1.19 µs | 3.2 kB | 3 |
 
 ### Container format parsers
 
 | Format | Operation | Time/op |
 |---|---|---:|
-| JPEG | Segment extraction | 102 ns |
-| JPEG | Segment injection | 206 ns |
-| JPEG | Real corpus file (full parse) | 2.02 µs |
-| PNG | Extraction | 192 ns |
-| PNG | Extraction — compressed XMP (`zlib`) | 810 ns |
-| TIFF | Extraction | 98 ns |
-| WebP | Extraction | 98 ns |
-| HEIF / AVIF | Extraction | 271 ns |
-| Sony ARW | Extraction | 81 ns |
-| Canon CR2 | Extraction | 82 ns |
-| Adobe DNG | Extraction | 79 ns |
-| Nikon NEF | Extraction | 80 ns |
-
-> Canon CR3 and Olympus ORF/Panasonic RW2 benchmarks are covered by the TIFF and BMFF
-> primitive benchmarks; their combined overhead falls within the same 80–100 ns range.
+| JPEG | Segment extraction | 136 ns |
+| JPEG | Segment injection | 337 ns |
+| JPEG | Real corpus file (full parse) | 1.67 µs |
+| PNG | Extraction | 260 ns |
+| PNG | Extraction — compressed XMP (`zlib`) | 484 ns |
+| TIFF | Extraction | 49 ns |
+| WebP | Extraction | 78 ns |
+| HEIF / AVIF | Extraction | 190 ns |
+| Sony ARW | Extraction | 28 ns |
+| Canon CR2 | Extraction | 28 ns |
+| Adobe DNG | Extraction | 27 ns |
+| Nikon NEF | Extraction | 27 ns |
+| Canon CR3 | Extraction | 82 ns |
+| Olympus ORF | Extraction | 46 ns |
+| Panasonic RW2 | Extraction | 45 ns |
 
 ### Internal primitives
 
 | Component | Operation | Time/op |
 |---|---|---:|
-| `sync.Pool` buffer | Get + Put (≤4 kB) | 7.0 ns |
-| `sync.Pool` buffer | Get + Put (>64 kB) | 7.2 ns |
-| Byte-order | `Uint16` little-endian | 0.26 ns |
-| Byte-order | `Uint32` little-endian | 0.27 ns |
-| BMFF | Read box header | 24.8 ns |
-| BMFF | Skip box | 27.5 ns |
-| RIFF | Read chunk header | 24.4 ns |
+| `sync.Pool` buffer | Get + Put (4 kB) | 7.1 ns |
+| `sync.Pool` buffer | Get + Put (64 kB) | 6.9 ns |
+| RIFF | Read chunk header | 18.6 ns |
 
 ### Design choices behind the numbers
 
@@ -415,7 +411,7 @@ go test -bench=. -benchmem -benchtime=2s -count=5 ./... | benchstat /dev/stdin
 |---|---|
 | `sync.Pool`-backed buffers (`internal/iobuf`) | Amortises heap allocation to zero after warm-up |
 | Lazy parsing (`WithoutEXIF`, `WithoutIPTC`, `WithoutXMP`, `WithoutMakerNote`) | Skips unwanted segments entirely; MakerNote skip is the largest win on RAW files |
-| Binary search in IFD entry set | Tag lookup in a 100-entry IFD costs **3.8 ns** and **0 allocations** |
+| Binary search in IFD entry set | Tag lookup in a 100-entry IFD costs **3.7 ns** and **0 allocations** |
 | Lazy map init for extended XMP | Map is only allocated when extended XMP is actually present |
 | Magic-byte format detection | Dispatch adds no measurable overhead; no string allocation |
 

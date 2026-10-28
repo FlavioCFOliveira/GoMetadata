@@ -1025,7 +1025,7 @@ func TestInjectAllThreeMetadataPreservesUnknownAndScan(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestExtendedXMPMultiSegmentGUIDReassembly verifies the full extended-XMP
-// reassembly pipeline as specified in Adobe XMP Specification Part 3 §1.1.4:
+// reassembly pipeline as specified in Adobe XMP Specification Part 3 §1.1.3.1:
 //
 //  1. A standard XMP APP1 carries HasExtendedXMP="<GUID>" in the main packet.
 //  2. Multiple extended XMP APP1 segments carry the same GUID, each with
@@ -1069,7 +1069,7 @@ func TestExtendedXMPMultiSegmentGUIDReassembly(t *testing.T) {
 }
 
 // TestExtendedXMPHeaderLayout verifies that the extended XMP APP1 binary
-// header layout matches Adobe XMP Specification Part 3 §1.1.4:
+// header layout matches Adobe XMP Specification Part 3 §1.1.3.1:
 //
 //	Bytes 0–34: "http://ns.adobe.com/xmp/extension/\x00" (35 bytes)
 //	Bytes 35–66: GUID (32 ASCII hex characters)

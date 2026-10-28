@@ -295,7 +295,7 @@ func TestJPEGXMPNamespaceURIPrefix(t *testing.T) {
 // TestJPEGExtendedXMPHeaderLayout verifies the exact binary layout of the
 // ExtendedXMP APP1 header written by writeExtendedChunks.
 //
-// Adobe XMP Specification Part 3 §1.1.4: the APP1 segment body for an
+// Adobe XMP Specification Part 3 §1.1.3.1: the APP1 segment body for an
 // Extended XMP chunk is:
 //
 //	[0..34]  = "http://ns.adobe.com/xmp/extension/\x00"  (35 bytes)
@@ -342,7 +342,7 @@ func TestJPEGExtendedXMPHeaderLayout(t *testing.T) {
 	for _, b := range guidBytes {
 		isHex := (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
 		if !isHex {
-			t.Errorf("GUID byte 0x%02X is not a valid hex character; GUID must be 32 hex chars (XMP Part 3 §1.1.4)", b)
+			t.Errorf("GUID byte 0x%02X is not a valid hex character; GUID must be 32 hex chars (XMP Part 3 §1.1.3.1)", b)
 		}
 	}
 
@@ -581,7 +581,7 @@ func TestJPEGEXIFPayloadLimit65533(t *testing.T) {
 // mutually consistent: every offset must be within [0, fullLength), and
 // offset=0 for the first chunk.
 //
-// Adobe XMP Specification Part 3 §1.1.4: fullLength is the total size of the
+// Adobe XMP Specification Part 3 §1.1.3.1: fullLength is the total size of the
 // complete extended XMP document; offset is the byte offset within that document
 // where this chunk's data begins. All chunks must cover non-overlapping ranges
 // that together cover [0, fullLength).
@@ -945,7 +945,7 @@ func TestJPEGRobustExtendedXMPDuplicateOffsets(t *testing.T) {
 // whose GUID differs from the GUID in the main XMP are silently ignored.
 //
 // §1(f): "GUID mismatch."
-// Adobe XMP Specification Part 3 §1.1.4: readers must use only chunks whose
+// Adobe XMP Specification Part 3 §1.1.3.1: readers must use only chunks whose
 // GUID matches the HasExtendedXMP value in the main packet.
 func TestJPEGRobustExtendedXMPGUIDMismatch(t *testing.T) {
 	t.Parallel()

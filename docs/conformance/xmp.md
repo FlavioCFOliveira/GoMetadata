@@ -2,7 +2,7 @@
 
 Normative-requirements checklist for the GoMetadata conformance test battery. Rule IDs
 (`PW-*`, `RDF-*`, `NS-*`, `VT-*`, `JPEG-*`, `TIFF-*`, `PNG-*`, `HEIF-*`, `MWG-*`, `ROB-*`)
-are used verbatim as Go sub-test names. 74 rules total.
+are used verbatim as Go sub-test names. 86 rules total.
 
 > Note for implementers: a few byte-length constants below (e.g. the JPEG XMP namespace
 > identifier length) must be reconciled against the actual codebase during implementation —
@@ -65,7 +65,7 @@ are used verbatim as Go sub-test names. 74 rules total.
 - **VT-04** Boolean = `True`/`False` (capitalised); write strict, accept lowercase/numeric variants for robustness.
 - **VT-05** Date = ISO 8601 subset: `YYYY`, `YYYY-MM`, `YYYY-MM-DD`, `…Thh:mmTZD`, `…Thh:mm:ssTZD`, `…Thh:mm:ss.sTZD` (TZD = `Z` or `±hh:mm`). Accept all six; write most precise without inventing precision.
 - **VT-06** URI = RFC 3986; serialize as Text value (not rdf:resource unless a resource ref).
-- **VT-07** GUID = 32 hex digits, no separators/braces; accept both cases, write lowercase.
+- **VT-07** GUID = 32 hex digits, no separators/braces; accept both cases on read. The ExtendedXMP GUID (`xmpNote:HasExtendedXMP` and the APP1 chunk header) is written as 32 uppercase hex digits, "capital A-F, no null termination" (S3 §1.1.3.1, p. 14); any other GUID-valued property is carried as stored, without case conversion. `format/jpeg` canonicalises the GUID to upper case; `TestConformanceVT07` covers the verbatim carriage.
 - **VT-08** Forbidden XML 1.0 §2.2 code points (U+0000–08, 0B, 0C, 0E–1F, FFFE, FFFF): never emit; on read substitute U+FFFD or skip, never crash.
 
 ## Section 3: Embedding Rules
@@ -116,7 +116,7 @@ are used verbatim as Go sub-test names. 74 rules total.
 - **MWG-05** dc:rights[x-default] ↔ EXIF Copyright `0x8298` ↔ IIM 2:116; sync all on write.
 - **MWG-06** photoshop:DateCreated ↔ EXIF DateTimeOriginal `0x9003`+SubSec `0x9291` (+OffsetTime `0x9011`) ↔ IIM 2:55+2:60; combine/split (MWG §5.3).
 - **MWG-07** dc:subject ↔ IIM 2:25 keywords (no EXIF equivalent); sync both.
-- **MWG-08** exif:GPS* (XMP) ↔ EXIF GPS IFD `0x0002/0x0004/0x0006/0x0005`; decimal degrees in XMP.
+- **MWG-08** exif:GPS* (XMP) ↔ EXIF GPS IFD `0x0002/0x0004/0x0006/0x0005`; the XMP value is a `GPSCoordinate` text, `DDD,MM.mmk` or `DDD,MM,SSk` (`k` = `N`, `S`, `E` or `W`), not decimal degrees (XMP Part 2 §3.4, p. 35, which defers the Exif namespace to CIPA DC-010; Adobe XMP Toolkit SDK `ReconcileTIFF.cpp`, `ImportTIFF_GPSCoordinate`, which writes both forms). `xmp.GPS` parses both forms and returns decimal degrees.
 - **MWG-09** Write sync scope: update all formats present unless API requests a format-specific mode.
 
 ## Section 5: Robustness Cases (MUST NOT crash)
@@ -133,6 +133,7 @@ are used verbatim as Go sub-test names. 74 rules total.
 - **ROB-10** Filter/replace forbidden XML C0 chars before serialization (U+FFFD acceptable).
 - **ROB-11** Prefix-collision on output → distinct prefixes per distinct URI.
 - **ROB-12** Deep nesting → enforce max recursion depth (~100); error if exceeded; no stack overflow.
+- **ROB-14** A raw forbidden C0 control (XML 1.0 §2.2 `Char` production excludes U+0000-U+0008, U+000B, U+000C, U+000E-U+001F), written literally in element text or a CDATA section, makes the document ill-formed XML. `Parse` stays lenient (ROB-05): it does not reject the document and stores the byte in the property value. This differs from a numeric character reference to such a code point, which `Parse` replaces with U+FFFD (XML 1.0 §4.1; `TestTask274CharRefForbiddenCharSanitized`, `TestTask274OtherForbiddenCharRefsSanitized`). U+001E is the one forbidden C0 control that also is this library's internal multi-value separator, so the list accessors, which split a stored value on U+001E, see a literal U+001E in a value as an item separator. `Encode` never emits any forbidden code point: `writeXMLEscaped` (`xmp/write.go`) substitutes U+FFFD, as for ROB-10, so the written packet is well-formed. The rationale for the character-reference side is in `xmp/rdf.go` (`decodeCharRef`, `isForbiddenXMLCharRef`) and for the dispatch on U+001E in `xmp/write.go` (`writeKeyedProperties`). The output side is tested under ROB-10 (`TestConformanceROB10`) and VT-08 (`TestConformanceVT08`); the parse-side retention of the literal byte is tested by `TestConformanceROB14`.
 
 ## Sources
 - ISO 16684-1:2019, ISO 16684-2:2014; Adobe XMP Specification Parts 1/2/3

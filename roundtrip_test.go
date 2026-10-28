@@ -126,7 +126,7 @@ func rtBuildPNG(exifData, xmpData []byte) []byte {
 		rtPNGWriteChunk(&buf, "eXIf", exifData)
 	}
 	if xmpData != nil {
-		// iTXt chunk with keyword "XML:com.adobe.xmp" (XMP Part 3 §1.1.4).
+		// iTXt chunk with keyword "XML:com.adobe.xmp" (XMP Part 3 §1.1.5).
 		const kw = "XML:com.adobe.xmp"
 		var chunk bytes.Buffer
 		chunk.WriteString(kw)
@@ -360,7 +360,9 @@ func TestRoundTripCaption_JPEG(t *testing.T) {
 
 // TestRoundTripXMP_PNG verifies that XMP caption and copyright written to a
 // PNG survive a complete Read→Write→Read cycle.
-// IPTC is not supported by PNG containers; only XMP is tested here.
+// A PNG has no native IPTC chunk, so Set* creates no IPTC for it and only XMP
+// is tested here. IPTC already present in a "Raw profile type iptc" text chunk
+// is read and rewritten (format/png).
 func TestRoundTripXMP_PNG(t *testing.T) {
 	t.Parallel()
 	const (
@@ -536,7 +538,8 @@ func TestRoundTripTableDriven(t *testing.T) {
 			},
 		},
 		{
-			// PNG does not carry IPTC — XMP only.
+			// A PNG with no IPTC gets none created — XMP only (IPTC in a
+			// "Raw profile type iptc" chunk is read and rewritten, format/png).
 			name:  "PNG+XMP+caption",
 			image: func() []byte { return rtBuildPNG(nil, nil) },
 			modify: func(m *gometadata.Metadata) {

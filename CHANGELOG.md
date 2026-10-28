@@ -57,6 +57,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 - **A PNG write keeps the chunks of unmodified segments** (`write.go`, `format/png/png.go`, #405): `Write` after `SetKeywords` or `SetISO` removed the unmodified eXIf or XMP chunk, because `png.Inject` reads a nil payload as "remove". This corrects a defect of #387 that no release contains. The other containers were audited and were not affected.
 - **README: IPTC in RAW files** (`README.md`, #388): the format table listed IPTC as unsupported in CR2, NEF, ARW, DNG, ORF and RW2; it is read and written there (IFD0 tag `0x83BB`). `readme_iptc_raw_test.go` checks the table against the code.
 
+### Documentation
+
+- **Citations of the extended XMP and PNG XMP rules** (`format/jpeg`, `format/png`, `roundtrip_test.go`, #338): the comments cited Adobe XMP Specification Part 3 §1.1.4, which is JPEG 2000. Extended XMP is §1.1.3.1 (pp. 14-15) and the PNG `iTXt` chunk is §1.1.5 (p. 16); every comment and test now cites those sections.
+- **Conformance rules VT-07 and MWG-08** (`docs/conformance/xmp.md`, #338): VT-07 said to write a GUID in lowercase; the ExtendedXMP GUID is written in capital A-F (XMP Part 3 §1.1.3.1, p. 14), and other GUID properties are carried as stored. MWG-08 said the XMP GPS value is decimal degrees; it is a `GPSCoordinate` text, `DDD,MM.mmk` or `DDD,MM,SSk`.
+- **Stale comments** (`format/tiff/relocate_makernote_test.go`, `roundtrip_test.go`, `metadata_autocreate_test.go`, #338): the Panasonic MakerNote test comment said the offsets count from the MakerNote; they count from the TIFF header and are rebased. The PNG comments said PNG has no IPTC pathway; IPTC in a `Raw profile type iptc` chunk is read and rewritten.
+- **README performance tables** (`README.md`, #338): every figure is re-measured with `go test -run '^$' -bench ... -benchmem -count=5` and `benchstat` (Go 1.27.3, Apple M4). The CR3, ORF and RW2 extraction rows are added, and the byte-order and BMFF rows, which no benchmark in the repository reproduces, are removed.
+- **Conformance rule ROB-14** (`docs/conformance/xmp.md`, `xmp/conformance_test.go`, #275): a raw forbidden C0 control, U+001E included, in element text is kept by `Parse` and replaced with U+FFFD by `Encode`. The rule is tested by `TestConformanceROB14`.
+
 ## [1.5.2] - 2026-10-28
 
 ### Fixed
