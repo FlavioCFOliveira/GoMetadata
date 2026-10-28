@@ -165,7 +165,7 @@ func newMakerNoteEdit(e *EXIF) (*mnEdit, error) {
 		return nil, err
 	}
 	m.buf = append(make([]byte, 0, len(mn)+64), mn...)
-	m.footer = lay.layout == mnCanon && len(mn) > canonFooterLen && isTIFFHeaderMark(mn[len(mn)-canonFooterLen:], lay.ByteOrder)
+	m.footer = lay.layout == mnCanon && genuineFooter(mn, lay, m.origin) // a value that ends like a footer is not one (task #418)
 	if err := m.checkTable(); err != nil {
 		return nil, err
 	}
