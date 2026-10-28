@@ -187,13 +187,27 @@ linters:
         # context must be first param (proactive — fires nowhere currently)
         - name: context-as-argument
           severity: warning
-        # silent error discard; fmt.Fprint* are intentionally allowed
+        # silent error discard. Arguments are regular expressions that must
+        # match the whole function name (revive unhandled-error); a method is
+        # written "pkg.Type.Method". Allowed calls:
+        #   - fmt.Fprint*: intentionally allowed.
+        #   - fmt.Print*: stdout output of examples and Example tests; the
+        #     library (non-test, non-example) code never calls them.
+        #   - bytes.Buffer and strings.Builder writes: the standard library
+        #     documents that the error is always nil ("err is always nil" in
+        #     pkg.go.dev/bytes#Buffer.Write; "always returns len(p), nil" in
+        #     pkg.go.dev/strings#Builder.Write).
         - name: unhandled-error
           severity: warning
           arguments:
             - "fmt.Fprint"
             - "fmt.Fprintf"
             - "fmt.Fprintln"
+            - "fmt.Print"
+            - "fmt.Printf"
+            - "fmt.Println"
+            - 'bytes\.Buffer\.Write(Byte|Rune|String)?'
+            - 'strings\.Builder\.Write(Byte|Rune|String)?'
         # complement to forcetypeassert
         - name: unchecked-type-assertion
           severity: warning

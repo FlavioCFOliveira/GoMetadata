@@ -82,6 +82,10 @@ jobs:
           files: coverage.out
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
+          # Go emits a coverprofile only: turn off the gcov, xcode and pycoverage
+          # plugins and the file search, which do not apply and only log warnings.
+          plugins: noop
+          disable_search: true
 
   bench:
     name: Benchmark

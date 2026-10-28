@@ -3,6 +3,7 @@ package format
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"testing"
 )
 
@@ -855,7 +856,9 @@ func TestDetect_ZeroAllocs(t *testing.T) {
 	_, _ = Detect(r)
 
 	allocs := testing.AllocsPerRun(100, func() {
-		r.Seek(0, 0) //nolint:errcheck,gosec // G104: seek on bytes.Reader never fails
+		if _, err := r.Seek(0, io.SeekStart); err != nil {
+			t.Fatalf("Seek: %v", err)
+		}
 		_, _ = Detect(r)
 	})
 
@@ -877,7 +880,9 @@ func BenchmarkDetect(b *testing.B) {
 	b.ResetTimer()
 
 	for range b.N {
-		r.Seek(0, 0) //nolint:errcheck,gosec // G104: seek on bytes.Reader never fails
+		if _, err := r.Seek(0, io.SeekStart); err != nil {
+			b.Fatalf("Seek: %v", err)
+		}
 		_, _ = Detect(r)
 	}
 }
