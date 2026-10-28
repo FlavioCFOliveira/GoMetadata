@@ -415,11 +415,23 @@ func (w *mnWalker) entry(e mnEntry, depth int, pair *jpegPair) {
 		return // a type this package does not know
 	case e.total > 4:
 		w.valueEntry(e, depth)
-	case depth == 0 && w.isSubIFDTag(e.tag) && e.cnt == 1 && (e.typ == TypeLong || e.typ == TypeIFD):
+	case w.isInlineSubIFD(e, depth):
 		w.subIFD(e.field, depth)
-	case (w.nikon || w.samsung) && depth > 0:
+	case w.walksPreview(depth):
 		w.jpegEntry(e, pair)
 	}
+}
+
+// isInlineSubIFD reports whether e, an inline entry of the IFD at depth, holds
+// the offset of a sub-IFD: only the top IFD has them, as one LONG or IFD value.
+func (w *mnWalker) isInlineSubIFD(e mnEntry, depth int) bool {
+	return depth == 0 && w.isSubIFDTag(e.tag) && e.cnt == 1 && (e.typ == TypeLong || e.typ == TypeIFD)
+}
+
+// walksPreview reports whether the IFD at depth may locate a preview image: a
+// sub-IFD of a Nikon or Samsung MakerNote.
+func (w *mnWalker) walksPreview(depth int) bool {
+	return (w.nikon || w.samsung) && depth > 0
 }
 
 // valueEntry handles an out-of-line entry: its value is repaired, and when it

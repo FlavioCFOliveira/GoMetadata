@@ -2,17 +2,26 @@ name: CI
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "develop"]
   pull_request:
-    branches: ["main"]
+    branches: ["main", "develop"]
+  workflow_dispatch:
 
+# Runners are pinned to an explicit image: ubuntu-latest is migrating from
+# Ubuntu 24.04 to 26.04, which would change the environment without a commit.
+#
+# Only the lint job lets setup-go save the Go cache. setup-go derives its cache
+# key from the OS, the Go version and go.mod, so parallel jobs that used it all
+# raced to reserve the same key ("Unable to reserve cache"). The other jobs
+# turn it off and keep their own per-job cache (the "Cache Go" step), because
+# race, coverage, benchmark and fuzz builds fill the build cache differently.
 env:
   GOTOOLCHAIN: local
 
 jobs:
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-go@v7.0.0
@@ -26,25 +35,45 @@ jobs:
 
   test-race:
     name: Test (race)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
+      - name: Cache Go (race)
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-race-${{ hashFiles('go.mod', 'go.sum') }}-${{ hashFiles('**/*.go') }}
+          restore-keys: |
+            go-${{ runner.os }}-race-${{ hashFiles('go.mod', 'go.sum') }}-
+            go-${{ runner.os }}-race-
       - name: Run tests with race detector
         run: go test -race -count=1 -skip ^Example ./...
 
   coverage:
     name: Coverage
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
+      - name: Cache Go (coverage)
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-coverage-${{ hashFiles('go.mod', 'go.sum') }}-${{ hashFiles('**/*.go') }}
+          restore-keys: |
+            go-${{ runner.os }}-coverage-${{ hashFiles('go.mod', 'go.sum') }}-
+            go-${{ runner.os }}-coverage-
       - name: Run tests with coverage
         run: go test -coverprofile=coverage.out -covermode=atomic -skip ^Example ./...
       - name: Upload coverage to Codecov
@@ -56,25 +85,45 @@ jobs:
 
   bench:
     name: Benchmark
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
+      - name: Cache Go (bench)
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-bench-${{ hashFiles('go.mod', 'go.sum') }}-${{ hashFiles('**/*.go') }}
+          restore-keys: |
+            go-${{ runner.os }}-bench-${{ hashFiles('go.mod', 'go.sum') }}-
+            go-${{ runner.os }}-bench-
       - name: Run benchmarks (smoke)
         run: go test -bench=. -benchmem -benchtime=1x -skip ^Example ./...
 
   fuzz:
     name: Fuzz (smoke)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
+      - name: Cache Go (fuzz)
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-fuzz-${{ hashFiles('go.mod', 'go.sum') }}-${{ hashFiles('**/*.go') }}
+          restore-keys: |
+            go-${{ runner.os }}-fuzz-${{ hashFiles('go.mod', 'go.sum') }}-
+            go-${{ runner.os }}-fuzz-
       - name: FuzzRead — end-to-end entry point
         run: go test -fuzz=FuzzRead -fuzztime=10s -race .
       - name: FuzzParseEXIF — EXIF/TIFF parser

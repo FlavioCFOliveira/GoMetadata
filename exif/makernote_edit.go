@@ -144,13 +144,8 @@ func newMakerNoteEdit(e *EXIF) (*mnEdit, error) {
 		return nil, err
 	}
 	lay, mnOff, ok := resolveMakerNote(e, mn, mk)
-	switch {
-	case !ok || lay.layout == mnNone:
-		return nil, notEditable("the manufacturer layout of the MakerNote is not known, so the base of its offsets is not")
-	case lay.layout == mnKyocera:
-		return nil, notEditable("the offsets of a Kyocera MakerNote count from their own entries, which an edit does not keep")
-	case lay.TIFFRelative && mnOff == 0:
-		return nil, notEditable("the position of the MakerNote in the file it was read from is not known")
+	if err := checkLayoutEditable(lay, mnOff, ok); err != nil {
+		return nil, err
 	}
 	m := &mnEdit{e: e, ent: ent, lay: lay, mk: mk, mnOff: mnOff, orig: mn}
 	if err := m.checkSelfContained(); err != nil {
@@ -162,6 +157,21 @@ func newMakerNoteEdit(e *EXIF) (*mnEdit, error) {
 		return nil, err
 	}
 	return m, nil
+}
+
+// checkLayoutEditable refuses a note whose layout (ok is false when there is
+// none) does not let an edit keep its offsets: unknown, Kyocera, or TIFF-relative
+// with a position in the file that is not known.
+func checkLayoutEditable(lay MakerNoteLayout, mnOff uint64, ok bool) error {
+	switch {
+	case !ok || lay.layout == mnNone:
+		return notEditable("the manufacturer layout of the MakerNote is not known, so the base of its offsets is not")
+	case lay.layout == mnKyocera:
+		return notEditable("the offsets of a Kyocera MakerNote count from their own entries, which an edit does not keep")
+	case lay.TIFFRelative && mnOff == 0:
+		return notEditable("the position of the MakerNote in the file it was read from is not known")
+	}
+	return nil
 }
 
 // checkTable refuses a note whose tag table is empty or cut, or on which a value
