@@ -451,6 +451,40 @@ func TestMakerNoteEdit_R398_DeleteSeveralAtomically(t *testing.T) {
 	}
 }
 
+// TestMakerNoteEdit_R420_DeleteEmptyListNoOp: a nil or empty list deletes
+// nothing and returns nil (it panicked after task #416); a note that cannot be
+// edited is still refused.
+func TestMakerNoteEdit_R420_DeleteEmptyListNoOp(t *testing.T) {
+	t.Parallel()
+	for _, tc := range mnCases() {
+		for name, list := range map[string][]TagID{"nil": nil, "empty": {}} {
+			t.Run(tc.name+"/"+name, func(t *testing.T) {
+				t.Parallel()
+				tiff, _ := testutil.MakerNoteTIFF(tc.spec)
+				e, err := Parse(tiff)
+				if err != nil {
+					t.Fatal(err)
+				}
+				before := bytes.Clone(e.MakerNote)
+				n := len(e.MakerNoteIFD.Entries)
+				err = e.DeleteMakerNoteTags(list)
+				if err != nil {
+					if !errors.Is(err, ErrMakerNoteNotEditable) {
+						t.Fatalf("error = %v", err)
+					}
+					return
+				}
+				if !bytes.Equal(before, e.MakerNote) || len(e.MakerNoteIFD.Entries) != n {
+					t.Error("an empty delete changed the note")
+				}
+			})
+		}
+	}
+	if err := (&EXIF{}).DeleteMakerNoteTags(nil); !errors.Is(err, ErrNoMakerNote) {
+		t.Errorf("no MakerNote: error = %v, want ErrNoMakerNote", err)
+	}
+}
+
 // TestMakerNoteEdit_R398_OtherBytesStay: the entries of the
 // MakerNote other than the edited one stay byte for byte, whichever the layout.
 func TestMakerNoteEdit_R398_OtherBytesStay(t *testing.T) {

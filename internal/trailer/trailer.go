@@ -167,7 +167,7 @@ func PlanFromRegion(region []byte, base int64, newIPTC []byte) Plan {
 // bytes of the file from the absolute offset base to base+size, read through
 // src (task #393). The plan finds the same trailers and spans, reading only
 // what it has to inspect: the signatures are searched for with a streaming scan
-// (Source.Index), and a trailer that is rewritten is read in full.
+// (Source.IndexEach), and a trailer that is rewritten is read in full.
 //
 // A read error of src is returned; the plan is then incomplete and must not be
 // used.

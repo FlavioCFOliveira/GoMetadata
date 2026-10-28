@@ -16,6 +16,12 @@ import (
 // into memory whole) is written with the audio offsets rewritten, allocating
 // less than 256 KiB; the trailer bytes are the source's.
 //
+// The deterministic measure of "not held" is the largest read from the source
+// and the largest write to the output, which stay far below the trailer size
+// whatever the runtime does. The heap bound depends on sync.Pool, which the race
+// detector makes drop puts at random (so that pooled buffers are allocated
+// again), and so it is asserted only when the race detector is off (task #419).
+//
 //nolint:paralleltest // measures the heap of the process: no other test may allocate meanwhile
 func TestInjectLargeTrailerNotHeld(t *testing.T) {
 	audio := bytes.Repeat([]byte("0123456789abcdef"), 12<<16) // 12 MiB
@@ -23,20 +29,26 @@ func TestInjectLargeTrailerNotHeld(t *testing.T) {
 	src := jpegWithTail(samsungOf(base, audio))
 	exif := []byte("II*\x00\x08\x00\x00\x00\x00\x00\x00\x00")
 
-	var out bytes.Buffer
-	out.Grow(len(src) + 1<<16) // not counted: the caller's buffer
+	var buf bytes.Buffer
+	buf.Grow(len(src) + 1<<16) // not counted: the caller's buffer
+	out := &spanWriter{w: &buf}
+	in := &spanReader{r: bytes.NewReader(src)}
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
-	if err := Inject(bytes.NewReader(src), &out, exif, newIIM, nil, true); err != nil {
+	if err := Inject(in, out, exif, newIIM, nil, true); err != nil {
 		t.Fatalf("Inject: %v", err)
 	}
 	runtime.ReadMemStats(&after)
-	if grown := after.TotalAlloc - before.TotalAlloc; grown > 256<<10 {
+	// A trailer held in memory is read or written whole, in one call.
+	if limit := 1 << 20; in.maxRead > limit || out.maxWrite > limit {
+		t.Errorf("largest read %d and largest write %d bytes, want at most %d (the trailer is %d)", in.maxRead, out.maxWrite, limit, len(audio))
+	}
+	if grown := after.TotalAlloc - before.TotalAlloc; !raceEnabled && grown > 256<<10 {
 		t.Errorf("Inject of a JPEG with a %d MiB trailer allocated %d bytes, want < 256 KiB", len(audio)>>20, grown)
 	}
 
-	got := out.Bytes()
+	got := buf.Bytes()
 	s, e := samsungAudioOffsets(t, got)
 	if s0, _ := samsungAudioOffsets(t, src); s == s0 {
 		t.Fatal("the trailer did not move: the test proves nothing")
@@ -56,6 +68,33 @@ func TestInjectLargeTrailerNotHeld(t *testing.T) {
 	if diff == 0 || diff > 8 {
 		t.Errorf("%d trailer bytes differ, want only the audio offsets (1 to 8 bytes)", diff)
 	}
+}
+
+// spanReader records the largest read of a source; it hides the fast paths
+// that a *bytes.Reader would give.
+type spanReader struct {
+	r       io.ReadSeeker
+	maxRead int
+}
+
+func (s *spanReader) Read(p []byte) (int, error) {
+	s.maxRead = max(s.maxRead, len(p))
+	return s.r.Read(p) //nolint:wrapcheck // a test double: the error is the reader's
+}
+
+func (s *spanReader) Seek(off int64, whence int) (int64, error) {
+	return s.r.Seek(off, whence) //nolint:wrapcheck // a test double: the error is the seeker's
+}
+
+// spanWriter records the largest write to a sink.
+type spanWriter struct {
+	w        io.Writer
+	maxWrite int
+}
+
+func (s *spanWriter) Write(p []byte) (int, error) {
+	s.maxWrite = max(s.maxWrite, len(p))
+	return s.w.Write(p) //nolint:wrapcheck // a test double: the error is the writer's
 }
 
 // shrinkingSource delivers the source for the first `full` reads and then

@@ -102,6 +102,7 @@ type mnPlan struct {
 	changed bool             // blob is such a copy
 	origLen int              // length of the original MakerNote
 	tiffRel bool
+	footer  bool    // the original ends with a genuine Canon footer (genuineFooter)
 	fixes   []mnFix // pointers to set once the position is known (TIFF-relative layouts)
 }
 
@@ -213,6 +214,7 @@ func planMakerNote(e *EXIF, src []byte, carry *int) *mnPlan {
 		changed: w.copied,
 		origLen: len(mn),
 		tiffRel: lay.TIFFRelative,
+		footer:  genuineFooter(mn, lay, w.origin),
 		fixes:   w.fixes,
 	}
 }
@@ -263,7 +265,9 @@ func (p *mnPlan) finish(out []byte, order binary.ByteOrder) {
 		}
 		p.order.PutUint32(out[mnAbs+f.field:], uint32(v))
 	}
-	fixMakerNoteFooter(out, mnAbs, p.origLen, p.order, uint64(mnAbs)) //nolint:gosec // G115: non-negative offset
+	if p.footer {
+		fixMakerNoteFooter(out, mnAbs, p.origLen, p.order, uint64(mnAbs)) //nolint:gosec // G115: non-negative offset
+	}
 }
 
 // fixMakerNoteFooter updates the TIFF footer that Canon writes at the end of
@@ -278,7 +282,7 @@ func (p *mnPlan) finish(out []byte, order binary.ByteOrder) {
 // brought in step with them. A MakerNote without the footer is left alone
 // (task #310).
 func fixMakerNoteFooter(buf []byte, mnAbs, n int, order binary.ByteOrder, newAbs uint64) {
-	const footerLen = 8
+	const footerLen = canonFooterLen
 	if n <= footerLen || mnAbs < 0 || mnAbs+n > len(buf) {
 		return
 	}
@@ -287,6 +291,30 @@ func fixMakerNoteFooter(buf []byte, mnAbs, n int, order binary.ByteOrder, newAbs
 		return
 	}
 	order.PutUint32(f[4:], uint32(newAbs))
+}
+
+// genuineFooter reports whether mn ends with a Canon footer that is not part of
+// a value: its last 8 bytes are a TIFF header mark in the byte order of lay
+// (isTIFFHeaderMark) and no out-of-line value of the IFD, read against the TIFF
+// header at -origin relative to mn, overlaps them. Canon writes the footer after
+// the last value, never inside one (ExifTool Canon.pm, "Canon maker note
+// footer": a structure of its own at the end of the note, which its writer
+// validates and rewrites apart from the values), so a value whose tail merely
+// looks like a header mark (task #418) must be preserved byte for byte and its
+// tail must not be patched. This is GoMetadata's rule; Exif 3.1 does not define
+// the footer.
+func genuineFooter(mn []byte, lay MakerNoteLayout, origin int64) bool {
+	if len(mn) <= canonFooterLen || !isTIFFHeaderMark(mn[len(mn)-canonFooterLen:], lay.ByteOrder) {
+		return false
+	}
+	start := int64(len(mn) - canonFooterLen)
+	genuine := true
+	eachOOL(mn, lay, func(ptr, total int64) {
+		if t := ptr - origin; t < int64(len(mn)) && t+total > start {
+			genuine = false
+		}
+	})
+	return genuine
 }
 
 // isTIFFHeaderMark reports whether b starts with the TIFF header mark of

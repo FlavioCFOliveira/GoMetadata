@@ -199,11 +199,10 @@ func TestSecurityAuditV150(t *testing.T) {
 	t.Run("F-03", func(t *testing.T) {
 		t.Parallel()
 		region := afcpBomb(512 << 10)
-		var buf [maxAFCPSignatures]afcpSig
 		viewOf := func(region []byte) view[regionSource] {
 			return view[regionSource]{src: regionSource{b: region, base: 100}, base: 100, end: 100 + int64(len(region))}
 		}
-		if sigs, _ := collectAFCPSigs(buf[:0], viewOf(region)); sigs != nil {
+		if sigs, _ := collectAFCPSigs(new(afcpScan), viewOf(region)); sigs != nil {
 			t.Errorf("collectAFCPSigs kept %d signatures of a %d-signature region, want nil (over the cap)", len(sigs), len(region)/12)
 		}
 		if a := FindAFCP(region, 100); a != nil {
@@ -214,7 +213,7 @@ func TestSecurityAuditV150(t *testing.T) {
 			t.Errorf("PlanFromRegion planned %d spans for a repeated-signature region", len(plan.Spans))
 		}
 		atCap := afcpBomb(maxAFCPSignatures * 12)
-		if sigs, _ := collectAFCPSigs(buf[:0], viewOf(atCap)); len(sigs) != maxAFCPSignatures {
+		if sigs, _ := collectAFCPSigs(new(afcpScan), viewOf(atCap)); len(sigs) != maxAFCPSignatures {
 			t.Errorf("collectAFCPSigs kept %d signatures of a region with exactly %d, want all", len(sigs), maxAFCPSignatures)
 		}
 		if a := FindAFCP(atCap, 100); a != nil {

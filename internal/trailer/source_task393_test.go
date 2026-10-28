@@ -152,6 +152,11 @@ func FuzzPlanFromSource(f *testing.F) {
 	f.Add(append([]byte("xx"), samsungOf(2, []byte("audio"))...), uint16(2))
 	f.Add([]byte("AXS!\x00\x00\x00\x00AXS!\x00\x00\x00\x00"), uint16(0))
 	f.Add(afcpBomb(4096), uint16(100))
+	// Task #417: regions made of candidates that are not trailers, and a chain
+	// of short FotoStation records.
+	f.Add(repeatTo("AXSA", 4096), uint16(0))
+	f.Add(repeatTo("QDIOBS", 4096), uint16(7))
+	f.Add(repeatTo("\x00\x01\x00\x00\x00\x0a\xa1\xb2\xc3\xd4", 4096), uint16(0))
 	f.Fuzz(func(t *testing.T, file []byte, base uint16) {
 		assertSameAsRegion(t, "fuzz", file, int64(base), newIIM)
 	})
