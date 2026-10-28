@@ -747,6 +747,18 @@ func TestHEIFCdscRef(t *testing.T) {
 	result = append(result, newMeta...)
 	result = append(result, baseFile[me:]...)
 
+	// The item data moved by len(irefBox) bytes: rebase the extent_offset of
+	// the single iloc item (iloc: box header 8 + version/flags 4 + sizes 2 +
+	// item_count 2 + item_ID 2 + data_reference_index 2 + extent_count 2 puts
+	// extent_offset at +22; ISO 14496-12 §8.11.3.2). Without this the item would
+	// address bytes of the meta box, not an Exif payload.
+	ilocAt := bytes.Index(result, []byte("iloc"))
+	if ilocAt < 4 {
+		t.Fatal("HEIF-cdsc-ref: iloc box not found in synthetic file")
+	}
+	offAt := ilocAt - 4 + 22
+	binary.BigEndian.PutUint32(result[offAt:], binary.BigEndian.Uint32(result[offAt:])+uint32(len(irefBox))) //nolint:gosec // G115: test helper, bounded
+
 	// Must not panic or error.
 	rawEXIF, _, _, err := Extract(bytes.NewReader(result))
 	if err != nil {

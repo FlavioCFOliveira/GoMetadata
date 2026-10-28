@@ -635,11 +635,19 @@ type IFD struct {
 // to the new positions. Nil means no strips are carried (the default, and the
 // case when the strips lie outside the parsed bytes or exceed the carry
 // limits). It lives here and not in IFD so that the common IFD stays small.
+//
+// stripsNotCarried is set by Parse with CarryThumbnailStrips when the IFD
+// records strips (StripOffsets present) that could not be carried. Their
+// offsets address the source stream, not the stream Encode writes, so Encode
+// omits StripOffsets and StripByteCounts of that IFD instead of writing
+// pointers to unrelated bytes (task #414).
 type SubIFDs struct {
 	Exif            *IFD
 	GPS             *IFD
 	Interop         *IFD
 	ThumbnailStrips [][]byte
+
+	stripsNotCarried bool
 }
 
 // thumbnailStrips returns the strips of the uncompressed thumbnail of ifd (see

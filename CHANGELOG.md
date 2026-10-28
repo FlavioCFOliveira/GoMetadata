@@ -57,6 +57,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 - **A PNG write keeps the chunks of unmodified segments** (`write.go`, `format/png/png.go`, #405): `Write` after `SetKeywords` or `SetISO` removed the unmodified eXIf or XMP chunk, because `png.Inject` reads a nil payload as "remove". This corrects a defect of #387 that no release contains. The other containers were audited and were not affected.
 - **README: IPTC in RAW files** (`README.md`, #388): the format table listed IPTC as unsupported in CR2, NEF, ARW, DNG, ORF and RW2; it is read and written there (IFD0 tag `0x83BB`). `readme_iptc_raw_test.go` checks the table against the code.
 
+## [1.5.2] - 2026-10-28
+
+### Fixed
+
+- **EXIF thumbnail strips** (`exif/thumbnail_strips.go`, `exif/chain.go`, #414): with `CarryThumbnailStrips`, an IFD of the chain whose StripOffsets strips could not be carried kept its source offsets, and `Encode` wrote them unchanged; they then addressed unrelated bytes of the written stream, and a `Parse` of the output carried those bytes as strips (4 strips before the round trip, 8 after). `Encode` now omits StripOffsets and StripByteCounts of such an IFD, so the strips are identical after a round trip. Found by `FuzzParseEXIF`.
+- **HEIF/AVIF Exif item** (`format/heif/heif.go`, #415): `Extract` returned the remainder of an Exif item as EXIF even when it was shorter than a TIFF header (2 bytes in the fuzz seed). An Exif item that does not hold the 4-byte `exif_tiff_header_offset` and 8 bytes of TIFF header (ISO/IEC 23008-12 Annex A.2.1) now yields no EXIF, like an offset that points outside the item. Found by `FuzzHEIFExtract`.
+
 ## [1.5.1] - 2026-10-28
 
 ### Fixed

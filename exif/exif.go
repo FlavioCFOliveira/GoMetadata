@@ -653,7 +653,8 @@ func Parse(b []byte, opts ...ParseOption) (*EXIF, error) { //nolint:gocyclo,cycl
 // read by Parse with CarryThumbnailStrips) are written after the IFD and
 // StripOffsets is set to their new positions (Exif 3.1 §4.5.8, task #368). Without
 // that option the entries StripOffsets and StripByteCounts are written as parsed,
-// and the strip data is not part of the stream.
+// and the strip data is not part of the stream. With the option, an IFD whose
+// strips cannot be carried is written without these two entries (task #414).
 //
 // Round-trip fidelity guarantee:
 //   - Known-type inline entries (total value size ≤ 4 bytes) are perfectly preserved.

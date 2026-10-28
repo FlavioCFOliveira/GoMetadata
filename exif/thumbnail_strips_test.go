@@ -353,3 +353,66 @@ func BenchmarkThumbnailStripsEncode(b *testing.B) {
 		}
 	}
 }
+
+// TestTask414_UncarriedStripsNotWritten: the strips of an IFD that cannot be
+// carried keep source offsets that address unrelated bytes of the stream Encode
+// writes. Encode must omit StripOffsets and StripByteCounts of that IFD, or a
+// re-parse of the (larger) output carries those unrelated bytes as strips
+// (fuzz seed testdata/fuzz/FuzzParseEXIF/584292984466e8b4: 4 strips before the
+// round trip, 8 after).
+func TestTask414_UncarriedStripsNotWritten(t *testing.T) {
+	t.Parallel()
+	chainStrips := func(e *EXIF) (strips [][]byte, uncarried int) {
+		for ifd := e.IFD0.Next; ifd != nil; ifd = ifd.Next {
+			strips = append(strips, ifd.thumbnailStrips()...)
+			if ifd.Get(TagStripOffsets) != nil && ifd.thumbnailStrips() == nil {
+				uncarried++
+			}
+		}
+		return strips, uncarried
+	}
+	order := binary.LittleEndian
+	outside, _ := rawStripStream(order, TypeLong, TypeLong, []int{10, 10}, []int{0}, false)
+	cnt := int(order.Uint32(outside[8+18+2+12*3+8:]))
+	order.PutUint32(outside[cnt:], uint32(len(outside))) //nolint:gosec // G115: tiny test values
+	// The fuzz seed: IFD1 carries 4 strips, the IFD that overlaps it (offset 38)
+	// does not fit the budget of the source stream.
+	seed := []byte("MM\x00*\x00\x00\x00\b\x00\x01000000000000\x00\x00\x00\x1a\x00\x04000000000000\x01\x11\x00\x04\x00\x00\x00\x04\x00\x00\x00X000000000000\x01\x17\x00\x04\x00\x00\x00\x04\x00\x00\x00X\x00\x00\x00&00000000\x00\x00\x000\x00\x00\x000\x00\x00\x000\x00\x00\x00000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000")
+	for _, tc := range []struct {
+		name string
+		src  []byte
+	}{
+		{"fuzz seed 584292984466e8b4", seed},
+		{"a strip outside the stream", outside},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			e, err := Parse(tc.src, CarryThumbnailStrips())
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			want, uncarried := chainStrips(e)
+			if uncarried == 0 {
+				t.Fatal("the fixture has no IFD whose strips are not carried")
+			}
+			out, err := Encode(e)
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+			if n, sizeErr := EncodedSize(e); sizeErr != nil || n != len(out) {
+				t.Errorf("EncodedSize = %d, %v; len(Encode) = %d", n, sizeErr, len(out))
+			}
+			e2, err := Parse(out, CarryThumbnailStrips())
+			if err != nil {
+				t.Fatalf("Parse of the output: %v", err)
+			}
+			got, uncarried2 := chainStrips(e2)
+			if !equalStrips(got, want) {
+				t.Errorf("the strips differ after Encode: %d before, %d after", len(want), len(got))
+			}
+			if uncarried2 != 0 {
+				t.Errorf("%d IFDs of the output still hold StripOffsets without carried strips", uncarried2)
+			}
+		})
+	}
+}

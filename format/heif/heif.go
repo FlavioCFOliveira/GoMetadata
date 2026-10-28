@@ -276,12 +276,20 @@ func selectBestItem(itemTypes map[uint16][4]byte, primaryID uint16, targetTypes 
 	return bestID, found
 }
 
+// tiffHeaderLen is the size of a TIFF header: byte order mark, magic and the
+// IFD0 offset (TIFF 6.0 §2, p. 13).
+const tiffHeaderLen = 8
+
 // extractExifFromData reads an HEIF EXIF item payload, validates its length,
 // computes the skip offset, and returns the trimmed EXIF bytes.
-// Returns nil if the data is too short or the skip offset is out of range.
+// Returns nil if the data is too short, the skip offset is out of range, or
+// fewer than 8 bytes (a TIFF header) remain after it.
 //
 // ISO 23008-12 §6.6.1: EXIF item begins with a 4-byte offset to the TIFF
 // header within the item. Skip = value + 4 (to account for the prefix itself).
+// ISO 23008-12 Annex A.2.1: the item holds exif_tiff_header_offset followed by
+// the Exif data, which starts with a TIFF header of 8 bytes (TIFF 6.0 §2), so
+// a shorter remainder cannot be an Exif payload (task #415).
 func extractExifFromData(data []byte) []byte {
 	if len(data) < 4 {
 		return nil
@@ -296,7 +304,7 @@ func extractExifFromData(data []byte) []byte {
 	// format/detect.go's parseClassicTIFFIFD0 and the FIX 5 fix in
 	// format/tiff/tiff.go's extractTagValues.
 	skip := uint64(binary.BigEndian.Uint32(data[:4])) + 4
-	if skip > uint64(len(data)) {
+	if skip > uint64(len(data)) || uint64(len(data))-skip < tiffHeaderLen {
 		return nil
 	}
 	// skip <= uint64(len(data)) and len(data) is a valid int on this
