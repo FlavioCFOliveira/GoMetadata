@@ -7,6 +7,17 @@ on:
     branches: ["main", "develop"]
   workflow_dispatch:
 
+# Runs of this workflow on the same ref never overlap. Overlapping runs share
+# identical per-job cache keys (they hash go.mod, go.sum and the Go sources),
+# so both tried to save the same key ("Unable to reserve cache"). Superseded
+# runs on develop, pull request and dispatch refs are cancelled. Runs on main
+# are never cancelled once started. A pending main run can be superseded by a
+# newer push, and its commit is still covered by the newer run's result,
+# because the newer commit contains it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 # Runners are pinned to an explicit image: ubuntu-latest is migrating from
 # Ubuntu 24.04 to 26.04, which would change the environment without a commit.
 #
