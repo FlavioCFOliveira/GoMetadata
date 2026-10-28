@@ -58,6 +58,16 @@ package exif
 // and the origin of the pointers must be the ones the note had, and no pointer
 // may leave the note. A note that fails the check is not changed.
 //
+// A note whose table repeats a tag (the corpus has Canon, Sony and Samsung notes
+// that repeat the filler tag 0; a hostile note can repeat one tag in thousands of
+// entries) is edited in time proportional to its table, not to its table times
+// the number of entries edited: the protection of the bytes that other entries
+// use is answered by an index (makernote_edit_index.go), the entries to delete
+// are removed in one pass, and a value is encoded once per type. The bytes that
+// an edit adds to the note are bounded by maxMakerNoteGrowth: an edit that would
+// add more (a large value written for each of a thousand entries) is refused
+// with ErrMakerNoteNotEditable.
+//
 // EXIF.MakerNote and the MakerNote entry of the Exif IFD are replaced by the
 // edited copy: the bytes the parsed EXIF aliases (the buffer given to Parse)
 // are never written to.
@@ -67,6 +77,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -104,6 +115,8 @@ type mnEdit struct {
 	buf    []byte // the private copy that the edit changes
 	footer bool   // buf ends with the Canon footer
 	walker mnWalker
+	ix     mnRangeIndex // the ranges of the entries, for protectedAgainst (task #416)
+	grown  int          // bytes that the edit has added to buf
 }
 
 // notEditable returns ErrMakerNoteNotEditable with the reason.
@@ -156,6 +169,7 @@ func newMakerNoteEdit(e *EXIF) (*mnEdit, error) {
 	if err := m.checkTable(); err != nil {
 		return nil, err
 	}
+	m.ix = m.newMnRangeIndex()
 	return m, nil
 }
 
@@ -274,36 +288,23 @@ func (m *mnEdit) protectedAgainst(start, end, skip int) bool {
 
 // overlapsStructure is protectedAgainst; withTable false leaves the header and
 // the entry table out, to ask whether a layout keeps a value where the next-IFD
-// offset would be.
+// offset would be. The entries are asked through the index (task #416), whose
+// answer is that of asking each entry as it is now: an entry that the edit has
+// deleted or moved no longer counts, a value the edit has added does.
 func (m *mnEdit) overlapsStructure(start, end, skip int, withTable bool) bool {
 	overlap := func(a, b int) bool { return start < b && a < end }
 	tableEnd := m.entryAt(m.count()) // the next-IFD offset is not part of it: a layout without one keeps a value there
 	if withTable && overlap(0, tableEnd) {
 		return true
 	}
-	if m.footer && overlap(len(m.buf)-canonFooterLen, len(m.buf)) {
-		return true
-	}
-	for i := range m.count() {
-		if i == skip {
-			continue
-		}
-		if m.entryOverlaps(m.entryAt(i), overlap) {
+	valuesEnd := len(m.buf)
+	if m.footer {
+		valuesEnd -= canonFooterLen
+		if overlap(valuesEnd, len(m.buf)) {
 			return true
 		}
 	}
-	return false
-}
-
-// entryOverlaps reports whether the value of the entry at offset ep, or the
-// sub-IFD it addresses inline (Nikon PreviewIFD, Olympus sub-IFDs), overlaps
-// the range that overlap tests.
-func (m *mnEdit) entryOverlaps(ep int, overlap func(a, b int) bool) bool {
-	if s, e, ok := m.valueRange(ep); ok && overlap(s, e) {
-		return true
-	}
-	s, e, ok := m.subIFDExtent(ep)
-	return ok && overlap(s, e)
+	return m.ix.appended(start, end, valuesEnd) || m.ix.overlapsOther(start, end, skip)
 }
 
 // subIFDExtent returns the range of the note that the IFD addressed by the inline
@@ -332,33 +333,64 @@ func (m *mnEdit) zeroValue(ep, skip int) {
 	}
 }
 
-// deleteEntry removes entry k from the table (see the file comment).
-func (m *mnEdit) deleteEntry(k int) error {
+// deleteEntries removes the entries of the table for which del reports true
+// (see the file comment), in one pass over the table: the values they address
+// are zeroed, newest entry first, as each deletion of an entry on its own
+// would, and the entries that remain move up together (task #416: a deletion
+// per entry is linear in the table each time).
+func (m *mnEdit) deleteEntries(del func(TagID) bool) error {
 	n := m.count()
-	if n <= 1 {
+	order := m.lay.ByteOrder
+	var gone []int // the positions to delete, ascending
+	for i := range n {
+		if del(TagID(order.Uint16(m.buf[m.entryAt(i):]))) {
+			gone = append(gone, i)
+		}
+	}
+	if len(gone) >= n {
 		return notEditable("the tag is the last one of the MakerNote")
 	}
-	order := m.lay.ByteOrder
-	ep := m.entryAt(k)
-	m.zeroValue(ep, k) // before the table changes: the ranges are those of the entries as they are
-	tableEnd := m.entryAt(n)
 	// The next-IFD offset follows the entries. A layout that has none (its first
-	// value starts at tableEnd) keeps those bytes: they are a value.
+	// value starts at tableEnd) keeps those bytes: they are a value. Asked before
+	// any value is zeroed, with the last entry to delete as the one that is left
+	// out, as for the first of the deletions one at a time.
+	tableEnd := m.entryAt(n)
 	slot := tableEnd
-	slotUsed := m.overlapsStructure(slot, slot+4, k, false) || slot+4 > len(m.buf)
+	slotUsed := m.overlapsStructure(slot, slot+4, gone[len(gone)-1], false) || slot+4 > len(m.buf)
+	for _, k := range slices.Backward(gone) {
+		m.zeroValue(m.entryAt(k), k) // the table is as it was: the ranges are those of the entries as they are
+		m.ix.release(k)
+	}
 	var next [4]byte
 	if !slotUsed {
 		copy(next[:], m.buf[slot:slot+4])
 	}
-	copy(m.buf[ep:], m.buf[ep+12:tableEnd])
-	newEnd := tableEnd - 12
+	newEnd := m.compactTable(n, gone) // the 12 bytes each that the deleted entries gave up are cleared:
 	clear(m.buf[newEnd:tableEnd])
 	if !slotUsed {
 		copy(m.buf[newEnd:], next[:])
 		clear(m.buf[slot : slot+4])
 	}
-	order.PutUint16(m.buf[m.lay.IFDOffset:], uint16(n-1)) //nolint:gosec // G115: n-1 < n <= 0xFFFF
+	order.PutUint16(m.buf[m.lay.IFDOffset:], uint16(n-len(gone))) //nolint:gosec // G115: n-len(gone) < n <= 0xFFFF
 	return nil
+}
+
+// compactTable moves the entries of the table (n of them) that are not at the
+// ascending positions gone up over the ones that are, and returns the offset
+// where the table now ends.
+func (m *mnEdit) compactTable(n int, gone []int) int {
+	w, g := m.entryAt(0), 0 // w is where the next entry that stays goes
+	for i := range n {
+		if g < len(gone) && gone[g] == i {
+			g++
+			continue
+		}
+		if ep := m.entryAt(i); ep != w {
+			copy(m.buf[w:w+12], m.buf[ep:ep+12])
+		}
+		w += 12
+	}
+	return w
 }
 
 // replaceEntry writes value (count elements of the type of the entry,
@@ -392,6 +424,9 @@ func (m *mnEdit) replaceEntry(k int, value []byte, count uint32, fixedSize bool)
 		}
 	}
 	order.PutUint32(m.buf[ep+4:], count)
+	if !m.refresh(k) {
+		return notEditable("the edit would add more than %d sub-IFDs to the MakerNote", maxMakerNoteExtraRanges)
+	}
 	return nil
 }
 
@@ -445,11 +480,19 @@ func (m *mnEdit) appendValue(value []byte) (int, error) {
 	if int64(end)+int64(len(value))+int64(canonFooterLen)+2 > math.MaxUint32 {
 		return 0, notEditable("the MakerNote would be larger than 4 GiB")
 	}
+	// Task #416: the values added for the entries of one edit (the same tag
+	// repeated in the table of a malformed note) are bounded as a whole.
+	if m.grown += len(value) + 2; m.grown > maxMakerNoteGrowth {
+		return 0, notEditable("the edit would add more than %d bytes to the MakerNote", maxMakerNoteGrowth)
+	}
 	b := m.buf[:end]
 	if len(b)&1 == 1 {
 		b = append(b, 0)
 	}
 	pos := len(b)
+	if m.ix.appendFrom == 0 {
+		m.ix.appendFrom = pos
+	}
 	b = append(b, value...)
 	if len(b)&1 == 1 {
 		b = append(b, 0)
@@ -595,12 +638,8 @@ func (e *EXIF) DeleteMakerNoteTags(tags []TagID) error {
 	if err != nil {
 		return err
 	}
-	for k := m.count() - 1; k >= 0; k-- {
-		if del[TagID(m.lay.ByteOrder.Uint16(m.buf[m.entryAt(k):]))] {
-			if err := m.deleteEntry(k); err != nil {
-				return err
-			}
-		}
+	if err := m.deleteEntries(func(t TagID) bool { return del[t] }); err != nil {
+		return err
 	}
 	if err := m.verify(kept); err != nil {
 		return err
@@ -694,16 +733,25 @@ func (e *EXIF) SetMakerNoteTag(tag TagID, value any, opts ...MakerNoteEditOption
 // encoded for the type of the entry, and returns the replacement.
 func encodeReplacements(want []topEntry, tag TagID, value any, order binary.ByteOrder) (map[TagID]topEntry, error) {
 	replaced := map[TagID]topEntry{}
+	// The encoding depends on the type of the entry only, so a table that repeats
+	// the tag (task #416) encodes the value once per type, not once per entry: the
+	// entries of one type share the bytes (which the edit only reads).
+	memo := map[DataType]topEntry{}
 	for k := range want {
 		if want[k].tag != tag {
 			continue
 		}
-		raw, count, err := encodeMakerNoteValue(want[k].typ, value, order)
-		if err != nil {
-			return nil, err
+		te, done := memo[want[k].typ]
+		if !done {
+			raw, count, err := encodeMakerNoteValue(want[k].typ, value, order)
+			if err != nil {
+				return nil, err
+			}
+			te = topEntry{tag: tag, typ: want[k].typ, cnt: count, val: raw}
+			memo[want[k].typ] = te
 		}
-		want[k] = topEntry{tag: tag, typ: want[k].typ, cnt: count, val: raw}
-		replaced[tag] = want[k]
+		want[k] = te
+		replaced[tag] = te
 	}
 	if len(replaced) == 0 {
 		return nil, fmt.Errorf("%w: %#04x", ErrMakerNoteTagNotFound, uint16(tag))
