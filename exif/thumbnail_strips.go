@@ -48,7 +48,10 @@ const (
 // IFD of the chain after IFD0 of e, when CarryThumbnailStrips was requested.
 // An IFD with a JPEG thumbnail, or without StripOffsets, is left alone. A
 // thumbnail whose strips cannot be carried is left as parsed and reported in
-// e.Warnings: Encode then writes its entries unchanged.
+// e.Warnings: Encode then omits its StripOffsets and StripByteCounts entries,
+// whose offsets would address unrelated bytes of the written stream (task #414:
+// written unchanged, a re-parse of a larger stream could take them for strips
+// and carry data that was never a thumbnail).
 //
 // The strips of all the IFDs together are bounded by the length of b, as the
 // JPEG thumbnails are (traverseBudget.chargeThumbnail): strips are disjoint
@@ -65,12 +68,15 @@ func attachThumbnailStrips(b []byte, e *EXIF, alias bool) {
 		for _, s := range strips {
 			remaining -= len(s)
 		}
-		if strips == nil {
-			e.Warnings = append(e.Warnings, "exif: thumbnail image data not carried: "+reason)
-			continue
-		}
 		if ifd.Sub == nil {
 			ifd.Sub = &SubIFDs{}
+		}
+		if strips == nil {
+			// The offsets address b, not the stream Encode writes: Encode
+			// omits the two tags (SubIFDs.stripsNotCarried, task #414).
+			ifd.Sub.stripsNotCarried = true
+			e.Warnings = append(e.Warnings, "exif: thumbnail image data not carried: "+reason)
+			continue
 		}
 		ifd.Sub.ThumbnailStrips = strips
 	}
