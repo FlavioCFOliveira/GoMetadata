@@ -2753,6 +2753,7 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 		sizeOff += uint32(total) //nolint:gosec // G115: total bounded by Count*typeSize ≤ MaxUint32 enforced by ifdTotalSize
 	}
 
+	moveKnownTypeFirst(entryBuf, 12, order, false)
 	out = append(out, entryBuf...)
 	// TIFF §2: next-IFD pointer is a 4-byte unsigned integer (0 = no next IFD).
 	out = appendUint32Order(out, order, nextIFDOffset)
@@ -2802,6 +2803,59 @@ func writeIFD(out []byte, entries []IFDEntry, order binary.ByteOrder, startOff, 
 		out = append(out, 0x00)
 	}
 	return out
+}
+
+// moveKnownTypeFirst makes the first entry record of the IFD table in
+// entryBuf (records of recSize bytes: 12 for classic TIFF, 20 for BigTIFF) an
+// entry of known type, so that ExifTool reads the IFD. It moves the leading
+// records of unknown type to just after the first record of known type and
+// leaves every other record in place. It does nothing when the first record
+// is of known type or when no record is.
+//
+// A type is unknown when its element size is 0 (typeSize, typeSizeBigTIFF):
+// type 0 or a code the container does not define. TIFF 6.0 §2, p. 16 says a
+// reader should skip such a field, and ExifTool does so with a warning, except
+// when it is the first entry of the IFD: it then takes the IFD for corrupted
+// and reads none of it (ExifTool 13.55, Exif.pm ProcessExif: "assume corrupted
+// IFD if this is our first entry"). The entries are in tag order, so an entry
+// whose tag is below every valid one, such as the tag 0x0001 of type 0 that the
+// Sony DSC-HX5V holds in place of XResolution, led IFD0, and ExifTool read no
+// IFD0, ExifIFD or MakerNote from the rewritten file (task #366). Dropping the
+// entry would break V-14 (an unknown-type entry round-trips byte for byte),
+// so it is kept, out of tag order, where ExifTool only warns about it, as it
+// does for the source. Only the pooled table is permuted; the entries of the
+// caller are not touched, and the value area (pass 2) does not depend on the
+// order because an unknown type has no out-of-line value.
+//
+// References: metadata-extractor TiffReader.java (Apache-2.0): an entry whose
+// format code is invalid is skipped ("continue"), the reader goes on with the
+// next one; ExifTool Exif.pm (study and oracle only, not copied).
+func moveKnownTypeFirst(entryBuf []byte, recSize int, order binary.ByteOrder, bigTIFF bool) {
+	n := len(entryBuf) / recSize
+	if n < 2 || !unknownTypeRecord(entryBuf[2:4], order, bigTIFF) {
+		return
+	}
+	j := 1
+	for j < n && unknownTypeRecord(entryBuf[j*recSize+2:], order, bigTIFF) {
+		j++
+	}
+	if j == n {
+		return
+	}
+	var known [20]byte
+	copy(known[:recSize], entryBuf[j*recSize:])
+	copy(entryBuf[recSize:(j+1)*recSize], entryBuf[:j*recSize])
+	copy(entryBuf, known[:recSize])
+}
+
+// unknownTypeRecord reports whether the 2-byte type field at the start of b
+// holds a type of unknown element size (see moveKnownTypeFirst).
+func unknownTypeRecord(b []byte, order binary.ByteOrder, bigTIFF bool) bool {
+	t := DataType(order.Uint16(b))
+	if bigTIFF {
+		return typeSizeBigTIFF(t) == 0
+	}
+	return typeSize(t) == 0
 }
 
 // ifdWrittenLen returns the exact number of bytes writeIFD (bigTIFF false)
@@ -3006,6 +3060,7 @@ func writeIFDBigTIFF(out []byte, entries []IFDEntry, order binary.ByteOrder, sta
 		sizeOff += total
 	}
 
+	moveKnownTypeFirst(entryBuf, 20, order, true)
 	out = append(out, entryBuf...)
 	// BigTIFF spec §2: next-IFD pointer is an 8-byte unsigned integer (0 = end).
 	out = appendUint64Order(out, order, nextIFDOffset)
