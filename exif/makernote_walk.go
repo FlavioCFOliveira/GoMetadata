@@ -213,6 +213,7 @@ type mnWalker struct {
 	olympus bool
 	ricoh   bool
 	noCarry bool // the pointers are inconsistent: carry nothing from outside
+	lost    int  // pointers that address data outside the blob and were left as they are (makernote_edit.go tests it to be 0)
 	fixes   []mnFix
 	carried map[[2]int64]int // source range -> position in buf, so one value is carried once
 }
@@ -362,6 +363,7 @@ func (w *mnWalker) walkValueIFD(loc, depth int) {
 func (w *mnWalker) ref(field int, total int64) (int, bool) {
 	target := w.targetOf(int64(w.order.Uint32(w.buf[field:])))
 	if w.tiffRel && target < 0 {
+		w.lost++
 		return 0, false // before the MakerNote: a stale or zero pointer, left as it is
 	}
 	if target >= 0 && target+total <= int64(w.origLen) {
@@ -377,12 +379,14 @@ func (w *mnWalker) ref(field int, total int64) (int, bool) {
 			w.point(field, int(target))
 			return int(target), true
 		}
+		w.lost++
 		return 0, false
 	}
 	if loc, ok := w.carry(target, total); ok {
 		w.point(field, loc)
 		return loc, true
 	}
+	w.lost++
 	return 0, false
 }
 
@@ -400,6 +404,7 @@ func (w *mnWalker) subIFD(field, depth int) {
 	case w.src != nil && target >= 0 && w.mnOff+target+2 <= int64(len(w.src)):
 		n = int64(w.order.Uint16(w.src[w.mnOff+target:]))
 	default:
+		w.lost++
 		return
 	}
 	span := 2 + 12*n + 4 // TIFF 6.0 §2: count, entries, next-IFD offset
@@ -411,7 +416,9 @@ func (w *mnWalker) subIFD(field, depth int) {
 	if loc, ok := w.carry(target, span); ok {
 		w.point(field, loc)
 		w.walkIFD(loc, depth+1)
+		return
 	}
+	w.lost++
 }
 
 // carry copies total bytes that lie at offset target of the MakerNote (outside

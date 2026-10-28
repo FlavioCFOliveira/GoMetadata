@@ -142,6 +142,24 @@ func holdsMakerNote(src []byte, off uint64, mn []byte) bool {
 	return src != nil && off+uint64(len(mn)) <= uint64(len(src)) && bytes.Equal(src[off:off+uint64(len(mn))], mn)
 }
 
+// resolveMakerNote returns the layout of the MakerNote mn of e (the Make of
+// IFD0 trimmed is mk) with the offset base decided as the repair of a moved
+// MakerNote decides it (offsetsCountFromTIFF), and the position of the
+// MakerNote in the source stream. ok is false when mn holds no IFD this package
+// reads. The editor of MakerNote values (makernote_edit.go) uses the same
+// decision, so that an edit and the write that follows read the offsets alike.
+func resolveMakerNote(e *EXIF, mn, mk []byte) (lay MakerNoteLayout, mnOff uint64, ok bool) {
+	lay, ok = makerNoteLayoutOf(mn, mk, e.ifd0ByteOrder())
+	if !ok {
+		return lay, 0, false
+	}
+	mnOff = makerNoteSourceOffset(e)
+	if lay.layout != mnNikon3 && mnOff > 0 {
+		lay.TIFFRelative = offsetsCountFromTIFF(mn, lay, int64(mnOff)) //nolint:gosec // G115: a classic TIFF offset, below 2^32
+	}
+	return lay, mnOff, true
+}
+
 // planMakerNote walks the MakerNote of e and returns the repair, or nil when
 // the MakerNote needs none (absent, inline, not an IFD, BigTIFF, or a layout
 // that moves unchanged and addresses nothing outside itself). src is the
@@ -154,13 +172,9 @@ func planMakerNote(e *EXIF, src []byte, carry *int) *mnPlan {
 	if mn == nil {
 		return nil
 	}
-	lay, ok := makerNoteLayoutOf(mn, mk, e.ifd0ByteOrder())
+	lay, mnOff, ok := resolveMakerNote(e, mn, mk)
 	if !ok {
 		return nil
-	}
-	mnOff := makerNoteSourceOffset(e)
-	if lay.layout != mnNikon3 && mnOff > 0 {
-		lay.TIFFRelative = offsetsCountFromTIFF(mn, lay, int64(mnOff)) //nolint:gosec // G115: a classic TIFF offset, below 2^32
 	}
 	if lay.TIFFRelative && mnOff == 0 {
 		return nil // the source position is unknown: no delta to apply

@@ -121,9 +121,7 @@ func TestLensModel_CorpusMakerNote(t *testing.T) {
 // lensRemaining still has an empty LensModel although ExifTool reports a lens
 // for it (task #396).
 var lensRemainingReasons = map[string]string{ //nolint:gochecknoglobals // test table
-	"canon-id-only": "the MakerNote holds only the numeric LensType (no LensModel tag 0x0095); the id-to-name table of metadata-extractor is converted from ExifTool and is not copied",
-	"canon-base-shifted": "the file has a LensModel tag but the value offsets of its Canon MakerNote are shifted (ExifTool: \"Adjusted MakerNotes base by -164\"); " +
-		"the library reads the value from the wrong position and finds zeros",
+	"canon-id-only":      "the MakerNote holds only the numeric LensType (no LensModel tag 0x0095); the id-to-name table of metadata-extractor is converted from ExifTool and is not copied",
 	"sony-id-only":       "the Sony MakerNote holds only the numeric LensID (tag 0xB027); metadata-extractor has no lens table for it",
 	"other-manufacturer": "a manufacturer outside the scope of the fallback (Canon, Nikon, Sony), or a lens in a non-MakerNote directory (for example FLIR)",
 }

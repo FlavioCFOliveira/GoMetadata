@@ -126,6 +126,13 @@ func makerNoteDispatchAt(makeValue []byte, parentOrder binary.ByteOrder, makerNo
 	if parse == nil {
 		return nil
 	}
+	if l == mnCanon && tiff != nil && mnOff > 0 {
+		// Task #407: a Canon note that was moved without updating its pointers
+		// is read against the base its footer names (makernote_canon_base.go).
+		if c, ok := canonRebasedCopy(makerNote, parentOrder, mnOff); ok {
+			return parse(blobView(c), parentOrder)
+		}
+	}
 	return parse(makerNoteView(l, makerNote, tiff, mnOff), parentOrder)
 }
 
